@@ -7,6 +7,7 @@ import numpy as np
 import logging
 import json
 import random
+import time  # Added for measuring steps per second
 
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -29,7 +30,7 @@ from src.evaluation.evaluate_utils import (
     format_rank_change,
     print_scoreboard,
     print_action_counts,
-    plot_version_heatmap,
+    plot_agent_heatmap,  # Updated plotting function
     adapt_observation_for_version,
     model,  # Import the model here
 )
@@ -42,22 +43,26 @@ def initialize_players(players_dir, device):
     """
     players = {}
     logger = logging.getLogger("Evaluate")
+    
     for version in os.listdir(players_dir):
         version_path = os.path.join(players_dir, version)
         if os.path.isdir(version_path):
-            checkpoint_path = os.path.join(version_path, "combined_checkpoint.pth")
-            if os.path.exists(checkpoint_path):
+            
+            # Find all .pth files in the directory
+            checkpoint_files = [f for f in os.listdir(version_path) if f.endswith(".pth")]
+            
+            for checkpoint_file in checkpoint_files:
+                checkpoint_path = os.path.join(version_path, checkpoint_file)
                 try:
                     checkpoint = load_combined_checkpoint(checkpoint_path, device)
                     policy_nets = checkpoint['policy_nets']
                     value_nets = checkpoint['value_nets']
                     obp_model_state = checkpoint.get('obp_model', None)
-
+                    
                     # Determine version based on policy network input dim
                     any_policy = next(iter(policy_nets.values()))
                     actual_input_dim = any_policy['fc1.weight'].shape[1]
 
-                    # Corrected mapping based on known input dimensions
                     if actual_input_dim == 18:
                         obs_version = 1  # OBS_VERSION_1
                     elif actual_input_dim == 16:
@@ -70,15 +75,7 @@ def initialize_players(players_dir, device):
                     obp_model = None
                     if obp_model_state is not None:
                         obp_hidden_dim = get_hidden_dim_from_state_dict(obp_model_state, layer_prefix='fc1')
-                        
-                        # Set input_dim based on obs_version
-                        if obs_version == 1:
-                            obp_input_dim = 5
-                        elif obs_version == 2:
-                            obp_input_dim = 4
-                        else:
-                            raise ValueError(f"Unknown obs_version: {obs_version}")
-
+                        obp_input_dim = 5 if obs_version == 1 else 4
                         obp_model = OpponentBehaviorPredictor(
                             input_dim=obp_input_dim,
                             hidden_dim=obp_hidden_dim,
@@ -90,7 +87,7 @@ def initialize_players(players_dir, device):
                     for agent_name, policy_state_dict in policy_nets.items():
                         policy_hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, layer_prefix='fc1')
                         policy_net = PolicyNetwork(
-                            input_dim=actual_input_dim,  # Use actual loaded dim
+                            input_dim=actual_input_dim, 
                             hidden_dim=policy_hidden_dim,
                             output_dim=config.OUTPUT_DIM,
                             use_lstm=True,
@@ -120,7 +117,7 @@ def initialize_players(players_dir, device):
                             'rating': model.rating(name=player_id)
                         }
                 except Exception as e:
-                    logging.error(f"Error loading {version}: {str(e)}")
+                    logging.error(f"Error loading {checkpoint_file} in {version}: {str(e)}")
     return players
 
 
@@ -177,7 +174,10 @@ def evaluate_agents(env, device, players_in_this_game, episodes=10):
     action_counts = {pid: {action: 0 for action in range(7)} for pid in player_ids}
     cumulative_wins = {pid: 0 for pid in player_ids}
     total_steps = 0
+    total_time = 0.0  # Added for steps per second
     game_wins_list = []
+
+    start_time = time.time()  # Start time for measuring steps per second
 
     for game_idx in range(1, episodes + 1):
         env.reset()
@@ -278,8 +278,12 @@ def evaluate_agents(env, device, players_in_this_game, episodes=10):
         total_steps += steps_in_game
         game_wins_list.append(game_wins)
 
+    end_time = time.time()  # End time for measuring steps per second
+    elapsed_time = end_time - start_time
+    steps_per_sec = total_steps / elapsed_time if elapsed_time > 0 else 0
+
     avg_steps = total_steps / episodes if episodes > 0 else 0
-    return cumulative_wins, action_counts, game_wins_list, avg_steps
+    return cumulative_wins, action_counts, game_wins_list, avg_steps, steps_per_sec
 
 
 def run_evaluation(env, device, players, num_games_per_triple=11):
@@ -295,15 +299,17 @@ def run_evaluation(env, device, players, num_games_per_triple=11):
     global_action_counts = {pid: {a: 0 for a in range(7)} for pid in players}
     global_wins = {pid: 0 for pid in players}
     global_games = {pid: 0 for pid in players}
+    total_steps = 0
+    total_steps_per_sec = 0.0  # Accumulate steps per second
 
     agent_head_to_head = defaultdict(lambda: defaultdict(int))
-    version_head_to_head = defaultdict(lambda: defaultdict(int))
+    # Removed version_head_to_head since it's no longer needed
 
     for idx, triple in enumerate(triples_list, start=1):
         logger.info(f"Evaluating triple {idx}/{total_triples}: {triple}")
         players_in_this_game = {pid: players[pid] for pid in triple}
 
-        cumulative_wins, action_counts, game_wins_list, avg_steps = evaluate_agents(
+        cumulative_wins, action_counts, game_wins_list, avg_steps, steps_per_sec = evaluate_agents(
             env,
             device,
             players_in_this_game,
@@ -315,6 +321,9 @@ def run_evaluation(env, device, players, num_games_per_triple=11):
             global_games[pid] += num_games_per_triple
             for a in range(7):
                 global_action_counts[pid][a] += action_counts[pid][a]
+
+        total_steps += avg_steps * num_games_per_triple
+        total_steps_per_sec += steps_per_sec * num_games_per_triple
 
         # Assign ranks based on cumulative wins
         ranks = assign_final_ranks(triple, cumulative_wins)
@@ -328,9 +337,9 @@ def run_evaluation(env, device, players, num_games_per_triple=11):
                     continue
                 if rank_i < rank_j:
                     agent_head_to_head[pid_i][pid_j] += 1
-                    version_head_to_head[get_version(pid_i)][get_version(pid_j)] += 1
+                    # Removed version_head_to_head updates
 
-        logger.info(f"Triple {idx}/{total_triples} wins: {cumulative_wins}, steps/ep: {avg_steps:.2f}")
+        logger.info(f"Triple {idx}/{total_triples} wins: {cumulative_wins}, steps/ep: {avg_steps:.2f}, steps/sec: {steps_per_sec:.2f}")
         for pid in triple:
             # ordinal() typically does mu - 3*sigma
             skill_val = players[pid]['rating'].ordinal()
@@ -343,7 +352,7 @@ def run_evaluation(env, device, players, num_games_per_triple=11):
         else:
             players[pid]['win_rate'] = 0.0
 
-    return global_action_counts, agent_head_to_head, version_head_to_head
+    return global_action_counts, agent_head_to_head
 
 
 def get_version(pid):
@@ -361,8 +370,7 @@ def main():
         level=logging.INFO,  # Changed back to INFO level
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler("evaluation.log"),
-            logging.StreamHandler()
+            logging.StreamHandler()  # Removed FileHandler to stop logging to a file
         ]
     )
     logger = logging.getLogger("Evaluate")
@@ -394,7 +402,7 @@ def main():
     NUM_GAMES_PER_TRIPLE = 11
 
     # Run the evaluation
-    action_counts, agent_h2h, version_h2h = run_evaluation(
+    action_counts, agent_h2h = run_evaluation(
         env,
         device,
         players,
@@ -407,7 +415,7 @@ def main():
     # Print the results
     print_scoreboard(players, differences=differences)
     print_action_counts(players, action_counts)
-    plot_version_heatmap(version_h2h, "Version vs. Version Win Counts")
+    plot_agent_heatmap(agent_h2h, "Agent vs. Agent Win Counts")  # Updated plotting function
 
     # Save the new scoreboard
     save_scoreboard(players, "scoreboard.json")

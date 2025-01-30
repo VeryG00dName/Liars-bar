@@ -229,32 +229,29 @@ def print_action_counts(players, action_counts):
     print("===============================\n")
 
 
-def plot_version_heatmap(version_head_to_head, title="Version vs. Version Wins"):
+def plot_agent_heatmap(agent_h2h, title):
     """
-    Plot a heatmap of wins between different versions.
-    """
-    versions = sorted(
-        set(version_head_to_head.keys())
-        | set(v for row in version_head_to_head.values() for v in row.keys())
-    )
-    matrix = []
-    for vw in versions:
-        row = []
-        for vl in versions:
-            if vw == vl:
-                row.append(0)
-            else:
-                row.append(version_head_to_head[vw][vl])
-        matrix.append(row)
+    Plots a heatmap for agent vs. agent win counts.
 
-    df = pd.DataFrame(matrix, index=versions, columns=versions)
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(df, annot=True, cmap="Blues", fmt="d")
+    Args:
+        agent_h2h (defaultdict): Nested dictionary with head-to-head win counts.
+        title (str): Title of the heatmap.
+    """
+    agents = sorted(agent_h2h.keys())
+    heatmap_data = pd.DataFrame(index=agents, columns=agents, data=0)
+
+    for agent, opponents in agent_h2h.items():
+        for opponent, wins in opponents.items():
+            heatmap_data.loc[agent, opponent] = wins
+
+    plt.figure(figsize=(12, 10))
+    sns.heatmap(heatmap_data, annot=True, fmt='g', cmap='Blues')
     plt.title(title)
-    plt.ylabel("Winner Version")
-    plt.xlabel("Loser Version")
+    plt.ylabel('Agent')
+    plt.xlabel('Opponent')
     plt.tight_layout()
-    plt.show()
+    plt.savefig("agent_head_to_head_heatmap.png")
+    plt.close()
 
 
 def _convert_to_v1_observation(raw_obs, num_players):
