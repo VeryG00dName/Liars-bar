@@ -163,3 +163,5 @@ cython_debug/
 trial_agents.pkl
 my_optuna_study.db
 /runs
+agent_head_to_head_heatmap.png
+*.old
