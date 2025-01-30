@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Categorical
 
+from src.env.reward_restriction_wrapper_2 import RewardRestrictionWrapper2
 from src.env.liars_deck_env_core import LiarsDeckEnv
 from src.model.models import PolicyNetwork, ValueNetwork, OpponentBehaviorPredictor
 from src.model.memory import RolloutMemory
@@ -517,7 +518,7 @@ def main():
 
     if config.USE_WRAPPER: 
         base_env = LiarsDeckEnv(num_players=config.NUM_PLAYERS, render_mode=config.RENDER_MODE)
-        env = RewardRestrictionWrapper(base_env)
+        env = RewardRestrictionWrapper2(base_env)
     else:
         env = LiarsDeckEnv(num_players=config.NUM_PLAYERS, render_mode=config.RENDER_MODE)
 
