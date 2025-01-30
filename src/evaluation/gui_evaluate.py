@@ -1,4 +1,5 @@
 # src/evaluation/gui_evaluate.py
+
 import torch
 import logging
 import threading
@@ -10,8 +11,7 @@ from src.env.liars_deck_env_core import LiarsDeckEnv
 from src.model.models import PolicyNetwork, OpponentBehaviorPredictor, ValueNetwork
 from src import config
 from src.evaluation.evaluate_tournament import (
-    run_obp_inference,
-    evaluate_agents,
+    evaluate_agents_tournament,
     update_openskill_ratings
 )
 
@@ -58,6 +58,8 @@ class TournamentManager:
                     use_dropout=True,
                     use_layer_norm=True
                 ).to(self.device)
+                policy.load_state_dict(model_data['policy_net'])
+                policy.eval()
                 
                 value_hidden_dim = get_hidden_dim_from_state_dict(model_data['value_net'])
                 value = ValueNetwork(
@@ -66,29 +68,48 @@ class TournamentManager:
                     use_dropout=True,
                     use_layer_norm=True
                 ).to(self.device)
+                value.load_state_dict(model_data['value_net'])
+                value.eval()
                 
                 obp = None
+                obs_version = None
                 if model_data['obp_model'] is not None:
                     obp_hidden_dim = get_hidden_dim_from_state_dict(model_data['obp_model'])
+                    
+                    # Determine obs_version based on OBP model's input_dim
+                    obp_fc1_weight_shape = model_data['obp_model']['fc1.weight'].shape[1]
+                    if obp_fc1_weight_shape == 5:
+                        obs_version = 1  # OBS_VERSION_1
+                        obp_input_dim = 5
+                    elif obp_fc1_weight_shape == 4:
+                        obs_version = 2  # OBS_VERSION_2
+                        obp_input_dim = 4
+                    else:
+                        raise ValueError(f"Unknown OBP input_dim {obp_fc1_weight_shape} for player {name}")
+    
                     obp = OpponentBehaviorPredictor(
-                        config.OPPONENT_INPUT_DIM,
-                        obp_hidden_dim,
+                        input_dim=obp_input_dim,
+                        hidden_dim=obp_hidden_dim,
                         output_dim=2
                     ).to(self.device)
                     obp.load_state_dict(model_data['obp_model'])
                     obp.eval()
-
+                else:
+                    # If no OBP model, default to obs_version=2 and input_dim=4
+                    obs_version = 2
+                    obp_input_dim = 4
+                
                 self.players[name] = {
                     'policy_net': policy,
                     'value_net': value,
                     'obp_model': obp,
+                    'obs_version': obs_version,
                     'rating': self.openskill_model.rating(name=name),
-                    'score': 0.0,
+                    'score': self.openskill_model.rating(name=name).ordinal(),
                     'wins': 0,
                     'games_played': 0
                 }
-                self.players[name]['score'] = self.players[name]['rating'].ordinal()
-                self.current_tournament_wins = {name: 0 for name in participant_names}
+        self.current_tournament_wins = {name: 0 for name in participant_names}
 
     def log(self, message, error=False):
         """Send logs to the GUI callback."""
@@ -149,10 +170,10 @@ class TournamentManager:
                     continue
 
                 try:
-                    # Evaluate the group using evaluate_agents
+                    # Evaluate the group using evaluate_agents_tournament
                     players_in_this_game = {pid: self.players[pid] for pid in group}
 
-                    cumulative_wins, action_counts, game_wins_list, avg_steps = evaluate_agents(
+                    cumulative_wins, action_counts, game_wins_list, avg_steps = evaluate_agents_tournament(
                         env=self.env,
                         device=self.device,
                         players_in_this_game=players_in_this_game,
