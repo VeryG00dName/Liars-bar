@@ -28,12 +28,12 @@ torch.backends.cudnn.benchmark = True
 ########################################
 # Benchmark configuration overrides
 ########################################
-HIDDEN_DIM_LIST = [100, 500, 1000, 1500, 2000]
+HIDDEN_DIM_LIST = [128, 512, 1024, 1504, 2000]
 NUM_EPISODES = 100         # Total episodes to run during the benchmark
 UPDATE_STEPS = 5           # Frequency (in episodes) of the PPO update phase
 K_EPOCHS = 4               # Number of PPO epochs per update
-OBP_UPDATE_STEPS = 10      # Frequency (in episodes) to train OBP
-OBP_BATCH_SIZE = 64        # Batch size for OBP training
+OBP_UPDATE_STEPS = 5      # Frequency (in episodes) to train OBP
+OBP_BATCH_SIZE = 200        # Batch size for OBP training
 OBP_TRAINING_THRESHOLD = 100  # Minimum OBP data points before training
 
 ########################################
