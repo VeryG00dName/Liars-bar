@@ -21,7 +21,7 @@ class RewardRestrictionWrapper(AECEnv):
         self.agents = env.agents
         self.observation_spaces = env.observation_spaces
         self.action_spaces = env.action_spaces
-        self.violators = {agent: False for agent in self.agents}  # Track who violated
+
         # Track how many non-table vs table cards each agent has played so far
         # to enforce "non-table first, then table"
         self.non_table_played = {agent: 0 for agent in self.agents}
@@ -91,15 +91,7 @@ class RewardRestrictionWrapper(AECEnv):
 
     @property
     def rewards(self):
-        # Copy original rewards
-        rewards = self.env.rewards.copy()
-
-        # Ensure all violators receive only negative rewards
-        for agent in self.agents:
-            if self.violators[agent]:
-                rewards[agent] = min(rewards[agent], -1.0)  # Ensure negative rewards
-
-        return rewards
+        return self.env.rewards
 
     @property
     def infos(self):
@@ -163,7 +155,6 @@ class RewardRestrictionWrapper(AECEnv):
         # Apply penalties based on violations
         if any_violation:
             # Initialize the reward if not already penalized
-            self.violators[agent] = True  # Mark agent as a violator
             self.env.rewards[agent] = self.env.rewards.get(agent, 0.0) - 1.0
             if backtrack_violation or max_play_violation:
                 self.env.infos[agent]["pattern_violation"] = True

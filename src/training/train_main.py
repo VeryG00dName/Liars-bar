@@ -250,7 +250,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
             )
 
             for a in agents:
-                episode_rewards[a] = env.rewards[a]
+                episode_rewards[a] += env.rewards[a]
 
         # Extract and store OBP training data
         episode_obp_data = extract_obp_training_data(env)
@@ -259,17 +259,12 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
         # Calculate avg_rewards based on total accumulated rewards
         # End of episode processing:
         for agent in agents:
-            recent_rewards[agent].append(env.rewards[agent])
+            recent_rewards[agent].append(episode_rewards[agent])
             if len(recent_rewards[agent]) > 100:
                 recent_rewards[agent].pop(0)
         
         avg_rewards = {agent: np.mean(recent_rewards[agent]) if recent_rewards[agent] else 0.0 for agent in agents}
 
-        # Append to recent_rewards for entropy adjustment
-        for agent in agents:
-            recent_rewards[agent].append(avg_rewards[agent])
-            if len(recent_rewards[agent]) > 100:
-                recent_rewards[agent].pop(0)
 
         # Compute advantages and returns using Generalized Advantage Estimation (GAE)
         for agent in agents:
