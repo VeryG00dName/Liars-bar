@@ -12,7 +12,7 @@ from src.model.models import PolicyNetwork, OpponentBehaviorPredictor
 from src import config
 import random
 
-from src.model.hard_coded_agents import GreedyCardSpammer, TableFirstConservativeChallenger, StrategicChallenger, RandomAgent
+from src.model.hard_coded_agents import GreedyCardSpammer, TableFirstConservativeChallenger, StrategicChallenger, RandomAgent, StrategicDominator
 
 from src.evaluation.evaluate import run_obp_inference
 from src.evaluation.evaluate_utils import (
@@ -20,7 +20,7 @@ from src.evaluation.evaluate_utils import (
     get_hidden_dim_from_state_dict
 )
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO)  # Set to DEBUG for detailed logs
 logger = logging.getLogger("AgentBattleground")
 
 class AgentBattlegroundGUI:
@@ -33,7 +33,7 @@ class AgentBattlegroundGUI:
         self.hardcoded_agents = {
             "GreedySpammer": GreedyCardSpammer,
             "TableFirst": TableFirstConservativeChallenger,
-            "Strategic": lambda name: StrategicChallenger(name, 3),
+            "Strategic": lambda name: StrategicChallenger(name, 3, 2),  # Pass agent_index=2
             "Random": RandomAgent
         }
         
@@ -182,7 +182,6 @@ class AgentBattlegroundGUI:
         except Exception as e:
             self.show_info(f"Error loading selected agents: {str(e)}")
             return None
-
 
     def start_battleground(self):
         try:
@@ -383,8 +382,6 @@ class AgentBattlegroundGUI:
             self.results_text.insert(tk.END, line)
             
         self.results_text.config(state=tk.DISABLED)
-
-
 
 if __name__ == "__main__":
     root = TkinterDnD.Tk()

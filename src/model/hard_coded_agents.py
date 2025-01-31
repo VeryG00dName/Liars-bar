@@ -1,4 +1,5 @@
 # src/model/hard_coded_agents.py
+
 import numpy as np
 import random
 
@@ -65,13 +66,21 @@ class TableFirstConservativeChallenger:
 
         # Final fallback to challenge
         return 6
-    
+
 class StrategicChallenger:
-    def __init__(self, agent_name, num_players):
+    def __init__(self, agent_name, num_players, agent_index):
+        """
+        Initialize the StrategicChallenger.
+
+        Args:
+            agent_name (str): Name of the agent.
+            num_players (int): Total number of players in the game.
+            agent_index (int): The index of this agent (e.g., 2 for 'player_2').
+        """
         self.name = agent_name
         self.num_players = num_players
-        self.agent_index = int(agent_name.split('_')[-1])  # Extract player number
-        
+        self.agent_index = agent_index  # Assign directly without parsing from name
+
     def play_turn(self, observation, action_mask, table_card):
         """
         Strategy:
@@ -83,7 +92,7 @@ class StrategicChallenger:
         """
         # Extract observation components
         hand_vector = observation[:2]
-        last_action_count = int(observation[2])  # Normalized to actual count
+        last_action_count = int(round(observation[2]))  # Normalized to actual count
         active_players_vector = observation[3:3+self.num_players]
         
         # Calculate actual card counts
@@ -119,6 +128,6 @@ class StrategicChallenger:
 class RandomAgent:
     def __init__(self, agent_name):
         self.name = agent_name        
-        
+    
     def play_turn(self, observation, action_mask, table_card):
         return random.choice([i for i in range(7) if action_mask[i] == 1])
