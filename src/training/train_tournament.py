@@ -7,232 +7,253 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from src.evaluation.evaluate import evaluate_agents
 from src.env.liars_deck_env_core import LiarsDeckEnv
 from src.model.models import PolicyNetwork, ValueNetwork, OpponentBehaviorPredictor
 from src.training.train_multi_utils import save_multi_checkpoint, load_multi_checkpoint
-from src.training.train_utils import compute_gae
-from src.training.train_extras import set_seed
 from src.training.train import train
+from src.training.train_extras import set_seed
+from src.misc.tune_eval import run_group_swiss_tournament
 from src import config
 
-def create_player_pool(total_players, device):
-    """Create initial pool of players with unique IDs"""
-    player_pool = {}
-    for p in range(total_players):
-        key = f"player_{p}"
-        policy_net = PolicyNetwork(
-            input_dim=config.INPUT_DIM,
-            hidden_dim=config.HIDDEN_DIM,
-            output_dim=config.OUTPUT_DIM,
-            use_lstm=True,
-            use_dropout=True,
-            use_layer_norm=True
-        ).to(device)
-        value_net = ValueNetwork(
-            input_dim=config.INPUT_DIM,
-            hidden_dim=config.HIDDEN_DIM,
-            use_dropout=True,
-            use_layer_norm=True
-        ).to(device)
-        optimizer_policy = torch.optim.Adam(policy_net.parameters(), lr=config.LEARNING_RATE)
-        optimizer_value = torch.optim.Adam(value_net.parameters(), lr=config.LEARNING_RATE)
-        player_pool[key] = {
-            'policy_net': policy_net,
-            'value_net': value_net,
-            'optimizer_policy': optimizer_policy,
-            'optimizer_value': optimizer_value,
-            'entropy_coef': config.INIT_ENTROPY_COEF,
-            'wins': 0,
-            'games_played': 0
-        }
-    return player_pool
+from src.misc.tune_eval import openskill_model
 
-def evaluate_tournament(players, device, num_games_per_player=20):
-    """Evaluate all players through random matchups"""
-    logger = logging.getLogger('TournamentEval')
+# Tournament configuration
+TOURNAMENT_INTERVAL = 2        # Run tournament every N batches
+CULL_PERCENTAGE = 0.5          # Remove bottom 20% each tournament
+CLONE_PERCENTAGE = 0.5         # 50% of new agents are clones of top performers
+
+def configure_logger():
+    logger = logging.getLogger('TrainTournament')
+    logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(levelname)s:%(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    return logger
+
+def initialize_obp(device):
+    """Initialize Opponent Behavior Predictor model and optimizer"""
+    obp_model = OpponentBehaviorPredictor(
+        input_dim=config.OPPONENT_INPUT_DIM,
+        hidden_dim=config.OPPONENT_HIDDEN_DIM,
+        output_dim=2
+    ).to(device)
+    
+    obp_optimizer = torch.optim.Adam(obp_model.parameters(), 
+                                   lr=config.OPPONENT_LEARNING_RATE)
+    return obp_model, obp_optimizer
+
+def create_new_agent(device):
+    """Create a brand new untrained agent"""
+    policy_net = PolicyNetwork(
+        input_dim=config.INPUT_DIM,
+        hidden_dim=config.HIDDEN_DIM,
+        output_dim=config.OUTPUT_DIM
+    ).to(device)
+    
+    value_net = ValueNetwork(
+        input_dim=config.INPUT_DIM,
+        hidden_dim=config.HIDDEN_DIM
+    ).to(device)
+    
+    return {
+        'policy_net': policy_net,
+        'value_net': value_net,
+        'optimizer_policy': torch.optim.Adam(policy_net.parameters(), lr=config.LEARNING_RATE),
+        'optimizer_value': torch.optim.Adam(value_net.parameters(), lr=config.LEARNING_RATE),
+        'entropy_coef': config.INIT_ENTROPY_COEF
+    }
+
+def clone_agent(source_agent, device):
+    """Create a deep copy of an existing agent"""
+    policy_net = PolicyNetwork(
+        input_dim=config.INPUT_DIM,
+        hidden_dim=config.HIDDEN_DIM,
+        output_dim=config.OUTPUT_DIM
+    ).to(device)
+    policy_net.load_state_dict(source_agent['policy_net'].state_dict())
+    
+    value_net = ValueNetwork(
+        input_dim=config.INPUT_DIM,
+        hidden_dim=config.HIDDEN_DIM
+    ).to(device)
+    value_net.load_state_dict(source_agent['value_net'].state_dict())
+    
+    return {
+        'policy_net': policy_net,
+        'value_net': value_net,
+        'optimizer_policy': torch.optim.Adam(policy_net.parameters(), lr=config.LEARNING_RATE),
+        'optimizer_value': torch.optim.Adam(value_net.parameters(), lr=config.LEARNING_RATE),
+        'entropy_coef': source_agent['entropy_coef']
+    }
+
+def run_tournament(env, device, player_pool, obp_model, logger):
+    """Evaluate all agents and return sorted rankings"""
     logger.info("Starting tournament evaluation...")
     
-    player_ids = list(players.keys())
-    win_counts = {pid: 0 for pid in player_ids}
+    # Convert pool to tournament format
+    players = {}
+    for pid, agent in player_pool.items():
+        players[pid] = {
+            'policy_net': agent['policy_net'],
+            'value_net': agent['value_net'],
+            'obp_model': obp_model,
+            'rating': openskill_model.rating(name=pid),  # Initialize OpenSkill rating
+            'score': 0.0,
+            'wins': 0,
+            'games_played': 0
+        }
     
-    # Run random matchups
-    for _ in range(num_games_per_player):
-        group = random.sample(player_ids, 3)
-        env = LiarsDeckEnv(num_players=3, render_mode=None)
-        
-        # Create temporary agent mapping
-        players_in_game = {pid: players[pid] for pid in group}
-        
-        # Run evaluation
-        cumulative_wins, _, _, _ = evaluate_agents(
-            env=env,
-            device=device,
-            players_in_this_game=players_in_game,
-            episodes=5
-        )
-        
-        # Update stats
-        for pid in group:
-            win_counts[pid] += cumulative_wins.get(pid, 0)
-            players[pid]['games_played'] += 5
-            players[pid]['wins'] += cumulative_wins.get(pid, 0)
+    # Run Swiss tournament
+    final_rankings = run_group_swiss_tournament(
+        env=env,
+        device=device,
+        players=players,
+        num_games_per_match=11,
+        NUM_ROUNDS=7
+    )
+    
+    return final_rankings
 
-    # Calculate win rates
-    rankings = sorted(player_ids, 
-                     key=lambda x: win_counts[x]/players[x]['games_played'] if players[x]['games_played'] > 0 else 0, 
-                     reverse=True)
+def cull_and_replace(player_pool, rankings, device, logger):
+    """Cull bottom performers and replace with new/cloned agents"""
+    num_agents = len(rankings)
+    num_cull = int(num_agents * CULL_PERCENTAGE)
+    culled_ids = rankings[-num_cull:]
     
-    logger.info("Tournament evaluation completed.")
-    return rankings
-
-def cull_and_replace(players, rankings, cull_percent=0.2, device=torch.device("cpu")):
-    """Replace bottom performers with new agents and top clones"""
-    logger = logging.getLogger('Evolution')
-    total_players = len(rankings)
-    num_to_cull = int(total_players * cull_percent)
+    logger.info(f"Culling {num_cull} agents: {culled_ids}")
     
-    # Identify bottom performers
-    bottom_cutoff = total_players - num_to_cull
-    survivors = rankings[:bottom_cutoff]
-    culled = rankings[bottom_cutoff:]
+    # Remove culled agents from pool
+    for pid in culled_ids:
+        del player_pool[pid]
     
-    # Remove culled players
-    for pid in culled:
-        del players[pid]
+    # Create replacement agents
+    num_new = int(num_cull * CLONE_PERCENTAGE)
+    num_clones = num_cull - num_new
     
-    # Create replacements: 50% new, 50% clones from top 25%
-    num_new = num_to_cull // 2
-    num_clones = num_to_cull - num_new
-    top_performers = rankings[:max(1, len(rankings)//4)]
+    # Get top performers for cloning
+    clone_source_ids = rankings[:max(1, int(num_clones*2))]
     
     # Add new agents
-    for i in range(num_new):
-        new_id = f"player_{len(players)}"
-        policy_net = PolicyNetwork(
-            config.INPUT_DIM, config.HIDDEN_DIM, config.OUTPUT_DIM,
-            use_lstm=True, use_dropout=True, use_layer_norm=True
-        ).to(device)
-        value_net = ValueNetwork(
-            config.INPUT_DIM, config.HIDDEN_DIM,
-            use_dropout=True, use_layer_norm=True
-        ).to(device)
-        players[new_id] = {
-            'policy_net': policy_net,
-            'value_net': value_net,
-            'optimizer_policy': torch.optim.Adam(policy_net.parameters(), lr=config.LEARNING_RATE),
-            'optimizer_value': torch.optim.Adam(value_net.parameters(), lr=config.LEARNING_RATE),
-            'entropy_coef': config.INIT_ENTROPY_COEF,
-            'wins': 0,
-            'games_played': 0
-        }
+    new_players = {}
+    for i in range(num_cull):
+        if i < num_new:
+            new_id = f"new_{len(player_pool)+i}"
+            new_players[new_id] = create_new_agent(device)
+        else:
+            source_id = random.choice(clone_source_ids)
+            clone_id = f"clone_{source_id}_{len(player_pool)+i}"
+            new_players[clone_id] = clone_agent(player_pool[source_id], device)
     
-    # Clone top performers
-    for _ in range(num_clones):
-        if not top_performers:
-            break
-        original_id = random.choice(top_performers)
-        clone_id = f"clone_{original_id}_{len(players)}"
-        
-        # Clone networks
-        original = players[original_id]
-        policy_net = PolicyNetwork(
-            config.INPUT_DIM, config.HIDDEN_DIM, config.OUTPUT_DIM,
-            use_lstm=True, use_dropout=True, use_layer_norm=True
-        ).to(device)
-        policy_net.load_state_dict(original['policy_net'].state_dict())
-        
-        value_net = ValueNetwork(
-            config.INPUT_DIM, config.HIDDEN_DIM,
-            use_dropout=True, use_layer_norm=True
-        ).to(device)
-        value_net.load_state_dict(original['value_net'].state_dict())
-        
-        players[clone_id] = {
-            'policy_net': policy_net,
-            'value_net': value_net,
-            'optimizer_policy': torch.optim.Adam(policy_net.parameters(), lr=config.LEARNING_RATE),
-            'optimizer_value': torch.optim.Adam(value_net.parameters(), lr=config.LEARNING_RATE),
-            'entropy_coef': original['entropy_coef'],
-            'wins': 0,
-            'games_played': 0
-        }
+    # Add new players to pool
+    player_pool.update(new_players)
+    logger.info(f"Added {len(new_players)} new agents ({num_new} new, {num_clones} clones)")
     
-    logger.info(f"Culled {len(culled)} agents, added {num_new} new and {num_clones} cloned agents")
-    return players
+    return list(player_pool.keys())
 
 def main():
     set_seed()
-    logger = logging.getLogger('TrainTournament')
-    logger.setLevel(logging.INFO)
-    logger.addHandler(logging.StreamHandler())
-    
+    logger = configure_logger()
     device = torch.device(config.DEVICE)
-    writer = SummaryWriter(log_dir=os.path.join(config.TENSORBOARD_RUNS_DIR, "tournament"))
     
-    # Training parameters
-    TOTAL_PLAYERS = 12
-    GROUP_SIZE = 3
-    BATCHES_BETWEEN_EVALS = 2
-    CULL_PERCENT = 0.25
-    TOTAL_BATCHES = 10
+    # Initialize OBP model
+    obp_model, obp_optimizer = initialize_obp(device)
     
     # Initialize environment
-    temp_env = LiarsDeckEnv(num_players=GROUP_SIZE, render_mode=None)
+    base_env = LiarsDeckEnv(num_players=3, render_mode=None)
     config.set_derived_config(
-        temp_env.observation_spaces[temp_env.agents[0]],
-        temp_env.action_spaces[temp_env.agents[0]],
-        GROUP_SIZE - 1
+        base_env.observation_spaces[base_env.agents[0]],
+        base_env.action_spaces[base_env.agents[0]],
+        num_opponents=2
     )
     
-    # Create player pool
-    player_pool = create_player_pool(TOTAL_PLAYERS, device)
+    # Initialize player pool with GROUP_SIZE alignment
+    GROUP_SIZE = 3
+    TOTAL_PLAYERS = 15  # Must be multiple of GROUP_SIZE
+    player_pool = {f"player_{i}": create_new_agent(device) for i in range(TOTAL_PLAYERS)}
     
     # Load existing checkpoints
     start_batch, loaded_entropy, obp_state, obp_optim_state = load_multi_checkpoint(
         player_pool, config.CHECKPOINT_DIR, GROUP_SIZE
     )
     
-    # Main training loop
-    for batch in range(start_batch, TOTAL_BATCHES + 1):
-        logger.info(f"\n=== Processing Batch {batch}/{TOTAL_BATCHES} ===")
+    # Enforce GROUP_SIZE alignment in loaded pool
+    current_count = len(player_pool)
+    padding = (-current_count) % GROUP_SIZE
+    for i in range(padding):
+        player_pool[f"pad_{current_count + i}"] = create_new_agent(device)
+    
+    # Load OBP states
+    if obp_state is not None:
+        obp_model.load_state_dict(obp_state)
+    if obp_optim_state is not None:
+        obp_optimizer.load_state_dict(obp_optim_state)
+    
+    # Training loop
+    writer = SummaryWriter(log_dir=config.MULTI_LOG_DIR)
+    for batch_id in range(start_batch, 20):
+        logger.info(f"\n=== Batch {batch_id} ===")
         
-        # Train all groups
-        groups = [list(player_pool.keys())[i:i+GROUP_SIZE] 
-                 for i in range(0, len(player_pool), GROUP_SIZE)]
+        # Create groups with size validation
+        all_ids = list(player_pool.keys())
+        groups = [all_ids[i:i+GROUP_SIZE] for i in range(0, len(all_ids), GROUP_SIZE)]
         
         for group in groups:
+            if len(group) != GROUP_SIZE:
+                logger.warning(f"Skipping invalid group size {len(group)}")
+                continue
+            
             env = LiarsDeckEnv(num_players=GROUP_SIZE, render_mode=None)
-            agent_map = {f'player_{i}': group[i] for i in range(GROUP_SIZE)}
+            try:
+                agent_map = {env.agents[i]: group[i] for i in range(GROUP_SIZE)}
+            except IndexError as e:
+                logger.error(f"Group formation failed: {str(e)}")
+                continue
             
             train(
                 agents_dict={pid: player_pool[pid] for pid in group},
                 env=env,
                 device=device,
-                num_episodes=config.EPISODES_PER_BATCH,
+                num_episodes=2000,
                 log_tensorboard=True,
                 writer=writer,
-                agent_mapping=agent_map
+                logger=logger,
+                agent_mapping=agent_map,
+                obp_model=obp_model,
+                obp_optimizer=obp_optimizer
             )
         
-        # Evolutionary selection
-        if batch % BATCHES_BETWEEN_EVALS == 0:
-            # Evaluate and cull
-            rankings = evaluate_tournament(player_pool, device)
-            player_pool = cull_and_replace(player_pool, rankings, CULL_PERCENT, device)
+        # Tournament and evolution
+        if batch_id % TOURNAMENT_INTERVAL == 0:
+            tournament_env = LiarsDeckEnv(num_players=GROUP_SIZE, render_mode=None)
+            rankings = run_tournament(tournament_env, device, player_pool, obp_model, logger)
+            updated_ids = cull_and_replace(player_pool, rankings, device, logger)
             
-            # Save evolved population
-            save_multi_checkpoint(
-                player_pool=player_pool,
-                obp_model=None,  # Assuming OBP not used in this implementation
-                obp_optimizer=None,
-                batch=batch,
-                checkpoint_dir=config.CHECKPOINT_DIR,
-                group_size=GROUP_SIZE
-            )
+            # Maintain GROUP_SIZE alignment
+            padding = (-len(updated_ids)) % GROUP_SIZE
+            for i in range(padding):
+                updated_ids.append(f"pad_{len(updated_ids)}")
+                player_pool[updated_ids[-1]] = create_new_agent(device)
+            
+            # Remix groups
+            random.shuffle(updated_ids)
+            groups = [updated_ids[i:i+GROUP_SIZE] 
+                     for i in range(0, len(updated_ids), GROUP_SIZE)]
+            
+            logger.info(f"New group composition: {groups}")
+        
+        # Save checkpoints
+        save_multi_checkpoint(
+            player_pool=player_pool,
+            obp_model=obp_model,
+            obp_optimizer=obp_optimizer,
+            batch=batch_id,
+            checkpoint_dir=config.CHECKPOINT_DIR,
+            group_size=GROUP_SIZE
+        )
     
     writer.close()
-    logger.info("Training completed!")
+    logger.info("Training completed with tournament-based evolution")
 
 if __name__ == "__main__":
     main()
