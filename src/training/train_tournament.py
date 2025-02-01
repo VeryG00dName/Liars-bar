@@ -225,18 +225,24 @@ def main():
     config.set_derived_config(
         base_env.observation_spaces[base_env.agents[0]],
         base_env.action_spaces[base_env.agents[0]],
-        num_opponents=GROUP_SIZE-1
+        num_opponents=GROUP_SIZE - 1
     )
     
     # Initialize player pool
     player_pool = {f"player_{i}": create_new_agent(device) for i in range(TOTAL_PLAYERS)}
     
-    # Load checkpoints
-    start_batch, loaded_entropy, obp_state, obp_optim_state = load_multi_checkpoint(
+    # Load checkpoints (including current batch and entropy coefficients)
+    start_batch, loaded_entropy_coefs, obp_state, obp_optim_state = load_multi_checkpoint(
         player_pool, config.CHECKPOINT_DIR, GROUP_SIZE
     )
     
-    # Load OBP states
+    # If entropy coefficients were loaded, update the player pool
+    if loaded_entropy_coefs is not None:
+        for agent, coef in loaded_entropy_coefs.items():
+            if agent in player_pool:
+                player_pool[agent]['entropy_coef'] = coef
+    
+    # Load OBP model and optimizer states if available
     if obp_state is not None:
         obp_model.load_state_dict(obp_state)
     if obp_optim_state is not None:
@@ -245,6 +251,10 @@ def main():
     # Training infrastructure
     writer = SummaryWriter(log_dir=config.MULTI_LOG_DIR)
     
+    # Set cumulative episode offset based on the starting batch.
+    # (Assuming 2000 episodes per batch as in the train() calls below.)
+    block_episode_offset = start_batch * 2000
+
     try:
         for batch_id in range(start_batch, 20):
             logger.info("\n=== Starting Batch %d ===", batch_id)
@@ -255,7 +265,7 @@ def main():
             # Form training groups
             all_ids = list(player_pool.keys())
             random.shuffle(all_ids)
-            groups = [all_ids[i:i+GROUP_SIZE] for i in range(0, len(all_ids), GROUP_SIZE)]
+            groups = [all_ids[i:i + GROUP_SIZE] for i in range(0, len(all_ids), GROUP_SIZE)]
             
             # Train each group
             for group_idx, group in enumerate(groups):
@@ -263,7 +273,7 @@ def main():
                     logger.error("Invalid group size %d, skipping", len(group))
                     continue
                 
-                logger.info("Training Group %d: %s", group_idx+1, group)
+                logger.info("Training Group %d: %s", group_idx + 1, group)
                 env = LiarsDeckEnv(num_players=GROUP_SIZE, render_mode=None)
                 agent_map = {env.agents[i]: group[i] for i in range(GROUP_SIZE)}
                 
@@ -272,6 +282,7 @@ def main():
                     env=env,
                     device=device,
                     num_episodes=2000,
+                    episode_offset=block_episode_offset,  # Pass the cumulative episode offset
                     log_tensorboard=True,
                     writer=writer,
                     logger=logger,
@@ -280,21 +291,24 @@ def main():
                     obp_optimizer=obp_optimizer
                 )
             
-            # Evolutionary tournament
+            # Update the cumulative episode count after each batch
+            block_episode_offset += 2000
+            
+            # Evolutionary tournament: run if interval condition is met
             if batch_id % TOURNAMENT_INTERVAL == 0:
                 logger.info("\n--- Running Evolution Tournament ---")
                 tournament_env = LiarsDeckEnv(num_players=GROUP_SIZE, render_mode=None)
                 
-                # Run tournament with validated pool
+                # Run tournament with a validated copy of the pool
                 temp_pool = maintain_player_pool_size(player_pool.copy(), GROUP_SIZE)
                 rankings = run_tournament(tournament_env, device, temp_pool, obp_model, logger)
                 
-                # Evolutionary replacement
+                # Evolutionary replacement based on tournament rankings
                 player_pool = cull_and_replace(player_pool, rankings, device, logger)
                 
                 logger.info("New population: %s", list(player_pool.keys())[:6] + ["..."])
             
-            # Save checkpoint
+            # Save checkpoint (includes current batch number and entropy coefficients)
             save_multi_checkpoint(
                 player_pool=player_pool,
                 obp_model=obp_model,
