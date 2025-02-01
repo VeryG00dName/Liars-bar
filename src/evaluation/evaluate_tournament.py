@@ -35,17 +35,17 @@ __all__ = [
 def initialize_players(checkpoints_dir, device):
     """
     Specialized initialization for the tournament scenario.
-    Loads checkpoint files named `checkpoint_episode_x.pth` and
-    creates players with OpenSkill ratings. Handles both v1 & v2 obs models.
+    Loads checkpoint files ending with `.pth` and creates players with OpenSkill ratings. 
+    Handles both v1 & v2 obs models.
     """
     if not os.path.isdir(checkpoints_dir):
         raise FileNotFoundError(f"The directory '{checkpoints_dir}' does not exist.")
 
-    pattern = re.compile(r"^checkpoint_episode_(\d+)\.pth$")
+    pattern = re.compile(r'\.pth$', re.IGNORECASE)  # Updated regex to match any .pth file
 
     players = {}
     for filename in os.listdir(checkpoints_dir):
-        if pattern.match(filename):
+        if pattern.search(filename):  # Changed from match() to search() to find .pth at the end
             checkpoint_path = os.path.join(checkpoints_dir, filename)
             try:
                 checkpoint = load_combined_checkpoint(checkpoint_path, device)
