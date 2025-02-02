@@ -1,4 +1,4 @@
-# src/misc/mix_gui.py
+# src/misc/mix.py
 
 import os
 import logging
@@ -21,6 +21,7 @@ class MixGUI:
 
         self.loaded_checkpoints = {}  # key: file_path, value: checkpoint dict
         self.agent_display_map = {}   # key: display_name, value: (file_path, agent_name)
+        self.source_dirs = []         # will store unique source directory names from selected checkpoints
 
         self.create_file_drop_zone()
         self.create_model_info_panel()
@@ -134,7 +135,7 @@ class MixGUI:
         for key in required_keys:
             if key not in checkpoint:
                 raise ValueError(f"Missing required key '{key}' in checkpoint")
-        # Validate that there are three agents
+        # Validate that there are three agents in the policy networks
         if len(checkpoint["policy_nets"]) != 3:
             raise ValueError("Checkpoint does not contain exactly three agents in 'policy_nets'")
         self.loaded_checkpoints[file_path] = checkpoint
@@ -156,7 +157,6 @@ class MixGUI:
         agents = []
         for file_path, checkpoint in self.loaded_checkpoints.items():
             base_dir = os.path.basename(os.path.dirname(file_path))
-            base_name = os.path.basename(file_path)
             for agent_name in checkpoint["policy_nets"].keys():
                 # Create a display name with directory prefix
                 display_name = f"{base_dir}_{agent_name}"
@@ -235,8 +235,12 @@ class MixGUI:
             "episode": None
         }
 
+        # Reset and build source directories from selected checkpoints
+        source_dirs = set()
+
         # Assign selected agents to player_0, player_1, player_2
         for idx, (file_path, agent_name) in enumerate(selected_agents):
+            source_dirs.add(os.path.basename(os.path.dirname(file_path)))
             target_player = f"player_{idx}"  # player_0, player_1, player_2
             checkpoint = self.loaded_checkpoints[file_path]
 
@@ -246,12 +250,23 @@ class MixGUI:
             combined["optimizers_policy"][target_player] = checkpoint["optimizers_policy"][agent_name]
             combined["optimizers_value"][target_player] = checkpoint["optimizers_value"][agent_name]
 
-            # If the first agent is from player_0, copy global settings
-            if idx == 0 and agent_name == "player_0":
+            # For the first selected checkpoint, use its OBP model/optimizer and episode info.
+            if idx == 0:
                 combined["obp_model"] = checkpoint.get("obp_model", None)
                 combined["obp_optimizer"] = checkpoint.get("obp_optimizer", None)
                 combined["episode"] = checkpoint.get("episode", None)
 
+        # If OBP information is still missing, try to get it from the first loaded checkpoint overall.
+        if combined["obp_model"] is None or combined["obp_optimizer"] is None:
+            for cp in self.loaded_checkpoints.values():
+                if cp.get("obp_model") is not None and cp.get("obp_optimizer") is not None:
+                    combined["obp_model"] = cp["obp_model"]
+                    combined["obp_optimizer"] = cp["obp_optimizer"]
+                    if combined["episode"] is None:
+                        combined["episode"] = cp.get("episode", None)
+                    break
+
+        self.source_dirs = sorted(list(source_dirs))
         return combined
 
     def browse_save_location(self):
@@ -274,21 +289,17 @@ class MixGUI:
             messagebox.showwarning("No Save Path", "Please specify a save location.")
             return
 
-        # Extract the filename and check if it's 'combined_checkpoint.pth'
+        # If the filename is generic, modify it to include source directory names.
         filename = os.path.basename(save_path)
         dir_path = os.path.dirname(save_path)
-
         if filename == "combined_checkpoint.pth":
-            # Create a prefix from source directory names
-            if not hasattr(self, 'source_dirs') or not self.source_dirs:
+            if not self.source_dirs:
                 messagebox.showerror("Missing Source Directories", "Source directory names are missing.")
                 return
             prefix = "_".join(self.source_dirs)
             new_filename = f"{prefix}_combined_checkpoint.pth"
-            new_save_path = os.path.join(dir_path, new_filename)
-            # Update the save path
-            save_path = new_save_path
-            self.save_path_var.set(new_save_path)
+            save_path = os.path.join(dir_path, new_filename)
+            self.save_path_var.set(save_path)
             self.show_info(f"Filename changed to {new_filename} to include source directory names.")
 
         try:
