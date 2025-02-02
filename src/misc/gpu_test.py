@@ -14,7 +14,7 @@ import random
 from src.env.liars_deck_env_core import LiarsDeckEnv
 from src.env.reward_restriction_wrapper import RewardRestrictionWrapper
 from src.training.train_utils import compute_gae, train_obp
-from src.model.models import PolicyNetwork, ValueNetwork, OpponentBehaviorPredictor
+from src.model.new_models import PolicyNetwork, ValueNetwork, OpponentBehaviorPredictor
 from src.model.memory import RolloutMemory
 from src.training.train_extras import set_seed, extract_obp_training_data, run_obp_inference
 from src import config
@@ -55,15 +55,15 @@ def measure_training_speed(hidden_dim, device, use_cudnn_benchmark=True, use_mix
         hidden_dim=hidden_dim,
         output_dim=config.OUTPUT_DIM,
         use_lstm=True,
-        use_dropout=False,
-        use_layer_norm=False
+        use_dropout=True,
+        use_layer_norm=True
     ).to(device)
     
     value_net = ValueNetwork(
         input_dim=config.INPUT_DIM,
         hidden_dim=hidden_dim,
-        use_dropout=False,
-        use_layer_norm=False
+        use_dropout=True,
+        use_layer_norm=True
     ).to(device)
     
     obp_model = OpponentBehaviorPredictor(
