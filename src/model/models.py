@@ -6,7 +6,7 @@ import torch.nn.functional as F
 torch.backends.cudnn.benchmark = True
 
 class PolicyNetwork(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, use_lstm=False, use_dropout=False, use_layer_norm=False):
+    def __init__(self, input_dim, hidden_dim, output_dim, use_lstm=True, use_dropout=True, use_layer_norm=True):
         """
         Initializes the Policy Network.
         
@@ -78,7 +78,7 @@ class PolicyNetwork(nn.Module):
             return action_probs, None  # No hidden state
 
 class ValueNetwork(nn.Module):
-    def __init__(self, input_dim, hidden_dim, use_dropout=False, use_layer_norm=False):
+    def __init__(self, input_dim, hidden_dim, use_dropout=True, use_layer_norm=True):
         """
         Initializes the Value Network.
         
