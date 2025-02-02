@@ -85,23 +85,23 @@ def load_multi_checkpoint(player_pool, checkpoint_dir, group_size=3):
         
         # Load player data
         for p_id, state in checkpoint['policy_nets'].items():
-            p_id = int(p_id)
+            
             if p_id in player_pool:
                 player_pool[p_id]['policy_net'].load_state_dict(state)
         for p_id, state in checkpoint['value_nets'].items():
-            p_id = int(p_id)
+            
             if p_id in player_pool:
                 player_pool[p_id]['value_net'].load_state_dict(state)
         for p_id, state in checkpoint['optimizers_policy'].items():
-            p_id = int(p_id)
+            
             if p_id in player_pool:
                 player_pool[p_id]['optimizer_policy'].load_state_dict(state)
         for p_id, state in checkpoint['optimizers_value'].items():
-            p_id = int(p_id)
+            
             if p_id in player_pool:
                 player_pool[p_id]['optimizer_value'].load_state_dict(state)
         for p_id, coef in checkpoint['entropy_coefs'].items():
-            loaded_entropy_coefs[int(p_id)] = coef
+            loaded_entropy_coefs[p_id] = coef
         
         # Load OBP data (overwrite with latest group's state)
         if 'obp_model' in checkpoint:
