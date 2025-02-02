@@ -11,19 +11,23 @@ from torch.utils.tensorboard import SummaryWriter
 from collections import defaultdict
 
 from src.env.liars_deck_env_core import LiarsDeckEnv
-from src.model.models import PolicyNetwork, ValueNetwork, OpponentBehaviorPredictor
+from src.model.new_models import PolicyNetwork, ValueNetwork, OpponentBehaviorPredictor
 from src.training.train_multi_utils import save_multi_checkpoint, load_multi_checkpoint
 from src.training.train import train
 from src.training.train_extras import set_seed
 from src.misc.tune_eval import run_group_swiss_tournament, openskill_model
 from src import config
 
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+torch.backends.cudnn.benchmark = True
+
 # Tournament configuration
 TOURNAMENT_INTERVAL = 2
 CULL_PERCENTAGE = 0.2
 CLONE_PERCENTAGE = 0.5
 GROUP_SIZE = 3
-TOTAL_PLAYERS = 9
+TOTAL_PLAYERS = 15
 
 CLONE_REGISTRY = defaultdict(int)
 
@@ -187,7 +191,7 @@ def run_tournament(env, device, player_pool, obp_model, logger):
         NUM_ROUNDS=5
     )
     
-    # Optionally move agents back to CPU if you do not need them on GPU anymore
+    # move agents back to CPU if you do not need them on GPU anymore
     for pid, agent in player_pool.items():
         move_agent_to_device(agent, 'cpu')
     
@@ -303,6 +307,27 @@ def load_best_checkpoint(device, checkpoint_dir):
     
     return player_pool, obp_model, obp_optimizer, checkpoint['max_rating']
 
+def trim_pool_by_rankings(player_pool, rankings, total_players, logger):
+    """
+    Given a player_pool (dict mapping player IDs to agents) and a ranking list
+    (assumed sorted best to worst), trim the pool so that only the top total_players
+    remain. If the pool is smaller than total_players, add new agents.
+    """
+    # Filter the ranking list so it only contains players present in the pool.
+    filtered_rankings = [pid for pid in rankings if pid in player_pool]
+    if len(filtered_rankings) >= total_players:
+        top_ids = filtered_rankings[:total_players]
+        trimmed_pool = {pid: player_pool[pid] for pid in top_ids}
+        logger.info("Trimmed pool from %d to %d players.", len(player_pool), len(trimmed_pool))
+        return trimmed_pool
+    else:
+        # If somehow the pool is too small, add new agents until it reaches total_players.
+        while len(player_pool) < total_players:
+            new_pid = generate_agent_name()
+            player_pool[new_pid] = create_new_agent(on_device='cpu')
+        logger.info("Expanded pool to %d players.", total_players)
+        return player_pool
+
 def main():
     set_seed()
     logger = configure_logger()
@@ -310,7 +335,7 @@ def main():
     # The device for active training/evaluation
     device = torch.device(config.DEVICE)  # e.g., 'cuda' or 'cpu'
     
-    # Initialize OBP model on the GPU (or CPU) if you want to train it actively on GPU
+    # Initialize OBP model on the GPU (or CPU)
     obp_model, obp_optimizer = initialize_obp(device)
     
     base_env = LiarsDeckEnv(num_players=GROUP_SIZE, render_mode=None)
@@ -344,7 +369,7 @@ def main():
     best_max_rating = -float('inf')
 
     try:
-        for batch_id in range(start_batch, 10):
+        for batch_id in range(start_batch, 20):
             logger.info("\n=== Starting Batch %d ===", batch_id)
             
             player_pool = maintain_player_pool_size(player_pool, GROUP_SIZE)
@@ -391,26 +416,26 @@ def main():
                 logger.info("\n--- Running Evolution Tournament ---")
                 tournament_env = LiarsDeckEnv(num_players=GROUP_SIZE, render_mode=None)
                 
-                # Copy pool before culling/cloning
+                # Copy pool before merging in the saved best agents.
                 temp_pool = player_pool.copy()
                 temp_pool = maintain_player_pool_size(temp_pool, GROUP_SIZE)
                 
                 # Load the best checkpoint so far if available
                 best_agents, best_obp_model, best_obp_optim, loaded_max_rating = load_best_checkpoint(device, config.CHECKPOINT_DIR)
                 if best_agents:
-                    # Rename agents from best checkpoint to avoid collisions
+                    # Rename agents from best checkpoint to avoid collisions.
                     for pid in list(best_agents.keys()):
                         new_pid = generate_agent_name(source_id=pid)
                         best_agents[new_pid] = best_agents.pop(pid)
                     temp_pool.update(best_agents)
                     temp_pool = maintain_player_pool_size(temp_pool, GROUP_SIZE)
                 
-                # Run tournament on GPU (then move back to CPU inside run_tournament)
+                # Run tournament on GPU (agents are moved back to CPU inside run_tournament)
                 rankings = run_tournament(tournament_env, device, temp_pool, obp_model, logger)
                 for pid, agent in temp_pool.items():
                     if 'rating' not in agent:
                         agent['rating'] = openskill_model.rating(name=pid)
-
+                
                 current_max_rating = max([agent['rating'].mu for agent in temp_pool.values()])
                 
                 if current_max_rating > best_max_rating:
@@ -418,9 +443,15 @@ def main():
                     save_best_checkpoint(temp_pool, obp_model, obp_optimizer, best_max_rating, config.CHECKPOINT_DIR)
                     logger.info("New best checkpoint saved with rating: %.2f", best_max_rating)
                 
-                # Cull/replace in temp_pool, then adopt that as our new player_pool
-                player_pool = cull_and_replace(temp_pool, rankings, device, logger)
-                logger.info("New population: %s", list(player_pool.keys())[:6] + ["..."])
+                # First, trim the pool to exactly TOTAL_PLAYERS based on tournament rankings.
+                trimmed_pool = trim_pool_by_rankings(temp_pool, rankings, TOTAL_PLAYERS, logger)
+                # Filter rankings to only those players in the trimmed pool.
+                filtered_rankings = [pid for pid in rankings if pid in trimmed_pool]
+                
+                # Now, perform evolutionary culling replacement:
+                # Remove the bottom CULL_PERCENTAGE and add back new agents and clones with CLONE_PERCENTAGE.
+                player_pool = cull_and_replace(trimmed_pool, filtered_rankings, device, logger)
+                logger.info("New population after evolutionary replacement: %s", list(player_pool.keys())[:6] + ["..."])
             
             # Save a checkpoint of everything
             save_multi_checkpoint(
@@ -439,3 +470,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
