@@ -1,0 +1,10 @@
+numpy
+torch
+gymnasium
+pettingzoo
+matplotlib
+seaborn
+pandas
+scipy
+tensorboard
+openskill
