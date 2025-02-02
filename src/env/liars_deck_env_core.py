@@ -43,14 +43,14 @@ class LiarsDeckEnv(AECEnv):
             "invalid_play_penalty": 0,  # -1
             "challenge_success_challenger_reward": 0,  # 15
             "challenge_success_claimant_penalty": 0,  # -5
-            "challenge_fail_challenger_penalty": -1,     # -1
+            "challenge_fail_challenger_penalty": 0,     # -1
             "challenge_fail_claimant_reward": 0,         # 5
             "forced_challenge_success_challenger_reward": 0,  # 10
-            "forced_challenge_success_claimant_penalty": -3,  # -3
-            "invalid_challenge_penalty": -1,             # -1
+            "forced_challenge_success_claimant_penalty": 0,  # -3
+            "invalid_challenge_penalty": 0,             # -1
             "termination_penalty": 0,                   # -5
             "game_win_bonus": 10,                        # 15
-            "game_lose_penalty": -7,                     # -10
+            "game_lose_penalty": -5,                     # -10
             "hand_empty_bonus": 0,                       # 2
             "consecutive_action_penalty": 0  # -10
         }
