@@ -8,7 +8,7 @@ import pickle  # For saving/loading trial_agents and ratings
 
 from src.training.train import train
 from src.training.train_extras import set_seed
-from src.model.models import PolicyNetwork, ValueNetwork, OpponentBehaviorPredictor
+from src.model.new_models import PolicyNetwork, ValueNetwork, OpponentBehaviorPredictor
 
 from src.evaluation.evaluate import evaluate_agents
 from src.env.liars_deck_env_core import LiarsDeckEnv
@@ -19,6 +19,10 @@ from src.misc.tune_eval import (
     run_group_swiss_tournament,
     openskill_model  # Ensure this is exposed in evaluate_tournament.py
 )
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+torch.backends.cudnn.benchmark = True
 
 # ----------------------------------------------------------------------------
 # Persistent storage paths
@@ -33,7 +37,7 @@ trial_agents = {}  # Key: trial_number (int), Value: agents dict
 # ----------------------------------------------------------------------------
 # Pruning Configuration
 # ----------------------------------------------------------------------------
-MAX_AGENTS = 99  # Maximum number of agents to retain
+MAX_AGENTS = 30  # Maximum number of agents to retain
 
 def load_trial_agents(path: str) -> dict:
     """
@@ -205,7 +209,7 @@ def objective(trial: optuna.trial.Trial) -> float:
         # === 2) Train new 3-agent team ===
         train_env = LiarsDeckEnv(num_players=3, render_mode=config.RENDER_MODE)
         device = torch.device(config.DEVICE)
-        TUNE_NUM_EPISODES = 1000
+        TUNE_NUM_EPISODES = 10000
 
         training_results = train_new_agents(
             env=train_env,
