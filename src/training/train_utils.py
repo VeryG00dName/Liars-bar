@@ -26,9 +26,10 @@ def compute_gae(rewards, dones, values, next_values, gamma=0.99, lam=0.95):
     returns = [adv + val for adv, val in zip(advantages, values)]
     return advantages, returns
 
-def save_checkpoint(policy_nets, value_nets, optimizers_policy, optimizers_value, obp_model, obp_optimizer, entropy_coefs, episode, checkpoint_dir=config.CHECKPOINT_DIR):
+def save_checkpoint(policy_nets, value_nets, optimizers_policy, optimizers_value, obp_model, obp_optimizer, episode, checkpoint_dir=config.CHECKPOINT_DIR):
     """
-    Saves the current state of the training process, including models, optimizers, and entropy coefficients.
+    Saves the current state of the training process, including models and optimizers.
+    Note: Entropy coefficients are no longer saved.
 
     Args:
         policy_nets (dict): Dictionary of policy networks per agent.
@@ -37,7 +38,6 @@ def save_checkpoint(policy_nets, value_nets, optimizers_policy, optimizers_value
         optimizers_value (dict): Dictionary of value optimizers per agent.
         obp_model (OpponentBehaviorPredictor): The Opponent Behavior Predictor model.
         obp_optimizer (torch.optim.Optimizer): The optimizer for the OBP model.
-        entropy_coefs (dict): Dictionary of entropy coefficients per agent.
         episode (int): Current episode number.
         checkpoint_dir (str): Directory to save the checkpoint.
     """
@@ -52,7 +52,7 @@ def save_checkpoint(policy_nets, value_nets, optimizers_policy, optimizers_value
         'optimizers_value': {agent: opt.state_dict() for agent, opt in optimizers_value.items()},
         'obp_model': obp_model.state_dict(),
         'obp_optimizer': obp_optimizer.state_dict(),
-        'entropy_coefs': entropy_coefs,  # Save entropy coefficients
+        # Note: Entropy coefficients are no longer saved.
     }
 
     torch.save(checkpoint, checkpoint_path)
@@ -60,7 +60,8 @@ def save_checkpoint(policy_nets, value_nets, optimizers_policy, optimizers_value
 
 def load_checkpoint_if_available(policy_nets, value_nets, optimizers_policy, optimizers_value, obp_model, obp_optimizer, checkpoint_dir=config.CHECKPOINT_DIR):
     """
-    Loads the latest checkpoint if available and restores the state of models, optimizers, and entropy coefficients.
+    Loads the latest checkpoint if available and restores the state of models and optimizers.
+    Any entropy coefficient information present in an old checkpoint is ignored.
 
     Args:
         policy_nets (dict): Dictionary of policy networks per agent.
@@ -73,6 +74,7 @@ def load_checkpoint_if_available(policy_nets, value_nets, optimizers_policy, opt
 
     Returns:
         tuple: (start_episode (int), entropy_coefs (dict))
+               The returned entropy_coefs are initialized with default values.
     """
     if not os.path.isdir(checkpoint_dir):
         logging.info("Checkpoint directory does not exist. Starting training from scratch.")
@@ -179,13 +181,12 @@ def load_checkpoint_if_available(policy_nets, value_nets, optimizers_policy, opt
     else:
         logging.warning("Opponent Behavior Predictor model and/or optimizer not found in checkpoint. Skipping.")
 
-    # Load entropy coefficients if available
+    # Even if the checkpoint contains entropy coefficients, ignore them.
     if 'entropy_coefs' in checkpoint:
-        entropy_coefs = checkpoint['entropy_coefs']
-        logging.info(f"Loaded Entropy Coefficients from episode {latest_episode}.")
-    else:
-        logging.warning("Entropy Coefficients not found in checkpoint. Initializing with default values.")
-        entropy_coefs = {agent: config.INIT_ENTROPY_COEF for agent in policy_nets.keys()}
+        logging.info("Ignoring entropy coefficients found in checkpoint.")
+
+    # Initialize entropy coefficients with default values.
+    entropy_coefs = {agent: config.INIT_ENTROPY_COEF for agent in policy_nets.keys()}
 
     logging.info(f"Resuming training from episode {latest_episode + 1}.")
     return latest_episode + 1, entropy_coefs
