@@ -36,7 +36,7 @@ USE_WRAPPER = False            # Set to True to use the reward restriction wrapp
 # ----------------------------
 # Neural Network Configuration
 # ----------------------------
-HIDDEN_DIM = 1672             # Number of hidden units in neural networks
+HIDDEN_DIM = 672             # Number of hidden units in neural networks
 INPUT_DIM = 16                # To be set dynamically based on environment
 OUTPUT_DIM = 7                # To be set dynamically based on environment
 
@@ -48,7 +48,7 @@ OPPONENT_LEARNING_RATE = 1e-4 # Learning rate for opponent behavior predictor
 # ----------------------------
 # Training Hyperparameters
 # ----------------------------
-LEARNING_RATE = 0.00038494    # Learning rate for policy/value networks
+LEARNING_RATE = 0.0006        # Learning rate for policy/value networks
 GAMMA = 0.99                  # Discount factor
 GAE_LAMBDA = 0.95             # GAE lambda parameter
 EPS_CLIP = 0.2                # PPO clip parameter
@@ -68,7 +68,7 @@ ENTROPY_CLIP_MAX = 0.3         # Maximum allowed value for entropy coefficient
 # Logging and Checkpointing
 # ----------------------------
 CULL_INTERVAL = 20001             # Number of episodes between each culling event
-CHECKPOINT_INTERVAL = 10000       # Episodes between saving checkpoints
+CHECKPOINT_INTERVAL = 5000       # Episodes between saving checkpoints
 LOG_INTERVAL = 100                # Episodes between logging to TensorBoard
 # ----------------------------
 # Evaluation Configuration
@@ -79,13 +79,14 @@ challenge_amount = 6           # Number of times agents need to have challenged 
 # self play configuration
 # ----------------------------
 HISTORICAL_POOL_SIZE = 12
-
+SELFPLAY_NUM_EPISODES = 5000
+SELFPLAY_EVAL_INTERVAL = 300
+SELFPLAY_SNAPSHOT_INTERVAL = 500
 # ----------------------------
 # Miscellaneous
 # ----------------------------
 SEED = 42                     # Seed for reproducibility
 DEVICE = "cuda"                # Device for training (CPU/GPU)
-EPISODES_PER_BATCH = 10000    # Number of episodes per batch
 # ----------------------------
 # Derived Configurations
 # ----------------------------
