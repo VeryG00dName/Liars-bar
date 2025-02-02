@@ -12,7 +12,7 @@ from torch.distributions import Categorical
 
 from src.env.reward_restriction_wrapper_2 import RewardRestrictionWrapper2
 from src.env.liars_deck_env_core import LiarsDeckEnv
-from src.model.models import PolicyNetwork, ValueNetwork, OpponentBehaviorPredictor
+from src.model.new_models import PolicyNetwork, ValueNetwork, OpponentBehaviorPredictor
 from src.model.memory import RolloutMemory
 from src.env.reward_restriction_wrapper import RewardRestrictionWrapper
 from src import config
@@ -151,14 +151,14 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
             checkpoint_dir=checkpoint_dir  # Use the specified load directory
         )
         if checkpoint_data is not None:
-            start_episode, entropy_coefs = checkpoint_data
+            start_episode, _ = checkpoint_data  # Ignore any entropy coefficient data
         else:
             start_episode = 1
-            entropy_coefs = {agent: config.INIT_ENTROPY_COEF for agent in agents}
     else:
         start_episode = 1
-        # Initialize entropy coefficients with default values
-        entropy_coefs = {agent: config.INIT_ENTROPY_COEF for agent in agents}
+
+    # Define a fixed (static) entropy coefficient for all agents.
+    static_entropy_coef = config.INIT_ENTROPY_COEF
 
     last_log_time = time.time()
     steps_since_log = 0
@@ -169,9 +169,6 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
 
     recent_rewards = {agent: [] for agent in agents}
 
-    # Initialize entropy coefficients if starting from scratch
-    if start_episode == 1 and 'entropy_coefs' not in locals():
-        entropy_coefs = {agent: config.INIT_ENTROPY_COEF for agent in agents}
     original_agent_order = list(env.agents)  # Capture the original turn order
 
     for episode in range(start_episode, num_episodes + 1):
@@ -266,7 +263,6 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
         
         avg_rewards = {agent: np.mean(recent_rewards[agent]) if recent_rewards[agent] else 0.0 for agent in agents}
 
-
         # Compute advantages and returns using Generalized Advantage Estimation (GAE)
         for agent in agents:
             memory = memories[agent]
@@ -322,10 +318,8 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                     surr2 = torch.clamp(ratios, 1 - config.EPS_CLIP, 1 + config.EPS_CLIP) * advantages_
                     policy_loss = -torch.min(surr1, surr2).mean()
 
-                    # ---------------------------------------------------------
-                    # 2. Incorporate dynamic entropy weighting into policy loss
-                    # ---------------------------------------------------------
-                    policy_loss -= entropy_coefs[agent] * entropy
+                    # Incorporate a fixed entropy bonus into policy loss
+                    policy_loss -= static_entropy_coef * entropy
 
                     state_values = value_nets[agent](states).squeeze()
                     value_loss = nn.MSELoss()(state_values, returns_)
@@ -339,35 +333,15 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                     optimizers_policy[agent].step()
                     optimizers_value[agent].step()
 
-                # -----------------------------------------------------
-                # 3. Update the entropy coefficient after K_EPOCHS
-                #    Based solely on the agent's rewards.
-                # -----------------------------------------------------
-                with torch.no_grad():
-                    # Use the average of recent rewards to adjust the entropy coefficient
-                    if recent_rewards[agent]:
-                        avg_recent_reward = np.mean(recent_rewards[agent])
-                    else:
-                        avg_recent_reward = 0.0
-
-                     # Compute reward error
-                    reward_error = avg_recent_reward - np.mean(recent_rewards[agent][-10:]) if len(recent_rewards[agent]) > 10 else 0
-
-                    # Adjust entropy coefficient based on the reward error
-                    entropy_coefs[agent] += config.ENTROPY_LR * config.REWARD_ENTROPY_SCALE * reward_error
-
-                    # Clip entropy coefficient within bounds
-                    entropy_coefs[agent] = max(config.ENTROPY_CLIP_MIN, min(config.ENTROPY_CLIP_MAX, entropy_coefs[agent]))
-
                 # Log to TensorBoard
                 if log_tensorboard and writer is not None:
                     writer.add_scalar(f"Loss/Policy_{agent}", policy_loss.item(), episode)
                     writer.add_scalar(f"Loss/Value_{agent}", value_loss.item(), episode)
                     writer.add_scalar(f"Entropy/{agent}", entropy.item(), episode)
-                    writer.add_scalar(f"Entropy_Coef/{agent}", entropy_coefs[agent], episode)
+                    writer.add_scalar(f"Entropy_Coef/{agent}", static_entropy_coef, episode)
 
             # ------------------------------
-            # 4. Reset memories after update
+            # Reset memories after update
             # ------------------------------
             for agent in agents:
                 memories[agent].reset()
@@ -394,7 +368,6 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                     optimizers_value,
                     obp_model,
                     obp_optimizer,
-                    entropy_coefs,
                     episode,
                     checkpoint_dir=checkpoint_dir
                 )
@@ -487,9 +460,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 optimizers_value[lowest_agent] = optim.Adam(value_nets[lowest_agent].parameters(), lr=config.LEARNING_RATE)
                 memories[lowest_agent] = RolloutMemory([lowest_agent])
                 recent_rewards[lowest_agent] = []
-
-                # Also reset the agent's entropy coefficient
-                entropy_coefs[lowest_agent] = config.INIT_ENTROPY_COEF
+                # No dynamic entropy coefficient to reset
 
     # Close TensorBoard writer if it was opened
     if log_tensorboard and writer is not None:
@@ -508,8 +479,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
         'agents': trained_agents,
         'optimizers_policy': optimizers_policy,
         'optimizers_value': optimizers_value,
-        'obp_optimizer': obp_optimizer,
-        'entropy_coefs': entropy_coefs  # Return entropy coefficients as well
+        'obp_optimizer': obp_optimizer
     }
 
 def main():
@@ -543,7 +513,6 @@ def main():
     optimizers_policy = training_results['optimizers_policy']
     optimizers_value = training_results['optimizers_value']
     obp_optimizer = training_results['obp_optimizer']
-    entropy_coefs = training_results.get('entropy_coefs', {agent: config.INIT_ENTROPY_COEF for agent in trained_agents.keys()})
 
     any_agent = next(iter(trained_agents))
     save_checkpoint(
@@ -553,7 +522,6 @@ def main():
         optimizers_value,
         trained_agents[any_agent]['obp_model'],
         obp_optimizer,
-        entropy_coefs,  # Pass the entropy coefficients
         config.NUM_EPISODES,
         checkpoint_dir=config.CHECKPOINT_DIR
     )
