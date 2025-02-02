@@ -479,7 +479,7 @@ def main():
     )
     logger = logging.getLogger("EvaluateTournament")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(config.DEVICE)
     logger.info(f"Using device: {device}")
 
     checkpoints_dir = config.CHECKPOINT_DIR
