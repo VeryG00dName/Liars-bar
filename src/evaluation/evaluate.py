@@ -13,11 +13,11 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import pandas as pd
 from collections import defaultdict
-
+from src.env.liars_deck_env_core import LiarsDeckEnv
 from pettingzoo.utils import agent_selector
 from src.model.models import PolicyNetwork, OpponentBehaviorPredictor, ValueNetwork
+from src.model import new_models  # Import the new models module
 
-from src.env.liars_deck_env_core import LiarsDeckEnv
 from src.evaluation.evaluate_utils import (
     load_combined_checkpoint,
     get_hidden_dim_from_state_dict,
@@ -72,39 +72,68 @@ def initialize_players(players_dir, device):
 
                     logger.debug(f"Player version determined: {version} with input_dim {actual_input_dim}")
 
+                    # Initialize the OBP model if available
                     obp_model = None
                     if obp_model_state is not None:
                         obp_hidden_dim = get_hidden_dim_from_state_dict(obp_model_state, layer_prefix='fc1')
                         obp_input_dim = 5 if obs_version == 1 else 4
-                        obp_model = OpponentBehaviorPredictor(
-                            input_dim=obp_input_dim,
-                            hidden_dim=obp_hidden_dim,
-                            output_dim=2
-                        ).to(device)
+                        # Choose OBP model based on state_dict keys
+                        if "fc3.weight" in obp_model_state:
+                            obp_model = new_models.OpponentBehaviorPredictor(
+                                input_dim=obp_input_dim,
+                                hidden_dim=obp_hidden_dim,
+                                output_dim=2
+                            ).to(device)
+                        else:
+                            obp_model = OpponentBehaviorPredictor(
+                                input_dim=obp_input_dim,
+                                hidden_dim=obp_hidden_dim,
+                                output_dim=2
+                            ).to(device)
                         obp_model.load_state_dict(obp_model_state)
                         obp_model.eval()
 
                     for agent_name, policy_state_dict in policy_nets.items():
                         policy_hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, layer_prefix='fc1')
-                        policy_net = PolicyNetwork(
-                            input_dim=actual_input_dim, 
-                            hidden_dim=policy_hidden_dim,
-                            output_dim=config.OUTPUT_DIM,
-                            use_lstm=True,
-                            use_dropout=True,
-                            use_layer_norm=True
-                        ).to(device)
+                        # If the checkpoint contains the new extra layer ("fc4") then load the new policy network
+                        if "fc4.weight" in policy_state_dict:
+                            policy_net = new_models.PolicyNetwork(
+                                input_dim=actual_input_dim, 
+                                hidden_dim=policy_hidden_dim,
+                                output_dim=config.OUTPUT_DIM,
+                                use_lstm=True,
+                                use_dropout=True,
+                                use_layer_norm=True
+                            ).to(device)
+                        else:
+                            policy_net = PolicyNetwork(
+                                input_dim=actual_input_dim, 
+                                hidden_dim=policy_hidden_dim,
+                                output_dim=config.OUTPUT_DIM,
+                                use_lstm=True,
+                                use_dropout=True,
+                                use_layer_norm=True
+                            ).to(device)
                         policy_net.load_state_dict(policy_state_dict)
                         policy_net.eval()
 
                         value_state_dict = value_nets[agent_name]
                         value_hidden_dim = get_hidden_dim_from_state_dict(value_state_dict, layer_prefix='fc1')
-                        value_net = ValueNetwork(
-                            input_dim=actual_input_dim,
-                            hidden_dim=value_hidden_dim,
-                            use_dropout=True,
-                            use_layer_norm=True
-                        ).to(device)
+                        # For value network, if the checkpoint includes an extra fc3 layer, use the new model
+                        if "fc3.weight" in value_state_dict:
+                            value_net = new_models.ValueNetwork(
+                                input_dim=actual_input_dim,
+                                hidden_dim=value_hidden_dim,
+                                use_dropout=True,
+                                use_layer_norm=True
+                            ).to(device)
+                        else:
+                            value_net = ValueNetwork(
+                                input_dim=actual_input_dim,
+                                hidden_dim=value_hidden_dim,
+                                use_dropout=True,
+                                use_layer_norm=True
+                            ).to(device)
                         value_net.load_state_dict(value_state_dict)
                         value_net.eval()
 
