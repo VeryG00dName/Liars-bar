@@ -1,47 +1,47 @@
 {
   "Version_A_player_1": {
-    "score": -2.4151237220913364
+    "score": -1.483777043600318
   },
   "Version_A_player_2": {
-    "score": 17.140422225156186
+    "score": 16.664078300886636
   },
   "Version_A_player_0": {
-    "score": 25.964512295397387
+    "score": 29.741438295863443
   },
   "Version_B_player_1": {
-    "score": 29.387038623771296
+    "score": 29.772844304436767
   },
   "Version_B_player_2": {
-    "score": 14.885580508874632
+    "score": 17.283474214685842
   },
   "Version_B_player_0": {
-    "score": 15.582663773565686
+    "score": 16.342688337238645
   },
   "Version_C_player_1": {
-    "score": 31.81317156758879
+    "score": 28.56810921453428
   },
   "Version_C_player_0": {
-    "score": 12.60139991099818
+    "score": 12.938277124764687
   },
   "Version_C_player_2": {
-    "score": 1.2529131457814895
+    "score": -4.816888001754605
   },
   "Version_D_player_1": {
-    "score": 2.976051963827482
+    "score": -0.16187438516366726
   },
   "Version_D_player_2": {
-    "score": 22.808552506442744
+    "score": 20.05862571141543
   },
   "Version_D_player_0": {
-    "score": 31.98227850721337
-  },
-  "Version_E_player_1": {
-    "score": 17.91610767576948
+    "score": 32.92463520253636
   },
   "Version_E_player_2": {
-    "score": 5.951069155513753
+    "score": 11.464557429235866
   },
   "Version_E_player_0": {
-    "score": 12.12701320435714
+    "score": 2.1105122046748868
+  },
+  "Version_E_player_1": {
+    "score": 22.229667323139978
   }
 }
