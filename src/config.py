@@ -32,7 +32,7 @@ ensure_dirs()
 # ----------------------------
 NUM_PLAYERS = 3               # Number of players in the game
 RENDER_MODE = None            # Set to 'human' to enable rendering
-USE_WRAPPER = True            # Set to True to use the reward restriction wrapper
+USE_WRAPPER = False            # Set to True to use the reward restriction wrapper
 # ----------------------------
 # Neural Network Configuration
 # ----------------------------
@@ -53,13 +53,14 @@ GAMMA = 0.99                  # Discount factor
 GAE_LAMBDA = 0.95             # GAE lambda parameter
 EPS_CLIP = 0.2                # PPO clip parameter
 K_EPOCHS = 4                  # Number of PPO epochs per update
-NUM_EPISODES = 20000         # Total number of training episodes
+NUM_EPISODES = 50000         # Total number of training episodes
 UPDATE_STEPS = 5              # Number of episodes before PPO update
 # ----------------------------
 # Entropy Regularization
 # ----------------------------
-INIT_ENTROPY_COEF = 0.1        # Initial entropy coefficient
+INIT_ENTROPY_COEF = 0.002        # Initial entropy coefficient
 REWARD_ENTROPY_SCALE = 0.01    # Scale factor for reward-based entropy adjustments
+BASELINE_REWARD = -10         # Baseline reward for entropy coefficient updates
 ENTROPY_LR = 0.001             # Learning rate for entropy coefficient updates
 ENTROPY_CLIP_MIN = 0.05       # Minimum allowed value for entropy coefficient
 ENTROPY_CLIP_MAX = 0.3         # Maximum allowed value for entropy coefficient
@@ -67,7 +68,7 @@ ENTROPY_CLIP_MAX = 0.3         # Maximum allowed value for entropy coefficient
 # Logging and Checkpointing
 # ----------------------------
 CULL_INTERVAL = 20001             # Number of episodes between each culling event
-CHECKPOINT_INTERVAL = 5000       # Episodes between saving checkpoints
+CHECKPOINT_INTERVAL = 10000       # Episodes between saving checkpoints
 LOG_INTERVAL = 100                # Episodes between logging to TensorBoard
 # ----------------------------
 # Evaluation Configuration
@@ -75,11 +76,16 @@ LOG_INTERVAL = 100                # Episodes between logging to TensorBoard
 ELO_K_FACTOR = 32             # K-factor for evaluation
 challenge_amount = 6           # Number of times agents need to have challenged to win
 # ----------------------------
+# self play configuration
+# ----------------------------
+HISTORICAL_POOL_SIZE = 12
+
+# ----------------------------
 # Miscellaneous
 # ----------------------------
 SEED = 42                     # Seed for reproducibility
 DEVICE = "cuda"                # Device for training (CPU/GPU)
-
+EPISODES_PER_BATCH = 10000    # Number of episodes per batch
 # ----------------------------
 # Derived Configurations
 # ----------------------------
