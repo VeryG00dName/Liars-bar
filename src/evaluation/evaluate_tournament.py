@@ -4,7 +4,6 @@ import os
 import logging
 import random
 import re
-
 import torch
 import numpy as np
 from pettingzoo.utils import agent_selector
@@ -107,7 +106,7 @@ def initialize_players(checkpoints_dir, device):
                     value_net.load_state_dict(value_state_dict)
                     value_net.eval()
 
-                    # Create a unique player ID
+                    # Create a unique player ID that includes the checkpoint filename as prefix.
                     player_id = f"{filename}_player_{agent_name}"
                     # Initialize the rating using our shared OpenSkill model
                     players[player_id] = {
@@ -432,6 +431,40 @@ def print_action_counts(players, action_counts):
     print("===============================\n")
 
 
+def delete_bottom_half_checkpoints_by_score(players, checkpoints_dir):
+    """
+    Group players by checkpoint file (using the filename prefix in player_id),
+    compute the best (maximum) score per checkpoint, and delete the bottom half
+    (the ones with the lowest best score).
+    """
+    # Group players by checkpoint file
+    cp_to_scores = {}
+    for player_id, data in players.items():
+        # Assume the checkpoint filename is the part before "_player_"
+        cp_filename = player_id.split("_player_")[0]
+        cp_to_scores.setdefault(cp_filename, []).append(data['score'])
+    
+    # Compute the best score per checkpoint
+    cp_best_scores = {cp: max(scores) for cp, scores in cp_to_scores.items()}
+    
+    # Sort checkpoint filenames by best score (ascending: worst first)
+    sorted_cps = sorted(cp_best_scores.items(), key=lambda x: x[1])
+    
+    num_to_delete = len(sorted_cps) // 2
+    bottom_half = sorted_cps[:num_to_delete]
+    
+    for cp_filename, score in bottom_half:
+        cp_path = os.path.join(checkpoints_dir, cp_filename)
+        if os.path.exists(cp_path):
+            try:
+                os.remove(cp_path)
+                print(f"Deleted checkpoint file '{cp_filename}' with best score {score:.2f}")
+            except Exception as e:
+                print(f"Failed to delete '{cp_filename}': {e}")
+        else:
+            print(f"Checkpoint file '{cp_filename}' not found in {checkpoints_dir}.")
+
+
 def main():
     """
     Main function for the Swiss tournament, updated to handle both obs v1 and v2 models.
@@ -482,6 +515,12 @@ def main():
     print_scoreboard(players)
     print_action_counts(players, action_counts)
 
+    # Ask user whether to delete the bottom half of checkpoints (by evaluated score)
+    response = input("Do you want to delete the bottom half of checkpoint files (by best agent score)? (y/n): ")
+    if response.lower().startswith('y'):
+        delete_bottom_half_checkpoints_by_score(players, checkpoints_dir)
+    else:
+        print("No checkpoints were deleted.")
 
 if __name__ == "__main__":
     main()
