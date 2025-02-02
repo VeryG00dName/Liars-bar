@@ -7,7 +7,6 @@ from torch.utils.tensorboard import SummaryWriter
 import logging
 import numpy as np
 from torch.utils.data import DataLoader, TensorDataset
-from src.model.models import PolicyNetwork, ValueNetwork, OpponentBehaviorPredictor
 from src import config
 
 AGENT_NAME_MAPPING = {
@@ -193,73 +192,6 @@ def load_checkpoint_if_available(policy_nets, value_nets, optimizers_policy, opt
 
 def get_tensorboard_writer(log_dir=config.TENSORBOARD_RUNS_DIR):
     return SummaryWriter(log_dir=log_dir)
-
-def load_agent_models(checkpoint_path, device):
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
-
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    players = {}
-
-    if config.INPUT_DIM is None or config.OUTPUT_DIM is None:
-        raise ValueError("CONFIG.INPUT_DIM and CONFIG.OUTPUT_DIM must be set before loading agent models.")
-
-    policy_nets_state = checkpoint.get('policy_nets', {})
-    value_nets_state = checkpoint.get('value_nets', {})
-    obp_model_state = checkpoint.get('obp_model', None)
-
-    obp_model = None
-    if obp_model_state is not None:
-        obp_model = OpponentBehaviorPredictor(
-            input_dim=config.OPPONENT_INPUT_DIM,
-            hidden_dim=config.OPPONENT_HIDDEN_DIM,
-            output_dim=2
-        ).to(device)
-        obp_model.load_state_dict(obp_model_state)
-        obp_model.eval()
-        logging.info("Loaded Opponent Behavior Predictor (OBP) model.")
-
-    for agent_id in policy_nets_state:
-        policy_net = PolicyNetwork(
-            input_dim=config.INPUT_DIM,
-            hidden_dim=config.HIDDEN_DIM,
-            output_dim=config.OUTPUT_DIM,
-            use_lstm=True,
-            use_dropout=True,
-            use_layer_norm=True
-        ).to(device)
-        try:
-            policy_net.load_state_dict(policy_nets_state[agent_id])
-            policy_net.eval()
-        except RuntimeError as e:
-            logging.error(f"Error loading Policy Network for {agent_id}: {e}")
-            logging.info("Initializing Policy Network randomly.")
-            policy_net.reset_parameters()
-
-        value_net = ValueNetwork(
-            input_dim=config.INPUT_DIM,
-            hidden_dim=config.HIDDEN_DIM,
-            use_dropout=True,
-            use_layer_norm=True
-        ).to(device)
-        try:
-            value_net.load_state_dict(value_nets_state.get(agent_id, {}))
-            value_net.eval()
-        except RuntimeError as e:
-            logging.error(f"Error loading Value Network for {agent_id}: {e}")
-            logging.info("Initializing Value Network randomly.")
-            value_net.reset_parameters()
-
-        player_id = AGENT_NAME_MAPPING.get(agent_id, agent_id)
-        players[player_id] = {
-            'policy_net': policy_net,
-            'value_net': value_net,
-            'obp_model': obp_model,
-            'elo': 1000.0
-        }
-        logging.info(f"Loaded models for player '{player_id}'.")
-
-    return players
 
 def train_obp(obp_model, obp_optimizer, obp_memory, device, logger):
     if len(obp_memory) <= 100:
