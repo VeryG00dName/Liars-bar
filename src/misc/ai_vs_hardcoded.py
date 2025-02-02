@@ -12,7 +12,7 @@ from src.model.models import PolicyNetwork, OpponentBehaviorPredictor
 from src import config
 import random
 
-from src.model.hard_coded_agents import GreedyCardSpammer, TableFirstConservativeChallenger, StrategicChallenger, RandomAgent, StrategicDominator
+from src.model.hard_coded_agents import GreedyCardSpammer, TableFirstConservativeChallenger, StrategicChallenger, RandomAgent
 
 from src.evaluation.evaluate import run_obp_inference
 from src.evaluation.evaluate_utils import (
