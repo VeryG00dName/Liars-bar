@@ -15,11 +15,8 @@ from src.env.liars_deck_env_utils_2 import (
     TABLE_CARD_MAP
 )
 from src.env.liars_deck_env_utils import (
-    record_action_history,
-    apply_challenge,
     apply_action,
-    get_observations,
-    get_opponent_features
+    get_observations
 )
 
 
@@ -42,19 +39,19 @@ class LiarsDeckEnv(AECEnv):
         # Default scoring parameters
         default_scoring_params = {
             "play_reward_per_card": 0,  # 2
-            "play_reward": 1,  # 0.1
+            "play_reward": 0,  # 0.1
             "invalid_play_penalty": 0,  # -1
-            "challenge_success_challenger_reward": 1,  # 15
-            "challenge_success_claimant_penalty": -5,  # -5
-            "challenge_fail_challenger_penalty": 0,     # -1
+            "challenge_success_challenger_reward": 0,  # 15
+            "challenge_success_claimant_penalty": 0,  # -5
+            "challenge_fail_challenger_penalty": -1,     # -1
             "challenge_fail_claimant_reward": 0,         # 5
             "forced_challenge_success_challenger_reward": 0,  # 10
-            "forced_challenge_success_claimant_penalty": 0,  # -3
-            "invalid_challenge_penalty": 0,             # -1
+            "forced_challenge_success_claimant_penalty": -3,  # -3
+            "invalid_challenge_penalty": -1,             # -1
             "termination_penalty": 0,                   # -5
             "game_win_bonus": 10,                        # 15
             "game_lose_penalty": -7,                     # -10
-            "hand_empty_bonus": 5,                       # 2
+            "hand_empty_bonus": 0,                       # 2
             "consecutive_action_penalty": 0  # -10
         }
 
