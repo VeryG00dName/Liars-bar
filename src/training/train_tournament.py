@@ -23,7 +23,7 @@ TOURNAMENT_INTERVAL = 2
 CULL_PERCENTAGE = 0.2
 CLONE_PERCENTAGE = 0.5
 GROUP_SIZE = 3
-TOTAL_PLAYERS = 15
+TOTAL_PLAYERS = 12
 
 CLONE_REGISTRY = defaultdict(int)
 
@@ -303,11 +303,11 @@ def main():
         obp_optimizer.load_state_dict(obp_optim_state)
     
     writer = SummaryWriter(log_dir=config.MULTI_LOG_DIR)
-    block_episode_offset = start_batch * 2000
+    block_episode_offset = (start_batch - 1) * 2000
     best_max_rating = -float('inf')
 
     try:
-        for batch_id in range(start_batch, 20):
+        for batch_id in range(start_batch, 10):
             logger.info("\n=== Starting Batch %d ===", batch_id)
             
             player_pool = maintain_player_pool_size(player_pool, GROUP_SIZE)
