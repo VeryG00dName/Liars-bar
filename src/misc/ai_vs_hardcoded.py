@@ -8,7 +8,7 @@ from tkinterdnd2 import TkinterDnD, DND_FILES
 import torch
 import numpy as np
 from src.env.liars_deck_env_core import LiarsDeckEnv
-from src.model.models import PolicyNetwork, OpponentBehaviorPredictor
+from src.model.new_models import PolicyNetwork, OpponentBehaviorPredictor
 from src import config
 import random
 
