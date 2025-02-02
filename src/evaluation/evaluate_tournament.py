@@ -9,7 +9,7 @@ import numpy as np
 from pettingzoo.utils import agent_selector
 
 from src.env.liars_deck_env_core import LiarsDeckEnv
-from src.model.models import PolicyNetwork, OpponentBehaviorPredictor, ValueNetwork
+from src.model.new_models import PolicyNetwork, OpponentBehaviorPredictor, ValueNetwork
 from src import config
 
 # Reuse logic from evaluate.py / evaluate_utils.py
