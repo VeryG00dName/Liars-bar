@@ -537,11 +537,6 @@ def main():
                 
                 current_max_rating = max([agent['rating'].mu for agent in temp_pool.values()])
                 
-                if current_max_rating > best_max_rating:
-                    best_max_rating = current_max_rating
-                    save_best_checkpoint(temp_pool, obp_model, obp_optimizer, best_max_rating, config.CHECKPOINT_DIR)
-                    logger.info("New best checkpoint saved with rating: %.2f", best_max_rating)
-                
                 # First, trim the pool to exactly TOTAL_PLAYERS based on tournament rankings.
                 trimmed_pool = trim_pool_by_rankings(temp_pool, rankings, TOTAL_PLAYERS, logger)
                 # Filter rankings to only those players in the trimmed pool.
@@ -550,6 +545,12 @@ def main():
                 # Now, perform evolutionary culling replacement:
                 # Remove the bottom CULL_PERCENTAGE and add back new agents and clones with CLONE_PERCENTAGE.
                 player_pool = cull_and_replace(trimmed_pool, filtered_rankings, device, logger)
+
+                if current_max_rating > best_max_rating:
+                    best_max_rating = current_max_rating
+                    save_best_checkpoint(temp_pool, obp_model, obp_optimizer, best_max_rating, config.CHECKPOINT_DIR)
+                    logger.info("New best checkpoint saved with rating: %.2f", best_max_rating)
+
                 logger.info("New population after evolutionary replacement: %s", list(player_pool.keys())[:6] + ["..."])
             
             # Save a checkpoint of everything
