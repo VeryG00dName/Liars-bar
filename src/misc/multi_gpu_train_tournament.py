@@ -548,7 +548,7 @@ def main():
 
                 if current_max_rating > best_max_rating:
                     best_max_rating = current_max_rating
-                    save_best_checkpoint(temp_pool, obp_model, obp_optimizer, best_max_rating, config.CHECKPOINT_DIR)
+                    save_best_checkpoint(player_pool, obp_model, obp_optimizer, best_max_rating, config.CHECKPOINT_DIR)
                     logger.info("New best checkpoint saved with rating: %.2f", best_max_rating)
 
                 logger.info("New population after evolutionary replacement: %s", list(player_pool.keys())[:6] + ["..."])
