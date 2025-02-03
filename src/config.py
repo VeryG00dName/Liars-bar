@@ -52,13 +52,13 @@ LEARNING_RATE = 0.0006        # Learning rate for policy/value networks
 GAMMA = 0.99                  # Discount factor
 GAE_LAMBDA = 0.95             # GAE lambda parameter
 EPS_CLIP = 0.2                # PPO clip parameter
-K_EPOCHS = 4                  # Number of PPO epochs per update
+K_EPOCHS = 2                  # Number of PPO epochs per update
 NUM_EPISODES = 50000         # Total number of training episodes
 UPDATE_STEPS = 5              # Number of episodes before PPO update
 # ----------------------------
 # Entropy Regularization
 # ----------------------------
-INIT_ENTROPY_COEF = 0.002        # Initial entropy coefficient
+INIT_ENTROPY_COEF = 0.01        # Initial entropy coefficient
 REWARD_ENTROPY_SCALE = 0.01    # Scale factor for reward-based entropy adjustments
 BASELINE_REWARD = -10         # Baseline reward for entropy coefficient updates
 ENTROPY_LR = 0.001             # Learning rate for entropy coefficient updates
@@ -75,6 +75,14 @@ LOG_INTERVAL = 100                # Episodes between logging to TensorBoard
 # ----------------------------
 ELO_K_FACTOR = 32             # K-factor for evaluation
 challenge_amount = 6           # Number of times agents need to have challenged to win
+# ----------------------------
+# Tournament Configuration
+# ----------------------------
+TOURNAMENT_INTERVAL = 2
+CULL_PERCENTAGE = 0.2
+CLONE_PERCENTAGE = 0.5
+GROUP_SIZE = 3
+TOTAL_PLAYERS = 15
 # ----------------------------
 # self play configuration
 # ----------------------------
@@ -99,5 +107,5 @@ def set_derived_config(env_observation_space, env_action_space, num_opponents):
     # Calculate opponent feature dimension (4 features per opponent)
     OPPONENT_INPUT_DIM = 4
     
-    INPUT_DIM = env_observation_space.shape[0] + num_opponents  # Existing
+    INPUT_DIM = env_observation_space.shape[0] + 2  # Existing
     OUTPUT_DIM = env_action_space.n  # Existing
