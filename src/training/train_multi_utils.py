@@ -9,16 +9,26 @@ from src import config
 def save_multi_checkpoint(player_pool, obp_model, obp_optimizer, batch, checkpoint_dir, group_size=3):
     """
     Saves a checkpoint for the global player pool and OBP model in groups.
-    
-    Args:
-        player_pool (dict): Global pool mapping player_id -> network states and optimizers.
-        obp_model (nn.Module): OBP model to save.
-        obp_optimizer (torch.optim.Optimizer): OBP optimizer to save.
-        batch (int): Current batch number.
-        checkpoint_dir (str): Directory to save checkpoints.
-        group_size (int): Number of players per checkpoint file.
+    Deletes previous checkpoints from older batches while preserving best_checkpoint.
     """
     os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # Delete previous checkpoint files from older batches
+    pattern = r"multi_checkpoint_batch_(\d+)_group_(\d+)\.pth"
+    for filename in os.listdir(checkpoint_dir):
+        file_path = os.path.join(checkpoint_dir, filename)
+        if os.path.isfile(file_path):
+            match = re.match(pattern, filename)
+            if match:
+                existing_batch = int(match.group(1))
+                if existing_batch < batch:  # Only delete older batches
+                    try:
+                        os.remove(file_path)
+                        logging.info(f"Deleted old checkpoint: {filename}")
+                    except Exception as e:
+                        logging.warning(f"Could not delete {filename}: {str(e)}")
+
+    # Create new checkpoints for current batch
     player_ids = sorted(player_pool.keys())
     num_groups = (len(player_ids) + group_size - 1) // group_size
 
@@ -36,13 +46,19 @@ def save_multi_checkpoint(player_pool, obp_model, obp_optimizer, batch, checkpoi
             'obp_model': obp_model.state_dict(),
             'obp_optimizer': obp_optimizer.state_dict()
         }
+
+        # Populate group data
         for p_id in group_players:
-            checkpoint['policy_nets'][p_id] = player_pool[p_id]['policy_net'].state_dict()
-            checkpoint['value_nets'][p_id] = player_pool[p_id]['value_net'].state_dict()
-            checkpoint['optimizers_policy'][p_id] = player_pool[p_id]['optimizer_policy'].state_dict()
-            checkpoint['optimizers_value'][p_id] = player_pool[p_id]['optimizer_value'].state_dict()
-            checkpoint['entropy_coefs'][p_id] = player_pool[p_id]['entropy_coef']
-        checkpoint_path = os.path.join(checkpoint_dir, f"multi_checkpoint_batch_{batch}_group_{grp}.pth")
+            agent = player_pool[p_id]
+            checkpoint['policy_nets'][p_id] = agent['policy_net'].state_dict()
+            checkpoint['value_nets'][p_id] = agent['value_net'].state_dict()
+            checkpoint['optimizers_policy'][p_id] = agent['optimizer_policy'].state_dict()
+            checkpoint['optimizers_value'][p_id] = agent['optimizer_value'].state_dict()
+            checkpoint['entropy_coefs'][p_id] = agent['entropy_coef']
+
+        # Save group checkpoint
+        checkpoint_path = os.path.join(checkpoint_dir, 
+                                     f"multi_checkpoint_batch_{batch}_group_{grp}.pth")
         torch.save(checkpoint, checkpoint_path)
         logging.info(f"Saved multi-checkpoint for batch {batch}, group {grp} to {checkpoint_path}.")
 
