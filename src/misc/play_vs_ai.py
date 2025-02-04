@@ -312,7 +312,7 @@ class PlayVsAIGUI:
         # Debugging: Log action probabilities
         logging.debug(f"Action probabilities: {masked_probs.cpu().numpy()}")
         logging.debug(f"Selected action: {action}")
-        if action_mask[action] == 6:
+        if action == 6:
             print("Challenge")
         return action
 
