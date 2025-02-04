@@ -62,7 +62,7 @@ def move_pool_to_device(player_pool, device):
 def move_optimizer_state(optimizer, device):
     """Move all state tensors in an optimizer to a given device."""
     for param_key, param_state in optimizer.state.items():
-        
+
         for state_key, state_value in param_state.items():
             if torch.is_tensor(state_value):
                 param_state[state_key] = state_value.to(device)
@@ -366,46 +366,69 @@ def main():
     logger = configure_logger()
     device = torch.device(config.DEVICE)
     obp_model, obp_optimizer = initialize_obp(device)
+    
+    # Initialize environment and config
     base_env = LiarsDeckEnv(num_players=GROUP_SIZE, render_mode=None)
     config.set_derived_config(
         base_env.observation_spaces[base_env.agents[0]],
         base_env.action_spaces[base_env.agents[0]],
         num_opponents=GROUP_SIZE - 1
     )
+    
+    # Initialize player pool
     player_pool = {f"player_{i}": create_new_agent(on_device='cpu') for i in range(TOTAL_PLAYERS)}
+    
+    # Load checkpoints if available
+    start_batch = 1
+    best_max_rating = -float('inf')
     start_batch, loaded_entropy_coefs, obp_state, obp_optim_state = load_multi_checkpoint(
         player_pool, config.CHECKPOINT_DIR, GROUP_SIZE
     )
+    
     if loaded_entropy_coefs is not None:
         for agent, coef in loaded_entropy_coefs.items():
             if agent in player_pool:
                 player_pool[agent]['entropy_coef'] = coef
+    
     if obp_state is not None:
         obp_model.load_state_dict(obp_state)
     if obp_optim_state is not None:
         obp_optimizer.load_state_dict(obp_optim_state)
+    
     writer = SummaryWriter(log_dir=config.MULTI_LOG_DIR)
     block_episode_offset = (start_batch - 1) * 2000
-    best_max_rating = -float('inf')
+    
     try:
         for batch_id in range(start_batch, 20):
             logger.info("\n=== Starting Batch %d ===", batch_id)
+            
+            # Ensure valid group sizes
             player_pool = maintain_player_pool_size(player_pool, GROUP_SIZE)
+            
+            # Split into groups and train
             all_ids = list(player_pool.keys())
             random.shuffle(all_ids)
             groups = [all_ids[i:i + GROUP_SIZE] for i in range(0, len(all_ids), GROUP_SIZE)]
+            
+            # Train groups on available GPUs
             available_gpus = list(range(torch.cuda.device_count()))
             if not available_gpus:
-                available_gpus = [0]
+                available_gpus = [0]  # Fallback to CPU if needed
+                
             futures = []
             with ProcessPoolExecutor(max_workers=len(available_gpus)) as executor:
                 for group_idx, group in enumerate(groups):
                     if len(group) != GROUP_SIZE:
                         logger.error("Invalid group size %d, skipping", len(group))
                         continue
+                        
                     gpu_id = available_gpus[group_idx % len(available_gpus)]
-                    logger.info("Submitting training for Group %d on GPU %d: %s", group_idx + 1, gpu_id, group)
+                    logger.info("Submitting training for Group %d on GPU %d: %s", 
+                               group_idx + 1, gpu_id, group)
+                    
+                    # Deep copy agents for isolated training
                     agent_group_state = {pid: copy.deepcopy(player_pool[pid]) for pid in group}
+                    
                     future = executor.submit(
                         train_group_process,
                         group,
@@ -415,40 +438,75 @@ def main():
                         obp_model.state_dict()
                     )
                     futures.append(future)
+                
+                # Collect results and update OBP
                 obp_states = []
                 for future in as_completed(futures):
                     result = future.result()
                     updated_agents = result['agents']
+                    
+                    # Merge trained agents back into pool
                     for pid, agent in updated_agents.items():
                         player_pool[pid] = agent
+                    
+                    # Collect OBP states for averaging
                     obp_states.append(result['obp_state'])
+                
+                # Average OBP models from all groups
                 if obp_states:
                     new_obp_state = average_state_dicts(obp_states)
                     obp_model.load_state_dict(new_obp_state)
-                    obp_optimizer = torch.optim.Adam(obp_model.parameters(), lr=config.OPPONENT_LEARNING_RATE)
+                    obp_optimizer = torch.optim.Adam(obp_model.parameters(), 
+                                                   lr=config.OPPONENT_LEARNING_RATE)
+            
             block_episode_offset += 2000
+            
+            # Run tournament every TOURNAMENT_INTERVAL batches
             if batch_id % TOURNAMENT_INTERVAL == 0:
                 logger.info("\n--- Running Evolution Tournament ---")
                 tournament_env = LiarsDeckEnv(num_players=GROUP_SIZE, render_mode=None)
+                
+                # Create temporary pool with current agents
                 temp_pool = player_pool.copy()
                 temp_pool = maintain_player_pool_size(temp_pool, GROUP_SIZE)
+                
+                # Track merged historical agents
+                merged_old_best_ids = set()
+                
+                # Merge best historical agents into tournament
                 best_agents, best_obp_model, best_obp_optim, loaded_max_rating = load_best_checkpoint(device, config.CHECKPOINT_DIR)
                 if best_agents:
+                    # Rename and merge historical best agents
                     for pid in list(best_agents.keys()):
                         new_pid = generate_agent_name(source_id=pid)
                         temp_pool[new_pid] = best_agents[pid]
+                        merged_old_best_ids.add(new_pid)
                     temp_pool = maintain_player_pool_size(temp_pool, GROUP_SIZE)
+                
+                # Run tournament
                 rankings = run_tournament(tournament_env, device, temp_pool, obp_model, logger)
+                
+                # Update ratings for all agents
                 for pid, agent in temp_pool.items():
                     if 'rating' not in agent:
                         agent['rating'] = openskill_model.rating(name=pid)
+                
+                # Determine if top agent is new
                 current_max_rating = max([agent['rating'].mu for agent in temp_pool.values()])
+                top_agent_id = rankings[0]
+                is_top_agent_old = top_agent_id in merged_old_best_ids
+                
+                # Evolutionary update
                 trimmed_pool = trim_pool_by_rankings(temp_pool, rankings, TOTAL_PLAYERS, logger)
                 player_pool = cull_and_replace(trimmed_pool, rankings, device, logger)
-                if current_max_rating > best_max_rating:
-                    best_max_rating = current_max_rating
+                
+                # New checkpoint condition
+                if (current_max_rating > best_max_rating) or (not is_top_agent_old):
+                    best_max_rating = max(best_max_rating, current_max_rating)
                     save_best_checkpoint(player_pool, obp_model, obp_optimizer, best_max_rating, config.CHECKPOINT_DIR)
-                    logger.info("New best checkpoint saved with rating: %.2f", best_max_rating)
+                    logger.info(f"New best checkpoint saved. Reason: {'new top agent' if not is_top_agent_old else 'higher rating (%.2f)' % current_max_rating}")
+            
+            # Save regular checkpoint
             save_multi_checkpoint(
                 player_pool=player_pool,
                 obp_model=obp_model,
@@ -458,6 +516,7 @@ def main():
                 group_size=GROUP_SIZE
             )
             logger.info("Checkpoint saved for batch %d", batch_id)
+            
     finally:
         writer.close()
         logger.info("Training session completed")
