@@ -125,6 +125,57 @@ class StrategicChallenger:
         # 5. Final challenge
         return 6
 
+class SelectiveTableConservativeChallenger:
+    def __init__(self, agent_name):
+        self.name = agent_name
+
+    def play_turn(self, observation, action_mask, table_card):
+        """
+        Strategy:
+        1. If holding 1 card total, challenge.
+        2. If exactly 1 table card is held:
+           a. If more than one non-table card is held, play 1 non-table card (action 3).
+           b. If exactly 1 non-table card is held (i.e. hand is [1 table, 1 non-table]),
+              play the table card (action 0) to force a one-card situation next turn.
+        3. Otherwise, follow the TableFirstConservativeChallenger logic:
+           a. Play maximum allowed table cards (actions 2, 1, 0).
+           b. Then play a non-table card (action 3).
+           c. Challenge as last resort.
+        """
+        # Extract card counts from observation (normalized values)
+        table_count = int(round(observation[0] * 5))  # Table cards + Jokers
+        non_table_count = int(round(observation[1] * 5))
+        total_cards = table_count + non_table_count
+
+        # Immediate challenge if only one card remains.
+        if total_cards == 1:
+            return 6  # Challenge action
+
+        # Special handling when there is exactly one table card.
+        if table_count == 1:
+            # If there are more non-table cards than one, play a non-table card.
+            if non_table_count > 1:
+                if action_mask[3]:
+                    return 3  # Play one non-table card
+            # If there is exactly one non-table card, play the table card.
+            elif non_table_count == 1:
+                if action_mask[0]:
+                    return 0  # Play the table card to force one remaining card next turn
+
+        # Default strategy: try to play table cards (maximum allowed first).
+        # Here, actions 2, 1, 0 correspond to playing 3, 2, and 1 table cards respectively.
+        for action in [2, 1, 0]:
+            required = (action % 3) + 1  # 3, 2, or 1 table cards respectively
+            if action_mask[action] and table_count >= required:
+                return action
+
+        # Next, try to play one non-table card.
+        if action_mask[3] and non_table_count >= 1:
+            return 3
+
+        # If no other move is available, challenge.
+        return 6
+
 class RandomAgent:
     def __init__(self, agent_name):
         self.name = agent_name        
