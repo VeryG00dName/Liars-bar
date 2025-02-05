@@ -33,6 +33,24 @@ ensure_dirs()
 NUM_PLAYERS = 3               # Number of players in the game
 RENDER_MODE = None            # Set to 'human' to enable rendering
 USE_WRAPPER = False            # Set to True to use the reward restriction wrapper
+DEFAULT_SCORING_PARAMS = {
+            "play_reward_per_card": 0,  # 2
+            "play_reward": 0,  # 0.1
+            "invalid_play_penalty": 0,  # -1
+            "challenge_success_challenger_reward": 0,  # 15
+            "challenge_success_claimant_penalty": 0,  # -5
+            "challenge_fail_challenger_penalty": 0,     # -1
+            "challenge_fail_claimant_reward": 0,         # 5
+            "forced_challenge_success_challenger_reward": 0,  # 10
+            "forced_challenge_success_claimant_penalty": 0,  # -3
+            "invalid_challenge_penalty": 0,             # -1
+            "termination_penalty": 0,                   # -5
+            "game_win_bonus": 10,                        # 15
+            "game_lose_penalty": -7,                     # -10
+            "hand_empty_bonus": 0,                       # 2
+            "consecutive_action_penalty": 0  # -10
+        }
+
 # ----------------------------
 # Neural Network Configuration
 # ----------------------------
@@ -48,13 +66,14 @@ OPPONENT_LEARNING_RATE = 1e-4 # Learning rate for opponent behavior predictor
 # ----------------------------
 # Training Hyperparameters
 # ----------------------------
-LEARNING_RATE = 0.0006        # Learning rate for policy/value networks
+LEARNING_RATE = 0.0001        # Learning rate for policy/value networks
 GAMMA = 0.99                  # Discount factor
 GAE_LAMBDA = 0.95             # GAE lambda parameter
-EPS_CLIP = 0.2                # PPO clip parameter
-K_EPOCHS = 2                  # Number of PPO epochs per update
+EPS_CLIP = 0.1                # PPO clip parameter
+K_EPOCHS = 4                  # Number of PPO epochs per update
 NUM_EPISODES = 50000         # Total number of training episodes
-UPDATE_STEPS = 5              # Number of episodes before PPO update
+UPDATE_STEPS = 3              # Number of episodes before PPO update
+MAX_NORM = 0.3                # Maximum norm for gradient clipping
 # ----------------------------
 # Entropy Regularization
 # ----------------------------
@@ -68,7 +87,7 @@ ENTROPY_CLIP_MAX = 0.3         # Maximum allowed value for entropy coefficient
 # Logging and Checkpointing
 # ----------------------------
 CULL_INTERVAL = 20001             # Number of episodes between each culling event
-CHECKPOINT_INTERVAL = 5000       # Episodes between saving checkpoints
+CHECKPOINT_INTERVAL = 10000       # Episodes between saving checkpoints
 LOG_INTERVAL = 100                # Episodes between logging to TensorBoard
 # ----------------------------
 # Evaluation Configuration
@@ -87,9 +106,10 @@ TOTAL_PLAYERS = 15
 # self play configuration
 # ----------------------------
 HISTORICAL_POOL_SIZE = 12
-SELFPLAY_NUM_EPISODES = 5000
-SELFPLAY_EVAL_INTERVAL = 300
-SELFPLAY_SNAPSHOT_INTERVAL = 500
+SELFPLAY_NUM_EPISODES = 10000
+SELFPLAY_EVAL_INTERVAL = 1000
+SELFPLAY_SNAPSHOT_INTERVAL = 1000
+WIN_RATE_THRESHOLD = 0.55
 # ----------------------------
 # Miscellaneous
 # ----------------------------
