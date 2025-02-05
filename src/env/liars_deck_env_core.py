@@ -116,8 +116,8 @@ class LiarsDeckEnv(AECEnv):
         self._agent_selector = None
         self.rewards = {}
 
-        # Track consecutive actions
-        self.last_action_type = {agent: None for agent in self.possible_agents}
+        # ### CHANGED: Track the last discrete action used by each agent
+        self.last_agent_action = {agent: None for agent in self.possible_agents}
         self.consecutive_action_count = {agent: 0 for agent in self.possible_agents}
 
         # Initialize table_card
@@ -178,7 +178,6 @@ class LiarsDeckEnv(AECEnv):
 
         return mask
 
-
     def action_space(self, agent):
         return self.action_spaces[agent]
 
@@ -217,6 +216,11 @@ class LiarsDeckEnv(AECEnv):
         self.table_card = random.choice(["King", "Queen", "Ace"])
         self.logger.debug(f"Resetting environment. Initial table_card: {self.table_card}")
 
+        # ### CHANGED: Reset the last_agent_action and consecutive_action_count
+        for agent in self.possible_agents:
+            self.last_agent_action[agent] = None
+            self.consecutive_action_count[agent] = 0
+
         self.start_new_round()
         return get_observations(self), self.infos
 
@@ -230,9 +234,9 @@ class LiarsDeckEnv(AECEnv):
             self._check_game_end()
             return
 
-        # Reset consecutive action tracking for the new round
+        # ### CHANGED: Reset consecutive action tracking for the new round
         for agent in self.possible_agents:
-            self.last_action_type[agent] = None
+            self.last_agent_action[agent] = None
             self.consecutive_action_count[agent] = 0
 
         random.shuffle(eligible_agents)
@@ -266,24 +270,24 @@ class LiarsDeckEnv(AECEnv):
     def step(self, action):
         agent = self.agent_selection
 
+        # Decode to see if the action is a "Play" or "Challenge", etc.
         action_type, _, _ = decode_action(action)
 
-        # Check for consecutive identical actions
-        if action_type == self.last_action_type[agent]:
+        # ### CHANGED: Check for consecutive identical discrete actions
+        if action == self.last_agent_action[agent]:
             self.consecutive_action_count[agent] += 1
         else:
             self.consecutive_action_count[agent] = 1
-            self.last_action_type[agent] = action_type
+            self.last_agent_action[agent] = action
 
-        # Apply penalty/reward for repeated "Play" actions (example: action 0 or 3)
+        # ### CHANGED: Apply penalty if the same discrete action is repeated.
+        # Optionally, only penalize repeating "Play" actions (actions 0..5).
         if self.consecutive_action_count[agent] > 1 and action_type == "Play":
-            # If you specifically only care about discrete actions 0 and 3 being consecutive
-            if action in [0, 3]:
-                self.rewards[agent] += self.scoring_params['consecutive_action_penalty']
-                self.logger.debug(
-                    f"Penalty applied to {agent} for consecutive action {action}. "
-                    f"Count: {self.consecutive_action_count[agent]}"
-                )
+            self.rewards[agent] += self.scoring_params.get('consecutive_action_penalty', -1)
+            self.logger.debug(
+                f"Penalty applied to {agent} for repeating the same action {action}. "
+                f"Consecutive count: {self.consecutive_action_count[agent]}"
+            )
 
         # Apply the main logic for the environment step
         apply_action(self, agent, action)
