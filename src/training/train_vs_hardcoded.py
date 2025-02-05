@@ -106,6 +106,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
         optimizers_policy[agent] = optimizer_policy
         optimizers_value[agent] = optimizer_value
 
+        # Each agent gets its own RolloutMemory instance
         memories[agent] = RolloutMemory([agent])
 
     # Initialize Opponent Behavior Predictor (OBP)
@@ -123,6 +124,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
     writer = get_tensorboard_writer(log_dir=config.TENSORBOARD_RUNS_DIR) if log_tensorboard else None
     checkpoint_dir = load_directory if load_directory is not None else config.CHECKPOINT_DIR
 
+    # Load checkpoint if available
     if load_checkpoint:
         checkpoint_data = load_checkpoint_if_available(
             policy_nets,
@@ -140,6 +142,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
     else:
         start_episode = 1
 
+    # Fixed entropy coefficient for all agents
     static_entropy_coef = config.INIT_ENTROPY_COEF
 
     last_log_time = time.time()
@@ -151,14 +154,14 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
     recent_rewards = {agent: [] for agent in agents}
     original_agent_order = list(env.agents)
 
-    # Hardcoded agents to choose from if you randomize
+    # Hard-coded agents to choose from if you randomize
     hardcoded_agent_classes = [GreedyCardSpammer, TableFirstConservativeChallenger, StrategicChallenger, RandomAgent]
 
     for episode in range(start_episode, num_episodes + 1):
         obs, infos = env.reset()
         agents = env.agents
 
-        # --- Replace one agent with a specific or random hardcoded agent
+        # --- Replace one RL agent with a random hard-coded agent
         hardcoded_agent_id = random.choice(agents)
         hardcoded_class = random.choice(hardcoded_agent_classes)
         if hardcoded_class == StrategicChallenger:
@@ -173,7 +176,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
         episode_rewards = {agent: 0 for agent in agents}
         steps_in_episode = 0
 
-        # Bluff tracking
+        # Optional: Track bluff attempts or other custom logic, if needed
         bluff_attempts = {agent: None for agent in agents}
         previous_agent = None
 
@@ -185,11 +188,12 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 env.step(None)
                 continue
 
-            # 1) Get observation & OBP output
+            # 1) Get observation & action mask from environment
             observation_dict = env.observe(agent)
             observation = observation_dict[agent]
             action_mask = env.infos[agent]['action_mask']
 
+            # 2) Run OBP
             obp_probs = run_obp_inference(obp_model, observation, device, env.num_players)
             final_obs = np.concatenate([observation, obp_probs], axis=0)
 
@@ -197,42 +201,59 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
 
             # 3) Decide action
             if agent == hardcoded_agent_id:
+                # Hard-coded agent picks action
                 action = hardcoded_agent_instance.play_turn(observation, action_mask, table_card=None)
                 log_prob_value = 0.0
             else:
+                # RL Agent picks action
                 probs, _ = policy_nets[agent](observation_tensor, None)
-                probs = torch.clamp(probs, 1e-8, 1.0)
-                m = Categorical(probs)
+                probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
+
+                # Apply action mask for action selection
+                mask_t = torch.tensor(action_mask, dtype=torch.float32, device=device)
+                masked_probs = probs * mask_t
+
+                if masked_probs.sum() == 0:
+                    # Fallback if all masked probs are zero
+                    valid_indices = torch.nonzero(mask_t, as_tuple=True)[0]
+                    if len(valid_indices) > 0:
+                        masked_probs[valid_indices] = 1.0 / valid_indices.numel()
+                    else:
+                        # If no valid action, pick uniformly
+                        masked_probs = torch.ones_like(probs) / probs.size(0)
+                else:
+                    masked_probs /= masked_probs.sum()
+
+                m = Categorical(masked_probs)
                 action = m.sample().item()
                 log_prob_value = m.log_prob(torch.tensor(action, device=device)).item()
 
-            # Step environment
+            action_counts_periodic[agent][action] += 1
             env.step(action)
 
-            # 5) Check if previous agent's bluff succeeded or failed
+            # 4) Handle any custom "bluff" logic, if needed
             if previous_agent is not None and bluff_attempts[previous_agent] is not None:
+                # Example custom shaping
                 bluff_index = bluff_attempts[previous_agent]
-                if action == 6:  
-                    # challenged
+                if action == 6:  # e.g., if 6 is "challenge" action
                     memories[previous_agent].rewards[previous_agent][bluff_index] -= 3
                 else:
-                    # not challenged => success
                     memories[previous_agent].rewards[previous_agent][bluff_index] += 4
                 bluff_attempts[previous_agent] = None
 
-            # 6) Track new bluff attempt
-            if action in [2, 3, 4, 5]:
+            if action in [2, 3, 4, 5]:  # Suppose these are "bluff" moves
                 bluff_index = len(memories[agent].rewards[agent])
                 bluff_attempts[agent] = bluff_index
 
-            # 7) Immediate reward shaping
+            # 5) Immediate shaping (example)
             reward = 0
             if action in [2, 3, 4, 5]:
                 reward += 1
-            if action == 6:
+            if action == 6:  # "challenge"
                 reward -= 1
 
-            # 8) Store transition
+            # 6) Store transition in RolloutMemory
+            # <-- ADDED OR MODIFIED: We also store the action_mask here
             memories[agent].store_transition(
                 agent=agent,
                 state=final_obs,
@@ -241,36 +262,35 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 reward=reward,
                 is_terminal=env.terminations[agent] or env.truncations[agent],
                 state_value=value_nets[agent](observation_tensor).item(),
+                action_mask=action_mask  # <-- Store it
             )
 
-            # Track final environment reward
             env_reward = env.rewards[agent]
             episode_rewards[agent] += env_reward
-
             previous_agent = agent
 
-        # <-- ADDED: Update final rewards for all agents
-        # The game is over here (exited the while loop),
-        # so let's add any leftover final env.rewards to the last memory entry
+        # Once the episode terminates or truncates
         for ag in agents:
             if len(memories[ag].rewards[ag]) > 0:
-                # Add the final reward to the last entry
+                # Add final environment reward to the last transition
                 memories[ag].rewards[ag][-1] += env.rewards[ag]
 
         # Extract & store OBP data
         episode_obp_data = extract_obp_training_data(env)
         obp_memory.extend(episode_obp_data)
 
-        # End-of-episode reward logging
+        # Track recent rewards for logging
         for agent in agents:
             recent_rewards[agent].append(episode_rewards[agent])
             if len(recent_rewards[agent]) > 100:
                 recent_rewards[agent].pop(0)
 
-        avg_rewards = {agent: np.mean(recent_rewards[agent]) if recent_rewards[agent] else 0.0 
-                       for agent in agents}
+        avg_rewards = {
+            agent: np.mean(recent_rewards[agent]) if recent_rewards[agent] else 0.0 
+            for agent in agents
+        }
 
-        # -- GAE for RL agents (skip the hardcoded one)
+        # Compute GAE for RL agents (skip hard-coded agent)
         for agent in agents:
             if agent == hardcoded_agent_id:
                 continue
@@ -294,11 +314,10 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 gamma=config.GAMMA,
                 lam=config.GAE_LAMBDA,
             )
-
             memory.advantages[agent] = advantages
             memory.returns[agent] = returns_
 
-        # Update RL agents periodically
+        # Periodically update RL agents
         if episode % config.UPDATE_STEPS == 0:
             for agent in agents:
                 if agent == hardcoded_agent_id:
@@ -308,12 +327,16 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 if not memory.states[agent]:
                     continue
 
+                # Convert memory lists to tensors
                 states = torch.tensor(np.array(memory.states[agent], dtype=np.float32), device=device)
                 actions_ = torch.tensor(np.array(memory.actions[agent], dtype=np.int64), device=device)
                 old_log_probs = torch.tensor(np.array(memory.log_probs[agent], dtype=np.float32), device=device)
                 returns_ = torch.tensor(np.array(memory.returns[agent], dtype=np.float32), device=device)
                 advantages_ = torch.tensor(np.array(memory.advantages[agent], dtype=np.float32), device=device)
+                # <-- ADDED: action masks
+                action_masks_ = torch.tensor(np.array(memory.action_masks[agent], dtype=np.float32), device=device)
 
+                # Normalize advantages
                 advantages_ = (advantages_ - advantages_.mean()) / (advantages_.std() + 1e-5)
 
                 kl_divs = []
@@ -324,23 +347,40 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 entropies = []
 
                 for _ in range(config.K_EPOCHS):
-                    probs, _ = policy_nets[agent](states, None)
+                    # Forward pass
+                    probs, _ = policy_nets[agent](states, None)  # shape: (batch_size, action_dim)
                     probs = torch.clamp(probs, 1e-8, 1.0)
-                    probs = probs / probs.sum(dim=-1, keepdim=True)
-                    m = Categorical(probs)
+
+                    # <-- ADDED: Mask invalid actions before computing distribution
+                    masked_probs = probs * action_masks_
+
+                    # Handle rows where the sum is zero after masking
+                    row_sums = masked_probs.sum(dim=-1, keepdim=True)
+                    # Where sum is zero, use uniform distribution across *all* actions
+                    masked_probs = torch.where(
+                        row_sums > 0,
+                        masked_probs / row_sums,
+                        torch.ones_like(masked_probs) / masked_probs.shape[1]
+                    )
+
+                    m = Categorical(masked_probs)
                     new_log_probs = m.log_prob(actions_)
                     entropy = m.entropy().mean()
 
+                    # KL divergence (approx)
                     kl_div = torch.mean(old_log_probs - new_log_probs)
                     kl_divs.append(kl_div.item())
 
+                    # Surrogate losses
                     ratios = torch.exp(new_log_probs - old_log_probs)
                     surr1 = ratios * advantages_
                     surr2 = torch.clamp(ratios, 1 - config.EPS_CLIP, 1 + config.EPS_CLIP) * advantages_
                     policy_loss = -torch.min(surr1, surr2).mean()
 
+                    # Subtract entropy bonus
                     policy_loss -= static_entropy_coef * entropy
 
+                    # Value loss
                     state_values = value_nets[agent](states).squeeze()
                     value_loss = nn.MSELoss()(state_values, returns_)
 
@@ -350,10 +390,12 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
 
                     total_loss = policy_loss + 0.5 * value_loss
 
+                    # Optimize
                     optimizers_policy[agent].zero_grad()
                     optimizers_value[agent].zero_grad()
                     total_loss.backward()
 
+                    # Policy grad norm
                     p_grad_norm = 0.0
                     for param in policy_nets[agent].parameters():
                         if param.grad is not None:
@@ -361,6 +403,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                     p_grad_norm = p_grad_norm ** 0.5
                     policy_grad_norms.append(p_grad_norm)
 
+                    # Value grad norm
                     v_grad_norm = 0.0
                     for param in value_nets[agent].parameters():
                         if param.grad is not None:
@@ -381,6 +424,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 avg_policy_grad_norm = np.mean(policy_grad_norms)
                 avg_value_grad_norm = np.mean(value_grad_norms)
 
+                # TensorBoard logs
                 if log_tensorboard and writer is not None:
                     writer.add_scalar(f"Loss/Policy/{agent}", avg_policy_loss, episode)
                     writer.add_scalar(f"Loss/Value/{agent}", avg_value_loss, episode)
@@ -390,7 +434,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                     writer.add_scalar(f"Gradient_Norms/Policy/{agent}", avg_policy_grad_norm, episode)
                     writer.add_scalar(f"Gradient_Norms/Value/{agent}", avg_value_grad_norm, episode)
 
-            # Reset memories
+            # Reset memory for RL agents after update
             for agent in agents:
                 if agent != hardcoded_agent_id:
                     memories[agent].reset()
@@ -403,6 +447,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                     writer.add_scalar("OBP/Accuracy", accuracy, episode)
                 obp_memory = []
 
+        # Checkpoint saving
         if episode % config.CHECKPOINT_INTERVAL == 0 and load_checkpoint:
             save_checkpoint(
                 policy_nets,
@@ -416,6 +461,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
             )
             logger.info(f"Saved global checkpoint at episode {episode}.")
 
+        # Logging & stats
         steps_since_log += steps_in_episode
         episodes_since_log += 1
 
@@ -439,9 +485,13 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                     writer.add_scalar(f"Average Reward/{agent}", reward, episode)
                 for agent in agents:
                     for action in range(config.OUTPUT_DIM):
-                        writer.add_scalar(f"Action Counts/{agent}/Action_{action}",
-                                          action_counts_periodic[agent][action], episode)
+                        writer.add_scalar(
+                            f"Action Counts/{agent}/Action_{action}",
+                            action_counts_periodic[agent][action],
+                            episode
+                        )
 
+            # Reset periodic stats
             for agent in agents:
                 invalid_action_counts_periodic[agent] = 0
                 for action in range(config.OUTPUT_DIM):
@@ -451,6 +501,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
             steps_since_log = 0
             episodes_since_log = 0
 
+            # Culling logic
             if episode % config.CULL_INTERVAL == 0:
                 average_rewards = {}
                 for agent in agents:
@@ -463,6 +514,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 lowest_score = average_rewards[lowest_agent]
                 logger.info(f"Culling Agent '{lowest_agent}' with average reward {lowest_score:.2f}.")
 
+                # If the culled agent is RL-controlled, reset its networks
                 if lowest_agent != hardcoded_agent_id:
                     policy_nets[lowest_agent] = PolicyNetwork(
                         input_dim=config.INPUT_DIM,
@@ -480,14 +532,22 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                         use_layer_norm=True
                     ).to(device)
 
-                    optimizers_policy[lowest_agent] = optim.Adam(policy_nets[lowest_agent].parameters(), lr=config.LEARNING_RATE)
-                    optimizers_value[lowest_agent] = optim.Adam(value_nets[lowest_agent].parameters(), lr=config.LEARNING_RATE)
+                    optimizers_policy[lowest_agent] = optim.Adam(
+                        policy_nets[lowest_agent].parameters(), 
+                        lr=config.LEARNING_RATE
+                    )
+                    optimizers_value[lowest_agent] = optim.Adam(
+                        value_nets[lowest_agent].parameters(), 
+                        lr=config.LEARNING_RATE
+                    )
+
                     memories[lowest_agent] = RolloutMemory([lowest_agent])
                     recent_rewards[lowest_agent] = []
 
     if log_tensorboard and writer is not None:
         writer.close()
 
+    # Compile final trained agents
     trained_agents = {}
     for agent in agents:
         trained_agents[agent] = {
