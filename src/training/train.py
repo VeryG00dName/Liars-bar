@@ -16,7 +16,6 @@ from src.training.train_extras import set_seed, extract_obp_training_data, run_o
 from src import config
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-
 torch.backends.cudnn.benchmark = True
 
 def train(
@@ -49,7 +48,7 @@ def train(
 
     # Determine pool agents based on agent_mapping
     pool_agents = list({agent_mapping[agent] if agent_mapping is not None else agent for agent in agents})
-    num_opponents = len(pool_agents) - 1  # Assuming one is the learning agent
+    num_opponents = len(pool_agents) - 1  # One agent is "learning" if you have 2+ agents
     config.set_derived_config(env.observation_spaces[agents[0]], env.action_spaces[agents[0]], num_opponents)
 
     # Initialize RolloutMemory for each pool agent
@@ -62,7 +61,10 @@ def train(
     
     # Initialize periodic statistics
     invalid_action_counts_periodic = {pool_agent: 0 for pool_agent in pool_agents}
-    action_counts_periodic = {pool_agent: {a: 0 for a in range(config.OUTPUT_DIM)} for pool_agent in pool_agents}
+    action_counts_periodic = {
+        pool_agent: {a: 0 for a in range(config.OUTPUT_DIM)} 
+        for pool_agent in pool_agents
+    }
     recent_rewards = {pool_agent: [] for pool_agent in pool_agents}
     win_reasons_record = []
 
@@ -84,6 +86,7 @@ def train(
                 env.step(None)
                 continue
 
+            # Map the environment agent to the "pool_agent" (a single training identity)
             pool_agent = agent_mapping[env_agent] if agent_mapping is not None else env_agent
 
             observation_dict = env.observe(env_agent)
@@ -94,16 +97,17 @@ def train(
             obp_probs = run_obp_inference(obp_model, observation, device, env.num_players)
             final_obs = np.concatenate([observation, np.array(obp_probs, dtype=np.float32)], axis=0)
             
-            # Ensure that the final observation has the correct dimension
-            assert final_obs.shape[0] == config.INPUT_DIM, f"Expected observation dimension {config.INPUT_DIM}, got {final_obs.shape[0]}"
+            # Ensure correct observation dimension
+            assert final_obs.shape[0] == config.INPUT_DIM, \
+                f"Expected observation dimension {config.INPUT_DIM}, got {final_obs.shape[0]}"
             
             observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
             
             # Get action probabilities from PolicyNetwork
             probs, _ = policy_nets[pool_agent](observation_tensor, None)
-            probs = torch.clamp(probs, min=1e-8, max=1.0).squeeze(0)
-            
-            # Apply action mask
+            probs = torch.clamp(probs, min=1e-8, max=1.0).squeeze(0)  # shape: (output_dim,)
+
+            # <--- ADDED: apply action mask here
             action_mask_tensor = torch.tensor(action_mask, dtype=torch.float32, device=device)
             masked_probs = probs * action_mask_tensor
             
@@ -116,7 +120,6 @@ def train(
                 else:
                     masked_probs = torch.ones_like(probs) / probs.size(0)
             else:
-                # Normalize valid actions
                 masked_probs = masked_probs / masked_probs.sum()
 
             m = Categorical(masked_probs)
@@ -138,7 +141,7 @@ def train(
             if 'penalty' in env.infos.get(env_agent, {}) and 'Invalid' in env.infos[env_agent]['penalty']:
                 invalid_action_counts_periodic[pool_agent] += 1
 
-            # Store transition in RolloutMemory
+            # <--- ADDED: store action_mask in memory
             memories[pool_agent].store_transition(
                 agent=pool_agent,
                 state=final_obs,
@@ -147,6 +150,7 @@ def train(
                 reward=reward,
                 is_terminal=done_or_truncated,
                 state_value=state_value,
+                action_mask=action_mask  # store mask here
             )
 
             # Update episode rewards
@@ -172,7 +176,10 @@ def train(
                 recent_rewards[pa].pop(0)
         
         # Compute average rewards
-        avg_rewards = {pa: np.mean(recent_rewards[pa]) if recent_rewards[pa] else 0.0 for pa in pool_agents}
+        avg_rewards = {
+            pa: np.mean(recent_rewards[pa]) if recent_rewards[pa] else 0.0 
+            for pa in pool_agents
+        }
 
         # Compute advantages and returns using GAE
         for pool_agent in pool_agents:
@@ -205,19 +212,51 @@ def train(
                     continue
 
                 # Convert memory to tensors
-                states = torch.tensor(np.array(memory.states[pool_agent], dtype=np.float32), device=device)
-                actions_ = torch.tensor(np.array(memory.actions[pool_agent], dtype=np.int64), device=device)
-                old_log_probs = torch.tensor(np.array(memory.log_probs[pool_agent], dtype=np.float32), device=device)
-                returns_ = torch.tensor(np.array(memory.returns[pool_agent], dtype=np.float32), device=device)
-                advantages_ = torch.tensor(np.array(memory.advantages[pool_agent], dtype=np.float32), device=device)
+                states = torch.tensor(
+                    np.array(memory.states[pool_agent], dtype=np.float32), 
+                    device=device
+                )
+                actions_ = torch.tensor(
+                    np.array(memory.actions[pool_agent], dtype=np.int64), 
+                    device=device
+                )
+                old_log_probs = torch.tensor(
+                    np.array(memory.log_probs[pool_agent], dtype=np.float32), 
+                    device=device
+                )
+                returns_ = torch.tensor(
+                    np.array(memory.returns[pool_agent], dtype=np.float32), 
+                    device=device
+                )
+                advantages_ = torch.tensor(
+                    np.array(memory.advantages[pool_agent], dtype=np.float32), 
+                    device=device
+                )
                 advantages_ = (advantages_ - advantages_.mean()) / (advantages_.std() + 1e-5)
+
+                # <--- ADDED: retrieve stored action masks
+                action_masks_ = torch.tensor(
+                    np.array(memory.action_masks[pool_agent], dtype=np.float32), 
+                    device=device
+                )
 
                 # PPO update
                 for _ in range(config.K_EPOCHS):
+                    # Forward pass
                     probs, _ = policy_nets[pool_agent](states, None)
                     probs = torch.clamp(probs, 1e-8, 1.0)
-                    probs = probs / probs.sum(dim=-1, keepdim=True)
-                    m = Categorical(probs)
+
+                    # <--- ADDED: apply action masks to zero out invalid actions
+                    masked_probs = probs * action_masks_
+                    row_sums = masked_probs.sum(dim=-1, keepdim=True)
+                    # For rows that sum to zero, fall back to uniform distribution
+                    masked_probs = torch.where(
+                        row_sums > 0,
+                        masked_probs / row_sums,
+                        torch.ones_like(masked_probs) / masked_probs.shape[1]
+                    )
+
+                    m = Categorical(masked_probs)
                     new_log_probs = m.log_prob(actions_)
                     entropy = m.entropy().mean()
 
@@ -236,18 +275,39 @@ def train(
                     optimizers_policy[pool_agent].zero_grad()
                     optimizers_value[pool_agent].zero_grad()
                     total_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(policy_nets[pool_agent].parameters(), max_norm=config.MAX_NORM)
-                    torch.nn.utils.clip_grad_norm_(value_nets[pool_agent].parameters(), max_norm=config.MAX_NORM)
+                    torch.nn.utils.clip_grad_norm_(
+                        policy_nets[pool_agent].parameters(), 
+                        max_norm=config.MAX_NORM
+                    )
+                    torch.nn.utils.clip_grad_norm_(
+                        value_nets[pool_agent].parameters(), 
+                        max_norm=config.MAX_NORM
+                    )
                     optimizers_policy[pool_agent].step()
                     optimizers_value[pool_agent].step()
 
-                # Note: The dynamic adjustment of entropy_coef has been removed in favor of the static coefficient.
                 # Log to TensorBoard if enabled
                 if log_tensorboard and writer:
-                    writer.add_scalar(f"Loss/Policy_{pool_agent}", policy_loss.item(), current_episode)
-                    writer.add_scalar(f"Loss/Value_{pool_agent}", value_loss.item(), current_episode)
-                    writer.add_scalar(f"Entropy/{pool_agent}", entropy.item(), current_episode)
-                    writer.add_scalar(f"Entropy_Coef/{pool_agent}", static_entropy_coef, current_episode)
+                    writer.add_scalar(
+                        f"Loss/Policy_{pool_agent}", 
+                        policy_loss.item(), 
+                        current_episode
+                    )
+                    writer.add_scalar(
+                        f"Loss/Value_{pool_agent}", 
+                        value_loss.item(), 
+                        current_episode
+                    )
+                    writer.add_scalar(
+                        f"Entropy/{pool_agent}", 
+                        entropy.item(), 
+                        current_episode
+                    )
+                    writer.add_scalar(
+                        f"Entropy_Coef/{pool_agent}", 
+                        static_entropy_coef, 
+                        current_episode
+                    )
 
             # Train OBP periodically
             if len(obp_memory) > 100:
@@ -273,7 +333,9 @@ def train(
                 pa = agent_mapping[agent] if agent_mapping is not None else agent
                 if pa not in logged_pool_agents:
                     logged_pool_agents.append(pa)
-            avg_rewards_str = ", ".join([f"{pa}: {avg_rewards.get(pa, 0.0):.2f}" for pa in logged_pool_agents])
+            avg_rewards_str = ", ".join(
+                [f"{pa}: {avg_rewards.get(pa, 0.0):.2f}" for pa in logged_pool_agents]
+            )
             
             avg_steps = steps_since_log / episodes_since_log
             elapsed_time = time.time() - last_log_time
@@ -290,7 +352,11 @@ def train(
                     writer.add_scalar(f"Reward/{pa}", avg_rewards[pa], current_episode)
                     writer.add_scalar(f"Invalid/{pa}", invalid_action_counts_periodic[pa], current_episode)
                     for action in range(config.OUTPUT_DIM):
-                        writer.add_scalar(f"Actions/{pa}/Action_{action}", action_counts_periodic[pa][action], current_episode)
+                        writer.add_scalar(
+                            f"Actions/{pa}/Action_{action}", 
+                            action_counts_periodic[pa][action], 
+                            current_episode
+                        )
 
             # Reset periodic statistics
             for pa in pool_agents:
