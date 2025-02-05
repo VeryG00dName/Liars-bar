@@ -16,7 +16,7 @@ import torch
 from src import config
 from src.env.liars_deck_env_core import LiarsDeckEnv
 from src.env.reward_restriction_wrapper_2 import RewardRestrictionWrapper2
-from src.training.train_main import train_agents
+from src.training.train_vs_hardcoded import train_agents
 from src.evaluation.evaluate_tournament import (
     initialize_players,
     run_group_swiss_tournament,
@@ -157,9 +157,11 @@ def main():
     then decide whether to delete the newest checkpoint. Increase the target
     for the next training phase and continue.
     """
+
     iteration = 1
     training_increment = 5000
-    target_total_episodes = 50000
+    newest_checkpoint = get_newest_checkpoint_episode()
+    target_total_episodes = newest_checkpoint + training_increment
 
     while True:
         logger.info(f"\n{'='*40}\nIteration {iteration}: Starting training-evaluation cycle.\n{'='*40}")
