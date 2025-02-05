@@ -233,8 +233,6 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
             done_or_truncated = env.terminations[agent] or env.truncations[agent]
 
             info = env.infos.get(agent, {})
-            if 'penalty' in info and 'Invalid' in info['penalty']:
-                invalid_action_counts_periodic[agent] += 1
 
             # Store transition
             memories[agent].store_transition(
@@ -271,8 +269,13 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
             values_agent = memory.state_values[agent]
             next_values_agent = values_agent[1:] + [0]
 
+            # ✅ Normalize rewards before using GAE
+            mean_reward = np.mean(rewards_agent)
+            std_reward = np.std(rewards_agent) + 1e-5  # Avoid division by zero
+            normalized_rewards = (np.array(rewards_agent) - mean_reward) / std_reward
+
             advantages, returns_ = compute_gae(
-                rewards=rewards_agent,
+                rewards=normalized_rewards,
                 dones=dones_agent,
                 values=values_agent,
                 next_values=next_values_agent,
@@ -302,43 +305,93 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 # Normalize advantages
                 advantages_ = (advantages_ - advantages_.mean()) / (advantages_.std() + 1e-5)
 
-                # --------------------
-                # PPO-K epochs update
-                # --------------------
+                # Containers for logging metrics across PPO epochs
+                kl_divs = []
+                policy_grad_norms = []
+                value_grad_norms = []
+                policy_losses = []
+                value_losses = []
+                entropies = []
+
+                # PPO-K epochs update loop
                 for _ in range(config.K_EPOCHS):
+                    # Forward pass through policy network
                     probs, _ = policy_nets[agent](states, None)
                     probs = torch.clamp(probs, 1e-8, 1.0)
                     probs = probs / probs.sum(dim=-1, keepdim=True)
-                    m = Categorical(probs)
+                    m = torch.distributions.Categorical(probs)
                     new_log_probs = m.log_prob(actions_)
                     entropy = m.entropy().mean()
 
+                    # Approximate KL divergence (only for sampled actions)
+                    kl_div = torch.mean(old_log_probs - new_log_probs)
+                    kl_divs.append(kl_div.item())
+
+                    # Compute PPO surrogate losses
                     ratios = torch.exp(new_log_probs - old_log_probs)
                     surr1 = ratios * advantages_
                     surr2 = torch.clamp(ratios, 1 - config.EPS_CLIP, 1 + config.EPS_CLIP) * advantages_
                     policy_loss = -torch.min(surr1, surr2).mean()
-
-                    # Incorporate a fixed entropy bonus into policy loss
+                    # Incorporate the fixed entropy bonus
                     policy_loss -= static_entropy_coef * entropy
 
+                    # Value network loss
                     state_values = value_nets[agent](states).squeeze()
                     value_loss = nn.MSELoss()(state_values, returns_)
+
+                    # Store losses and entropy for logging later
+                    policy_losses.append(policy_loss.item())
+                    value_losses.append(value_loss.item())
+                    entropies.append(entropy.item())
+
                     total_loss = policy_loss + 0.5 * value_loss
 
+                    # Zero gradients
                     optimizers_policy[agent].zero_grad()
                     optimizers_value[agent].zero_grad()
                     total_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(policy_nets[agent].parameters(), max_norm=0.5)
-                    torch.nn.utils.clip_grad_norm_(value_nets[agent].parameters(), max_norm=0.5)
+
+                    # Compute gradient norm for policy network
+                    p_grad_norm = 0.0
+                    for param in policy_nets[agent].parameters():
+                        if param.grad is not None:
+                            p_grad_norm += param.grad.data.norm(2).item() ** 2
+                    p_grad_norm = p_grad_norm ** 0.5
+                    policy_grad_norms.append(p_grad_norm)
+
+                    # Compute gradient norm for value network
+                    v_grad_norm = 0.0
+                    for param in value_nets[agent].parameters():
+                        if param.grad is not None:
+                            v_grad_norm += param.grad.data.norm(2).item() ** 2
+                    v_grad_norm = v_grad_norm ** 0.5
+                    value_grad_norms.append(v_grad_norm)
+
+                    # Clip gradients for stability
+                    torch.nn.utils.clip_grad_norm_(policy_nets[agent].parameters(), max_norm=config.MAX_NORM)
+                    torch.nn.utils.clip_grad_norm_(value_nets[agent].parameters(), max_norm=config.MAX_NORM)
+
+                    # Optimizer step
                     optimizers_policy[agent].step()
                     optimizers_value[agent].step()
 
-                # Log to TensorBoard
+                # Aggregate metrics over the PPO epochs
+                avg_policy_loss = np.mean(policy_losses)
+                avg_value_loss = np.mean(value_losses)
+                avg_entropy = np.mean(entropies)
+                avg_kl_div = np.mean(kl_divs)
+                avg_policy_grad_norm = np.mean(policy_grad_norms)
+                avg_value_grad_norm = np.mean(value_grad_norms)
+
+                # Log the metrics to TensorBoard
                 if log_tensorboard and writer is not None:
-                    writer.add_scalar(f"Loss/Policy_{agent}", policy_loss.item(), episode)
-                    writer.add_scalar(f"Loss/Value_{agent}", value_loss.item(), episode)
-                    writer.add_scalar(f"Entropy/{agent}", entropy.item(), episode)
+                    writer.add_scalar(f"Loss/Policy/{agent}", avg_policy_loss, episode)
+                    writer.add_scalar(f"Loss/Value/{agent}", avg_value_loss, episode)
+                    writer.add_scalar(f"Entropy/{agent}", avg_entropy, episode)
                     writer.add_scalar(f"Entropy_Coef/{agent}", static_entropy_coef, episode)
+                    writer.add_scalar(f"KL_Divergence/{agent}", avg_kl_div, episode)
+                    writer.add_scalar(f"Gradient_Norms/Policy/{agent}", avg_policy_grad_norm, episode)
+                    writer.add_scalar(f"Gradient_Norms/Value/{agent}", avg_value_grad_norm, episode)
 
             # ------------------------------
             # Reset memories after update
@@ -360,18 +413,18 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
             # -----------------------------------
             # Save checkpoint at specified intervals
             # -----------------------------------
-            if episode % config.CHECKPOINT_INTERVAL == 0 and load_checkpoint:
-                save_checkpoint(
-                    policy_nets,
-                    value_nets,
-                    optimizers_policy,
-                    optimizers_value,
-                    obp_model,
-                    obp_optimizer,
-                    episode,
-                    checkpoint_dir=checkpoint_dir
-                )
-                logger.info(f"Saved global checkpoint at episode {episode}.")
+        if episode % config.CHECKPOINT_INTERVAL == 0 and load_checkpoint:
+            save_checkpoint(
+                policy_nets,
+                value_nets,
+                optimizers_policy,
+                optimizers_value,
+                obp_model,
+                obp_optimizer,
+                episode,
+                checkpoint_dir=checkpoint_dir
+            )
+            logger.info(f"Saved global checkpoint at episode {episode}.")
 
         # ----------------------------
         # Periodic logging & culling
@@ -403,7 +456,6 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 for agent, reward in avg_rewards.items():
                     writer.add_scalar(f"Average Reward/{agent}", reward, episode)
                 for agent in agents:
-                    writer.add_scalar(f"Invalid Actions/{agent}", invalid_action_counts_periodic[agent], episode)
                     for action in range(config.OUTPUT_DIM):
                         writer.add_scalar(f"Action Counts/{agent}/Action_{action}",
                                           action_counts_periodic[agent][action], episode)
