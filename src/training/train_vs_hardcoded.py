@@ -230,27 +230,28 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
 
             action_counts_periodic[agent][action] += 1
             env.step(action)
-
+            reward = 0
             # 4) Handle any custom "bluff" logic, if needed
             if previous_agent is not None and bluff_attempts[previous_agent] is not None:
                 # Example custom shaping
                 bluff_index = bluff_attempts[previous_agent]
+                
                 if action == 6:  # e.g., if 6 is "challenge" action
+                    # If the challenge succeeds, previous agent loses points
                     memories[previous_agent].rewards[previous_agent][bluff_index] -= 3
                 else:
+                    # If bluff goes unchallenged, bluffing agent gains points, and the next agent (who failed to call) loses points
                     memories[previous_agent].rewards[previous_agent][bluff_index] += 4
+                    
+                    # Apply a penalty to the agent who failed to challenge
+                    if agent in memories and len(memories[agent].rewards[agent]) > 0:
+                        memories[agent].rewards[agent][-1] -= 2
+
                 bluff_attempts[previous_agent] = None
 
             if action in [2, 3, 4, 5]:  # Suppose these are "bluff" moves
                 bluff_index = len(memories[agent].rewards[agent])
                 bluff_attempts[agent] = bluff_index
-
-            # 5) Immediate shaping (example)
-            reward = 0
-            if action in [2, 3, 4, 5]:
-                reward += 1
-            if action == 6:  # "challenge"
-                reward -= 1
 
             # 6) Store transition in RolloutMemory
             # <-- ADDED OR MODIFIED: We also store the action_mask here
