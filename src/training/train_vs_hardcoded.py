@@ -176,9 +176,6 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
         episode_rewards = {agent: 0 for agent in agents}
         steps_in_episode = 0
 
-        # Optional: Track bluff attempts or other custom logic, if needed
-        bluff_attempts = {agent: None for agent in agents}
-        previous_agent = None
 
         while env.agent_selection is not None:
             steps_in_episode += 1
@@ -231,30 +228,9 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
             action_counts_periodic[agent][action] += 1
             env.step(action)
             reward = 0
-            # 4) Handle any custom "bluff" logic, if needed
-            if previous_agent is not None and bluff_attempts[previous_agent] is not None:
-                # Example custom shaping
-                bluff_index = bluff_attempts[previous_agent]
-                
-                if action == 6:  # e.g., if 6 is "challenge" action
-                    # If the challenge succeeds, previous agent loses points
-                    memories[previous_agent].rewards[previous_agent][bluff_index] -= 3
-                else:
-                    # If bluff goes unchallenged, bluffing agent gains points, and the next agent (who failed to call) loses points
-                    memories[previous_agent].rewards[previous_agent][bluff_index] += 4
-                    
-                    # Apply a penalty to the agent who failed to challenge
-                    if agent in memories and len(memories[agent].rewards[agent]) > 0:
-                        memories[agent].rewards[agent][-1] -= 2
 
-                bluff_attempts[previous_agent] = None
-
-            if action in [2, 3, 4, 5]:  # Suppose these are "bluff" moves
-                bluff_index = len(memories[agent].rewards[agent])
-                bluff_attempts[agent] = bluff_index
 
             # 6) Store transition in RolloutMemory
-            # <-- ADDED OR MODIFIED: We also store the action_mask here
             memories[agent].store_transition(
                 agent=agent,
                 state=final_obs,
@@ -263,12 +239,11 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 reward=reward,
                 is_terminal=env.terminations[agent] or env.truncations[agent],
                 state_value=value_nets[agent](observation_tensor).item(),
-                action_mask=action_mask  # <-- Store it
+                action_mask=action_mask  # Store it
             )
 
             env_reward = env.rewards[agent]
             episode_rewards[agent] += env_reward
-            previous_agent = agent
 
         # Once the episode terminates or truncates
         for ag in agents:
@@ -357,7 +332,6 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
 
                     # Handle rows where the sum is zero after masking
                     row_sums = masked_probs.sum(dim=-1, keepdim=True)
-                    # Where sum is zero, use uniform distribution across *all* actions
                     masked_probs = torch.where(
                         row_sums > 0,
                         masked_probs / row_sums,
