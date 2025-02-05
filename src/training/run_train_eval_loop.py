@@ -3,9 +3,8 @@
 Script: run_train_eval_loop.py
 
 This script runs training until a target total episode count is reached,
-then runs an evaluation tournament. It then checks the episode numbers in the checkpoint filenames.
-If the best agent’s checkpoint (from evaluation) is not among the top 2 highest episode numbers,
-the newest checkpoint is deleted before continuing training.
+then runs an evaluation tournament. After evaluation, it checks whether the best agent
+came from the newest checkpoint. If not, the newest checkpoint is deleted before continuing training.
 """
 
 import os
@@ -113,22 +112,17 @@ def parse_episode_number(filename):
     return None
 
 
-def get_top_two_checkpoint_episodes():
+def get_newest_checkpoint_episode():
     """
-    Lists all checkpoint files in config.CHECKPOINT_DIR (with the expected naming)
-    and returns a set containing the top two episode numbers (highest values).
+    Returns the highest episode number among the checkpoint files in config.CHECKPOINT_DIR.
     """
     checkpoint_files = [f for f in os.listdir(config.CHECKPOINT_DIR) if f.endswith(".pth")]
-    episode_numbers = []
+    newest_episode = -1
     for fname in checkpoint_files:
         ep = parse_episode_number(fname)
-        if ep is not None:
-            episode_numbers.append(ep)
-    if not episode_numbers:
-        return set()
-    # Sort descending and take top two
-    top_two = sorted(episode_numbers, reverse=True)[:2]
-    return set(top_two)
+        if ep is not None and ep > newest_episode:
+            newest_episode = ep
+    return newest_episode if newest_episode >= 0 else None
 
 
 def delete_newest_checkpoint():
@@ -176,13 +170,16 @@ def main():
         time.sleep(2)
         
         # 2. Run evaluation phase.
-        players = run_evaluation_phase(num_games_per_match=11, num_rounds=7)
+        players = run_evaluation_phase(num_games_per_match=5, num_rounds=3)
         
-        # 3. Determine the top two checkpoint episodes.
-        top_two_eps = get_top_two_checkpoint_episodes()
-        logger.info(f"Top two checkpoint episodes: {sorted(top_two_eps, reverse=True)}")
+        # 3. Get the newest checkpoint episode.
+        newest_episode = get_newest_checkpoint_episode()
+        if newest_episode is None:
+            logger.warning("No checkpoints found. Skipping deletion step.")
+        else:
+            logger.info(f"Newest checkpoint episode is: {newest_episode}")
         
-        # 4. Extract the best agent's checkpoint episode from its player_id.
+        # 4. Determine the best agent's checkpoint episode from evaluation.
         sorted_players = sorted(players.items(), key=lambda x: x[1]['score'], reverse=True)
         best_player_id, best_player_data = sorted_players[0]
         best_cp_filename = best_player_id.split("_player_")[0]  # Extract the checkpoint prefix
@@ -190,16 +187,16 @@ def main():
         if best_episode is None:
             logger.warning(f"Could not parse episode number from best agent checkpoint: {best_cp_filename}")
         else:
-            logger.info(f"Best agent's checkpoint episode: {best_episode}")
+            logger.info(f"Best agent's checkpoint episode is: {best_episode}")
         
-        # 5. If the best agent's checkpoint episode is NOT among the top two, delete the newest checkpoint.
-        if best_episode is None or best_episode not in top_two_eps:
-            logger.info("Best agent's checkpoint is not among the top two. Deleting the newest checkpoint.")
-            delete_newest_checkpoint()
-        else:
-            logger.info("Best agent's checkpoint is among the top two. No deletion will occur.")
-            target_total_episodes += training_increment
-        # 6. Increase the target total episodes for the next training phase.
+        # 5. If the best agent's checkpoint is not the newest checkpoint, delete the newest checkpoint.
+        if newest_episode is not None and best_episode is not None:
+            if best_episode != newest_episode:
+                logger.info("Best agent is NOT from the newest checkpoint. Deleting the newest checkpoint.")
+                delete_newest_checkpoint()
+            else:
+                logger.info("Best agent is from the newest checkpoint. No deletion will occur.")
+                target_total_episodes += training_increment
         iteration += 1
         logger.info("Starting next training phase...\n")
 
