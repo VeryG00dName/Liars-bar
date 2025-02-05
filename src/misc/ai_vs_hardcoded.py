@@ -34,6 +34,7 @@ class AgentBattlegroundGUI:
             "GreedySpammer": GreedyCardSpammer,
             "TableFirst": TableFirstConservativeChallenger,
             "Strategic": lambda name: StrategicChallenger(name, 3, 2),  # Pass agent_index=2
+            "Conservative": lambda name: TableFirstConservativeChallenger(name),
             "Random": RandomAgent
         }
         
@@ -192,7 +193,7 @@ class AgentBattlegroundGUI:
             results = {}
             for hc_name, hc_class in self.hardcoded_agents.items():
                 wins = [0, 0, 0]  # [AI1 Wins, AI2 Wins, Hardcoded Wins]
-                for _ in range(10):
+                for _ in range(20):
                     winner = self.run_match(ai_agents, hc_class(hc_name))
                     if winner == "player_0":
                         wins[0] += 1
