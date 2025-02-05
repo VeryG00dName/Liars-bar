@@ -23,6 +23,7 @@ from src.model.hard_coded_agents import (
     GreedyCardSpammer,
     TableFirstConservativeChallenger,
     StrategicChallenger,
+    SelectiveTableConservativeChallenger,
     RandomAgent
 )
 
@@ -155,7 +156,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
     original_agent_order = list(env.agents)
 
     # Hard-coded agents to choose from if you randomize
-    hardcoded_agent_classes = [GreedyCardSpammer, TableFirstConservativeChallenger, StrategicChallenger, RandomAgent]
+    hardcoded_agent_classes = [GreedyCardSpammer, TableFirstConservativeChallenger, StrategicChallenger, SelectiveTableConservativeChallenger, RandomAgent]
 
     for episode in range(start_episode, num_episodes + 1):
         obs, infos = env.reset()
