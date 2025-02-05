@@ -19,7 +19,11 @@ def compute_gae(rewards, dones, values, next_values, gamma=0.99, lam=0.95):
     advantages = []
     gae = 0
     for step in reversed(range(len(rewards))):
-        delta = rewards[step] + gamma * next_values[step] * (1 - dones[step]) - values[step]
+        if step < len(values) - 1:  # Ensure step index is valid
+            next_val = next_values[step] if step < len(next_values) else 0  # Safe index access
+            delta = rewards[step] + gamma * next_val * (1 - dones[step]) - values[step]
+        else:
+            delta = rewards[step] - values[step] if step < len(rewards) else 0  # Ensure reward index is valid
         gae = delta + gamma * lam * (1 - dones[step]) * gae
         advantages.insert(0, gae)
     returns = [adv + val for adv, val in zip(advantages, values)]
