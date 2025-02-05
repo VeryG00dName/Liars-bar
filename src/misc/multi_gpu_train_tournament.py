@@ -81,21 +81,35 @@ def initialize_obp(device):
     return obp_model, obp_optimizer
 
 def generate_agent_name(source_id=None):
-    """Generate structured agent names with lineage tracking."""
+    """Generate structured agent names with lineage tracking.
+    
+    If cloning an existing agent, this function extracts the ultimate original
+    name (i.e. the part after the last "_orig_") and counts how many times
+    the string "clone_v" appears in the source_id to determine the generation.
+    This prevents nested clone prefixes.
+    """
     if source_id is None:
-        return f"new_{int(time.time())}_{uuid.uuid4().hex[:6]}"
-    if source_id.startswith("clone"):
-        parts = source_id.split("_")
-        try:
-            orig = parts[parts.index("orig")+1]
-            gen = int(parts[parts.index("v")+1]) + 1
-        except (ValueError, IndexError):
-            orig = source_id
-            gen = 1
+        # Use only the last 2 digits of the current epoch time.
+        timestamp = str(int(time.time()))[-2:]
+        return f"new_{timestamp}_{uuid.uuid4().hex[:6]}"
+    
+    # If the source_id already includes an "_orig_" marker, extract the ultimate original.
+    if "_orig_" in source_id:
+        # Split on "_orig_" and take the last piece.
+        parts = source_id.split("_orig_")
+        ultimate_original_with_suffix = parts[-1]  # e.g. "player_4_95ee"
+        # Remove the trailing random suffix (assumed to be 4 hex characters after an underscore)
+        original_candidate, sep, suffix = ultimate_original_with_suffix.rpartition('_')
+        original = original_candidate if sep else ultimate_original_with_suffix
+        # Count the number of times "clone_v" appears in source_id to determine generation.
+        num_clones = source_id.count("clone_v")
+        new_gen = num_clones + 1
     else:
-        orig = source_id
-        gen = 1
-    return f"clone_v{gen}_orig_{orig}_{uuid.uuid4().hex[:4]}"
+        original = source_id
+        new_gen = 1
+
+    return f"clone_v{new_gen}_orig_{original}_{uuid.uuid4().hex[:4]}"
+
 
 def create_new_agent(on_device='cpu'):
     """Create a new agent on CPU by default."""
@@ -113,7 +127,9 @@ def create_new_agent(on_device='cpu'):
         use_dropout=True,
         use_layer_norm=True
     ).to(on_device)
-    return {
+    
+    # Create the agent dictionary
+    agent = {
         'policy_net': policy_net,
         'value_net': value_net,
         'optimizer_policy': torch.optim.Adam(policy_net.parameters(), lr=config.LEARNING_RATE),
@@ -121,6 +137,11 @@ def create_new_agent(on_device='cpu'):
         'entropy_coef': config.INIT_ENTROPY_COEF,
         'architecture': 'LSTM_v1'
     }
+    
+    # Initialize a default rating using openskill_model.
+    # You can use a unique id or some default value as the agent name.
+    agent['rating'] = openskill_model.rating(name=str(uuid.uuid4()))
+    return agent
 
 def clone_agent(source_agent, source_id, on_device='cpu'):
     """Create a clone with architecture preservation on CPU by default."""
@@ -142,7 +163,8 @@ def clone_agent(source_agent, source_id, on_device='cpu'):
     ).to(on_device)
     value_net.load_state_dict(source_agent['value_net'].state_dict())
     CLONE_REGISTRY[source_id] += 1
-    return {
+
+    agent = {
         'policy_net': policy_net,
         'value_net': value_net,
         'optimizer_policy': torch.optim.Adam(policy_net.parameters(), lr=config.LEARNING_RATE),
@@ -154,6 +176,9 @@ def clone_agent(source_agent, source_id, on_device='cpu'):
             'created_at': time.time()
         }
     }
+    # Initialize a default rating for the clone as well.
+    agent['rating'] = openskill_model.rating(name=clone_id)
+    return agent
 
 def run_tournament(env, device, player_pool, obp_model, logger):
     """Evaluate all agents in Swiss-style tournament on GPU or CPU as desired."""
@@ -195,11 +220,13 @@ def maintain_player_pool_size(player_pool, group_size):
 
 def cull_and_replace(player_pool, rankings, device, logger):
     """Evolutionary replacement with size maintenance."""
-    num_agents = len(rankings)
+    # Filter rankings to only include agents that are in the current pool.
+    filtered_rankings = [pid for pid in rankings if pid in player_pool]
+    num_agents = len(filtered_rankings)
     num_cull = int(num_agents * CULL_PERCENTAGE)
     num_cull = num_cull - (num_cull % GROUP_SIZE)
     num_cull = max(GROUP_SIZE, num_cull)
-    culled_ids = rankings[-num_cull:]
+    culled_ids = filtered_rankings[-num_cull:]
     logger.info("Culling %d agents: %s...", num_cull, culled_ids[-3:])
     for pid in culled_ids:
         del player_pool[pid]
@@ -209,7 +236,8 @@ def cull_and_replace(player_pool, rankings, device, logger):
             new_id = generate_agent_name()
             new_players[new_id] = create_new_agent(on_device='cpu')
         else:
-            source_id = random.choice(rankings[:GROUP_SIZE*2])
+            # Choose a source from the top GROUP_SIZE*2 agents in the filtered rankings.
+            source_id = random.choice(filtered_rankings[:GROUP_SIZE*2])
             new_players[generate_agent_name(source_id)] = clone_agent(
                 player_pool[source_id], source_id, on_device='cpu'
             )
