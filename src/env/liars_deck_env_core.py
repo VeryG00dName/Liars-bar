@@ -7,6 +7,8 @@ from gymnasium import spaces
 from pettingzoo.utils.env import AECEnv
 from pettingzoo.utils import agent_selector
 
+from src import config
+
 # Example utility imports - adjust as needed for your project structure
 from src.env.liars_deck_env_utils_2 import (
     create_deck,
@@ -37,23 +39,7 @@ class LiarsDeckEnv(AECEnv):
         self.agents = []
 
         # Default scoring parameters
-        default_scoring_params = {
-            "play_reward_per_card": 0,  # 2
-            "play_reward": 0,  # 0.1
-            "invalid_play_penalty": 0,  # -1
-            "challenge_success_challenger_reward": 0,  # 15
-            "challenge_success_claimant_penalty": 0,  # -5
-            "challenge_fail_challenger_penalty": 0,     # -1
-            "challenge_fail_claimant_reward": 0,         # 5
-            "forced_challenge_success_challenger_reward": 0,  # 10
-            "forced_challenge_success_claimant_penalty": 0,  # -3
-            "invalid_challenge_penalty": 0,             # -1
-            "termination_penalty": 0,                   # -5
-            "game_win_bonus": 10,                        # 15
-            "game_lose_penalty": -5,                     # -10
-            "hand_empty_bonus": 0,                       # 2
-            "consecutive_action_penalty": 0  # -10
-        }
+        default_scoring_params = config.DEFAULT_SCORING_PARAMS
 
         # Merge provided scoring_params with defaults
         if scoring_params is None:
