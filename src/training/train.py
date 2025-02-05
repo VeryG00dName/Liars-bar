@@ -66,6 +66,9 @@ def train(
     recent_rewards = {pool_agent: [] for pool_agent in pool_agents}
     win_reasons_record = []
 
+    # Define a fixed (static) entropy coefficient
+    static_entropy_coef = config.INIT_ENTROPY_COEF
+
     for episode in range(1, num_episodes + 1):
         current_episode = episode_offset + episode
         obs, infos = env.reset()
@@ -222,7 +225,8 @@ def train(
                     surr1 = ratios * advantages_
                     surr2 = torch.clamp(ratios, 1 - config.EPS_CLIP, 1 + config.EPS_CLIP) * advantages_
                     policy_loss = -torch.min(surr1, surr2).mean()
-                    policy_loss -= agents_dict[pool_agent]['entropy_coef'] * entropy
+                    # Use fixed entropy coefficient
+                    policy_loss -= static_entropy_coef * entropy
 
                     state_values = value_nets[pool_agent](states).squeeze()
                     value_loss = torch.nn.MSELoss()(state_values, returns_)
@@ -232,25 +236,18 @@ def train(
                     optimizers_policy[pool_agent].zero_grad()
                     optimizers_value[pool_agent].zero_grad()
                     total_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(policy_nets[pool_agent].parameters(), max_norm=0.5)
-                    torch.nn.utils.clip_grad_norm_(value_nets[pool_agent].parameters(), max_norm=0.5)
+                    torch.nn.utils.clip_grad_norm_(policy_nets[pool_agent].parameters(), max_norm=config.MAX_NORM)
+                    torch.nn.utils.clip_grad_norm_(value_nets[pool_agent].parameters(), max_norm=config.MAX_NORM)
                     optimizers_policy[pool_agent].step()
                     optimizers_value[pool_agent].step()
 
-                # Adjust entropy coefficient based on recent rewards
-                with torch.no_grad():
-                    avg_recent_reward = np.mean(recent_rewards[pool_agent]) if recent_rewards[pool_agent] else 0.0
-                    reward_error = config.BASELINE_REWARD - avg_recent_reward
-                    agents_dict[pool_agent]['entropy_coef'] += config.ENTROPY_LR * config.REWARD_ENTROPY_SCALE * reward_error
-                    agents_dict[pool_agent]['entropy_coef'] = max(agents_dict[pool_agent]['entropy_coef'], config.ENTROPY_CLIP_MIN)
-                    agents_dict[pool_agent]['entropy_coef'] = min(agents_dict[pool_agent]['entropy_coef'], config.ENTROPY_CLIP_MAX)
-
+                # Note: The dynamic adjustment of entropy_coef has been removed in favor of the static coefficient.
                 # Log to TensorBoard if enabled
                 if log_tensorboard and writer:
                     writer.add_scalar(f"Loss/Policy_{pool_agent}", policy_loss.item(), current_episode)
                     writer.add_scalar(f"Loss/Value_{pool_agent}", value_loss.item(), current_episode)
                     writer.add_scalar(f"Entropy/{pool_agent}", entropy.item(), current_episode)
-                    writer.add_scalar(f"Entropy_Coef/{pool_agent}", agents_dict[pool_agent]['entropy_coef'], current_episode)
+                    writer.add_scalar(f"Entropy_Coef/{pool_agent}", static_entropy_coef, current_episode)
 
             # Train OBP periodically
             if len(obp_memory) > 100:
@@ -312,5 +309,5 @@ def train(
         'obp_model': obp_model,
         'optimizers_policy': optimizers_policy,
         'optimizers_value': optimizers_value,
-        'entropy_coefs': {agent: agents_dict[agent]['entropy_coef'] for agent in agents_dict}
+        'entropy_coefs': {agent: static_entropy_coef for agent in agents_dict}
     }
