@@ -23,8 +23,9 @@ class RolloutMemory:
         self.state_values = {agent: [] for agent in self.agents}
         self.advantages = {agent: [] for agent in self.agents}
         self.returns = {agent: [] for agent in self.agents}
+        self.action_masks = {agent: [] for agent in self.agents}
 
-    def store_transition(self, agent, state, action, log_prob, reward, is_terminal, state_value):
+    def store_transition(self, agent, state, action, log_prob, reward, is_terminal, state_value, action_mask):
         """
         Stores a single transition for a specific agent.
 
@@ -43,3 +44,4 @@ class RolloutMemory:
         self.rewards[agent].append(reward)
         self.is_terminals[agent].append(is_terminal)
         self.state_values[agent].append(state_value)
+        self.action_masks[agent].append(action_mask)
