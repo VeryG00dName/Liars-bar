@@ -240,6 +240,12 @@ class PlayVsAIGUI:
                     num_players=num_players,
                     action_mask=action_mask
                 )
+                if 0 <= action <= 2:
+                    print(f"AI Agent {current_agent} played: {action+1} cards")
+                elif 3 <= action <= 5:
+                    print(f"AI Agent {current_agent} played: {action-2} cards")
+                else:
+                    print(f"AI Agent {current_agent} callenged {action}")
             else:
                 # Human player's turn
                 self.current_env.render('player')
@@ -312,8 +318,6 @@ class PlayVsAIGUI:
         # Debugging: Log action probabilities
         logging.debug(f"Action probabilities: {masked_probs.cpu().numpy()}")
         logging.debug(f"Selected action: {action}")
-        if action == 6:
-            print("Challenge")
         return action
 
     def get_human_action(self):
