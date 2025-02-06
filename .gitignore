@@ -167,3 +167,6 @@ agent_head_to_head_heatmap.png
 *.old
 scoreboard.json
 scoreboard.json
+game_logs.json
+processed_game_logs.json
+supervised_training_data.json
