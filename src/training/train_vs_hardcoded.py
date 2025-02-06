@@ -138,6 +138,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
         )
         if checkpoint_data is not None:
             start_episode, _ = checkpoint_data
+            logger.info(f"Loaded checkpoint from episode {start_episode}")
         else:
             start_episode = 1
     else:
