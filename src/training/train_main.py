@@ -201,7 +201,6 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
             raw_probs, _ = policy_nets[agent](observation_tensor, None)
             raw_probs = torch.clamp(raw_probs, min=1e-8, max=1.0).squeeze(0)  # shape: (output_dim,)
 
-            # <-- ADDED OR MODIFIED: Apply mask during action selection
             action_mask_tensor = torch.tensor(action_mask, dtype=torch.float32, device=device)
             masked_probs = raw_probs * action_mask_tensor
 
@@ -229,7 +228,6 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
             reward = env.rewards[agent]
             done_or_truncated = env.terminations[agent] or env.truncations[agent]
 
-            # <-- ADDED OR MODIFIED: Store the mask in memory
             memories[agent].store_transition(
                 agent=agent,
                 state=final_obs,
@@ -238,7 +236,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 reward=reward,
                 is_terminal=done_or_truncated,
                 state_value=state_value,
-                action_mask=action_mask  # We add the action mask here
+                action_mask=action_mask
             )
 
             # Accumulate rewards for logging
@@ -477,19 +475,19 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
 
             # Cull the lowest-performing agent at specified intervals
             if episode % config.CULL_INTERVAL == 0:
-                average_rewards = {}
-                for agent in agents:
-                    if recent_rewards[agent]:
-                        average_rewards[agent] = sum(recent_rewards[agent]) / len(recent_rewards[agent])
-                    else:
-                        average_rewards[agent] = 0.0
+                # Compute average rewards for all agents
+                average_rewards = {agent: np.mean(recent_rewards[agent]) if recent_rewards[agent] else 0.0 for agent in agents}
 
+                # Identify weakest and best-performing agents
                 lowest_agent = min(average_rewards, key=average_rewards.get)
+                highest_agent = max(average_rewards, key=average_rewards.get)
+
                 lowest_score = average_rewards[lowest_agent]
+                highest_score = average_rewards[highest_agent]
 
-                logger.info(f"Culling Agent '{lowest_agent}' with average reward {lowest_score:.2f}.")
+                logger.info(f"Culling Agent '{lowest_agent}' (Avg Reward: {lowest_score:.2f}) and replacing with a clone of '{highest_agent}' (Avg Reward: {highest_score:.2f}).")
 
-                # Reinitialize the culled agent's networks and optimizer
+                # Clone best agent's policy and value networks
                 policy_nets[lowest_agent] = PolicyNetwork(
                     input_dim=config.INPUT_DIM,
                     hidden_dim=config.HIDDEN_DIM,
@@ -498,6 +496,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                     use_dropout=True,
                     use_layer_norm=True
                 ).to(device)
+                policy_nets[lowest_agent].load_state_dict(policy_nets[highest_agent].state_dict())  # Copy weights
 
                 value_nets[lowest_agent] = ValueNetwork(
                     input_dim=config.INPUT_DIM,
@@ -505,12 +504,15 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                     use_dropout=True,
                     use_layer_norm=True
                 ).to(device)
+                value_nets[lowest_agent].load_state_dict(value_nets[highest_agent].state_dict())  # Copy weights
 
+                # Clone optimizer states for stability
                 optimizers_policy[lowest_agent] = optim.Adam(policy_nets[lowest_agent].parameters(), lr=config.LEARNING_RATE)
                 optimizers_value[lowest_agent] = optim.Adam(value_nets[lowest_agent].parameters(), lr=config.LEARNING_RATE)
+
+                # Reset experience memory and recent rewards for the cloned agent
                 memories[lowest_agent] = RolloutMemory([lowest_agent])
                 recent_rewards[lowest_agent] = []
-                # No dynamic entropy coefficient to reset
 
     # Close TensorBoard writer if it was opened
     if log_tensorboard and writer is not None:
