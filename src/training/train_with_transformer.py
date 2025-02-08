@@ -35,13 +35,38 @@ from src.training.train_extras import (
 )
 from src.env.liars_deck_env_utils import query_opponent_memory_full
 
-# --- CONCRETE IMPLEMENTATION: Convert Opponent Memory to Token Sequence ---
-def convert_memory_to_tokens(memory):
+# --- Vocabulary & Tokenization ---
+class Vocabulary:
+    def __init__(self, max_size):
+        """
+        Initialize a vocabulary with a maximum size.
+        We reserve index 0 for "<PAD>" and index 1 for "<UNK>".
+        """
+        self.token2idx = {"<PAD>": 0, "<UNK>": 1}
+        self.idx2token = {0: "<PAD>", 1: "<UNK>"}
+        self.max_size = max_size
+
+    def encode(self, token):
+        """
+        Return the index for the token. If the token is not in the vocabulary
+        and the vocabulary is not yet full, add it. Otherwise return the index for <UNK>.
+        """
+        if token in self.token2idx:
+            return self.token2idx[token]
+        else:
+            if len(self.token2idx) < self.max_size:
+                idx = len(self.token2idx)
+                self.token2idx[token] = idx
+                self.idx2token[idx] = token
+                return idx
+            else:
+                return self.token2idx["<UNK>"]
+
+def convert_memory_to_tokens(memory, vocab):
     """
     Convert the opponent memory (a list of events) to a sequence of token indices.
-    For each event (assumed to be a dictionary), create a string by sorting its keys
-    and joining key-value pairs with a separator. Then, use Python's built-in hash
-    (modulo config.STRATEGY_NUM_TOKENS) to convert that string into a token index.
+    For each event (assumed to be a dictionary or a string), create a string representation,
+    then use the provided vocabulary to map that string to an index.
     """
     tokens = []
     for event in memory:
@@ -51,11 +76,13 @@ def convert_memory_to_tokens(memory):
             token_str = "_".join(f"{k}-{v}" for k, v in sorted_items)
         else:
             token_str = str(event)
-        # Compute a token index from the string representation.
-        # (0 is typically reserved for PAD, so we use modulo and add 1 if needed.)
-        token_index = (abs(hash(token_str)) % config.STRATEGY_NUM_TOKENS)
+        token_index = vocab.encode(token_str)
         tokens.append(token_index)
     return tokens
+
+# Create a global vocabulary instance.
+# The maximum vocabulary size is set to config.STRATEGY_NUM_TOKENS.
+vocab = Vocabulary(max_size=config.STRATEGY_NUM_TOKENS)
 
 # --- Instantiate the Strategy Transformer and Remove the Classification Head ---
 strategy_transformer = StrategyTransformer(
@@ -191,8 +218,8 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
             for opp in env.possible_agents:
                 if opp != agent:
                     mem_summary = query_opponent_memory_full(agent, opp)
-                    # Convert the raw memory (list of events) to a token sequence using our concrete function.
-                    token_seq = convert_memory_to_tokens(mem_summary)
+                    # Convert the raw memory (list of events) to a token sequence using our vocabulary.
+                    token_seq = convert_memory_to_tokens(mem_summary, vocab)
                     token_tensor = torch.tensor(token_seq, dtype=torch.long, device=device).unsqueeze(0)
                     # Obtain the strategy embedding from the transformer.
                     with torch.no_grad():
