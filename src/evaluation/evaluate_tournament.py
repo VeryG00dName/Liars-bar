@@ -503,8 +503,8 @@ def main():
     logger.info(f"Total individual players loaded: {len(players)}")
 
     # Run the Swiss tournament
-    NUM_GAMES_PER_MATCH = 11
-    NUM_ROUNDS = 7
+    NUM_GAMES_PER_MATCH = config.NUM_GAMES_PER_MATCH
+    NUM_ROUNDS = config.NUM_ROUNDS
     action_counts = run_group_swiss_tournament(
         env, device, players,
         num_games_per_match=NUM_GAMES_PER_MATCH,
