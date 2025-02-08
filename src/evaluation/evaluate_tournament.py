@@ -13,7 +13,6 @@ from src.env.liars_deck_env_core import LiarsDeckEnv
 from src.model.new_models import PolicyNetwork, OpponentBehaviorPredictor, ValueNetwork
 from src import config
 
-
 from src.evaluation.evaluate_utils import (
     load_combined_checkpoint,
     get_hidden_dim_from_state_dict,
@@ -22,6 +21,9 @@ from src.evaluation.evaluate_utils import (
     OBS_VERSION_1,
     OBS_VERSION_2,
 )
+
+# Import memory utilities for models that use memory.
+from src.model.memory import get_opponent_memory
 
 __all__ = [
     'run_group_swiss_tournament',
@@ -33,7 +35,7 @@ def initialize_players(checkpoints_dir, device):
     """
     Specialized initialization for the tournament scenario.
     Loads checkpoint files ending with `.pth` and creates players with OpenSkill ratings. 
-    Handles both v1 & v2 obs models.
+    Handles both v1 & v2 obs models, and now records whether a player uses persistent memory.
     """
     if not os.path.isdir(checkpoints_dir):
         raise FileNotFoundError(f"The directory '{checkpoints_dir}' does not exist.")
@@ -66,18 +68,22 @@ def initialize_players(checkpoints_dir, device):
 
                 # Each checkpoint might contain multiple agents
                 for agent_name in policy_nets.keys():
-                    # Determine obs_version by checking the policy net's input dimension
                     policy_state_dict = policy_nets[agent_name]
+                    
+                    # Determine obs_version by checking the policy net's input dimension.
                     actual_input_dim = policy_state_dict['fc1.weight'].shape[1]
                     if actual_input_dim == 18:
                         obs_version = OBS_VERSION_1  # v1
-                    elif actual_input_dim == 16:
+                    elif actual_input_dim in (16, 24):
                         obs_version = OBS_VERSION_2  # v2
                     else:
                         raise ValueError(
                             f"Unknown input dimension ({actual_input_dim}) "
                             f"for agent '{agent_name}' in {filename}."
                         )
+                    
+                    # Check whether the policy network uses memory.
+                    uses_memory = ("fc4.weight" in policy_state_dict)
 
                     # Load the policy net
                     policy_hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, layer_prefix='fc1')
@@ -106,7 +112,7 @@ def initialize_players(checkpoints_dir, device):
 
                     # Create a unique player ID that includes the checkpoint filename as prefix.
                     player_id = f"{filename}_player_{agent_name}"
-                    # Initialize the rating using our shared OpenSkill model
+                    # Initialize the rating using our shared OpenSkill model.
                     players[player_id] = {
                         'policy_net': policy_net,
                         'value_net': value_net,
@@ -116,11 +122,12 @@ def initialize_players(checkpoints_dir, device):
                         'wins': 0,
                         'games_played': 0,
                         'obs_version': obs_version,  # Store the observation version
+                        'uses_memory': uses_memory
                     }
                     players[player_id]['score'] = players[player_id]['rating'].ordinal()
 
                     logging.info(
-                        f"Initialized player '{player_id}' [v{obs_version}] "
+                        f"Initialized player '{player_id}' [v{obs_version}, uses_memory={uses_memory}] "
                         f"with rating ordinal={players[player_id]['score']:.2f}."
                     )
 
@@ -134,7 +141,7 @@ def run_obp_inference_tournament(obp_model, obs, device, num_players, obs_versio
     """
     Similar to the function in evaluate.py, but specialized for the tournament.
     Uses the observation version to determine the opponent feature dimension.
-    If obp_model is None, return empty. Otherwise, run inference for each opponent.
+    If obp_model is None, return empty list.
     """
     if obp_model is None:
         return []
@@ -163,6 +170,7 @@ def run_obp_inference_tournament(obp_model, obs, device, num_players, obs_versio
             obp_probs.append(probs[0, 1].item())
 
     return obp_probs
+
 
 def swiss_grouping(players, match_history, group_size):
     """
@@ -212,10 +220,11 @@ def swiss_grouping(players, match_history, group_size):
 
     return groups
 
+
 def evaluate_agents_tournament(env, device, players_in_this_game, episodes=5):
     """
     A specialized version of evaluate_agents for the Swiss tournament.
-    Now supports both obs v1 and v2 by using adapt_observation_for_version.
+    Now supports both obs v1 and v2 (and memory-enhanced v2 models) by using adapt_observation_for_version.
     """
     logger = logging.getLogger("EvaluateTournament")
     player_ids = list(players_in_this_game.keys())
@@ -225,7 +234,15 @@ def evaluate_agents_tournament(env, device, players_in_this_game, episodes=5):
             f"environment's num_players ({env.num_players})."
         )
 
+    # Map environment agents (e.g. 'player_0', 'player_1', etc.) to our player IDs.
     agent_to_player = {f'player_{i}': player_ids[i] for i in range(env.num_players)}
+
+    # For players that use memory (and are obs v2), reset persistent memory at the start of the match.
+    for env_agent in agent_to_player:
+        pid = agent_to_player[env_agent]
+        if players_in_this_game[pid].get('uses_memory', False) and players_in_this_game[pid]['obs_version'] == OBS_VERSION_2:
+            get_opponent_memory(env_agent).memory.clear()
+
     action_counts = {pid: {action: 0 for action in range(config.OUTPUT_DIM)} for pid in player_ids}
     cumulative_wins = {pid: 0 for pid in player_ids}
     total_steps = 0
@@ -265,36 +282,57 @@ def evaluate_agents_tournament(env, device, players_in_this_game, episodes=5):
 
             player_id = agent_to_player[agent]
             player_data = players_in_this_game[player_id]
-
-            # 1) Adapt the observation to the player's obs_version
             obs_version = player_data['obs_version']
+
+            # 1) Adapt the observation to the player's obs_version.
             converted_obs = adapt_observation_for_version(observation, env.num_players, obs_version)
 
-            # 2) Run OBP inference using the converted_obs and player's obs_version
+            # 2) Run OBP inference using the converted_obs and player's obs_version.
             obp_model = player_data.get('obp_model', None)
             obp_probs = run_obp_inference_tournament(obp_model, converted_obs, device, env.num_players, obs_version)
 
-            # 3) Concatenate final observation
-            final_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32)], axis=0)
-
-            # 4) Check dimension
+            # 3) Build the final observation.
             expected_dim = player_data['policy_net'].fc1.in_features
+            # For players that use memory (and are v2), query and incorporate memory features.
+            if player_data.get('uses_memory', False) and obs_version == OBS_VERSION_2:
+                from src.env.liars_deck_env_utils import query_opponent_memory
+                mem_features_list = []
+                for opp in env.possible_agents:
+                    if opp != agent:
+                        mem_summary = query_opponent_memory(agent, opp)
+                        mem_features_list.append(mem_summary)
+                if mem_features_list:
+                    mem_features = np.concatenate(mem_features_list, axis=0)
+                else:
+                    mem_features = np.array([], dtype=np.float32)
+                # Compute required memory dimension.
+                required_mem_dim = expected_dim - (len(converted_obs) + len(obp_probs))
+                current_mem_dim = mem_features.shape[0]
+                if current_mem_dim < required_mem_dim:
+                    pad = np.zeros(required_mem_dim - current_mem_dim, dtype=np.float32)
+                    mem_features = np.concatenate([mem_features, pad], axis=0)
+                elif current_mem_dim > required_mem_dim:
+                    mem_features = mem_features[:required_mem_dim]
+                final_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32), mem_features], axis=0)
+            else:
+                final_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32)], axis=0)
+
+            # 4) Check the dimension.
             if len(final_obs) != expected_dim:
                 logger.error(
-                    f"Obs dimension mismatch for {player_id}: "
-                    f"expected {expected_dim}, got {len(final_obs)} (version={obs_version})."
+                    f"Obs dimension mismatch for {player_id}: expected {expected_dim}, got {len(final_obs)} (version={obs_version})."
                 )
                 env.step(None)
                 continue
 
-            # 5) Forward pass
+            # 5) Forward pass through the policy network.
             obs_tensor = torch.tensor(final_obs, dtype=torch.float32).unsqueeze(0).to(device)
             policy_net = player_data['policy_net']
             with torch.no_grad():
                 probs, _ = policy_net(obs_tensor, None)
             probs = torch.clamp(probs, min=1e-8, max=1.0)
 
-            # 6) Apply action mask
+            # 6) Apply action mask.
             mask = env.infos[agent].get('action_mask', [1] * config.OUTPUT_DIM)
             mask_tensor = torch.tensor(mask, dtype=torch.float32).to(device)
             masked_probs = probs * mask_tensor
@@ -508,7 +546,7 @@ def delete_bottom_half_checkpoints_by_score(players, checkpoints_dir):
 
 def main():
     """
-    Main function for the Swiss tournament, updated to handle both obs v1 and v2 models.
+    Main function for the Swiss tournament, updated to handle both obs v1/v2 and memory-enhanced models.
     """
     logging.basicConfig(
         level=logging.INFO,
