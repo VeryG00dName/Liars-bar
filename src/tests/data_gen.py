@@ -177,7 +177,11 @@ class AgentBattlegroundGUI:
             self.agent_selectors[i].state(["!disabled"])
 
     def load_selected_agents(self):
-        """Loads the selected AI agents from the selectors."""
+        """Loads the selected AI agents from the selectors.
+        
+        The label now includes the file name to differentiate PPO models,
+        since they are all named like 'player_0', 'player_1', etc.
+        """
         ai_agents = {}
         try:
             for i in range(2):
@@ -199,7 +203,7 @@ class AgentBattlegroundGUI:
                     "obs_version": model_data["obs_version"],
                     "input_dim": model_data["input_dim"],
                     "uses_memory": model_data["uses_memory"],
-                    "label": agent_name  # Save the model's label for training data purposes.
+                    "label": f"{file_name}_{agent_name}"  # Label now includes the file name for differentiation.
                 }
             return ai_agents
         except Exception as e:
