@@ -1,4 +1,4 @@
-# src/misc/gpu_test.py
+# src/tests/gpu_test.py
 
 import time
 import torch

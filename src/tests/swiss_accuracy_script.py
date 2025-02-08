@@ -1,4 +1,4 @@
-# src/misc/swiss_accuracy_script.py
+# src/tests/swiss_accuracy_script.py
 
 """
 swiss_accuracy_script.py

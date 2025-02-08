@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+# src/tests/swiss_consistency_test.py
 """
 swiss_consistency_test.py
 

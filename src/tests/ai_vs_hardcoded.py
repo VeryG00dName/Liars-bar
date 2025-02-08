@@ -1,4 +1,4 @@
-# src/misc/ai_vs_hardcoded.py
+# src/tests/ai_vs_hardcoded.py
 
 import os
 import logging
