@@ -1,6 +1,7 @@
 # src/model/memory.py
 
 import numpy as np
+from collections import deque
 
 class RolloutMemory:
     def __init__(self, agents):
@@ -50,20 +51,24 @@ class RolloutMemory:
 
 
 class OpponentMemory:
-    def __init__(self, decay=0.9):
+    def __init__(self, max_events=100):
         """
-        Initialize a persistent per-agent opponent memory.
-        The memory maps an opponent’s identifier to a list of events.
+        Initialize a persistent per-agent opponent memory with aggregates.
         
         Args:
-            decay (float): A decay factor for older observations (if used later).
+            max_events (int): Maximum number of events to store per opponent.
         """
-        self.memory = {}  # {opponent_id: [event, event, ...]}
-        self.decay = decay
+        # Store events as a deque with a fixed maximum length.
+        self.memory = {}         # {opponent_id: deque([event, event, ...], maxlen=max_events)}
+        # Aggregated statistics for each opponent.
+        self.aggregates = {}     # {opponent_id: {'total': int, 'challenge_count': int, 
+                                 #                'card_count_sum': int, 'penalties_sum': int,
+                                 #                'three_card_trigger_count': int}}
+        self.max_events = max_events
 
     def update(self, opponent, response, triggering_action, penalties, card_count):
         """
-        Record an event for a given opponent.
+        Record an event for a given opponent and update the running aggregates.
         
         Args:
             opponent (str): Opponent's identifier.
@@ -78,9 +83,38 @@ class OpponentMemory:
             'penalties': penalties,
             'card_count': card_count,
         }
+        # Initialize data structures if needed.
         if opponent not in self.memory:
-            self.memory[opponent] = []
+            self.memory[opponent] = deque(maxlen=self.max_events)
+            self.aggregates[opponent] = {
+                'total': 0,
+                'challenge_count': 0,
+                'card_count_sum': 0,
+                'penalties_sum': 0,
+                'three_card_trigger_count': 0
+            }
+
+        # If the deque is full, remove the oldest event and subtract its contributions.
+        if len(self.memory[opponent]) == self.max_events:
+            old_event = self.memory[opponent][0]
+            self.aggregates[opponent]['total'] -= 1
+            if old_event['response'] == "Challenge":
+                self.aggregates[opponent]['challenge_count'] -= 1
+            self.aggregates[opponent]['card_count_sum'] -= old_event['card_count']
+            self.aggregates[opponent]['penalties_sum'] -= old_event['penalties']
+            if old_event['triggering_action'] == "Play_3":
+                self.aggregates[opponent]['three_card_trigger_count'] -= 1
+
+        # Append the new event.
         self.memory[opponent].append(event)
+        # Update aggregates.
+        self.aggregates[opponent]['total'] += 1
+        if response == "Challenge":
+            self.aggregates[opponent]['challenge_count'] += 1
+        self.aggregates[opponent]['card_count_sum'] += card_count
+        self.aggregates[opponent]['penalties_sum'] += penalties
+        if triggering_action == "Play_3":
+            self.aggregates[opponent]['three_card_trigger_count'] += 1
 
     def get_summary(self, opponent):
         """
@@ -88,33 +122,24 @@ class OpponentMemory:
         Returns a vector (e.g., [challenge_rate, normalized_avg_card_count, normalized_avg_penalties, three_card_trigger_rate]).
         
         If no events exist for the opponent, returns a zero vector.
+        This method now runs in O(1) time.
         """
-        events = self.memory.get(opponent, [])
-        if not events:
+        agg = self.aggregates.get(opponent)
+        if not agg or agg['total'] == 0:
             return np.zeros(4, dtype=np.float32)
-        
-        total = len(events)
-        challenge_count = sum(1 for e in events if e['response'] == "Challenge")
-        avg_card_count = np.mean([e['card_count'] for e in events])
-        avg_penalties = np.mean([e['penalties'] for e in events])
-        three_card_trigger_count = sum(1 for e in events if e['triggering_action'] == "Play_3")
-        
+        total = agg['total']
+        challenge_rate = agg['challenge_count'] / total
+        avg_card_count = agg['card_count_sum'] / total
+        avg_penalties = agg['penalties_sum'] / total
+        three_card_rate = agg['three_card_trigger_count'] / total
         summary = np.array([
-            challenge_count / total,         # Challenge rate
-            avg_card_count / 5.0,              # Normalized average card count (assuming max hand size of 5)
-            avg_penalties / 3.0,               # Normalized average penalty count (if threshold is 3)
-            three_card_trigger_count / total   # Fraction for 3-card triggers
+            challenge_rate,       # Challenge rate
+            avg_card_count / 5.0, # Normalized average card count (assuming max hand size 5)
+            avg_penalties / 3.0,  # Normalized average penalties (if threshold is 3)
+            three_card_rate       # Fraction of 3-card triggers
         ], dtype=np.float32)
         return summary
 
-    def decay_memory(self):
-        """
-        Optionally, prune the memory so that only recent events are kept.
-        """
-        max_events = 50  # For example, keep only the last 50 events per opponent
-        for opponent, events in self.memory.items():
-            if len(events) > max_events:
-                self.memory[opponent] = events[-max_events:]
 
 # Global dictionary to hold persistent opponent memories per agent.
 PERSISTENT_OPPONENT_MEMORIES = {}
@@ -125,5 +150,5 @@ def get_opponent_memory(agent):
     If one does not exist, it creates it.
     """
     if agent not in PERSISTENT_OPPONENT_MEMORIES:
-        PERSISTENT_OPPONENT_MEMORIES[agent] = OpponentMemory()
+        PERSISTENT_OPPONENT_MEMORIES[agent] = OpponentMemory(max_events=50)
     return PERSISTENT_OPPONENT_MEMORIES[agent]
