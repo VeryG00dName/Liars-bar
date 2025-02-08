@@ -420,7 +420,7 @@ def main():
     logger.info(f"Loaded {len(players)} total players.")
 
     # Define the number of games per triple
-    NUM_GAMES_PER_TRIPLE = config.NUM_GAMES_PER_TRIPLE
+    NUM_GAMES_PER_TRIPLE = config.NUM_GAMES_PER_MATCH
 
     # Run the evaluation
     action_counts, agent_h2h = run_evaluation(
