@@ -241,8 +241,8 @@ def objective(trial: optuna.trial.Trial) -> float:
                 }
 
         # === 5) Run the Swiss tournament ===
-        NUM_ROUNDS = 7
-        NUM_GAMES_PER_MATCH = 11
+        NUM_ROUNDS = config.NUM_ROUNDS
+        NUM_GAMES_PER_MATCH = config.NUM_GAMES_PER_MATCH
 
         if len(trial_agents) == 1:
             # First trial: No existing agents to evaluate against
