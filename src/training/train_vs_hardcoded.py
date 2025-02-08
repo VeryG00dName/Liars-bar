@@ -24,8 +24,12 @@ from src.model.hard_coded_agents import (
     TableFirstConservativeChallenger,
     StrategicChallenger,
     SelectiveTableConservativeChallenger,
-    RandomAgent
+    RandomAgent,
+    TableNonTableAgent
 )
+
+# Import query_opponent_memory for opponent memory integration
+from src.env.liars_deck_env_utils import query_opponent_memory
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 torch.backends.cudnn.benchmark = True
@@ -157,7 +161,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
     original_agent_order = list(env.agents)
 
     # Hard-coded agents to choose from if you randomize
-    hardcoded_agent_classes = [GreedyCardSpammer, TableFirstConservativeChallenger, StrategicChallenger, SelectiveTableConservativeChallenger, RandomAgent]
+    hardcoded_agent_classes = [GreedyCardSpammer, TableFirstConservativeChallenger, StrategicChallenger, SelectiveTableConservativeChallenger, RandomAgent, TableNonTableAgent]
 
     for episode in range(start_episode, num_episodes + 1):
         obs, infos = env.reset()
@@ -178,7 +182,6 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
         episode_rewards = {agent: 0 for agent in agents}
         steps_in_episode = 0
 
-
         while env.agent_selection is not None:
             steps_in_episode += 1
             agent = env.agent_selection
@@ -194,17 +197,36 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
 
             # 2) Run OBP
             obp_probs = run_obp_inference(obp_model, observation, device, env.num_players)
-            final_obs = np.concatenate([observation, obp_probs], axis=0)
 
-            observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
-
-            # 3) Decide action
+            # 3) Integrate Opponent Memory and build final_obs with a consistent shape
             if agent == hardcoded_agent_id:
-                # Hard-coded agent picks action
+                # For hard-coded agents, we still need to create a final_obs with the same shape as RL agents.
+                # Compute the dimensions for the base observation + OBP output.
+                base_obs = observation
+                obp_arr = np.array(obp_probs, dtype=np.float32)
+                current_dim = base_obs.shape[0] + obp_arr.shape[0]
+                # The expected dimension is config.INPUT_DIM. Fill the missing part with zeros.
+                missing_dim = config.INPUT_DIM - current_dim
+                mem_features = np.zeros(missing_dim, dtype=np.float32)
+                final_obs = np.concatenate([base_obs, obp_arr, mem_features], axis=0)
+            else:
+                # For RL agents, query opponent memory and use it.
+                mem_features_list = []
+                for opp in env.possible_agents:
+                    if opp != agent:
+                        mem_summary = query_opponent_memory(agent, opp)
+                        mem_features_list.append(mem_summary)
+                mem_features = np.concatenate(mem_features_list, axis=0)
+                final_obs = np.concatenate([observation, np.array(obp_probs, dtype=np.float32), mem_features], axis=0)
+
+            # 4) Decide action
+            if agent == hardcoded_agent_id:
+                # Hard-coded agent picks action using the base observation (without dummy memory)
                 action = hardcoded_agent_instance.play_turn(observation, action_mask, table_card=None)
                 log_prob_value = 0.0
             else:
-                # RL Agent picks action
+                # RL Agent picks action using the combined observation (base + OBP + memory)
+                observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
                 probs, _ = policy_nets[agent](observation_tensor, None)
                 probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
 
@@ -213,12 +235,10 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 masked_probs = probs * mask_t
 
                 if masked_probs.sum() == 0:
-                    # Fallback if all masked probs are zero
                     valid_indices = torch.nonzero(mask_t, as_tuple=True)[0]
                     if len(valid_indices) > 0:
                         masked_probs[valid_indices] = 1.0 / valid_indices.numel()
                     else:
-                        # If no valid action, pick uniformly
                         masked_probs = torch.ones_like(probs) / probs.size(0)
                 else:
                     masked_probs /= masked_probs.sum()
@@ -231,8 +251,8 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
             env.step(action)
             reward = 0
 
-
-            # 6) Store transition in RolloutMemory
+            # 5) Store transition in RolloutMemory.
+            # Use final_obs (which now always has length config.INPUT_DIM).
             memories[agent].store_transition(
                 agent=agent,
                 state=final_obs,
@@ -240,17 +260,19 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 log_prob=log_prob_value,
                 reward=reward,
                 is_terminal=env.terminations[agent] or env.truncations[agent],
-                state_value=value_nets[agent](observation_tensor).item(),
-                action_mask=action_mask  # Store it
+                state_value=(
+                    value_nets[agent](torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)).item()
+                    if agent != hardcoded_agent_id else 0.0
+                ),
+                action_mask=action_mask  # Store it for later use in masking
             )
 
             env_reward = env.rewards[agent]
             episode_rewards[agent] += env_reward
 
-        # Once the episode terminates or truncates
+        # Once the episode terminates or truncates, add final environment reward to the last transition for each agent
         for ag in agents:
             if len(memories[ag].rewards[ag]) > 0:
-                # Add final environment reward to the last transition
                 memories[ag].rewards[ag][-1] += env.rewards[ag]
 
         # Extract & store OBP data
@@ -311,7 +333,6 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 old_log_probs = torch.tensor(np.array(memory.log_probs[agent], dtype=np.float32), device=device)
                 returns_ = torch.tensor(np.array(memory.returns[agent], dtype=np.float32), device=device)
                 advantages_ = torch.tensor(np.array(memory.advantages[agent], dtype=np.float32), device=device)
-                # <-- ADDED: action masks
                 action_masks_ = torch.tensor(np.array(memory.action_masks[agent], dtype=np.float32), device=device)
 
                 # Normalize advantages
@@ -326,13 +347,11 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
 
                 for _ in range(config.K_EPOCHS):
                     # Forward pass
-                    probs, _ = policy_nets[agent](states, None)  # shape: (batch_size, action_dim)
+                    probs, _ = policy_nets[agent](states, None)
                     probs = torch.clamp(probs, 1e-8, 1.0)
 
-                    # <-- ADDED: Mask invalid actions before computing distribution
+                    # Mask invalid actions
                     masked_probs = probs * action_masks_
-
-                    # Handle rows where the sum is zero after masking
                     row_sums = masked_probs.sum(dim=-1, keepdim=True)
                     masked_probs = torch.where(
                         row_sums > 0,
@@ -353,8 +372,6 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                     surr1 = ratios * advantages_
                     surr2 = torch.clamp(ratios, 1 - config.EPS_CLIP, 1 + config.EPS_CLIP) * advantages_
                     policy_loss = -torch.min(surr1, surr2).mean()
-
-                    # Subtract entropy bonus
                     policy_loss -= static_entropy_coef * entropy
 
                     # Value loss
@@ -367,12 +384,11 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
 
                     total_loss = policy_loss + 0.5 * value_loss
 
-                    # Optimize
                     optimizers_policy[agent].zero_grad()
                     optimizers_value[agent].zero_grad()
                     total_loss.backward()
 
-                    # Policy grad norm
+                    # Compute gradient norms for logging
                     p_grad_norm = 0.0
                     for param in policy_nets[agent].parameters():
                         if param.grad is not None:
@@ -380,7 +396,6 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                     p_grad_norm = p_grad_norm ** 0.5
                     policy_grad_norms.append(p_grad_norm)
 
-                    # Value grad norm
                     v_grad_norm = 0.0
                     for param in value_nets[agent].parameters():
                         if param.grad is not None:
