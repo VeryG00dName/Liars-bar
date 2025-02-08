@@ -73,7 +73,7 @@ GAMMA = 0.99                  # Discount factor
 GAE_LAMBDA = 0.95             # GAE lambda parameter
 EPS_CLIP = 0.1                # PPO clip parameter
 K_EPOCHS = 4                  # Number of PPO epochs per update
-NUM_EPISODES = 15000         # Total number of training episodes
+NUM_EPISODES = 30000         # Total number of training episodes
 UPDATE_STEPS = 3              # Number of episodes before PPO update
 MAX_NORM = 0.3                # Maximum norm for gradient clipping
 # ----------------------------
@@ -122,13 +122,17 @@ DEVICE = "cuda"                # Device for training (CPU/GPU)
 # Derived Configurations
 # ----------------------------
 def set_derived_config(env_observation_space, env_action_space, num_opponents):
-    global INPUT_DIM, OUTPUT_DIM, OPPONENT_INPUT_DIM  # Add OPPONENT_INPUT_DIM
-    
+    global INPUT_DIM, OUTPUT_DIM, OPPONENT_INPUT_DIM
+
     if not isinstance(env_observation_space, spaces.Box):
         raise NotImplementedError("Only Box observation spaces are supported.")
-    
-    # Calculate opponent feature dimension (4 features per opponent)
+
+    # OBP model input dimension is fixed to 4 features.
     OPPONENT_INPUT_DIM = 4
-    
-    INPUT_DIM = env_observation_space.shape[0] + 2  # Existing
-    OUTPUT_DIM = env_action_space.n  # Existing
+
+    # Main model's input dimension is:
+    #   base observation dimension +
+    #   2 (for the OBP output) +
+    #   (OPPONENT_INPUT_DIM * num_opponents) for memory features from each opponent.
+    INPUT_DIM = env_observation_space.shape[0] + 2 + (OPPONENT_INPUT_DIM * num_opponents)
+    OUTPUT_DIM = env_action_space.n
