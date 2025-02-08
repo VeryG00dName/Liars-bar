@@ -140,6 +140,16 @@ class OpponentMemory:
         ], dtype=np.float32)
         return summary
 
+    def get_full_memory(self, opponent):
+        """
+        Return the full memory (all recorded events) for the given opponent as a list.
+        If no events are recorded, returns an empty list.
+        """
+        if opponent in self.memory:
+            return list(self.memory[opponent])
+        else:
+            return []
+        
 # Global dictionary to hold persistent opponent memories per agent.
 PERSISTENT_OPPONENT_MEMORIES = {}
 
