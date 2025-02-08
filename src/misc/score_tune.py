@@ -195,21 +195,21 @@ def objective(trial: optuna.trial.Trial) -> float:
     scoring_params = {
         "play_reward_per_card": trial.suggest_int("play_reward_per_card", -2, 2),
         "play_reward": trial.suggest_int("play_reward", -2, 2),
-        "invalid_play_penalty": trial.suggest_int("invalid_play_penalty", -10, 0),
-        "challenge_success_challenger_reward": trial.suggest_int("challenge_success_challenger_reward", 1, 10),
-        "challenge_success_claimant_penalty": trial.suggest_int("challenge_success_claimant_penalty", -10, -1),
-        "challenge_fail_challenger_penalty": trial.suggest_int("challenge_fail_challenger_penalty", -10, 0),
-        "challenge_fail_claimant_reward": trial.suggest_int("challenge_fail_claimant_reward", 0, 10),
-        "forced_challenge_success_challenger_reward": trial.suggest_int("forced_challenge_success_challenger_reward", 0, 5),
-        "forced_challenge_success_claimant_penalty": trial.suggest_int("forced_challenge_success_claimant_penalty", -10, 0),
-        "invalid_challenge_penalty": trial.suggest_int("invalid_challenge_penalty", -10, 0),
-        "termination_penalty": trial.suggest_int("termination_penalty", -10, 0),
+        "invalid_play_penalty": trial.suggest_int("invalid_play_penalty", -10, 1),
+        "challenge_success_challenger_reward": trial.suggest_int("challenge_success_challenger_reward", -1, 10),
+        "challenge_success_claimant_penalty": trial.suggest_int("challenge_success_claimant_penalty", -10, 1),
+        "challenge_fail_challenger_penalty": trial.suggest_int("challenge_fail_challenger_penalty", -10, 1),
+        "challenge_fail_claimant_reward": trial.suggest_int("challenge_fail_claimant_reward", -1, 10),
+        "forced_challenge_success_challenger_reward": trial.suggest_int("forced_challenge_success_challenger_reward", -1, 5),
+        "forced_challenge_success_claimant_penalty": trial.suggest_int("forced_challenge_success_claimant_penalty", -10, 1),
+        "invalid_challenge_penalty": trial.suggest_int("invalid_challenge_penalty", -10, 1),
+        "termination_penalty": trial.suggest_int("termination_penalty", -10, 1),
         "game_win_bonus": trial.suggest_int("game_win_bonus", 5, 20),
         "game_lose_penalty": trial.suggest_int("game_lose_penalty", -20, -1),
         "hand_empty_bonus": trial.suggest_int("hand_empty_bonus", -2, 2),
-        "consecutive_action_penalty": trial.suggest_int("consecutive_action_penalty", -5, 0),
-        "successful_bluff_reward": trial.suggest_int("successful_bluff_reward", 0, 5),
-        "unchallenged_bluff_penalty": trial.suggest_int("unchallenged_bluff_penalty", -5, 0)
+        "consecutive_action_penalty": trial.suggest_int("consecutive_action_penalty", -5, 1),
+        "successful_bluff_reward": trial.suggest_int("successful_bluff_reward", -1, 5),
+        "unchallenged_bluff_penalty": trial.suggest_int("unchallenged_bluff_penalty", -5, 1)
     }
     logging.info(f"Trial {trial.number} scoring parameters: {scoring_params}")
 
