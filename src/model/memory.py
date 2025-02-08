@@ -51,104 +51,99 @@ class RolloutMemory:
 
 
 class OpponentMemory:
-    def __init__(self, max_events=100):
+    def __init__(self, max_events=200):
         """
-        Initialize a persistent per-agent opponent memory with aggregates.
+        Initialize per-agent opponent memory with separate early/late aggregates.
         
         Args:
             max_events (int): Maximum number of events to store per opponent.
         """
-        # Store events as a deque with a fixed maximum length.
-        self.memory = {}         # {opponent_id: deque([event, event, ...], maxlen=max_events)}
-        # Aggregated statistics for each opponent.
-        self.aggregates = {}     # {opponent_id: {'total': int, 'challenge_count': int, 
-                                 #                'card_count_sum': int, 'penalties_sum': int,
-                                 #                'three_card_trigger_count': int}}
+        self.memory = {}     # {opponent_id: deque(..., maxlen=max_events)}
+        self.aggregates = {} # {opponent_id: {early_total, late_total, early_challenge_count, late_challenge_count,
+                             #                early_three_card_trigger_count, late_three_card_trigger_count}}
         self.max_events = max_events
 
     def update(self, opponent, response, triggering_action, penalties, card_count):
         """
-        Record an event for a given opponent and update the running aggregates.
+        Record an event and update early/late aggregates based on the card count.
         
         Args:
             opponent (str): Opponent's identifier.
-            response (str): The action taken by the opponent (e.g., "Challenge", "Play").
-            triggering_action (str): The action that prompted the opponent’s response.
-            penalties (int): The opponent’s penalty count at that moment.
-            card_count (int): The opponent’s number of cards at that moment.
+            response (str): E.g., "Challenge" or another response type.
+            triggering_action (str): E.g., "Play_3" if it's a three-card play.
+            penalties (int): Current penalty count (not used in this summary, but you might log it).
+            card_count (int): Current card count of the opponent.
+                             (If card_count < 3, consider the event as occurring in the late phase.)
         """
         event = {
             'response': response,
             'triggering_action': triggering_action,
             'penalties': penalties,
-            'card_count': card_count,
+            'card_count': card_count
         }
-        # Initialize data structures if needed.
+        
+        # Initialize storage for opponent if necessary.
         if opponent not in self.memory:
             self.memory[opponent] = deque(maxlen=self.max_events)
             self.aggregates[opponent] = {
-                'total': 0,
-                'challenge_count': 0,
-                'card_count_sum': 0,
-                'penalties_sum': 0,
-                'three_card_trigger_count': 0
+                'early_total': 0,
+                'late_total': 0,
+                'early_challenge_count': 0,
+                'late_challenge_count': 0,
+                'early_three_card_trigger_count': 0,
+                'late_three_card_trigger_count': 0
             }
+        
+        # (Optionally, if the deque is full, you might subtract the oldest event's contribution here.)
 
-        # If the deque is full, remove the oldest event and subtract its contributions.
-        if len(self.memory[opponent]) == self.max_events:
-            old_event = self.memory[opponent][0]
-            self.aggregates[opponent]['total'] -= 1
-            if old_event['response'] == "Challenge":
-                self.aggregates[opponent]['challenge_count'] -= 1
-            self.aggregates[opponent]['card_count_sum'] -= old_event['card_count']
-            self.aggregates[opponent]['penalties_sum'] -= old_event['penalties']
-            if old_event['triggering_action'] == "Play_3":
-                self.aggregates[opponent]['three_card_trigger_count'] -= 1
-
-        # Append the new event.
         self.memory[opponent].append(event)
-        # Update aggregates.
-        self.aggregates[opponent]['total'] += 1
-        if response == "Challenge":
-            self.aggregates[opponent]['challenge_count'] += 1
-        self.aggregates[opponent]['card_count_sum'] += card_count
-        self.aggregates[opponent]['penalties_sum'] += penalties
-        if triggering_action == "Play_3":
-            self.aggregates[opponent]['three_card_trigger_count'] += 1
+        agg = self.aggregates[opponent]
+        
+        # Use the opponent's card count to determine if the event is early or late.
+        if card_count < 3:
+            # Late event
+            agg['late_total'] += 1
+            if response == "Challenge":
+                agg['late_challenge_count'] += 1
+            if triggering_action == "Play_3":
+                agg['late_three_card_trigger_count'] += 1
+        else:
+            # Early event
+            agg['early_total'] += 1
+            if response == "Challenge":
+                agg['early_challenge_count'] += 1
+            if triggering_action == "Play_3":
+                agg['early_three_card_trigger_count'] += 1
 
     def get_summary(self, opponent):
         """
-        Produce a fixed-length summary vector for an opponent based on stored events.
-        Returns a vector (e.g., [challenge_rate, normalized_avg_card_count, normalized_avg_penalties, three_card_trigger_rate]).
-        
-        If no events exist for the opponent, returns a zero vector.
-        This method now runs in O(1) time.
+        Produce a summary vector with early/late challenge rates and three-card challenge rates.
+        Returns a vector of shape (4,).
         """
-        agg = self.aggregates.get(opponent)
-        if not agg or agg['total'] == 0:
+        agg = self.aggregates.get(opponent, None)
+        if not agg:
             return np.zeros(4, dtype=np.float32)
-        total = agg['total']
-        challenge_rate = agg['challenge_count'] / total
-        avg_card_count = agg['card_count_sum'] / total
-        avg_penalties = agg['penalties_sum'] / total
-        three_card_rate = agg['three_card_trigger_count'] / total
+        
+        early_total = agg['early_total']
+        late_total = agg['late_total']
+        
+        early_challenge_rate = (agg['early_challenge_count'] / early_total) if early_total > 0 else 0.0
+        late_challenge_rate = (agg['late_challenge_count'] / late_total) if late_total > 0 else 0.0
+        early_three_rate = (agg['early_three_card_trigger_count'] / early_total) if early_total > 0 else 0.0
+        late_three_rate = (agg['late_three_card_trigger_count'] / late_total) if late_total > 0 else 0.0
+        
         summary = np.array([
-            challenge_rate,       # Challenge rate
-            avg_card_count / 5.0, # Normalized average card count (assuming max hand size 5)
-            avg_penalties / 3.0,  # Normalized average penalties (if threshold is 3)
-            three_card_rate       # Fraction of 3-card triggers
+            early_challenge_rate,
+            late_challenge_rate,
+            early_three_rate,
+            late_three_rate
         ], dtype=np.float32)
         return summary
-
 
 # Global dictionary to hold persistent opponent memories per agent.
 PERSISTENT_OPPONENT_MEMORIES = {}
 
 def get_opponent_memory(agent):
-    """
-    Returns the persistent OpponentMemory instance for the given agent.
-    If one does not exist, it creates it.
-    """
     if agent not in PERSISTENT_OPPONENT_MEMORIES:
-        PERSISTENT_OPPONENT_MEMORIES[agent] = OpponentMemory(max_events=50)
+        PERSISTENT_OPPONENT_MEMORIES[agent] = OpponentMemory(max_events=200)
     return PERSISTENT_OPPONENT_MEMORIES[agent]
