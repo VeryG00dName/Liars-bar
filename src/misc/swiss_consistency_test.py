@@ -163,7 +163,7 @@ def main():
     NUM_ROUNDS = 7       # Number of Swiss rounds per tournament run.
     NUM_RUNS = 5          # How many independent tournament runs per setting.
     # List of NUM_GAMES_PER_MATCH values to test.
-    num_games_list = [1, 3, 5, 7, 11, 15]
+    num_games_list = [7, 11, 15, 19, 23]
 
     # Set up the environment and device.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
