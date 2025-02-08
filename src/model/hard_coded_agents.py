@@ -176,6 +176,78 @@ class SelectiveTableConservativeChallenger:
         # If no other move is available, challenge.
         return 6
 
+class TableNonTableAgent:
+    def __init__(self, agent_name):
+        self.name = agent_name
+        # This flag is used to commit to playing table cards consecutively when starting from 2 table cards.
+        self.commit_to_table = False
+
+    def play_turn(self, observation, action_mask, table_card):
+        """
+        Strategy:
+        1. If 3 or more table cards are available, play 3 table cards (action 2).
+        2. If in the middle of a 2-table-card series (commit mode), play a table card (action 0).
+        3. If exactly 2 table cards are available (and not already committed), initiate the series by playing one table card (action 0).
+        4. If non-table cards are 3 or more, play 2 non-table cards (action 4).
+        5. If exactly 1 table card is available (and not in commit mode):
+           - If there are any non-table cards, play one non-table card (action 3).
+           - Otherwise, play the table card (action 0).
+        6. If no table cards remain, try playing one non-table card (action 3).
+        7. If none of the above applies, challenge (action 6).
+        
+        Notes:
+          - We assume that the observation’s first two values are normalized counts for table and non-table cards.
+          - The counts are rescaled by 5 (as in the other bots).
+          - Action indices:
+              - Action 2: play 3 table cards.
+              - Action 0: play 1 table card.
+              - Action 4: play 2 non-table cards.
+              - Action 3: play 1 non-table card.
+              - Action 6: challenge.
+        """
+        # Decode card counts (using the same scaling as the other agents).
+        table_cards = int(round(observation[0] * 5))
+        non_table_cards = int(round(observation[1] * 5))
+
+        # 1. If 3 or more table cards: play 3 table cards.
+        if table_cards >= 3 and action_mask[2] == 1:
+            self.commit_to_table = False  # clear any previous commit mode
+            return 2
+
+        # 2. If we are in commit mode, force playing a table card.
+        if self.commit_to_table:
+            if table_cards > 0 and action_mask[0] == 1:
+                return 0
+            else:
+                # If for some reason we can no longer play a table card, cancel commit mode.
+                self.commit_to_table = False
+
+        # 3. If exactly 2 table cards, start the commit mode and play one table card.
+        if table_cards == 2 and action_mask[0] == 1:
+            self.commit_to_table = True
+            return 0
+
+        # 4. If non-table cards are 3 or more, play 2 non-table cards.
+        if non_table_cards >= 3 and action_mask[4] == 1:
+            return 4
+
+        # 5. If exactly 1 table card (and not in commit mode):
+        if table_cards == 1:
+            # Prefer playing non-table cards one at a time if available.
+            if non_table_cards > 0 and action_mask[3] == 1:
+                return 3
+            # Otherwise, play the table card.
+            if action_mask[0] == 1:
+                return 0
+
+        # 6. If no table cards remain, try playing one non-table card.
+        if table_cards == 0:
+            if non_table_cards >= 1 and action_mask[3] == 1:
+                return 3
+
+        # 7. Fallback: challenge.
+        return 6
+
 class RandomAgent:
     def __init__(self, agent_name):
         self.name = agent_name        
