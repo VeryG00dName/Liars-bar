@@ -323,9 +323,10 @@ def update_openskill_ratings(players, group, group_ranking, cumulative_wins):
 
 def run_group_swiss_tournament(env, device, players, num_games_per_match=5, NUM_ROUNDS=7):
     """
-    Runs a Swiss-style tournament. Each round, sort players by 'score', group them
-    into sets of size env.num_players, evaluate with evaluate_agents_tournament,
-    then update OpenSkill ratings once per group.
+    Runs a Swiss-style tournament. Each round, players are grouped into sets of size env.num_players.
+    For the first round, the grouping is done randomly; in subsequent rounds, players are sorted by 'score'.
+    Then, for each group the match is evaluated with evaluate_agents_tournament,
+    and the OpenSkill ratings are updated once per group.
     """
     logger = logging.getLogger("EvaluateTournament")
     player_ids = list(players.keys())
@@ -337,8 +338,13 @@ def run_group_swiss_tournament(env, device, players, num_games_per_match=5, NUM_
     for round_num in range(1, NUM_ROUNDS + 1):
         logger.info(f"=== Starting Round {round_num} with {len(player_ids)} players ===")
 
-        # Sort descending by current 'score'
-        sorted_players = sorted(player_ids, key=lambda pid: players[pid]['score'], reverse=True)
+        # For the first round, mix players randomly.
+        if round_num == 1:
+            sorted_players = player_ids.copy()
+            random.shuffle(sorted_players)
+        else:
+            # For subsequent rounds, sort players descending by current 'score'
+            sorted_players = sorted(player_ids, key=lambda pid: players[pid]['score'], reverse=True)
 
         # Partition into groups of size group_size
         groups = []
