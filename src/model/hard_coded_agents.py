@@ -248,6 +248,54 @@ class TableNonTableAgent:
         # 7. Fallback: challenge.
         return 6
 
+class Classic:
+    def __init__(self, agent_name):
+        self.name = agent_name
+
+    def play_turn(self, observation, action_mask, table_card):
+        """
+        Classic Bot Strategy:
+        1. Challenge if the opponent has exactly 1 card left.
+        2. Challenge if the opponent's last played move involved more than 1 card.
+        3. Otherwise, play 1 table card at a time (action 0) as long as table cards remain.
+        4. If no table cards remain, play 1 non-table card at a time (action 3).
+        5. Fallback: challenge (action 6).
+
+        Note: This implementation assumes a 2-player game.
+        """
+        # Decode card counts (using the same scaling as the other bots).
+        table_cards = int(round(observation[0] * 5))
+        non_table_cards = int(round(observation[1] * 5))
+        total_cards = table_cards + non_table_cards
+
+        # Determine how many cards the opponent last played.
+        last_action_count = int(round(observation[2]))
+
+        # Extract active players' card counts.
+        # Assuming a 2-player game, observation[3:5] contains normalized counts for both players.
+        active_counts = [int(round(c * 5)) for c in observation[3:5]]
+        # Our card count is total_cards; thus the opponent's card count is:
+        opponent_cards = sum(active_counts) - total_cards
+
+        # 1. Challenge if the opponent has exactly 1 card left.
+        if opponent_cards == 1:
+            return 6
+
+        # 2. Challenge if the opponent's last play involved more than 1 card.
+        if last_action_count > 1:
+            return 6
+
+        # 3. If we have any table cards, play 1 table card (action 0).
+        if table_cards > 0 and action_mask[0] == 1:
+            return 0
+
+        # 4. If no table cards remain but we have non-table cards, play 1 non-table card (action 3).
+        if non_table_cards > 0 and action_mask[3] == 1:
+            return 3
+
+        # 5. Fallback: challenge.
+        return 6
+
 class RandomAgent:
     def __init__(self, agent_name):
         self.name = agent_name        
