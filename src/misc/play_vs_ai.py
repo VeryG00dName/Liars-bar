@@ -8,12 +8,18 @@ from tkinter import messagebox
 from tkinterdnd2 import TkinterDnD, DND_FILES
 import torch
 import numpy as np
+
 from src.env.liars_deck_env_core import LiarsDeckEnv
 from src.model.new_models import PolicyNetwork, OpponentBehaviorPredictor
 from src import config
 
+# Import memory utilities and opponent memory query function.
+from src.model.memory import get_opponent_memory
+from src.env.liars_deck_env_utils import query_opponent_memory
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("PlayVsAI")
+
 
 class PlayVsAIGUI:
     def __init__(self, root):
@@ -22,6 +28,7 @@ class PlayVsAIGUI:
         self.root.geometry("800x500")
         
         self.loaded_models = {}
+        # When an AI agent is loaded, we now save both its checkpoint state dicts (policy and OBP)
         self.selected_agents = {}
         
         self.create_file_drop_zone()
@@ -104,6 +111,7 @@ class PlayVsAIGUI:
         required_keys = ["policy_nets", "obp_model"]
         if any(k not in checkpoint for k in required_keys):
             raise ValueError("Missing required keys in checkpoint")
+        # Save both the policy networks state dicts and the OBP model state dict.
         self.loaded_models[file_path] = {
             "policy_nets": checkpoint["policy_nets"],
             "obp_model": checkpoint["obp_model"]
@@ -128,6 +136,7 @@ class PlayVsAIGUI:
 
     def start_game(self):
         try:
+            # Build an "agents" dict that holds each AI agent's checkpoint state dicts.
             agents = {}
             for i in range(2):
                 selection = self.agent_selectors[i].get()
@@ -143,8 +152,8 @@ class PlayVsAIGUI:
                     raise ValueError(f"File for {file_name} not found among loaded models.")
                 file_path = file_path_candidates[0]
                 agents[f"player_{i}"] = {
-                    "policy_net": self.loaded_models[file_path]["policy_nets"][agent_name],
-                    "obp_model": self.loaded_models[file_path]["obp_model"]
+                    "policy_state": self.loaded_models[file_path]["policy_nets"][agent_name],
+                    "obp_model_state": self.loaded_models[file_path]["obp_model"]
                 }
             self.root.after(100, lambda: self.play_game(agents))
         except Exception as e:
@@ -169,30 +178,27 @@ class PlayVsAIGUI:
 
     def play_game(self, agents):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        num_players = 3  # Assuming player vs 2 AI agents
+        num_players = 3  # Assuming human player + 2 AI agents
         self.current_env = LiarsDeckEnv(num_players=num_players, render_mode="player")
         
-        # Initialize networks
+        # Create dictionaries for the AI agents' policy and OBP models, and record whether they use memory.
         policy_nets = {}
         obp_models = {}
+        agent_memory_usage = {}
         for agent_id, agent_data in agents.items():
-            # Policy Network
-            policy_state = agent_data["policy_net"]
-            try:
-                hidden_dim = self.get_hidden_dim_from_state_dict(policy_state)
-            except ValueError as e:
-                self.show_info(f"Invalid policy model for {agent_id}: {str(e)}")
-                return
-            
-            # Assuming config.INPUT_DIM is set to observation_space.shape[0] + num_opponents
-            # For num_players=3, num_opponents=2
-            observation_space = self.current_env.observation_spaces[agent_id]
-            num_opponents = num_players - 1
-            input_dim = observation_space.shape[0] + num_opponents  # Append OBP probs
+            policy_state = agent_data["policy_state"]
+            # Check if this agent's checkpoint indicates memory usage.
+            uses_memory = ("fc4.weight" in policy_state)
+            agent_memory_usage[agent_id] = uses_memory
+
+            # Determine the expected input dimension from the checkpoint state.
+            expected_input_dim = policy_state['fc1.weight'].shape[1]
+            hidden_dim = self.get_hidden_dim_from_state_dict(policy_state)
             output_dim = self.current_env.action_spaces[agent_id].n
-            
+
+            # When constructing the network, we now use the expected input dimension.
             policy_net = PolicyNetwork(
-                input_dim=input_dim,
+                input_dim=expected_input_dim,
                 hidden_dim=hidden_dim,
                 output_dim=output_dim,
                 use_lstm=True,
@@ -202,11 +208,10 @@ class PlayVsAIGUI:
             policy_net.to(device).eval()
             policy_nets[agent_id] = policy_net
             
-            # Opponent Behavior Predictor (OBP) Model
-            obp_model_state = agent_data["obp_model"]
+            obp_model_state = agent_data["obp_model_state"]
             if obp_model_state:
-                obp_input_dim = config.OPPONENT_INPUT_DIM  # Should be 4
-                obp_hidden_dim = config.OPPONENT_HIDDEN_DIM  # Ensure this aligns with your model architecture
+                obp_input_dim = config.OPPONENT_INPUT_DIM  # For example, 4
+                obp_hidden_dim = config.OPPONENT_HIDDEN_DIM  # Ensure this matches your architecture
                 obp_model = OpponentBehaviorPredictor(
                     input_dim=obp_input_dim,
                     hidden_dim=obp_hidden_dim,
@@ -216,8 +221,13 @@ class PlayVsAIGUI:
                 obp_model.to(device).eval()
                 obp_models[agent_id] = obp_model
             else:
-                obp_models[agent_id] = None  # Handle cases where OBP is not present
+                obp_models[agent_id] = None
 
+        # For AI agents that use memory, reset their persistent memory at the start.
+        for agent_id, uses_memory in agent_memory_usage.items():
+            if uses_memory:
+                get_opponent_memory(agent_id).memory.clear()
+        
         # Game loop
         self.current_env.reset()
         while self.current_env.agent_selection is not None:
@@ -233,19 +243,21 @@ class PlayVsAIGUI:
                 observation = obs[current_agent]
                 action_mask = info['action_mask']
                 action = self.choose_action(
-                    policy_nets[current_agent],
-                    obp_models[current_agent],
-                    observation,
-                    device,
+                    agent_id=current_agent,
+                    policy_net=policy_nets[current_agent],
+                    obp_model=obp_models[current_agent],
+                    observation=observation,
+                    device=device,
                     num_players=num_players,
-                    action_mask=action_mask
+                    action_mask=action_mask,
+                    uses_memory=agent_memory_usage[current_agent]
                 )
                 if 0 <= action <= 2:
                     print(f"AI Agent {current_agent} played: {action+1} cards")
                 elif 3 <= action <= 5:
                     print(f"AI Agent {current_agent} played: {action-2} cards")
                 else:
-                    print(f"AI Agent {current_agent} callenged {action}")
+                    print(f"AI Agent {current_agent} challenged with action {action}")
             else:
                 # Human player's turn
                 self.current_env.render('player')
@@ -255,24 +267,24 @@ class PlayVsAIGUI:
         self.show_game_result()
         self.current_env.close()
 
-    def choose_action(self, policy_net, obp_model, observation, device, num_players, action_mask):
-        """Full action selection with OBP integration"""
+    def choose_action(self, agent_id, policy_net, obp_model, observation, device, num_players, action_mask, uses_memory=False):
+        """Selects an action for an AI agent by combining the raw observation, OBP predictions, and, if applicable, memory features."""
         num_opponents = num_players - 1
-        opp_feature_dim = config.OPPONENT_INPUT_DIM  # Should be 4
+        opp_feature_dim = config.OPPONENT_INPUT_DIM  # Typically 4
         
-        # Extract opponent features from observation
-        # The opponent features start after hand_vector_length + 1 + num_players
+        # Extract opponent features from the observation.
+        # (Here we assume the observation is arranged as:
+        #  [hand_vector (length 2), last_action_val (length 1), active_players (length num_players), opponent features...])
         hand_vector_length = 2
         last_action_val_length = 1
         active_players_length = num_players
-
         opp_features_start = hand_vector_length + last_action_val_length + active_players_length
         opp_features_end = opp_features_start + opp_feature_dim * num_opponents
 
         opponent_features = observation[opp_features_start:opp_features_end]
         opponent_features = opponent_features.reshape(num_opponents, opp_feature_dim)
 
-        # Run OBP inference
+        # Run OBP inference for each opponent.
         obp_probs = []
         for opp_feat in opponent_features:
             opp_feat_tensor = torch.tensor(opp_feat, dtype=torch.float32, device=device).unsqueeze(0)
@@ -280,42 +292,63 @@ class PlayVsAIGUI:
                 if obp_model:
                     logits = obp_model(opp_feat_tensor)
                     probs = torch.softmax(logits, dim=-1)
-                    bluff_prob = probs[0, 1].item()  # Probability of "bluff" class
+                    bluff_prob = probs[0, 1].item()  # Probability of bluffing
                 else:
-                    bluff_prob = 0.0  # Default if OBP is not available
+                    bluff_prob = 0.0
             obp_probs.append(bluff_prob)
-
-        # Append OBP predictions to observation
-        final_obs = np.concatenate([observation, np.array(obp_probs, dtype=np.float32)], axis=0)
         
-        # Optional: Add assertion to verify input dimensions
-        expected_dim = config.INPUT_DIM
+        # Build the final observation vector.
+        if uses_memory:
+            # Query the persistent memory for each opponent.
+            mem_features_list = []
+            for opp in self.current_env.possible_agents:
+                if opp != agent_id:
+                    mem_summary = query_opponent_memory(agent_id, opp)
+                    mem_features_list.append(mem_summary)
+            if mem_features_list:
+                mem_features = np.concatenate(mem_features_list, axis=0)
+            else:
+                mem_features = np.array([], dtype=np.float32)
+            
+            # Determine how many memory features are expected.
+            expected_dim = policy_net.fc1.in_features  # Total expected dimension
+            non_memory_dim = len(observation) + len(obp_probs)
+            required_mem_dim = expected_dim - non_memory_dim
+
+            current_mem_dim = mem_features.shape[0]
+            if current_mem_dim < required_mem_dim:
+                pad = np.zeros(required_mem_dim - current_mem_dim, dtype=np.float32)
+                mem_features = np.concatenate([mem_features, pad], axis=0)
+            elif current_mem_dim > required_mem_dim:
+                mem_features = mem_features[:required_mem_dim]
+            
+            final_obs = np.concatenate([observation, np.array(obp_probs, dtype=np.float32), mem_features], axis=0)
+        else:
+            final_obs = np.concatenate([observation, np.array(obp_probs, dtype=np.float32)], axis=0)
+
+        # Verify that the constructed observation has the correct dimension.
+        expected_dim = policy_net.fc1.in_features
         actual_dim = final_obs.shape[0]
         assert actual_dim == expected_dim, f"Expected observation dimension {expected_dim}, got {actual_dim}"
         
         observation_tensor = torch.tensor(final_obs, dtype=torch.float32).unsqueeze(0).to(device)
         
-        # Get action probabilities
+        # Get action probabilities from the policy network.
         with torch.no_grad():
             action_probs, _ = policy_net(observation_tensor)
         
-        # Apply action mask
+        # Apply the action mask.
         mask_tensor = torch.tensor(action_mask, dtype=torch.float32).to(device)
         masked_probs = action_probs * mask_tensor
-        
-        # Handle zero-probability cases
         if masked_probs.sum() == 0:
-            # Fallback to uniform distribution over valid actions
+            # Fallback to uniform distribution over valid actions.
             masked_probs = mask_tensor / mask_tensor.sum()
         else:
-            # Normalize valid actions
             masked_probs /= masked_probs.sum()
         
-        # Sample action
         m = torch.distributions.Categorical(masked_probs)
         action = m.sample().item()
         
-        # Debugging: Log action probabilities
         logging.debug(f"Action probabilities: {masked_probs.cpu().numpy()}")
         logging.debug(f"Selected action: {action}")
         return action
@@ -345,7 +378,7 @@ class PlayVsAIGUI:
         # Create a button for each action
         for action_value, label in actions:
             btn = ttk.Button(action_window, text=label,
-                            command=lambda val=action_value: select_action(val))
+                             command=lambda val=action_value: select_action(val))
             btn.pack(padx=10, pady=5, fill=tk.X)
 
         # Wait for the user to select an action
@@ -353,6 +386,7 @@ class PlayVsAIGUI:
 
         # Return the action that was selected
         return action_var.get()
+
 
 if __name__ == "__main__":
     root = TkinterDnD.Tk()
