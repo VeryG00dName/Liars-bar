@@ -383,14 +383,6 @@ def run_evaluation(env, device, players, num_games_per_triple=11):
 
     return global_action_counts, agent_head_to_head
 
-
-def get_version(pid):
-    """
-    Extract the version from the player ID.
-    """
-    return pid.split("_player_")[0]
-
-
 def main():
     """
     Main function to execute the evaluation process.
@@ -428,7 +420,7 @@ def main():
     logger.info(f"Loaded {len(players)} total players.")
 
     # Define the number of games per triple
-    NUM_GAMES_PER_TRIPLE = 11
+    NUM_GAMES_PER_TRIPLE = config.NUM_GAMES_PER_TRIPLE
 
     # Run the evaluation
     action_counts, agent_h2h = run_evaluation(
