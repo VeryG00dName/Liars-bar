@@ -1,4 +1,4 @@
-# src/training/agent_play.py
+# src/misc/agent_play.py
 
 import logging
 import tkinter as tk
@@ -7,9 +7,25 @@ from tkinterdnd2 import TkinterDnD, DND_FILES
 import torch
 import numpy as np
 import os
+
 from src.env.liars_deck_env_core import LiarsDeckEnv
-from src.model.models import OpponentBehaviorPredictor, PolicyNetwork
+
+# First try to import the new models.
+try:
+    from src.model.new_models import PolicyNetwork, OpponentBehaviorPredictor
+except ImportError:
+    from src.model.models import PolicyNetwork, OpponentBehaviorPredictor
+
+# Explicitly import the legacy models so we can use them when needed.
+import importlib
+legacy_module = importlib.import_module("src.model.models")
+legacy_PolicyNetwork = legacy_module.PolicyNetwork
+legacy_OpponentBehaviorPredictor = legacy_module.OpponentBehaviorPredictor
+
+# Import evaluation utilities for observation conversion and hidden dim extraction.
+from src.evaluation.evaluate_utils import adapt_observation_for_version, get_hidden_dim_from_state_dict
 from src import config
+
 
 class AgentManagerApp:
     def __init__(self, root):
@@ -39,7 +55,7 @@ class AgentManagerApp:
         drop_label = ttk.Label(frame, text="Drag and drop .pth files here")
         drop_label.pack(pady=5)
 
-        # Register drop target on multiple elements
+        # Register drop target on multiple elements.
         for widget in [frame, self.file_list, drop_label]:
             widget.drop_target_register(DND_FILES)
             widget.dnd_bind("<<Drop>>", self.on_file_drop)
@@ -58,35 +74,20 @@ class AgentManagerApp:
         frame = ttk.LabelFrame(self.root, text="Game Configuration", padding=10)
         frame.pack(fill=tk.X, padx=10, pady=5)
         
-        # Configure grid layout
-        frame.columnconfigure(1, weight=1)  # Make second column expandable
+        # Configure grid layout.
+        frame.columnconfigure(1, weight=1)
         
-        # Player count selector
         ttk.Label(frame, text="Number of Players:").grid(row=0, column=0, sticky=tk.W)
         self.player_count = ttk.Combobox(frame, values=[3, 4], state="readonly")
         self.player_count.current(0)
         self.player_count.grid(row=0, column=1, sticky=tk.EW, padx=5, pady=2)
         
-        # Create wider agent selectors
         self.agent_selectors = {}
         for i in range(4):
             ttk.Label(frame, text=f"Player {i+1}:").grid(row=i+1, column=0, sticky=tk.W, pady=2)
-            
-            # Create combobox with wider width
-            self.agent_selectors[i] = ttk.Combobox(
-                frame, 
-                state="readonly",
-                width=50  # Increased width
-            )
-            self.agent_selectors[i].grid(
-                row=i+1, 
-                column=1, 
-                sticky=tk.EW, 
-                padx=5, 
-                pady=2
-            )
+            self.agent_selectors[i] = ttk.Combobox(frame, state="readonly", width=50)
+            self.agent_selectors[i].grid(row=i+1, column=1, sticky=tk.EW, padx=5, pady=2)
         
-        # Make the comboboxes expand with window
         for i in range(4):
             frame.rowconfigure(i+1, weight=1)
         
@@ -96,47 +97,24 @@ class AgentManagerApp:
     def create_control_buttons(self):
         frame = ttk.Frame(self.root)
         frame.pack(pady=10)
-        
         ttk.Button(frame, text="Refresh Agents", command=self.update_agent_selectors).pack(side=tk.LEFT, padx=5)
         ttk.Button(frame, text="Start Game", command=self.start_game).pack(side=tk.LEFT, padx=5)
         logging.debug("Created control buttons")
-
-    def get_hidden_dim_from_state_dict(self, state_dict, layer_prefix='fc1'):
-        """
-        Extracts the hidden dimension from a state_dict based on the first linear layer's weight shape.
-        """
-        weight_key = f"{layer_prefix}.weight"
-        if weight_key in state_dict:
-            return state_dict[weight_key].shape[0]
-        else:
-            for key in state_dict.keys():
-                if key.endswith('.weight') and ('fc' in key or 'layer' in key):
-                    return state_dict[key].shape[0]
-        raise ValueError(f"Cannot determine hidden_dim from state_dict for layer prefix '{layer_prefix}'")
 
     def on_file_drop(self, event):
         try:
             self.drop_counter += 1
             logging.debug(f"\nDrop event #{self.drop_counter} received")
             logging.debug(f"Raw event data: {repr(event.data)}")
-
-            # Improved path handling for different platforms
             file_path = event.data.strip()
 
-            # Handle Windows paths with quotes
             if os.name == 'nt':
-                # Remove surrounding braces and quotes
                 file_path = file_path.replace("{", "").replace("}", "")
                 if file_path.startswith('"') and file_path.endswith('"'):
                     file_path = file_path[1:-1]
-
-            # Handle UNIX-like paths
             else:
-                # Remove any URI formatting (some Linux DEs add this)
                 if file_path.startswith("file://"):
                     file_path = file_path[7:]
-
-            # Convert to system-native path format
             file_path = os.path.normpath(file_path)
             logging.debug(f"Processed file path: {file_path}")
 
@@ -150,7 +128,6 @@ class AgentManagerApp:
                 self.show_info(f"File not found: {os.path.basename(file_path)}")
                 return
 
-            # Check if we already loaded this file
             if file_path in self.loaded_models:
                 logging.debug(f"File already loaded: {file_path}")
                 self.show_info(f"Already loaded: {os.path.basename(file_path)}")
@@ -170,23 +147,18 @@ class AgentManagerApp:
         try:
             logging.debug(f"Attempting to load model: {file_path}")
             checkpoint = torch.load(file_path, map_location="cpu")
-            
             if not isinstance(checkpoint, dict):
                 raise ValueError("Checkpoint is not a dictionary")
-                
             required_keys = ["policy_nets", "obp_model"]
             missing_keys = [k for k in required_keys if k not in checkpoint]
             if missing_keys:
                 raise ValueError(f"Missing required keys: {missing_keys}")
-                
             logging.debug(f"Model contains agents: {list(checkpoint['policy_nets'].keys())}")
-            
             self.loaded_models[file_path] = {
                 "policy_nets": checkpoint["policy_nets"],
                 "obp_model": checkpoint["obp_model"]
             }
             logging.info(f"Model loaded successfully: {file_path}")
-            
         except Exception as e:
             logging.error(f"Failed to load model {file_path}: {str(e)}")
             self.show_info(f"Error loading {os.path.basename(file_path)}:\n{str(e)}")
@@ -203,17 +175,13 @@ class AgentManagerApp:
         try:
             logging.debug("Updating agent selectors")
             agent_options = []
-            
             for file_path, data in self.loaded_models.items():
-                folder_name = os.path.basename(os.path.dirname(file_path))  # Get parent folder
+                folder_name = os.path.basename(os.path.dirname(file_path))
                 for agent_name in data["policy_nets"].keys():
-                    # Include folder, filename, and agent name in display
                     display_text = f"{folder_name} - {os.path.basename(file_path)} - {agent_name}"
                     agent_options.append(display_text)
-            
             num_players = int(self.player_count.get())
             logging.debug(f"Updating for {num_players} players with {len(agent_options)} options")
-            
             for i in range(4):
                 if i < num_players:
                     self.agent_selectors[i]["values"] = agent_options
@@ -222,7 +190,6 @@ class AgentManagerApp:
                 else:
                     self.agent_selectors[i].set("")
                     self.agent_selectors[i].state(["disabled"])
-                    
         except Exception as e:
             logging.exception("Error in update_agent_selectors")
             self.show_info(f"Selection error: {str(e)}")
@@ -232,163 +199,173 @@ class AgentManagerApp:
         try:
             num_players = int(self.player_count.get())
             agents = {}
-            
             for i in range(num_players):
                 selection = self.agent_selectors[i].get()
                 if not selection:
                     raise ValueError(f"No agent selected for Player {i+1}")
-                
-                # Split into three parts: folder, filename, agent_name
                 parts = selection.split(" - ")
                 if len(parts) != 3:
                     raise ValueError(f"Invalid selection format: {selection}")
-                file_name = parts[1]  # Second part is the filename
-                agent_name = parts[2]  # Third part is the agent name
-                
-                # Find full file path using the filename
+                file_name = parts[1]
+                agent_name = parts[2]
                 file_path_candidates = [p for p in self.loaded_models.keys() if os.path.basename(p) == file_name]
                 if not file_path_candidates:
                     raise ValueError(f"File for {file_name} not found among loaded models.")
                 file_path = file_path_candidates[0]
-                
                 agents[f"player_{i}"] = {
                     "policy_net": self.loaded_models[file_path]["policy_nets"][agent_name],
                     "obp_model": self.loaded_models[file_path]["obp_model"]
                 }
-            
             logging.info(f"Starting game with {num_players} players")
             self.root.after(100, lambda: self.play_game(agents, num_players))
-            
         except Exception as e:
             logging.exception("Game start failed")
             self.show_info(f"Start error: {str(e)}")
-            
+
     def play_game(self, agents, num_players):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         env = LiarsDeckEnv(num_players=num_players, render_mode="human")
         
+        # Dictionaries to store the reconstructed models and observation versions.
         policy_nets = {}
         obp_models = {}
+        obs_versions = {}  # Maps agent_id to observation version (1 or 2)
         
         for agent_id, data in agents.items():
-            # Dynamically determine network dimensions based on environment's observation space
-            observation_space = env.observation_spaces[agent_id]
-            num_opponents = num_players - 1
-            input_dim = observation_space.shape[0] + num_opponents  # Append OBP probs
+            # Determine observation version from the policy checkpoint.
+            policy_state = data["policy_net"]
+            actual_input_dim = policy_state["fc1.weight"].shape[1]
+            if actual_input_dim == 18:
+                obs_version = 1
+            elif actual_input_dim == 16:
+                obs_version = 2
+            else:
+                raise ValueError(f"Unknown input dimension {actual_input_dim} for {agent_id}")
             output_dim = env.action_spaces[agent_id].n
-            
-            # Get hidden_dim from model weights
             try:
-                hidden_dim = self.get_hidden_dim_from_state_dict(data["policy_net"])
+                hidden_dim = get_hidden_dim_from_state_dict(policy_state)
             except ValueError as e:
                 logging.error(f"Error loading {agent_id}: {str(e)}")
                 self.show_info(f"Invalid model for {agent_id}: {str(e)}")
                 return
 
-            # Reconstruct policy network
-            policy_net = PolicyNetwork(
-                input_dim=input_dim, 
-                hidden_dim=hidden_dim, 
-                output_dim=output_dim,
-                use_lstm=True,
-                use_layer_norm=True
-            )
-            policy_net.load_state_dict(data["policy_net"])
+            # Reconstruct the policy network – use the new model if the checkpoint has extra keys;
+            # otherwise, use the legacy model.
+            if "fc4.weight" in policy_state:
+                policy_net = PolicyNetwork(
+                    input_dim=actual_input_dim,
+                    hidden_dim=hidden_dim,
+                    output_dim=output_dim,
+                    use_lstm=True,
+                    use_dropout=True,
+                    use_layer_norm=True
+                )
+            else:
+                policy_net = legacy_PolicyNetwork(
+                    input_dim=actual_input_dim,
+                    hidden_dim=hidden_dim,
+                    output_dim=output_dim,
+                    use_lstm=True,
+                    use_dropout=True,
+                    use_layer_norm=True
+                )
+            policy_net.load_state_dict(policy_state)
             policy_net.to(device)
             policy_net.eval()
             policy_nets[agent_id] = policy_net
+            obs_versions[agent_id] = obs_version
 
-            # Reconstruct OBP model if still needed
+            # Reconstruct OBP model if provided.
             obp_model = None
             if data["obp_model"]:
-                obp_input_dim = config.OPPONENT_INPUT_DIM  # Should be 4
-                obp_hidden_dim = config.OPPONENT_HIDDEN_DIM  # Ensure this aligns with your model architecture
-                obp_model = OpponentBehaviorPredictor(
-                    input_dim=obp_input_dim, 
-                    hidden_dim=obp_hidden_dim, 
-                    output_dim=2
-                )
+                obp_input_dim = 5 if obs_version == 1 else 4
+                obp_hidden_dim = get_hidden_dim_from_state_dict(data["obp_model"], layer_prefix='fc1')
+                if "fc3.weight" in data["obp_model"]:
+                    obp_model = OpponentBehaviorPredictor(
+                        input_dim=obp_input_dim,
+                        hidden_dim=obp_hidden_dim,
+                        output_dim=2
+                    )
+                else:
+                    obp_model = legacy_OpponentBehaviorPredictor(
+                        input_dim=obp_input_dim,
+                        hidden_dim=obp_hidden_dim,
+                        output_dim=2
+                    )
                 obp_model.load_state_dict(data["obp_model"])
                 obp_model.to(device)
                 obp_model.eval()
             obp_models[agent_id] = obp_model
 
-        # Rest of the game loop remains the same
         env.reset()
         while env.agent_selection is not None:
             current_agent = env.agent_selection
             obs, reward, termination, truncation, info = env.last()
-            
             if termination or truncation:
                 env.step(None)
                 continue
-            
-            # Extract the observation array from the dictionary
+            # Get the raw observation (assumed to be a numpy array)
             observation_array = obs[current_agent]
+            # Adapt the observation to the version expected by the agent.
+            converted_obs = adapt_observation_for_version(observation_array, num_players, obs_versions[current_agent])
             action_mask = info['action_mask']
             action = self.choose_action(
                 policy_nets[current_agent],
-                obp_models[current_agent],  # Pass OBP model if needed
-                observation_array,  # Pass the array, not the dict
+                obp_models[current_agent],
+                converted_obs,  # Pass the adapted observation
                 device,
                 num_players,
-                action_mask
+                action_mask,
+                obs_versions[current_agent]
             )
             logging.info(f"{current_agent} chose action {action}")
             env.step(action)
         env.close()
 
-    def choose_action(self, policy_net, obp_model, observation, device, num_players, action_mask):
+    def choose_action(self, policy_net, obp_model, converted_obs, device, num_players, action_mask, obs_version):
         """
-        Chooses an action with action masking.
-        Appends OBP predictions to the observation to maintain input_dim.
+        Chooses an action with OBP integration.
+        The observation is assumed to be already converted (via adapt_observation_for_version).
         """
+        # Determine opponent feature dimension based on obs_version.
+        if obs_version == 1:
+            opp_feature_dim = 5
+        elif obs_version == 2:
+            opp_feature_dim = 4
+        else:
+            raise ValueError(f"Unknown obs_version: {obs_version}")
         num_opponents = num_players - 1
-        opp_feature_dim = config.OPPONENT_INPUT_DIM  # Should be 4
+        opp_features_start = len(converted_obs) - (num_opponents * opp_feature_dim)
         
-        # Extract opponent features from observation
-        # The opponent features start after hand_vector_length + 1 + num_players
-        hand_vector_length = 2
-        last_action_val_length = 1
-        active_players_length = num_players
-
-        opp_features_start = hand_vector_length + last_action_val_length + active_players_length
-        opp_features_end = opp_features_start + opp_feature_dim * num_opponents
-
-        opponent_features = observation[opp_features_start:opp_features_end]
-        opponent_features = opponent_features.reshape(num_opponents, opp_feature_dim)
-
-        # Run OBP inference
         obp_probs = []
-        for opp_feat in opponent_features:
-            opp_feat_tensor = torch.tensor(opp_feat, dtype=torch.float32, device=device).unsqueeze(0)
+        for i in range(num_opponents):
+            start_idx = opp_features_start + i * opp_feature_dim
+            end_idx = start_idx + opp_feature_dim
+            opp_vec = converted_obs[start_idx:end_idx]
+            opp_vec_tensor = torch.tensor(opp_vec, dtype=torch.float32, device=device).unsqueeze(0)
             with torch.no_grad():
-                logits = obp_model(opp_feat_tensor)
-                probs = torch.softmax(logits, dim=-1)
-            bluff_prob = probs[0, 1].item()  # Probability of "bluff" class
+                if obp_model:
+                    logits = obp_model(opp_vec_tensor)
+                    probs = torch.softmax(logits, dim=-1)
+                    bluff_prob = probs[0, 1].item()  # Probability of "bluff" class
+                else:
+                    bluff_prob = 0.0
             obp_probs.append(bluff_prob)
-
-        # Append OBP predictions to observation
-        final_obs = np.concatenate([observation, np.array(obp_probs, dtype=np.float32)], axis=0)
-        observation_tensor = torch.tensor(final_obs, dtype=torch.float32).unsqueeze(0).to(device)
         
-        # Get raw action probabilities
+        # Append OBP predictions to the converted observation.
+        final_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32)], axis=0)
+        expected_dim = policy_net.fc1.in_features  # Expected input dimension
+        if len(final_obs) != expected_dim:
+            raise ValueError(f"Expected observation dimension {expected_dim}, got {len(final_obs)}")
+        observation_tensor = torch.tensor(final_obs, dtype=torch.float32).unsqueeze(0).to(device)
         with torch.no_grad():
             action_probs, _ = policy_net(observation_tensor)
-        
-        # Apply action mask
         mask_tensor = torch.tensor(action_mask, dtype=torch.float32).to(device)
         masked_probs = action_probs * mask_tensor
-        
-        # Handle zero-probability cases
         if masked_probs.sum() == 0:
-            # Fallback to uniform distribution over valid actions
             masked_probs = mask_tensor / mask_tensor.sum()
         else:
-            # Normalize valid actions
             masked_probs /= masked_probs.sum()
-        
-        # Sample from masked distribution
         m = torch.distributions.Categorical(masked_probs)
         action = m.sample().item()
         return action
