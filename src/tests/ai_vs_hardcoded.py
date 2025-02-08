@@ -12,7 +12,7 @@ from src.model.new_models import PolicyNetwork, OpponentBehaviorPredictor
 from src import config
 import random
 
-from src.model.hard_coded_agents import GreedyCardSpammer, TableFirstConservativeChallenger, StrategicChallenger, RandomAgent
+from src.model.hard_coded_agents import GreedyCardSpammer, TableFirstConservativeChallenger, StrategicChallenger, RandomAgent, TableNonTableAgent
 
 from src.evaluation.evaluate import run_obp_inference
 from src.evaluation.evaluate_utils import (
@@ -35,6 +35,7 @@ class AgentBattlegroundGUI:
             "TableFirst": TableFirstConservativeChallenger,
             "Strategic": lambda name: StrategicChallenger(name, 3, 2),  # Pass agent_index=2
             "Conservative": lambda name: TableFirstConservativeChallenger(name),
+            "TableNonTableAgent": TableNonTableAgent,
             "Random": RandomAgent
         }
         
@@ -125,16 +126,20 @@ class AgentBattlegroundGUI:
         
         if input_dim == 18:
             obs_version = 1  # OBS_VERSION_1
-        elif input_dim == 16:
+        elif input_dim in (16, 24):
             obs_version = 2  # OBS_VERSION_2
         else:
             raise ValueError(f"Unknown input_dim {input_dim} for model {file_path}")
+        
+        # Check if the model uses memory by looking for "fc4.weight"
+        uses_memory = ("fc4.weight" in any_policy)
         
         self.loaded_models[file_path] = {
             "policy_nets": checkpoint["policy_nets"],
             "obp_model": checkpoint["obp_model"],
             "obs_version": obs_version,
-            "input_dim": input_dim
+            "input_dim": input_dim,
+            "uses_memory": uses_memory
         }
 
     def show_info(self, message):
@@ -177,7 +182,8 @@ class AgentBattlegroundGUI:
                     "policy_net": model_data["policy_nets"][agent_name],
                     "obp_model": model_data["obp_model"],
                     "obs_version": model_data["obs_version"],
-                    "input_dim": model_data["input_dim"]
+                    "input_dim": model_data["input_dim"],
+                    "uses_memory": model_data["uses_memory"]
                 }
             return ai_agents
         except Exception as e:
@@ -219,14 +225,14 @@ class AgentBattlegroundGUI:
         obp_models = {}
         obs_versions = {}
         input_dims = {}
+        uses_memories = {}
         for agent_id, agent_data in ai_agents.items():
-            obs_version = agent_data["obs_version"]
-            input_dim = agent_data["input_dim"]
-            obs_versions[agent_id] = obs_version
-            input_dims[agent_id] = input_dim
+            obs_versions[agent_id] = agent_data["obs_version"]
+            input_dims[agent_id] = agent_data["input_dim"]
+            uses_memories[agent_id] = agent_data["uses_memory"]
             
             policy_net = PolicyNetwork(
-                input_dim=input_dim,
+                input_dim=agent_data["input_dim"],
                 hidden_dim=self.get_hidden_dim_from_state_dict(agent_data["policy_net"]),
                 output_dim=env.action_spaces[agent_id].n,
                 use_lstm=True,
@@ -239,7 +245,7 @@ class AgentBattlegroundGUI:
             # Initialize OBP model
             obp_model_state = agent_data["obp_model"]
             if obp_model_state:
-                obp_input_dim = 5 if obs_version == 1 else 4
+                obp_input_dim = 5 if agent_data["obs_version"] == 1 else 4
                 obp_model = OpponentBehaviorPredictor(
                     input_dim=obp_input_dim,
                     hidden_dim=config.OPPONENT_HIDDEN_DIM,
@@ -261,18 +267,18 @@ class AgentBattlegroundGUI:
                 continue
 
             if current_agent in policy_nets:
-                # AI Agent's turn
-                obs_version = obs_versions[current_agent]
-                input_dim = input_dims[current_agent]
+                # AI Agent's turn: pass the agent id and uses_memory flag
                 action = self.choose_action(
+                    current_agent,
                     policy_nets[current_agent],
                     obp_models[current_agent],
                     obs[current_agent],
                     info['action_mask'],
                     device,
                     env.num_players,
-                    obs_version,
-                    input_dim
+                    obs_versions[current_agent],
+                    input_dims[current_agent],
+                    uses_memories[current_agent]
                 )
             else:
                 # Hardcoded Agent's turn
@@ -304,7 +310,7 @@ class AgentBattlegroundGUI:
         else:
             return "unknown_agent"
 
-    def choose_action(self, policy_net, obp_model, observation, action_mask, device, num_players, obs_version, input_dim):
+    def choose_action(self, agent_id, policy_net, obp_model, observation, action_mask, device, num_players, obs_version, input_dim, uses_memory):
         """Full action selection with OBP integration using imported utilities."""
         # Adapt observation based on agent version
         converted_obs = adapt_observation_for_version(
@@ -324,13 +330,20 @@ class AgentBattlegroundGUI:
         )
         logging.debug(f"OBP probabilities: {obp_probs}")
 
-        # Append OBP predictions to observation
-        final_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32)], axis=0)
+        # If the model uses memory (and obs_version is 2) then pad zeros for memory features.
+        if obs_version == 2 and uses_memory:
+            required_mem_dim = input_dim - (len(converted_obs) + len(obp_probs))
+            if required_mem_dim > 0:
+                mem_features = np.zeros(required_mem_dim, dtype=np.float32)
+            else:
+                mem_features = np.array([], dtype=np.float32)
+            final_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32), mem_features], axis=0)
+        else:
+            final_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32)], axis=0)
         logging.debug(f"Final observation (length {len(final_obs)}): {final_obs}")
         
-        # Determine expected input dimension
-        # Since input_dim already includes the OBP probabilities, no need to add num_opponents
-        expected_dim = input_dim  # Corrected
+        # Check dimensions
+        expected_dim = input_dim  # input_dim already includes OBP predictions (and memory, if applicable)
         actual_dim = final_obs.shape[0]
         logging.debug(f"Expected dim: {expected_dim}, Actual dim: {actual_dim}")
         assert actual_dim == expected_dim, f"Expected observation dimension {expected_dim}, got {actual_dim}"
@@ -350,14 +363,12 @@ class AgentBattlegroundGUI:
             # Fallback to uniform distribution over valid actions
             masked_probs = mask_tensor / mask_tensor.sum()
         else:
-            # Normalize valid actions
             masked_probs /= masked_probs.sum()
         
         # Sample action
         m = torch.distributions.Categorical(masked_probs)
         action = m.sample().item()
         
-        # Debugging: Log action probabilities
         logging.debug(f"Action probabilities: {masked_probs.cpu().numpy()}")
         logging.debug(f"Selected action: {action}")
         if action_mask[action] == 6:
