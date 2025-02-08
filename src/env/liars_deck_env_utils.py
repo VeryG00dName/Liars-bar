@@ -356,3 +356,18 @@ def query_opponent_memory(observer, opponent):
     """
     from src.model.memory import get_opponent_memory
     return get_opponent_memory(observer).get_summary(opponent)
+
+def query_opponent_memory_full(observer, opponent):
+    """
+    Returns the full memory (all events) for a given opponent as seen by the observer.
+    
+    Args:
+        observer (str): The observing agent's identifier.
+        opponent (str): The opponent's identifier.
+    
+    Returns:
+        list: The full list of recorded events from the observer's persistent memory for the opponent.
+              If no events are recorded, returns an empty list.
+    """
+    from src.model.memory import get_opponent_memory
+    return get_opponent_memory(observer).get_full_memory(opponent)
