@@ -9,6 +9,8 @@ Tracks rank correlation (Spearman/Kendall) across rounds.
 
 Usage:
   python swiss_accuracy_script.py
+
+Updated to include version differentiation in the final ranking output.
 """
 
 import os
@@ -16,15 +18,17 @@ import json
 import logging
 import torch
 import numpy as np
+import random
 from typing import Dict, List, Tuple
 from scipy.stats import spearmanr, kendalltau
 
 # --- Import Swiss logic from evaluate_tournament ---
 from src.evaluation.evaluate_tournament import (
     run_group_swiss_tournament,
-    evaluate_agents,
+    evaluate_agents_tournament as evaluate_agents,  # Correct function reference
     update_openskill_ratings,
-    openskill_model
+    openskill_model,
+    swiss_grouping
 )
 
 # --- Import initialize_players from evaluate.py ---
@@ -88,55 +92,65 @@ def run_swiss_tournament_with_rank_correlation(
 ) -> Tuple[List[float], List[float]]:
     """
     Runs a Swiss tournament and tracks ranking correlation after each round.
+    In each round, players are grouped using a greedy Swiss grouping method (swiss_grouping)
+    that minimizes repeated matchups while forming groups of size env.num_players.
+    
     Returns lists of Spearman & Kendall correlation values.
     """
     spearman_list = []
     kendall_list = []
 
-    # Measure at round=0 (before the tournament starts)
+    # Measure initial rank correlation before any rounds.
     rho0, tau0 = measure_rank_correlation(players, scoreboard_ranks)
     spearman_list.append(rho0)
     kendall_list.append(tau0)
     logging.info(f"Initial Rank Correlation => Spearman={rho0:.3f}, Kendall={tau0:.3f}")
 
     player_ids = list(players.keys())
-    group_size = env.num_players
+    group_size = env.num_players  # e.g. 3.
+    # Initialize match history.
+    match_history = {pid: set() for pid in players}
 
     for round_num in range(1, NUM_ROUNDS + 1):
         logging.info(f"=== Starting Round {round_num}/{NUM_ROUNDS} ===")
 
-        sorted_pids = sorted(player_ids, key=lambda pid: players[pid]["score"], reverse=True)
-        groups = [sorted_pids[i : i + group_size] for i in range(0, len(sorted_pids), group_size)]
+        groups = swiss_grouping(players, match_history, group_size)
+        logging.info(f"Formed {len(groups)} groups this round: {groups}")
 
         for group in groups:
-            if len(group) < group_size:
-                logging.warning(f"Skipping small group {group}.")
+            if len(group) != group_size:
+                logging.warning(f"Skipping group {group} as it does not have the required size {group_size}.")
                 continue
 
             logging.info(f"Group match: {group}")
             players_in_this_game = {pid: players[pid] for pid in group}
-
             cumulative_wins, action_counts, game_wins_list, avg_steps = evaluate_agents(
                 env=env,
                 device=device,
                 players_in_this_game=players_in_this_game,
                 episodes=num_games_per_match
             )
-
             for pid in group:
                 players[pid]["wins"] += cumulative_wins[pid]
                 players[pid]["games_played"] += num_games_per_match
-
             group_ranking = sorted(group, key=lambda pid: cumulative_wins[pid], reverse=True)
-            rank_dict = {pid: i for i, pid in enumerate(group_ranking)}
-
-            match = [[players[pid]["rating"]] for pid in group]
-            ranks = [rank_dict[pid] for pid in group]
-            new_ratings = openskill_model.rate(match, ranks=ranks)
-
-            for idx_g, pid in enumerate(group):
-                players[pid]["rating"] = new_ratings[idx_g][0]
+            logging.info(
+                "Group Results: " + ", ".join([f"{pid} wins={cumulative_wins[pid]}" for pid in group]) +
+                f", Winner: {group_ranking[0]}, Avg Steps/Ep: {avg_steps:.2f}"
+            )
+            # Update ratings for this group.
+            match_ratings = [[players[pid]["rating"]] for pid in group]
+            ranks = [group_ranking.index(pid) for pid in group]
+            new_ratings = openskill_model.rate(match_ratings, ranks=ranks)
+            for idx, pid in enumerate(group):
+                players[pid]["rating"] = new_ratings[idx][0]
                 players[pid]["score"] = players[pid]["rating"].ordinal()
+
+            # Update match history.
+            for pid in group:
+                for other in group:
+                    if other != pid:
+                        match_history[pid].add(other)
 
         rho, tau = measure_rank_correlation(players, scoreboard_ranks)
         spearman_list.append(rho)
@@ -177,6 +191,7 @@ def main():
     players = initialize_players(players_dir, device)
     logger.info(f"Loaded {len(players)} players from {players_dir}")
 
+    # Initialize each player's rating stats
     for pid, pdata in players.items():
         pdata["score"] = pdata["rating"].ordinal()
         pdata["wins"] = 0
@@ -200,9 +215,14 @@ def main():
 
     final_sorted = sorted(players.items(), key=lambda x: x[1]["score"], reverse=True)
     print("\n=== Final Swiss Rankings vs. Old Scoreboard Rankings ===")
-    for rank, (pid, pdata) in enumerate(final_sorted, start=1):
-        old_rank = true_ranks.get(pid, None)
-        print(f"{rank:>2}. {pid:<50} => new rank={rank}, old rank={old_rank}")
+    print(f"{'Rank':<5}{'Player ID':<50}{'New Rank':<10}{'Old Rank':<10}{'Version':<10}")
+    print("-" * 90)
+    # Changed enumeration to start at 0 for new ranks.
+    for rank, (pid, pdata) in enumerate(final_sorted):
+        old_rank = true_ranks.get(pid, "N/A")
+        # Include observation version (v1 or v2) in the output
+        version = f"v{pdata.get('obs_version', 'unknown')}"
+        print(f"{rank:<5}{pid:<50}{rank:<10}{old_rank:<10}{version:<10}")
 
 
 if __name__ == "__main__":

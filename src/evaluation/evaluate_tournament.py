@@ -7,15 +7,13 @@ import re
 import torch
 import numpy as np
 from pettingzoo.utils import agent_selector
+from itertools import combinations
 
 from src.env.liars_deck_env_core import LiarsDeckEnv
 from src.model.new_models import PolicyNetwork, OpponentBehaviorPredictor, ValueNetwork
 from src import config
 
-# Reuse logic from evaluate.py / evaluate_utils.py
-from src.evaluation.evaluate import (
-    get_version,             # Helper to parse version from player ID (if needed)
-)
+
 from src.evaluation.evaluate_utils import (
     load_combined_checkpoint,
     get_hidden_dim_from_state_dict,
@@ -40,11 +38,11 @@ def initialize_players(checkpoints_dir, device):
     if not os.path.isdir(checkpoints_dir):
         raise FileNotFoundError(f"The directory '{checkpoints_dir}' does not exist.")
 
-    pattern = re.compile(r'\.pth$', re.IGNORECASE)  # Updated regex to match any .pth file
+    pattern = re.compile(r'\.pth$', re.IGNORECASE)  # Match any .pth file
 
     players = {}
     for filename in os.listdir(checkpoints_dir):
-        if pattern.search(filename):  # Changed from match() to search() to find .pth at the end
+        if pattern.search(filename):
             checkpoint_path = os.path.join(checkpoints_dir, filename)
             try:
                 checkpoint = load_combined_checkpoint(checkpoint_path, device)
@@ -117,7 +115,7 @@ def initialize_players(checkpoints_dir, device):
                         'score': 0.0,   # We'll store rating.ordinal() here for sorting
                         'wins': 0,
                         'games_played': 0,
-                        'obs_version': obs_version,  # Store the version
+                        'obs_version': obs_version,  # Store the observation version
                     }
                     players[player_id]['score'] = players[player_id]['rating'].ordinal()
 
@@ -132,16 +130,24 @@ def initialize_players(checkpoints_dir, device):
     return players
 
 
-def run_obp_inference_tournament(obp_model, obs, device, num_players):
+def run_obp_inference_tournament(obp_model, obs, device, num_players, obs_version):
     """
-    Similar to the function in evaluate.py, but simplified or specialized for the tournament.
+    Similar to the function in evaluate.py, but specialized for the tournament.
+    Uses the observation version to determine the opponent feature dimension.
     If obp_model is None, return empty. Otherwise, run inference for each opponent.
     """
     if obp_model is None:
         return []
 
+    # Determine opponent feature dimension based on obs_version
+    if obs_version == OBS_VERSION_1 or obs_version == 1:
+        opp_feature_dim = 5
+    elif obs_version == OBS_VERSION_2 or obs_version == 2:
+        opp_feature_dim = 4
+    else:
+        raise ValueError(f"Unknown observation version: {obs_version}")
+
     num_opponents = num_players - 1
-    opp_feature_dim = config.OPPONENT_INPUT_DIM
     opp_features_start = len(obs) - (num_opponents * opp_feature_dim)
 
     obp_probs = []
@@ -158,6 +164,53 @@ def run_obp_inference_tournament(obp_model, obs, device, num_players):
 
     return obp_probs
 
+def swiss_grouping(players, match_history, group_size):
+    """
+    Greedy Swiss pairing that minimizes repeated matchups while forming groups of size `group_size`.
+    
+    Parameters:
+      players      - dictionary of players keyed by player_id; each value must have a "score" key.
+      match_history- dictionary mapping player_id to a set of opponents they've faced.
+      group_size   - desired size of each group.
+      
+    Returns:
+      groups       - a list of groups (each group is a list of player_ids).
+    """
+    # Sort players by score (highest first)
+    player_ids = sorted(players.keys(), key=lambda pid: players[pid]["score"], reverse=True)
+    groups = []
+    used = set()
+
+    while len(used) < len(player_ids):
+        group = []
+        # available players not yet assigned in this round
+        available_players = [pid for pid in player_ids if pid not in used]
+
+        # Start the group with the highest-ranked available player.
+        if available_players:
+            group.append(available_players.pop(0))
+        else:
+            break
+
+        # Fill the rest of the group by choosing the candidate who has the fewest repeated matchups with current group members.
+        while len(group) < group_size and available_players:
+            best_candidate = None
+            least_repeats = float("inf")
+
+            for candidate in available_players:
+                past_matches = sum(candidate in match_history.get(pid, set()) for pid in group)
+                if past_matches < least_repeats:
+                    best_candidate = candidate
+                    least_repeats = past_matches
+
+            if best_candidate:
+                group.append(best_candidate)
+                available_players.remove(best_candidate)
+
+        groups.append(group)
+        used.update(group)
+
+    return groups
 
 def evaluate_agents_tournament(env, device, players_in_this_game, episodes=5):
     """
@@ -217,9 +270,9 @@ def evaluate_agents_tournament(env, device, players_in_this_game, episodes=5):
             obs_version = player_data['obs_version']
             converted_obs = adapt_observation_for_version(observation, env.num_players, obs_version)
 
-            # 2) Run OBP inference using the converted_obs
+            # 2) Run OBP inference using the converted_obs and player's obs_version
             obp_model = player_data.get('obp_model', None)
-            obp_probs = run_obp_inference_tournament(obp_model, converted_obs, device, env.num_players)
+            obp_probs = run_obp_inference_tournament(obp_model, converted_obs, device, env.num_players, obs_version)
 
             # 3) Concatenate final observation
             final_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32)], axis=0)
@@ -323,78 +376,60 @@ def update_openskill_ratings(players, group, group_ranking, cumulative_wins):
 
 def run_group_swiss_tournament(env, device, players, num_games_per_match=5, NUM_ROUNDS=7):
     """
-    Runs a Swiss-style tournament. Each round, players are grouped into sets of size env.num_players.
-    For the first round, the grouping is done randomly; in subsequent rounds, players are sorted by 'score'.
+    Runs a Swiss-style tournament. In each round, players are grouped using a greedy
+    Swiss grouping method (swiss_grouping) that minimizes repeated matchups.
     Then, for each group the match is evaluated with evaluate_agents_tournament,
     and the OpenSkill ratings are updated once per group.
     """
     logger = logging.getLogger("EvaluateTournament")
     player_ids = list(players.keys())
-    group_size = env.num_players
-    logger.info(f"Using group-based Swiss tournament with group size {group_size} over {NUM_ROUNDS} rounds.")
+    group_size = env.num_players  # e.g. 3 if groups of 3 are required.
+    logger.info(f"Using greedy Swiss grouping for tournament over {NUM_ROUNDS} rounds with group size {group_size}.")
+
+    # Initialize match history: for each player, track the set of opponents they've faced.
+    match_history = {pid: set() for pid in players}
 
     global_action_counts = {pid: {action: 0 for action in range(config.OUTPUT_DIM)} for pid in players}
 
     for round_num in range(1, NUM_ROUNDS + 1):
         logger.info(f"=== Starting Round {round_num} with {len(player_ids)} players ===")
 
-        # For the first round, mix players randomly.
-        if round_num == 1:
-            sorted_players = player_ids.copy()
-            random.shuffle(sorted_players)
-        else:
-            # For subsequent rounds, sort players descending by current 'score'
-            sorted_players = sorted(player_ids, key=lambda pid: players[pid]['score'], reverse=True)
-
-        # Partition into groups of size group_size
-        groups = []
-        i = 0
-        while i < len(sorted_players):
-            if i + group_size <= len(sorted_players):
-                groups.append(sorted_players[i : i + group_size])
-            else:
-                # Merge last smaller group
-                if groups:
-                    groups[-1].extend(sorted_players[i:])
-                else:
-                    groups.append(sorted_players[i:])
-            i += group_size
-
+        # Group players using the greedy Swiss grouping function.
+        groups = swiss_grouping(players, match_history, group_size)
         logger.info(f"Formed {len(groups)} groups this round: {groups}")
 
         for group in groups:
-            if len(group) < group_size:
-                logger.warning(f"Group {group} is smaller than required. Skipping.")
+            if len(group) != group_size:
+                logger.warning(f"Group {group} does not have required size {group_size}. Skipping.")
                 continue
 
             logger.info(f"Group match: {group}")
             players_in_this_game = {pid: players[pid] for pid in group}
 
-            # Evaluate using our specialized function that handles obs v1/v2
             cumulative_wins, action_counts, game_wins_list, avg_steps = evaluate_agents_tournament(
                 env=env,
                 device=device,
                 players_in_this_game=players_in_this_game,
                 episodes=num_games_per_match
             )
-
-            # Update global action counts
+            # Update global action counts.
             for pid in group:
                 for action in range(config.OUTPUT_DIM):
                     global_action_counts[pid][action] += action_counts[pid][action]
 
-            # Sort group by total wins
             group_ranking = sorted(group, key=lambda pid: cumulative_wins[pid], reverse=True)
             logger.info(
-                f"Group Results: "
-                + ", ".join([f"{pid} wins={cumulative_wins[pid]}" for pid in group])
-                + f", Winner: {group_ranking[0]}, Avg Steps/Ep: {avg_steps:.2f}"
+                "Group Results: " + ", ".join([f"{pid} wins={cumulative_wins[pid]}" for pid in group]) +
+                f", Winner: {group_ranking[0]}, Avg Steps/Ep: {avg_steps:.2f}"
             )
-
-            # Update OpenSkill ratings once per group
             update_openskill_ratings(players, group, group_ranking, cumulative_wins)
 
-        # End of round: log updated scores
+            # Update match history: record that all players in this group have played together.
+            for pid in group:
+                for other in group:
+                    if other != pid:
+                        match_history[pid].add(other)
+
         logger.info(f"Scores after round {round_num}:")
         for pid in sorted(player_ids):
             logger.info(f"Player {pid}: score={players[pid]['score']:.2f}")
@@ -527,6 +562,7 @@ def main():
         delete_bottom_half_checkpoints_by_score(players, checkpoints_dir)
     else:
         print("No checkpoints were deleted.")
+
 
 if __name__ == "__main__":
     main()
