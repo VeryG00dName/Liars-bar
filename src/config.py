@@ -95,7 +95,8 @@ LOG_INTERVAL = 100                # Episodes between logging to TensorBoard
 # Evaluation Configuration
 # ----------------------------
 ELO_K_FACTOR = 32             # K-factor for evaluation
-challenge_amount = 6           # Number of times agents need to have challenged to win
+NUM_ROUNDS = 7                # Number of rounds in Swiss tournament
+NUM_GAMES_PER_MATCH = 11      # Number of games per match
 # ----------------------------
 # Tournament Configuration
 # ----------------------------
