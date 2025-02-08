@@ -170,3 +170,4 @@ scoreboard.json
 game_logs.json
 processed_game_logs.json
 supervised_training_data.json
+opponent_training_data.pkl
