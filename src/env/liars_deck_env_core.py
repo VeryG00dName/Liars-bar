@@ -116,12 +116,13 @@ class LiarsDeckEnv(AECEnv):
         self._agent_selector = None
         self.rewards = {}
 
-        # ### CHANGED: Track the last discrete action used by each agent
         self.last_agent_action = {agent: None for agent in self.possible_agents}
         self.consecutive_action_count = {agent: 0 for agent in self.possible_agents}
 
         # Initialize table_card
         self.table_card = random.choice(["King", "Queen", "Ace"])
+
+        self.pending_bluff = None
 
         self.reset()
 
@@ -216,15 +217,35 @@ class LiarsDeckEnv(AECEnv):
         self.table_card = random.choice(["King", "Queen", "Ace"])
         self.logger.debug(f"Resetting environment. Initial table_card: {self.table_card}")
 
-        # ### CHANGED: Reset the last_agent_action and consecutive_action_count
+        # Reset the last_agent_action and consecutive_action_count
         for agent in self.possible_agents:
             self.last_agent_action[agent] = None
             self.consecutive_action_count[agent] = 0
+
+        # Reset pending bluff (if any) ---
+        self.pending_bluff = None
 
         self.start_new_round()
         return get_observations(self), self.infos
 
     def start_new_round(self):
+        # Check for any pending bluff before starting a new round ---
+        if self.pending_bluff is not None:
+            bluffing_agent = self.pending_bluff["agent"]
+            # For any agent who never challenged the bluff in this round, apply penalty.
+            for ag in self.pending_bluff["unchallenged_agents"]:
+                self.rewards[ag] += self.scoring_params['unchallenged_bluff_penalty']
+                self.logger.debug(
+                    f"Agent {ag} penalized at round end for not challenging bluff from {bluffing_agent}"
+                )
+            # Reward the bluffing agent for a successful, unchallenged bluff.
+            self.rewards[bluffing_agent] += self.scoring_params['successful_bluff_reward']
+            self.logger.info(
+                f"Bluff by {bluffing_agent} was successful; rewarded {self.scoring_params['successful_bluff_reward']}"
+            )
+            # Clear pending bluff since it is now resolved.
+            self.pending_bluff = None
+
         for agent in self.possible_agents:
             self.round_eliminated[agent] = False
 
@@ -270,17 +291,29 @@ class LiarsDeckEnv(AECEnv):
     def step(self, action):
         agent = self.agent_selection
 
-        # Decode to see if the action is a "Play" or "Challenge", etc.
+        # Decode the action early for use in our new bluff logic.
         action_type, _, _ = decode_action(action)
 
-        # ### CHANGED: Check for consecutive identical discrete actions
+        # If there is a pending bluff and the acting agent is not the bluffing agent,
+        # then if the agent does not challenge, penalize them immediately.
+        if self.pending_bluff is not None:
+            bluffing_agent = self.pending_bluff["agent"]
+            if agent != bluffing_agent and action_type != "Challenge":
+                self.rewards[agent] += self.scoring_params['unchallenged_bluff_penalty']
+                self.logger.debug(
+                    f"Agent {agent} penalized for not challenging bluff from {bluffing_agent} (action: {action_type})."
+                )
+                # Remove this agent from the pending list so they are not penalized repeatedly.
+                self.pending_bluff["unchallenged_agents"].discard(agent)
+
+        # Check for consecutive identical discrete actions
         if action == self.last_agent_action[agent]:
             self.consecutive_action_count[agent] += 1
         else:
             self.consecutive_action_count[agent] = 1
             self.last_agent_action[agent] = action
 
-        # ### CHANGED: Apply penalty if the same discrete action is repeated.
+        # Apply penalty if the same discrete action is repeated.
         # Optionally, only penalize repeating "Play" actions (actions 0..5).
         if self.consecutive_action_count[agent] > 1 and action_type == "Play":
             self.rewards[agent] += self.scoring_params.get('consecutive_action_penalty', -1)
@@ -289,12 +322,27 @@ class LiarsDeckEnv(AECEnv):
                 f"Consecutive count: {self.consecutive_action_count[agent]}"
             )
 
-        # Apply the main logic for the environment step
+        # Apply the main logic for the environment step.
         apply_action(self, agent, action)
         self._cumulative_rewards[agent] = self.rewards[agent]
         self.logger.debug(f"Action applied by {agent}: {action}")
         self.logger.debug(f"Rewards after action: {self.rewards}")
         self.logger.debug(f"Terminations after action: {self.terminations}")
+
+        # If a challenge action is taken, clear any pending bluff.
+        if action_type == "Challenge":
+            self.pending_bluff = None
+
+        # If a bluff is played (a Play action that is not truthful), then set a pending bluff.
+        if action_type == "Play" and self.last_action_bluff:
+            # Create a pending bluff record where all other agents are expected to challenge.
+            self.pending_bluff = {
+                "agent": agent,
+                "unchallenged_agents": set(self.possible_agents) - {agent}
+            }
+            self.logger.debug(
+                f"Pending bluff set by {agent}. Agents expected to challenge: {self.pending_bluff['unchallenged_agents']}"
+            )
 
         self._advance_to_next_agent()
         self._check_round_end()
