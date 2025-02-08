@@ -3,6 +3,8 @@
 import numpy as np
 from src.env.liars_deck_env_utils_2 import decode_action, select_cards_to_play, validate_claim
 
+# --- Existing functions ---
+
 def record_action_history(env, agent, action_type, card_category, count, was_challenged=False):
     entry = {
         'action_type': action_type,
@@ -31,7 +33,6 @@ def apply_challenge(env, challenger_agent, claimant_agent):
     env.logger.debug(f"Applying challenge: {challenger_agent} vs {claimant_agent}, claimed_cards={claimed_cards}")
 
     # Find the last play entry in the histories
-    # We'll need to update the public history now that bluff info is revealed
     def find_last_play_entry(hist):
         for entry in reversed(hist):
             if entry['action_type'] == "Play":
@@ -55,11 +56,22 @@ def apply_challenge(env, challenger_agent, claimant_agent):
             env.rewards[claimant_agent] += env.scoring_params['termination_penalty']
             env.logger.info(f"{claimant_agent} has been terminated due to excessive penalties.")
 
-        # Reveal was_bluff (True) in the public history (the challenge showed that claimant lied by not playing cards)
+        # Reveal was_bluff (True) in the public history (claimant lied by not playing cards)
         if public_last_play:
             public_last_play['was_bluff'] = True
             env.logger.debug(f"Updated public history for {claimant_agent}: was_bluff=True")
 
+        # --- MEMORY UPDATE: Record that claimant did not play any cards ---
+        from src.model.memory import get_opponent_memory
+        for observer in env.possible_agents:
+            if observer != claimant_agent:
+                get_opponent_memory(observer).update(
+                    opponent=claimant_agent,
+                    response="NoPlay",
+                    triggering_action="Challenge",
+                    penalties=env.penalties.get(claimant_agent, 0),
+                    card_count=len(env.players_hands.get(claimant_agent, []))
+                )
         env.start_new_round()
         return
 
@@ -77,10 +89,10 @@ def apply_challenge(env, challenger_agent, claimant_agent):
             env.rewards[challenger_agent] += env.scoring_params['termination_penalty']
             env.logger.info(f"{challenger_agent} has been terminated due to excessive penalties.")
 
-        # Reveal was_bluff (False) in public history because challenge proved the claim valid
         if public_last_play:
             public_last_play['was_bluff'] = False
             env.logger.debug(f"Updated public history for {claimant_agent}: was_bluff=False")
+        outcome = "Truthful"
     else:
         # Claimant was bluffing
         env.penalties[claimant_agent] += 1
@@ -95,13 +107,24 @@ def apply_challenge(env, challenger_agent, claimant_agent):
             env.rewards[claimant_agent] += env.scoring_params['termination_penalty']
             env.logger.info(f"{claimant_agent} has been terminated due to excessive penalties.")
 
-        # Reveal was_bluff (True) in the public history because the challenge exposed the bluff
         if public_last_play:
             public_last_play['was_bluff'] = True
             env.logger.debug(f"Updated public history for {claimant_agent}: was_bluff=True")
+        outcome = "Bluff"
+
+    # --- MEMORY UPDATE: Record the outcome of the challenge for claimant ---
+    from src.model.memory import get_opponent_memory
+    for observer in env.possible_agents:
+        if observer != claimant_agent:
+            get_opponent_memory(observer).update(
+                opponent=claimant_agent,
+                response=outcome,
+                triggering_action="Challenge",
+                penalties=env.penalties.get(claimant_agent, 0),
+                card_count=len(env.players_hands.get(claimant_agent, []))
+            )
 
     env.start_new_round()
-    # Check if only one agent remains eligible after the challenge
     eligible_agents = [ag for ag in env.possible_agents if not env.terminations[ag]]
     if len(eligible_agents) == 1:
         winner = eligible_agents[0]
@@ -162,6 +185,19 @@ def apply_action(env, agent, action):
             if len(env.private_opponent_histories[agent]) > H:
                 env.private_opponent_histories[agent].pop(0)
             # ----------------- END OF NEW CODE ----------------------
+
+            # --- MEMORY UPDATE: After a play action, update all other agents’ memory about this play ---
+            from src.model.memory import get_opponent_memory
+            for observer in env.possible_agents:
+                if observer != agent:
+                    # Record that 'agent' played (and whether it was a bluff)
+                    get_opponent_memory(observer).update(
+                        opponent=agent,
+                        response="Play_Bluff" if env.last_action_bluff else "Play_Truthful",
+                        triggering_action="Play_" + str(num_cards_played),
+                        penalties=env.penalties.get(agent, 0),
+                        card_count=len(env.players_hands.get(agent, []))
+                    )
 
             if not current_hand:
                 env.logger.debug(f"{agent} emptied their hand. Adding hand emptying bonus.")
@@ -254,7 +290,7 @@ def get_opponent_features(env, observing_agent):
             count_val = float(raw_count if raw_count is not None else 0) / 5.0
         else:
             # No previous action - set No-Action flag
-            atype_onehot[0] = 1.0  # <-- THIS FIXES THE MISSING FEATURES
+            atype_onehot[0] = 1.0
         
         features.extend(atype_onehot + [count_val])
     
@@ -304,3 +340,19 @@ def get_observations(env, agent_specific=None):
         env.logger.debug(f"Observation for {agent}: Shape={flattened_obs.shape}, Data={flattened_obs}")
 
     return observations
+
+# New helper function to query persistent opponent memory.
+def query_opponent_memory(observer, opponent):
+    """
+    Returns the persistent summary vector for a given opponent as seen by the observer.
+    
+    Args:
+        observer (str): The observing agent's identifier.
+        opponent (str): The opponent's identifier.
+    
+    Returns:
+        np.ndarray: The summary vector from the observer's persistent memory.
+                    If no events are recorded, returns a zero vector.
+    """
+    from src.model.memory import get_opponent_memory
+    return get_opponent_memory(observer).get_summary(opponent)
