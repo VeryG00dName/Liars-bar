@@ -9,6 +9,7 @@ from tkinterdnd2 import TkinterDnD, DND_FILES
 import torch
 import numpy as np
 import pickle
+import traceback
 
 from src.env.liars_deck_env_core import LiarsDeckEnv
 from src.model.new_models import PolicyNetwork, OpponentBehaviorPredictor
@@ -31,7 +32,7 @@ from src.evaluation.evaluate_utils import (
 # Import the opponent memory query helper from memory.py
 from src.model.memory import get_opponent_memory
 
-logging.basicConfig(level=logging.INFO)  # Set to DEBUG for detailed logs
+logging.basicConfig(level=logging.DEBUG)  # Set to DEBUG for detailed logs
 logger = logging.getLogger("AgentBattleground")
 
 
@@ -194,6 +195,7 @@ class AgentBattlegroundGUI:
           - input_dim
           - uses_memory
           - label (the agent name)
+          - display (the original display string; used for safe comparison)
         """
         parts = display_text.split(" - ")
         if len(parts) != 3:
@@ -204,23 +206,21 @@ class AgentBattlegroundGUI:
             raise ValueError(f"File for {file_name} not found among loaded models.")
         file_path = file_path_candidates[0]
         model_data = self.loaded_models[file_path]
-        return {
+        agent = {
             "policy_net": model_data["policy_nets"][agent_name],
             "obp_model": model_data["obp_model"],
             "obs_version": model_data["obs_version"],
             "input_dim": model_data["input_dim"],
             "uses_memory": model_data["uses_memory"],
-            "label": agent_name
+            "label": agent_name,
+            "display": display_text  # Save the original display string
         }
+        return agent
 
     def start_battleground_all(self):
         """
         Run matches with all selected PPO agents (including the main agent)
-        and all available hardcoded bots. Matches are played in a single game
-        with total players = (# PPO agents selected + main agent) + (# hardcoded bots).
-        Training data is extracted from all agents, and win counts are recorded.
-        Matches are repeated until every agent has accumulated at least a target
-        number of training segments.
+        and all available hardcoded bots.
         """
         try:
             # Load selected PPO agents from the Opponent list.
@@ -234,14 +234,14 @@ class AgentBattlegroundGUI:
                 self.show_info("Select a Main PPO Agent")
                 return
             main_agent = self.load_agent_from_string(main_selection)
-            # Ensure the main agent is included (avoid duplicates).
-            if main_agent not in ppo_agents:
+            # Instead of direct dictionary comparison, check the "display" key.
+            if not any(agent["display"] == main_agent["display"] for agent in ppo_agents):
                 ppo_agents.insert(0, main_agent)
             
+            # [Rest of the function remains unchanged...]
             # Get all hardcoded agents.
             hardcoded_agents = []
             for label, agent_class in self.hardcoded_agents.items():
-                # Create an instance by calling the class with its label.
                 agent_instance = agent_class(label)
                 hardcoded_agents.append({
                     "type": "hardcoded",
@@ -250,7 +250,6 @@ class AgentBattlegroundGUI:
                 })
             
             # Build a combined dictionary of agents.
-            # Assign player IDs in order: first all PPO agents, then all hardcoded bots.
             all_agents = {}
             player_id = 0
             for agent in ppo_agents:
@@ -264,12 +263,11 @@ class AgentBattlegroundGUI:
             total_players = len(all_agents)
             target_segments = 20  # Target training segments per agent.
             
-            # Initialize win counts for each agent label.
+            # Initialize win counts.
             wins = {}
             for pid, agent in all_agents.items():
                 wins[agent["label"]] = 0
             
-            # Helper: count segments per label.
             def segments_count(label):
                 return sum(1 for seg, l in self.training_data if l == label)
             
@@ -278,7 +276,6 @@ class AgentBattlegroundGUI:
             while any(segments_count(lbl) < target_segments for lbl in all_labels):
                 match_count += 1
                 winner = self.run_match(all_agents)
-                # Update win counts for each winner.
                 if isinstance(winner, list):
                     for w in winner:
                         wins[w] += 1
@@ -290,6 +287,7 @@ class AgentBattlegroundGUI:
             self.display_results(wins)
             self.show_info(f"Battleground complete. Generated {len(self.training_data)} training examples from {match_count} matches.")
         except Exception as e:
+            logger.error("Error in start_battleground_all: " + traceback.format_exc())
             self.show_info(f"Error: {str(e)}")
 
     def run_match(self, all_agents):
@@ -400,45 +398,93 @@ class AgentBattlegroundGUI:
         return winner_labels if len(winner_labels) > 1 else winner_labels[0]
 
     def choose_action(self, agent_id, policy_net, obp_model, observation, action_mask, device, num_players, obs_version, input_dim, uses_memory):
-        """Selects an action using the policy network (with OBP integration)."""
-        converted_obs = adapt_observation_for_version(observation, num_players, obs_version)
-        logging.debug(f"Converted observation (length {len(converted_obs)}): {converted_obs}")
+        """Selects an action using the policy network (with OBP integration) with detailed debug logging."""
+        try:
+            converted_obs = adapt_observation_for_version(observation, num_players, obs_version)
+            logger.debug(f"[{agent_id}] Converted observation (len={len(converted_obs)}): {converted_obs}")
+        except Exception as e:
+            logger.error(f"[{agent_id}] Error in adapt_observation_for_version: {traceback.format_exc()}")
+            raise
 
-        obp_probs = run_obp_inference(obp_model, converted_obs, device, num_players, obs_version)
-        logging.debug(f"OBP probabilities: {obp_probs}")
+        try:
+            obp_probs = run_obp_inference(obp_model, converted_obs, device, num_players, obs_version)
+            logger.debug(f"[{agent_id}] OBP probabilities: {obp_probs}")
+        except Exception as e:
+            logger.error(f"[{agent_id}] Error in run_obp_inference: {traceback.format_exc()}")
+            raise
 
-        if obs_version == 2 and uses_memory:
-            required_mem_dim = input_dim - (len(converted_obs) + len(obp_probs))
-            mem_features = np.zeros(required_mem_dim, dtype=np.float32) if required_mem_dim > 0 else np.array([], dtype=np.float32)
-            final_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32), mem_features], axis=0)
-        else:
-            final_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32)], axis=0)
-        logging.debug(f"Final observation (length {len(final_obs)}): {final_obs}")
-        
-        expected_dim = input_dim
-        actual_dim = final_obs.shape[0]
-        logging.debug(f"Expected dim: {expected_dim}, Actual dim: {actual_dim}")
-        assert actual_dim == expected_dim, f"Expected observation dimension {expected_dim}, got {actual_dim}"
+        try:
+            if obs_version == 2 and uses_memory:
+                required_mem_dim = input_dim - (len(converted_obs) + len(obp_probs))
+                logger.debug(f"[{agent_id}] Required memory dimension: {required_mem_dim}")
+                if required_mem_dim > 0:
+                    mem_features = np.zeros(required_mem_dim, dtype=np.float32)
+                else:
+                    mem_features = np.array([], dtype=np.float32)
+                final_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32), mem_features], axis=0)
+            else:
+                final_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32)], axis=0)
+            logger.debug(f"[{agent_id}] Final observation (len={len(final_obs)}): {final_obs}")
+        except Exception as e:
+            logger.error(f"[{agent_id}] Error in concatenating observation features: {traceback.format_exc()}")
+            raise
 
-        observation_tensor = torch.tensor(final_obs, dtype=torch.float32).unsqueeze(0).to(device)
-        with torch.no_grad():
-            action_probs, _ = policy_net(observation_tensor)
-        
-        mask_tensor = torch.tensor(action_mask, dtype=torch.float32).to(device)
-        masked_probs = action_probs * mask_tensor
-        
-        # Fix: Use .item() on the sum to get a Python number.
-        if masked_probs.sum().item() == 0:
-            masked_probs = mask_tensor / mask_tensor.sum().item()
-        else:
-            masked_probs /= masked_probs.sum()
-        
-        m = torch.distributions.Categorical(masked_probs)
-        action = m.sample().item()
-        logging.debug(f"Action probabilities: {masked_probs.cpu().numpy()}")
-        logging.debug(f"Selected action: {action}")
-        if action_mask[action] == 6:
-            logging.debug("Challenge Action Selected")
+        try:
+            expected_dim = input_dim
+            actual_dim = final_obs.shape[0]
+            logger.debug(f"[{agent_id}] Expected dim: {expected_dim}, Actual dim: {actual_dim}")
+            assert actual_dim == expected_dim, f"Expected observation dimension {expected_dim}, got {actual_dim}"
+        except Exception as e:
+            logger.error(f"[{agent_id}] Error in final_obs shape assertion: {traceback.format_exc()}")
+            raise
+
+        try:
+            observation_tensor = torch.tensor(final_obs, dtype=torch.float32).unsqueeze(0).to(device)
+            with torch.no_grad():
+                action_probs, _ = policy_net(observation_tensor)
+            logger.debug(f"[{agent_id}] Action probabilities from policy_net: {action_probs}")
+        except Exception as e:
+            logger.error(f"[{agent_id}] Error computing action_probs: {traceback.format_exc()}")
+            raise
+
+        try:
+            mask_tensor = torch.tensor(action_mask, dtype=torch.float32).to(device)
+            logger.debug(f"[{agent_id}] Mask tensor: {mask_tensor}")
+            masked_probs = action_probs * mask_tensor
+            logger.debug(f"[{agent_id}] Masked probabilities before normalization: {masked_probs}")
+            total_prob = masked_probs.sum().item()  # using .item() to get a scalar
+            logger.debug(f"[{agent_id}] Total probability sum: {total_prob}")
+            if total_prob == 0:
+                mask_sum = mask_tensor.sum().item()
+                logger.debug(f"[{agent_id}] Mask tensor sum: {mask_sum}")
+                masked_probs = mask_tensor / mask_sum
+            else:
+                masked_probs /= total_prob
+            logger.debug(f"[{agent_id}] Masked probabilities after normalization: {masked_probs}")
+        except Exception as e:
+            logger.error(f"[{agent_id}] Error in masking/normalization of action probabilities: {traceback.format_exc()}")
+            raise
+
+        try:
+            m = torch.distributions.Categorical(masked_probs)
+            action = m.sample().item()
+            logger.debug(f"[{agent_id}] Sampled action: {action}")
+        except Exception as e:
+            logger.error(f"[{agent_id}] Error sampling action: {traceback.format_exc()}")
+            raise
+
+        try:
+            # Ensure that if action_mask is a tensor, we extract its scalar value.
+            if isinstance(action_mask, (list, tuple)):
+                mask_value = action_mask[action]
+            else:
+                mask_value = action_mask[action].item() if isinstance(action_mask[action], torch.Tensor) else action_mask[action]
+            if mask_value == 6:
+                logger.debug(f"[{agent_id}] Challenge Action Selected (mask_value: {mask_value})")
+        except Exception as e:
+            logger.error(f"[{agent_id}] Error in checking action_mask for challenge: {traceback.format_exc()}")
+            raise
+
         return action
 
     def save_training_data(self):
@@ -449,7 +495,7 @@ class AgentBattlegroundGUI:
                 with open(file_path, "rb") as f:
                     existing_data = pickle.load(f)
             except Exception as e:
-                logger.error(f"Error loading existing training data: {e}")
+                logger.error(f"Error loading existing training data: {traceback.format_exc()}")
                 existing_data = []
         else:
             existing_data = []
