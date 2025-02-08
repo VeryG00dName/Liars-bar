@@ -174,7 +174,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
         agents = env.agents  # Agents may be shuffled
         episode_rewards = {agent: 0 for agent in agents}  # Initialize accumulated rewards
         steps_in_episode = 0
-
+        pending_rewards = {agent: 0.0 for agent in agents}
         while env.agent_selection is not None:
             steps_in_episode += 1
             agent = env.agent_selection
@@ -225,19 +225,28 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
             # Step in the environment
             env.step(action)
 
-            reward = env.rewards[agent]
             done_or_truncated = env.terminations[agent] or env.truncations[agent]
 
-            memories[agent].store_transition(
-                agent=agent,
-                state=final_obs,
-                action=action,
-                log_prob=log_prob.item(),
-                reward=reward,
-                is_terminal=done_or_truncated,
-                state_value=state_value,
-                action_mask=action_mask
-            )
+            for ag in agents:
+                if ag != agent:
+                    pending_rewards[ag] += env.rewards[ag]  # Store off-turn rewards
+                else:
+                    # If it's the current agent's turn, apply any stored pending rewards
+                    reward = env.rewards[agent] + pending_rewards[agent]
+                    pending_rewards[agent] = 0  # Reset pending rewards after applying
+
+                    done_or_truncated = env.terminations[agent] or env.truncations[agent]
+
+                    memories[agent].store_transition(
+                        agent=agent,
+                        state=final_obs,
+                        action=action,
+                        log_prob=log_prob.item(),
+                        reward=reward,
+                        is_terminal=done_or_truncated,
+                        state_value=state_value,
+                        action_mask=action_mask
+                    )
 
             # Accumulate rewards for logging
             for a in agents:
