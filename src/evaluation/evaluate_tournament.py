@@ -31,11 +31,15 @@ __all__ = [
     'openskill_model'
 ]
 
+# --- Global variable to store the transformer so it is loaded only once ---
+global_strategy_transformer = None
+
 def initialize_players(checkpoints_dir, device):
     """
     Specialized initialization for the tournament scenario.
     Loads checkpoint files ending with `.pth` and creates players with OpenSkill ratings. 
-    Handles both v1 & v2 obs models, and now records whether a player uses persistent memory.
+    Handles both v1 & v2 obs models (with v2 now including new models with input dimension 26),
+    and records whether a player uses persistent memory.
     """
     if not os.path.isdir(checkpoints_dir):
         raise FileNotFoundError(f"The directory '{checkpoints_dir}' does not exist.")
@@ -74,7 +78,7 @@ def initialize_players(checkpoints_dir, device):
                     actual_input_dim = policy_state_dict['fc1.weight'].shape[1]
                     if actual_input_dim == 18:
                         obs_version = OBS_VERSION_1  # v1
-                    elif actual_input_dim in (16, 24):
+                    elif actual_input_dim in (16, 24, 26):  # now handle new models with 26 input dimension
                         obs_version = OBS_VERSION_2  # v2
                     else:
                         raise ValueError(
@@ -224,7 +228,9 @@ def swiss_grouping(players, match_history, group_size):
 def evaluate_agents_tournament(env, device, players_in_this_game, episodes=5):
     """
     A specialized version of evaluate_agents for the Swiss tournament.
-    Now supports both obs v1 and v2 (and memory-enhanced v2 models) by using adapt_observation_for_version.
+    Now supports both obs v1 and v2 (and memory‐enhanced models) by using adapt_observation_for_version.
+    Also distinguishes between old memory integration (using query_opponent_memory) versus the new
+    transformer‐based approach.
     """
     logger = logging.getLogger("EvaluateTournament")
     player_ids = list(players_in_this_game.keys())
@@ -293,20 +299,97 @@ def evaluate_agents_tournament(env, device, players_in_this_game, episodes=5):
 
             # 3) Build the final observation.
             expected_dim = player_data['policy_net'].fc1.in_features
-            # For players that use memory (and are v2), query and incorporate memory features.
+
+            # Determine if memory integration should be applied.
+            required_mem_dim = expected_dim - (len(converted_obs) + len(obp_probs))
             if player_data.get('uses_memory', False) and obs_version == OBS_VERSION_2:
-                from src.env.liars_deck_env_utils import query_opponent_memory
-                mem_features_list = []
-                for opp in env.possible_agents:
-                    if opp != agent:
-                        mem_summary = query_opponent_memory(agent, opp)
-                        mem_features_list.append(mem_summary)
-                if mem_features_list:
-                    mem_features = np.concatenate(mem_features_list, axis=0)
+                # Decide which memory integration technique to use.
+                if required_mem_dim == config.STRATEGY_DIM * (env.num_players - 1):
+                    # --- Transformer-based memory integration ---
+                    # Define a local vocabulary class and conversion function.
+                    class Vocabulary:
+                        def __init__(self, max_size):
+                            self.token2idx = {"<PAD>": 0, "<UNK>": 1}
+                            self.idx2token = {0: "<PAD>", 1: "<UNK>"}
+                            self.max_size = max_size
+                        def encode(self, token):
+                            if token in self.token2idx:
+                                return self.token2idx[token]
+                            else:
+                                if len(self.token2idx) < self.max_size:
+                                    idx = len(self.token2idx)
+                                    self.token2idx[token] = idx
+                                    self.idx2token[idx] = token
+                                    return idx
+                                else:
+                                    return self.token2idx["<UNK>"]
+
+                    def convert_memory_to_tokens(memory, vocab):
+                        tokens = []
+                        for event in memory:
+                            if isinstance(event, dict):
+                                sorted_items = sorted(event.items())
+                                token_str = "_".join(f"{k}-{v}" for k, v in sorted_items)
+                            else:
+                                token_str = str(event)
+                            tokens.append(vocab.encode(token_str))
+                        return tokens
+
+                    # Create a vocabulary instance.
+                    vocab_inst = Vocabulary(max_size=config.STRATEGY_NUM_TOKENS)
+
+                    # Use the full-memory query plus transformer.
+                    from src.env.liars_deck_env_utils import query_opponent_memory_full
+                    mem_features_list = []
+                    for opp in env.possible_agents:
+                        if opp != agent:
+                            mem_summary = query_opponent_memory_full(agent, opp)
+                            token_seq = convert_memory_to_tokens(mem_summary, vocab_inst)
+                            token_tensor = torch.tensor(token_seq, dtype=torch.long, device=device).unsqueeze(0)
+                            # Use global_strategy_transformer so it is loaded only once.
+                            global global_strategy_transformer
+                            if global_strategy_transformer is None:
+                                from src.model.new_models import StrategyTransformer
+                                global_strategy_transformer = StrategyTransformer(
+                                    num_tokens=config.STRATEGY_NUM_TOKENS,
+                                    token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM,
+                                    nhead=config.STRATEGY_NHEAD,
+                                    num_layers=config.STRATEGY_NUM_LAYERS,
+                                    strategy_dim=config.STRATEGY_DIM,
+                                    num_classes=config.STRATEGY_NUM_CLASSES,
+                                    dropout=config.STRATEGY_DROPOUT,
+                                    use_cls_token=True
+                                ).to(device)
+                                transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
+                                if os.path.exists(transformer_checkpoint_path):
+                                    state_dict = torch.load(transformer_checkpoint_path, map_location=device)
+                                    global_strategy_transformer.load_state_dict(state_dict)
+                                    logging.info(f"Loaded transformer from '{transformer_checkpoint_path}'.")
+                                else:
+                                    logging.warning("Transformer checkpoint not found, using randomly initialized transformer.")
+                                global_strategy_transformer.classification_head = None
+                                global_strategy_transformer.eval()
+                            with torch.no_grad():
+                                embedding, _ = global_strategy_transformer(token_tensor)
+                            mem_features_list.append(embedding.cpu().numpy().flatten())
+                    if mem_features_list:
+                        mem_features = np.concatenate(mem_features_list, axis=0)
+                    else:
+                        mem_features = np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
                 else:
-                    mem_features = np.array([], dtype=np.float32)
-                # Compute required memory dimension.
-                required_mem_dim = expected_dim - (len(converted_obs) + len(obp_probs))
+                    # --- Old memory integration using memory summary ---
+                    from src.env.liars_deck_env_utils import query_opponent_memory
+                    mem_features_list = []
+                    for opp in env.possible_agents:
+                        if opp != agent:
+                            mem_summary = query_opponent_memory(agent, opp)
+                            mem_features_list.append(mem_summary)
+                    if mem_features_list:
+                        mem_features = np.concatenate(mem_features_list, axis=0)
+                    else:
+                        mem_features = np.array([], dtype=np.float32)
+
+                # Pad or truncate mem_features to match the required dimension.
                 current_mem_dim = mem_features.shape[0]
                 if current_mem_dim < required_mem_dim:
                     pad = np.zeros(required_mem_dim - current_mem_dim, dtype=np.float32)
