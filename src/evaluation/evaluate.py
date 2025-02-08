@@ -39,9 +39,13 @@ from src import config
 # For resetting and querying persistent memory
 from src.model.memory import get_opponent_memory
 
+# --- Global transformer variable (for transformer‐based memory integration) ---
+global_strategy_transformer = None
+
 def initialize_players(players_dir, device):
     """
-    [Unchanged code from previous version; see your earlier implementation]
+    Loads checkpoints from subdirectories of players_dir. Models with input dimension 26
+    are now treated as new (obs_version 2). Also records whether a player uses persistent memory.
     """
     players = {}
     logger = logging.getLogger("Evaluate")
@@ -63,7 +67,7 @@ def initialize_players(players_dir, device):
 
                     if actual_input_dim == 18:
                         obs_version = 1  # old model
-                    elif actual_input_dim in (16, 24):
+                    elif actual_input_dim in (16, 24, 26):  # new models now include input dim 26
                         obs_version = 2  # new model
                     else:
                         raise ValueError(f"Unknown input dim {actual_input_dim}")
@@ -142,13 +146,13 @@ def initialize_players(players_dir, device):
                             'uses_memory': uses_memory
                         }
                 except Exception as e:
-                    logging.error(f"Error loading {checkpoint_file} in {version}: {str(e)}")
+                    logger.error(f"Error loading {checkpoint_file} in {version}: {str(e)}")
     return players
 
 
 def run_obp_inference(obp_model, obs, device, num_players, agent_version):
     """
-    [Unchanged code from previous version]
+    Runs OBP inference for an observation. If no OBP model is provided, returns a default list.
     """
     if obp_model is None:
         num_opponents = num_players - 1
@@ -182,14 +186,11 @@ def run_obp_inference(obp_model, obs, device, num_players, agent_version):
 
 def evaluate_agents(env, device, players_in_this_game, episodes=10):
     """
-    Plays 'episodes' games with the same players and returns statistics.
-    For players that use memory (new models with obs_version == 2), their persistent memory is
-    reset at the start of the match and then builds up over the config.NUM_GAMES_PER_MATCH games.
-    
-    Final observation is constructed as follows:
-      - For old models (obs_version == 1): final_obs = [converted_obs, OBP output]
-      - For new models (obs_version == 2) that use memory:
-             final_obs = [converted_obs, OBP output, memory_features_padded]
+    Plays a number of games with the same players and returns statistics.
+    For new models (obs_version == 2) that use memory, the final observation is constructed
+    as [converted_obs, OBP output, memory_features_padded]. If the required memory dimension equals
+    config.STRATEGY_DIM*(env.num_players-1), transformer-based memory integration is used.
+    Otherwise, the old memory integration (via query_opponent_memory) is applied.
     """
     logger = logging.getLogger("Evaluate")
     player_ids = list(players_in_this_game.keys())
@@ -198,12 +199,13 @@ def evaluate_agents(env, device, players_in_this_game, episodes=10):
 
     agent_to_player = {f'player_{i}': player_ids[i] for i in range(env.num_players)}
     
-    # For each environment agent corresponding to a player that uses memory and is new (obs_version == 2), reset memory.
+    # Reset persistent memory for players that use memory and are new (obs_version == 2)
     for env_agent in agent_to_player:
         pid = agent_to_player[env_agent]
         if players_in_this_game[pid].get('uses_memory', False) and players_in_this_game[pid]['obs_version'] == 2:
             get_opponent_memory(env_agent).memory.clear()
 
+    # Assuming 7 actions
     action_counts = {pid: {action: 0 for action in range(7)} for pid in player_ids}
     cumulative_wins = {pid: 0 for pid in player_ids}
     total_steps = 0
@@ -243,26 +245,97 @@ def evaluate_agents(env, device, players_in_this_game, episodes=10):
             converted_obs = adapt_observation_for_version(observation, env.num_players, version)
             obp_probs = run_obp_inference(obp_model, converted_obs, device, env.num_players, version)
 
-            # Build the default observation: concatenation of converted_obs and OBP output.
+            # Build the default observation
             default_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32)], axis=0)
             expected_dim = player_data['policy_net'].fc1.in_features
 
-            # For new models that use memory, we want to include memory features.
+            # For new models that use memory (obs_version == 2)
             if player_data.get('uses_memory', False) and version == 2:
-                from src.env.liars_deck_env_utils import query_opponent_memory
-                mem_features_list = []
-                for opp in env.possible_agents:
-                    if opp != agent:
-                        mem_summary = query_opponent_memory(agent, opp)
-                        mem_features_list.append(mem_summary)
-                if mem_features_list:
-                    mem_features = np.concatenate(mem_features_list, axis=0)
-                else:
-                    mem_features = np.array([], dtype=np.float32)
-                # Now, we compute the required memory dimension.
-                # Let L_conv = len(converted_obs), L_obp = len(obp_probs) (which equals num_opponents),
-                # and expected_dim be the final length.
                 required_mem_dim = expected_dim - (len(converted_obs) + len(obp_probs))
+                # Decide whether to use transformer-based integration.
+                if required_mem_dim == config.STRATEGY_DIM * (env.num_players - 1):
+                    # --- Transformer-based memory integration ---
+                    # Define a local Vocabulary class and conversion function.
+                    class Vocabulary:
+                        def __init__(self, max_size):
+                            self.token2idx = {"<PAD>": 0, "<UNK>": 1}
+                            self.idx2token = {0: "<PAD>", 1: "<UNK>"}
+                            self.max_size = max_size
+                        def encode(self, token):
+                            if token in self.token2idx:
+                                return self.token2idx[token]
+                            else:
+                                if len(self.token2idx) < self.max_size:
+                                    idx = len(self.token2idx)
+                                    self.token2idx[token] = idx
+                                    self.idx2token[idx] = token
+                                    return idx
+                                else:
+                                    return self.token2idx["<UNK>"]
+
+                    def convert_memory_to_tokens(memory, vocab):
+                        tokens = []
+                        for event in memory:
+                            if isinstance(event, dict):
+                                sorted_items = sorted(event.items())
+                                token_str = "_".join(f"{k}-{v}" for k, v in sorted_items)
+                            else:
+                                token_str = str(event)
+                            tokens.append(vocab.encode(token_str))
+                        return tokens
+
+                    # Create a vocabulary instance.
+                    vocab_inst = Vocabulary(max_size=config.STRATEGY_NUM_TOKENS)
+                    # Use full-memory query plus transformer.
+                    from src.env.liars_deck_env_utils import query_opponent_memory_full
+                    mem_features_list = []
+                    for opp in env.possible_agents:
+                        if opp != agent:
+                            mem_summary = query_opponent_memory_full(agent, opp)
+                            token_seq = convert_memory_to_tokens(mem_summary, vocab_inst)
+                            token_tensor = torch.tensor(token_seq, dtype=torch.long, device=device).unsqueeze(0)
+                            global global_strategy_transformer
+                            if global_strategy_transformer is None:
+                                from src.model.new_models import StrategyTransformer
+                                global_strategy_transformer = StrategyTransformer(
+                                    num_tokens=config.STRATEGY_NUM_TOKENS,
+                                    token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM,
+                                    nhead=config.STRATEGY_NHEAD,
+                                    num_layers=config.STRATEGY_NUM_LAYERS,
+                                    strategy_dim=config.STRATEGY_DIM,
+                                    num_classes=config.STRATEGY_NUM_CLASSES,
+                                    dropout=config.STRATEGY_DROPOUT,
+                                    use_cls_token=True
+                                ).to(device)
+                                transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
+                                if os.path.exists(transformer_checkpoint_path):
+                                    state_dict = torch.load(transformer_checkpoint_path, map_location=device)
+                                    global_strategy_transformer.load_state_dict(state_dict)
+                                    logging.info(f"Loaded transformer from '{transformer_checkpoint_path}'.")
+                                else:
+                                    logging.warning("Transformer checkpoint not found, using randomly initialized transformer.")
+                                global_strategy_transformer.classification_head = None
+                                global_strategy_transformer.eval()
+                            with torch.no_grad():
+                                embedding, _ = global_strategy_transformer(token_tensor)
+                            mem_features_list.append(embedding.cpu().numpy().flatten())
+                    if mem_features_list:
+                        mem_features = np.concatenate(mem_features_list, axis=0)
+                    else:
+                        mem_features = np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
+                else:
+                    # --- Old memory integration using query_opponent_memory ---
+                    from src.env.liars_deck_env_utils import query_opponent_memory
+                    mem_features_list = []
+                    for opp in env.possible_agents:
+                        if opp != agent:
+                            mem_summary = query_opponent_memory(agent, opp)
+                            mem_features_list.append(mem_summary)
+                    if mem_features_list:
+                        mem_features = np.concatenate(mem_features_list, axis=0)
+                    else:
+                        mem_features = np.array([], dtype=np.float32)
+                # Pad or truncate mem_features to match required dimension.
                 current_mem_dim = mem_features.shape[0]
                 if current_mem_dim < required_mem_dim:
                     pad = np.zeros(required_mem_dim - current_mem_dim, dtype=np.float32)
@@ -320,9 +393,8 @@ def evaluate_agents(env, device, players_in_this_game, episodes=10):
 
 def run_evaluation(env, device, players, num_games_per_triple=11):
     """
-    Conduct the evaluation by iterating over all player triples.
-    For each triple, the persistent memory for players that use memory is reset (so that
-    memory builds up only over the num_games_per_triple games).
+    Conducts evaluation over all triples of players.
+    For each triple, resets persistent memory for new (memory‐using) players and aggregates statistics.
     """
     logger = logging.getLogger("Evaluate")
     player_ids = list(players.keys())
@@ -340,7 +412,7 @@ def run_evaluation(env, device, players, num_games_per_triple=11):
     for idx, triple in enumerate(triples_list, start=1):
         logger.info(f"Evaluating triple {idx}/{total_triples}: {triple}")
         players_in_this_game = {pid: players[pid] for pid in triple}
-        # For each environment agent corresponding to a player that uses memory and is new (obs_version == 2), reset memory.
+        # Reset memory for new players (obs_version 2 with memory)
         for env_agent in [f'player_{i}' for i in range(3)]:
             pid = triple[int(env_agent.split('_')[1])]
             if players_in_this_game[pid].get('uses_memory', False) and players_in_this_game[pid]['obs_version'] == 2:
