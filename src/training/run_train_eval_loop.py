@@ -172,7 +172,7 @@ def main():
         time.sleep(2)
         
         # 2. Run evaluation phase.
-        players = run_evaluation_phase(num_games_per_match=5, num_rounds=3)
+        players = run_evaluation_phase(num_games_per_match=11, num_rounds=7)
         
         # 3. Get the newest checkpoint episode.
         newest_episode = get_newest_checkpoint_episode()
