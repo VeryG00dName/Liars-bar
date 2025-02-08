@@ -24,6 +24,7 @@ legacy_OpponentBehaviorPredictor = legacy_module.OpponentBehaviorPredictor
 
 # Import evaluation utilities for observation conversion and hidden dim extraction.
 from src.evaluation.evaluate_utils import adapt_observation_for_version, get_hidden_dim_from_state_dict
+from src.evaluation.evaluate import run_obp_inference  # New import for OBP inference
 from src import config
 
 
@@ -226,18 +227,20 @@ class AgentManagerApp:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         env = LiarsDeckEnv(num_players=num_players, render_mode="human")
         
-        # Dictionaries to store the reconstructed models and observation versions.
+        # Dictionaries to store the reconstructed models and observation properties.
         policy_nets = {}
         obp_models = {}
-        obs_versions = {}  # Maps agent_id to observation version (1 or 2)
+        obs_versions = {}    # Maps agent_id to observation version (1 or 2)
+        input_dims = {}      # Maps agent_id to expected input dimension of the policy network
+        uses_memories = {}   # Maps agent_id to a boolean indicating whether the policy uses memory
         
         for agent_id, data in agents.items():
-            # Determine observation version from the policy checkpoint.
+            # Determine observation version and input dimension from the policy checkpoint.
             policy_state = data["policy_net"]
             actual_input_dim = policy_state["fc1.weight"].shape[1]
             if actual_input_dim == 18:
                 obs_version = 1
-            elif actual_input_dim == 16:
+            elif actual_input_dim in (16, 24):
                 obs_version = 2
             else:
                 raise ValueError(f"Unknown input dimension {actual_input_dim} for {agent_id}")
@@ -274,6 +277,8 @@ class AgentManagerApp:
             policy_net.eval()
             policy_nets[agent_id] = policy_net
             obs_versions[agent_id] = obs_version
+            input_dims[agent_id] = actual_input_dim
+            uses_memories[agent_id] = ("fc4.weight" in policy_state)
 
             # Reconstruct OBP model if provided.
             obp_model = None
@@ -309,52 +314,46 @@ class AgentManagerApp:
             # Adapt the observation to the version expected by the agent.
             converted_obs = adapt_observation_for_version(observation_array, num_players, obs_versions[current_agent])
             action_mask = info['action_mask']
+            # Pass the additional parameters (input dimension and memory flag) to choose_action.
             action = self.choose_action(
                 policy_nets[current_agent],
                 obp_models[current_agent],
-                converted_obs,  # Pass the adapted observation
+                converted_obs,
                 device,
                 num_players,
                 action_mask,
-                obs_versions[current_agent]
+                obs_versions[current_agent],
+                input_dims[current_agent],
+                uses_memories[current_agent]
             )
             logging.info(f"{current_agent} chose action {action}")
             env.step(action)
         env.close()
 
-    def choose_action(self, policy_net, obp_model, converted_obs, device, num_players, action_mask, obs_version):
+    def choose_action(self, policy_net, obp_model, converted_obs, device, num_players, action_mask, obs_version, input_dim, uses_memory):
         """
-        Chooses an action with OBP integration.
-        The observation is assumed to be already converted (via adapt_observation_for_version).
+        Chooses an action with OBP integration and memory padding if needed.
         """
-        # Determine opponent feature dimension based on obs_version.
-        if obs_version == 1:
-            opp_feature_dim = 5
-        elif obs_version == 2:
-            opp_feature_dim = 4
+        # Run OBP inference to get opponent behavior probabilities.
+        obp_probs = run_obp_inference(
+            obp_model,
+            converted_obs,
+            device,
+            num_players,
+            obs_version
+        )
+        # If the model uses memory (and obs_version is 2), pad with zeros for memory features.
+        if obs_version == 2 and uses_memory:
+            required_mem_dim = input_dim - (len(converted_obs) + len(obp_probs))
+            if required_mem_dim > 0:
+                mem_features = np.zeros(required_mem_dim, dtype=np.float32)
+            else:
+                mem_features = np.array([], dtype=np.float32)
+            final_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32), mem_features], axis=0)
         else:
-            raise ValueError(f"Unknown obs_version: {obs_version}")
-        num_opponents = num_players - 1
-        opp_features_start = len(converted_obs) - (num_opponents * opp_feature_dim)
-        
-        obp_probs = []
-        for i in range(num_opponents):
-            start_idx = opp_features_start + i * opp_feature_dim
-            end_idx = start_idx + opp_feature_dim
-            opp_vec = converted_obs[start_idx:end_idx]
-            opp_vec_tensor = torch.tensor(opp_vec, dtype=torch.float32, device=device).unsqueeze(0)
-            with torch.no_grad():
-                if obp_model:
-                    logits = obp_model(opp_vec_tensor)
-                    probs = torch.softmax(logits, dim=-1)
-                    bluff_prob = probs[0, 1].item()  # Probability of "bluff" class
-                else:
-                    bluff_prob = 0.0
-            obp_probs.append(bluff_prob)
-        
-        # Append OBP predictions to the converted observation.
-        final_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32)], axis=0)
-        expected_dim = policy_net.fc1.in_features  # Expected input dimension
+            final_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32)], axis=0)
+
+        expected_dim = input_dim  # Expected input dimension for the policy network
         if len(final_obs) != expected_dim:
             raise ValueError(f"Expected observation dimension {expected_dim}, got {len(final_obs)}")
         observation_tensor = torch.tensor(final_obs, dtype=torch.float32).unsqueeze(0).to(device)
