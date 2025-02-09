@@ -184,7 +184,7 @@ def run_obp_inference(obp_model, obs, device, num_players, agent_version):
     return obp_probs
 
 
-def evaluate_agents(env, device, players_in_this_game, episodes=10):
+def evaluate_agents(env, device, players_in_this_game, episodes=11):
     """
     Plays a number of games with the same players and returns statistics.
     For new models (obs_version == 2) that use memory, the final observation is constructed
