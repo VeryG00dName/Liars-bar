@@ -12,7 +12,14 @@ from src.model.new_models import PolicyNetwork, OpponentBehaviorPredictor
 from src import config
 import random
 
-from src.model.hard_coded_agents import GreedyCardSpammer, TableFirstConservativeChallenger, StrategicChallenger, RandomAgent, TableNonTableAgent
+from src.model.hard_coded_agents import (
+    GreedyCardSpammer,
+    TableFirstConservativeChallenger,
+    StrategicChallenger,
+    RandomAgent,
+    TableNonTableAgent,
+    Classic
+)
 
 from src.evaluation.evaluate import run_obp_inference
 from src.evaluation.evaluate_utils import (
@@ -22,6 +29,9 @@ from src.evaluation.evaluate_utils import (
 
 logging.basicConfig(level=logging.INFO)  # Set to DEBUG for detailed logs
 logger = logging.getLogger("AgentBattleground")
+
+# Global transformer variable for transformer‐based memory integration.
+global_strategy_transformer = None
 
 class AgentBattlegroundGUI:
     def __init__(self, root):
@@ -36,6 +46,7 @@ class AgentBattlegroundGUI:
             "Strategic": lambda name: StrategicChallenger(name, 3, 2),  # Pass agent_index=2
             "Conservative": lambda name: TableFirstConservativeChallenger(name),
             "TableNonTableAgent": TableNonTableAgent,
+            "Classic": Classic,
             "Random": RandomAgent
         }
         
@@ -45,7 +56,7 @@ class AgentBattlegroundGUI:
         self.create_control_buttons()
         self.create_results_display()
 
-        self.current_env = None
+        self.current_env = None  # Will be set when a match is run
 
     def get_hidden_dim_from_state_dict(self, state_dict, layer_prefix='fc1'):
         """Extracts hidden dimension from model weights using imported utility."""
@@ -126,7 +137,7 @@ class AgentBattlegroundGUI:
         
         if input_dim == 18:
             obs_version = 1  # OBS_VERSION_1
-        elif input_dim in (16, 24):
+        elif input_dim in (16, 24, 26):
             obs_version = 2  # OBS_VERSION_2
         else:
             raise ValueError(f"Unknown input_dim {input_dim} for model {file_path}")
@@ -219,6 +230,7 @@ class AgentBattlegroundGUI:
     def run_match(self, ai_agents, hardcoded_agent):
         env = LiarsDeckEnv(num_players=3, render_mode=None)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.current_env = env  # Save current environment for memory queries
         
         # Initialize AI agents
         policy_nets = {}
@@ -267,7 +279,7 @@ class AgentBattlegroundGUI:
                 continue
 
             if current_agent in policy_nets:
-                # AI Agent's turn: pass the agent id and uses_memory flag
+                # AI Agent's turn
                 action = self.choose_action(
                     current_agent,
                     policy_nets[current_agent],
@@ -311,7 +323,7 @@ class AgentBattlegroundGUI:
             return "unknown_agent"
 
     def choose_action(self, agent_id, policy_net, obp_model, observation, action_mask, device, num_players, obs_version, input_dim, uses_memory):
-        """Full action selection with OBP integration using imported utilities."""
+        """Selects an action using OBP integration and, if applicable, transformer‐based memory integration."""
         # Adapt observation based on agent version
         converted_obs = adapt_observation_for_version(
             observation, 
@@ -330,13 +342,99 @@ class AgentBattlegroundGUI:
         )
         logging.debug(f"OBP probabilities: {obp_probs}")
 
-        # If the model uses memory (and obs_version is 2) then pad zeros for memory features.
+        # If the model uses memory (and obs_version is 2) then integrate memory features.
         if obs_version == 2 and uses_memory:
             required_mem_dim = input_dim - (len(converted_obs) + len(obp_probs))
-            if required_mem_dim > 0:
-                mem_features = np.zeros(required_mem_dim, dtype=np.float32)
+            # Use transformer-based integration if the required memory dimension matches
+            if required_mem_dim == config.STRATEGY_DIM * (num_players - 1):
+                # Import the full-memory query function
+                from src.env.liars_deck_env_utils import query_opponent_memory_full
+
+                # Define a local Vocabulary class and conversion function
+                class Vocabulary:
+                    def __init__(self, max_size):
+                        self.token2idx = {"<PAD>": 0, "<UNK>": 1}
+                        self.idx2token = {0: "<PAD>", 1: "<UNK>"}
+                        self.max_size = max_size
+                    def encode(self, token):
+                        if token in self.token2idx:
+                            return self.token2idx[token]
+                        else:
+                            if len(self.token2idx) < self.max_size:
+                                idx = len(self.token2idx)
+                                self.token2idx[token] = idx
+                                self.idx2token[idx] = token
+                                return idx
+                            else:
+                                return self.token2idx["<UNK>"]
+
+                def convert_memory_to_tokens(memory, vocab):
+                    tokens = []
+                    for event in memory:
+                        if isinstance(event, dict):
+                            sorted_items = sorted(event.items())
+                            token_str = "_".join(f"{k}-{v}" for k, v in sorted_items)
+                        else:
+                            token_str = str(event)
+                        tokens.append(vocab.encode(token_str))
+                    return tokens
+
+                vocab_inst = Vocabulary(max_size=config.STRATEGY_NUM_TOKENS)
+                mem_features_list = []
+                # Iterate over opponents using the current environment stored in self.current_env
+                for opp in self.current_env.possible_agents:
+                    if opp != agent_id:
+                        mem_summary = query_opponent_memory_full(agent_id, opp)
+                        token_seq = convert_memory_to_tokens(mem_summary, vocab_inst)
+                        token_tensor = torch.tensor(token_seq, dtype=torch.long, device=device).unsqueeze(0)
+                        global global_strategy_transformer
+                        if global_strategy_transformer is None:
+                            from src.model.new_models import StrategyTransformer
+                            global_strategy_transformer = StrategyTransformer(
+                                num_tokens=config.STRATEGY_NUM_TOKENS,
+                                token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM,
+                                nhead=config.STRATEGY_NHEAD,
+                                num_layers=config.STRATEGY_NUM_LAYERS,
+                                strategy_dim=config.STRATEGY_DIM,
+                                num_classes=config.STRATEGY_NUM_CLASSES,
+                                dropout=config.STRATEGY_DROPOUT,
+                                use_cls_token=True
+                            ).to(device)
+                            transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
+                            if os.path.exists(transformer_checkpoint_path):
+                                state_dict = torch.load(transformer_checkpoint_path, map_location=device)
+                                global_strategy_transformer.load_state_dict(state_dict)
+                                logging.info(f"Loaded transformer from '{transformer_checkpoint_path}'.")
+                            else:
+                                logging.warning("Transformer checkpoint not found, using randomly initialized transformer.")
+                            global_strategy_transformer.classification_head = None
+                            global_strategy_transformer.eval()
+                        with torch.no_grad():
+                            embedding, _ = global_strategy_transformer(token_tensor)
+                        mem_features_list.append(embedding.cpu().numpy().flatten())
+                if mem_features_list:
+                    mem_features = np.concatenate(mem_features_list, axis=0)
+                else:
+                    mem_features = np.zeros(config.STRATEGY_DIM * (num_players - 1), dtype=np.float32)
             else:
-                mem_features = np.array([], dtype=np.float32)
+                # Use the old memory integration method if transformer-based integration is not applicable
+                from src.env.liars_deck_env_utils import query_opponent_memory
+                mem_features_list = []
+                for opp in self.current_env.possible_agents:
+                    if opp != agent_id:
+                        mem_summary = query_opponent_memory(agent_id, opp)
+                        mem_features_list.append(mem_summary)
+                if mem_features_list:
+                    mem_features = np.concatenate(mem_features_list, axis=0)
+                else:
+                    mem_features = np.array([], dtype=np.float32)
+            # Pad or truncate mem_features to match required dimension.
+            current_mem_dim = mem_features.shape[0]
+            if current_mem_dim < required_mem_dim:
+                pad = np.zeros(required_mem_dim - current_mem_dim, dtype=np.float32)
+                mem_features = np.concatenate([mem_features, pad], axis=0)
+            elif current_mem_dim > required_mem_dim:
+                mem_features = mem_features[:required_mem_dim]
             final_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32), mem_features], axis=0)
         else:
             final_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32)], axis=0)
