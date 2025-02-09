@@ -13,12 +13,15 @@ from src.env.liars_deck_env_core import LiarsDeckEnv
 from src.model.new_models import PolicyNetwork, OpponentBehaviorPredictor
 from src import config
 
-# Import memory utilities and opponent memory query function.
+# Import memory utilities and opponent memory query functions.
 from src.model.memory import get_opponent_memory
-from src.env.liars_deck_env_utils import query_opponent_memory
+from src.env.liars_deck_env_utils import query_opponent_memory, query_opponent_memory_full
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("PlayVsAI")
+
+# Global transformer variable (for transformer‐based memory integration)
+global_strategy_transformer = None
 
 
 class PlayVsAIGUI:
@@ -222,11 +225,6 @@ class PlayVsAIGUI:
                 obp_models[agent_id] = obp_model
             else:
                 obp_models[agent_id] = None
-
-        # For AI agents that use memory, reset their persistent memory at the start.
-        for agent_id, uses_memory in agent_memory_usage.items():
-            if uses_memory:
-                get_opponent_memory(agent_id).memory.clear()
         
         # Game loop
         self.current_env.reset()
@@ -299,22 +297,91 @@ class PlayVsAIGUI:
         
         # Build the final observation vector.
         if uses_memory:
-            # Query the persistent memory for each opponent.
-            mem_features_list = []
-            for opp in self.current_env.possible_agents:
-                if opp != agent_id:
-                    mem_summary = query_opponent_memory(agent_id, opp)
-                    mem_features_list.append(mem_summary)
-            if mem_features_list:
-                mem_features = np.concatenate(mem_features_list, axis=0)
-            else:
-                mem_features = np.array([], dtype=np.float32)
-            
-            # Determine how many memory features are expected.
-            expected_dim = policy_net.fc1.in_features  # Total expected dimension
+            expected_dim = policy_net.fc1.in_features
             non_memory_dim = len(observation) + len(obp_probs)
             required_mem_dim = expected_dim - non_memory_dim
 
+            # Use transformer-based memory integration if the required memory dimension matches
+            # config.STRATEGY_DIM * (num_players - 1)
+            if required_mem_dim == config.STRATEGY_DIM * (num_players - 1):
+                # --- Transformer-based memory integration ---
+                class Vocabulary:
+                    def __init__(self, max_size):
+                        self.token2idx = {"<PAD>": 0, "<UNK>": 1}
+                        self.idx2token = {0: "<PAD>", 1: "<UNK>"}
+                        self.max_size = max_size
+                    def encode(self, token):
+                        if token in self.token2idx:
+                            return self.token2idx[token]
+                        else:
+                            if len(self.token2idx) < self.max_size:
+                                idx = len(self.token2idx)
+                                self.token2idx[token] = idx
+                                self.idx2token[idx] = token
+                                return idx
+                            else:
+                                return self.token2idx["<UNK>"]
+
+                def convert_memory_to_tokens(memory, vocab):
+                    tokens = []
+                    for event in memory:
+                        if isinstance(event, dict):
+                            sorted_items = sorted(event.items())
+                            token_str = "_".join(f"{k}-{v}" for k, v in sorted_items)
+                        else:
+                            token_str = str(event)
+                        tokens.append(vocab.encode(token_str))
+                    return tokens
+
+                vocab_inst = Vocabulary(max_size=config.STRATEGY_NUM_TOKENS)
+                mem_features_list = []
+                for opp in self.current_env.possible_agents:
+                    if opp != agent_id:
+                        mem_summary = query_opponent_memory_full(agent_id, opp)
+                        token_seq = convert_memory_to_tokens(mem_summary, vocab_inst)
+                        token_tensor = torch.tensor(token_seq, dtype=torch.long, device=device).unsqueeze(0)
+                        global global_strategy_transformer
+                        if global_strategy_transformer is None:
+                            from src.model.new_models import StrategyTransformer
+                            global_strategy_transformer = StrategyTransformer(
+                                num_tokens=config.STRATEGY_NUM_TOKENS,
+                                token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM,
+                                nhead=config.STRATEGY_NHEAD,
+                                num_layers=config.STRATEGY_NUM_LAYERS,
+                                strategy_dim=config.STRATEGY_DIM,
+                                num_classes=config.STRATEGY_NUM_CLASSES,
+                                dropout=config.STRATEGY_DROPOUT,
+                                use_cls_token=True
+                            ).to(device)
+                            transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
+                            if os.path.exists(transformer_checkpoint_path):
+                                state_dict = torch.load(transformer_checkpoint_path, map_location=device)
+                                global_strategy_transformer.load_state_dict(state_dict)
+                                logging.info(f"Loaded transformer from '{transformer_checkpoint_path}'.")
+                            else:
+                                logging.warning("Transformer checkpoint not found, using randomly initialized transformer.")
+                            global_strategy_transformer.classification_head = None
+                            global_strategy_transformer.eval()
+                        with torch.no_grad():
+                            embedding, _ = global_strategy_transformer(token_tensor)
+                        mem_features_list.append(embedding.cpu().numpy().flatten())
+                if mem_features_list:
+                    mem_features = np.concatenate(mem_features_list, axis=0)
+                else:
+                    mem_features = np.zeros(config.STRATEGY_DIM * (num_players - 1), dtype=np.float32)
+            else:
+                # --- Old memory integration using query_opponent_memory ---
+                mem_features_list = []
+                for opp in self.current_env.possible_agents:
+                    if opp != agent_id:
+                        mem_summary = query_opponent_memory(agent_id, opp)
+                        mem_features_list.append(mem_summary)
+                if mem_features_list:
+                    mem_features = np.concatenate(mem_features_list, axis=0)
+                else:
+                    mem_features = np.array([], dtype=np.float32)
+            
+            # Pad or truncate mem_features to match the required dimension.
             current_mem_dim = mem_features.shape[0]
             if current_mem_dim < required_mem_dim:
                 pad = np.zeros(required_mem_dim - current_mem_dim, dtype=np.float32)
