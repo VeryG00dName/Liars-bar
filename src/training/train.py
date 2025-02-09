@@ -15,8 +15,58 @@ from src.model.memory import RolloutMemory
 from src.training.train_extras import set_seed, extract_obp_training_data, run_obp_inference
 from src import config
 
+# New import for querying opponent memory
+from src.env.liars_deck_env_utils import query_opponent_memory_full
+# New import for the transformer-based strategy model
+from src.model.new_models import StrategyTransformer
+
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 torch.backends.cudnn.benchmark = True
+
+# --- Vocabulary & Tokenization ---
+class Vocabulary:
+    def __init__(self, max_size):
+        """
+        Initialize a vocabulary with a maximum size.
+        We reserve index 0 for "<PAD>" and index 1 for "<UNK>".
+        """
+        self.token2idx = {"<PAD>": 0, "<UNK>": 1}
+        self.idx2token = {0: "<PAD>", 1: "<UNK>"}
+        self.max_size = max_size
+
+    def encode(self, token):
+        """
+        Return the index for the token. If the token is not in the vocabulary
+        and the vocabulary is not yet full, add it. Otherwise return the index for <UNK>.
+        """
+        if token in self.token2idx:
+            return self.token2idx[token]
+        else:
+            if len(self.token2idx) < self.max_size:
+                idx = len(self.token2idx)
+                self.token2idx[token] = idx
+                self.idx2token[idx] = token
+                return idx
+            else:
+                return self.token2idx["<UNK>"]
+
+def convert_memory_to_tokens(memory, vocab):
+    """
+    Convert the opponent memory (a list of events) to a sequence of token indices.
+    For each event (assumed to be a dictionary or string), we sort its keys (if applicable)
+    and join key-value pairs with an underscore. Then, we use the provided vocabulary to map
+    the resulting string to an index.
+    """
+    tokens = []
+    for event in memory:
+        if isinstance(event, dict):
+            sorted_items = sorted(event.items())
+            token_str = "_".join(f"{k}-{v}" for k, v in sorted_items)
+        else:
+            token_str = str(event)
+        token_index = vocab.encode(token_str)
+        tokens.append(token_index)
+    return tokens
 
 def train(
     agents_dict,
@@ -71,10 +121,36 @@ def train(
     # Define a fixed (static) entropy coefficient
     static_entropy_coef = config.INIT_ENTROPY_COEF
 
+    # --- Instantiate Vocabulary and Strategy Transformer ---
+    vocab = Vocabulary(max_size=config.STRATEGY_NUM_TOKENS)
+    strategy_transformer = StrategyTransformer(
+        num_tokens=config.STRATEGY_NUM_TOKENS,
+        token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM,
+        nhead=config.STRATEGY_NHEAD,
+        num_layers=config.STRATEGY_NUM_LAYERS,
+        strategy_dim=config.STRATEGY_DIM,
+        num_classes=config.STRATEGY_NUM_CLASSES,  # Not used after removal of classification head.
+        dropout=config.STRATEGY_DROPOUT,
+        use_cls_token=True
+    ).to(device)
+
+    transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
+    if os.path.exists(transformer_checkpoint_path):
+        state_dict = torch.load(transformer_checkpoint_path, map_location=device)
+        strategy_transformer.load_state_dict(state_dict)
+        logger.info(f"Loaded transformer from {transformer_checkpoint_path}")
+    else:
+        logger.info("Transformer checkpoint not found, using randomly initialized transformer.")
+
+    # Remove the classification head so that only the strategy embedding is used.
+    strategy_transformer.classification_head = None
+    strategy_transformer.eval()
+    
     for episode in range(1, num_episodes + 1):
         current_episode = episode_offset + episode
         obs, infos = env.reset()
         agents_in_episode = env.agents
+        # Initialize episode rewards for pool agents
         episode_rewards = {pool_agent: 0 for pool_agent in pool_agents}
         steps_in_episode = 0
 
@@ -93,10 +169,31 @@ def train(
             observation = observation_dict[env_agent]
             action_mask = env.infos[env_agent].get('action_mask', [1]*config.OUTPUT_DIM)
 
-            # Run OBP inference and append predictions
+            # --- OBP Inference ---
             obp_probs = run_obp_inference(obp_model, observation, device, env.num_players)
-            final_obs = np.concatenate([observation, np.array(obp_probs, dtype=np.float32)], axis=0)
-            
+
+            # --- Transformer Integration: Query Opponent Memory ---
+            transformer_embeddings = []
+            for opp in env.possible_agents:
+                if opp != env_agent:
+                    mem_summary = query_opponent_memory_full(env_agent, opp)
+                    token_seq = convert_memory_to_tokens(mem_summary, vocab)
+                    token_tensor = torch.tensor(token_seq, dtype=torch.long, device=device).unsqueeze(0)
+                    with torch.no_grad():
+                        strategy_embedding, _ = strategy_transformer(token_tensor)
+                    transformer_embeddings.append(strategy_embedding.cpu().numpy().flatten())
+            if transformer_embeddings:
+                transformer_features = np.concatenate(transformer_embeddings, axis=0)
+            else:
+                transformer_features = np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
+
+            # --- Form the final observation ---
+            final_obs = np.concatenate([
+                observation,
+                np.array(obp_probs, dtype=np.float32),
+                transformer_features
+            ], axis=0)
+
             # Ensure correct observation dimension
             assert final_obs.shape[0] == config.INPUT_DIM, \
                 f"Expected observation dimension {config.INPUT_DIM}, got {final_obs.shape[0]}"
@@ -107,7 +204,7 @@ def train(
             probs, _ = policy_nets[pool_agent](observation_tensor, None)
             probs = torch.clamp(probs, min=1e-8, max=1.0).squeeze(0)  # shape: (output_dim,)
 
-            # <--- ADDED: apply action mask here
+            # --- Apply action mask ---
             action_mask_tensor = torch.tensor(action_mask, dtype=torch.float32, device=device)
             masked_probs = probs * action_mask_tensor
             
@@ -141,7 +238,7 @@ def train(
             if 'penalty' in env.infos.get(env_agent, {}) and 'Invalid' in env.infos[env_agent]['penalty']:
                 invalid_action_counts_periodic[pool_agent] += 1
 
-            # <--- ADDED: store action_mask in memory
+            # Store the transition (including the action mask) in memory
             memories[pool_agent].store_transition(
                 agent=pool_agent,
                 state=final_obs,
@@ -150,13 +247,13 @@ def train(
                 reward=reward,
                 is_terminal=done_or_truncated,
                 state_value=state_value,
-                action_mask=action_mask  # store mask here
+                action_mask=action_mask  # stored for later use in the loss
             )
 
-            # Update episode rewards
+            # Update episode rewards (accumulate rewards)
             for a in agents_in_episode:
                 pa = agent_mapping[a] if agent_mapping is not None else a
-                episode_rewards[pa] = env.rewards[a]
+                episode_rewards[pa] += env.rewards[a]
 
         # Extract OBP training data from the episode
         episode_obp_data = extract_obp_training_data(env)
@@ -181,7 +278,7 @@ def train(
             for pa in pool_agents
         }
 
-        # Compute advantages and returns using GAE
+        # Compute advantages and returns using GAE for each pool agent
         for pool_agent in pool_agents:
             memory = memories[pool_agent]
             if not memory.states[pool_agent]:
@@ -204,7 +301,7 @@ def train(
             memory.advantages[pool_agent] = advantages
             memory.returns[pool_agent] = returns_
 
-        # Update networks periodically
+        # --- Update Networks Periodically ---
         if episode % config.UPDATE_STEPS == 0:
             for pool_agent in pool_agents:
                 memory = memories[pool_agent]
@@ -234,22 +331,21 @@ def train(
                 )
                 advantages_ = (advantages_ - advantages_.mean()) / (advantages_.std() + 1e-5)
 
-                # <--- ADDED: retrieve stored action masks
+                # Retrieve stored action masks
                 action_masks_ = torch.tensor(
                     np.array(memory.action_masks[pool_agent], dtype=np.float32), 
                     device=device
                 )
 
-                # PPO update
+                # PPO update loop
                 for _ in range(config.K_EPOCHS):
                     # Forward pass
                     probs, _ = policy_nets[pool_agent](states, None)
                     probs = torch.clamp(probs, 1e-8, 1.0)
 
-                    # <--- ADDED: apply action masks to zero out invalid actions
+                    # Apply action masks so that invalid actions have zero probability
                     masked_probs = probs * action_masks_
                     row_sums = masked_probs.sum(dim=-1, keepdim=True)
-                    # For rows that sum to zero, fall back to uniform distribution
                     masked_probs = torch.where(
                         row_sums > 0,
                         masked_probs / row_sums,
@@ -264,7 +360,6 @@ def train(
                     surr1 = ratios * advantages_
                     surr2 = torch.clamp(ratios, 1 - config.EPS_CLIP, 1 + config.EPS_CLIP) * advantages_
                     policy_loss = -torch.min(surr1, surr2).mean()
-                    # Use fixed entropy coefficient
                     policy_loss -= static_entropy_coef * entropy
 
                     state_values = value_nets[pool_agent](states).squeeze()
@@ -321,12 +416,11 @@ def train(
             for pool_agent in pool_agents:
                 memories[pool_agent].reset()
 
-        # Update periodic statistics
+        # --- Periodic Logging ---
         steps_since_log += steps_in_episode
         episodes_since_log += 1
 
         if episode % config.LOG_INTERVAL == 0:
-
             # Maintain order based on original_agent_order's mapped pool agents
             logged_pool_agents = []
             for agent in original_agent_order:
