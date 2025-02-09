@@ -1,32 +1,48 @@
-# train_transformer.py
+#!/usr/bin/env python
+"""
+evaluate_transformer_on_ppo_games.py
+
+This script loads a trained StrategyTransformer and two PPO agent checkpoints
+(using combined checkpoint logic similar to src/evaluation/evaluate.py), runs
+several games (using LiarsDeckEnv) between the two PPO agents, extracts each
+agent's opponent memory after each game, obtains a strategy embedding from the
+transformer, and computes distances (Euclidean and cosine similarity) between the
+agents' strategy embeddings.
+
+Usage example:
+    python evaluate_transformer_on_ppo_games.py --transformer_checkpoint checkpoints/transformer_classifier.pth \
+        --ppo_checkpoint1 path/to/ppo_agent1.pth --ppo_checkpoint2 path/to/ppo_agent2.pth --num_games 10
+"""
 
 import os
-import pickle
-import math
-import random
 import argparse
+import numpy as np
+import torch
+import torch.nn.functional as F
 from collections import Counter
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+# Imports from evaluation utilities and configuration.
+from src.evaluation.evaluate_utils import load_combined_checkpoint, get_hidden_dim_from_state_dict
+from src import config
+from src.env.liars_deck_env_core import LiarsDeckEnv
+from src.model import new_models  # For new_models.PolicyNetwork and new_models.StrategyTransformer
+from src.model.new_models import PolicyNetwork, StrategyTransformer
+from src.model.memory import get_opponent_memory
 
-# Import the transformer model from new_models.py
-from src.model.new_models import StrategyTransformer
+# -----------------------------------------------------------------------------
+# Transformer settings (as provided)
+# -----------------------------------------------------------------------------
+STRATEGY_NUM_TOKENS = 5              # Vocabulary size for tokenizing opponent events.
+STRATEGY_TOKEN_EMBEDDING_DIM = 64     # Dimension of token embeddings.
+STRATEGY_NHEAD = 4                    # Number of attention heads.
+STRATEGY_NUM_LAYERS = 2               # Number of transformer encoder layers.
+STRATEGY_DIM = 5                      # Final dimension of the strategy embedding.
+STRATEGY_NUM_CLASSES = 8              # Unused after removing the classification head.
+STRATEGY_DROPOUT = 0.1                # Dropout rate in the transformer.
 
-# -------------------------------
-# Step 1. Load Training Data
-# -------------------------------
-def load_training_data(training_data_path):
-    with open(training_data_path, "rb") as f:
-        data = pickle.load(f)
-    # data is a list of tuples: (full_memory, label)
-    return data
-
-# -------------------------------
-# Step 2. Preprocess Events and Build Vocabulary
-# -------------------------------
+# -----------------------------------------------------------------------------
+# Tokenization Utilities
+# -----------------------------------------------------------------------------
 def event_to_token(event):
     """
     Convert an event to a string token.
@@ -42,194 +58,209 @@ def event_to_token(event):
     else:
         return str(event)
 
-def build_vocab(training_data, min_freq=1):
+def build_vocab():
     """
-    Build a vocabulary mapping from event tokens (strings) to indices.
-    training_data: list of (full_memory, label) tuples,
-      where full_memory is a list of event dictionaries (or strings).
-    Returns:
-      token2idx: dict mapping token -> index (starting at 2)
-      idx2token: reverse mapping.
-      We reserve index 0 for padding and 1 for unknown tokens.
+    Build a fixed vocabulary for evaluation.
+    We create a vocabulary with exactly STRATEGY_NUM_TOKENS tokens.
+    (Here, the tokens are fixed and must match what was used during training.)
     """
-    counter = Counter()
-    for memory, _ in training_data:
-        for event in memory:
-            token = event_to_token(event)
-            counter[token] += 1
-
-    # Only keep tokens that occur at least min_freq times.
-    tokens = [tok for tok, freq in counter.items() if freq >= min_freq]
-    # Reserve 0 for PAD, 1 for UNK.
-    token2idx = {token: idx+2 for idx, token in enumerate(tokens)}
-    token2idx["<PAD>"] = 0
-    token2idx["<UNK>"] = 1
+    # The first two tokens are reserved: <PAD> (index 0) and <UNK> (index 1).
+    tokens = ["<PAD>", "<UNK>", "event_1", "event_2", "event_3"]  # Total 5 tokens.
+    token2idx = {token: idx for idx, token in enumerate(tokens)}
     idx2token = {idx: token for token, idx in token2idx.items()}
     return token2idx, idx2token
 
-# -------------------------------
-# Step 3. Build Label Mapping
-# -------------------------------
-def build_label_mapping(training_data):
-    labels = set()
-    for _, label in training_data:
-        labels.add(label)
-    label2idx = {label: idx for idx, label in enumerate(sorted(labels))}
-    idx2label = {idx: label for label, idx in label2idx.items()}
-    return label2idx, idx2label
-
-# -------------------------------
-# Step 4. Define Dataset
-# -------------------------------
-class OpponentMemoryDataset(Dataset):
-    def __init__(self, training_data, token2idx, label2idx, max_seq_length=None):
-        """
-        training_data: list of (memory, label) tuples.
-        token2idx: mapping from token string to int.
-        label2idx: mapping from label string to int.
-        max_seq_length: if provided, truncate or pad sequences to this length.
-        """
-        self.samples = []
-        self.token2idx = token2idx
-        self.label2idx = label2idx
-        self.max_seq_length = max_seq_length
-
-        for memory, label in training_data:
-            # Convert full memory (list of event dicts or strings) into a list of token indices.
-            token_ids = []
-            for event in memory:
-                token = event_to_token(event)
-                token_ids.append(token2idx.get(token, token2idx["<UNK>"]))
-            self.samples.append((token_ids, label2idx[label]))
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        token_ids, label = self.samples[idx]
-        return torch.tensor(token_ids, dtype=torch.long), torch.tensor(label, dtype=torch.long)
-
-# -------------------------------
-# Step 5. Collate Function for Padding
-# -------------------------------
-def collate_fn(batch):
+def tokenize_memory(memory, token2idx):
     """
-    batch: list of tuples (sequence_tensor, label_tensor)
-    Pads the sequences in the batch to the maximum length.
-    Returns padded sequences, lengths, and labels.
+    Convert a memory (list of events) into a list of token indices.
+    Unknown tokens are mapped to <UNK>.
     """
-    sequences, labels = zip(*batch)
-    lengths = [len(seq) for seq in sequences]
-    max_len = max(lengths)
-    padded_seqs = []
-    for seq in sequences:
-        pad_length = max_len - len(seq)
-        if pad_length > 0:
-            padded_seq = torch.cat([seq, torch.zeros(pad_length, dtype=torch.long)])
-        else:
-            padded_seq = seq
-        padded_seqs.append(padded_seq)
-    padded_seqs = torch.stack(padded_seqs)
-    labels = torch.stack(labels)
-    return padded_seqs, torch.tensor(lengths, dtype=torch.long), labels
+    token_ids = []
+    for event in memory:
+        token = event_to_token(event)
+        token_id = token2idx.get(token, token2idx["<UNK>"])
+        token_ids.append(token_id)
+    return token_ids
 
-# -------------------------------
-# Step 6. Training Function
-# -------------------------------
-def train_transformer(model, dataloader, optimizer, criterion, device, num_epochs=10):
-    model.train()
-    for epoch in range(1, num_epochs + 1):
-        total_loss = 0.0
-        total_correct = 0
-        total_samples = 0
-        for batch in dataloader:
-            sequences, lengths, labels = batch
-            sequences = sequences.to(device)
-            labels = labels.to(device)
+# -----------------------------------------------------------------------------
+# Simplified Action Selection (for PPO agents)
+# -----------------------------------------------------------------------------
+def choose_action(policy_net, observation, action_mask, device):
+    """
+    Given a policy network, an observation, and an action mask,
+    compute action probabilities and sample an action.
+    """
+    obs_tensor = torch.tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
+    with torch.no_grad():
+        action_probs, _ = policy_net(obs_tensor, None)
+    action_probs = action_probs.squeeze(0)
+    mask_tensor = torch.tensor(action_mask, dtype=torch.float32, device=device)
+    masked_probs = action_probs * mask_tensor
+    if masked_probs.sum() == 0:
+        masked_probs = mask_tensor / mask_tensor.sum()
+    else:
+        masked_probs = masked_probs / masked_probs.sum()
+    action = torch.multinomial(masked_probs, 1).item()
+    return action
 
-            optimizer.zero_grad()
-            # The transformer expects input shape (batch_size, seq_length)
-            # It returns (strategy_embedding, classification_logits)
-            _, logits = model(sequences)
-            loss = criterion(logits, labels)
-            loss.backward()
-            optimizer.step()
+# -----------------------------------------------------------------------------
+# PPO Agent Loading (using combined checkpoint logic)
+# -----------------------------------------------------------------------------
+def load_ppo_agent_checkpoint(checkpoint_path, device):
+    """
+    Loads a PPO agent checkpoint (combined checkpoint) using logic similar
+    to src/evaluation/evaluate.py. The checkpoint is expected to contain a
+    dictionary with a "policy_nets" key.
+    """
+    checkpoint = load_combined_checkpoint(checkpoint_path, device)
+    policy_nets = checkpoint['policy_nets']
+    # Get one policy state dictionary (preferably "player_0" if available)
+    if "player_0" in policy_nets:
+        policy_state = policy_nets["player_0"]
+    else:
+        _, policy_state = next(iter(policy_nets.items()))
+    actual_input_dim = policy_state['fc1.weight'].shape[1]
+    policy_hidden_dim = get_hidden_dim_from_state_dict(policy_state, layer_prefix='fc1')
+    uses_memory = ("fc4.weight" in policy_state)
+    # Instantiate using new_models.PolicyNetwork if uses memory; otherwise, use the older PolicyNetwork.
+    if uses_memory:
+        net = new_models.PolicyNetwork(
+            input_dim=actual_input_dim,
+            hidden_dim=policy_hidden_dim,
+            output_dim=config.OUTPUT_DIM,
+            use_lstm=True,
+            use_dropout=True,
+            use_layer_norm=True
+        ).to(device)
+    else:
+        net = PolicyNetwork(
+            input_dim=actual_input_dim,
+            hidden_dim=policy_hidden_dim,
+            output_dim=config.OUTPUT_DIM,
+            use_lstm=True,
+            use_dropout=True,
+            use_layer_norm=True
+        ).to(device)
+    net.load_state_dict(policy_state)
+    net.eval()
+    return net
 
-            total_loss += loss.item() * sequences.size(0)
-            preds = logits.argmax(dim=1)
-            total_correct += (preds == labels).sum().item()
-            total_samples += sequences.size(0)
-        avg_loss = total_loss / total_samples
-        accuracy = total_correct / total_samples
-        print(f"Epoch {epoch}: Loss = {avg_loss:.4f}, Accuracy = {accuracy:.4f}")
-
-# -------------------------------
-# Step 7. Main Script
-# -------------------------------
+# -----------------------------------------------------------------------------
+# Main Evaluation Function
+# -----------------------------------------------------------------------------
 def main(args):
-    # Load training data from pickle file.
-    training_data = load_training_data(args.training_data_path)
-    print(f"Loaded {len(training_data)} training samples.")
-
-    # Build vocabulary and label mappings.
-    token2idx, idx2token = build_vocab(training_data, min_freq=1)
-    label2idx, idx2label = build_label_mapping(training_data)
-    print(f"Vocabulary size: {len(token2idx)}")
-    print(f"Number of classes: {len(label2idx)}")
-
-    # Create dataset and dataloader.
-    dataset = OpponentMemoryDataset(training_data, token2idx, label2idx, max_seq_length=args.max_seq_length)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Define transformer hyperparameters.
-    num_tokens = len(token2idx)
-    token_embedding_dim = args.token_embedding_dim  # e.g., 64
-    nhead = args.nhead                             # e.g., 4
-    num_layers = args.num_layers                   # e.g., 2
-    strategy_dim = args.strategy_dim               # e.g., 5 or 10
-    num_classes = len(label2idx)
-    dropout = args.dropout
-    use_cls_token = True
-
-    model = StrategyTransformer(
-        num_tokens=num_tokens,
-        token_embedding_dim=token_embedding_dim,
-        nhead=nhead,
-        num_layers=num_layers,
-        strategy_dim=strategy_dim,
-        num_classes=num_classes,
-        dropout=dropout,
-        use_cls_token=use_cls_token
+    # (Optionally, set derived config if needed.)
+    # For example:
+    # agents = env.agents
+    # config.set_derived_config(env.observation_spaces[agents[0]], env.action_spaces[agents[0]], env.num_players-1)
+    
+    # 1. Load fixed vocabulary.
+    token2idx, idx2token = build_vocab()
+    print(f"Using fixed vocabulary with {len(token2idx)} tokens.")
+    
+    # 2. Load the transformer.
+    transformer = StrategyTransformer(
+        num_tokens=STRATEGY_NUM_TOKENS,
+        token_embedding_dim=STRATEGY_TOKEN_EMBEDDING_DIM,
+        nhead=STRATEGY_NHEAD,
+        num_layers=STRATEGY_NUM_LAYERS,
+        strategy_dim=STRATEGY_DIM,
+        num_classes=STRATEGY_NUM_CLASSES,
+        dropout=STRATEGY_DROPOUT,
+        use_cls_token=True
     ).to(device)
-
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    criterion = nn.CrossEntropyLoss()
-
-    # Train the transformer.
-    train_transformer(model, dataloader, optimizer, criterion, device, num_epochs=args.epochs)
-
-    # Save the trained model.
-    save_path = os.path.join(args.save_dir, "transformer_classifier.pth")
-    os.makedirs(args.save_dir, exist_ok=True)
-    torch.save(model.state_dict(), save_path)
-    print(f"Trained transformer model saved to {save_path}")
+    if not os.path.exists(args.transformer_checkpoint):
+        raise FileNotFoundError(f"Transformer checkpoint not found: {args.transformer_checkpoint}")
+    transformer_state = torch.load(args.transformer_checkpoint, map_location=device)
+    transformer.load_state_dict(transformer_state)
+    transformer.classification_head = None  # Remove the classification head
+    transformer.eval()
+    print(f"Loaded transformer checkpoint from {args.transformer_checkpoint}.")
+    
+    # 3. Load the two PPO agent checkpoints.
+    policy_net1 = load_ppo_agent_checkpoint(args.ppo_checkpoint1, device)
+    policy_net2 = load_ppo_agent_checkpoint(args.ppo_checkpoint2, device)
+    print(f"Loaded PPO agent checkpoints from:\n  {args.ppo_checkpoint1}\n  {args.ppo_checkpoint2}")
+    
+    # 4. Create the environment.
+    env = LiarsDeckEnv(num_players=2, render_mode=None)
+    output_dim = env.action_spaces[env.agents[0]].n
+    
+    # 5. Run games and compute embedding distances.
+    euclidean_distances = []
+    cosine_similarities = []
+    
+    for game_idx in range(args.num_games):
+        env.reset()
+        # Run the game loop.
+        while env.agent_selection is not None:
+            current_agent = env.agent_selection
+            obs_dict = env.observe(current_agent)
+            observation = obs_dict[current_agent]
+            # --- ADAPT OBSERVATION ---
+            # If the observation's dimension is less than the expected config.INPUT_DIM,
+            # pad it with zeros.
+            if observation.shape[0] < config.INPUT_DIM:
+                padded_obs = np.zeros(config.INPUT_DIM, dtype=observation.dtype)
+                padded_obs[:observation.shape[0]] = observation
+                observation = padded_obs
+            action_mask = env.infos[current_agent].get('action_mask', [1] * output_dim)
+            # Use policy_net1 for agent 0 and policy_net2 for agent 1.
+            if current_agent == env.agents[0]:
+                action = choose_action(policy_net1, observation, action_mask, device)
+            else:
+                action = choose_action(policy_net2, observation, action_mask, device)
+            env.step(action)
+        
+        # After the game, extract opponent memory and compute the strategy embedding.
+        embeddings = {}
+        for agent in env.agents:
+            memory_obj = get_opponent_memory(agent)
+            memory_list = list(memory_obj.memory)
+            token_ids = tokenize_memory(memory_list, token2idx)
+            if not token_ids:
+                print(f"Agent {agent} produced no valid tokens; skipping embedding extraction.")
+                continue
+            memory_tensor = torch.tensor(token_ids, dtype=torch.long, device=device).unsqueeze(0)
+            with torch.no_grad():
+                strategy_embedding, _ = transformer(memory_tensor)
+            embeddings[agent] = strategy_embedding.squeeze(0)
+            # Clear memory for the next game.
+            memory_obj.memory.clear()
+        
+        if len(embeddings) < 2:
+            print(f"Game {game_idx+1}: Not enough embeddings extracted; skipping distance computation.")
+            continue
+        
+        # Compute distances between the two agents.
+        agents = list(embeddings.keys())
+        emb1 = embeddings[agents[0]]
+        emb2 = embeddings[agents[1]]
+        euclidean = torch.norm(emb1 - emb2, p=2).item()
+        cosine = F.cosine_similarity(emb1.unsqueeze(0), emb2.unsqueeze(0)).item()
+        euclidean_distances.append(euclidean)
+        cosine_similarities.append(cosine)
+        print(f"Game {game_idx+1}: Euclidean distance: {euclidean:.4f}, Cosine similarity: {cosine:.4f}")
+    
+    if euclidean_distances:
+        print(f"\nAverage Euclidean Distance: {np.mean(euclidean_distances):.4f}")
+        print(f"Average Cosine Similarity: {np.mean(cosine_similarities):.4f}")
+    else:
+        print("No valid games for distance computation.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train Strategy Transformer Classifier")
-    parser.add_argument("--training_data_path", type=str, default="opponent_training_data.pkl",
-                        help="Path to the pickle file with training data.")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training.")
-    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs.")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
-    parser.add_argument("--max_seq_length", type=int, default=None, help="Maximum sequence length (None for variable).")
-    parser.add_argument("--token_embedding_dim", type=int, default=64, help="Dimension of token embeddings.")
-    parser.add_argument("--nhead", type=int, default=4, help="Number of attention heads in the transformer.")
-    parser.add_argument("--num_layers", type=int, default=2, help="Number of transformer encoder layers.")
-    parser.add_argument("--strategy_dim", type=int, default=5, help="Dimension of the final strategy embedding.")
-    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate.")
-    parser.add_argument("--save_dir", type=str, default="checkpoints", help="Directory to save the trained model.")
+    parser = argparse.ArgumentParser(
+        description="Evaluate StrategyTransformer on PPO games and measure embedding distances."
+    )
+    parser.add_argument("--transformer_checkpoint", type=str, default="checkpoints/transformer_classifier.pth",
+                        help="Path to the trained transformer checkpoint.")
+    parser.add_argument("--ppo_checkpoint1", type=str, required=True,
+                        help="Path to PPO agent 1 checkpoint (combined checkpoint).")
+    parser.add_argument("--ppo_checkpoint2", type=str, required=True,
+                        help="Path to PPO agent 2 checkpoint (combined checkpoint).")
+    parser.add_argument("--num_games", type=int, default=10,
+                        help="Number of games to run for evaluation.")
     args = parser.parse_args()
-
     main(args)
