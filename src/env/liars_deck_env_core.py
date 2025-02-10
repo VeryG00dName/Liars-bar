@@ -234,7 +234,8 @@ class LiarsDeckEnv(AECEnv):
             bluffing_agent = self.pending_bluff["agent"]
             # For any agent who never challenged the bluff in this round, apply penalty.
             for ag in self.pending_bluff["unchallenged_agents"]:
-                self.rewards[ag] += self.scoring_params['unchallenged_bluff_penalty']
+                penalty = self.scoring_params['unchallenged_bluff_penalty'] * self.pending_bluff["num_cards"]
+                self.rewards[ag] += penalty
                 self.logger.debug(
                     f"Agent {ag} penalized at round end for not challenging bluff from {bluffing_agent}"
                 )
@@ -292,14 +293,15 @@ class LiarsDeckEnv(AECEnv):
         agent = self.agent_selection
 
         # Decode the action early for use in our new bluff logic.
-        action_type, _, _ = decode_action(action)
+        action_type, _, count = decode_action(action)
 
         # If there is a pending bluff and the acting agent is not the bluffing agent,
         # then if the agent does not challenge, penalize them immediately.
         if self.pending_bluff is not None:
             bluffing_agent = self.pending_bluff["agent"]
             if agent != bluffing_agent and action_type != "Challenge":
-                self.rewards[agent] += self.scoring_params['unchallenged_bluff_penalty']
+                penalty = self.scoring_params['unchallenged_bluff_penalty'] * self.pending_bluff["num_cards"]
+                self.rewards[agent] += penalty
                 self.logger.debug(
                     f"Agent {agent} penalized for not challenging bluff from {bluffing_agent} (action: {action_type})."
                 )
@@ -337,8 +339,9 @@ class LiarsDeckEnv(AECEnv):
         if action_type == "Play" and self.last_action_bluff:
             # Create a pending bluff record where all other agents are expected to challenge.
             self.pending_bluff = {
-                "agent": agent,
-                "unchallenged_agents": set(self.possible_agents) - {agent}
+            "agent": agent,
+            "unchallenged_agents": set(self.possible_agents) - {agent},
+            "num_cards": count  # Store bluff size
             }
             self.logger.debug(
                 f"Pending bluff set by {agent}. Agents expected to challenge: {self.pending_bluff['unchallenged_agents']}"
