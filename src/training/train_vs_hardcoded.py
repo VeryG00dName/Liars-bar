@@ -25,7 +25,8 @@ from src.model.hard_coded_agents import (
     StrategicChallenger,
     SelectiveTableConservativeChallenger,
     RandomAgent,
-    TableNonTableAgent
+    TableNonTableAgent,
+    Classic
 )
 
 # Import query_opponent_memory for opponent memory integration
@@ -217,24 +218,29 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
     original_agent_order = list(env.agents)
 
     # Hard-coded agents to choose from if randomizing
-    hardcoded_agent_classes = [GreedyCardSpammer, TableFirstConservativeChallenger, StrategicChallenger, 
-                               SelectiveTableConservativeChallenger, RandomAgent, TableNonTableAgent]
+    hardcoded_agent_classes = [GreedyCardSpammer, StrategicChallenger, 
+                                TableNonTableAgent, Classic]
+
+    # Declare variables to hold the current hard-coded agent across episodes.
+    current_hardcoded_agent_id = None
+    current_hardcoded_agent_instance = None
 
     for episode in range(start_episode, num_episodes + 1):
         obs, infos = env.reset()
         agents = env.agents
 
-        # Randomly replace one RL agent with a hard-coded agent
-        hardcoded_agent_id = random.choice(agents)
-        hardcoded_class = random.choice(hardcoded_agent_classes)
-        if hardcoded_class == StrategicChallenger:
-            hardcoded_agent_instance = hardcoded_class(
-                agent_name=hardcoded_agent_id, 
-                num_players=config.NUM_PLAYERS, 
-                agent_index=agents.index(hardcoded_agent_id)
-            )
-        else:
-            hardcoded_agent_instance = hardcoded_class(agent_name=hardcoded_agent_id)
+        # Every 5 episodes, update the hard-coded agent selection.
+        if (episode - start_episode) % 5 == 0:
+            current_hardcoded_agent_id = random.choice(agents)
+            hardcoded_class = random.choice(hardcoded_agent_classes)
+            if hardcoded_class == StrategicChallenger:
+                current_hardcoded_agent_instance = hardcoded_class(
+                    agent_name=current_hardcoded_agent_id, 
+                    num_players=config.NUM_PLAYERS, 
+                    agent_index=agents.index(current_hardcoded_agent_id)
+                )
+            else:
+                current_hardcoded_agent_instance = hardcoded_class(agent_name=current_hardcoded_agent_id)
 
         episode_rewards = {agent: 0 for agent in agents}
         steps_in_episode = 0
@@ -256,7 +262,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
             obp_probs = run_obp_inference(obp_model, observation, device, env.num_players)
 
             # 3) Integrate Opponent Memory & Transformer Embedding
-            if agent == hardcoded_agent_id:
+            if agent == current_hardcoded_agent_id:
                 # For hard-coded agents, use base observation and OBP outputs,
                 # then pad with zeros so that final_obs has length config.INPUT_DIM.
                 base_obs = observation
@@ -288,8 +294,8 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 ], axis=0)
 
             # 4) Decide action
-            if agent == hardcoded_agent_id:
-                action = hardcoded_agent_instance.play_turn(observation, action_mask, table_card=None)
+            if agent == current_hardcoded_agent_id:
+                action = current_hardcoded_agent_instance.play_turn(observation, action_mask, table_card=None)
                 log_prob_value = 0.0
             else:
                 observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
@@ -326,7 +332,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 is_terminal=env.terminations[agent] or env.truncations[agent],
                 state_value=( 
                     value_nets[agent](torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)).item()
-                    if agent != hardcoded_agent_id else 0.0
+                    if agent != current_hardcoded_agent_id else 0.0
                 ),
                 action_mask=action_mask
             )
@@ -351,7 +357,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
 
         # Compute GAE for RL agents (skip hard-coded agent)
         for agent in agents:
-            if agent == hardcoded_agent_id:
+            if agent == current_hardcoded_agent_id:
                 continue
             memory = memories[agent]
             rewards_agent = memory.rewards[agent]
@@ -377,7 +383,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
         # Periodically update RL agents
         if episode % config.UPDATE_STEPS == 0:
             for agent in agents:
-                if agent == hardcoded_agent_id:
+                if agent == current_hardcoded_agent_id:
                     continue
                 memory = memories[agent]
                 if not memory.states[agent]:
@@ -465,7 +471,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                     writer.add_scalar(f"Gradient_Norms/Value/{agent}", avg_value_grad_norm, episode)
 
             for agent in agents:
-                if agent != hardcoded_agent_id:
+                if agent != current_hardcoded_agent_id:
                     memories[agent].reset()
 
             if len(obp_memory) > 100:
@@ -536,7 +542,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 lowest_score = average_rewards[lowest_agent]
                 logger.info(f"Culling Agent '{lowest_agent}' with average reward {lowest_score:.2f}.")
 
-                if lowest_agent != hardcoded_agent_id:
+                if lowest_agent != current_hardcoded_agent_id:
                     policy_nets[lowest_agent] = PolicyNetwork(
                         input_dim=config.INPUT_DIM,
                         hidden_dim=config.HIDDEN_DIM,
