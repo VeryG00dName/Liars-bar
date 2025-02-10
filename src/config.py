@@ -16,7 +16,7 @@ DEFAULT_CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "agents_checkpoint.pth")
 OPTUNA_RESULTS_FILE = os.path.join(BASE_DIR, "optuna_results.json")
 EVALUATION_LOG_FILE = os.path.join(BASE_DIR, "evaluation.log")
 TENSORBOARD_RUNS_DIR = os.path.join(LOG_DIR, "liars_deck_training")
-
+TRANSFORMER_CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "transformer_classifier.pth")
 # Helper to ensure directories exist
 def ensure_dirs():
     dirs = [CHECKPOINT_DIR, LOG_DIR, PLAYERS_DIR]
@@ -35,21 +35,21 @@ USE_WRAPPER = False           # Set to True to use the reward restriction wrappe
 DEFAULT_SCORING_PARAMS = {
     "play_reward_per_card": 0,
     "play_reward": 0,
-    "invalid_play_penalty": 0,
-    "challenge_success_challenger_reward": 5,
-    "challenge_success_claimant_penalty": -1,
+    "invalid_play_penalty": -6,
+    "challenge_success_challenger_reward": 2,
+    "challenge_success_claimant_penalty": -6,
     "challenge_fail_challenger_penalty": 0,
-    "challenge_fail_claimant_reward": 0,
-    "forced_challenge_success_challenger_reward": 0,
-    "forced_challenge_success_claimant_penalty": 0,
-    "invalid_challenge_penalty": 0,
-    "termination_penalty": 0,
-    "game_win_bonus": 10,
-    "game_lose_penalty": -7,
+    "challenge_fail_claimant_reward": 5,
+    "forced_challenge_success_challenger_reward": 1,
+    "forced_challenge_success_claimant_penalty": -3,
+    "invalid_challenge_penalty": -5,
+    "termination_penalty": -6,
+    "game_win_bonus": 7,
+    "game_lose_penalty": -1,
     "hand_empty_bonus": 0,
-    "consecutive_action_penalty": -1,
-    "successful_bluff_reward": 0.1,
-    "unchallenged_bluff_penalty": -0.1
+    "consecutive_action_penalty": 1,
+    "successful_bluff_reward": 3,
+    "unchallenged_bluff_penalty": -2
 }
 
 # ----------------------------
@@ -59,7 +59,7 @@ HIDDEN_DIM = 672             # Number of hidden units in neural networks
 
 # The INPUT_DIM will be set dynamically based on the environment.
 # It is computed as: base observation dimension + 2 (for OBP output) + (STRATEGY_DIM * num_opponents)
-INPUT_DIM = 16               
+INPUT_DIM = 26               
 
 # OUTPUT_DIM will be set dynamically based on the environment.
 OUTPUT_DIM = 7                
@@ -80,7 +80,7 @@ STRATEGY_TOKEN_EMBEDDING_DIM = 64       # Dimension of token embeddings.
 STRATEGY_NHEAD = 4                      # Number of attention heads.
 STRATEGY_NUM_LAYERS = 2                 # Number of transformer encoder layers.
 STRATEGY_DIM = 5                       # Final dimension of the strategy embedding.
-STRATEGY_NUM_CLASSES = 8                # Unused after removing the classification head.
+STRATEGY_NUM_CLASSES = 7                # Unused after removing the classification head.
 STRATEGY_DROPOUT = 0.1                  # Dropout rate in the transformer.
 
 # ----------------------------
