@@ -363,7 +363,13 @@ def evaluate_agents_tournament(env, device, players_in_this_game, episodes=5):
                                 transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
                                 if os.path.exists(transformer_checkpoint_path):
                                     state_dict = torch.load(transformer_checkpoint_path, map_location=device)
-                                    global_strategy_transformer.load_state_dict(state_dict)
+                                    # Remove classification head weights to avoid shape mismatch
+                                    if 'classification_head.weight' in state_dict:
+                                        del state_dict['classification_head.weight']
+                                    if 'classification_head.bias' in state_dict:
+                                        del state_dict['classification_head.bias']
+                                    # Load the modified state_dict without strict mode (to ignore missing layers)
+                                    global_strategy_transformer.load_state_dict(state_dict, strict=False)
                                     logging.info(f"Loaded transformer from '{transformer_checkpoint_path}'.")
                                 else:
                                     logging.warning("Transformer checkpoint not found, using randomly initialized transformer.")
