@@ -9,8 +9,9 @@ import numpy as np
 from pettingzoo.utils import agent_selector
 from itertools import combinations
 
+from env.liars_deck_env_utils import query_opponent_memory_full
 from src.env.liars_deck_env_core import LiarsDeckEnv
-from src.model.new_models import PolicyNetwork, OpponentBehaviorPredictor, ValueNetwork
+from src.model.new_models import PolicyNetwork, OpponentBehaviorPredictor, ValueNetwork, StrategyTransformer
 from src import config
 
 from src.evaluation.evaluate_utils import (
@@ -31,8 +32,31 @@ __all__ = [
     'openskill_model'
 ]
 
-# --- Global variable to store the transformer so it is loaded only once ---
+# --- Global variables to store the transformer and event encoder so they are loaded only once ---
 global_strategy_transformer = None
+global_event_encoder = None
+global_response2idx = None
+global_action2idx = None
+
+# --- Helper: Convert memory events into 4D continuous features ---
+def convert_memory_to_features(memory, response_mapping, action_mapping):
+    """
+    Convert the opponent memory (a list of events) to a list of 4-dimensional feature vectors.
+    Each event is expected to be a dictionary with keys: "response", "triggering_action", "penalties", and "card_count".
+    """
+    features = []
+    for event in memory:
+        if not isinstance(event, dict):
+            raise ValueError(f"Memory event is not a dictionary: {event}.")
+        resp = event.get("response", "")
+        act = event.get("triggering_action", "")
+        penalties = float(event.get("penalties", 0))
+        card_count = float(event.get("card_count", 0))
+        # Map categorical features to floats via the provided mappings.
+        resp_val = float(response_mapping.get(resp, 0))
+        act_val = float(action_mapping.get(act, 0))
+        features.append([resp_val, act_val, penalties, card_count])
+    return features
 
 def initialize_players(checkpoints_dir, device):
     """
@@ -140,7 +164,6 @@ def initialize_players(checkpoints_dir, device):
 
     return players
 
-
 def run_obp_inference_tournament(obp_model, obs, device, num_players, obs_version):
     """
     Similar to the function in evaluate.py, but specialized for the tournament.
@@ -175,18 +198,9 @@ def run_obp_inference_tournament(obp_model, obs, device, num_players, obs_versio
 
     return obp_probs
 
-
 def swiss_grouping(players, match_history, group_size):
     """
     Greedy Swiss pairing that minimizes repeated matchups while forming groups of size `group_size`.
-    
-    Parameters:
-      players      - dictionary of players keyed by player_id; each value must have a "score" key.
-      match_history- dictionary mapping player_id to a set of opponents they've faced.
-      group_size   - desired size of each group.
-      
-    Returns:
-      groups       - a list of groups (each group is a list of player_ids).
     """
     # Sort players by score (highest first)
     player_ids = sorted(players.keys(), key=lambda pid: players[pid]["score"], reverse=True)
@@ -195,16 +209,13 @@ def swiss_grouping(players, match_history, group_size):
 
     while len(used) < len(player_ids):
         group = []
-        # available players not yet assigned in this round
         available_players = [pid for pid in player_ids if pid not in used]
 
-        # Start the group with the highest-ranked available player.
         if available_players:
             group.append(available_players.pop(0))
         else:
             break
 
-        # Fill the rest of the group by choosing the candidate who has the fewest repeated matchups with current group members.
         while len(group) < group_size and available_players:
             best_candidate = None
             least_repeats = float("inf")
@@ -224,13 +235,12 @@ def swiss_grouping(players, match_history, group_size):
 
     return groups
 
-
 def evaluate_agents_tournament(env, device, players_in_this_game, episodes=5):
     """
-    A specialized version of evaluate_agents for the Swiss tournament.
-    Now supports both obs v1 and v2 (and memory‐enhanced models) by using adapt_observation_for_version.
-    Also distinguishes between old memory integration (using query_opponent_memory) versus the new
-    transformer‐based approach.
+    Specialized evaluation for the Swiss tournament. Supports both obs v1 and v2.
+    For players using persistent memory (obs v2), if memory integration is needed,
+    the new transformer-based integration is applied: opponent memory events are converted
+    into continuous features, projected by an Event Encoder, then passed through the transformer.
     """
     logger = logging.getLogger("EvaluateTournament")
     player_ids = list(players_in_this_game.keys())
@@ -293,61 +303,50 @@ def evaluate_agents_tournament(env, device, players_in_this_game, episodes=5):
             # 1) Adapt the observation to the player's obs_version.
             converted_obs = adapt_observation_for_version(observation, env.num_players, obs_version)
 
-            # 2) Run OBP inference using the converted_obs and player's obs_version.
-            obp_model = player_data.get('obp_model', None)
-            obp_probs = run_obp_inference_tournament(obp_model, converted_obs, device, env.num_players, obs_version)
+            # 2) Run OBP inference.
+            obp_probs = run_obp_inference_tournament(player_data.get('obp_model', None),
+                                                      converted_obs, device, env.num_players, obs_version)
 
             # 3) Build the final observation.
             expected_dim = player_data['policy_net'].fc1.in_features
 
             # Determine if memory integration should be applied.
             required_mem_dim = expected_dim - (len(converted_obs) + len(obp_probs))
-            if player_data.get('uses_memory', False) and obs_version == OBS_VERSION_2:
-                # Decide which memory integration technique to use.
-                if required_mem_dim == config.STRATEGY_DIM * (env.num_players - 1):
-                    # --- Transformer-based memory integration ---
-                    # Define a local vocabulary class and conversion function.
-                    class Vocabulary:
-                        def __init__(self, max_size):
-                            self.token2idx = {"<PAD>": 0, "<UNK>": 1}
-                            self.idx2token = {0: "<PAD>", 1: "<UNK>"}
-                            self.max_size = max_size
-                        def encode(self, token):
-                            if token in self.token2idx:
-                                return self.token2idx[token]
-                            else:
-                                if len(self.token2idx) < self.max_size:
-                                    idx = len(self.token2idx)
-                                    self.token2idx[token] = idx
-                                    self.idx2token[idx] = token
-                                    return idx
-                                else:
-                                    return self.token2idx["<UNK>"]
+            if player_data.get('uses_memory', False) and player_data['obs_version'] == OBS_VERSION_2:
+                # --- New Transformer-based memory integration ---
+                # This branch uses continuous features instead of tokenization.
+                # Ensure global categorical mappings are loaded.
+                global global_response2idx, global_action2idx
+                transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
+                if global_response2idx is None or global_action2idx is None:
+                    if os.path.exists(transformer_checkpoint_path):
+                        ckpt = torch.load(transformer_checkpoint_path, map_location=device)
+                        global_response2idx = ckpt.get("response2idx", {})
+                        global_action2idx = ckpt.get("action2idx", {})
+                    else:
+                        # Fallback: use empty mappings
+                        global_response2idx = {}
+                        global_action2idx = {}
 
-                    def convert_memory_to_tokens(memory, vocab):
-                        tokens = []
-                        for event in memory:
-                            if isinstance(event, dict):
-                                sorted_items = sorted(event.items())
-                                token_str = "_".join(f"{k}-{v}" for k, v in sorted_items)
-                            else:
-                                token_str = str(event)
-                            tokens.append(vocab.encode(token_str))
-                        return tokens
-
-                    # Create a vocabulary instance.
-                    vocab_inst = Vocabulary(max_size=config.STRATEGY_NUM_TOKENS)
-
-                    # Use the full-memory query plus transformer.
-                    from src.env.liars_deck_env_utils import query_opponent_memory_full
-                    mem_features_list = []
-                    for opp in env.possible_agents:
-                        if opp != agent:
-                            mem_summary = query_opponent_memory_full(agent, opp)
-                            token_seq = convert_memory_to_tokens(mem_summary, vocab_inst)
-                            token_tensor = torch.tensor(token_seq, dtype=torch.long, device=device).unsqueeze(0)
-                            # Use global_strategy_transformer so it is loaded only once.
-                            global global_strategy_transformer
+                mem_features_list = []
+                for opp in env.possible_agents:
+                    if opp != agent:
+                        mem_summary = query_opponent_memory_full(agent, opp)
+                        features_list = convert_memory_to_features(mem_summary, global_response2idx, global_action2idx)
+                        if features_list:
+                            feature_tensor = torch.tensor(features_list, dtype=torch.float, device=device).unsqueeze(0)
+                            global global_event_encoder, global_strategy_transformer
+                            if global_event_encoder is None:
+                                from src.training.train_transformer import EventEncoder
+                                global_event_encoder = EventEncoder(
+                                    response_vocab_size=len(global_response2idx),
+                                    action_vocab_size=len(global_action2idx),
+                                    token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM
+                                ).to(device)
+                                if os.path.exists(transformer_checkpoint_path):
+                                    ckpt = torch.load(transformer_checkpoint_path, map_location=device)
+                                    global_event_encoder.load_state_dict(ckpt["event_encoder_state_dict"])
+                                    global_event_encoder.eval()
                             if global_strategy_transformer is None:
                                 from src.model.new_models import StrategyTransformer
                                 global_strategy_transformer = StrategyTransformer(
@@ -360,40 +359,20 @@ def evaluate_agents_tournament(env, device, players_in_this_game, episodes=5):
                                     dropout=config.STRATEGY_DROPOUT,
                                     use_cls_token=True
                                 ).to(device)
-                                transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
                                 if os.path.exists(transformer_checkpoint_path):
-                                    state_dict = torch.load(transformer_checkpoint_path, map_location=device)
-                                    # Remove classification head weights to avoid shape mismatch
-                                    if 'classification_head.weight' in state_dict:
-                                        del state_dict['classification_head.weight']
-                                    if 'classification_head.bias' in state_dict:
-                                        del state_dict['classification_head.bias']
-                                    # Load the modified state_dict without strict mode (to ignore missing layers)
-                                    global_strategy_transformer.load_state_dict(state_dict, strict=False)
-                                    logging.info(f"Loaded transformer from '{transformer_checkpoint_path}'.")
-                                else:
-                                    logging.warning("Transformer checkpoint not found, using randomly initialized transformer.")
-                                global_strategy_transformer.classification_head = None
-                                global_strategy_transformer.eval()
+                                    ckpt = torch.load(transformer_checkpoint_path, map_location=device)
+                                    global_strategy_transformer.load_state_dict(ckpt["transformer_state_dict"], strict=False)
+                                    global_strategy_transformer.eval()
                             with torch.no_grad():
-                                embedding, _ = global_strategy_transformer(token_tensor)
-                            mem_features_list.append(embedding.cpu().numpy().flatten())
-                    if mem_features_list:
-                        mem_features = np.concatenate(mem_features_list, axis=0)
-                    else:
-                        mem_features = np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
+                                projected = global_event_encoder(feature_tensor)
+                                strategy_embedding, _ = global_strategy_transformer(projected)
+                            mem_features_list.append(strategy_embedding.cpu().numpy().flatten())
+                        else:
+                            mem_features_list.append(np.zeros(config.STRATEGY_DIM, dtype=np.float32))
+                if mem_features_list:
+                    mem_features = np.concatenate(mem_features_list, axis=0)
                 else:
-                    # --- Old memory integration using memory summary ---
-                    from src.env.liars_deck_env_utils import query_opponent_memory
-                    mem_features_list = []
-                    for opp in env.possible_agents:
-                        if opp != agent:
-                            mem_summary = query_opponent_memory(agent, opp)
-                            mem_features_list.append(mem_summary)
-                    if mem_features_list:
-                        mem_features = np.concatenate(mem_features_list, axis=0)
-                    else:
-                        mem_features = np.array([], dtype=np.float32)
+                    mem_features = np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
 
                 # Pad or truncate mem_features to match the required dimension.
                 current_mem_dim = mem_features.shape[0]
@@ -416,7 +395,7 @@ def evaluate_agents_tournament(env, device, players_in_this_game, episodes=5):
 
             # 5) Forward pass through the policy network.
             obs_tensor = torch.tensor(final_obs, dtype=torch.float32).unsqueeze(0).to(device)
-            policy_net = player_data['policy_net']
+            policy_net = players_in_this_game[player_id]['policy_net']
             with torch.no_grad():
                 probs, _ = policy_net(obs_tensor, None)
             probs = torch.clamp(probs, min=1e-8, max=1.0)
@@ -428,7 +407,6 @@ def evaluate_agents_tournament(env, device, players_in_this_game, episodes=5):
             if masked_probs.sum() <= 0:
                 logger.warning(f"All actions masked for {agent}; using uniform distribution.")
                 masked_probs = mask_tensor + 1e-8
-
             masked_probs /= masked_probs.sum()
             m = torch.distributions.Categorical(masked_probs)
             action = m.sample().item()
@@ -436,7 +414,6 @@ def evaluate_agents_tournament(env, device, players_in_this_game, episodes=5):
             if action in action_counts[player_id]:
                 action_counts[player_id][action] += 1
             env.step(action)
-
         # Track winner
         winner_agent = env.winner
         if winner_agent:
@@ -459,12 +436,9 @@ def evaluate_agents_tournament(env, device, players_in_this_game, episodes=5):
     avg_steps = total_steps / episodes if episodes > 0 else 0
     return cumulative_wins, action_counts, game_wins_list, avg_steps
 
-
 def update_openskill_ratings(players, group, group_ranking, cumulative_wins):
     """
     Similar to evaluate_utils.update_openskill_batch, but specialized for Swiss.
-    Assign ranks [0,1,2,...] based on total wins in 'cumulative_wins' and
-    update each player's OpenSkill rating once for the group.
     """
     logger = logging.getLogger("EvaluateTournament")
 
@@ -500,28 +474,21 @@ def update_openskill_ratings(players, group, group_ranking, cumulative_wins):
             f"Updated rating for {pid} => ordinal={players[pid]['score']:.2f}, rank={rank_dict[pid]}"
         )
 
-
 def run_group_swiss_tournament(env, device, players, num_games_per_match=5, NUM_ROUNDS=7):
     """
     Runs a Swiss-style tournament. In each round, players are grouped using a greedy
-    Swiss grouping method (swiss_grouping) that minimizes repeated matchups.
-    Then, for each group the match is evaluated with evaluate_agents_tournament,
-    and the OpenSkill ratings are updated once per group.
+    Swiss grouping method, then matches are evaluated and OpenSkill ratings updated.
     """
     logger = logging.getLogger("EvaluateTournament")
     player_ids = list(players.keys())
-    group_size = env.num_players  # e.g. 3 if groups of 3 are required.
+    group_size = env.num_players
     logger.info(f"Using greedy Swiss grouping for tournament over {NUM_ROUNDS} rounds with group size {group_size}.")
 
-    # Initialize match history: for each player, track the set of opponents they've faced.
     match_history = {pid: set() for pid in players}
-
     global_action_counts = {pid: {action: 0 for action in range(config.OUTPUT_DIM)} for pid in players}
 
     for round_num in range(1, NUM_ROUNDS + 1):
         logger.info(f"=== Starting Round {round_num} with {len(player_ids)} players ===")
-
-        # Group players using the greedy Swiss grouping function.
         groups = swiss_grouping(players, match_history, group_size)
         logger.info(f"Formed {len(groups)} groups this round: {groups}")
 
@@ -532,14 +499,12 @@ def run_group_swiss_tournament(env, device, players, num_games_per_match=5, NUM_
 
             logger.info(f"Group match: {group}")
             players_in_this_game = {pid: players[pid] for pid in group}
-
             cumulative_wins, action_counts, game_wins_list, avg_steps = evaluate_agents_tournament(
                 env=env,
                 device=device,
                 players_in_this_game=players_in_this_game,
                 episodes=num_games_per_match
             )
-            # Update global action counts.
             for pid in group:
                 for action in range(config.OUTPUT_DIM):
                     global_action_counts[pid][action] += action_counts[pid][action]
@@ -551,7 +516,6 @@ def run_group_swiss_tournament(env, device, players, num_games_per_match=5, NUM_
             )
             update_openskill_ratings(players, group, group_ranking, cumulative_wins)
 
-            # Update match history: record that all players in this group have played together.
             for pid in group:
                 for other in group:
                     if other != pid:
@@ -563,11 +527,9 @@ def run_group_swiss_tournament(env, device, players, num_games_per_match=5, NUM_
 
     return global_action_counts
 
-
 def print_scoreboard(players):
     """
-    Print a final scoreboard for Swiss tournaments, showing each player's final 'score'
-    and basic win stats.
+    Print a final scoreboard for Swiss tournaments.
     """
     sorted_players = sorted(players.items(), key=lambda x: x[1]['score'], reverse=True)
 
@@ -583,7 +545,6 @@ def print_scoreboard(players):
         print(f"{rank:<5}{player_id:<50}{score:<12.2f}{wins:<6}{win_rate:<15.2f}")
     print("=" * 90)
 
-
 def print_action_counts(players, action_counts):
     """
     Print the action counts for each player.
@@ -598,26 +559,17 @@ def print_action_counts(players, action_counts):
         print(f"{player_id:<50}{actions_str}")
     print("===============================\n")
 
-
 def delete_bottom_half_checkpoints_by_score(players, checkpoints_dir):
     """
-    Group players by checkpoint file (using the filename prefix in player_id),
-    compute the best (maximum) score per checkpoint, and delete the bottom half
-    (the ones with the lowest best score).
+    Group players by checkpoint file and delete the bottom half based on best score.
     """
-    # Group players by checkpoint file
     cp_to_scores = {}
     for player_id, data in players.items():
-        # Assume the checkpoint filename is the part before "_player_"
         cp_filename = player_id.split("_player_")[0]
         cp_to_scores.setdefault(cp_filename, []).append(data['score'])
     
-    # Compute the best score per checkpoint
     cp_best_scores = {cp: max(scores) for cp, scores in cp_to_scores.items()}
-    
-    # Sort checkpoint filenames by best score (ascending: worst first)
     sorted_cps = sorted(cp_best_scores.items(), key=lambda x: x[1])
-    
     num_to_delete = len(sorted_cps) // 2
     bottom_half = sorted_cps[:num_to_delete]
     
@@ -632,10 +584,9 @@ def delete_bottom_half_checkpoints_by_score(players, checkpoints_dir):
         else:
             print(f"Checkpoint file '{cp_filename}' not found in {checkpoints_dir}.")
 
-
 def main():
     """
-    Main function for the Swiss tournament, updated to handle both obs v1/v2 and memory-enhanced models.
+    Main function for the Swiss tournament.
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -659,7 +610,6 @@ def main():
     obs, infos = env.reset()
     agents = env.agents
 
-    # Derive config dims from the env
     config.set_derived_config(env.observation_spaces[agents[0]], env.action_spaces[agents[0]], config.NUM_PLAYERS - 1)
     logger.info(f"Config INPUT_DIM after set_derived_config: {config.INPUT_DIM}")
     logger.info(f"Config OUTPUT_DIM after set_derived_config: {config.OUTPUT_DIM}")
@@ -670,7 +620,6 @@ def main():
         raise ValueError("Need at least 3 individual players for the tournament.")
     logger.info(f"Total individual players loaded: {len(players)}")
 
-    # Run the Swiss tournament
     NUM_GAMES_PER_MATCH = config.NUM_GAMES_PER_MATCH
     NUM_ROUNDS = config.NUM_ROUNDS
     action_counts = run_group_swiss_tournament(
@@ -679,17 +628,14 @@ def main():
         NUM_ROUNDS=NUM_ROUNDS
     )
 
-    # Print final scoreboard and action counts
     print_scoreboard(players)
     print_action_counts(players, action_counts)
 
-    # Ask user whether to delete the bottom half of checkpoints (by evaluated score)
     response = input("Do you want to delete the bottom half of checkpoint files (by best agent score)? (y/n): ")
     if response.lower().startswith('y'):
         delete_bottom_half_checkpoints_by_score(players, checkpoints_dir)
     else:
         print("No checkpoints were deleted.")
-
 
 if __name__ == "__main__":
     main()
