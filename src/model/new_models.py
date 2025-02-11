@@ -175,7 +175,7 @@ class StrategyTransformer(nn.Module):
         nhead,                  # Number of attention heads.
         num_layers,             # Number of Transformer encoder layers.
         strategy_dim,           # Desired dimension for the final strategy embedding (e.g. 5 or 10).
-        num_classes=7,            # Number of classes for the classification head.
+        num_classes=10,            # Number of classes for the classification head.
         dropout=0.1,
         use_cls_token=True      # If True, a learnable [CLS] token is prepended for pooling.
     ):
