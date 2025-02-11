@@ -30,8 +30,31 @@ from src.evaluation.evaluate_utils import (
 logging.basicConfig(level=logging.INFO)  # Set to DEBUG for detailed logs
 logger = logging.getLogger("AgentBattleground")
 
-# Global transformer variable for transformer‐based memory integration.
+# --- Global transformer/event encoder variables for transformer‐based memory integration ---
 global_strategy_transformer = None
+global_event_encoder = None
+global_response2idx = None
+global_action2idx = None
+
+# --- New helper: Convert memory events into 4D continuous features ---
+def convert_memory_to_features(memory, response_mapping, action_mapping):
+    """
+    Convert the opponent memory (a list of events) to a list of 4-dimensional feature vectors.
+    Each event must be a dictionary with keys: "response", "triggering_action", "penalties", and "card_count".
+    """
+    features = []
+    for event in memory:
+        if not isinstance(event, dict):
+            raise ValueError(f"Memory event is not a dictionary: {event}.")
+        resp = event.get("response", "")
+        act = event.get("triggering_action", "")
+        penalties = float(event.get("penalties", 0))
+        card_count = float(event.get("card_count", 0))
+        # Convert categorical features to numbers using provided mappings.
+        resp_val = float(response_mapping.get(resp, 0))
+        act_val = float(action_mapping.get(act, 0))
+        features.append([resp_val, act_val, penalties, card_count])
+    return features
 
 class AgentBattlegroundGUI:
     def __init__(self, root):
@@ -131,7 +154,7 @@ class AgentBattlegroundGUI:
         if any(k not in checkpoint for k in required_keys):
             raise ValueError("Missing required keys in checkpoint")
         
-        # Determine the observation version based on policy network's input dimension
+        # Determine the observation version based on policy net's input dimension.
         any_policy = next(iter(checkpoint["policy_nets"].values()))
         input_dim = any_policy['fc1.weight'].shape[1]
         
@@ -254,7 +277,6 @@ class AgentBattlegroundGUI:
             policy_net.to(device).eval()
             policy_nets[agent_id] = policy_net
 
-            # Initialize OBP model
             obp_model_state = agent_data["obp_model"]
             if obp_model_state:
                 obp_input_dim = 5 if agent_data["obs_version"] == 1 else 4
@@ -267,7 +289,7 @@ class AgentBattlegroundGUI:
                 obp_model.to(device).eval()
                 obp_models[agent_id] = obp_model
             else:
-                obp_models[agent_id] = None  # Handle cases where OBP is not present
+                obp_models[agent_id] = None
 
         env.reset()
         while env.agent_selection is not None:
@@ -279,7 +301,6 @@ class AgentBattlegroundGUI:
                 continue
 
             if current_agent in policy_nets:
-                # AI Agent's turn
                 action = self.choose_action(
                     current_agent,
                     policy_nets[current_agent],
@@ -293,131 +314,103 @@ class AgentBattlegroundGUI:
                     uses_memories[current_agent]
                 )
             else:
-                # Hardcoded Agent's turn
                 action = hardcoded_agent.play_turn(
                     obs[current_agent],
                     info['action_mask'],
                     env.table_card
                 )
-                # Ensure 'action' is an integer
                 if not isinstance(action, int):
                     logger.error(f"Hardcoded agent {hardcoded_agent.__class__.__name__} returned non-integer action: {action}")
                     raise ValueError(f"Hardcoded agent {hardcoded_agent.__class__.__name__} returned non-integer action: {action}")
             
             env.step(action)
         
-        # Determine winner
         max_reward = max(env.rewards.values())
         winners = [agent for agent, reward in env.rewards.items() if reward == max_reward]
-        # Assuming single winner for simplicity
         winner = winners[0]
-        
-        # Determine hardcoded agent's identifier
         hardcoded_agent_id = f"player_{env.num_players - 1}"  # 'player_2'
         
         if winner in ai_agents:
-            return winner  # 'player_0' or 'player_1'
+            return winner
         elif winner == hardcoded_agent_id:
             return "hardcoded_agent"
         else:
             return "unknown_agent"
 
     def choose_action(self, agent_id, policy_net, obp_model, observation, action_mask, device, num_players, obs_version, input_dim, uses_memory):
-        """Selects an action using OBP integration and, if applicable, transformer‐based memory integration."""
-        # Adapt observation based on agent version
-        converted_obs = adapt_observation_for_version(
-            observation, 
-            num_players,
-            obs_version
-        )
+        """Selects an action using OBP inference and, if applicable, transformer‐based memory integration."""
+        converted_obs = adapt_observation_for_version(observation, num_players, obs_version)
         logging.debug(f"Converted observation (length {len(converted_obs)}): {converted_obs}")
 
-        # Run OBP inference
-        obp_probs = run_obp_inference(
-            obp_model,
-            converted_obs,
-            device,
-            num_players,
-            obs_version
-        )
+        obp_probs = run_obp_inference(obp_model, converted_obs, device, num_players, obs_version)
         logging.debug(f"OBP probabilities: {obp_probs}")
 
-        # If the model uses memory (and obs_version is 2) then integrate memory features.
         if obs_version == 2 and uses_memory:
             required_mem_dim = input_dim - (len(converted_obs) + len(obp_probs))
-            # Use transformer-based integration if the required memory dimension matches
             if required_mem_dim == config.STRATEGY_DIM * (num_players - 1):
-                # Import the full-memory query function
                 from src.env.liars_deck_env_utils import query_opponent_memory_full
-
-                # Define a local Vocabulary class and conversion function
-                class Vocabulary:
-                    def __init__(self, max_size):
-                        self.token2idx = {"<PAD>": 0, "<UNK>": 1}
-                        self.idx2token = {0: "<PAD>", 1: "<UNK>"}
-                        self.max_size = max_size
-                    def encode(self, token):
-                        if token in self.token2idx:
-                            return self.token2idx[token]
-                        else:
-                            if len(self.token2idx) < self.max_size:
-                                idx = len(self.token2idx)
-                                self.token2idx[token] = idx
-                                self.idx2token[idx] = token
-                                return idx
-                            else:
-                                return self.token2idx["<UNK>"]
-
-                def convert_memory_to_tokens(memory, vocab):
-                    tokens = []
-                    for event in memory:
-                        if isinstance(event, dict):
-                            sorted_items = sorted(event.items())
-                            token_str = "_".join(f"{k}-{v}" for k, v in sorted_items)
-                        else:
-                            token_str = str(event)
-                        tokens.append(vocab.encode(token_str))
-                    return tokens
-
-                vocab_inst = Vocabulary(max_size=config.STRATEGY_NUM_TOKENS)
+                global global_response2idx, global_action2idx
+                transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
+                if global_response2idx is None or global_action2idx is None:
+                    if os.path.exists(transformer_checkpoint_path):
+                        ckpt = torch.load(transformer_checkpoint_path, map_location=device)
+                        global_response2idx = ckpt.get("response2idx", {})
+                        global_action2idx = ckpt.get("action2idx", {})
+                    else:
+                        global_response2idx = {}
+                        global_action2idx = {}
                 mem_features_list = []
-                # Iterate over opponents using the current environment stored in self.current_env
                 for opp in self.current_env.possible_agents:
                     if opp != agent_id:
+                        from src.env.liars_deck_env_utils import query_opponent_memory_full
                         mem_summary = query_opponent_memory_full(agent_id, opp)
-                        token_seq = convert_memory_to_tokens(mem_summary, vocab_inst)
-                        token_tensor = torch.tensor(token_seq, dtype=torch.long, device=device).unsqueeze(0)
-                        global global_strategy_transformer
-                        if global_strategy_transformer is None:
-                            from src.model.new_models import StrategyTransformer
-                            global_strategy_transformer = StrategyTransformer(
-                                num_tokens=config.STRATEGY_NUM_TOKENS,
-                                token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM,
-                                nhead=config.STRATEGY_NHEAD,
-                                num_layers=config.STRATEGY_NUM_LAYERS,
-                                strategy_dim=config.STRATEGY_DIM,
-                                num_classes=config.STRATEGY_NUM_CLASSES,
-                                dropout=config.STRATEGY_DROPOUT,
-                                use_cls_token=True
-                            ).to(device)
-                            transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
-                            if os.path.exists(transformer_checkpoint_path):
-                                state_dict = torch.load(transformer_checkpoint_path, map_location=device)
-                                global_strategy_transformer.load_state_dict(state_dict)
-                                logging.info(f"Loaded transformer from '{transformer_checkpoint_path}'.")
-                            else:
-                                logging.warning("Transformer checkpoint not found, using randomly initialized transformer.")
-                            global_strategy_transformer.classification_head = None
-                            global_strategy_transformer.eval()
-                        with torch.no_grad():
-                            embedding, _ = global_strategy_transformer(token_tensor)
-                        mem_features_list.append(embedding.cpu().numpy().flatten())
+                        features_list = convert_memory_to_features(mem_summary, global_response2idx, global_action2idx)
+                        if features_list:
+                            # Create a float tensor of continuous features.
+                            feature_tensor = torch.tensor(features_list, dtype=torch.float, device=device).unsqueeze(0)
+                            global global_event_encoder, global_strategy_transformer
+                            if global_event_encoder is None:
+                                from src.training.train_transformer import EventEncoder
+                                global_event_encoder = EventEncoder(
+                                    response_vocab_size=len(global_response2idx),
+                                    action_vocab_size=len(global_action2idx),
+                                    token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM
+                                ).to(device)
+                                if os.path.exists(transformer_checkpoint_path):
+                                    ckpt = torch.load(transformer_checkpoint_path, map_location=device)
+                                    global_event_encoder.load_state_dict(ckpt["event_encoder_state_dict"])
+                                    global_event_encoder.eval()
+                            if global_strategy_transformer is None:
+                                from src.model.new_models import StrategyTransformer
+                                global_strategy_transformer = StrategyTransformer(
+                                    num_tokens=config.STRATEGY_NUM_TOKENS,
+                                    token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM,
+                                    nhead=config.STRATEGY_NHEAD,
+                                    num_layers=config.STRATEGY_NUM_LAYERS,
+                                    strategy_dim=config.STRATEGY_DIM,
+                                    num_classes=config.STRATEGY_NUM_CLASSES,
+                                    dropout=config.STRATEGY_DROPOUT,
+                                    use_cls_token=True
+                                ).to(device)
+                                if os.path.exists(transformer_checkpoint_path):
+                                    ckpt = torch.load(transformer_checkpoint_path, map_location=device)
+                                    global_strategy_transformer.load_state_dict(ckpt["transformer_state_dict"], strict=False)
+                                # Override the token embedding to bypass index lookup.
+                                global_strategy_transformer.token_embedding = torch.nn.Identity()
+                                global_strategy_transformer.classification_head = None
+                                global_strategy_transformer.eval()
+                            with torch.no_grad():
+                                # First, project the continuous features.
+                                projected = global_event_encoder(feature_tensor)
+                                embedding, _ = global_strategy_transformer(projected)
+                            mem_features_list.append(embedding.cpu().numpy().flatten())
+                        else:
+                            mem_features_list.append(np.zeros(config.STRATEGY_DIM, dtype=np.float32))
                 if mem_features_list:
                     mem_features = np.concatenate(mem_features_list, axis=0)
                 else:
                     mem_features = np.zeros(config.STRATEGY_DIM * (num_players - 1), dtype=np.float32)
             else:
-                # Use the old memory integration method if transformer-based integration is not applicable
                 from src.env.liars_deck_env_utils import query_opponent_memory
                 mem_features_list = []
                 for opp in self.current_env.possible_agents:
@@ -428,7 +421,6 @@ class AgentBattlegroundGUI:
                     mem_features = np.concatenate(mem_features_list, axis=0)
                 else:
                     mem_features = np.array([], dtype=np.float32)
-            # Pad or truncate mem_features to match required dimension.
             current_mem_dim = mem_features.shape[0]
             if current_mem_dim < required_mem_dim:
                 pad = np.zeros(required_mem_dim - current_mem_dim, dtype=np.float32)
@@ -440,33 +432,22 @@ class AgentBattlegroundGUI:
             final_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32)], axis=0)
         logging.debug(f"Final observation (length {len(final_obs)}): {final_obs}")
         
-        # Check dimensions
-        expected_dim = input_dim  # input_dim already includes OBP predictions (and memory, if applicable)
+        expected_dim = input_dim
         actual_dim = final_obs.shape[0]
         logging.debug(f"Expected dim: {expected_dim}, Actual dim: {actual_dim}")
         assert actual_dim == expected_dim, f"Expected observation dimension {expected_dim}, got {actual_dim}"
-
+        
         observation_tensor = torch.tensor(final_obs, dtype=torch.float32).unsqueeze(0).to(device)
-        
-        # Get action probabilities
         with torch.no_grad():
-            action_probs, _ = policy_net(observation_tensor)
-        
-        # Apply action mask
+            action_probs, _ = policy_net(observation_tensor, None)
         mask_tensor = torch.tensor(action_mask, dtype=torch.float32).to(device)
         masked_probs = action_probs * mask_tensor
-        
-        # Handle zero-probability cases
         if masked_probs.sum() == 0:
-            # Fallback to uniform distribution over valid actions
             masked_probs = mask_tensor / mask_tensor.sum()
         else:
             masked_probs /= masked_probs.sum()
-        
-        # Sample action
         m = torch.distributions.Categorical(masked_probs)
         action = m.sample().item()
-        
         logging.debug(f"Action probabilities: {masked_probs.cpu().numpy()}")
         logging.debug(f"Selected action: {action}")
         if action_mask[action] == 6:
