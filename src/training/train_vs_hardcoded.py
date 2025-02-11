@@ -49,106 +49,116 @@ from src.training.train_extras import (
     run_obp_inference
 )
 
-# --- Vocabulary & Tokenization ---
-class Vocabulary:
-    def __init__(self, max_size):
-        """
-        Initialize a vocabulary with a maximum size.
-        We reserve index 0 for "<PAD>" and index 1 for "<UNK>".
-        """
-        self.token2idx = {"<PAD>": 0, "<UNK>": 1}
-        self.idx2token = {0: "<PAD>", 1: "<UNK>"}
-        self.max_size = max_size
+# ---- Import EventEncoder (used to project raw opponent memory features) ----
+from src.training.train_transformer import EventEncoder
 
-    def encode(self, token):
-        """
-        Return the index for the token. If the token is not in the vocabulary
-        and the vocabulary is not yet full, add it. Otherwise return the index for <UNK>.
-        """
-        if token in self.token2idx:
-            return self.token2idx[token]
-        else:
-            if len(self.token2idx) < self.max_size:
-                idx = len(self.token2idx)
-                self.token2idx[token] = idx
-                self.idx2token[idx] = token
-                return idx
-            else:
-                return self.token2idx["<UNK>"]
-
-def convert_memory_to_tokens(memory, vocab):
+# ---- Define a helper function to convert memory events into 4D feature vectors ----
+def convert_memory_to_features(memory, response_mapping, action_mapping):
     """
-    Convert the opponent memory (a list of events) to a sequence of token indices.
-    For each event (assumed to be a dictionary or string), we sort its keys (if applicable)
-    and join key-value pairs with an underscore. Then, we use the provided vocabulary to map
-    the resulting string to an index.
+    Convert the opponent memory (a list of events) to a list of 4-dimensional feature vectors.
+    Each event is expected to be a dictionary with keys: "response", "triggering_action", "penalties", and "card_count".
     """
-    tokens = []
+    features = []
     for event in memory:
-        if isinstance(event, dict):
-            sorted_items = sorted(event.items())
-            token_str = "_".join(f"{k}-{v}" for k, v in sorted_items)
-        else:
-            token_str = str(event)
-        token_index = vocab.encode(token_str)
-        tokens.append(token_index)
-    return tokens
+        if not isinstance(event, dict):
+            raise ValueError(f"Memory event is not a dictionary: {event}. Please fix the data generation.")
+        resp = event.get("response", "")
+        act = event.get("triggering_action", "")
+        penalties = float(event.get("penalties", 0))
+        card_count = float(event.get("card_count", 0))
+        # Map the categorical features using the provided mappings.
+        resp_val = float(response_mapping.get(resp, 0))
+        act_val = float(action_mapping.get(act, 0))
+        features.append([resp_val, act_val, penalties, card_count])
+    return features
 
-# Create a global vocabulary instance using the maximum size from config.
-vocab = Vocabulary(max_size=config.STRATEGY_NUM_TOKENS)
+# ---------------------------
+# Instantiate the device.
+# ---------------------------
+device = torch.device(config.DEVICE)
 
-# --- Instantiate the Strategy Transformer and remove the classification head ---
+# ---------------------------
+# Instantiate the Strategy Transformer.
+# ---------------------------
 strategy_transformer = StrategyTransformer(
     num_tokens=config.STRATEGY_NUM_TOKENS,
     token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM,
     nhead=config.STRATEGY_NHEAD,
     num_layers=config.STRATEGY_NUM_LAYERS,
     strategy_dim=config.STRATEGY_DIM,
-    num_classes=config.STRATEGY_NUM_CLASSES,  # This value is not used after the head is removed.
+    num_classes=config.STRATEGY_NUM_CLASSES,  # Not used after removing the classification head.
     dropout=config.STRATEGY_DROPOUT,
     use_cls_token=True
-).to(torch.device(config.DEVICE))
+).to(device)
 
-# Define the path to the saved transformer checkpoint.
+# ---------------------------
+# Load the transformer checkpoint, including the Event Encoder and categorical mappings.
+# ---------------------------
 transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
-
 if os.path.exists(transformer_checkpoint_path):
-    # Load the saved state dict
-    state_dict = torch.load(transformer_checkpoint_path, map_location=torch.device(config.DEVICE))
-    strategy_transformer.load_state_dict(state_dict)
+    checkpoint = torch.load(transformer_checkpoint_path, map_location=device)
+    
+    # Load transformer state in non-strict mode to ignore missing keys like token_embedding.weight.
+    strategy_transformer.load_state_dict(checkpoint["transformer_state_dict"], strict=False)
     print(f"Loaded transformer from {transformer_checkpoint_path}")
+    
+    # Load categorical mappings.
+    if "response2idx" in checkpoint and "action2idx" in checkpoint:
+        response2idx = checkpoint["response2idx"]
+        action2idx = checkpoint["action2idx"]
+        print("Loaded response and action mappings from checkpoint.")
+    else:
+        raise ValueError("Checkpoint is missing response2idx and/or action2idx.")
+    
+    # (Optionally, load label mapping if needed.)
+    if "label_mapping" in checkpoint:
+        label_mapping = checkpoint["label_mapping"]
+        label2idx = label_mapping["label2idx"]
+        idx2label = label_mapping["idx2label"]
+        print("Loaded label mapping from checkpoint.")
+    
+    # Instantiate the Event Encoder using the loaded vocabulary sizes.
+    event_encoder = EventEncoder(
+        response_vocab_size=len(response2idx),
+        action_vocab_size=len(action2idx),
+        token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM
+    ).to(device)
+    event_encoder.load_state_dict(checkpoint["event_encoder_state_dict"])
 else:
-    print("Transformer checkpoint not found, using randomly initialized transformer.")
+    raise FileNotFoundError(f"Transformer checkpoint not found at {transformer_checkpoint_path}")
 
-# Remove the classification head so that only the strategy embedding is used.
+# IMPORTANT: Override the transformer's token embedding and remove its classification head.
+strategy_transformer.token_embedding = nn.Identity()
 strategy_transformer.classification_head = None
 strategy_transformer.eval()
 
+# ---------------------------
+# Logger configuration.
+# ---------------------------
 def configure_logger():
     logger = logging.getLogger('Train')
     logger.setLevel(logging.INFO)
-
     if logger.hasHandlers():
         logger.handlers.clear()
-
     handler = logging.StreamHandler()
     formatter = logging.Formatter('%(levelname)s:%(message)s')
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     logger.propagate = False
-
     return logger
 
+# ---------------------------
+# Main training loop.
+# ---------------------------
 def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=True, load_directory=None, log_tensorboard=True):
     set_seed()
-
     obs, infos = env.reset()
     agents = env.agents
     assert len(agents) == config.NUM_PLAYERS, f"Expected {config.NUM_PLAYERS} agents, but got {len(agents)} agents."
     num_opponents = config.NUM_PLAYERS - 1
     config.set_derived_config(env.observation_spaces[agents[0]], env.action_spaces[agents[0]], num_opponents)
 
-    # Initialize networks, optimizers, and memories for each agent
+    # Initialize networks, optimizers, and memories for each agent.
     policy_nets = {}
     value_nets = {}
     optimizers_policy = {}
@@ -157,7 +167,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
 
     for agent in agents:
         policy_net = PolicyNetwork(
-            input_dim=config.INPUT_DIM,
+            input_dim=config.INPUT_DIM,  # Includes: base observation + OBP output + strategy embeddings.
             hidden_dim=config.HIDDEN_DIM,
             output_dim=config.OUTPUT_DIM,
             use_lstm=True,
@@ -217,9 +227,8 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
     recent_rewards = {agent: [] for agent in agents}
     original_agent_order = list(env.agents)
 
-    # Hard-coded agents to choose from if randomizing
-    hardcoded_agent_classes = [GreedyCardSpammer, StrategicChallenger, 
-                                TableNonTableAgent, Classic]
+    # Hard-coded agents to choose from if randomizing.
+    hardcoded_agent_classes = [GreedyCardSpammer, StrategicChallenger, TableNonTableAgent, Classic]
 
     # Declare variables to hold the current hard-coded agent across episodes.
     current_hardcoded_agent_id = None
@@ -253,15 +262,15 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 env.step(None)
                 continue
 
-            # 1) Get observation & action mask
+            # 1) Get observation & action mask.
             observation_dict = env.observe(agent)
             observation = observation_dict[agent]
             action_mask = env.infos[agent]['action_mask']
 
-            # 2) Run OBP inference
+            # 2) Run OBP inference.
             obp_probs = run_obp_inference(obp_model, observation, device, env.num_players)
 
-            # 3) Integrate Opponent Memory & Transformer Embedding
+            # 3) Integrate Opponent Memory & Transformer Embedding.
             if agent == current_hardcoded_agent_id:
                 # For hard-coded agents, use base observation and OBP outputs,
                 # then pad with zeros so that final_obs has length config.INPUT_DIM.
@@ -277,12 +286,16 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 for opp in env.possible_agents:
                     if opp != agent:
                         mem_summary = query_opponent_memory_full(agent, opp)
-                        # Convert memory to token sequence using our vocabulary.
-                        token_seq = convert_memory_to_tokens(mem_summary, vocab)
-                        token_tensor = torch.tensor(token_seq, dtype=torch.long, device=device).unsqueeze(0)
-                        with torch.no_grad():
-                            strategy_embedding, _ = strategy_transformer(token_tensor)
-                        transformer_embeddings.append(strategy_embedding.cpu().numpy().flatten())
+                        # Convert raw memory events to continuous features.
+                        features_list = convert_memory_to_features(mem_summary, response2idx, action2idx)
+                        if features_list:
+                            feature_tensor = torch.tensor(features_list, dtype=torch.float, device=device).unsqueeze(0)
+                            with torch.no_grad():
+                                projected = event_encoder(feature_tensor)
+                                strategy_embedding, _ = strategy_transformer(projected)
+                            transformer_embeddings.append(strategy_embedding.cpu().detach().numpy().flatten())
+                        else:
+                            transformer_embeddings.append(np.zeros(config.STRATEGY_DIM, dtype=np.float32))
                 if transformer_embeddings:
                     transformer_features = np.concatenate(transformer_embeddings, axis=0)
                 else:
@@ -293,7 +306,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                     transformer_features
                 ], axis=0)
 
-            # 4) Decide action
+            # 4) Decide action.
             if agent == current_hardcoded_agent_id:
                 action = current_hardcoded_agent_instance.play_turn(observation, action_mask, table_card=None)
                 log_prob_value = 0.0
@@ -322,7 +335,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
             env.step(action)
             reward = 0
 
-            # 5) Store transition in RolloutMemory using final_obs (with consistent shape)
+            # 5) Store transition in RolloutMemory using final_obs (with consistent shape).
             memories[agent].store_transition(
                 agent=agent,
                 state=final_obs,
@@ -340,7 +353,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
             env_reward = env.rewards[agent]
             episode_rewards[agent] += env_reward
 
-        # Add final environment reward to last transition for each agent
+        # Add final environment reward to last transition for each agent.
         for ag in agents:
             if len(memories[ag].rewards[ag]) > 0:
                 memories[ag].rewards[ag][-1] += env.rewards[ag]
@@ -355,7 +368,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
 
         avg_rewards = {agent: np.mean(recent_rewards[agent]) if recent_rewards[agent] else 0.0 for agent in agents}
 
-        # Compute GAE for RL agents (skip hard-coded agent)
+        # Compute GAE for RL agents (skip hard-coded agent).
         for agent in agents:
             if agent == current_hardcoded_agent_id:
                 continue
@@ -380,7 +393,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
             memory.advantages[agent] = advantages
             memory.returns[agent] = returns_
 
-        # Periodically update RL agents
+        # Periodically update RL agents.
         if episode % config.UPDATE_STEPS == 0:
             for agent in agents:
                 if agent == current_hardcoded_agent_id:
