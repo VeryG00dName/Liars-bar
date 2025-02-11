@@ -2,7 +2,7 @@
 
 import numpy as np
 from src.env.liars_deck_env_utils_2 import decode_action, select_cards_to_play, validate_claim
-
+from src.model.memory import get_opponent_memory
 # --- Existing functions ---
 
 def record_action_history(env, agent, action_type, card_category, count, was_challenged=False):
@@ -62,13 +62,17 @@ def apply_challenge(env, challenger_agent, claimant_agent):
             env.logger.debug(f"Updated public history for {claimant_agent}: was_bluff=True")
 
         # --- MEMORY UPDATE: Record that claimant did not play any cards ---
-        from src.model.memory import get_opponent_memory
         for observer in env.possible_agents:
             if observer != claimant_agent:
+                # Retrieve the last play entry from the public history for claimant
+                if public_last_play and 'count' in public_last_play:
+                    triggering_str = "Play_" + str(public_last_play['count'])
+                else:
+                    triggering_str = "None"
                 get_opponent_memory(observer).update(
                     opponent=claimant_agent,
-                    response="NoPlay",
-                    triggering_action="Challenge",
+                    response="Challenge",           # Fixed response value for challenges
+                    triggering_action=triggering_str, # Triggering action from the last play
                     penalties=env.penalties.get(claimant_agent, 0),
                     card_count=len(env.players_hands.get(claimant_agent, []))
                 )
@@ -116,13 +120,19 @@ def apply_challenge(env, challenger_agent, claimant_agent):
     from src.model.memory import get_opponent_memory
     for observer in env.possible_agents:
         if observer != claimant_agent:
+            # Retrieve the last play entry from the public history for claimant
+            if public_last_play and 'count' in public_last_play:
+                triggering_str = "Play_" + str(public_last_play['count'])
+            else:
+                triggering_str = "None"
             get_opponent_memory(observer).update(
                 opponent=claimant_agent,
-                response=outcome,
-                triggering_action="Challenge",
+                response="Challenge",           # Fixed response value for challenges
+                triggering_action=triggering_str, # Triggering action from the last play
                 penalties=env.penalties.get(claimant_agent, 0),
                 card_count=len(env.players_hands.get(claimant_agent, []))
             )
+
 
     env.start_new_round()
     eligible_agents = [ag for ag in env.possible_agents if not env.terminations[ag]]
@@ -148,64 +158,66 @@ def apply_action(env, agent, action):
     if action_type == "Play":
         selected_cards = select_cards_to_play(current_hand, card_category, count, env.table_card, env.np_random)
         if selected_cards:
+            # Remove played cards from the hand.
             for card in selected_cards:
                 current_hand.remove(card)
             env.last_played_cards[agent] = selected_cards
-            env.last_action = len(selected_cards)  # Store the count of cards played
-            env.last_action_agent = agent
 
-            # Determine if this play is a bluff
+            # Capture the current play's card count.
+            current_play = count
+            # Capture the previous turn's play value before updating.
+            previous_play = env.last_action  # May be None if this is the first play of the round.
+
+            # --- MEMORY UPDATE: Use current play as response and previous play as triggering_action ---
+            for observer in env.possible_agents:
+                if observer != agent:
+                    # response is this turn's value:
+                    response_str = "Play_" + str(current_play)
+                    # triggering_action is last turn's value (or "None" if it doesn't exist):
+                    triggering_str = "Play_" + str(previous_play) if previous_play is not None else "None"
+                    get_opponent_memory(observer).update(
+                        opponent=agent,
+                        response=response_str,
+                        triggering_action=triggering_str,
+                        penalties=env.penalties.get(agent, 0),
+                        card_count=len(env.players_hands.get(agent, []))
+                    )
+            # --- END MEMORY UPDATE ---
+
+            # Now update the environment for the current play.
+            env.last_action = current_play
+            env.last_action_agent = agent
             env.last_action_bluff = not all(c == env.table_card or c == "Joker" for c in selected_cards)
 
-            # Track total plays and bluffs
+            # Track total plays and bluffs.
             env.total_plays[agent] += 1
             if env.last_action_bluff:
                 env.bluff_counts[agent] += 1
 
-            # Calculate reward based on the number of cards played
-            num_cards_played = len(selected_cards)
-            play_reward = env.scoring_params.get('play_reward_per_card', 1.0) * num_cards_played
+            # Calculate reward based on the number of cards played.
+            play_reward = env.scoring_params.get('play_reward_per_card', 1.0) * current_play
             env.rewards[agent] += play_reward
-            env.logger.debug(f"{agent} played {num_cards_played} card(s). Reward increased by {play_reward}.")
+            env.logger.debug(f"{agent} played {current_play} card(s). Reward increased by {play_reward}.")
 
-            # Record in public history
+            # Record in public history.
             record_action_history(env, agent, "Play", card_category, count, was_challenged=False)
 
-            # ----------------- NEW CODE ADDED BELOW -----------------
-            # Record in private history with 'was_bluff'
+            # ----------------- PRIVATE HISTORY UPDATE -----------------
             private_entry = {
                 'action_type': "Play",
                 'count': count,
                 'was_bluff': env.last_action_bluff
             }
             env.private_opponent_histories[agent].append(private_entry)
-
-            # Maintain history length (e.g., last 10 entries)
-            H = 10
+            H = 10  # Maintain history length.
             if len(env.private_opponent_histories[agent]) > H:
                 env.private_opponent_histories[agent].pop(0)
-            # ----------------- END OF NEW CODE ----------------------
-
-            # --- MEMORY UPDATE: After a play action, update all other agents’ memory about this play ---
-            from src.model.memory import get_opponent_memory
-            for observer in env.possible_agents:
-                if observer != agent:
-                    # Record that 'agent' played (and whether it was a bluff)
-                    get_opponent_memory(observer).update(
-                        opponent=agent,
-                        response="Play_Bluff" if env.last_action_bluff else "Play_Truthful",
-                        triggering_action="Play_" + str(num_cards_played),
-                        penalties=env.penalties.get(agent, 0),
-                        card_count=len(env.players_hands.get(agent, []))
-                    )
+            # ----------------------------------------------------------
 
             if not current_hand:
                 env.logger.debug(f"{agent} emptied their hand. Adding hand emptying bonus.")
-
-                # Add the hand emptying bonus
                 hand_empty_bonus = env.scoring_params.get('hand_empty_bonus', 5)
                 env.rewards[agent] += hand_empty_bonus
-
                 env.logger.info(f"{agent} received a bonus of {hand_empty_bonus} for emptying their hand.")
 
                 active_agents = env._active_agents_in_round()
@@ -230,7 +242,6 @@ def apply_action(env, agent, action):
 
     elif action_type == "Challenge":
         record_action_history(env, agent, "Challenge", card_category=None, count=None, was_challenged=True)
-
         if env.last_action_agent is not None and env.last_played_cards.get(env.last_action_agent, []):
             challenger = agent
             claimant = env.last_action_agent
@@ -245,13 +256,13 @@ def apply_action(env, agent, action):
             env._check_game_end()
 
     else:
-        # Invalid action handling
+        # Invalid action handling.
         env.penalties[agent] += 1
         info["penalty"] = "Invalid action"
         env.rewards[agent] += env.scoring_params['invalid_play_penalty']
         env.logger.debug(f"Invalid Action by {agent}: Penalty={env.penalties[agent]}, Reward={env.rewards[agent]}")
 
-    # Check for termination due to penalties
+    # Check for termination due to penalties.
     if env.penalties[agent] >= env.penalty_thresholds[agent]:
         env.terminations[agent] = True
         env.rewards[agent] += env.scoring_params['termination_penalty']
@@ -259,6 +270,7 @@ def apply_action(env, agent, action):
         env.logger.debug(f"Rewards after termination: {env.rewards}")
 
     env.infos[agent] = info
+
 
 def get_opponent_features(env, observing_agent):
     """
