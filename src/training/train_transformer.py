@@ -435,7 +435,6 @@ def main(args):
             with torch.no_grad():
                 embedding, _ = model(projected)
             opponent_embeddings.append(embedding.cpu().numpy().flatten())
-            # Use the ground truth label name for plotting.
             # If the label is already a string, use it directly; otherwise, map it.
             gt_label_name = label if isinstance(label, str) else idx2label[label]
             labels_for_plot.append(gt_label_name)
@@ -452,13 +451,19 @@ def main(args):
         embedded_2d = reducer.fit_transform(pca_embeddings)
 
         plt.figure(figsize=(10, 6))
+        # Create a dictionary to hold one scatter handle per unique label.
+        legend_handles = {}
         for i, label in enumerate(labels_for_plot):
-            plt.scatter(embedded_2d[i, 0], embedded_2d[i, 1], color=label_colors[i],
-                        label=label if i < 10 else None)
+            if label not in legend_handles:
+                scatter_handle = plt.scatter(embedded_2d[i, 0], embedded_2d[i, 1],
+                                             color=label_colors[i], label=label)
+                legend_handles[label] = scatter_handle
+            else:
+                plt.scatter(embedded_2d[i, 0], embedded_2d[i, 1], color=label_colors[i])
         plt.xlabel("Dimension 1")
         plt.ylabel("Dimension 2")
         plt.title("Transformer Strategy Embeddings (Evaluation Set)")
-        plt.legend(loc="best", fontsize=8)
+        plt.legend(handles=list(legend_handles.values()), loc="best", fontsize=8)
         plt.grid()
         plt.show()
     else:
@@ -475,7 +480,7 @@ def main(args):
         "transformer_state_dict": model.state_dict(),
         "event_encoder_state_dict": event_encoder.state_dict(),
         "label_mapping": label_mapping,
-        "response2idx": response2idx,   # Ensure these mappings are saved!
+        "response2idx": response2idx,   # Save these mappings for consistent evaluation.
         "action2idx": action2idx
     }
     torch.save(checkpoint, save_path)
