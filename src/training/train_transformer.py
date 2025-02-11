@@ -5,231 +5,239 @@ import pickle
 import math
 import random
 import argparse
+import numpy as np
 from collections import Counter
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+from transformers import get_cosine_schedule_with_warmup
 
-# Import the transformer model from new_models.py
 from src.model.new_models import StrategyTransformer
+from src import config
 
 # -------------------------------
-# Step 1. Load Training Data
+# Updated Transformer Configuration
 # -------------------------------
-def load_training_data(training_data_path):
-    with open(training_data_path, "rb") as f:
-        data = pickle.load(f)
-    # data is a list of tuples: (full_memory, label)
-    return data
+STRATEGY_NUM_TOKENS = config.STRATEGY_NUM_TOKENS
+STRATEGY_TOKEN_EMBEDDING_DIM = 128
+STRATEGY_NHEAD = 8
+STRATEGY_NUM_LAYERS = 4
+STRATEGY_DIM = 128
+STRATEGY_NUM_CLASSES = 10
+STRATEGY_DROPOUT = 0.1
 
 # -------------------------------
-# Step 2. Preprocess Events and Build Vocabulary
+# Enhanced Feature Processing
 # -------------------------------
-def event_to_token(event):
-    """
-    Convert an event to a string token.
-    If the event is a dictionary, use a fixed ordering of keys.
-    If it's already a string, return it directly.
-    """
-    if isinstance(event, dict):
-        keys = ['response', 'triggering_action', 'penalties', 'card_count']
-        token = "|".join(f"{k}:{event.get(k, '')}" for k in keys)
-        return token
-    elif isinstance(event, str):
-        return event
-    else:
-        return str(event)
+class FeatureProcessor:
+    def __init__(self, training_data):
+        self.response_vocab = self._build_vocab(training_data, "response")
+        self.action_vocab = self._build_vocab(training_data, "triggering_action")
+        self._compute_normalization(training_data)
 
-def build_vocab(training_data, min_freq=1):
-    """
-    Build a vocabulary mapping from event tokens (strings) to indices.
-    training_data: list of (full_memory, label) tuples,
-      where full_memory is a list of event dictionaries (or strings).
-    Returns:
-      token2idx: dict mapping token -> index (starting at 2)
-      idx2token: reverse mapping.
-      We reserve index 0 for padding and 1 for unknown tokens.
-    """
-    counter = Counter()
-    for memory, _ in training_data:
-        for event in memory:
-            token = event_to_token(event)
-            counter[token] += 1
+    def _build_vocab(self, data, field):
+        values = set()
+        for memory, _ in data:
+            for event in memory:
+                event = self._parse_event(event)
+                values.add(event.get(field, ""))
+        return {v: i for i, v in enumerate(sorted(values))}
 
-    # Only keep tokens that occur at least min_freq times.
-    tokens = [tok for tok, freq in counter.items() if freq >= min_freq]
-    # Reserve 0 for PAD, 1 for UNK.
-    token2idx = {token: idx+2 for idx, token in enumerate(tokens)}
-    token2idx["<PAD>"] = 0
-    token2idx["<UNK>"] = 1
-    idx2token = {idx: token for token, idx in token2idx.items()}
-    return token2idx, idx2token
+    def _compute_normalization(self, data):
+        penalties, card_counts = [], []
+        for memory, _ in data:
+            for event in memory:
+                event = self._parse_event(event)
+                penalties.append(float(event.get("penalties", 0)))
+                card_counts.append(float(event.get("card_count", 0)))
+        self.penalties_mean = np.mean(penalties) if penalties else 0
+        self.penalties_std = np.std(penalties) + 1e-8
+        self.card_count_mean = np.mean(card_counts) if card_counts else 0
+        self.card_count_std = np.std(card_counts) + 1e-8
 
-# -------------------------------
-# Step 3. Build Label Mapping
-# -------------------------------
-def build_label_mapping(training_data):
-    labels = set()
-    for _, label in training_data:
-        labels.add(label)
-    label2idx = {label: idx for idx, label in enumerate(sorted(labels))}
-    idx2label = {idx: label for label, idx in label2idx.items()}
-    return label2idx, idx2label
+    def _parse_event(self, event):
+        if isinstance(event, dict):
+            return event
+        raise ValueError(f"Invalid event format: {event}")
+
+    def process_event(self, event):
+        event = self._parse_event(event)
+        return {
+            "response": self.response_vocab.get(event.get("response", ""), 0),
+            "action": self.action_vocab.get(event.get("triggering_action", ""), 0),
+            "penalties": (float(event.get("penalties", 0)) - self.penalties_mean) / self.penalties_std,
+            "card_count": (float(event.get("card_count", 0)) - self.card_count_mean) / self.card_count_std
+        }
 
 # -------------------------------
-# Step 4. Define Dataset
+# Enhanced Dataset Class
 # -------------------------------
 class OpponentMemoryDataset(Dataset):
-    def __init__(self, training_data, token2idx, label2idx, max_seq_length=None):
-        """
-        training_data: list of (memory, label) tuples.
-        token2idx: mapping from token string to int.
-        label2idx: mapping from label string to int.
-        max_seq_length: if provided, truncate or pad sequences to this length.
-        """
-        self.samples = []
-        self.token2idx = token2idx
+    def __init__(self, training_data, feature_processor, label2idx, max_seq_length=512):
+        self.feature_processor = feature_processor
         self.label2idx = label2idx
         self.max_seq_length = max_seq_length
-
+        
+        self.samples = []
         for memory, label in training_data:
-            # Convert full memory (list of event dicts or strings) into a list of token indices.
-            token_ids = []
-            for event in memory:
-                token = event_to_token(event)
-                token_ids.append(token2idx.get(token, token2idx["<UNK>"]))
-            self.samples.append((token_ids, label2idx[label]))
+            processed_events = [self.feature_processor.process_event(e) for e in memory[:max_seq_length]]
+            self.samples.append((processed_events, self.label2idx[label]))
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        token_ids, label = self.samples[idx]
-        return torch.tensor(token_ids, dtype=torch.long), torch.tensor(label, dtype=torch.long)
+        events, label = self.samples[idx]
+        return {
+            "response": torch.tensor([e["response"] for e in events], dtype=torch.long),
+            "action": torch.tensor([e["action"] for e in events], dtype=torch.long),
+            "numerical": torch.tensor([[e["penalties"], e["card_count"]] for e in events], dtype=torch.float),
+            "label": torch.tensor(label, dtype=torch.long)
+        }
 
 # -------------------------------
-# Step 5. Collate Function for Padding
+# Improved Model Architecture
 # -------------------------------
-def collate_fn(batch):
-    """
-    batch: list of tuples (sequence_tensor, label_tensor)
-    Pads the sequences in the batch to the maximum length.
-    Returns padded sequences, lengths, and labels.
-    """
-    sequences, labels = zip(*batch)
-    lengths = [len(seq) for seq in sequences]
-    max_len = max(lengths)
-    padded_seqs = []
-    for seq in sequences:
-        pad_length = max_len - len(seq)
-        if pad_length > 0:
-            padded_seq = torch.cat([seq, torch.zeros(pad_length, dtype=torch.long)])
-        else:
-            padded_seq = seq
-        padded_seqs.append(padded_seq)
-    padded_seqs = torch.stack(padded_seqs)
-    labels = torch.stack(labels)
-    return padded_seqs, torch.tensor(lengths, dtype=torch.long), labels
+class EnhancedStrategyTransformer(nn.Module):
+    def __init__(self, num_responses, num_actions):
+        super().__init__()
+        
+        # Embedding layers
+        self.response_embed = nn.Embedding(num_responses, 32)
+        self.action_embed = nn.Embedding(num_actions, 32)
+        
+        # Numerical feature processing
+        self.num_proj = nn.Sequential(
+            nn.Linear(2, 64),
+            nn.LayerNorm(64),
+            nn.ReLU()
+        )
+        
+        # Combined projection
+        self.input_proj = nn.Sequential(
+            nn.Linear(32+32+64, STRATEGY_TOKEN_EMBEDDING_DIM),
+            nn.LayerNorm(STRATEGY_TOKEN_EMBEDDING_DIM),
+            nn.ReLU(),
+            nn.Dropout(STRATEGY_DROPOUT)
+        )
+        
+        # Transformer
+        self.transformer = StrategyTransformer(
+            num_tokens=STRATEGY_NUM_TOKENS,
+            token_embedding_dim=STRATEGY_TOKEN_EMBEDDING_DIM,
+            nhead=STRATEGY_NHEAD,
+            num_layers=STRATEGY_NUM_LAYERS,
+            strategy_dim=STRATEGY_DIM,
+            num_classes=STRATEGY_NUM_CLASSES,
+            dropout=STRATEGY_DROPOUT,
+            use_cls_token=True
+        )
+
+    def forward(self, inputs):
+        # Embed categorical features
+        resp_emb = self.response_embed(inputs["response"])
+        act_emb = self.action_embed(inputs["action"])
+        
+        # Process numerical features
+        num_feats = self.num_proj(inputs["numerical"])
+        
+        # Combine features
+        combined = torch.cat([resp_emb, act_emb, num_feats], dim=-1)
+        projected = self.input_proj(combined)
+        
+        # Transformer
+        strategy, logits = self.transformer(projected)
+        return logits
 
 # -------------------------------
-# Step 6. Training Function
+# Enhanced Training Loop
 # -------------------------------
-def train_transformer(model, dataloader, optimizer, criterion, device, num_epochs=10):
+def train_epoch(model, dataloader, optimizer, scheduler, criterion, device, grad_clip=1.0):
     model.train()
-    for epoch in range(1, num_epochs + 1):
-        total_loss = 0.0
-        total_correct = 0
-        total_samples = 0
-        for batch in dataloader:
-            sequences, lengths, labels = batch
-            sequences = sequences.to(device)
-            labels = labels.to(device)
-
-            optimizer.zero_grad()
-            # The transformer expects input shape (batch_size, seq_length)
-            # It returns (strategy_embedding, classification_logits)
-            _, logits = model(sequences)
-            loss = criterion(logits, labels)
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item() * sequences.size(0)
-            preds = logits.argmax(dim=1)
-            total_correct += (preds == labels).sum().item()
-            total_samples += sequences.size(0)
-        avg_loss = total_loss / total_samples
-        accuracy = total_correct / total_samples
-        print(f"Epoch {epoch}: Loss = {avg_loss:.4f}, Accuracy = {accuracy:.4f}")
+    total_loss = 0
+    correct = 0
+    total = 0
+    
+    for batch in dataloader:
+        inputs = {k: v.to(device) for k, v in batch.items() if k != "label"}
+        labels = batch["label"].to(device)
+        
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        
+        nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
+        scheduler.step()
+        
+        total_loss += loss.item() * labels.size(0)
+        _, predicted = torch.max(outputs, 1)
+        correct += (predicted == labels).sum().item()
+        total += labels.size(0)
+    
+    return total_loss / total, correct / total
 
 # -------------------------------
-# Step 7. Main Script
+# Main Execution Flow
 # -------------------------------
 def main(args):
-    # Load training data from pickle file.
-    training_data = load_training_data(args.training_data_path)
-    print(f"Loaded {len(training_data)} training samples.")
-
-    # Build vocabulary and label mappings.
-    token2idx, idx2token = build_vocab(training_data, min_freq=1)
-    label2idx, idx2label = build_label_mapping(training_data)
-    print(f"Vocabulary size: {len(token2idx)}")
-    print(f"Number of classes: {len(label2idx)}")
-
-    # Create dataset and dataloader.
-    dataset = OpponentMemoryDataset(training_data, token2idx, label2idx, max_seq_length=args.max_seq_length)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Load and process data
+    with open(args.training_data_path, "rb") as f:
+        raw_data = pickle.load(f)
     
-    # Define transformer hyperparameters.
-    num_tokens = len(token2idx)
-    token_embedding_dim = args.token_embedding_dim  # e.g., 64
-    nhead = args.nhead                             # e.g., 4
-    num_layers = args.num_layers                   # e.g., 2
-    strategy_dim = args.strategy_dim               # e.g., 5 or 10
-    num_classes = len(label2idx)
-    dropout = args.dropout
-    use_cls_token = True
-
-    model = StrategyTransformer(
-        num_tokens=num_tokens,
-        token_embedding_dim=token_embedding_dim,
-        nhead=nhead,
-        num_layers=num_layers,
-        strategy_dim=strategy_dim,
-        num_classes=num_classes,
-        dropout=dropout,
-        use_cls_token=use_cls_token
+    # Balance classes
+    label_counts = Counter(l for _, l in raw_data)
+    min_count = min(label_counts.values())
+    balanced_data = []
+    for label in label_counts:
+        balanced_data.extend([d for d in raw_data if d[1] == label][:min_count])
+    random.shuffle(balanced_data)
+    
+    # Create processors
+    feature_processor = FeatureProcessor(balanced_data)
+    label2idx = {l: i for i, l in enumerate(sorted(set(l for _, l in balanced_data)))}
+    
+    # Create datasets
+    dataset = OpponentMemoryDataset(balanced_data, feature_processor, label2idx)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=lambda x: x)
+    
+    # Initialize model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = EnhancedStrategyTransformer(
+        num_responses=len(feature_processor.response_vocab),
+        num_actions=len(feature_processor.action_vocab)
     ).to(device)
-
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    criterion = nn.CrossEntropyLoss()
-
-    # Train the transformer.
-    train_transformer(model, dataloader, optimizer, criterion, device, num_epochs=args.epochs)
-
-    # Save the trained model.
-    save_path = os.path.join(args.save_dir, "transformer_classifier.pth")
+    
+    # Optimizer and scheduler
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=100,
+        num_training_steps=args.epochs * len(dataloader)
+    )
+    
+    # Label-smoothed loss
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    
+    # Training loop
+    for epoch in range(1, args.epochs + 1):
+        loss, acc = train_epoch(model, dataloader, optimizer, scheduler, criterion, device)
+        print(f"Epoch {epoch:02d} | Loss: {loss:.4f} | Acc: {acc:.4f}")
+    
+    # Save model
     os.makedirs(args.save_dir, exist_ok=True)
-    torch.save(model.state_dict(), save_path)
-    print(f"Trained transformer model saved to {save_path}")
+    torch.save(model.state_dict(), os.path.join(args.save_dir, "strategy_transformer.pt"))
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train Strategy Transformer Classifier")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--training_data_path", type=str, default="opponent_training_data.pkl",
                         help="Path to the pickle file with training data.")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training.")
-    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs.")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
-    parser.add_argument("--max_seq_length", type=int, default=None, help="Maximum sequence length (None for variable).")
-    parser.add_argument("--token_embedding_dim", type=int, default=64, help="Dimension of token embeddings.")
-    parser.add_argument("--nhead", type=int, default=4, help="Number of attention heads in the transformer.")
-    parser.add_argument("--num_layers", type=int, default=2, help="Number of transformer encoder layers.")
-    parser.add_argument("--strategy_dim", type=int, default=5, help="Dimension of the final strategy embedding.")
-    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate.")
-    parser.add_argument("--save_dir", type=str, default="checkpoints", help="Directory to save the trained model.")
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--save_dir", type=str, default="models")
     args = parser.parse_args()
-
+    
     main(args)
