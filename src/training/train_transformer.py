@@ -7,6 +7,7 @@ import random
 import argparse
 from collections import Counter
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -14,8 +15,12 @@ from torch.utils.data import Dataset, DataLoader
 
 # Import the transformer model from new_models.py
 from src.model.new_models import StrategyTransformer
-
 from src import config
+
+# For visualization
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
 
 # -------------------------------
 # Transformer Configuration (Fixed)
@@ -67,12 +72,8 @@ def parse_event(event):
 def encode_event(event, opponent2idx, response2idx, action2idx):
     """
     Encode an event as a 4-dimensional vector.
-    Since all data comes from the same opponent, we remove the opponent field.
-    The dimensions are:
-      1. response: mapped via response2idx
-      2. triggering_action: mapped via action2idx
-      3. penalties: numerical value
-      4. card_count: numerical value
+    The first two dimensions are the categorical indices for response and triggering_action.
+    The last two dimensions are the continuous features: penalties and card_count.
     """
     event = parse_event(event)
     # Ignore the opponent field; use only response, triggering_action, penalties, and card_count.
@@ -138,11 +139,11 @@ class OpponentMemoryDataset(Dataset):
     def __init__(self, training_data, opponent2idx, response2idx, action2idx, label2idx, max_seq_length=None):
         """
         Each sample is a tuple (sequence, label) where:
-          - sequence is a list of 4-dimensional float vectors (one per event)
+          - sequence is a list of 4-dimensional vectors (one per event):
+              [response_index, triggering_action_index, penalties, card_count]
           - label is the integer label
         """
         self.samples = []
-        # We no longer use opponent2idx in encoding since opponent is fixed.
         self.response2idx = response2idx
         self.action2idx = action2idx
         self.label2idx = label2idx
@@ -189,11 +190,57 @@ def collate_fn(batch):
     return padded_seqs, torch.tensor(lengths, dtype=torch.long), labels
 
 # -------------------------------
-# Step 6. Training Function (with Prediction Distribution Debug)
+# Step 6. Define Event Encoder with Embeddings for Categorical Features
 # -------------------------------
-def train_transformer(model, input_projection, dataloader, optimizer, criterion, device, num_epochs=10):
+class EventEncoder(nn.Module):
+    def __init__(self, response_vocab_size, action_vocab_size, token_embedding_dim, response_embed_dim=16, action_embed_dim=16):
+        """
+        Encodes a 4-dimensional event vector into a token embedding.
+        The first two dimensions are categorical indices for response and triggering_action.
+        The last two dimensions are continuous features: penalties and card_count.
+        """
+        super(EventEncoder, self).__init__()
+        self.response_embedding = nn.Embedding(response_vocab_size, response_embed_dim)
+        self.action_embedding = nn.Embedding(action_vocab_size, action_embed_dim)
+        # Total input dimension = response_embed_dim + action_embed_dim + 2.
+        self.input_dim = response_embed_dim + action_embed_dim + 2
+        self.projection = nn.Linear(self.input_dim, token_embedding_dim)
+    
+    def forward(self, x):
+        # x shape: (batch, seq_len, 4)
+        response_idx = x[:, :, 0].long()  # (batch, seq_len)
+        action_idx = x[:, :, 1].long()      # (batch, seq_len)
+        continuous = x[:, :, 2:]            # (batch, seq_len, 2)
+        response_embedded = self.response_embedding(response_idx)  # (batch, seq_len, response_embed_dim)
+        action_embedded = self.action_embedding(action_idx)          # (batch, seq_len, action_embed_dim)
+        concatenated = torch.cat([response_embedded, action_embedded, continuous], dim=-1)  # (batch, seq_len, input_dim)
+        projected = self.projection(concatenated)  # (batch, seq_len, token_embedding_dim)
+        return projected
+
+# -------------------------------
+# A helper function to convert raw memory events to 4D features
+# (Copied from your see_transformer.py script)
+# -------------------------------
+def convert_memory_to_features(memory, response_mapping, action_mapping):
+    features = []
+    for event in memory:
+        if not isinstance(event, dict):
+            raise ValueError(f"Memory event is not a dictionary: {event}. Please fix the data generation.")
+        resp = event.get("response", "")
+        act = event.get("triggering_action", "")
+        penalties = float(event.get("penalties", 0))
+        card_count = float(event.get("card_count", 0))
+        resp_val = float(response_mapping.get(resp, 0))
+        act_val = float(action_mapping.get(act, 0))
+        features.append([resp_val, act_val, penalties, card_count])
+    return features
+
+# -------------------------------
+# Step 7. Training Function (with Prediction Distribution Debug)
+# -------------------------------
+def train_transformer(model, event_encoder, dataloader, optimizer, criterion, device, num_epochs=10):
     model.train()
-    input_projection.train()
+    event_encoder.train()
     for epoch in range(1, num_epochs + 1):
         total_loss = 0.0
         total_correct = 0
@@ -202,13 +249,13 @@ def train_transformer(model, input_projection, dataloader, optimizer, criterion,
         
         for batch in dataloader:
             sequences, lengths, labels = batch
-            sequences = sequences.to(device)  # shape: (batch, seq_len, feature_dim)
+            sequences = sequences.to(device)  # shape: (batch, seq_len, 4)
             labels = labels.to(device)
 
             optimizer.zero_grad()
-            # Project each event vector (of dim 4) to token_embedding_dim.
-            projected = input_projection(sequences)  # shape: (batch, seq_len, token_embedding_dim)
-            # Pass projected sequences to the transformer.
+            # Use the event encoder to project raw event vectors to token embeddings.
+            projected = event_encoder(sequences)  # shape: (batch, seq_len, token_embedding_dim)
+            # Pass the projected sequences to the transformer.
             _, logits = model(projected)
             loss = criterion(logits, labels)
             loss.backward()
@@ -232,12 +279,63 @@ def train_transformer(model, input_projection, dataloader, optimizer, criterion,
         print("-----------------------------------")
 
 # -------------------------------
-# Step 7. Main Script
+# Step 8. Evaluation Function
+# -------------------------------
+def evaluate_transformer(model, event_encoder, dataloader, criterion, device):
+    model.eval()
+    event_encoder.eval()
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+    all_preds = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for batch in dataloader:
+            sequences, lengths, labels = batch
+            sequences = sequences.to(device)
+            labels = labels.to(device)
+            
+            projected = event_encoder(sequences)
+            _, logits = model(projected)
+            loss = criterion(logits, labels)
+            total_loss += loss.item() * sequences.size(0)
+            
+            preds = logits.argmax(dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            
+            total_correct += (preds == labels).sum().item()
+            total_samples += sequences.size(0)
+    
+    avg_loss = total_loss / total_samples
+    accuracy = total_correct / total_samples
+
+    pred_counts = Counter(all_preds)
+    # Compute per-class accuracy
+    per_class_correct = Counter()
+    per_class_total = Counter()
+    for gt, pred in zip(all_labels, all_preds):
+        per_class_total[gt] += 1
+        if gt == pred:
+            per_class_correct[gt] += 1
+
+    return avg_loss, accuracy, pred_counts, per_class_correct, per_class_total, all_labels, all_preds
+
+# -------------------------------
+# Step 9. Main Script
 # -------------------------------
 def main(args):
     # Load and balance training data.
     training_data = load_training_data(args.training_data_path)
     print(f"Loaded {len(training_data)} training samples.")
+
+    # --- Split the data: 90% for training, 10% for evaluation ---
+    random.shuffle(training_data)
+    split_idx = int(0.1 * len(training_data))
+    eval_data = training_data[:split_idx]
+    train_data = training_data[split_idx:]
+    print(f"Training samples: {len(train_data)} | Evaluation samples: {len(eval_data)}")
 
     # Build vocabularies for categorical fields: response and triggering_action.
     response2idx = build_field_vocab(training_data, "response")
@@ -254,9 +352,12 @@ def main(args):
     # For opponent vocabulary, we simply fix it to a single value.
     opponent2idx = {"default": 0}
 
-    # Create dataset and dataloader.
-    dataset = OpponentMemoryDataset(training_data, opponent2idx, response2idx, action2idx, label2idx, max_seq_length=args.max_seq_length)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
+    # Create dataset and dataloaders.
+    train_dataset = OpponentMemoryDataset(train_data, opponent2idx, response2idx, action2idx, label2idx, max_seq_length=args.max_seq_length)
+    eval_dataset = OpponentMemoryDataset(eval_data, opponent2idx, response2idx, action2idx, label2idx, max_seq_length=args.max_seq_length)
+    
+    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
+    eval_dataloader = DataLoader(eval_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -283,20 +384,101 @@ def main(args):
     # Override the token embedding so that continuous embeddings pass through.
     model.token_embedding = nn.Identity()
 
-    # Create an input projection layer that maps raw feature vectors (dim 4) to token_embedding_dim.
-    feature_dim = 4
-    input_projection = nn.Linear(feature_dim, token_embedding_dim).to(device)
+    # Create an event encoder that maps raw event vectors (dim 4) to token embeddings.
+    event_encoder = EventEncoder(
+        response_vocab_size=len(response2idx),
+        action_vocab_size=len(action2idx),
+        token_embedding_dim=token_embedding_dim
+    ).to(device)
 
-    optimizer = optim.Adam(list(model.parameters()) + list(input_projection.parameters()), lr=args.lr)
+    optimizer = optim.Adam(list(model.parameters()) + list(event_encoder.parameters()), lr=args.lr)
     criterion = nn.CrossEntropyLoss()
 
     # Train the transformer.
-    train_transformer(model, input_projection, dataloader, optimizer, criterion, device, num_epochs=args.epochs)
+    train_transformer(model, event_encoder, train_dataloader, optimizer, criterion, device, num_epochs=args.epochs)
+
+    # Evaluate the model on the evaluation set.
+    eval_loss, eval_accuracy, pred_counts, per_class_correct, per_class_total, all_labels, all_preds = evaluate_transformer(model, event_encoder, eval_dataloader, criterion, device)
+    print("----- Evaluation Results -----")
+    print(f"Eval Loss: {eval_loss:.4f}, Eval Accuracy: {eval_accuracy:.4f}")
+    print("Distribution of Predicted Classes:")
+    for label, count in sorted(pred_counts.items()):
+        print(f"  Class {label}: {count} predictions")
+    print("Per-Class Accuracy:")
+    for label, total in sorted(per_class_total.items()):
+        correct = per_class_correct[label]
+        acc = (correct / total) * 100 if total > 0 else 0.0
+        print(f"  {idx2label[label]}: {acc:.2f}% ({correct}/{total})")
+    print("-----------------------------------")
+    
+    # -------------------------------
+    # Visualize Transformer Strategy Embeddings (Evaluation Set)
+    # -------------------------------
+    # Build a color mapping based on label names.
+    bot_types_sorted = sorted(label2idx, key=lambda x: label2idx[x])
+    colors = plt.colormaps["tab10"](np.linspace(0, 1, len(bot_types_sorted)))
+    bot_color_map = {label: colors[i] for i, label in enumerate(bot_types_sorted)}
+
+    opponent_embeddings = []
+    labels_for_plot = []
+    label_colors = []
+
+    for i, (memory, label) in enumerate(eval_data):
+        try:
+            features_cont = convert_memory_to_features(memory, response2idx, action2idx)
+        except Exception as e:
+            print(f"Error converting sample {i}: {e}")
+            continue
+        if len(features_cont) > 0:
+            feature_tensor = torch.tensor(features_cont, dtype=torch.float, device=device).unsqueeze(0)
+            projected = event_encoder(feature_tensor)
+            with torch.no_grad():
+                embedding, _ = model(projected)
+            opponent_embeddings.append(embedding.cpu().numpy().flatten())
+            # Use the ground truth label name for plotting.
+            # If the label is already a string, use it directly; otherwise, map it.
+            gt_label_name = label if isinstance(label, str) else idx2label[label]
+            labels_for_plot.append(gt_label_name)
+            label_colors.append(bot_color_map[gt_label_name])
+    
+    if len(opponent_embeddings) > 1:
+        embeddings_array = np.array(opponent_embeddings)
+        pca_components = min(10, embeddings_array.shape[1])
+        pca = PCA(n_components=pca_components)
+        pca_embeddings = pca.fit_transform(embeddings_array)
+
+        perplexity = min(5, len(pca_embeddings) - 1)
+        reducer = TSNE(n_components=2, perplexity=perplexity, random_state=42)
+        embedded_2d = reducer.fit_transform(pca_embeddings)
+
+        plt.figure(figsize=(10, 6))
+        for i, label in enumerate(labels_for_plot):
+            plt.scatter(embedded_2d[i, 0], embedded_2d[i, 1], color=label_colors[i],
+                        label=label if i < 10 else None)
+        plt.xlabel("Dimension 1")
+        plt.ylabel("Dimension 2")
+        plt.title("Transformer Strategy Embeddings (Evaluation Set)")
+        plt.legend(loc="best", fontsize=8)
+        plt.grid()
+        plt.show()
+    else:
+        print("Not enough samples to visualize embeddings.")
 
     # Save the trained model.
     save_path = os.path.join(args.save_dir, "transformer_classifier.pth")
     os.makedirs(args.save_dir, exist_ok=True)
-    torch.save(model.state_dict(), save_path)
+    label_mapping = {
+        "label2idx": label2idx,
+        "idx2label": idx2label
+    }
+    checkpoint = {
+        "transformer_state_dict": model.state_dict(),
+        "event_encoder_state_dict": event_encoder.state_dict(),
+        "label_mapping": label_mapping,
+        "response2idx": response2idx,   # Ensure these mappings are saved!
+        "action2idx": action2idx
+    }
+    torch.save(checkpoint, save_path)
     print(f"Trained transformer model saved to {save_path}")
 
 if __name__ == "__main__":
