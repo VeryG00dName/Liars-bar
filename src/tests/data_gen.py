@@ -19,7 +19,8 @@ from src.model.hard_coded_agents import (
     TableFirstConservativeChallenger,
     StrategicChallenger,
     RandomAgent,
-    TableNonTableAgent
+    TableNonTableAgent,
+    Classic
 )
 
 from src.evaluation.evaluate import run_obp_inference
@@ -39,27 +40,33 @@ class AgentBattlegroundGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Agent Battleground")
-        self.root.geometry("800x600")
+        self.root.geometry("900x700")
         
         self.loaded_models = {}
         self.hardcoded_agents = {
+            "GreedySpammer": GreedyCardSpammer,
             "TableFirst": TableFirstConservativeChallenger,
+            "Strategic": lambda name: StrategicChallenger(name, 3, 2),  # Pass agent_index=2
             "Conservative": lambda name: TableFirstConservativeChallenger(name),
             "TableNonTableAgent": TableNonTableAgent,
+            "Classic": Classic,
             "Random": RandomAgent
         }
         
         # This list will accumulate training examples.
         # Each element is a tuple: (memory_segment, label)
         self.training_data = []
+        # Will hold the transformer instance once loaded.
+        self.strategy_transformer = None
+        # Will store the current environment for memory queries.
+        self.current_env = None
 
         self.create_file_drop_zone()
         self.create_model_info_panel()
         self.create_ai_selection()
+        self.create_match_options()
         self.create_control_buttons()
         self.create_results_display()
-
-        self.current_env = None
 
     def get_hidden_dim_from_state_dict(self, state_dict, layer_prefix='fc1'):
         """Extracts hidden dimension from model weights using imported utility."""
@@ -83,20 +90,30 @@ class AgentBattlegroundGUI:
         self.info_text.pack(fill=tk.BOTH, expand=True)
 
     def create_ai_selection(self):
-        frame = ttk.LabelFrame(self.root, text="AI Agents Selection", padding=10)
+        frame = ttk.LabelFrame(self.root, text="PPO Agents Selection", padding=10)
         frame.pack(fill=tk.X, padx=10, pady=5)
         self.agent_selectors = {}
-        for i in range(2):
-            ttk.Label(frame, text=f"AI Agent {i+1}:").grid(row=i, column=0, sticky=tk.W, pady=2)
+        # Now support 3 PPO agent selectors.
+        for i in range(3):
+            ttk.Label(frame, text=f"PPO Agent {i+1}:").grid(row=i, column=0, sticky=tk.W, pady=2)
             self.agent_selectors[i] = ttk.Combobox(frame, state="readonly", width=50)
             self.agent_selectors[i].grid(row=i, column=1, sticky=tk.EW, padx=5, pady=2)
         frame.columnconfigure(1, weight=1)
+
+    def create_match_options(self):
+        # Add checkbuttons to choose which match types to run.
+        frame = ttk.LabelFrame(self.root, text="Match Options", padding=10)
+        frame.pack(fill=tk.X, padx=10, pady=5)
+        self.include_hardcoded = tk.BooleanVar(value=True)
+        self.include_ppo = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frame, text="Include Matches vs. Hardcoded Opponents", variable=self.include_hardcoded).pack(anchor=tk.W, pady=2)
+        ttk.Checkbutton(frame, text="Include Matches among PPO Agents", variable=self.include_ppo).pack(anchor=tk.W, pady=2)
 
     def create_control_buttons(self):
         frame = ttk.Frame(self.root)
         frame.pack(pady=10)
         ttk.Button(frame, text="Refresh Agents", command=self.update_agent_selectors).pack(side=tk.LEFT, padx=5)
-        ttk.Button(frame, text="Start Battleground", command=self.start_battleground).pack(side=tk.LEFT, padx=5)
+        ttk.Button(frame, text="Start Battleground", command=self.start_battleground_async).pack(side=tk.LEFT, padx=5)
         ttk.Button(frame, text="Save Training Data", command=self.save_training_data).pack(side=tk.LEFT, padx=5)
 
     def create_results_display(self):
@@ -141,7 +158,7 @@ class AgentBattlegroundGUI:
         
         if input_dim == 18:
             obs_version = 1  # OBS_VERSION_1
-        elif input_dim in (16, 24):
+        elif input_dim in (16, 24, 26):
             obs_version = 2  # OBS_VERSION_2
         else:
             raise ValueError(f"Unknown input_dim {input_dim} for model {file_path}")
@@ -170,24 +187,24 @@ class AgentBattlegroundGUI:
             for agent_name in data["policy_nets"].keys():
                 display_text = f"{folder_name} - {os.path.basename(file_path)} - {agent_name}"
                 agent_options.append(display_text)
-        for i in range(2):
+        for i in range(3):
             self.agent_selectors[i]["values"] = agent_options
             if agent_options:
+                # Select first option if nothing is selected
                 self.agent_selectors[i].current(0)
             self.agent_selectors[i].state(["!disabled"])
 
-    def load_selected_agents(self):
-        """Loads the selected AI agents from the selectors.
+    def load_selected_agents(self, num_agents):
+        """Loads the selected PPO agents.
         
-        The label now includes the file name to differentiate PPO models,
-        since they are all named like 'player_0', 'player_1', etc.
+        num_agents should be 2 (for matches vs. hardcoded opponents) or 3 (for PPO vs. PPO matches).
         """
         ai_agents = {}
         try:
-            for i in range(2):
+            for i in range(num_agents):
                 selection = self.agent_selectors[i].get()
                 if not selection:
-                    raise ValueError(f"Select AI Agent {i+1}")
+                    raise ValueError(f"Select PPO Agent {i+1}")
                 parts = selection.split(" - ")
                 if len(parts) != 3:
                     raise ValueError("Invalid agent format")
@@ -203,54 +220,98 @@ class AgentBattlegroundGUI:
                     "obs_version": model_data["obs_version"],
                     "input_dim": model_data["input_dim"],
                     "uses_memory": model_data["uses_memory"],
-                    "label": f"{file_name}_{agent_name}"  # Label now includes the file name for differentiation.
+                    "label": f"{file_name}_{agent_name}"  # Label includes the file name for differentiation.
                 }
             return ai_agents
         except Exception as e:
             self.show_info(f"Error loading selected agents: {str(e)}")
             return None
 
+    def start_battleground_async(self):
+        # Run the battleground in a separate thread so the GUI remains responsive.
+        import threading
+        thread = threading.Thread(target=self.start_battleground)
+        thread.start()
+
     def start_battleground(self):
         try:
-            ai_agents = self.load_selected_agents()
-            if not ai_agents:
-                return
-
-            results = {}
-            target_segments = 20  # We want to generate at least 5 training segments per hardcoded bot.
-            # For each hardcoded bot, run matches until we accumulate the required training segments.
-            for hc_name, hc_class in self.hardcoded_agents.items():
-                wins = [0, 0, 0]  # [AI1 Wins, AI2 Wins, Hardcoded Wins]
-                current_segments = sum(1 for seg, label in self.training_data if label == hc_name)
-                match_count = 0
-                while current_segments < target_segments:
-                    match_count += 1
-                    winner = self.run_match(ai_agents, hc_class(hc_name), hardcoded_label=hc_name)
-                    if winner == "player_0":
-                        wins[0] += 1
-                    elif winner == "player_1":
-                        wins[1] += 1
-                    elif winner == "hardcoded_agent":
-                        wins[2] += 1
+            overall_results = {}
+            target_segments = 20  # We want to generate at least 20 training segments per opponent label.
+            
+            # -------------------------------
+            # Matches vs. Hardcoded Opponents
+            # -------------------------------
+            if self.include_hardcoded.get():
+                hardcoded_results = {}
+                # Use 2 PPO agents for these matches.
+                ai_agents = self.load_selected_agents(num_agents=2)
+                if not ai_agents:
+                    return
+                for hc_name, hc_class in self.hardcoded_agents.items():
+                    wins = [0, 0, 0]  # [PPO1 Wins, PPO2 Wins, Hardcoded Wins]
                     current_segments = sum(1 for seg, label in self.training_data if label == hc_name)
-                    logger.info(f"After {match_count} matches for {hc_name}, training segments: {current_segments}")
-                results[hc_name] = wins
+                    match_count = 0
+                    while current_segments < target_segments:
+                        match_count += 1
+                        winner = self.run_match(ai_agents, hardcoded_agent=hc_class(hc_name), hardcoded_label=hc_name)
+                        if winner == "player_0":
+                            wins[0] += 1
+                        elif winner == "player_1":
+                            wins[1] += 1
+                        elif winner == "hardcoded_agent":
+                            wins[2] += 1
+                        current_segments = sum(1 for seg, label in self.training_data if label == hc_name)
+                        logger.info(f"[Hardcoded:{hc_name}] After {match_count} matches, training segments: {current_segments}")
+                    hardcoded_results[hc_name] = wins
+                overall_results["hardcoded"] = hardcoded_results
 
-            self.display_results(results)
-            self.show_info(f"Battleground complete. Generated {len(self.training_data)} training examples.")
+            # -------------------------------
+            # Matches among PPO Agents
+            # -------------------------------
+            if self.include_ppo.get():
+                ppo_results = {}  # keys: PPO agent label, value: win count
+                # Use 3 PPO agents for these matches.
+                ai_agents = self.load_selected_agents(num_agents=3)
+                if not ai_agents:
+                    return
+                # Initialize win counts for each PPO agent.
+                for agent in ai_agents.values():
+                    ppo_results[agent['label']] = 0
+                match_count = 0
+                # Continue until each PPO agent has at least target_segments training examples.
+                while any(
+                    sum(1 for seg, label in self.training_data if label == agent_label) < target_segments
+                    for agent_label in ppo_results.keys()
+                ):
+                    match_count += 1
+                    # In PPO vs. PPO matches, no hardcoded opponent is used.
+                    winner = self.run_match(ai_agents, hardcoded_agent=None, hardcoded_label=None)
+                    if winner in ai_agents:
+                        ppo_results[ai_agents[winner]['label']] += 1
+                    logger.info(f"[PPO] After {match_count} matches, training segments: " +
+                                ", ".join(f"{lbl}: {sum(1 for seg, label in self.training_data if label == lbl)}" for lbl in ppo_results))
+                overall_results["ppo"] = {"wins": ppo_results, "matches": match_count}
+            
+            self.display_results(overall_results)
+            total_examples = len(self.training_data)
+            self.show_info(f"Battleground complete. Generated {total_examples} training examples.")
         except Exception as e:
             self.show_info(f"Error: {str(e)}")
 
-    def run_match(self, ai_agents, hardcoded_agent, hardcoded_label):
+    def run_match(self, ai_agents, hardcoded_agent=None, hardcoded_label=None):
         """
-        Runs a single match with two AI agents and one hardcoded agent.
-        After the match, it extracts training examples from the opponent memories.
-        Instead of a single training example per agent, we split the full memory into up to 5 segments.
+        Runs a single match with either:
+          - Two PPO agents (from ai_agents) and one hardcoded agent (if provided), or
+          - Three PPO agents if hardcoded_agent is None.
+        After the match, training examples are extracted from each agent's opponent memory.
+        The full memory is split into up to 5 segments.
         """
         env = LiarsDeckEnv(num_players=3, render_mode=None)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Set the current environment so that memory queries work in choose_action.
+        self.current_env = env
         
-        # Initialize AI agents.
+        # Initialize policy networks and OBP models for PPO agents.
         policy_nets = {}
         obp_models = {}
         obs_versions = {}
@@ -272,7 +333,6 @@ class AgentBattlegroundGUI:
             policy_net.to(device).eval()
             policy_nets[agent_id] = policy_net
 
-            # Initialize OBP model if present.
             obp_model_state = agent_data["obp_model"]
             if obp_model_state:
                 obp_input_dim = 5 if agent_data["obs_version"] == 1 else 4
@@ -285,7 +345,7 @@ class AgentBattlegroundGUI:
                 obp_model.to(device).eval()
                 obp_models[agent_id] = obp_model
             else:
-                obp_models[agent_id] = None  # Handle cases where OBP is not present
+                obp_models[agent_id] = None
 
         env.reset()
         while env.agent_selection is not None:
@@ -297,7 +357,6 @@ class AgentBattlegroundGUI:
                 continue
 
             if current_agent in policy_nets:
-                # AI Agent's turn.
                 action = self.choose_action(
                     current_agent,
                     policy_nets[current_agent],
@@ -311,7 +370,9 @@ class AgentBattlegroundGUI:
                     uses_memories[current_agent]
                 )
             else:
-                # Hardcoded Agent's turn.
+                # For matches with a hardcoded agent.
+                if hardcoded_agent is None:
+                    raise ValueError("No hardcoded agent provided for non-PPO-controlled player.")
                 action = hardcoded_agent.play_turn(
                     obs[current_agent],
                     info['action_mask'],
@@ -329,74 +390,135 @@ class AgentBattlegroundGUI:
         winner = winners[0]  # Assuming a single winner.
 
         # Generate training data from opponent memories.
-        # For each agent in the match, extract its full memory (all stored events) from its OpponentMemory.
         for agent in env.agents:
-            # Decide on the label.
             if agent in ai_agents:
                 label = ai_agents[agent]['label']
             else:
                 label = hardcoded_label
-            # Get the opponent memory for this agent.
             memory_obj = get_opponent_memory(agent)
-            # Extract the full memory as a list of events (each event is a dict or string).
             full_memory = list(memory_obj.memory)
-            # Split the full memory into up to 5 segments if possible.
-            if len(full_memory) >= 5:
-                seg_length = len(full_memory) // 5
-                for i in range(5):
-                    # For the last segment, include any remainder.
-                    segment = full_memory[i * seg_length : (i + 1) * seg_length] if i < 4 else full_memory[i * seg_length :]
-                    if segment:
-                        self.training_data.append((segment, label))
-            else:
-                if full_memory:
-                    self.training_data.append((full_memory, label))
-            # Clear the memory so that subsequent matches start fresh.
+            # Always split the memory into 5 segments (using np.array_split)
+            if full_memory:
+                segments = np.array_split(full_memory, 5)
+                for seg in segments:
+                    seg_list = seg.tolist() if hasattr(seg, 'tolist') else list(seg)
+                    if seg_list:
+                        self.training_data.append((seg_list, label))
             memory_obj.memory.clear()
             memory_obj.aggregates.clear()
 
-        # Determine identifier to return.
         hardcoded_agent_id = f"player_{env.num_players - 1}"  # e.g. 'player_2'
         if winner in ai_agents:
-            return winner  # 'player_0' or 'player_1'
+            return winner
         elif winner == hardcoded_agent_id:
             return "hardcoded_agent"
         else:
             return "unknown_agent"
 
     def choose_action(self, agent_id, policy_net, obp_model, observation, action_mask, device, num_players, obs_version, input_dim, uses_memory):
-        """Full action selection with OBP integration using imported utilities."""
+        """Selects an action using OBP integration and, if applicable, transformer‐based memory integration."""
         converted_obs = adapt_observation_for_version(observation, num_players, obs_version)
         logging.debug(f"Converted observation (length {len(converted_obs)}): {converted_obs}")
 
-        # Handle OBP inference if model is available
-        if obp_model is not None:
-            obp_probs = run_obp_inference(obp_model, converted_obs, device, num_players, obs_version)
-            logging.debug(f"OBP probabilities: {obp_probs}")
-            obp_array = np.array(obp_probs, dtype=np.float32)
-        else:
-            obp_array = np.array([], dtype=np.float32)
-            logging.debug("No OBP model, skipping OBP inference")
+        # Run OBP inference.
+        obp_probs = run_obp_inference(obp_model, converted_obs, device, num_players, obs_version)
+        logging.debug(f"OBP probabilities: {obp_probs}")
 
-        # Handle memory features if needed
-        if uses_memory:
-            combined_obs_length = len(converted_obs) + len(obp_array)
-            required_mem_dim = input_dim - combined_obs_length
-            if required_mem_dim > 0:
-                mem_features = np.zeros(required_mem_dim, dtype=np.float32)
+        if obs_version == 2 and uses_memory:
+            required_mem_dim = input_dim - (len(converted_obs) + len(obp_probs))
+            if required_mem_dim == config.STRATEGY_DIM * (num_players - 1):
+                from src.env.liars_deck_env_utils import query_opponent_memory_full
+
+                class Vocabulary:
+                    def __init__(self, max_size):
+                        self.token2idx = {"<PAD>": 0, "<UNK>": 1}
+                        self.idx2token = {0: "<PAD>", 1: "<UNK>"}
+                        self.max_size = max_size
+                    def encode(self, token):
+                        if token in self.token2idx:
+                            return self.token2idx[token]
+                        else:
+                            if len(self.token2idx) < self.max_size:
+                                idx = len(self.token2idx)
+                                self.token2idx[token] = idx
+                                self.idx2token[idx] = token
+                                return idx
+                            else:
+                                return self.token2idx["<UNK>"]
+
+                def convert_memory_to_tokens(memory, vocab):
+                    tokens = []
+                    for event in memory:
+                        if isinstance(event, dict):
+                            sorted_items = sorted(event.items())
+                            token_str = "_".join(f"{k}-{v}" for k, v in sorted_items)
+                        else:
+                            token_str = str(event)
+                        tokens.append(vocab.encode(token_str))
+                    return tokens
+
+                vocab_inst = Vocabulary(max_size=config.STRATEGY_NUM_TOKENS)
+                mem_features_list = []
+                for opp in self.current_env.possible_agents:
+                    if opp != agent_id:
+                        mem_summary = query_opponent_memory_full(agent_id, opp)
+                        token_seq = convert_memory_to_tokens(mem_summary, vocab_inst)
+                        token_tensor = torch.tensor(token_seq, dtype=torch.long, device=device).unsqueeze(0)
+                        # Use the stored transformer (load once)
+                        if self.strategy_transformer is None:
+                            from src.model.new_models import StrategyTransformer
+                            self.strategy_transformer = StrategyTransformer(
+                                num_tokens=config.STRATEGY_NUM_TOKENS,
+                                token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM,
+                                nhead=config.STRATEGY_NHEAD,
+                                num_layers=config.STRATEGY_NUM_LAYERS,
+                                strategy_dim=config.STRATEGY_DIM,
+                                num_classes=config.STRATEGY_NUM_CLASSES,
+                                dropout=config.STRATEGY_DROPOUT,
+                                use_cls_token=True
+                            ).to(device)
+                            transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
+                            if os.path.exists(transformer_checkpoint_path):
+                                state_dict = torch.load(transformer_checkpoint_path, map_location=device)
+                                self.strategy_transformer.load_state_dict(state_dict)
+                                logging.info(f"Loaded transformer from '{transformer_checkpoint_path}'.")
+                            else:
+                                logging.warning("Transformer checkpoint not found, using randomly initialized transformer.")
+                            self.strategy_transformer.classification_head = None
+                            self.strategy_transformer.eval()
+                        with torch.no_grad():
+                            embedding, _ = self.strategy_transformer(token_tensor)
+                        mem_features_list.append(embedding.cpu().numpy().flatten())
+                if mem_features_list:
+                    mem_features = np.concatenate(mem_features_list, axis=0)
+                else:
+                    mem_features = np.zeros(config.STRATEGY_DIM * (num_players - 1), dtype=np.float32)
             else:
-                mem_features = np.array([], dtype=np.float32)
-            final_obs_parts = [converted_obs, obp_array, mem_features]
+                from src.env.liars_deck_env_utils import query_opponent_memory
+                mem_features_list = []
+                for opp in self.current_env.possible_agents:
+                    if opp != agent_id:
+                        mem_summary = query_opponent_memory(agent_id, opp)
+                        mem_features_list.append(mem_summary)
+                if mem_features_list:
+                    mem_features = np.concatenate(mem_features_list, axis=0)
+                else:
+                    mem_features = np.array([], dtype=np.float32)
+            current_mem_dim = mem_features.shape[0]
+            if current_mem_dim < required_mem_dim:
+                pad = np.zeros(required_mem_dim - current_mem_dim, dtype=np.float32)
+                mem_features = np.concatenate([mem_features, pad], axis=0)
+            elif current_mem_dim > required_mem_dim:
+                mem_features = mem_features[:required_mem_dim]
+            final_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32), mem_features], axis=0)
         else:
-            final_obs_parts = [converted_obs, obp_array]
-
-        # Concatenate all parts, excluding empty arrays
-        final_obs = np.concatenate([part for part in final_obs_parts if part.size > 0], axis=0)
-
-        # Verify the final observation dimension matches the expected input_dim
+            final_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32)], axis=0)
+        logging.debug(f"Final observation (length {len(final_obs)}): {final_obs}")
+        
+        expected_dim = input_dim
         actual_dim = final_obs.shape[0]
-        logging.debug(f"Expected dim: {input_dim}, Actual dim: {actual_dim}")
-        assert actual_dim == input_dim, f"Expected observation dimension {input_dim}, got {actual_dim}"
+        logging.debug(f"Expected dim: {expected_dim}, Actual dim: {actual_dim}")
+        assert actual_dim == expected_dim, f"Expected observation dimension {expected_dim}, got {actual_dim}"
 
         observation_tensor = torch.tensor(final_obs, dtype=torch.float32).unsqueeze(0).to(device)
         
@@ -423,7 +545,6 @@ class AgentBattlegroundGUI:
     def save_training_data(self):
         """Append the accumulated training data to the file instead of overwriting it."""
         file_path = os.path.join(os.getcwd(), "opponent_training_data.pkl")
-        # Load existing data if file exists
         if os.path.exists(file_path):
             try:
                 with open(file_path, "rb") as f:
@@ -434,14 +555,12 @@ class AgentBattlegroundGUI:
         else:
             existing_data = []
 
-        # Combine existing data with the new training data
         combined_data = existing_data + self.training_data
 
         try:
             with open(file_path, "wb") as f:
                 pickle.dump(combined_data, f)
             self.show_info(f"Training data saved to {file_path} (appended {len(self.training_data)} new samples)")
-            # Optionally, clear self.training_data after saving if you don't want to re-save the same data next time.
             self.training_data.clear()
         except Exception as e:
             self.show_info(f"Error saving training data: {str(e)}")
@@ -449,21 +568,34 @@ class AgentBattlegroundGUI:
     def display_results(self, results):
         self.results_text.config(state=tk.NORMAL)
         self.results_text.delete(1.0, tk.END)
-        
-        header = "Hardcoded Agent | AI1 Wins | AI2 Wins | Hardcoded Wins | AI1 Win Rate | AI2 Win Rate | Hardcoded Win Rate\n"
-        self.results_text.insert(tk.END, header)
-        self.results_text.insert(tk.END, "-"*100 + "\n")
-        
-        for hc_name, wins in results.items():
-            ai1_wins, ai2_wins, hc_wins = wins
-            total = ai1_wins + ai2_wins + hc_wins
-            rate1 = ai1_wins / total if total > 0 else 0.0
-            rate2 = ai2_wins / total if total > 0 else 0.0
-            rate_hc = hc_wins / total if total > 0 else 0.0
-            line = (f"{hc_name:20} | {ai1_wins:^9} | {ai2_wins:^9} | {hc_wins:^15} | "
-                    f"{rate1:12.2%} | {rate2:12.2%} | {rate_hc:18.2%}\n")
-            self.results_text.insert(tk.END, line)
-            
+        output = ""
+        # Display hardcoded match results, if available.
+        if "hardcoded" in results:
+            output += "Matches vs. Hardcoded Opponents:\n"
+            header = ("Hardcoded Agent   | PPO1 Wins | PPO2 Wins | Hardcoded Wins | "
+                      "PPO1 Win Rate | PPO2 Win Rate | Hardcoded Win Rate\n")
+            output += header
+            output += "-" * 100 + "\n"
+            for hc_name, wins in results["hardcoded"].items():
+                ppo1_wins, ppo2_wins, hc_wins = wins
+                total = ppo1_wins + ppo2_wins + hc_wins
+                rate1 = ppo1_wins / total if total > 0 else 0.0
+                rate2 = ppo2_wins / total if total > 0 else 0.0
+                rate_hc = hc_wins / total if total > 0 else 0.0
+                output += (f"{hc_name:18} | {ppo1_wins:^9} | {ppo2_wins:^9} | {hc_wins:^14} | "
+                           f"{rate1:12.2%} | {rate2:12.2%} | {rate_hc:16.2%}\n")
+            output += "\n"
+        # Display PPO vs. PPO match results, if available.
+        if "ppo" in results:
+            output += "Matches among PPO Agents:\n"
+            header = "PPO Agent             | Wins | Win Rate\n"
+            output += header
+            output += "-" * 50 + "\n"
+            total_matches = results["ppo"]["matches"]
+            for agent_label, wins in results["ppo"]["wins"].items():
+                win_rate = wins / total_matches if total_matches > 0 else 0.0
+                output += f"{agent_label:22} | {wins:^4} | {win_rate:8.2%}\n"
+        self.results_text.insert(tk.END, output)
         self.results_text.config(state=tk.DISABLED)
 
 
