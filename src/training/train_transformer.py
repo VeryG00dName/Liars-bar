@@ -5,239 +5,311 @@ import pickle
 import math
 import random
 import argparse
-import numpy as np
 from collections import Counter
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from transformers import get_cosine_schedule_with_warmup
 
+# Import the transformer model from new_models.py
 from src.model.new_models import StrategyTransformer
+
 from src import config
 
 # -------------------------------
-# Updated Transformer Configuration
+# Transformer Configuration (Fixed)
 # -------------------------------
-STRATEGY_NUM_TOKENS = config.STRATEGY_NUM_TOKENS
-STRATEGY_TOKEN_EMBEDDING_DIM = 128
-STRATEGY_NHEAD = 8
-STRATEGY_NUM_LAYERS = 4
-STRATEGY_DIM = 128
-STRATEGY_NUM_CLASSES = 10
-STRATEGY_DROPOUT = 0.1
-
-# -------------------------------
-# Enhanced Feature Processing
-# -------------------------------
-class FeatureProcessor:
-    def __init__(self, training_data):
-        self.response_vocab = self._build_vocab(training_data, "response")
-        self.action_vocab = self._build_vocab(training_data, "triggering_action")
-        self._compute_normalization(training_data)
-
-    def _build_vocab(self, data, field):
-        values = set()
-        for memory, _ in data:
-            for event in memory:
-                event = self._parse_event(event)
-                values.add(event.get(field, ""))
-        return {v: i for i, v in enumerate(sorted(values))}
-
-    def _compute_normalization(self, data):
-        penalties, card_counts = [], []
-        for memory, _ in data:
-            for event in memory:
-                event = self._parse_event(event)
-                penalties.append(float(event.get("penalties", 0)))
-                card_counts.append(float(event.get("card_count", 0)))
-        self.penalties_mean = np.mean(penalties) if penalties else 0
-        self.penalties_std = np.std(penalties) + 1e-8
-        self.card_count_mean = np.mean(card_counts) if card_counts else 0
-        self.card_count_std = np.std(card_counts) + 1e-8
-
-    def _parse_event(self, event):
-        if isinstance(event, dict):
-            return event
-        raise ValueError(f"Invalid event format: {event}")
-
-    def process_event(self, event):
-        event = self._parse_event(event)
-        return {
-            "response": self.response_vocab.get(event.get("response", ""), 0),
-            "action": self.action_vocab.get(event.get("triggering_action", ""), 0),
-            "penalties": (float(event.get("penalties", 0)) - self.penalties_mean) / self.penalties_std,
-            "card_count": (float(event.get("card_count", 0)) - self.card_count_mean) / self.card_count_std
-        }
+STRATEGY_NUM_TOKENS = config.STRATEGY_NUM_TOKENS                         # Vocabulary size for tokenizing opponent events.
+STRATEGY_TOKEN_EMBEDDING_DIM = config.STRATEGY_TOKEN_EMBEDDING_DIM       # Dimension of token embeddings.
+STRATEGY_NHEAD = config.STRATEGY_NHEAD                                   # Number of attention heads.
+STRATEGY_NUM_LAYERS = config.STRATEGY_NUM_LAYERS                         # Number of transformer encoder layers.
+STRATEGY_DIM = config.STRATEGY_DIM                                       # Final dimension of the strategy embedding.
+STRATEGY_NUM_CLASSES = config.STRATEGY_NUM_CLASSES                       # Unused after removing the classification head.
+STRATEGY_DROPOUT = config.STRATEGY_DROPOUT                               # Dropout rate in the transformer.
 
 # -------------------------------
-# Enhanced Dataset Class
+# Step 1. Load and Balance Training Data
+# -------------------------------
+def balance_training_data(training_data):
+    """
+    Balance the dataset by undersampling each class to match the number of samples
+    in the smallest class.
+    """
+    label_counts = Counter(label for _, label in training_data)
+    min_count = min(label_counts.values())
+    balanced_data = []
+    for label in label_counts:
+        samples = [sample for sample in training_data if sample[1] == label]
+        random.shuffle(samples)
+        balanced_data.extend(samples[:min_count])
+    return balanced_data
+
+def load_training_data(training_data_path):
+    with open(training_data_path, "rb") as f:
+        data = pickle.load(f)
+    data = balance_training_data(data)
+    return data
+
+# -------------------------------
+# Step 2. Parse and Encode Memory Events
+# -------------------------------
+def parse_event(event):
+    """
+    Convert an event to a dictionary.
+    Raises an error if the event is not a dictionary.
+    """
+    if isinstance(event, dict):
+        return event
+    else:
+        raise ValueError(f"Memory event is not a dictionary: {event}. Please fix the data generation.")
+
+def encode_event(event, opponent2idx, response2idx, action2idx):
+    """
+    Encode an event as a 4-dimensional vector.
+    Since all data comes from the same opponent, we remove the opponent field.
+    The dimensions are:
+      1. response: mapped via response2idx
+      2. triggering_action: mapped via action2idx
+      3. penalties: numerical value
+      4. card_count: numerical value
+    """
+    event = parse_event(event)
+    # Ignore the opponent field; use only response, triggering_action, penalties, and card_count.
+    resp = event.get("response", "")
+    act = event.get("triggering_action", "")
+    penalties = float(event.get("penalties", 0))
+    card_count = float(event.get("card_count", 0))
+    resp_idx = response2idx.get(resp, 0)
+    act_idx = action2idx.get(act, 0)
+    return [float(resp_idx), float(act_idx), penalties, card_count]
+
+def build_field_vocab(training_data, field_name):
+    """
+    Build a vocabulary mapping from each unique value of field_name (from event dictionaries)
+    to an integer index.
+    (This function will be used only for 'response' and 'triggering_action'.)
+    """
+    vocab = {}
+    for memory, _ in training_data:
+        for event in memory:
+            event_dict = parse_event(event)
+            value = event_dict.get(field_name, None)
+            if value is not None and value not in vocab:
+                vocab[value] = len(vocab)
+    return vocab
+
+# -------------------------------
+# Step 3. Build Label Mapping
+# -------------------------------
+def build_label_mapping(training_data):
+    labels = set()
+    for _, label in training_data:
+        labels.add(label)
+    label2idx = {label: idx for idx, label in enumerate(sorted(labels))}
+    idx2label = {idx: label for label, idx in label2idx.items()}
+    return label2idx, idx2label
+
+# -------------------------------
+# Debug: Print Training Data Summary
+# -------------------------------
+def print_training_data_summary(training_data, response2idx, action2idx, label2idx):
+    print("----- Training Data Summary -----")
+    print(f"Total training samples: {len(training_data)}")
+    label_counts = Counter(label for _, label in training_data)
+    print("Label distribution:")
+    for label, count in label_counts.items():
+        print(f"  {label}: {count} samples")
+    lengths = [len(memory) for memory, _ in training_data]
+    if lengths:
+        print(f"Average sequence length: {sum(lengths)/len(lengths):.2f}")
+        print(f"Minimum sequence length: {min(lengths)}")
+        print(f"Maximum sequence length: {max(lengths)}")
+    else:
+        print("No sequences found!")
+    print(f"Response vocab size: {len(response2idx)}")
+    print(f"Action vocab size: {len(action2idx)}")
+    print("---------------------------------")
+
+# -------------------------------
+# Step 4. Define Dataset Using Richer Memory Representations
 # -------------------------------
 class OpponentMemoryDataset(Dataset):
-    def __init__(self, training_data, feature_processor, label2idx, max_seq_length=512):
-        self.feature_processor = feature_processor
+    def __init__(self, training_data, opponent2idx, response2idx, action2idx, label2idx, max_seq_length=None):
+        """
+        Each sample is a tuple (sequence, label) where:
+          - sequence is a list of 4-dimensional float vectors (one per event)
+          - label is the integer label
+        """
+        self.samples = []
+        # We no longer use opponent2idx in encoding since opponent is fixed.
+        self.response2idx = response2idx
+        self.action2idx = action2idx
         self.label2idx = label2idx
         self.max_seq_length = max_seq_length
-        
-        self.samples = []
+
         for memory, label in training_data:
-            processed_events = [self.feature_processor.process_event(e) for e in memory[:max_seq_length]]
-            self.samples.append((processed_events, self.label2idx[label]))
+            event_vectors = []
+            for event in memory:
+                vec = encode_event(event, None, response2idx, action2idx)
+                event_vectors.append(vec)
+            if event_vectors:
+                self.samples.append((event_vectors, label2idx[label]))
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        events, label = self.samples[idx]
-        return {
-            "response": torch.tensor([e["response"] for e in events], dtype=torch.long),
-            "action": torch.tensor([e["action"] for e in events], dtype=torch.long),
-            "numerical": torch.tensor([[e["penalties"], e["card_count"]] for e in events], dtype=torch.float),
-            "label": torch.tensor(label, dtype=torch.long)
-        }
+        event_vectors, label = self.samples[idx]
+        tensor = torch.tensor(event_vectors, dtype=torch.float)  # shape: (seq_length, 4)
+        return tensor, torch.tensor(label, dtype=torch.long)
 
 # -------------------------------
-# Improved Model Architecture
+# Step 5. Collate Function for Padding
 # -------------------------------
-class EnhancedStrategyTransformer(nn.Module):
-    def __init__(self, num_responses, num_actions):
-        super().__init__()
-        
-        # Embedding layers
-        self.response_embed = nn.Embedding(num_responses, 32)
-        self.action_embed = nn.Embedding(num_actions, 32)
-        
-        # Numerical feature processing
-        self.num_proj = nn.Sequential(
-            nn.Linear(2, 64),
-            nn.LayerNorm(64),
-            nn.ReLU()
-        )
-        
-        # Combined projection
-        self.input_proj = nn.Sequential(
-            nn.Linear(32+32+64, STRATEGY_TOKEN_EMBEDDING_DIM),
-            nn.LayerNorm(STRATEGY_TOKEN_EMBEDDING_DIM),
-            nn.ReLU(),
-            nn.Dropout(STRATEGY_DROPOUT)
-        )
-        
-        # Transformer
-        self.transformer = StrategyTransformer(
-            num_tokens=STRATEGY_NUM_TOKENS,
-            token_embedding_dim=STRATEGY_TOKEN_EMBEDDING_DIM,
-            nhead=STRATEGY_NHEAD,
-            num_layers=STRATEGY_NUM_LAYERS,
-            strategy_dim=STRATEGY_DIM,
-            num_classes=STRATEGY_NUM_CLASSES,
-            dropout=STRATEGY_DROPOUT,
-            use_cls_token=True
-        )
-
-    def forward(self, inputs):
-        # Embed categorical features
-        resp_emb = self.response_embed(inputs["response"])
-        act_emb = self.action_embed(inputs["action"])
-        
-        # Process numerical features
-        num_feats = self.num_proj(inputs["numerical"])
-        
-        # Combine features
-        combined = torch.cat([resp_emb, act_emb, num_feats], dim=-1)
-        projected = self.input_proj(combined)
-        
-        # Transformer
-        strategy, logits = self.transformer(projected)
-        return logits
+def collate_fn(batch):
+    """
+    Pads sequences of event vectors to the maximum length in the batch.
+    Returns padded sequences, lengths, and labels.
+    """
+    sequences, labels = zip(*batch)
+    lengths = [seq.size(0) for seq in sequences]
+    max_len = max(lengths)
+    padded_seqs = []
+    for seq in sequences:
+        pad_length = max_len - seq.size(0)
+        if pad_length > 0:
+            pad = torch.zeros(pad_length, seq.size(1))
+            padded_seq = torch.cat([seq, pad], dim=0)
+        else:
+            padded_seq = seq
+        padded_seqs.append(padded_seq)
+    padded_seqs = torch.stack(padded_seqs)
+    labels = torch.stack(labels)
+    return padded_seqs, torch.tensor(lengths, dtype=torch.long), labels
 
 # -------------------------------
-# Enhanced Training Loop
+# Step 6. Training Function (with Prediction Distribution Debug)
 # -------------------------------
-def train_epoch(model, dataloader, optimizer, scheduler, criterion, device, grad_clip=1.0):
+def train_transformer(model, input_projection, dataloader, optimizer, criterion, device, num_epochs=10):
     model.train()
-    total_loss = 0
-    correct = 0
-    total = 0
-    
-    for batch in dataloader:
-        inputs = {k: v.to(device) for k, v in batch.items() if k != "label"}
-        labels = batch["label"].to(device)
+    input_projection.train()
+    for epoch in range(1, num_epochs + 1):
+        total_loss = 0.0
+        total_correct = 0
+        total_samples = 0
+        all_preds = []
         
-        optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
-        loss.backward()
+        for batch in dataloader:
+            sequences, lengths, labels = batch
+            sequences = sequences.to(device)  # shape: (batch, seq_len, feature_dim)
+            labels = labels.to(device)
+
+            optimizer.zero_grad()
+            # Project each event vector (of dim 4) to token_embedding_dim.
+            projected = input_projection(sequences)  # shape: (batch, seq_len, token_embedding_dim)
+            # Pass projected sequences to the transformer.
+            _, logits = model(projected)
+            loss = criterion(logits, labels)
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item() * sequences.size(0)
+            preds = logits.argmax(dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            total_correct += (preds == labels).sum().item()
+            total_samples += sequences.size(0)
         
-        nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        optimizer.step()
-        scheduler.step()
-        
-        total_loss += loss.item() * labels.size(0)
-        _, predicted = torch.max(outputs, 1)
-        correct += (predicted == labels).sum().item()
-        total += labels.size(0)
-    
-    return total_loss / total, correct / total
+        avg_loss = total_loss / total_samples
+        accuracy = total_correct / total_samples
+
+        # Print distribution of predictions
+        pred_counts = Counter(all_preds)
+        print(f"Epoch {epoch}: Loss = {avg_loss:.4f}, Accuracy = {accuracy:.4f}")
+        print("Prediction distribution:")
+        for label, count in sorted(pred_counts.items()):
+            print(f"  Class {label}: {count} predictions")
+        print("-----------------------------------")
 
 # -------------------------------
-# Main Execution Flow
+# Step 7. Main Script
 # -------------------------------
 def main(args):
-    # Load and process data
-    with open(args.training_data_path, "rb") as f:
-        raw_data = pickle.load(f)
-    
-    # Balance classes
-    label_counts = Counter(l for _, l in raw_data)
-    min_count = min(label_counts.values())
-    balanced_data = []
-    for label in label_counts:
-        balanced_data.extend([d for d in raw_data if d[1] == label][:min_count])
-    random.shuffle(balanced_data)
-    
-    # Create processors
-    feature_processor = FeatureProcessor(balanced_data)
-    label2idx = {l: i for i, l in enumerate(sorted(set(l for _, l in balanced_data)))}
-    
-    # Create datasets
-    dataset = OpponentMemoryDataset(balanced_data, feature_processor, label2idx)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=lambda x: x)
-    
-    # Initialize model
+    # Load and balance training data.
+    training_data = load_training_data(args.training_data_path)
+    print(f"Loaded {len(training_data)} training samples.")
+
+    # Build vocabularies for categorical fields: response and triggering_action.
+    response2idx = build_field_vocab(training_data, "response")
+    action2idx = build_field_vocab(training_data, "triggering_action")
+    print(f"Response vocab size: {len(response2idx)}, Action vocab size: {len(action2idx)}")
+
+    # Build label mapping.
+    label2idx, idx2label = build_label_mapping(training_data)
+    print(f"Number of classes: {len(label2idx)}")
+
+    # Print a summary of the training data for debugging.
+    print_training_data_summary(training_data, response2idx, action2idx, label2idx)
+
+    # For opponent vocabulary, we simply fix it to a single value.
+    opponent2idx = {"default": 0}
+
+    # Create dataset and dataloader.
+    dataset = OpponentMemoryDataset(training_data, opponent2idx, response2idx, action2idx, label2idx, max_seq_length=args.max_seq_length)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = EnhancedStrategyTransformer(
-        num_responses=len(feature_processor.response_vocab),
-        num_actions=len(feature_processor.action_vocab)
+    
+    # Use configuration constants for transformer hyperparameters.
+    token_embedding_dim = STRATEGY_TOKEN_EMBEDDING_DIM
+    nhead = STRATEGY_NHEAD
+    num_layers = STRATEGY_NUM_LAYERS
+    strategy_dim = STRATEGY_DIM
+    dropout = STRATEGY_DROPOUT
+    use_cls_token = True
+
+    # Instantiate the transformer model.
+    model = StrategyTransformer(
+        num_tokens=STRATEGY_NUM_TOKENS,  # although unused after we override token_embedding.
+        token_embedding_dim=token_embedding_dim,
+        nhead=nhead,
+        num_layers=num_layers,
+        strategy_dim=strategy_dim,
+        num_classes=len(label2idx),
+        dropout=dropout,
+        use_cls_token=use_cls_token
     ).to(device)
     
-    # Optimizer and scheduler
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=100,
-        num_training_steps=args.epochs * len(dataloader)
-    )
-    
-    # Label-smoothed loss
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-    
-    # Training loop
-    for epoch in range(1, args.epochs + 1):
-        loss, acc = train_epoch(model, dataloader, optimizer, scheduler, criterion, device)
-        print(f"Epoch {epoch:02d} | Loss: {loss:.4f} | Acc: {acc:.4f}")
-    
-    # Save model
+    # Override the token embedding so that continuous embeddings pass through.
+    model.token_embedding = nn.Identity()
+
+    # Create an input projection layer that maps raw feature vectors (dim 4) to token_embedding_dim.
+    feature_dim = 4
+    input_projection = nn.Linear(feature_dim, token_embedding_dim).to(device)
+
+    optimizer = optim.Adam(list(model.parameters()) + list(input_projection.parameters()), lr=args.lr)
+    criterion = nn.CrossEntropyLoss()
+
+    # Train the transformer.
+    train_transformer(model, input_projection, dataloader, optimizer, criterion, device, num_epochs=args.epochs)
+
+    # Save the trained model.
+    save_path = os.path.join(args.save_dir, "transformer_classifier.pth")
     os.makedirs(args.save_dir, exist_ok=True)
-    torch.save(model.state_dict(), os.path.join(args.save_dir, "strategy_transformer.pt"))
+    torch.save(model.state_dict(), save_path)
+    print(f"Trained transformer model saved to {save_path}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Train Strategy Transformer Classifier with Rich Memory Representations"
+    )
     parser.add_argument("--training_data_path", type=str, default="opponent_training_data.pkl",
                         help="Path to the pickle file with training data.")
-    parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--save_dir", type=str, default="models")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training.")
+    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs.")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
+    parser.add_argument("--max_seq_length", type=int, default=None, help="Maximum sequence length (None for variable).")
+    parser.add_argument("--save_dir", type=str, default="checkpoints", help="Directory to save the trained model.")
     args = parser.parse_args()
-    
+
     main(args)
