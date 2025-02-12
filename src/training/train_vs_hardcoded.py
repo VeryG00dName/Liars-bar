@@ -190,7 +190,8 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
     obp_model = OpponentBehaviorPredictor(
         input_dim=config.OPPONENT_INPUT_DIM, 
         hidden_dim=config.OPPONENT_HIDDEN_DIM, 
-        output_dim=2
+        output_dim=2,
+        memory_dim=config.STRATEGY_DIM  # New transformer memory embedding dimension
     ).to(device)
     obp_optimizer = optim.Adam(obp_model.parameters(), lr=config.OPPONENT_LEARNING_RATE)
     obp_memory = []
@@ -267,13 +268,39 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
             observation = observation_dict[agent]
             action_mask = env.infos[agent]['action_mask']
 
-            # 2) Run OBP inference.
-            obp_probs = run_obp_inference(obp_model, observation, device, env.num_players)
-
             # 3) Integrate Opponent Memory & Transformer Embedding.
             if agent == current_hardcoded_agent_id:
-                # For hard-coded agents, use base observation and OBP outputs,
-                # then pad with zeros so that final_obs has length config.INPUT_DIM.
+                # For hard-coded agents, call OBP without memory (old behavior)
+                obp_probs = run_obp_inference(obp_model, observation, device, env.num_players,
+                                            memory_embeddings=[torch.zeros(1, config.STRATEGY_DIM, device=device)
+                                                                for _ in range(env.num_players - 1)])
+            else:
+                transformer_embeddings = []
+                obp_memory_embeddings = []
+                for opp in env.possible_agents:
+                    if opp != agent:
+                        mem_summary = query_opponent_memory_full(agent, opp)
+                        features_list = convert_memory_to_features(mem_summary, response2idx, action2idx)
+                        if features_list:
+                            feature_tensor = torch.tensor(features_list, dtype=torch.float32, device=device).unsqueeze(0)
+                            with torch.no_grad():
+                                projected = event_encoder(feature_tensor)
+                                strategy_embedding, _ = strategy_transformer(projected)
+                            # Append the raw embedding (keep tensor shape [1, STRATEGY_DIM])
+                            obp_memory_embeddings.append(strategy_embedding)
+                            transformer_embeddings.append(strategy_embedding.cpu().detach().numpy().flatten())
+                        else:
+                            # If no memory events, supply a zero vector.
+                            zero_emb = torch.zeros(1, config.STRATEGY_DIM, device=device)
+                            obp_memory_embeddings.append(zero_emb)
+                            transformer_embeddings.append(np.zeros(config.STRATEGY_DIM, dtype=np.float32))
+                
+                # Use the new OBP inference that takes memory embeddings.
+                obp_probs = run_obp_inference(obp_model, observation, device, env.num_players,
+                                            memory_embeddings=obp_memory_embeddings)
+
+            # Build the final observation:
+            if agent == current_hardcoded_agent_id:
                 base_obs = observation
                 obp_arr = np.array(obp_probs, dtype=np.float32)
                 current_dim = base_obs.shape[0] + obp_arr.shape[0]
@@ -281,30 +308,9 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 mem_features = np.zeros(missing_dim, dtype=np.float32)
                 final_obs = np.concatenate([base_obs, obp_arr, mem_features], axis=0)
             else:
-                # For RL agents, query each opponent's memory and obtain strategy embeddings.
-                transformer_embeddings = []
-                for opp in env.possible_agents:
-                    if opp != agent:
-                        mem_summary = query_opponent_memory_full(agent, opp)
-                        # Convert raw memory events to continuous features.
-                        features_list = convert_memory_to_features(mem_summary, response2idx, action2idx)
-                        if features_list:
-                            feature_tensor = torch.tensor(features_list, dtype=torch.float, device=device).unsqueeze(0)
-                            with torch.no_grad():
-                                projected = event_encoder(feature_tensor)
-                                strategy_embedding, _ = strategy_transformer(projected)
-                            transformer_embeddings.append(strategy_embedding.cpu().detach().numpy().flatten())
-                        else:
-                            transformer_embeddings.append(np.zeros(config.STRATEGY_DIM, dtype=np.float32))
-                if transformer_embeddings:
-                    transformer_features = np.concatenate(transformer_embeddings, axis=0)
-                else:
-                    transformer_features = np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
-                final_obs = np.concatenate([
-                    observation,
-                    np.array(obp_probs, dtype=np.float32),
-                    transformer_features
-                ], axis=0)
+                transformer_features = np.concatenate(transformer_embeddings, axis=0) if transformer_embeddings else \
+                                    np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
+                final_obs = np.concatenate([observation, np.array(obp_probs, dtype=np.float32), transformer_features], axis=0)
 
             # 4) Decide action.
             if agent == current_hardcoded_agent_id:

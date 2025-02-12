@@ -198,36 +198,45 @@ def get_tensorboard_writer(log_dir=config.TENSORBOARD_RUNS_DIR):
     return SummaryWriter(log_dir=log_dir)
 
 def train_obp(obp_model, obp_optimizer, obp_memory, device, logger):
+    """
+    Train OBP on training samples.
+    Expect each sample to be a triplet: (features, memory_embedding, label)
+    """
     if len(obp_memory) <= 100:
         logger.info(f"Insufficient OBP training samples ({len(obp_memory)}). Skipping training.")
         return None, None
 
-    all_features = [f for (f, l) in obp_memory]
-    all_labels = [l for (f, l) in obp_memory]
+    # Expecting each sample as (features, memory, label)
+    all_features = [f for (f, m, l) in obp_memory]
+    all_memories = [m for (f, m, l) in obp_memory]
+    all_labels = [l for (f, m, l) in obp_memory]
 
     features_tensor = torch.tensor(np.array(all_features, dtype=np.float32)).to(device)
+    memories_tensor = torch.tensor(np.array(all_memories, dtype=np.float32)).to(device)
     labels_tensor = torch.tensor(np.array(all_labels, dtype=np.int64)).to(device)
 
     perm = torch.randperm(features_tensor.size(0))
     features_tensor = features_tensor[perm]
+    memories_tensor = memories_tensor[perm]
     labels_tensor = labels_tensor[perm]
 
     obp_batch_size = 64
     obp_epochs = 5
 
-    dataset = TensorDataset(features_tensor, labels_tensor)
+    dataset = TensorDataset(features_tensor, memories_tensor, labels_tensor)
     dataloader = DataLoader(dataset, batch_size=obp_batch_size, shuffle=True)
 
     obp_model.train()
     total_loss_obp = 0.0
     correct = 0
     total = 0
+    criterion = torch.nn.CrossEntropyLoss()
     for epoch in range(obp_epochs):
         epoch_loss = 0.0
-        for batch_features, batch_labels in dataloader:
+        for batch_features, batch_memories, batch_labels in dataloader:
             obp_optimizer.zero_grad()
-            logits = obp_model(batch_features)
-            loss_obp = torch.nn.CrossEntropyLoss()(logits, batch_labels)
+            logits = obp_model(batch_features, batch_memories)
+            loss_obp = criterion(logits, batch_labels)
             loss_obp.backward()
             obp_optimizer.step()
             epoch_loss += loss_obp.item()

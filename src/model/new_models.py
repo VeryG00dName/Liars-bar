@@ -103,20 +103,27 @@ class ValueNetwork(nn.Module):
         return state_value
 
 class OpponentBehaviorPredictor(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim=2):
+    def __init__(self, input_dim, hidden_dim, output_dim=2, memory_dim=0):
+        """
+        memory_dim: Dimension of the transformer-based memory embedding.
+        """
         super(OpponentBehaviorPredictor, self).__init__()
-        # Deeper network
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        # The new input dimension is the sum of the original input and the memory embedding.
+        combined_dim = input_dim + memory_dim
+        self.fc1 = nn.Linear(combined_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, hidden_dim//2)
-        self.output_layer = nn.Linear(hidden_dim//2, output_dim)
+        self.fc3 = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.output_layer = nn.Linear(hidden_dim // 2, output_dim)
         
         self.dropout = nn.Dropout(0.3)
         self.layer_norm1 = nn.LayerNorm(hidden_dim)
         self.layer_norm2 = nn.LayerNorm(hidden_dim)
-        self.layer_norm3 = nn.LayerNorm(hidden_dim//2)
+        self.layer_norm3 = nn.LayerNorm(hidden_dim // 2)
 
-    def forward(self, x):
+    def forward(self, x, memory_embedding):
+        # Expect that memory_embedding is provided (for training OBP).
+        # Concatenate along the last dimension.
+        x = torch.cat([x, memory_embedding], dim=-1)
         x = F.gelu(self.fc1(x))
         x = self.layer_norm1(x)
         x = self.dropout(x)

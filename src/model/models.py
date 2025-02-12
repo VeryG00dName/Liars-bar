@@ -131,30 +131,30 @@ class ValueNetwork(nn.Module):
 
 class OpponentBehaviorPredictor(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim=2):
-        """
-        Initializes the Opponent Behavior Predictor.
-        
-        Args:
-            input_dim (int): Dimension of input features.
-            hidden_dim (int): Number of units in hidden layers.
-            output_dim (int): Number of output classes (e.g., lie or not).
-        """
         super(OpponentBehaviorPredictor, self).__init__()
+        # Deeper network
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.output_layer = nn.Linear(hidden_dim, output_dim)
-    
+        self.fc3 = nn.Linear(hidden_dim, hidden_dim//2)
+        self.output_layer = nn.Linear(hidden_dim//2, output_dim)
+        
+        self.dropout = nn.Dropout(0.3)
+        self.layer_norm1 = nn.LayerNorm(hidden_dim)
+        self.layer_norm2 = nn.LayerNorm(hidden_dim)
+        self.layer_norm3 = nn.LayerNorm(hidden_dim//2)
+
     def forward(self, x):
-        """
-        Forward pass through the network.
+        x = F.gelu(self.fc1(x))
+        x = self.layer_norm1(x)
+        x = self.dropout(x)
         
-        Args:
-            x (torch.Tensor): Input feature tensor.
+        x = F.gelu(self.fc2(x))
+        x = self.layer_norm2(x)
+        x = self.dropout(x)
         
-        Returns:
-            torch.Tensor: Logits for each class.
-        """
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
+        x = F.gelu(self.fc3(x))
+        x = self.layer_norm3(x)
+        x = self.dropout(x)
+        
         logits = self.output_layer(x)
-        return logits  # For CrossEntropyLoss
+        return logits

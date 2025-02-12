@@ -4,6 +4,7 @@ import random
 import numpy as np
 import torch
 from src.env.liars_deck_env_utils_2 import decode_action, select_cards_to_play, validate_claim
+from src import config
 
 def set_seed(seed=42):
     """
@@ -15,6 +16,24 @@ def set_seed(seed=42):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+def convert_memory_to_features(memory, response_mapping, action_mapping):
+    """
+    Convert the opponent memory (a list of events) to a list of 4-dimensional feature vectors.
+    Each event is expected to be a dictionary with keys: "response", "triggering_action", "penalties", and "card_count".
+    """
+    features = []
+    for event in memory:
+        if not isinstance(event, dict):
+            raise ValueError(f"Memory event is not a dictionary: {event}. Please fix the data generation.")
+        resp = event.get("response", "")
+        act = event.get("triggering_action", "")
+        penalties = float(event.get("penalties", 0))
+        card_count = float(event.get("card_count", 0))
+        # Map the categorical features using the provided mappings.
+        resp_val = float(response_mapping.get(resp, 0))
+        act_val = float(action_mapping.get(act, 0))
+        features.append([resp_val, act_val, penalties, card_count])
+    return features
 
 def extract_obp_features_from_action(action_entry):
     """
@@ -38,76 +57,60 @@ def extract_obp_features_from_action(action_entry):
 
 def extract_obp_training_data(env):
     """
-    Extract (features, label) pairs for OBP training from private_opponent_histories.
-
-    Args:
-        env: The environment containing opponent histories.
-
-    Returns:
-        list: A list of (features, label) pairs for OBP training.
+    Extract (features, memory_embedding, label) triplets for OBP training from private_opponent_histories.
+    The memory_embedding is computed from memory events via the transformer.
     """
     training_data = []
+    # Assume that response2idx, action2idx, event_encoder, and strategy_transformer are loaded
+    global response2idx, action2idx, event_encoder, strategy_transformer
     for agent in env.possible_agents:
-        for entry in env.private_opponent_histories[agent]:  # Use private data for training
+        for entry in env.private_opponent_histories[agent]:
             if entry['action_type'] == "Play" and entry['was_bluff'] is not None:
-                # Remove bluff_freq computation
                 features = extract_obp_features_from_action(entry)
-                label = 1 if entry['was_bluff'] else 0  # Bluffing or not
-                training_data.append((features, label))
+                label = 1 if entry['was_bluff'] else 0
+                if 'memory_events' in entry and entry['memory_events']:
+                    features_list = convert_memory_to_features(entry['memory_events'], response2idx, action2idx)
+                    if features_list:
+                        feature_tensor = torch.tensor(features_list, dtype=torch.float32).unsqueeze(0)
+                        with torch.no_grad():
+                            projected = event_encoder(feature_tensor)
+                            memory_embedding, _ = strategy_transformer(projected)
+                        # Convert to a list (or keep as tensor)
+                        memory_embedding = memory_embedding.squeeze(0).cpu().detach().numpy().tolist()
+                    else:
+                        memory_embedding = [0.0] * config.STRATEGY_DIM
+                else:
+                    memory_embedding = [0.0] * config.STRATEGY_DIM
+                training_data.append((features, memory_embedding, label))
     return training_data
 
 
-def run_obp_inference(obp_model, obs_array, device, num_players):
+def run_obp_inference(obp_model, obs_array, device, num_players, memory_embeddings):
     """
-    Run OBP inference on public opponent features in obs_array.
-
-    Args:
-        obp_model: The Opponent Behavior Predictor model.
-        obs_array: Observations containing opponent features.
-        device: The device (CPU/GPU) for inference.
-        num_players: Number of players in the game.
-
-    Returns:
-        list: Bluff probabilities for each opponent.
+    Run OBP inference on public opponent features.
+    memory_embeddings: a list of memory embedding tensors (one per opponent) to be passed to OBP.
     """
     if obp_model is None:
         num_opponents = num_players - 1
         return [0.0] * num_opponents
 
     num_opponents = num_players - 1
-    opp_feature_dim = 4  # As bluff_freq is removed
+    opp_feature_dim = 4  # (bluff_freq removed)
 
-    # Calculate observation structure offsets
     hand_vector_length = 2
     last_action_val_length = 1
     active_players_length = num_players
-    non_opponent_features_length = (
-        hand_vector_length + 
-        last_action_val_length + 
-        active_players_length
-    )
+    non_opponent_features_length = hand_vector_length + last_action_val_length + active_players_length
 
     obp_probs = []
     for i in range(num_opponents):
-        # Calculate slice positions for each opponent's features
         start_idx = non_opponent_features_length + (i * opp_feature_dim)
         end_idx = start_idx + opp_feature_dim
-        
-        # Extract features for this opponent
         opp_vec = obs_array[start_idx:end_idx]
-
-        if len(opp_vec) != opp_feature_dim:
-            raise ValueError(
-                f"Opponent feature vector size mismatch: expected {opp_feature_dim}, got {len(opp_vec)}"
-            )
-
-        # Convert to tensor and run inference
         opp_vec_tensor = torch.tensor(opp_vec, dtype=torch.float32, device=device).unsqueeze(0)
-        with torch.no_grad():
-            logits = obp_model(opp_vec_tensor)
-            probs = torch.softmax(logits, dim=-1)
-            
-        bluff_prob = probs[0, 1].item()  # Probability of "bluff" class
+        # Pass the corresponding memory embedding (assumed to be a tensor of shape [1, STRATEGY_DIM])
+        logits = obp_model(opp_vec_tensor, memory_embeddings[i])
+        probs = torch.softmax(logits, dim=-1)
+        bluff_prob = probs[0, 1].item()
         obp_probs.append(bluff_prob)
-
     return obp_probs
