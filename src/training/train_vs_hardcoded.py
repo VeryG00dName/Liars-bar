@@ -5,8 +5,10 @@ import time
 import os
 import random
 import numpy as np
+from sklearn.discriminant_analysis import StandardScaler
 import torch
 import torch.nn as nn
+import torch.nn.functional as F  # For cosine similarity.
 import torch.optim as optim
 from torch.distributions import Categorical
 
@@ -229,19 +231,31 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
     original_agent_order = list(env.agents)
 
     # Hard-coded agents to choose from if randomizing.
-    hardcoded_agent_classes = [GreedyCardSpammer, StrategicChallenger, TableNonTableAgent, Classic]
+    hardcoded_agent_classes = [GreedyCardSpammer, StrategicChallenger, TableNonTableAgent, Classic ,TableFirstConservativeChallenger, SelectiveTableConservativeChallenger]
 
     # Declare variables to hold the current hard-coded agent across episodes.
     current_hardcoded_agent_id = None
     current_hardcoded_agent_instance = None
 
+    # Initialize a global step counter.
+    global_step = 0
+
+    # Variables to track similarity of opponents’ memories for a particular (tracked) agent.
+    # The key is the observer agent, and the value is the last computed embedding (for the current tracked agent).
+    tracked_agent = None  
+    tracked_agent_last_embeddings = {}
+
     for episode in range(start_episode, num_episodes + 1):
         obs, infos = env.reset()
         agents = env.agents
 
-        # Every 5 episodes, update the hard-coded agent selection.
+        # Initialize pending rewards for all agents.
+        pending_rewards = {agent: 0.0 for agent in agents}
+
+        # Every 5 episodes, update the hard-coded agent selection and use that as the tracked agent.
         if (episode - start_episode) % 5 == 0:
             current_hardcoded_agent_id = random.choice(agents)
+            tracked_agent = current_hardcoded_agent_id  # This agent is the one whose memory we track.
             hardcoded_class = random.choice(hardcoded_agent_classes)
             if hardcoded_class == StrategicChallenger:
                 current_hardcoded_agent_instance = hardcoded_class(
@@ -257,6 +271,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
 
         while env.agent_selection is not None:
             steps_in_episode += 1
+            global_step += 1  # Increment the global step counter.
             agent = env.agent_selection
 
             if env.terminations[agent] or env.truncations[agent]:
@@ -271,9 +286,11 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
             # 3) Integrate Opponent Memory & Transformer Embedding.
             if agent == current_hardcoded_agent_id:
                 # For hard-coded agents, call OBP without memory (old behavior)
-                obp_probs = run_obp_inference(obp_model, observation, device, env.num_players,
-                                            memory_embeddings=[torch.zeros(1, config.STRATEGY_DIM, device=device)
-                                                                for _ in range(env.num_players - 1)])
+                obp_probs = run_obp_inference(
+                    obp_model, observation, device, env.num_players,
+                    memory_embeddings=[torch.zeros(1, config.STRATEGY_DIM, device=device)
+                                       for _ in range(env.num_players - 1)]
+                )
             else:
                 transformer_embeddings = []
                 obp_memory_embeddings = []
@@ -286,18 +303,27 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                             with torch.no_grad():
                                 projected = event_encoder(feature_tensor)
                                 strategy_embedding, _ = strategy_transformer(projected)
-                            # Append the raw embedding (keep tensor shape [1, STRATEGY_DIM])
+                        else:
+                            strategy_embedding = None
+
+                        if strategy_embedding is not None:
                             obp_memory_embeddings.append(strategy_embedding)
                             transformer_embeddings.append(strategy_embedding.cpu().detach().numpy().flatten())
                         else:
-                            # If no memory events, supply a zero vector.
                             zero_emb = torch.zeros(1, config.STRATEGY_DIM, device=device)
                             obp_memory_embeddings.append(zero_emb)
                             transformer_embeddings.append(np.zeros(config.STRATEGY_DIM, dtype=np.float32))
-                
-                # Use the new OBP inference that takes memory embeddings.
+
+                        # --- NEW: If this opponent is the tracked agent, compute & log similarity --- 
+                        if tracked_agent is not None and opp == tracked_agent and strategy_embedding is not None:
+                            if agent in tracked_agent_last_embeddings:
+                                prev_emb = tracked_agent_last_embeddings[agent]
+                                similarity = F.cosine_similarity(strategy_embedding, prev_emb, dim=1).item()
+                                if writer is not None:
+                                    writer.add_scalar(f"MemorySimilarity/{agent}/{tracked_agent}", similarity, global_step)
+                            tracked_agent_last_embeddings[agent] = strategy_embedding.detach()
                 obp_probs = run_obp_inference(obp_model, observation, device, env.num_players,
-                                            memory_embeddings=obp_memory_embeddings)
+                                              memory_embeddings=obp_memory_embeddings)
 
             # Build the final observation:
             if agent == current_hardcoded_agent_id:
@@ -308,10 +334,13 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 mem_features = np.zeros(missing_dim, dtype=np.float32)
                 final_obs = np.concatenate([base_obs, obp_arr, mem_features], axis=0)
             else:
-                transformer_features = np.concatenate(transformer_embeddings, axis=0) if transformer_embeddings else \
-                                    np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
-                final_obs = np.concatenate([observation, np.array(obp_probs, dtype=np.float32), transformer_features], axis=0)
-
+                transformer_features = (np.concatenate(transformer_embeddings, axis=0)
+                                        if transformer_embeddings
+                                        else np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32))
+                scaler = StandardScaler()
+                normalized_transformer_features = scaler.fit_transform(np.array(transformer_features).reshape(1, -1)).flatten()
+                final_obs = np.concatenate([observation, np.array(obp_probs, dtype=np.float32), normalized_transformer_features], axis=0)
+            
             # 4) Decide action.
             if agent == current_hardcoded_agent_id:
                 action = current_hardcoded_agent_instance.play_turn(observation, action_mask, table_card=None)
@@ -338,31 +367,34 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 log_prob_value = m.log_prob(torch.tensor(action, device=device)).item()
 
             action_counts_periodic[agent][action] += 1
+
+            # Take the step.
             env.step(action)
-            reward = 0
 
-            # 5) Store transition in RolloutMemory using final_obs (with consistent shape).
-            memories[agent].store_transition(
-                agent=agent,
-                state=final_obs,
-                action=action,
-                log_prob=log_prob_value,
-                reward=reward,
-                is_terminal=env.terminations[agent] or env.truncations[agent],
-                state_value=( 
-                    value_nets[agent](torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)).item()
-                    if agent != current_hardcoded_agent_id else 0.0
-                ),
-                action_mask=action_mask
-            )
-
-            env_reward = env.rewards[agent]
-            episode_rewards[agent] += env_reward
-
-        # Add final environment reward to last transition for each agent.
-        for ag in agents:
-            if len(memories[ag].rewards[ag]) > 0:
-                memories[ag].rewards[ag][-1] += env.rewards[ag]
+            # --- Update pending rewards ---
+            # For every agent other than the acting agent, accumulate their rewards.
+            for ag in agents:
+                if ag != agent:
+                    pending_rewards[ag] += env.rewards[ag]
+                else:
+                    # For the acting agent, add any pending rewards to its immediate reward.
+                    reward = env.rewards[agent] + pending_rewards[agent]
+                    pending_rewards[agent] = 0
+                    # Store the transition.
+                    memories[agent].store_transition(
+                        agent=agent,
+                        state=final_obs,
+                        action=action,
+                        log_prob=log_prob_value,
+                        reward=reward,
+                        is_terminal=env.terminations[agent] or env.truncations[agent],
+                        state_value=( 
+                            value_nets[agent](torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)).item()
+                            if agent != current_hardcoded_agent_id else 0.0
+                        ),
+                        action_mask=action_mask
+                    )
+                    episode_rewards[ag] += reward
 
         episode_obp_data = extract_obp_training_data(env)
         obp_memory.extend(episode_obp_data)
@@ -493,12 +525,12 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 if agent != current_hardcoded_agent_id:
                     memories[agent].reset()
 
-            if len(obp_memory) > 100:
-                avg_loss_obp, accuracy = train_obp(obp_model, obp_optimizer, obp_memory, device, logger)
-                if avg_loss_obp is not None and accuracy is not None and log_tensorboard and writer is not None:
-                    writer.add_scalar("OBP/Loss", avg_loss_obp, episode)
-                    writer.add_scalar("OBP/Accuracy", accuracy, episode)
-                obp_memory = []
+        if len(obp_memory) > 100:
+            avg_loss_obp, accuracy = train_obp(obp_model, obp_optimizer, obp_memory, device, logger)
+            if avg_loss_obp is not None and accuracy is not None and log_tensorboard and writer is not None:
+                writer.add_scalar("OBP/Loss", avg_loss_obp, episode)
+                writer.add_scalar("OBP/Accuracy", accuracy, episode)
+            obp_memory = []
 
         if episode % config.CHECKPOINT_INTERVAL == 0 and load_checkpoint:
             save_checkpoint(
