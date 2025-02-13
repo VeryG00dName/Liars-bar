@@ -21,6 +21,7 @@ from src.model.hard_coded_agents import (
     Classic
 )
 
+# Note: run_obp_inference now accepts additional parameters for real memory embedding computation.
 from src.evaluation.evaluate import run_obp_inference
 from src.evaluation.evaluate_utils import (
     adapt_observation_for_version,
@@ -77,6 +78,7 @@ class AgentBattlegroundGUI:
         self.create_model_info_panel()
         self.create_ai_selection()
         self.create_control_buttons()
+        self.create_progress_bar()  # New progress bar
         self.create_results_display()
 
         self.current_env = None  # Will be set when a match is run
@@ -117,6 +119,18 @@ class AgentBattlegroundGUI:
         frame.pack(pady=10)
         ttk.Button(frame, text="Refresh Agents", command=self.update_agent_selectors).pack(side=tk.LEFT, padx=5)
         ttk.Button(frame, text="Start Battleground", command=self.start_battleground).pack(side=tk.LEFT, padx=5)
+        # New: Rounds input
+        ttk.Label(frame, text="Rounds:").pack(side=tk.LEFT, padx=5)
+        self.rounds_var = tk.StringVar(value="20")
+        self.rounds_spinbox = ttk.Spinbox(frame, from_=1, to=1000, textvariable=self.rounds_var, width=5)
+        self.rounds_spinbox.pack(side=tk.LEFT, padx=5)
+
+    def create_progress_bar(self):
+        frame = ttk.Frame(self.root)
+        frame.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Label(frame, text="Progress:").pack(side=tk.LEFT, padx=5)
+        self.progress = ttk.Progressbar(frame, orient="horizontal", mode="determinate")
+        self.progress.pack(fill=tk.X, padx=5, pady=5)
 
     def create_results_display(self):
         frame = ttk.LabelFrame(self.root, text="Results", padding=10)
@@ -212,7 +226,8 @@ class AgentBattlegroundGUI:
                     raise ValueError(f"File for {file_name} not found among loaded models.")
                 file_path = file_path_candidates[0]
                 model_data = self.loaded_models[file_path]
-                ai_agents[f"player_{i}"] = {
+                key = f"player_{i}"
+                ai_agents[key] = {
                     "policy_net": model_data["policy_nets"][agent_name],
                     "obp_model": model_data["obp_model"],
                     "obs_version": model_data["obs_version"],
@@ -230,10 +245,17 @@ class AgentBattlegroundGUI:
             if not ai_agents:
                 return
 
+            # Read the number of rounds from the spinbox (default 20)
+            rounds = int(self.rounds_var.get())
             results = {}
+            total_matches = rounds * len(self.hardcoded_agents)
+            self.progress['value'] = 0
+            self.progress['maximum'] = total_matches
+            progress_counter = 0
+
             for hc_name, hc_class in self.hardcoded_agents.items():
                 wins = [0, 0, 0]  # [AI1 Wins, AI2 Wins, Hardcoded Wins]
-                for _ in range(20):
+                for _ in range(rounds):
                     winner = self.run_match(ai_agents, hc_class(hc_name))
                     if winner == "player_0":
                         wins[0] += 1
@@ -243,6 +265,9 @@ class AgentBattlegroundGUI:
                         wins[2] += 1
                     else:
                         logger.warning(f"Unknown winner identifier: {winner}")
+                    progress_counter += 1
+                    self.progress['value'] = progress_counter
+                    self.root.update_idletasks()
                 results[hc_name] = wins
 
             self.display_results(results)
@@ -254,8 +279,8 @@ class AgentBattlegroundGUI:
         env = LiarsDeckEnv(num_players=3, render_mode=None)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.current_env = env  # Save current environment for memory queries
-        
-        # Initialize AI agents
+
+        # Initialize AI agents (policy_nets, obp_models, etc.)
         policy_nets = {}
         obp_models = {}
         obs_versions = {}
@@ -265,7 +290,7 @@ class AgentBattlegroundGUI:
             obs_versions[agent_id] = agent_data["obs_version"]
             input_dims[agent_id] = agent_data["input_dim"]
             uses_memories[agent_id] = agent_data["uses_memory"]
-            
+
             policy_net = PolicyNetwork(
                 input_dim=agent_data["input_dim"],
                 hidden_dim=self.get_hidden_dim_from_state_dict(agent_data["policy_net"]),
@@ -278,34 +303,56 @@ class AgentBattlegroundGUI:
             policy_nets[agent_id] = policy_net
 
             obp_model_state = agent_data["obp_model"]
-            if obp_model_state:
-                obp_input_dim = 5 if agent_data["obs_version"] == 1 else 4
+            if obp_model_state is not None:
+                obp_hidden_dim = get_hidden_dim_from_state_dict(obp_model_state, layer_prefix='fc1')
+                obp_input_dim = obp_model_state["fc1.weight"].shape[1]
                 obp_model = OpponentBehaviorPredictor(
                     input_dim=obp_input_dim,
-                    hidden_dim=config.OPPONENT_HIDDEN_DIM,
+                    hidden_dim=obp_hidden_dim,
                     output_dim=2
-                )
+                ).to(device)
                 obp_model.load_state_dict(obp_model_state)
-                obp_model.to(device).eval()
+                obp_model.eval()
                 obp_models[agent_id] = obp_model
             else:
                 obp_models[agent_id] = None
 
+        logger.debug("policy_nets keys: %s", list(policy_nets.keys()))
+        logger.debug("obp_models keys: %s", list(obp_models.keys()))
+        logger.debug("Environment possible agents: %s", env.possible_agents)
+
         env.reset()
         while env.agent_selection is not None:
             current_agent = env.agent_selection
+
             obs, reward, termination, truncation, info = env.last()
-            
             if termination or truncation:
                 env.step(None)
                 continue
 
+            logger.debug("Current agent: %s", current_agent)
             if current_agent in policy_nets:
+                if current_agent not in obp_models:
+                    logger.error("Current agent %s not found in obp_models! Available keys: %s",
+                                current_agent, list(obp_models.keys()))
+                try:
+                    ai_policy_net = policy_nets[current_agent]
+                    ai_obp_model = obp_models[current_agent]
+                except KeyError as e:
+                    logger.exception("KeyError accessing AI models for agent %s: %s", current_agent, e)
+                    raise
+
+                try:
+                    agent_obs = obs[current_agent]
+                except KeyError as e:
+                    logger.exception("KeyError accessing observation for agent %s. Obs: %s", current_agent, obs)
+                    raise
+
                 action = self.choose_action(
                     current_agent,
-                    policy_nets[current_agent],
-                    obp_models[current_agent],
-                    obs[current_agent],
+                    ai_policy_net,
+                    ai_obp_model,
+                    agent_obs,
                     info['action_mask'],
                     device,
                     env.num_players,
@@ -314,22 +361,29 @@ class AgentBattlegroundGUI:
                     uses_memories[current_agent]
                 )
             else:
+                try:
+                    agent_obs = obs[current_agent]
+                except KeyError as e:
+                    logger.exception("KeyError accessing observation for hardcoded agent %s. Obs: %s", current_agent, obs)
+                    raise
+
                 action = hardcoded_agent.play_turn(
-                    obs[current_agent],
+                    agent_obs,
                     info['action_mask'],
                     env.table_card
                 )
                 if not isinstance(action, int):
-                    logger.error(f"Hardcoded agent {hardcoded_agent.__class__.__name__} returned non-integer action: {action}")
+                    logger.error("Hardcoded agent %s returned non-integer action: %s", 
+                                hardcoded_agent.__class__.__name__, action)
                     raise ValueError(f"Hardcoded agent {hardcoded_agent.__class__.__name__} returned non-integer action: {action}")
-            
+
             env.step(action)
-        
+
         max_reward = max(env.rewards.values())
         winners = [agent for agent, reward in env.rewards.items() if reward == max_reward]
         winner = winners[0]
-        hardcoded_agent_id = f"player_{env.num_players - 1}"  # 'player_2'
-        
+        hardcoded_agent_id = f"player_{env.num_players - 1}"  # e.g., 'player_2'
+
         if winner in ai_agents:
             return winner
         elif winner == hardcoded_agent_id:
@@ -340,10 +394,10 @@ class AgentBattlegroundGUI:
     def choose_action(self, agent_id, policy_net, obp_model, observation, action_mask, device, num_players, obs_version, input_dim, uses_memory):
         """Selects an action using OBP inference and, if applicable, transformer‐based memory integration."""
         converted_obs = adapt_observation_for_version(observation, num_players, obs_version)
-        logging.debug(f"Converted observation (length {len(converted_obs)}): {converted_obs}")
+        logger.debug(f"Converted observation (length {len(converted_obs)}): {converted_obs}")
 
-        obp_probs = run_obp_inference(obp_model, converted_obs, device, num_players, obs_version)
-        logging.debug(f"OBP probabilities: {obp_probs}")
+        obp_probs = run_obp_inference(obp_model, converted_obs, device, num_players, obs_version, agent_id, self.current_env)
+        logger.debug(f"OBP probabilities: {obp_probs}")
 
         if obs_version == 2 and uses_memory:
             required_mem_dim = input_dim - (len(converted_obs) + len(obp_probs))
@@ -366,7 +420,6 @@ class AgentBattlegroundGUI:
                         mem_summary = query_opponent_memory_full(agent_id, opp)
                         features_list = convert_memory_to_features(mem_summary, global_response2idx, global_action2idx)
                         if features_list:
-                            # Create a float tensor of continuous features.
                             feature_tensor = torch.tensor(features_list, dtype=torch.float, device=device).unsqueeze(0)
                             global global_event_encoder, global_strategy_transformer
                             if global_event_encoder is None:
@@ -395,12 +448,10 @@ class AgentBattlegroundGUI:
                                 if os.path.exists(transformer_checkpoint_path):
                                     ckpt = torch.load(transformer_checkpoint_path, map_location=device)
                                     global_strategy_transformer.load_state_dict(ckpt["transformer_state_dict"], strict=False)
-                                # Override the token embedding to bypass index lookup.
                                 global_strategy_transformer.token_embedding = torch.nn.Identity()
                                 global_strategy_transformer.classification_head = None
                                 global_strategy_transformer.eval()
                             with torch.no_grad():
-                                # First, project the continuous features.
                                 projected = global_event_encoder(feature_tensor)
                                 embedding, _ = global_strategy_transformer(projected)
                             mem_features_list.append(embedding.cpu().numpy().flatten())
@@ -430,11 +481,11 @@ class AgentBattlegroundGUI:
             final_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32), mem_features], axis=0)
         else:
             final_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32)], axis=0)
-        logging.debug(f"Final observation (length {len(final_obs)}): {final_obs}")
+        logger.debug(f"Final observation (length {len(final_obs)}): {final_obs}")
         
         expected_dim = input_dim
         actual_dim = final_obs.shape[0]
-        logging.debug(f"Expected dim: {expected_dim}, Actual dim: {actual_dim}")
+        logger.debug(f"Expected dim: {expected_dim}, Actual dim: {actual_dim}")
         assert actual_dim == expected_dim, f"Expected observation dimension {expected_dim}, got {actual_dim}"
         
         observation_tensor = torch.tensor(final_obs, dtype=torch.float32).unsqueeze(0).to(device)
@@ -448,10 +499,10 @@ class AgentBattlegroundGUI:
             masked_probs /= masked_probs.sum()
         m = torch.distributions.Categorical(masked_probs)
         action = m.sample().item()
-        logging.debug(f"Action probabilities: {masked_probs.cpu().numpy()}")
-        logging.debug(f"Selected action: {action}")
+        logger.debug(f"Action probabilities: {masked_probs.cpu().numpy()}")
+        logger.debug(f"Selected action: {action}")
         if action_mask[action] == 6:
-            logging.debug("Challenge Action Selected")
+            logger.debug("Challenge Action Selected")
         return action
 
     def display_results(self, results):
