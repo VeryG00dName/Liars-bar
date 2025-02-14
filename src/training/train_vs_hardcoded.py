@@ -8,7 +8,7 @@ import numpy as np
 from sklearn.discriminant_analysis import StandardScaler
 import torch
 import torch.nn as nn
-import torch.nn.functional as F  # For cosine similarity.
+import torch.nn.functional as F  # For cosine similarity and loss functions.
 import torch.optim as optim
 from torch.distributions import Categorical
 
@@ -73,6 +73,18 @@ def convert_memory_to_features(memory, response_mapping, action_mapping):
         act_val = float(action_mapping.get(act, 0))
         features.append([resp_val, act_val, penalties, card_count])
     return features
+
+# ---------------------------
+# Define a mapping from hard-coded agent class names to integer labels.
+# (Make sure config.NUM_OPPONENT_CLASSES matches the number of entries here.)
+HARD_CODED_LABELS = {
+    "GreedyCardSpammer": 0,
+    "StrategicChallenger": 1,
+    "TableNonTableAgent": 2,
+    "Classic": 3,
+    "TableFirstConservativeChallenger": 4,
+    "SelectiveTableConservativeChallenger": 5,
+}
 
 # ---------------------------
 # Instantiate the device.
@@ -167,6 +179,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
     optimizers_value = {}
     memories = {}
 
+    # IMPORTANT: When training, we now want the policy network to include the auxiliary classification head.
     for agent in agents:
         policy_net = PolicyNetwork(
             input_dim=config.INPUT_DIM,  # Includes: base observation + OBP output + strategy embeddings.
@@ -174,7 +187,9 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
             output_dim=config.OUTPUT_DIM,
             use_lstm=True,
             use_dropout=True,
-            use_layer_norm=True
+            use_layer_norm=True,
+            use_aux_classifier=True,             # Enable auxiliary classification.
+            num_opponent_classes=config.NUM_OPPONENT_CLASSES  # New config parameter.
         ).to(device)
         value_net = ValueNetwork(
             input_dim=config.INPUT_DIM,
@@ -231,7 +246,8 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
     original_agent_order = list(env.agents)
 
     # Hard-coded agents to choose from if randomizing.
-    hardcoded_agent_classes = [GreedyCardSpammer, StrategicChallenger, TableNonTableAgent, Classic ,TableFirstConservativeChallenger, SelectiveTableConservativeChallenger]
+    hardcoded_agent_classes = [GreedyCardSpammer, StrategicChallenger, TableNonTableAgent, Classic,
+                               TableFirstConservativeChallenger, SelectiveTableConservativeChallenger]
 
     # Declare variables to hold the current hard-coded agent across episodes.
     current_hardcoded_agent_id = None
@@ -347,7 +363,8 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 log_prob_value = 0.0
             else:
                 observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
-                probs, _ = policy_nets[agent](observation_tensor, None)
+                # Note: Now the policy network returns (action_probs, hidden_state, opponent_logits)
+                probs, _, _ = policy_nets[agent](observation_tensor, None)
                 probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
 
                 mask_t = torch.tensor(action_mask, dtype=torch.float32, device=device)
@@ -454,9 +471,11 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 policy_losses = []
                 value_losses = []
                 entropies = []
+                classification_losses = []  # To track auxiliary classifier loss
 
                 for _ in range(config.K_EPOCHS):
-                    probs, _ = policy_nets[agent](states, None)
+                    # Note: the forward now returns (probs, hidden_state, opponent_logits)
+                    probs, _, opponent_logits = policy_nets[agent](states, None)
                     probs = torch.clamp(probs, 1e-8, 1.0)
                     masked_probs = probs * action_masks_
                     row_sums = masked_probs.sum(dim=-1, keepdim=True)
@@ -477,41 +496,56 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                     policy_loss -= static_entropy_coef * entropy
                     state_values = value_nets[agent](states).squeeze()
                     value_loss = nn.MSELoss()(state_values, returns_)
+    
+                    # New: Compute auxiliary classification loss using the target hard-coded label.
+                    if opponent_logits is not None:
+                        if current_hardcoded_agent_instance is not None:
+                            label_name = current_hardcoded_agent_instance.__class__.__name__
+                            hardcoded_label = HARD_CODED_LABELS.get(label_name, 0)
+                        else:
+                            hardcoded_label = 0  # Fallback label.
+                        target_labels = torch.full((opponent_logits.size(0),), hardcoded_label, dtype=torch.long, device=device)
+                        classification_loss = F.cross_entropy(opponent_logits, target_labels)
+                        classification_losses.append(classification_loss.item())
+                        predicted_labels = opponent_logits.argmax(dim=1)
+                        accuracy = (predicted_labels == target_labels).float().mean().item()
+                        writer.add_scalar(f"Accuracy/Classification/{agent}", accuracy, episode)
+                        total_loss = policy_loss + 0.5 * value_loss + config.AUX_LOSS_WEIGHT * classification_loss
+                    else:
+                        total_loss = policy_loss + 0.5 * value_loss
+    
                     policy_losses.append(policy_loss.item())
                     value_losses.append(value_loss.item())
                     entropies.append(entropy.item())
-                    total_loss = policy_loss + 0.5 * value_loss
-
-                    optimizers_policy[agent].zero_grad()
-                    optimizers_value[agent].zero_grad()
                     total_loss.backward()
-
+    
                     p_grad_norm = 0.0
                     for param in policy_nets[agent].parameters():
                         if param.grad is not None:
                             p_grad_norm += param.grad.data.norm(2).item() ** 2
                     p_grad_norm = p_grad_norm ** 0.5
                     policy_grad_norms.append(p_grad_norm)
-
+    
                     v_grad_norm = 0.0
                     for param in value_nets[agent].parameters():
                         if param.grad is not None:
                             v_grad_norm += param.grad.data.norm(2).item() ** 2
                     v_grad_norm = v_grad_norm ** 0.5
                     value_grad_norms.append(v_grad_norm)
-
+    
                     torch.nn.utils.clip_grad_norm_(policy_nets[agent].parameters(), max_norm=config.MAX_NORM)
                     torch.nn.utils.clip_grad_norm_(value_nets[agent].parameters(), max_norm=config.MAX_NORM)
                     optimizers_policy[agent].step()
                     optimizers_value[agent].step()
-
+    
                 avg_policy_loss = np.mean(policy_losses)
                 avg_value_loss = np.mean(value_losses)
                 avg_entropy = np.mean(entropies)
                 avg_kl_div = np.mean(kl_divs)
                 avg_policy_grad_norm = np.mean(policy_grad_norms)
                 avg_value_grad_norm = np.mean(value_grad_norms)
-
+                avg_classification_loss = np.mean(classification_losses) if classification_losses else 0.0
+    
                 if log_tensorboard and writer is not None:
                     writer.add_scalar(f"Loss/Policy/{agent}", avg_policy_loss, episode)
                     writer.add_scalar(f"Loss/Value/{agent}", avg_value_loss, episode)
@@ -520,18 +554,19 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                     writer.add_scalar(f"KL_Divergence/{agent}", avg_kl_div, episode)
                     writer.add_scalar(f"Gradient_Norms/Policy/{agent}", avg_policy_grad_norm, episode)
                     writer.add_scalar(f"Gradient_Norms/Value/{agent}", avg_value_grad_norm, episode)
-
+                    writer.add_scalar(f"Loss/Classification/{agent}", avg_classification_loss, episode)
+    
             for agent in agents:
                 if agent != current_hardcoded_agent_id:
                     memories[agent].reset()
-
+    
         if len(obp_memory) > 100:
             avg_loss_obp, accuracy = train_obp(obp_model, obp_optimizer, obp_memory, device, logger)
             if avg_loss_obp is not None and accuracy is not None and log_tensorboard and writer is not None:
                 writer.add_scalar("OBP/Loss", avg_loss_obp, episode)
                 writer.add_scalar("OBP/Accuracy", accuracy, episode)
             obp_memory = []
-
+    
         if episode % config.CHECKPOINT_INTERVAL == 0 and load_checkpoint:
             save_checkpoint(
                 policy_nets,
@@ -544,23 +579,24 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 checkpoint_dir=checkpoint_dir
             )
             logger.info(f"Saved global checkpoint at episode {episode}.")
-
+    
         steps_since_log += steps_in_episode
         episodes_since_log += 1
-
+    
         if episode % config.LOG_INTERVAL == 0:
             avg_rewards_str = ", ".join([f"{agent}: {avg_rewards.get(agent, 0.0):.2f}" for agent in original_agent_order])
             avg_steps_per_episode = steps_since_log / episodes_since_log
             elapsed_time = time.time() - last_log_time
             steps_per_second = steps_since_log / elapsed_time if elapsed_time > 0 else 0.0
-
+    
             logger.info(
                 f"Episode {episode}\tAverage Rewards: [{avg_rewards_str}]\t"
                 f"Avg Steps/Ep: {avg_steps_per_episode:.2f}\t"
                 f"Time since last log: {elapsed_time:.2f} seconds\t"
                 f"Steps/s: {steps_per_second:.2f}"
+                f"accuracy: {accuracy:.2f}"
             )
-
+    
             if log_tensorboard and writer is not None:
                 for agent, reward in avg_rewards.items():
                     writer.add_scalar(f"Average Reward/{agent}", reward, episode)
@@ -571,16 +607,16 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                             action_counts_periodic[agent][action],
                             episode
                         )
-
+    
             for agent in agents:
                 invalid_action_counts_periodic[agent] = 0
                 for action in range(config.OUTPUT_DIM):
                     action_counts_periodic[agent][action] = 0
-
+    
             last_log_time = time.time()
             steps_since_log = 0
             episodes_since_log = 0
-
+    
             if episode % config.CULL_INTERVAL == 0:
                 average_rewards = {}
                 for agent in agents:
@@ -588,11 +624,11 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                         average_rewards[agent] = sum(recent_rewards[agent]) / len(recent_rewards[agent])
                     else:
                         average_rewards[agent] = 0.0
-
+    
                 lowest_agent = min(average_rewards, key=average_rewards.get)
                 lowest_score = average_rewards[lowest_agent]
                 logger.info(f"Culling Agent '{lowest_agent}' with average reward {lowest_score:.2f}.")
-
+    
                 if lowest_agent != current_hardcoded_agent_id:
                     policy_nets[lowest_agent] = PolicyNetwork(
                         input_dim=config.INPUT_DIM,
@@ -600,7 +636,9 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                         output_dim=config.OUTPUT_DIM,
                         use_lstm=True,
                         use_dropout=True,
-                        use_layer_norm=True
+                        use_layer_norm=True,
+                        use_aux_classifier=True,
+                        num_opponent_classes=config.NUM_OPPONENT_CLASSES
                     ).to(device)
                     value_nets[lowest_agent] = ValueNetwork(
                         input_dim=config.INPUT_DIM,
@@ -612,10 +650,10 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                     optimizers_value[lowest_agent] = optim.Adam(value_nets[lowest_agent].parameters(), lr=config.LEARNING_RATE)
                     memories[lowest_agent] = RolloutMemory([lowest_agent])
                     recent_rewards[lowest_agent] = []
-
+    
     if log_tensorboard and writer is not None:
         writer.close()
-
+    
     trained_agents = {}
     for agent in agents:
         trained_agents[agent] = {
@@ -623,7 +661,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
             'value_net': value_nets[agent],
             'obp_model': obp_model
         }
-
+    
     return {
         'agents': trained_agents,
         'optimizers_policy': optimizers_policy,
