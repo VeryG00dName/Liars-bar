@@ -199,13 +199,23 @@ class PlayVsAIGUI:
             hidden_dim = self.get_hidden_dim_from_state_dict(policy_state)
             output_dim = self.current_env.action_spaces[agent_id].n
 
-            # When constructing the network, we now use the expected input dimension.
+            # Check for auxiliary classifier presence.
+            if "fc_classifier.weight" in policy_state:
+                use_aux_classifier = True
+                num_opponent_classes = config.NUM_OPPONENT_CLASSES
+            else:
+                use_aux_classifier = False
+                num_opponent_classes = None
+
+            # Construct the policy network accordingly.
             policy_net = PolicyNetwork(
                 input_dim=expected_input_dim,
                 hidden_dim=hidden_dim,
                 output_dim=output_dim,
                 use_lstm=True,
-                use_layer_norm=True
+                use_layer_norm=True,
+                use_aux_classifier=use_aux_classifier,
+                num_opponent_classes=num_opponent_classes
             )
             policy_net.load_state_dict(policy_state)
             policy_net.to(device).eval()
@@ -213,13 +223,29 @@ class PlayVsAIGUI:
             
             obp_model_state = agent_data["obp_model_state"]
             if obp_model_state:
-                obp_input_dim = config.OPPONENT_INPUT_DIM  # For example, 4
-                obp_hidden_dim = config.OPPONENT_HIDDEN_DIM  # Ensure this matches your architecture
-                obp_model = OpponentBehaviorPredictor(
-                    input_dim=obp_input_dim,
-                    hidden_dim=obp_hidden_dim,
-                    output_dim=2
-                )
+                # Determine OBP model type based on fc1.weight shape.
+                fc1_weight = obp_model_state.get("fc1.weight")
+                if fc1_weight is None:
+                    raise ValueError("OBP checkpoint missing fc1.weight")
+                if fc1_weight.shape[1] == config.OPPONENT_INPUT_DIM + config.STRATEGY_DIM:
+                    obp_input_dim = config.OPPONENT_INPUT_DIM
+                    obp_hidden_dim = config.OPPONENT_HIDDEN_DIM
+                    obp_model = OpponentBehaviorPredictor(
+                        input_dim=obp_input_dim,
+                        hidden_dim=obp_hidden_dim,
+                        output_dim=2,
+                        memory_dim=config.STRATEGY_DIM
+                    )
+                elif fc1_weight.shape[1] == config.OPPONENT_INPUT_DIM:
+                    obp_input_dim = config.OPPONENT_INPUT_DIM
+                    obp_hidden_dim = config.OPPONENT_HIDDEN_DIM
+                    obp_model = OpponentBehaviorPredictor(
+                        input_dim=obp_input_dim,
+                        hidden_dim=obp_hidden_dim,
+                        output_dim=2
+                    )
+                else:
+                    raise ValueError(f"Unexpected OBP input dimension: {fc1_weight.shape[1]}")
                 obp_model.load_state_dict(obp_model_state)
                 obp_model.to(device).eval()
                 obp_models[agent_id] = obp_model
@@ -259,20 +285,19 @@ class PlayVsAIGUI:
             else:
                 # Human player's turn
                 self.current_env.render('player')
-                action = self.get_human_action()
+                # Pass the current action_mask to disable invalid buttons.
+                action = self.get_human_action(info['action_mask'])
             
             self.current_env.step(action)
         self.show_game_result()
         self.current_env.close()
 
     def choose_action(self, agent_id, policy_net, obp_model, observation, device, num_players, action_mask, uses_memory=False):
-        """Selects an action for an AI agent by combining the raw observation, OBP predictions, and, if applicable, memory features."""
+        global global_strategy_transformer  # Declare global before using it.
         num_opponents = num_players - 1
         opp_feature_dim = config.OPPONENT_INPUT_DIM  # Typically 4
         
         # Extract opponent features from the observation.
-        # (Here we assume the observation is arranged as:
-        #  [hand_vector (length 2), last_action_val (length 1), active_players (length num_players), opponent features...])
         hand_vector_length = 2
         last_action_val_length = 1
         active_players_length = num_players
@@ -284,11 +309,90 @@ class PlayVsAIGUI:
 
         # Run OBP inference for each opponent.
         obp_probs = []
-        for opp_feat in opponent_features:
+        for idx, opp_feat in enumerate(opponent_features):
             opp_feat_tensor = torch.tensor(opp_feat, dtype=torch.float32, device=device).unsqueeze(0)
             with torch.no_grad():
                 if obp_model:
-                    logits = obp_model(opp_feat_tensor)
+                    if uses_memory:
+                        # Obtain memory summary for the opponent.
+                        opp_id = self.current_env.possible_agents[idx]  # Assuming order matches.
+                        mem_summary = query_opponent_memory_full(agent_id, opp_id)
+                        # Print out the number of entries in the memory summary.
+                        if mem_summary is not None:
+                            logger.info(f"Memory summary for opponent '{opp_id}' has {len(mem_summary)} entries.")
+                        else:
+                            logger.info(f"Memory summary for opponent '{opp_id}' is empty.")
+                        # Process the memory summary to obtain a memory embedding.
+                        if mem_summary:
+                            class Vocabulary:
+                                def __init__(self, max_size):
+                                    self.token2idx = {"<PAD>": 0, "<UNK>": 1}
+                                    self.idx2token = {0: "<PAD>", 1: "<UNK>"}
+                                    self.max_size = max_size
+                                def encode(self, token):
+                                    if token in self.token2idx:
+                                        return self.token2idx[token]
+                                    else:
+                                        if len(self.token2idx) < self.max_size:
+                                            idx = len(self.token2idx)
+                                            self.token2idx[token] = idx
+                                            self.idx2token[idx] = token
+                                            return idx
+                                        else:
+                                            return self.token2idx["<UNK>"]
+                            def convert_memory_to_tokens(memory, vocab):
+                                tokens = []
+                                for event in memory:
+                                    if isinstance(event, dict):
+                                        sorted_items = sorted(event.items())
+                                        token_str = "_".join(f"{k}-{v}" for k, v in sorted_items)
+                                    else:
+                                        token_str = str(event)
+                                    tokens.append(vocab.encode(token_str))
+                                return tokens
+                            vocab_inst = Vocabulary(max_size=config.STRATEGY_NUM_TOKENS)
+                            token_seq = convert_memory_to_tokens(mem_summary, vocab_inst)
+                            if token_seq:
+                                token_tensor = torch.tensor(token_seq, dtype=torch.long, device=device).unsqueeze(0)
+                            else:
+                                token_tensor = None
+                        else:
+                            token_tensor = None
+                        if token_tensor is not None:
+                            if global_strategy_transformer is None:
+                                from src.model.new_models import StrategyTransformer
+                                global_strategy_transformer = StrategyTransformer(
+                                    num_tokens=config.STRATEGY_NUM_TOKENS,
+                                    token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM,
+                                    nhead=config.STRATEGY_NHEAD,
+                                    num_layers=config.STRATEGY_NUM_LAYERS,
+                                    strategy_dim=config.STRATEGY_DIM,
+                                    num_classes=config.STRATEGY_NUM_CLASSES,
+                                    dropout=config.STRATEGY_DROPOUT,
+                                    use_cls_token=True
+                                ).to(device)
+                                transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
+                                if os.path.exists(transformer_checkpoint_path):
+                                    state_dict = torch.load(transformer_checkpoint_path, map_location=device)
+                                    if "transformer_state_dict" in state_dict:
+                                        state_dict = state_dict["transformer_state_dict"]
+                                    global_strategy_transformer.load_state_dict(state_dict, strict=False)
+                                    logger.info(f"Loaded transformer from '{transformer_checkpoint_path}'.")
+                                else:
+                                    logger.warning("Transformer checkpoint not found, using randomly initialized transformer.")
+                                global_strategy_transformer.classification_head = None
+                                global_strategy_transformer.eval()
+                            with torch.no_grad():
+                                memory_embedding, _ = global_strategy_transformer(token_tensor)
+                        else:
+                            memory_embedding = torch.zeros(1, config.STRATEGY_DIM, device=device)
+                    else:
+                        memory_embedding = None
+                    # Call OBP model with memory_embedding if available.
+                    if memory_embedding is not None:
+                        logits = obp_model(opp_feat_tensor, memory_embedding)
+                    else:
+                        logits = obp_model(opp_feat_tensor)
                     probs = torch.softmax(logits, dim=-1)
                     bluff_prob = probs[0, 1].item()  # Probability of bluffing
                 else:
@@ -301,8 +405,6 @@ class PlayVsAIGUI:
             non_memory_dim = len(observation) + len(obp_probs)
             required_mem_dim = expected_dim - non_memory_dim
 
-            # Use transformer-based memory integration if the required memory dimension matches
-            # config.STRATEGY_DIM * (num_players - 1)
             if required_mem_dim == config.STRATEGY_DIM * (num_players - 1):
                 # --- Transformer-based memory integration ---
                 class Vocabulary:
@@ -340,7 +442,6 @@ class PlayVsAIGUI:
                         mem_summary = query_opponent_memory_full(agent_id, opp)
                         token_seq = convert_memory_to_tokens(mem_summary, vocab_inst)
                         token_tensor = torch.tensor(token_seq, dtype=torch.long, device=device).unsqueeze(0)
-                        global global_strategy_transformer
                         if global_strategy_transformer is None:
                             from src.model.new_models import StrategyTransformer
                             global_strategy_transformer = StrategyTransformer(
@@ -356,10 +457,12 @@ class PlayVsAIGUI:
                             transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
                             if os.path.exists(transformer_checkpoint_path):
                                 state_dict = torch.load(transformer_checkpoint_path, map_location=device)
-                                global_strategy_transformer.load_state_dict(state_dict)
-                                logging.info(f"Loaded transformer from '{transformer_checkpoint_path}'.")
+                                if "transformer_state_dict" in state_dict:
+                                    state_dict = state_dict["transformer_state_dict"]
+                                global_strategy_transformer.load_state_dict(state_dict, strict=False)
+                                logger.info(f"Loaded transformer from '{transformer_checkpoint_path}'.")
                             else:
-                                logging.warning("Transformer checkpoint not found, using randomly initialized transformer.")
+                                logger.warning("Transformer checkpoint not found, using randomly initialized transformer.")
                             global_strategy_transformer.classification_head = None
                             global_strategy_transformer.eval()
                         with torch.no_grad():
@@ -381,7 +484,6 @@ class PlayVsAIGUI:
                 else:
                     mem_features = np.array([], dtype=np.float32)
             
-            # Pad or truncate mem_features to match the required dimension.
             current_mem_dim = mem_features.shape[0]
             if current_mem_dim < required_mem_dim:
                 pad = np.zeros(required_mem_dim - current_mem_dim, dtype=np.float32)
@@ -393,22 +495,22 @@ class PlayVsAIGUI:
         else:
             final_obs = np.concatenate([observation, np.array(obp_probs, dtype=np.float32)], axis=0)
 
-        # Verify that the constructed observation has the correct dimension.
         expected_dim = policy_net.fc1.in_features
         actual_dim = final_obs.shape[0]
         assert actual_dim == expected_dim, f"Expected observation dimension {expected_dim}, got {actual_dim}"
         
         observation_tensor = torch.tensor(final_obs, dtype=torch.float32).unsqueeze(0).to(device)
         
-        # Get action probabilities from the policy network.
         with torch.no_grad():
-            action_probs, _ = policy_net(observation_tensor)
+            output = policy_net(observation_tensor)
+            if isinstance(output, tuple):
+                action_probs = output[0]
+            else:
+                action_probs = output
         
-        # Apply the action mask.
         mask_tensor = torch.tensor(action_mask, dtype=torch.float32).to(device)
         masked_probs = action_probs * mask_tensor
         if masked_probs.sum() == 0:
-            # Fallback to uniform distribution over valid actions.
             masked_probs = mask_tensor / mask_tensor.sum()
         else:
             masked_probs /= masked_probs.sum()
@@ -416,22 +518,20 @@ class PlayVsAIGUI:
         m = torch.distributions.Categorical(masked_probs)
         action = m.sample().item()
         
-        logging.debug(f"Action probabilities: {masked_probs.cpu().numpy()}")
-        logging.debug(f"Selected action: {action}")
+        logger.debug(f"Action probabilities: {masked_probs.cpu().numpy()}")
+        logger.debug(f"Selected action: {action}")
         return action
 
-    def get_human_action(self):
+    def get_human_action(self, action_mask):
         action_window = tk.Toplevel(self.root)
         action_window.title("Your Turn")
 
-        # This variable will store the selected action (0-6)
         action_var = tk.IntVar(value=-1)
 
         def select_action(action_value):
             action_var.set(action_value)
             action_window.destroy()
 
-        # Define the actions and their labels
         actions = [
             (0, "Play 1 Table Card (Action 0)"),
             (1, "Play 2 Table Cards (Action 1)"),
@@ -442,16 +542,14 @@ class PlayVsAIGUI:
             (6, "Challenge (Action 6)")
         ]
 
-        # Create a button for each action
         for action_value, label in actions:
+            # Disable the button if the corresponding action mask is 0.
+            state = tk.NORMAL if action_mask[action_value] != 0 else tk.DISABLED
             btn = ttk.Button(action_window, text=label,
-                             command=lambda val=action_value: select_action(val))
+                             command=lambda val=action_value: select_action(val), state=state)
             btn.pack(padx=10, pady=5, fill=tk.X)
 
-        # Wait for the user to select an action
         action_window.wait_window()
-
-        # Return the action that was selected
         return action_var.get()
 
 
