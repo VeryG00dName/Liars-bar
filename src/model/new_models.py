@@ -5,24 +5,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class PolicyNetwork(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, use_lstm=True, use_dropout=True, use_layer_norm=True):
+    def __init__(self, input_dim, hidden_dim, output_dim, use_lstm=True, use_dropout=True, use_layer_norm=True,
+                 use_aux_classifier=False, num_opponent_classes=None):
         super(PolicyNetwork, self).__init__()
         self.use_lstm = use_lstm
         self.use_dropout = use_dropout
         self.use_layer_norm = use_layer_norm
+        self.use_aux_classifier = use_aux_classifier
 
-        # Enhanced layers
+        # Core network layers.
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, hidden_dim)
         
         if self.use_lstm:
-            self.lstm = nn.LSTM(hidden_dim, hidden_dim, num_layers=2, batch_first=True)  # Deeper LSTM
+            self.lstm = nn.LSTM(hidden_dim, hidden_dim, num_layers=2, batch_first=True)
             self.fc4 = nn.Linear(hidden_dim, output_dim)
         else:
             self.fc4 = nn.Linear(hidden_dim, output_dim)
 
-        # Regularization
         if self.use_dropout:
             self.dropout = nn.Dropout(p=0.3)
         if self.use_layer_norm:
@@ -30,25 +31,43 @@ class PolicyNetwork(nn.Module):
             self.layer_norm2 = nn.LayerNorm(hidden_dim)
             self.layer_norm3 = nn.LayerNorm(hidden_dim)
 
+        # Optional auxiliary classification head.
+        if self.use_aux_classifier:
+            if num_opponent_classes is None:
+                raise ValueError("num_opponent_classes must be provided when use_aux_classifier is True")
+            self.fc_classifier = nn.Linear(hidden_dim, num_opponent_classes)
+        else:
+            self.fc_classifier = None
+
     def forward(self, x, hidden_state=None):
-        x = F.gelu(self.fc1(x))  # GELU activation
+        # First layer.
+        x = F.gelu(self.fc1(x))
         if self.use_layer_norm:
             x = self.layer_norm1(x)
         if self.use_dropout:
             x = self.dropout(x)
         
+        # Second layer.
         x = F.gelu(self.fc2(x))
         if self.use_layer_norm:
             x = self.layer_norm2(x)
         if self.use_dropout:
             x = self.dropout(x)
         
+        # Third layer.
         x = F.gelu(self.fc3(x))
         if self.use_layer_norm:
             x = self.layer_norm3(x)
         if self.use_dropout:
             x = self.dropout(x)
         
+        # Optionally, produce auxiliary classification logits using the hidden representation.
+        if self.use_aux_classifier:
+            opponent_logits = self.fc_classifier(x)
+        else:
+            opponent_logits = None
+        
+        # Continue with the original forward pass.
         if self.use_lstm:
             x = x.unsqueeze(1)
             x, hidden_state = self.lstm(x, hidden_state)
@@ -58,7 +77,7 @@ class PolicyNetwork(nn.Module):
             action_logits = self.fc4(x)
         
         action_probs = F.softmax(action_logits, dim=-1)
-        return action_probs, hidden_state
+        return action_probs, hidden_state, opponent_logits
 
 class ValueNetwork(nn.Module):
     def __init__(self, input_dim, hidden_dim, use_dropout=True, use_layer_norm=True):
