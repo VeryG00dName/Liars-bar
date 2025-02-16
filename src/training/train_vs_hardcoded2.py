@@ -223,14 +223,16 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
         "GreedyCardSpammer": deque(maxlen=200),
         "TableNonTableAgent": deque(maxlen=200)
     }
+    # For Phase 4, we create a separate history.
+    phase4_history = deque(maxlen=200)
 
     # Phases:
     # Phase 1: Train vs. GreedyCardSpammer.
     # Phase 2: Train vs. TableNonTableAgent.
-    # Alternate between Phase 1 and Phase 2 for a few cycles, then move to Phase 3.
-    phase = 1
+    # Phase 3: Alternate between the two opponents every 10 episodes.
+    # Phase 4: Fixed dual opponent – player_1 is GreedyCardSpammer and player_2 is TableNonTableAgent.
+    phase = 4
     phase_cycle = 0  # Count full cycles (Phase1->2->1->2)
-    # In Phase 3, alternate in 10-episode stretches.
     phase3_stretch_counter = 0
     current_phase3_type = None
 
@@ -247,14 +249,21 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
         # Set up opponents based on phase.
         if phase in [1, 2]:
             current_bot_class = GreedyCardSpammer if phase == 1 else TableNonTableAgent
-        else:
+            bot1_instance = current_bot_class("player_1")
+            bot2_instance = current_bot_class("player_2")
+        elif phase == 3:
             if phase3_stretch_counter % 10 == 0 or current_phase3_type is None:
                 current_phase3_type = random.choice(["GreedyCardSpammer", "TableNonTableAgent"])
             current_bot_class = GreedyCardSpammer if current_phase3_type == "GreedyCardSpammer" else TableNonTableAgent
+            bot1_instance = current_bot_class("player_1")
+            bot2_instance = current_bot_class("player_2")
             phase3_stretch_counter += 1
-
-        bot1_instance = current_bot_class("player_1")
-        bot2_instance = current_bot_class("player_2")
+        elif phase == 4:
+            # Phase 4: Fixed dual opponents.
+            bot1_instance = GreedyCardSpammer("player_1")
+            bot2_instance = TableNonTableAgent("player_2")
+        else:
+            raise ValueError(f"Unknown phase: {phase}")
 
         # Per-episode counters.
         episode_rewards = {agent: 0 for agent in agents}
@@ -302,7 +311,7 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
                 final_obs = np.concatenate([observation, np.array(obp_probs, dtype=np.float32), normalized_transformer_features], axis=0)
 
                 obs_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
-                # NOTE: The forward now returns (action_probs, opponent_logits)
+                # NOTE: The forward now returns (action_probs, _, opponent_logits)
                 probs, _, opponent_logits = policy_net(obs_tensor, None)
                 probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
                 mask_t = torch.tensor(action_mask, dtype=torch.float32, device=device)
@@ -331,7 +340,6 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
             env.step(action)
             # ---- Update pending rewards ----
             if current_agent == rl_agent:
-                # Add any pending rewards to the current reward.
                 reward = env.rewards[rl_agent] + pending_rewards[rl_agent]
                 pending_rewards[rl_agent] = 0.0
                 state_value = value_net(torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)).item()
@@ -346,7 +354,6 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
                     action_mask=action_mask
                 )
             else:
-                # For bot agents, accumulate their rewards as pending.
                 pending_rewards[current_agent] += env.rewards[current_agent]
             episode_rewards[current_agent] += env.rewards[current_agent]
 
@@ -365,8 +372,10 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
                 phase1_history.append(rl_win)
             else:
                 phase2_history.append(rl_win)
-        else:
+        elif phase == 3:
             phase3_history[current_phase3_type].append(rl_win)
+        elif phase == 4:
+            phase4_history.append(rl_win)
 
         interval_reward_sum += episode_rewards[rl_agent]
         interval_steps_sum += steps_in_episode
@@ -397,6 +406,9 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
             for bot_type, history in phase3_history.items():
                 win_rate_phase3[bot_type] = sum(history) / len(history) if history else 0.0
                 writer.add_scalar(f"WinRate/Phase3_{bot_type}", win_rate_phase3[bot_type], episode)
+            win_rate_phase4 = sum(phase4_history) / len(phase4_history) if phase4_history else 0.0
+            writer.add_scalar("WinRate/Phase4", win_rate_phase4, episode)
+
             if phase in [1, 2]:
                 if phase == 1:
                     writer.add_scalar("WinRate/Phase1", win_rate_phase1, episode)
@@ -408,13 +420,16 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
 
             log_message = (f"Episode {episode} | Avg Reward: {avg_reward:.2f} | "
                            f"Avg Steps/Ep: {avg_steps_per_episode:.2f} | "
-                           f"Elapsed Time: {elapsed_time:.2f}s | Steps/s: {steps_per_second:.2f} | ")
+                           f"Elapsed Time: {elapsed_time:.2f}s | Steps/s: {steps_per_second:.2f} | "
+                           f"accuracy: {np.mean(classification_accuracies):.2f} | ")
             if phase1_history:
                 log_message += f"Phase1 WinRate: {win_rate_phase1*100:.1f}% | "
             if phase2_history:
                 log_message += f"Phase2 WinRate: {win_rate_phase2*100:.1f}% | "
             for bot_type, wr in win_rate_phase3.items():
                 log_message += f"Phase3 {bot_type} WinRate: {wr*100:.1f}% | "
+            if phase == 4:
+                log_message += f"Phase4 WinRate: {win_rate_phase4*100:.1f}% | "
             logger.info(log_message)
 
             interval_reward_sum = 0
@@ -444,13 +459,18 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
                         phase3_history[bot].clear()
                     phase3_stretch_counter = 0
                     current_phase3_type = None
-        else:
+        elif phase == 3:
             done_phase3 = True
             for bot_type, history in phase3_history.items():
                 if len(history) < 200 or (sum(history)/len(history)) < 0.70:
                     done_phase3 = False
             if done_phase3:
-                logger.info("Training complete: Rolling win rate >= 70% against both bot types in Phase 3.")
+                logger.info("Phase 3 complete: Achieved rolling win rate >= 70% against both bot types. Moving to Phase 4.")
+                phase = 4
+                phase4_history.clear()
+        elif phase == 4:
+            if len(phase4_history) >= 200 and (sum(phase4_history)/len(phase4_history)) >= 0.80:
+                logger.info("Training complete: Rolling win rate >= 70% in Phase 4 against both opponents.")
                 break
 
         # Compute GAE and update policy.
@@ -486,13 +506,18 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
             value_losses = []
             entropies = []
             classification_losses = []
+            classification_accuracies = []
 
             # Determine the target label from the current bot type.
-            # Both opponents are of the same class in this episode.
-            bot_label = HARD_CODED_LABELS[current_bot_class.__name__]
+            # Both opponents are of the same class in this episode for phases 1,2,3.
+            if phase in [1, 2, 3]:
+                bot_label = HARD_CODED_LABELS[current_bot_class.__name__]
+            else:
+                # For phase 4, we combine the two labels into one measure.
+                # Here, we choose the label from player_1 (GreedyCardSpammer) as target.
+                bot_label = HARD_CODED_LABELS["GreedyCardSpammer"]
 
             for _ in range(config.K_EPOCHS):
-                # Forward pass now returns both policy and classification outputs.
                 probs, _, opponent_logits = policy_net(states, None)
                 probs = torch.clamp(probs, 1e-8, 1.0)
                 masked_probs = probs * action_masks_
@@ -517,11 +542,14 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
     
                 total_loss = policy_loss + 0.5 * value_loss
 
-                # Compute auxiliary classification loss.
+                # Compute auxiliary classification loss and accuracy.
                 if opponent_logits is not None:
                     target_labels = torch.full((opponent_logits.size(0),), bot_label, dtype=torch.long, device=device)
                     classification_loss = F.cross_entropy(opponent_logits, target_labels)
                     classification_losses.append(classification_loss.item())
+                    predicted_labels = opponent_logits.argmax(dim=1)
+                    accuracy = (predicted_labels == target_labels).float().mean().item()
+                    classification_accuracies.append(accuracy)
                     total_loss += config.AUX_LOSS_WEIGHT * classification_loss
 
                 policy_losses.append(policy_loss.item())
@@ -542,6 +570,7 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
             writer.add_scalar("KL_Divergence", np.mean(kl_divs), episode)
             if classification_losses:
                 writer.add_scalar("Loss/Classification", np.mean(classification_losses), episode)
+                writer.add_scalar("Accuracy/Classification", np.mean(classification_accuracies), episode)
     
             grad_norm_policy = np.sqrt(sum(p.grad.data.norm(2).item() ** 2 for p in policy_net.parameters() if p.grad is not None))
             grad_norm_value = np.sqrt(sum(p.grad.data.norm(2).item() ** 2 for p in value_net.parameters() if p.grad is not None))
