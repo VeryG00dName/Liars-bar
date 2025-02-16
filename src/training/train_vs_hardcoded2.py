@@ -93,24 +93,19 @@ strategy_transformer = StrategyTransformer(
 transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
 if os.path.exists(transformer_checkpoint_path):
     checkpoint = torch.load(transformer_checkpoint_path, map_location=device)
-    
-    # Load transformer state in non-strict mode.
     strategy_transformer.load_state_dict(checkpoint["transformer_state_dict"], strict=False)
     print(f"Loaded transformer from {transformer_checkpoint_path}")
-    
     if "response2idx" in checkpoint and "action2idx" in checkpoint:
         response2idx = checkpoint["response2idx"]
         action2idx = checkpoint["action2idx"]
         print("Loaded response and action mappings from checkpoint.")
     else:
         raise ValueError("Checkpoint is missing response2idx and/or action2idx.")
-    
     if "label_mapping" in checkpoint:
         label_mapping = checkpoint["label_mapping"]
         label2idx = label_mapping["label2idx"]
         idx2label = label_mapping["idx2label"]
         print("Loaded label mapping from checkpoint.")
-    
     event_encoder = EventEncoder(
         response_vocab_size=len(response2idx),
         action_vocab_size=len(action2idx),
@@ -124,6 +119,15 @@ else:
 strategy_transformer.token_embedding = nn.Identity()
 strategy_transformer.classification_head = None
 strategy_transformer.eval()
+
+# ---------------------------
+# Define mapping for hard-coded opponent labels.
+# In this training setting we have two types of bots.
+# ---------------------------
+HARD_CODED_LABELS = {
+    "GreedyCardSpammer": 0,
+    "TableNonTableAgent": 1,
+}
 
 # ---------------------------
 # Logger configuration.
@@ -152,14 +156,16 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
     agents = [rl_agent] + bot_agents
     config.set_derived_config(env.observation_spaces[rl_agent], env.action_spaces[rl_agent], num_opponents=2)
 
-    # Initialize the RL networks, optimizer, and memory.
+    # Instantiate the RL networks with an auxiliary classification head.
     policy_net = PolicyNetwork(
         input_dim=config.INPUT_DIM,  # base observation + OBP output + strategy embeddings.
         hidden_dim=config.HIDDEN_DIM,
         output_dim=config.OUTPUT_DIM,
         use_lstm=True,
         use_dropout=True,
-        use_layer_norm=True
+        use_layer_norm=True,
+        use_aux_classifier=True,              # Enable auxiliary classification.
+        num_opponent_classes=len(HARD_CODED_LABELS)  # Here: 2
     ).to(device)
     value_net = ValueNetwork(
         input_dim=config.INPUT_DIM,
@@ -176,7 +182,7 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
         input_dim=config.OPPONENT_INPUT_DIM, 
         hidden_dim=config.OPPONENT_HIDDEN_DIM, 
         output_dim=2,
-        memory_dim=config.STRATEGY_DIM  # transformer memory embedding dimension
+        memory_dim=config.STRATEGY_DIM
     ).to(device)
     obp_optimizer = optim.Adam(obp_model.parameters(), lr=config.OPPONENT_LEARNING_RATE)
     obp_memory = []
@@ -205,10 +211,12 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
 
     static_entropy_coef = config.INIT_ENTROPY_COEF
     last_log_time = time.time()
-    steps_since_log = 0
-    episodes_since_log = 0
+    # Interval counters for logging.
+    interval_reward_sum = 0
+    interval_steps_sum = 0
+    interval_episode_count = 0
 
-    # Initialize rolling windows for win rate tracking (max 200 episodes).
+    # Rolling windows for per-episode win rate (determined by env.winner) over last 200 episodes.
     phase1_history = deque(maxlen=200)
     phase2_history = deque(maxlen=200)
     phase3_history = {
@@ -219,23 +227,27 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
     # Phases:
     # Phase 1: Train vs. GreedyCardSpammer.
     # Phase 2: Train vs. TableNonTableAgent.
-    # We'll alternate between Phase 1 and Phase 2 a couple of times before moving to Phase 3.
+    # Alternate between Phase 1 and Phase 2 for a few cycles, then move to Phase 3.
     phase = 1
-    # Count how many full cycles (switch from Phase 1->2->1->2) we've done.
-    phase_cycle = 0  
-    # In Phase 3, we alternate in 10-episode stretches.
+    phase_cycle = 0  # Count full cycles (Phase1->2->1->2)
+    # In Phase 3, alternate in 10-episode stretches.
     phase3_stretch_counter = 0
-    current_phase3_type = None  # Will be set when a new stretch begins.
+    current_phase3_type = None
+
+    # Global (interval) action counts.
+    interval_action_count = {i: 0 for i in range(config.OUTPUT_DIM)}
 
     global_step = 0
     episode = start_episode
     while episode <= num_episodes:
         obs, infos = env.reset()
+        # Initialize pending rewards for each agent.
+        pending_rewards = {agent: 0.0 for agent in agents}
+
         # Set up opponents based on phase.
         if phase in [1, 2]:
             current_bot_class = GreedyCardSpammer if phase == 1 else TableNonTableAgent
         else:
-            # Phase 3: alternate in 10-episode stretches.
             if phase3_stretch_counter % 10 == 0 or current_phase3_type is None:
                 current_phase3_type = random.choice(["GreedyCardSpammer", "TableNonTableAgent"])
             current_bot_class = GreedyCardSpammer if current_phase3_type == "GreedyCardSpammer" else TableNonTableAgent
@@ -244,9 +256,10 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
         bot1_instance = current_bot_class("player_1")
         bot2_instance = current_bot_class("player_2")
 
-        # Reset per-episode reward counters.
+        # Per-episode counters.
         episode_rewards = {agent: 0 for agent in agents}
         steps_in_episode = 0
+        episode_action_count = {i: 0 for i in range(config.OUTPUT_DIM)}
 
         while env.agent_selection is not None:
             steps_in_episode += 1
@@ -262,7 +275,7 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
             action_mask = env.infos[current_agent]['action_mask']
 
             if current_agent == rl_agent:
-                # RL agent processing: integrate OBP and transformer memory.
+                # Process OBP and transformer embeddings.
                 transformer_embeddings = []
                 obp_memory_embeddings = []
                 for opp in bot_agents:
@@ -277,12 +290,10 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
                         strategy_embedding = torch.zeros(1, config.STRATEGY_DIM, device=device)
                     obp_memory_embeddings.append(strategy_embedding)
                     transformer_embeddings.append(strategy_embedding.cpu().detach().numpy().flatten())
-
                 obp_probs = run_obp_inference(
                     obp_model, observation, device, num_players=3,
                     memory_embeddings=obp_memory_embeddings
                 )
-                # Build final observation for the RL agent.
                 transformer_features = (np.concatenate(transformer_embeddings, axis=0)
                                         if transformer_embeddings
                                         else np.zeros(config.STRATEGY_DIM * 2, dtype=np.float32))
@@ -290,9 +301,9 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
                 normalized_transformer_features = scaler.fit_transform(np.array(transformer_features).reshape(1, -1)).flatten()
                 final_obs = np.concatenate([observation, np.array(obp_probs, dtype=np.float32), normalized_transformer_features], axis=0)
 
-                # RL agent selects action.
                 obs_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
-                probs, _ = policy_net(obs_tensor, None)
+                # NOTE: The forward now returns (action_probs, opponent_logits)
+                probs, _, opponent_logits = policy_net(obs_tensor, None)
                 probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
                 mask_t = torch.tensor(action_mask, dtype=torch.float32, device=device)
                 masked_probs = probs * mask_t
@@ -307,8 +318,10 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
                 m = Categorical(masked_probs)
                 action = m.sample().item()
                 log_prob_value = m.log_prob(torch.tensor(action, device=device)).item()
+
+                episode_action_count[action] += 1
+                interval_action_count[action] += 1
             else:
-                # For bot agents, use the hard-coded strategy.
                 if current_agent == "player_1":
                     action = bot1_instance.play_turn(observation, action_mask, table_card=None)
                 else:
@@ -316,65 +329,111 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
                 log_prob_value = 0.0
 
             env.step(action)
+            # ---- Update pending rewards ----
             if current_agent == rl_agent:
+                # Add any pending rewards to the current reward.
+                reward = env.rewards[rl_agent] + pending_rewards[rl_agent]
+                pending_rewards[rl_agent] = 0.0
                 state_value = value_net(torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)).item()
                 memory.store_transition(
                     agent=rl_agent,
                     state=final_obs,
                     action=action,
                     log_prob=log_prob_value,
-                    reward=0,  # reward will be updated at episode end
+                    reward=reward,
                     is_terminal=env.terminations[rl_agent] or env.truncations[rl_agent],
                     state_value=state_value,
                     action_mask=action_mask
                 )
+            else:
+                # For bot agents, accumulate their rewards as pending.
+                pending_rewards[current_agent] += env.rewards[current_agent]
             episode_rewards[current_agent] += env.rewards[current_agent]
 
-        # End-of-episode processing.
-        if rl_agent in memory.rewards and len(memory.rewards[rl_agent]) > 0:
-            memory.rewards[rl_agent][-1] += env.rewards[rl_agent]
+        # End-of-episode processing: extract OBP training data.
         episode_obp_data = extract_obp_training_data(env)
         obp_memory.extend(episode_obp_data)
 
-        # Determine win (assume win if RL reward > 0).
-        rl_win = 1 if episode_rewards[rl_agent] > 0 else 0
+        # Determine per-episode win using env.winner.
+        if hasattr(env, 'winner'):
+            rl_win = 1 if env.winner == rl_agent else 0
+        else:
+            rl_win = 1 if episode_rewards[rl_agent] > 0 else 0
 
-        # Update rolling win rates and log them.
         if phase in [1, 2]:
             if phase == 1:
                 phase1_history.append(rl_win)
-                win_rate_phase1 = sum(phase1_history) / len(phase1_history)
-                writer.add_scalar("WinRate/Phase1", win_rate_phase1, episode) if writer is not None else None
             else:
                 phase2_history.append(rl_win)
-                win_rate_phase2 = sum(phase2_history) / len(phase2_history)
-                writer.add_scalar("WinRate/Phase2", win_rate_phase2, episode) if writer is not None else None
         else:
             phase3_history[current_phase3_type].append(rl_win)
-            win_rate_phase3 = sum(phase3_history[current_phase3_type]) / len(phase3_history[current_phase3_type])
-            writer.add_scalar(f"WinRate/Phase3_{current_phase3_type}", win_rate_phase3, episode) if writer is not None else None
 
-        # Logging: print win rates for each phase.
-        log_message = f"Episode {episode} | "
-        if phase1_history:
-            log_message += f"Phase1 WinRate: {sum(phase1_history)/len(phase1_history)*100:.1f}% | "
-        if phase2_history:
-            log_message += f"Phase2 WinRate: {sum(phase2_history)/len(phase2_history)*100:.1f}% | "
-        for bot_type, history in phase3_history.items():
-            if history:
-                log_message += f"Phase3 {bot_type} WinRate: {sum(history)/len(history)*100:.1f}% | "
+        interval_reward_sum += episode_rewards[rl_agent]
+        interval_steps_sum += steps_in_episode
+        interval_episode_count += 1
+
+        # OBP training: trigger whenever OBP memory exceeds 100 samples.
+        if len(obp_memory) > 100:
+            avg_loss_obp, accuracy = train_obp(obp_model, obp_optimizer, obp_memory, device, logger)
+            if writer is not None:
+                writer.add_scalar("OBP/Loss", avg_loss_obp, episode)
+                writer.add_scalar("OBP/Accuracy", accuracy, episode)
+            obp_memory = []
+
+        # Logging every config.LOG_INTERVAL episodes.
+        if episode % config.LOG_INTERVAL == 0:
+            avg_reward = interval_reward_sum / interval_episode_count
+            avg_steps_per_episode = interval_steps_sum / interval_episode_count
+            elapsed_time = time.time() - last_log_time
+            steps_per_second = interval_steps_sum / elapsed_time if elapsed_time > 0 else 0.0
+
+            writer.add_scalar("Reward/Average", avg_reward, episode)
+            writer.add_scalar("Stats/StepsPerEpisode", avg_steps_per_episode, episode)
+            writer.add_scalar("Stats/StepsPerSecond", steps_per_second, episode)
+
+            win_rate_phase1 = sum(phase1_history) / len(phase1_history) if phase1_history else 0.0
+            win_rate_phase2 = sum(phase2_history) / len(phase2_history) if phase2_history else 0.0
+            win_rate_phase3 = {}
+            for bot_type, history in phase3_history.items():
+                win_rate_phase3[bot_type] = sum(history) / len(history) if history else 0.0
+                writer.add_scalar(f"WinRate/Phase3_{bot_type}", win_rate_phase3[bot_type], episode)
+            if phase in [1, 2]:
+                if phase == 1:
+                    writer.add_scalar("WinRate/Phase1", win_rate_phase1, episode)
+                else:
+                    writer.add_scalar("WinRate/Phase2", win_rate_phase2, episode)
+
+            for action_idx, count in interval_action_count.items():
+                writer.add_scalar(f"ActionCounts/Action_{action_idx}", count, episode)
+
+            log_message = (f"Episode {episode} | Avg Reward: {avg_reward:.2f} | "
+                           f"Avg Steps/Ep: {avg_steps_per_episode:.2f} | "
+                           f"Elapsed Time: {elapsed_time:.2f}s | Steps/s: {steps_per_second:.2f} | ")
+            if phase1_history:
+                log_message += f"Phase1 WinRate: {win_rate_phase1*100:.1f}% | "
+            if phase2_history:
+                log_message += f"Phase2 WinRate: {win_rate_phase2*100:.1f}% | "
+            for bot_type, wr in win_rate_phase3.items():
+                log_message += f"Phase3 {bot_type} WinRate: {wr*100:.1f}% | "
+            logger.info(log_message)
+
+            interval_reward_sum = 0
+            interval_steps_sum = 0
+            interval_episode_count = 0
+            last_log_time = time.time()
+            interval_action_count = {i: 0 for i in range(config.OUTPUT_DIM)}
 
         # Phase transitions.
         if phase in [1, 2]:
             if phase == 1 and len(phase1_history) >= 200 and (sum(phase1_history)/len(phase1_history)) >= 0.80:
                 logger.info(f"Phase 1 complete: Rolling win rate vs GreedyCardSpammer = {sum(phase1_history)/len(phase1_history)*100:.1f}%")
                 phase = 2
+                static_entropy_coef = config.INIT_ENTROPY_COEF * 2
                 phase_cycle += 1
                 phase2_history.clear()
             elif phase == 2 and len(phase2_history) >= 200 and (sum(phase2_history)/len(phase2_history)) >= 0.80:
                 logger.info(f"Phase 2 complete: Rolling win rate vs TableNonTableAgent = {sum(phase2_history)/len(phase2_history)*100:.1f}%")
-                # Alternate cycles: go back to Phase 1 if we haven't done 2 cycles, else move to Phase 3.
-                if phase_cycle < 4:
+                if phase_cycle < 1:
                     phase = 1
                     phase_cycle += 1
                     phase1_history.clear()
@@ -386,7 +445,6 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
                     phase3_stretch_counter = 0
                     current_phase3_type = None
         else:
-            # In Phase 3, check if both rolling win rates are >=70%.
             done_phase3 = True
             for bot_type, history in phase3_history.items():
                 if len(history) < 200 or (sum(history)/len(history)) < 0.70:
@@ -400,9 +458,9 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
         dones = memory.is_terminals[rl_agent]
         values = memory.state_values[rl_agent]
         next_values = values[1:] + [0]
-        mean_reward = np.mean(rewards) if rewards else 0.0
-        std_reward = np.std(rewards) + 1e-5 if rewards else 1.0
-        normalized_rewards = (np.array(rewards) - mean_reward) / std_reward
+        mean_reward_val = np.mean(rewards) if rewards else 0.0
+        std_reward_val = np.std(rewards) + 1e-5 if rewards else 1.0
+        normalized_rewards = (np.array(rewards) - mean_reward_val) / std_reward_val
         advantages, returns_ = compute_gae(
             rewards=normalized_rewards,
             dones=dones,
@@ -427,9 +485,15 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
             policy_losses = []
             value_losses = []
             entropies = []
+            classification_losses = []
+
+            # Determine the target label from the current bot type.
+            # Both opponents are of the same class in this episode.
+            bot_label = HARD_CODED_LABELS[current_bot_class.__name__]
 
             for _ in range(config.K_EPOCHS):
-                probs, _ = policy_net(states, None)
+                # Forward pass now returns both policy and classification outputs.
+                probs, _, opponent_logits = policy_net(states, None)
                 probs = torch.clamp(probs, 1e-8, 1.0)
                 masked_probs = probs * action_masks_
                 row_sums = masked_probs.sum(dim=-1, keepdim=True)
@@ -450,11 +514,20 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
                 policy_loss -= static_entropy_coef * entropy
                 state_values = value_net(states).squeeze()
                 value_loss = nn.MSELoss()(state_values, returns_tensor)
+    
+                total_loss = policy_loss + 0.5 * value_loss
+
+                # Compute auxiliary classification loss.
+                if opponent_logits is not None:
+                    target_labels = torch.full((opponent_logits.size(0),), bot_label, dtype=torch.long, device=device)
+                    classification_loss = F.cross_entropy(opponent_logits, target_labels)
+                    classification_losses.append(classification_loss.item())
+                    total_loss += config.AUX_LOSS_WEIGHT * classification_loss
+
                 policy_losses.append(policy_loss.item())
                 value_losses.append(value_loss.item())
                 entropies.append(entropy.item())
-                total_loss = policy_loss + 0.5 * value_loss
-
+    
                 optimizer_policy.zero_grad()
                 optimizer_value.zero_grad()
                 total_loss.backward()
@@ -463,36 +536,19 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
                 optimizer_policy.step()
                 optimizer_value.step()
 
-            writer.add_scalar("Loss/Policy", np.mean(policy_losses), episode) if writer is not None else None
-            writer.add_scalar("Loss/Value", np.mean(value_losses), episode) if writer is not None else None
-            writer.add_scalar("Entropy", np.mean(entropies), episode) if writer is not None else None
-            writer.add_scalar("KL_Divergence", np.mean(kl_divs), episode) if writer is not None else None
+            writer.add_scalar("Loss/Policy", np.mean(policy_losses), episode)
+            writer.add_scalar("Loss/Value", np.mean(value_losses), episode)
+            writer.add_scalar("Entropy", np.mean(entropies), episode)
+            writer.add_scalar("KL_Divergence", np.mean(kl_divs), episode)
+            if classification_losses:
+                writer.add_scalar("Loss/Classification", np.mean(classification_losses), episode)
+    
             grad_norm_policy = np.sqrt(sum(p.grad.data.norm(2).item() ** 2 for p in policy_net.parameters() if p.grad is not None))
             grad_norm_value = np.sqrt(sum(p.grad.data.norm(2).item() ** 2 for p in value_net.parameters() if p.grad is not None))
-            writer.add_scalar("Gradient_Norms/Policy", grad_norm_policy, episode) if writer is not None else None
-            writer.add_scalar("Gradient_Norms/Value", grad_norm_value, episode) if writer is not None else None
+            writer.add_scalar("Gradient_Norms/Policy", grad_norm_policy, episode)
+            writer.add_scalar("Gradient_Norms/Value", grad_norm_value, episode)
 
             memory.reset()
-            if len(obp_memory) > 100:
-                avg_loss_obp, accuracy = train_obp(obp_model, obp_optimizer, obp_memory, device, logger)
-                writer.add_scalar("OBP/Loss", avg_loss_obp, episode) if (writer is not None and avg_loss_obp is not None) else None
-                writer.add_scalar("OBP/Accuracy", accuracy, episode) if (writer is not None and accuracy is not None) else None
-                obp_memory = []
-
-        episodes_since_log += 1
-        steps_since_log += steps_in_episode
-        if episode % config.LOG_INTERVAL == 0:
-            avg_steps_per_episode = steps_since_log / episodes_since_log
-            elapsed_time = time.time() - last_log_time
-            steps_per_second = steps_since_log / elapsed_time if elapsed_time > 0 else 0.0
-            logger.info(
-                f"Episode {episode}\tRL Reward: {episode_rewards[rl_agent]:.2f}\tSteps/Ep: {avg_steps_per_episode:.2f}\tTime: {elapsed_time:.2f}s\tSteps/s: {steps_per_second:.2f}, {log_message}"
-            )
-            writer.add_scalar("Stats/StepsPerEpisode", avg_steps_per_episode, episode) if writer is not None else None
-            writer.add_scalar("Stats/StepsPerSecond", steps_per_second, episode) if writer is not None else None
-            last_log_time = time.time()
-            episodes_since_log = 0
-            steps_since_log = 0
 
         episode += 1
 
@@ -514,7 +570,7 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
 def main():
     set_seed()
     device = torch.device(config.DEVICE)
-    if config.USE_WRAPPER: 
+    if config.USE_WRAPPER:
         base_env = LiarsDeckEnv(num_players=config.NUM_PLAYERS, render_mode=config.RENDER_MODE)
         env = RewardRestrictionWrapper2(base_env)
     else:
