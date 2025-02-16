@@ -1,4 +1,4 @@
-# src/training/train_with_transformer.py
+# src/training/train_main.py
 
 import logging
 import time
