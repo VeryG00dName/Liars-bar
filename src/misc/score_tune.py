@@ -330,7 +330,7 @@ def main():
         raise e
 
     # 3) Specify how many additional trials to run
-    N_TRIALS = 20
+    N_TRIALS = 50
 
     # 4) Run the optimization
     study.optimize(
