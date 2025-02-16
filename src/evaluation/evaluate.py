@@ -1,5 +1,4 @@
 # src/evaluation/evaluate.py
-
 import itertools
 import torch
 import os
@@ -7,7 +6,7 @@ import numpy as np
 import logging
 import json
 import random
-import time  # Added for measuring steps per second
+import time
 
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -16,7 +15,8 @@ from collections import defaultdict
 from src.env.liars_deck_env_core import LiarsDeckEnv
 from pettingzoo.utils import agent_selector
 from src.model.models import PolicyNetwork, OpponentBehaviorPredictor, ValueNetwork
-from src.model import new_models  # Import the new models module
+from src.model import new_models
+from sklearn.preprocessing import StandardScaler
 
 from src.evaluation.evaluate_utils import (
     load_combined_checkpoint,
@@ -28,27 +28,53 @@ from src.evaluation.evaluate_utils import (
     compute_ranks,
     compare_scoreboards,
     format_rank_change,
-    print_scoreboard,
-    print_action_counts,
-    plot_agent_heatmap,  # Updated plotting function
+    plot_agent_heatmap,
     adapt_observation_for_version,
-    model,  # Import the model here
+    RichProgressScoreboard,
+    run_obp_inference,
+    evaluate_agents  # Unified evaluation function
 )
 from src import config
-
-# For resetting and querying persistent memory
 from src.model.memory import get_opponent_memory
+from src.env.liars_deck_env_utils import query_opponent_memory_full
+from openskill.models import PlackettLuce
+model = PlackettLuce(mu=25.0, sigma=25.0 / 3, beta=25.0 / 6)
+import warnings
+warnings.filterwarnings("ignore", message="enable_nested_tensor is True, but self.use_nested_tensor is False", category=UserWarning)
+warnings.filterwarnings("ignore", message="You are using `torch.load` with `weights_only=False`", category=FutureWarning)
 
-# --- Global transformer & encoder variables (for transformer‐based memory integration) ---
+# Global variables for transformer-based memory integration (if needed elsewhere)
 global_strategy_transformer = None
 global_event_encoder = None
 global_response2idx = None
 global_action2idx = None
 
+def convert_memory_to_features(memory, response_mapping, action_mapping):
+    """
+    Convert the opponent memory (a list of events) to a list of 4-dimensional feature vectors.
+    """
+    features = []
+    for event in memory:
+        if not isinstance(event, dict):
+            raise ValueError(f"Memory event is not a dictionary: {event}.")
+        resp = event.get("response", "")
+        act = event.get("triggering_action", "")
+        penalties = float(event.get("penalties", 0))
+        card_count = float(event.get("card_count", 0))
+        resp_val = float(response_mapping.get(resp, 0))
+        act_val = float(action_mapping.get(act, 0))
+        features.append([resp_val, act_val, penalties, card_count])
+    return features
+
 def initialize_players(players_dir, device):
     """
     Loads checkpoints from subdirectories of players_dir. Models with input dimension 26
     are now treated as new (obs_version 2). Also records whether a player uses persistent memory.
+    
+    IMPORTANT: When loading the OBP, the code checks the shape of fc1.weight in the saved
+    state_dict. If its second dimension equals config.OPPONENT_INPUT_DIM + config.STRATEGY_DIM,
+    the new OBP (from new_models) is instantiated (with memory_dim=config.STRATEGY_DIM);
+    otherwise, the old OBP (from models) is used.
     """
     players = {}
     logger = logging.getLogger("Evaluate")
@@ -80,12 +106,28 @@ def initialize_players(players_dir, device):
                     obp_model = None
                     if obp_model_state is not None:
                         obp_hidden_dim = get_hidden_dim_from_state_dict(obp_model_state, layer_prefix='fc1')
-                        obp_input_dim = 5 if obs_version == 1 else 4
-                        obp_model = OpponentBehaviorPredictor(
-                            input_dim=obp_input_dim,
-                            hidden_dim=obp_hidden_dim,
-                            output_dim=2
-                        ).to(device)
+                        fc1_weight = obp_model_state.get("fc1.weight", None)
+                        if fc1_weight is None:
+                            raise ValueError("OBP state dict missing fc1.weight")
+                        if fc1_weight.shape[1] == config.OPPONENT_INPUT_DIM + config.STRATEGY_DIM:
+                            # New OBP version that accepts a memory embedding.
+                            from src.model.new_models import OpponentBehaviorPredictor as OBPClass
+                            obp_model = OBPClass(
+                                input_dim=config.OPPONENT_INPUT_DIM,
+                                hidden_dim=obp_hidden_dim,
+                                output_dim=2,
+                                memory_dim=config.STRATEGY_DIM
+                            ).to(device)
+                        elif fc1_weight.shape[1] == config.OPPONENT_INPUT_DIM:
+                            # Old OBP version.
+                            from src.model.models import OpponentBehaviorPredictor as OBPClass
+                            obp_model = OBPClass(
+                                input_dim=config.OPPONENT_INPUT_DIM,
+                                hidden_dim=obp_hidden_dim,
+                                output_dim=2
+                            ).to(device)
+                        else:
+                            raise ValueError(f"Unexpected OBP input dimension: {fc1_weight.shape[1]}")
                         obp_model.load_state_dict(obp_model_state)
                         obp_model.eval()
 
@@ -145,392 +187,72 @@ def initialize_players(players_dir, device):
                     logger.error(f"Error loading {checkpoint_file} in {version}: {str(e)}")
     return players
 
-
-def run_obp_inference(obp_model, obs, device, num_players, agent_version, current_agent, env):
-    """
-    Runs OBP inference for an observation.
-    
-    For old OBP models (version 1 or 2), OBP is called with only the opponent feature vector.
-    For new OBP models (version 3) that expect a memory embedding, this function computes a
-    real memory embedding by querying persistent memory for each opponent and processing it
-    through the event encoder and transformer.
-    """
-    logger = logging.getLogger("Evaluate")
-    if obp_model is None:
-        num_opponents = num_players - 1
-        logger.debug(f"No OBP model available for agent version {agent_version}. Returning default 0.0s.")
-        return [0.0] * num_opponents
-
-    if agent_version == 1:
-        opp_feature_dim = 5
-    elif agent_version == 2:
-        opp_feature_dim = 4
-    else:
-        raise ValueError(f"Unknown agent_version: {agent_version}")
-
-    # Detect if OBP is new (version 3) by checking fc1 input dim.
-    fc1_weight = obp_model.state_dict().get("fc1.weight", None)
-    is_new_obp = False
-    if fc1_weight is not None:
-        input_dim = fc1_weight.shape[1]
-        if input_dim == config.OPPONENT_INPUT_DIM + config.STRATEGY_DIM:
-            is_new_obp = True
-
-    num_opponents = num_players - 1
-    opp_features_start = len(obs) - (num_opponents * opp_feature_dim)
-
-    # Determine opponent IDs (assuming env.possible_agents is defined).
-    opponents = [opp for opp in env.possible_agents if opp != current_agent]
-    obp_probs = []
-    for i, opp in enumerate(opponents):
-        start_idx = opp_features_start + i * opp_feature_dim
-        end_idx = start_idx + opp_feature_dim
-        opp_vec = obs[start_idx:end_idx]
-        opp_vec_tensor = torch.tensor(opp_vec, dtype=torch.float32, device=device).unsqueeze(0)
-        with torch.no_grad():
-            if is_new_obp:
-                # --- Compute a real memory embedding for this opponent ---
-                global global_response2idx, global_action2idx, global_event_encoder, global_strategy_transformer
-                transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
-                if global_response2idx is None or global_action2idx is None:
-                    if os.path.exists(transformer_checkpoint_path):
-                        ckpt = torch.load(transformer_checkpoint_path, map_location=device)
-                        global_response2idx = ckpt.get("response2idx", {})
-                        global_action2idx = ckpt.get("action2idx", {})
-                    else:
-                        global_response2idx = {}
-                        global_action2idx = {}
-                from src.env.liars_deck_env_utils import query_opponent_memory_full, convert_memory_to_features
-                mem_summary = query_opponent_memory_full(current_agent, opp)
-                features_list = convert_memory_to_features(mem_summary, global_response2idx, global_action2idx)
-                if features_list:
-                    feature_tensor = torch.tensor(features_list, dtype=torch.float32, device=device).unsqueeze(0)
-                    if global_event_encoder is None:
-                        from src.training.train_transformer import EventEncoder
-                        global_event_encoder = EventEncoder(
-                            response_vocab_size=len(global_response2idx),
-                            action_vocab_size=len(global_action2idx),
-                            token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM
-                        ).to(device)
-                        if os.path.exists(transformer_checkpoint_path):
-                            ckpt = torch.load(transformer_checkpoint_path, map_location=device)
-                            global_event_encoder.load_state_dict(ckpt["event_encoder_state_dict"])
-                            global_event_encoder.eval()
-                    if global_strategy_transformer is None:
-                        from src.model.new_models import StrategyTransformer
-                        global_strategy_transformer = StrategyTransformer(
-                            num_tokens=config.STRATEGY_NUM_TOKENS,
-                            token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM,
-                            nhead=config.STRATEGY_NHEAD,
-                            num_layers=config.STRATEGY_NUM_LAYERS,
-                            strategy_dim=config.STRATEGY_DIM,
-                            num_classes=config.STRATEGY_NUM_CLASSES,
-                            dropout=config.STRATEGY_DROPOUT,
-                            use_cls_token=True
-                        ).to(device)
-                        if os.path.exists(transformer_checkpoint_path):
-                            ckpt = torch.load(transformer_checkpoint_path, map_location=device)
-                            global_strategy_transformer.load_state_dict(ckpt["transformer_state_dict"], strict=False)
-                            global_strategy_transformer.eval()
-                        # Override the token embedding so continuous inputs are accepted.
-                        global_strategy_transformer.token_embedding = torch.nn.Identity()
-                        global_strategy_transformer.classification_head = None
-                    with torch.no_grad():
-                        memory_emb, _ = global_strategy_transformer(global_event_encoder(feature_tensor))
-                else:
-                    memory_emb = torch.zeros((1, config.STRATEGY_DIM), dtype=torch.float32, device=device)
-                logits = obp_model(opp_vec_tensor, memory_emb)
-            else:
-                logits = obp_model(opp_vec_tensor)
-            probs = torch.softmax(logits, dim=-1)
-            obp_probs.append(probs[0, 1].item())
-    return obp_probs
-
-
-def evaluate_agents(env, device, players_in_this_game, episodes=11):
-    """
-    Plays a number of games with the same players and returns statistics.
-    For new models (obs_version == 2) that use memory, the final observation is constructed
-    as [converted_obs, OBP output, memory_features_padded]. If the required memory dimension equals
-    config.STRATEGY_DIM*(env.num_players-1), transformer-based memory integration is used.
-    Otherwise, the old memory integration (via query_opponent_memory) is applied.
-    """
-    logger = logging.getLogger("Evaluate")
-    player_ids = list(players_in_this_game.keys())
-    if len(player_ids) != env.num_players:
-        raise ValueError("Number of players in the game doesn't match environment's num_players.")
-
-    agent_to_player = {f'player_{i}': player_ids[i] for i in range(env.num_players)}
-    
-    # Reset persistent memory for players that use memory and are new (obs_version == 2)
-    for env_agent in agent_to_player:
-        pid = agent_to_player[env_agent]
-        if players_in_this_game[pid].get('uses_memory', False) and players_in_this_game[pid]['obs_version'] == 2:
-            get_opponent_memory(env_agent).memory.clear()
-
-    # Assuming 7 actions
-    action_counts = {pid: {action: 0 for action in range(7)} for pid in player_ids}
-    cumulative_wins = {pid: 0 for pid in player_ids}
-    total_steps = 0
-    game_wins_list = []
-    start_time = time.time()
-
-    for game_idx in range(1, episodes + 1):
-        env.reset()
-        env.agents = list(agent_to_player.keys())
-        env._agent_selector = agent_selector(env.agents)
-        env.agent_selection = env._agent_selector.next() if env.agents else None
-
-        steps_in_game = 0
-        game_wins = {pid: 0 for pid in player_ids}
-
-        while env.agent_selection is not None:
-            steps_in_game += 1
-            agent = env.agent_selection
-            obs, reward, termination, truncation, info = env.last()
-            if env.terminations.get(agent, False) or env.truncations.get(agent, False):
-                env.step(None)
-                continue
-
-            observation = env.observe(agent)
-            if isinstance(observation, dict):
-                observation = observation.get(agent, None)
-            if not isinstance(observation, np.ndarray):
-                logger.error(f"Expected np.ndarray, got {type(observation)}.")
-                env.step(None)
-                continue
-
-            player_id = agent_to_player[agent]
-            player_data = players_in_this_game[player_id]
-            obp_model = player_data.get('obp_model', None)
-            version = player_data['obs_version']
-
-            converted_obs = adapt_observation_for_version(observation, env.num_players, version)
-            # Pass current agent and env into run_obp_inference so that real memory embedding is computed.
-            obp_probs = run_obp_inference(obp_model, converted_obs, device, env.num_players, version, agent, env)
-
-            # Build the default observation
-            default_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32)], axis=0)
-            expected_dim = player_data['policy_net'].fc1.in_features
-
-            # For new models that use memory (obs_version == 2)
-            if player_data.get('uses_memory', False) and version == 2:
-                required_mem_dim = expected_dim - (len(converted_obs) + len(obp_probs))
-                # Decide whether to use transformer-based integration.
-                if required_mem_dim == config.STRATEGY_DIM * (env.num_players - 1):
-                    # --- Transformer-based memory integration (using tokenized memory) ---
-                    class Vocabulary:
-                        def __init__(self, max_size):
-                            self.token2idx = {"<PAD>": 0, "<UNK>": 1}
-                            self.idx2token = {0: "<PAD>", 1: "<UNK>"}
-                            self.max_size = max_size
-                        def encode(self, token):
-                            if token in self.token2idx:
-                                return self.token2idx[token]
-                            else:
-                                if len(self.token2idx) < self.max_size:
-                                    idx = len(self.token2idx)
-                                    self.token2idx[token] = idx
-                                    self.idx2token[idx] = token
-                                    return idx
-                                else:
-                                    return self.token2idx["<UNK>"]
-
-                    def convert_memory_to_tokens(memory, vocab):
-                        tokens = []
-                        for event in memory:
-                            if isinstance(event, dict):
-                                sorted_items = sorted(event.items())
-                                token_str = "_".join(f"{k}-{v}" for k, v in sorted_items)
-                            else:
-                                token_str = str(event)
-                            tokens.append(vocab.encode(token_str))
-                        return tokens
-
-                    vocab_inst = Vocabulary(max_size=config.STRATEGY_NUM_TOKENS)
-                    from src.env.liars_deck_env_utils import query_opponent_memory_full
-                    mem_features_list = []
-                    for opp in env.possible_agents:
-                        if opp != agent:
-                            mem_summary = query_opponent_memory_full(agent, opp)
-                            token_seq = convert_memory_to_tokens(mem_summary, vocab_inst)
-                            token_tensor = torch.tensor(token_seq, dtype=torch.long, device=device).unsqueeze(0)
-                            global global_strategy_transformer
-                            if global_strategy_transformer is None:
-                                from src.model.new_models import StrategyTransformer
-                                global_strategy_transformer = StrategyTransformer(
-                                    num_tokens=config.STRATEGY_NUM_TOKENS,
-                                    token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM,
-                                    nhead=config.STRATEGY_NHEAD,
-                                    num_layers=config.STRATEGY_NUM_LAYERS,
-                                    strategy_dim=config.STRATEGY_DIM,
-                                    num_classes=config.STRATEGY_NUM_CLASSES,
-                                    dropout=config.STRATEGY_DROPOUT,
-                                    use_cls_token=True
-                                ).to(device)
-                                transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
-                                if os.path.exists(transformer_checkpoint_path):
-                                    ckpt = torch.load(transformer_checkpoint_path, map_location=device)
-                                    # Extract the transformer-specific state dict if it exists
-                                    state_dict = ckpt.get("transformer_state_dict", ckpt)
-                                    global_strategy_transformer.load_state_dict(state_dict, strict=False)
-                                    logging.info(f"Loaded transformer from '{transformer_checkpoint_path}'.")
-                                else:
-                                    logging.warning("Transformer checkpoint not found, using randomly initialized transformer.")
-                                global_strategy_transformer.classification_head = None
-                                global_strategy_transformer.eval()
-                            with torch.no_grad():
-                                embedding, _ = global_strategy_transformer(token_tensor)
-                            mem_features_list.append(embedding.cpu().numpy().flatten())
-                    if mem_features_list:
-                        mem_features = np.concatenate(mem_features_list, axis=0)
-                    else:
-                        mem_features = np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
-                else:
-                    from src.env.liars_deck_env_utils import query_opponent_memory
-                    mem_features_list = []
-                    for opp in env.possible_agents:
-                        if opp != agent:
-                            mem_summary = query_opponent_memory(agent, opp)
-                            mem_features_list.append(mem_summary)
-                    if mem_features_list:
-                        mem_features = np.concatenate(mem_features_list, axis=0)
-                    else:
-                        mem_features = np.array([], dtype=np.float32)
-                current_mem_dim = mem_features.shape[0]
-                if current_mem_dim < required_mem_dim:
-                    pad = np.zeros(required_mem_dim - current_mem_dim, dtype=np.float32)
-                    mem_features = np.concatenate([mem_features, pad], axis=0)
-                elif current_mem_dim > required_mem_dim:
-                    mem_features = mem_features[:required_mem_dim]
-                final_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32), mem_features], axis=0)
-            else:
-                final_obs = default_obs
-
-            if len(final_obs) != expected_dim:
-                raise ValueError(
-                    f"Observation dimension mismatch for {player_id}. Expected {expected_dim}, got {len(final_obs)}. Version: {version}"
-                )
-
-            obs_tensor = torch.tensor(final_obs, dtype=torch.float32).unsqueeze(0).to(device)
-            policy_net = player_data['policy_net']
-            with torch.no_grad():
-                probs, _ = policy_net(obs_tensor, None)
-            probs = torch.clamp(probs, 1e-8, 1.0)
-            mask = env.infos[agent].get('action_mask', [1] * 7)
-            mask_tensor = torch.tensor(mask, dtype=torch.float32).to(device)
-            masked_probs = probs * mask_tensor
-            if masked_probs.sum() <= 0:
-                logger.warning(f"All actions masked for {agent}; using uniform.")
-                masked_probs = mask_tensor + 1e-8
-            masked_probs /= masked_probs.sum()
-            m = torch.distributions.Categorical(masked_probs)
-            action = m.sample().item()
-            if action in action_counts[player_id]:
-                action_counts[player_id][action] += 1
-            env.step(action)
-
-        # Track winner for this game.
-        winner_agent = env.winner
-        if winner_agent:
-            winner_player = agent_to_player.get(winner_agent, None)
-            if winner_player:
-                game_wins[winner_player] += 1
-            else:
-                logger.error(f"Winner agent {winner_agent} not found.")
-        else:
-            logger.warning("No winner detected.")
-        for pid in player_ids:
-            cumulative_wins[pid] += game_wins[pid]
-        total_steps += steps_in_game
-        game_wins_list.append(game_wins)
-
-    end_time = time.time()
-    elapsed_time = end_time - start_time
-    steps_per_sec = total_steps / elapsed_time if elapsed_time > 0 else 0
-    avg_steps = total_steps / episodes if episodes > 0 else 0
-    return cumulative_wins, action_counts, game_wins_list, avg_steps, steps_per_sec
-
-
 def run_evaluation(env, device, players, num_games_per_triple=11):
-    """
-    Conducts evaluation over all triples of players.
-    For each triple, resets persistent memory for new (memory‐using) players and aggregates statistics.
-    """
     logger = logging.getLogger("Evaluate")
     player_ids = list(players.keys())
     triples_list = list(itertools.combinations(player_ids, 3))
     random.shuffle(triples_list)
-    total_triples = len(triples_list)
+
+    # Initialize the shared progress/scoreboard
+    progress_ui = RichProgressScoreboard(total_steps=len(triples_list), players=players)
+    old_scoreboard = load_scoreboard()
+    differences = compare_scoreboards(old_scoreboard, players)
 
     global_action_counts = {pid: {a: 0 for a in range(7)} for pid in players}
     global_wins = {pid: 0 for pid in players}
     global_games = {pid: 0 for pid in players}
     total_steps = 0
-    total_steps_per_sec = 0.0
     agent_head_to_head = defaultdict(lambda: defaultdict(int))
 
-    for idx, triple in enumerate(triples_list, start=1):
-        logger.info(f"Evaluating triple {idx}/{total_triples}: {triple}")
-        players_in_this_game = {pid: players[pid] for pid in triple}
-        # Reset memory for new players (obs_version 2 with memory)
-        for env_agent in [f'player_{i}' for i in range(3)]:
-            pid = triple[int(env_agent.split('_')[1])]
-            if players_in_this_game[pid].get('uses_memory', False) and players_in_this_game[pid]['obs_version'] == 2:
-                get_opponent_memory(env_agent).memory.clear()
+    try:
+        for idx, triple in enumerate(triples_list, 1):
+            players_in_this_game = {pid: players[pid] for pid in triple}
+            # (Clear memory if needed...)
+            cumulative_wins, action_counts, game_wins_list, avg_steps, steps_per_sec = evaluate_agents(
+                env,
+                device,
+                players_in_this_game,
+                episodes=num_games_per_triple
+            )
 
-        cumulative_wins, action_counts, game_wins_list, avg_steps, steps_per_sec = evaluate_agents(
-            env,
-            device,
-            players_in_this_game,
-            episodes=num_games_per_triple
-        )
+            for pid in triple:
+                global_wins[pid] += cumulative_wins[pid]
+                global_games[pid] += num_games_per_triple
+                for a in range(7):
+                    global_action_counts[pid][a] += action_counts[pid][a]
+                players[pid]['win_rate'] = global_wins[pid] / global_games[pid] if global_games[pid] > 0 else 0.0
 
-        for pid in triple:
-            global_wins[pid] += cumulative_wins[pid]
-            global_games[pid] += num_games_per_triple
-            for a in range(7):
-                global_action_counts[pid][a] += action_counts[pid][a]
-        total_steps += avg_steps * num_games_per_triple
-        total_steps_per_sec += steps_per_sec * num_games_per_triple
+            total_steps += avg_steps * num_games_per_triple
 
-        ranks = assign_final_ranks(triple, cumulative_wins)
-        update_openskill_batch(players, triple, ranks)
-        triple_ranked = list(zip(triple, ranks))
-        for i, (pid_i, rank_i) in enumerate(triple_ranked):
-            for j, (pid_j, rank_j) in enumerate(triple_ranked):
-                if i == j:
-                    continue
-                if rank_i < rank_j:
-                    agent_head_to_head[pid_i][pid_j] += 1
+            ranks = assign_final_ranks(triple, cumulative_wins)
+            update_openskill_batch(players, triple, ranks)
+            triple_ranked = list(zip(triple, ranks))
+            for i, (pid_i, rank_i) in enumerate(triple_ranked):
+                for j, (pid_j, rank_j) in enumerate(triple_ranked):
+                    if i == j:
+                        continue
+                    if rank_i < rank_j:
+                        agent_head_to_head[pid_i][pid_j] += 1
 
-        logger.info(f"Triple {idx}/{total_triples} wins: {cumulative_wins}, steps/ep: {avg_steps:.2f}, steps/sec: {steps_per_sec:.2f}")
-
-    for pid in player_ids:
-        if global_games[pid] > 0:
-            players[pid]['win_rate'] = global_wins[pid] / global_games[pid]
-        else:
-            players[pid]['win_rate'] = 0.0
+            differences = compare_scoreboards(old_scoreboard, players)
+            progress_ui.update(increment=1, differences=differences)
+                
+        differences = compare_scoreboards(old_scoreboard, players)
+        progress_ui.update(differences=differences)
+    finally:
+        progress_ui.close()
 
     return global_action_counts, agent_head_to_head
 
-
 def main():
-    """
-    Main function to execute the evaluation process.
-    """
+    # Simplified logging setup.
     logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        level=logging.WARNING,
+        format='%(message)s',
         handlers=[logging.StreamHandler()]
     )
-    logger = logging.getLogger("Evaluate")
     device = torch.device(config.DEVICE)
-    logger.info(f"Using device: {device}")
-
-    old_scoreboard = load_scoreboard("scoreboard.json")
-    logger.info(f"Loaded old scoreboard with {len(old_scoreboard)} players.")
-
+    old_scoreboard = load_scoreboard()
     players_dir = config.PLAYERS_DIR
     if not os.path.isdir(players_dir):
         raise FileNotFoundError(f"The directory '{players_dir}' does not exist.")
@@ -539,12 +261,9 @@ def main():
     obs, infos = env.reset()
     agents = env.agents
     config.set_derived_config(env.observation_spaces[agents[0]], env.action_spaces[agents[0]], config.NUM_PLAYERS - 1)
-    logger.info(f"Config INPUT_DIM: {config.INPUT_DIM}, OUTPUT_DIM: {config.OUTPUT_DIM}")
-
     players = initialize_players(players_dir, device)
     if len(players) < 3:
         raise ValueError("Need at least 3 players for evaluation.")
-    logger.info(f"Loaded {len(players)} total players.")
 
     NUM_GAMES_PER_TRIPLE = config.NUM_GAMES_PER_MATCH
 
@@ -552,16 +271,16 @@ def main():
         env,
         device,
         players,
-        num_games_per_triple=NUM_GAMES_PER_TRIPLE
+        num_games_per_triple=config.NUM_GAMES_PER_MATCH
     )
-
-    differences = compare_scoreboards(old_scoreboard, players)
-    print_scoreboard(players, differences=differences)
-    print_action_counts(players, action_counts)
+    # Final scoreboard update
+    differences = compare_scoreboards(load_scoreboard(), players)
+    ui = RichProgressScoreboard(total_steps=0, players=players)
+    ui.update(differences=differences)
+    ui.close()
     plot_agent_heatmap(agent_h2h, "Agent vs. Agent Win Counts")
     save_scoreboard(players, "scoreboard.json")
-    logger.info("Saved new scoreboard to 'scoreboard.json'.")
-
+    logging.getLogger("Evaluate").warning("Saved new scoreboard to 'scoreboard.json'.")
 
 if __name__ == "__main__":
     main()
