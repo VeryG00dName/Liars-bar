@@ -291,12 +291,15 @@ class AgentBattlegroundGUI:
             input_dims[agent_id] = agent_data["input_dim"]
             uses_memories[agent_id] = agent_data["uses_memory"]
 
+            # Instantiate the new PolicyNetwork with auxiliary classifier enabled.
             policy_net = PolicyNetwork(
                 input_dim=agent_data["input_dim"],
                 hidden_dim=self.get_hidden_dim_from_state_dict(agent_data["policy_net"]),
                 output_dim=env.action_spaces[agent_id].n,
                 use_lstm=True,
-                use_layer_norm=True
+                use_layer_norm=True,
+                use_aux_classifier=True,
+                num_opponent_classes=config.NUM_OPPONENT_CLASSES
             )
             policy_net.load_state_dict(agent_data["policy_net"])
             policy_net.to(device).eval()
@@ -332,9 +335,6 @@ class AgentBattlegroundGUI:
 
             logger.debug("Current agent: %s", current_agent)
             if current_agent in policy_nets:
-                if current_agent not in obp_models:
-                    logger.error("Current agent %s not found in obp_models! Available keys: %s",
-                                current_agent, list(obp_models.keys()))
                 try:
                     ai_policy_net = policy_nets[current_agent]
                     ai_obp_model = obp_models[current_agent]
@@ -490,7 +490,8 @@ class AgentBattlegroundGUI:
         
         observation_tensor = torch.tensor(final_obs, dtype=torch.float32).unsqueeze(0).to(device)
         with torch.no_grad():
-            action_probs, _ = policy_net(observation_tensor, None)
+            # Update: Unpack three outputs, ignoring the auxiliary classification logits.
+            action_probs, _, _ = policy_net(observation_tensor, None)
         mask_tensor = torch.tensor(action_mask, dtype=torch.float32).to(device)
         masked_probs = action_probs * mask_tensor
         if masked_probs.sum() == 0:
