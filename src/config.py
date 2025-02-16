@@ -35,21 +35,21 @@ USE_WRAPPER = False           # Set to True to use the reward restriction wrappe
 DEFAULT_SCORING_PARAMS = {
     "play_reward_per_card": 0,
     "play_reward": 0,
-    "invalid_play_penalty": -6,
-    "challenge_success_challenger_reward": 2,
-    "challenge_success_claimant_penalty": -6,
-    "challenge_fail_challenger_penalty": 0,
-    "challenge_fail_claimant_reward": 5,
-    "forced_challenge_success_challenger_reward": 1,
-    "forced_challenge_success_claimant_penalty": -3,
-    "invalid_challenge_penalty": -5,
-    "termination_penalty": -6,
-    "game_win_bonus": 7,
-    "game_lose_penalty": -1,
+    "invalid_play_penalty": 0, # -6
+    "challenge_success_challenger_reward": 3, # 2
+    "challenge_success_claimant_penalty": 0, # -6
+    "challenge_fail_challenger_penalty": -2,
+    "challenge_fail_claimant_reward": 0, # 5
+    "forced_challenge_success_challenger_reward": 1, # 1
+    "forced_challenge_success_claimant_penalty": -3, # -3
+    "invalid_challenge_penalty": -5, # -5
+    "termination_penalty": 0, # -6
+    "game_win_bonus": 7, # 7
+    "game_lose_penalty": -5, # -1
     "hand_empty_bonus": 0,
-    "consecutive_action_penalty": 1,
-    "successful_bluff_reward": 3,
-    "unchallenged_bluff_penalty": -2
+    "consecutive_action_penalty": 0, # 1
+    "successful_bluff_reward": 1, # 3
+    "unchallenged_bluff_penalty": -0.1  # -2
 }
 
 # ----------------------------
@@ -109,7 +109,7 @@ ENTROPY_CLIP_MAX = 0.3          # Maximum allowed value for entropy coefficient
 # Logging and Checkpointing
 # ----------------------------
 CULL_INTERVAL = 20001             # Number of episodes between each culling event
-CHECKPOINT_INTERVAL = 5000       # Episodes between saving checkpoints
+CHECKPOINT_INTERVAL = 2500       # Episodes between saving checkpoints
 LOG_INTERVAL = 100                # Episodes between logging to TensorBoard
 
 # ----------------------------
@@ -142,7 +142,8 @@ WIN_RATE_THRESHOLD = 0.55
 # ----------------------------
 SEED = 42                     # Seed for reproducibility
 DEVICE = "cuda"               # Device for training (CPU/GPU)
-
+NUM_OPPONENT_CLASSES = 2
+AUX_LOSS_WEIGHT = 0.1         # Weight for the auxiliary loss
 # ----------------------------
 # Derived Configurations
 # ----------------------------
