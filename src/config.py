@@ -142,7 +142,7 @@ WIN_RATE_THRESHOLD = 0.55
 # ----------------------------
 SEED = 42                     # Seed for reproducibility
 DEVICE = "cuda"               # Device for training (CPU/GPU)
-NUM_OPPONENT_CLASSES = 2
+NUM_OPPONENT_CLASSES = 6
 AUX_LOSS_WEIGHT = 0.1         # Weight for the auxiliary loss
 # ----------------------------
 # Derived Configurations
