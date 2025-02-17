@@ -469,7 +469,7 @@ def train_agent(env, device, num_episodes=1000, load_checkpoint_flag=True, log_t
                 phase = 4
                 phase4_history.clear()
         elif phase == 4:
-            if len(phase4_history) >= 200 and (sum(phase4_history)/len(phase4_history)) >= 0.80:
+            if len(phase4_history) >= 200 and (sum(phase4_history)/len(phase4_history)) >= 0.90:
                 logger.info("Training complete: Rolling win rate >= 70% in Phase 4 against both opponents.")
                 break
 
