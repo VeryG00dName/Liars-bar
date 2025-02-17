@@ -29,7 +29,7 @@ def compute_gae(rewards, dones, values, next_values, gamma=0.99, lam=0.95):
     returns = [adv + val for adv, val in zip(advantages, values)]
     return advantages, returns
 
-def save_checkpoint(policy_nets, value_nets, optimizers_policy, optimizers_value, obp_model, obp_optimizer, episode, checkpoint_dir=config.CHECKPOINT_DIR):
+def save_checkpoint(policy_nets, value_nets, optimizers_policy, optimizers_value, obp_model, obp_optimizer, episode, checkpoint_dir=config.CHECKPOINT_DIR, checkpoint_filename=None):
     """
     Saves the current state of the training process, including models and optimizers.
     Note: Entropy coefficients are no longer saved.
@@ -43,9 +43,12 @@ def save_checkpoint(policy_nets, value_nets, optimizers_policy, optimizers_value
         obp_optimizer (torch.optim.Optimizer): The optimizer for the OBP model.
         episode (int): Current episode number.
         checkpoint_dir (str): Directory to save the checkpoint.
+        checkpoint_filename (str, optional): Optional checkpoint filename. If not provided, a default name is used.
     """
     os.makedirs(checkpoint_dir, exist_ok=True)
-    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_episode_{episode}.pth")
+    if checkpoint_filename is None:
+        checkpoint_filename = f"checkpoint_episode_{episode}.pth"
+    checkpoint_path = os.path.join(checkpoint_dir, checkpoint_filename)
 
     checkpoint = {
         'episode': episode,
@@ -55,11 +58,10 @@ def save_checkpoint(policy_nets, value_nets, optimizers_policy, optimizers_value
         'optimizers_value': {agent: opt.state_dict() for agent, opt in optimizers_value.items()},
         'obp_model': obp_model.state_dict(),
         'obp_optimizer': obp_optimizer.state_dict(),
-        # Note: Entropy coefficients are no longer saved.
     }
 
     torch.save(checkpoint, checkpoint_path)
-    logging.info(f"Saved checkpoint at episode {episode} to {checkpoint_path}.")
+    print(f"Checkpoint saved to {checkpoint_path}")
 
 def load_checkpoint_if_available(policy_nets, value_nets, optimizers_policy, optimizers_value, obp_model, obp_optimizer, checkpoint_dir=config.CHECKPOINT_DIR):
     """
