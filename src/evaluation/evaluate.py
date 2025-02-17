@@ -2,22 +2,11 @@
 import itertools
 import torch
 import os
-import numpy as np
 import logging
-import json
 import random
-import time
 
-import seaborn as sns
-import matplotlib.pyplot as plt
-import pandas as pd
 from collections import defaultdict
 from src.env.liars_deck_env_core import LiarsDeckEnv
-from pettingzoo.utils import agent_selector
-from src.model.models import PolicyNetwork, OpponentBehaviorPredictor, ValueNetwork
-from src.model import new_models
-from sklearn.preprocessing import StandardScaler
-
 from src.evaluation.evaluate_utils import (
     load_combined_checkpoint,
     get_hidden_dim_from_state_dict,
@@ -25,23 +14,20 @@ from src.evaluation.evaluate_utils import (
     update_openskill_batch,
     save_scoreboard,
     load_scoreboard,
-    compute_ranks,
     compare_scoreboards,
-    format_rank_change,
     plot_agent_heatmap,
-    adapt_observation_for_version,
     RichProgressScoreboard,
-    run_obp_inference,
     evaluate_agents  # Unified evaluation function
 )
 from src import config
-from src.model.memory import get_opponent_memory
-from src.env.liars_deck_env_utils import query_opponent_memory_full
 from openskill.models import PlackettLuce
 model = PlackettLuce(mu=25.0, sigma=25.0 / 3, beta=25.0 / 6)
 import warnings
 warnings.filterwarnings("ignore", message="enable_nested_tensor is True, but self.use_nested_tensor is False", category=UserWarning)
 warnings.filterwarnings("ignore", message="You are using `torch.load` with `weights_only=False`", category=FutureWarning)
+
+# Import the new ModelFactory API.
+from src.model.model_factory import ModelFactory
 
 # Global variables for transformer-based memory integration (if needed elsewhere)
 global_strategy_transformer = None
@@ -49,32 +35,11 @@ global_event_encoder = None
 global_response2idx = None
 global_action2idx = None
 
-def convert_memory_to_features(memory, response_mapping, action_mapping):
-    """
-    Convert the opponent memory (a list of events) to a list of 4-dimensional feature vectors.
-    """
-    features = []
-    for event in memory:
-        if not isinstance(event, dict):
-            raise ValueError(f"Memory event is not a dictionary: {event}.")
-        resp = event.get("response", "")
-        act = event.get("triggering_action", "")
-        penalties = float(event.get("penalties", 0))
-        card_count = float(event.get("card_count", 0))
-        resp_val = float(response_mapping.get(resp, 0))
-        act_val = float(action_mapping.get(act, 0))
-        features.append([resp_val, act_val, penalties, card_count])
-    return features
-
 def initialize_players(players_dir, device):
     """
-    Loads checkpoints from subdirectories of players_dir. Models with input dimension 26
-    are now treated as new (obs_version 2). Also records whether a player uses persistent memory.
-    
-    IMPORTANT: When loading the OBP, the code checks the shape of fc1.weight in the saved
-    state_dict. If its second dimension equals config.OPPONENT_INPUT_DIM + config.STRATEGY_DIM,
-    the new OBP (from new_models) is instantiated (with memory_dim=config.STRATEGY_DIM);
-    otherwise, the old OBP (from models) is used.
+    Loads checkpoints from subdirectories of players_dir.
+    Uses the new OBP (with memory) if the checkpoint's fc1.weight shape indicates a combined input,
+    otherwise uses the old OBP that doesn't require memory.
     """
     players = {}
     logger = logging.getLogger("Evaluate")
@@ -109,70 +74,55 @@ def initialize_players(players_dir, device):
                         fc1_weight = obp_model_state.get("fc1.weight", None)
                         if fc1_weight is None:
                             raise ValueError("OBP state dict missing fc1.weight")
+                        # If checkpoint fc1.weight has combined dimensions, use new OBP.
                         if fc1_weight.shape[1] == config.OPPONENT_INPUT_DIM + config.STRATEGY_DIM:
-                            # New OBP version that accepts a memory embedding.
-                            from src.model.new_models import OpponentBehaviorPredictor as OBPClass
-                            obp_model = OBPClass(
-                                input_dim=config.OPPONENT_INPUT_DIM,
-                                hidden_dim=obp_hidden_dim,
-                                output_dim=2,
-                                memory_dim=config.STRATEGY_DIM
-                            ).to(device)
-                        elif fc1_weight.shape[1] == config.OPPONENT_INPUT_DIM:
-                            # Old OBP version.
-                            from src.model.models import OpponentBehaviorPredictor as OBPClass
-                            obp_model = OBPClass(
+                            obp_model = ModelFactory.create_obp(
+                                use_transformer_memory=True,
                                 input_dim=config.OPPONENT_INPUT_DIM,
                                 hidden_dim=obp_hidden_dim,
                                 output_dim=2
-                            ).to(device)
+                            )
+                        elif fc1_weight.shape[1] == config.OPPONENT_INPUT_DIM:
+                            obp_model = ModelFactory.create_obp(
+                                use_transformer_memory=False,
+                                input_dim=config.OPPONENT_INPUT_DIM,
+                                hidden_dim=obp_hidden_dim,
+                                output_dim=2
+                            )
                         else:
                             raise ValueError(f"Unexpected OBP input dimension: {fc1_weight.shape[1]}")
-                        obp_model.load_state_dict(obp_model_state)
+                        obp_model = ModelFactory.load_obp_state_dict(obp_model, obp_model_state)
                         obp_model.eval()
+                        obp_model.to(device)
 
                     for agent_name, policy_state_dict in policy_nets.items():
                         uses_memory = ("fc4.weight" in policy_state_dict)
                         policy_hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, layer_prefix='fc1')
-                        if uses_memory:
-                            policy_net = new_models.PolicyNetwork(
-                                input_dim=actual_input_dim, 
-                                hidden_dim=policy_hidden_dim,
-                                output_dim=config.OUTPUT_DIM,
-                                use_lstm=True,
-                                use_dropout=True,
-                                use_layer_norm=True
-                            ).to(device)
-                        else:
-                            policy_net = PolicyNetwork(
-                                input_dim=actual_input_dim, 
-                                hidden_dim=policy_hidden_dim,
-                                output_dim=config.OUTPUT_DIM,
-                                use_lstm=True,
-                                use_dropout=True,
-                                use_layer_norm=True
-                            ).to(device)
-                        policy_net.load_state_dict(policy_state_dict)
+                        policy_net = ModelFactory.create_policy_network(
+                            use_aux_classifier=False,
+                            num_opponent_classes=None,
+                            input_dim=actual_input_dim,
+                            hidden_dim=policy_hidden_dim,
+                            output_dim=config.OUTPUT_DIM,
+                            use_lstm=True,
+                            use_dropout=True,
+                            use_layer_norm=True
+                        )
+                        policy_net.load_state_dict(policy_state_dict, strict=False)
                         policy_net.eval()
+                        policy_net.to(device)
 
                         value_state_dict = value_nets[agent_name]
                         value_hidden_dim = get_hidden_dim_from_state_dict(value_state_dict, layer_prefix='fc1')
-                        if "fc3.weight" in value_state_dict:
-                            value_net = new_models.ValueNetwork(
-                                input_dim=actual_input_dim,
-                                hidden_dim=value_hidden_dim,
-                                use_dropout=True,
-                                use_layer_norm=True
-                            ).to(device)
-                        else:
-                            value_net = ValueNetwork(
-                                input_dim=actual_input_dim,
-                                hidden_dim=value_hidden_dim,
-                                use_dropout=True,
-                                use_layer_norm=True
-                            ).to(device)
+                        value_net = ModelFactory.create_value_network(
+                            input_dim=actual_input_dim,
+                            hidden_dim=value_hidden_dim,
+                            use_dropout=True,
+                            use_layer_norm=True
+                        )
                         value_net.load_state_dict(value_state_dict)
                         value_net.eval()
+                        value_net.to(device)
 
                         player_id = f"{version}_player_{agent_name.replace('player_', '')}"
                         players[player_id] = {
@@ -207,7 +157,7 @@ def run_evaluation(env, device, players, num_games_per_triple=11):
     try:
         for idx, triple in enumerate(triples_list, 1):
             players_in_this_game = {pid: players[pid] for pid in triple}
-            # (Clear memory if needed...)
+
             cumulative_wins, action_counts, game_wins_list, avg_steps, steps_per_sec = evaluate_agents(
                 env,
                 device,
@@ -235,7 +185,7 @@ def run_evaluation(env, device, players, num_games_per_triple=11):
                         agent_head_to_head[pid_i][pid_j] += 1
 
             differences = compare_scoreboards(old_scoreboard, players)
-            progress_ui.update(increment=1, differences=differences)
+            progress_ui.update(increment=1, differences=differences, steps_per_sec=steps_per_sec)
                 
         differences = compare_scoreboards(old_scoreboard, players)
         progress_ui.update(differences=differences)
@@ -252,7 +202,6 @@ def main():
         handlers=[logging.StreamHandler()]
     )
     device = torch.device(config.DEVICE)
-    old_scoreboard = load_scoreboard()
     players_dir = config.PLAYERS_DIR
     if not os.path.isdir(players_dir):
         raise FileNotFoundError(f"The directory '{players_dir}' does not exist.")
@@ -265,7 +214,6 @@ def main():
     if len(players) < 3:
         raise ValueError("Need at least 3 players for evaluation.")
 
-    NUM_GAMES_PER_TRIPLE = config.NUM_GAMES_PER_MATCH
 
     action_counts, agent_h2h = run_evaluation(
         env,

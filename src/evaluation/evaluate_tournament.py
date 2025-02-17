@@ -3,36 +3,21 @@
 import json
 import os
 import re
-import random
-from itertools import combinations
-
 import torch
-import numpy as np
-from pettingzoo.utils import agent_selector
-
-from src.env.liars_deck_env_utils import query_opponent_memory_full
 from src.env.liars_deck_env_core import LiarsDeckEnv
-from src.model.new_models import PolicyNetwork, ValueNetwork, StrategyTransformer
-from src.model import new_models
-from src.model.models import OpponentBehaviorPredictor  # Old OBP
+from src.model.new_models import PolicyNetwork, ValueNetwork
 from src import config
 
-# Import shared functions from evaluate_utils.py (including EvaluationProgress)
+# Import shared functions from evaluate_utils.py (including RichProgressScoreboard and evaluate_agents)
 from src.evaluation.evaluate_utils import (
     load_combined_checkpoint,
     get_hidden_dim_from_state_dict,
     model as openskill_model,  # Shared OpenSkill model
-    adapt_observation_for_version,
-    OBS_VERSION_1,
-    OBS_VERSION_2,
     RichProgressScoreboard,
-    evaluate_agents,  # Unified evaluation function (includes tournament OBP inference)
-    get_opponent_memory_embedding,
+    evaluate_agents,  # Unified evaluation function (handles OBP memory check)
     compare_scoreboards,
     load_scoreboard
 )
-
-from src.model.memory import get_opponent_memory
 
 # Rich imports for final scoreboard rendering
 from rich.console import Console
@@ -53,6 +38,11 @@ from src.model.hard_coded_agents import (
 )
 
 def initialize_players(checkpoints_dir, device):
+    """
+    Load checkpoint-based players. For each checkpoint, we load the policy, value, and OBP models.
+    The OBP model is checked to see if its fc1 weight's second dimension equals
+    config.OPPONENT_INPUT_DIM + config.STRATEGY_DIM. This determines whether memory is used.
+    """
     if not os.path.isdir(checkpoints_dir):
         raise FileNotFoundError(f"The directory '{checkpoints_dir}' does not exist.")
     pattern = re.compile(r'\.pth$', re.IGNORECASE)
@@ -96,20 +86,13 @@ def initialize_players(checkpoints_dir, device):
                 for agent_name in policy_nets.keys():
                     policy_state_dict = policy_nets[agent_name]
                     actual_input_dim = policy_state_dict['fc1.weight'].shape[1]
-                    if actual_input_dim == 18:
-                        obs_version = OBS_VERSION_1
-                    elif actual_input_dim in (16, 24, 26):
-                        obs_version = OBS_VERSION_2
-                    else:
-                        raise ValueError(f"Unknown input dimension ({actual_input_dim}) for agent '{agent_name}' in {filename}.")
+                    # In the updated pipeline we assume all models are new.
+                    # Whether memory is used is determined by the presence of a specific layer.
                     uses_memory = ("fc4.weight" in policy_state_dict)
-                    # Check for new models: if auxiliary classifier weights exist.
-                    if "fc_classifier.weight" in policy_state_dict:
-                        use_aux_classifier = True
-                        num_opponent_classes = config.NUM_OPPONENT_CLASSES
-                    else:
-                        use_aux_classifier = False
-                        num_opponent_classes = None
+                    # Also check for an auxiliary classifier weight if available.
+                    use_aux_classifier = "fc_classifier.weight" in policy_state_dict
+                    num_opponent_classes = config.NUM_OPPONENT_CLASSES if use_aux_classifier else None
+
                     policy_net = PolicyNetwork(
                         input_dim=actual_input_dim,
                         hidden_dim=get_hidden_dim_from_state_dict(policy_state_dict, layer_prefix='fc1'),
@@ -120,8 +103,10 @@ def initialize_players(checkpoints_dir, device):
                         use_aux_classifier=use_aux_classifier,
                         num_opponent_classes=num_opponent_classes
                     ).to(device)
-                    policy_net.load_state_dict(policy_state_dict)
+                    # Load with strict=False to ignore unexpected keys.
+                    policy_net.load_state_dict(policy_state_dict, strict=False)
                     policy_net.eval()
+
                     value_state_dict = value_nets[agent_name]
                     value_net = ValueNetwork(
                         input_dim=actual_input_dim,
@@ -129,8 +114,9 @@ def initialize_players(checkpoints_dir, device):
                         use_dropout=True,
                         use_layer_norm=True
                     ).to(device)
-                    value_net.load_state_dict(value_state_dict)
+                    value_net.load_state_dict(value_state_dict, strict=False)
                     value_net.eval()
+
                     player_id = f"{filename}_player_{agent_name}"
                     players[player_id] = {
                         'policy_net': policy_net,
@@ -140,7 +126,6 @@ def initialize_players(checkpoints_dir, device):
                         'score': 0.0,
                         'wins': 0,
                         'games_played': 0,
-                        'obs_version': obs_version,
                         'uses_memory': uses_memory
                     }
                     players[player_id]['score'] = players[player_id]['rating'].ordinal()
@@ -152,7 +137,6 @@ def initialize_players(checkpoints_dir, device):
 def add_hardcoded_players(players, device):
     """
     Add hard-coded bots to the players dictionary.
-    Each hard-coded bot entry is marked with 'hardcoded_bot': True and stores the agent instance under 'agent'.
     """
     hardcoded_constructors = {
         "GreedyCardSpammer": GreedyCardSpammer,
@@ -176,7 +160,7 @@ def add_hardcoded_players(players, device):
             'score': 0.0,
             'wins': 0,
             'games_played': 0,
-            'obs_version': OBS_VERSION_2,
+            # Hardcoded bots use the standard observation (and do not require memory).
             'uses_memory': False
         }
         players[player_id]['score'] = players[player_id]['rating'].ordinal()
@@ -311,7 +295,7 @@ def run_group_swiss_tournament(env, device, players, num_games_per_match=5, NUM_
     match_history = {pid: set() for pid in players}
     global_action_counts = {pid: {action: 0 for action in range(config.OUTPUT_DIM)} for pid in players}
     
-    # Calculate total number of matches to update the progress UI accordingly.
+    # Calculate total number of matches for progress UI.
     total_matches = 0
     for _ in range(NUM_ROUNDS):
         groups = swiss_grouping(players, match_history, group_size)
@@ -326,7 +310,7 @@ def run_group_swiss_tournament(env, device, players, num_games_per_match=5, NUM_
             if len(group) != group_size:
                 continue
             players_in_this_game = {pid: players[pid] for pid in group}
-            cumulative_wins, action_counts, game_wins_list, avg_steps, _ = evaluate_agents(
+            cumulative_wins, action_counts, game_wins_list, avg_steps, steps_per_sec = evaluate_agents(
                 env=env,
                 device=device,
                 players_in_this_game=players_in_this_game,
@@ -338,16 +322,22 @@ def run_group_swiss_tournament(env, device, players, num_games_per_match=5, NUM_
                 players[pid]['games_played'] += num_games_per_match
                 for action in range(config.OUTPUT_DIM):
                     global_action_counts[pid][action] += action_counts[pid][action]
+                players[pid]['win_rate'] = players[pid]['wins'] / players[pid]['games_played'] if players[pid]['games_played'] > 0 else 0.0
+
             group_ranking = sorted(group, key=lambda pid: cumulative_wins[pid], reverse=True)
             update_openskill_ratings(players, group, group_ranking, cumulative_wins)
             for pid in group:
                 for other in group:
                     if other != pid:
                         match_history[pid].add(other)
-            # Update the scoreboard after every match.
             match_counter += 1
             differences = compute_scoreboard_differences(players)
-            progress_ui.update(increment=1, differences=differences, description=f"Match {match_counter}")
+            progress_ui.update(
+                increment=1,
+                differences=differences,
+                description=f"Match {match_counter}",
+                steps_per_sec=steps_per_sec
+            )
     progress_ui.close()
     return global_action_counts
 
@@ -370,6 +360,10 @@ def main():
     # Add hardcoded bot players.
     players = add_hardcoded_players(players, device)
     
+    for pid, player in players.items():
+        if 'obs_version' not in player:
+            player['obs_version'] = 2
+
     if len(players) < 3:
         raise ValueError("Need at least 3 individual players for the tournament.")
     NUM_GAMES_PER_MATCH = config.NUM_GAMES_PER_MATCH

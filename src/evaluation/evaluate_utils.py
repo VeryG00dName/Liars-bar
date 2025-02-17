@@ -401,12 +401,23 @@ class RichProgressScoreboard:
         self.total = total_steps
         self.current = 0
         self.players = players
+        self.steps_per_sec = 0.0  # track steps per second
+
+        # Create a custom column to show steps/sec after the percentage.
         self.progress = Progress(
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
             TextColumn("{task.percentage:>3.0f}%"),
+            # Use dictionary indexing to access the steps_per_sec field.
+            TextColumn("[bold]{task.fields[steps_per_sec]}[/bold]", justify="left"),
         )
-        self.task_id = self.progress.add_task("Evaluating...", total=self.total)
+        # Provide an initial value for the steps_per_sec field.
+        self.task_id = self.progress.add_task(
+            "Evaluating...",
+            total=self.total,
+            steps_per_sec="0.00 steps/sec"
+        )
+
         self.live = Live(self._generate_layout(), console=self.console, refresh_per_second=4)
         self.live.__enter__()
 
@@ -433,7 +444,12 @@ class RichProgressScoreboard:
         return table
 
     def _generate_layout(self, differences=None):
-        progress_panel = Panel(self.progress, title="Progress", height=3)
+        # No steps/sec in the panel title; only show a generic title.
+        progress_panel = Panel(
+            self.progress,
+            title="Progress",
+            height=3
+        )
         scoreboard = self._generate_scoreboard_table(differences)
         layout = Layout()
         layout.split_column(
@@ -442,13 +458,25 @@ class RichProgressScoreboard:
         )
         return layout
 
-    def update(self, increment=1, differences=None, description=None):
+    def update(self, increment=1, differences=None, description=None, steps_per_sec=None):
+        if steps_per_sec is not None:
+            self.steps_per_sec = steps_per_sec
         self.current += increment
-        self.progress.update(self.task_id, advance=increment, description=description or "Evaluating...")
+
+        # Update the task with the new steps_per_sec field value.
+        self.progress.update(
+            self.task_id,
+            advance=increment,
+            description=description or "Evaluating...",
+            steps_per_sec=f"{self.steps_per_sec:.2f} steps/sec"
+        )
+
+        # Refresh the live layout.
         self.live.update(self._generate_layout(differences))
 
     def close(self):
         self.live.__exit__(None, None, None)
+
 
 # ----------------------------
 # Unified Evaluation Function (unchanged)
