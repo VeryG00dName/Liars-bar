@@ -1,5 +1,4 @@
 # src/training/train_main.py
-
 import logging
 import time
 import os
@@ -39,7 +38,6 @@ from src.env.liars_deck_env_utils import query_opponent_memory_full
 # ---- Import EventEncoder and helper function used for processing opponent memory events.
 from src.training.train_transformer import EventEncoder
 
-# ---- Define a helper to convert a memory (list of events) into 4D feature vectors.
 def convert_memory_to_features(memory, response_mapping, action_mapping):
     """
     Convert the opponent memory (a list of events) to a list of 4-dimensional feature vectors.
@@ -53,7 +51,6 @@ def convert_memory_to_features(memory, response_mapping, action_mapping):
         act = event.get("triggering_action", "")
         penalties = float(event.get("penalties", 0))
         card_count = float(event.get("card_count", 0))
-        # Map the categorical features using the provided mappings.
         resp_val = float(response_mapping.get(resp, 0))
         act_val = float(action_mapping.get(act, 0))
         features.append([resp_val, act_val, penalties, card_count])
@@ -174,9 +171,12 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
         optimizers_value[agent] = optim.Adam(value_net.parameters(), lr=config.LEARNING_RATE)
         memories[agent] = RolloutMemory([agent])
 
-    obp_input_dim = config.OPPONENT_INPUT_DIM
-    obp_hidden_dim = config.OPPONENT_HIDDEN_DIM
-    obp_model = OpponentBehaviorPredictor(input_dim=obp_input_dim, hidden_dim=obp_hidden_dim, output_dim=2).to(device)
+    obp_model = OpponentBehaviorPredictor(
+        input_dim=config.OPPONENT_INPUT_DIM, 
+        hidden_dim=config.OPPONENT_HIDDEN_DIM, 
+        output_dim=2,
+        memory_dim=config.STRATEGY_DIM  # New transformer memory embedding dimension
+    ).to(device)
     obp_optimizer = optim.Adam(obp_model.parameters(), lr=config.OPPONENT_LEARNING_RATE)
     obp_memory = []
 
@@ -226,41 +226,44 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
             observation = observation_dict[agent]
             action_mask = env.infos[agent]['action_mask']
 
-            # Run OBP inference.
-            obp_probs = run_obp_inference(obp_model, observation, device, env.num_players)
-
-            # --- MEMORY INTEGRATION: Obtain transformer-derived strategy embeddings ---
-            mem_features_list = []
+            # --- NEW OBP HANDLING: Integrate transformer-derived embeddings ---
+            transformer_embeddings = []
+            obp_memory_embeddings = []
             for opp in env.possible_agents:
                 if opp != agent:
                     mem_summary = query_opponent_memory_full(agent, opp)
-                    # Convert the raw memory events to 4D features.
                     features_list = convert_memory_to_features(mem_summary, response2idx, action2idx)
                     if features_list:
-                        feature_tensor = torch.tensor(features_list, dtype=torch.float, device=device).unsqueeze(0)
+                        feature_tensor = torch.tensor(features_list, dtype=torch.float32, device=device).unsqueeze(0)
                         with torch.no_grad():
                             projected = event_encoder(feature_tensor)
                             strategy_embedding, _ = strategy_transformer(projected)
-                        mem_features_list.append(strategy_embedding.cpu().detach().numpy().flatten())
                     else:
-                        mem_features_list.append(np.zeros(config.STRATEGY_DIM, dtype=np.float32))
-            if mem_features_list:
-                mem_features = np.concatenate(mem_features_list, axis=0)
-            else:
-                mem_features = np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
+                        strategy_embedding = None
 
-            # Combine the base observation, OBP probabilities, and strategy embeddings.
-            final_obs = np.concatenate([
-                observation,
-                np.array(obp_probs, dtype=np.float32),
-                mem_features
-            ], axis=0)
-            expected_dim = config.INPUT_DIM
-            actual_dim = final_obs.shape[0]
-            assert actual_dim == expected_dim, f"Expected final observation dimension {expected_dim}, got {actual_dim}"
+                    if strategy_embedding is not None:
+                        obp_memory_embeddings.append(strategy_embedding)
+                        transformer_embeddings.append(strategy_embedding.cpu().detach().numpy().flatten())
+                    else:
+                        zero_emb = torch.zeros(1, config.STRATEGY_DIM, device=device)
+                        obp_memory_embeddings.append(zero_emb)
+                        transformer_embeddings.append(np.zeros(config.STRATEGY_DIM, dtype=np.float32))
+
+            obp_probs = run_obp_inference(obp_model, observation, device, env.num_players, memory_embeddings=obp_memory_embeddings)
+
+            # Normalize the transformer embeddings.
+            from sklearn.preprocessing import StandardScaler
+            transformer_features = (np.concatenate(transformer_embeddings, axis=0)
+                                    if transformer_embeddings
+                                    else np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32))
+            scaler = StandardScaler()
+            normalized_transformer_features = scaler.fit_transform(np.array(transformer_features).reshape(1, -1)).flatten()
+
+            # Combine base observation, OBP output, and normalized transformer embeddings.
+            final_obs = np.concatenate([observation, np.array(obp_probs, dtype=np.float32), normalized_transformer_features], axis=0)
+            
             observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
-
-            raw_probs, _ = policy_nets[agent](observation_tensor, None)
+            raw_probs, _ , _= policy_nets[agent](observation_tensor, None)
             raw_probs = torch.clamp(raw_probs, min=1e-8, max=1.0).squeeze(0)
             action_mask_tensor = torch.tensor(action_mask, dtype=torch.float32, device=device)
             masked_probs = raw_probs * action_mask_tensor
@@ -287,7 +290,6 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 else:
                     reward = env.rewards[agent] + pending_rewards[agent]
                     pending_rewards[agent] = 0
-                    done_or_truncated = env.terminations[agent] or env.truncations[agent]
                     memories[agent].store_transition(
                         agent=agent,
                         state=final_obs,
@@ -351,7 +353,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                 entropies = []
 
                 for _ in range(config.K_EPOCHS):
-                    probs, _ = policy_nets[agent](states, None)
+                    probs, _, _ = policy_nets[agent](states, None)
                     probs = torch.clamp(probs, 1e-8, 1.0)
                     masked_probs = probs * action_masks_
                     row_sums = masked_probs.sum(dim=-1, keepdim=True)
@@ -447,8 +449,7 @@ def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=
                     writer.add_scalar(f"Average Reward/{agent}", reward, episode)
                 for agent in agents:
                     for action in range(config.OUTPUT_DIM):
-                        writer.add_scalar(f"Action Counts/{agent}/Action_{action}",
-                                          action_counts_periodic[agent][action], episode)
+                        writer.add_scalar(f"Action Counts/{agent}/Action_{action}", action_counts_periodic[agent][action], episode)
             for agent in agents:
                 invalid_action_counts_periodic[agent] = 0
                 for action in range(config.OUTPUT_DIM):
