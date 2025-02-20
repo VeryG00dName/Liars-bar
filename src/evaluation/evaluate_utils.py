@@ -24,15 +24,15 @@ from rich.progress import Progress, BarColumn, TextColumn
 # OpenSkill for rating updates
 from openskill.models import PlackettLuce
 
+from src.model.new_models import PolicyNetwork, ValueNetwork, StrategyTransformer ,OpponentBehaviorPredictor
+
 # Model and config imports
-from src.model.models import PolicyNetwork, OpponentBehaviorPredictor, ValueNetwork
 from src import config
 
 # Additional imports for memory and environment utilities
 from src.model.memory import get_opponent_memory
 from src.env.liars_deck_env_utils import query_opponent_memory_full
-
-from sklearn.preprocessing import StandardScaler
+from src.training.train_transformer import EventEncoder
 
 # Constants for observation versions
 OBS_VERSION_1 = 1
@@ -234,22 +234,38 @@ def get_opponent_memory_embedding(current_agent, opponent, device):
     global global_response2idx, global_action2idx, global_event_encoder, global_strategy_transformer
     transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
     
+    logger = logging.getLogger("Evaluate")
+    logger.debug("Entering get_opponent_memory_embedding")
+    
+    # Load categorical mappings if not already loaded.
     if global_response2idx is None or global_action2idx is None:
+        logger.debug("Global response/action mappings not set; loading from checkpoint if available.")
         if os.path.exists(transformer_checkpoint_path):
             ckpt = torch.load(transformer_checkpoint_path, map_location=device)
             global_response2idx = ckpt.get("response2idx", {})
             global_action2idx = ckpt.get("action2idx", {})
+            logger.debug(f"Loaded response2idx with {len(global_response2idx)} entries and action2idx with {len(global_action2idx)} entries.")
         else:
             global_response2idx = {}
             global_action2idx = {}
+            logger.debug("Transformer checkpoint not found; using empty mappings.")
     
+    # Query memory events.
+    logger.debug(f"Querying memory for current_agent: {current_agent}, opponent: {opponent}")
     mem_summary = query_opponent_memory_full(current_agent, opponent)
+    logger.debug(f"Memory summary: {mem_summary}")
+    
+    # Convert memory events to features.
     features_list = convert_memory_to_features(mem_summary, global_response2idx, global_action2idx)
+    logger.debug(f"Converted features list: {features_list}")
     
     if features_list:
         feature_tensor = torch.tensor(features_list, dtype=torch.float32, device=device).unsqueeze(0)
+        logger.debug(f"Feature tensor shape: {feature_tensor.shape}")
+        
+        # Ensure global_event_encoder is loaded.
         if global_event_encoder is None:
-            from src.training.train_transformer import EventEncoder
+            logger.debug("Global event encoder not set; initializing.")
             global_event_encoder = EventEncoder(
                 response_vocab_size=len(global_response2idx),
                 action_vocab_size=len(global_action2idx),
@@ -259,7 +275,13 @@ def get_opponent_memory_embedding(current_agent, opponent, device):
                 ckpt = torch.load(transformer_checkpoint_path, map_location=device)
                 global_event_encoder.load_state_dict(ckpt["event_encoder_state_dict"])
                 global_event_encoder.eval()
+                logger.debug("Loaded event encoder state_dict from checkpoint.")
+            else:
+                logger.debug("Transformer checkpoint not found; event encoder initialized with random weights.")
+        
+        # Ensure global_strategy_transformer is loaded.
         if global_strategy_transformer is None:
+            logger.debug("Global strategy transformer not set; initializing.")
             from src.model.new_models import StrategyTransformer
             global_strategy_transformer = StrategyTransformer(
                 num_tokens=config.STRATEGY_NUM_TOKENS,
@@ -275,17 +297,28 @@ def get_opponent_memory_embedding(current_agent, opponent, device):
                 ckpt = torch.load(transformer_checkpoint_path, map_location=device)
                 global_strategy_transformer.load_state_dict(ckpt["transformer_state_dict"], strict=False)
                 global_strategy_transformer.eval()
+                logger.debug("Loaded strategy transformer state_dict from checkpoint.")
+            else:
+                logger.debug("Transformer checkpoint not found; strategy transformer initialized with random weights.")
+            # Remove classification head and override token embedding.
             global_strategy_transformer.token_embedding = torch.nn.Identity()
             global_strategy_transformer.classification_head = None
+        
         with torch.no_grad():
+            logger.debug("Passing feature tensor through event encoder.")
             projected = global_event_encoder(feature_tensor)
+            logger.debug(f"Projected features shape: {projected.shape}")
             strategy_embedding, _ = global_strategy_transformer(projected)
+            logger.debug(f"Strategy embedding shape: {strategy_embedding.shape}")
+        
         return strategy_embedding
     else:
+        logger.debug("No features extracted from memory; returning zeros.")
         return torch.zeros((1, config.STRATEGY_DIM), dtype=torch.float32, device=device)
 
+
 # ----------------------------
-# OBP Inference Functions (unchanged)
+# OBP Inference Functions (unchanged except normalization)
 # ----------------------------
 
 def run_obp_inference(obp_model, obs, device, num_players, agent_version, current_agent, env):
@@ -363,6 +396,11 @@ def run_obp_inference_tournament(obp_model, obs, device, num_players, obs_versio
         with torch.no_grad():
             if is_new_obp:
                 memory_emb = get_opponent_memory_embedding(current_agent, opp, device)
+                # Normalize the memory embedding using min–max scaling.
+                mem_min = memory_emb.min()
+                mem_max = memory_emb.max()
+                if mem_max - mem_min != 0:
+                    memory_emb = (memory_emb - mem_min) / (mem_max - mem_min)
                 logits = obp_model(opp_vec_tensor, memory_emb)
             else:
                 logits = obp_model(opp_vec_tensor)
@@ -444,7 +482,6 @@ class RichProgressScoreboard:
         return table
 
     def _generate_layout(self, differences=None):
-        # No steps/sec in the panel title; only show a generic title.
         progress_panel = Panel(
             self.progress,
             title="Progress",
@@ -463,7 +500,6 @@ class RichProgressScoreboard:
             self.steps_per_sec = steps_per_sec
         self.current += increment
 
-        # Update the task with the new steps_per_sec field value.
         self.progress.update(
             self.task_id,
             advance=increment,
@@ -479,7 +515,139 @@ class RichProgressScoreboard:
 
 
 # ----------------------------
-# Unified Evaluation Function (unchanged)
+# New Unified initialize players function
+# ----------------------------
+def initialize_players(base_dir, device):
+    """
+    Unified function to load checkpoint-based players.
+
+    If base_dir contains any subdirectories, each subdirectory is treated as a version
+    (with its name used as a prefix for player IDs). Otherwise, base_dir is assumed to directly
+    contain checkpoint files (and the filename is used as the prefix).
+
+    For each checkpoint file (with a ".pth" extension, ignoring transformer_classifier.pth),
+    the checkpoint is loaded and the policy, value, and OBP models (if available) are created.
+    The observation version is set based on the input dimension of the policy network.
+    """
+    logger = logging.getLogger("Evaluate")
+    players = {}
+    items = os.listdir(base_dir)
+    has_subdirs = any(os.path.isdir(os.path.join(base_dir, item)) for item in items)
+
+    def process_checkpoint(checkpoint_path, identifier_prefix):
+        local_players = {}
+        try:
+            checkpoint = load_combined_checkpoint(checkpoint_path, device)
+            policy_nets = checkpoint['policy_nets']
+            value_nets = checkpoint['value_nets']
+            obp_model_state = checkpoint.get('obp_model', None)
+            obp_model = None
+
+            # Process OBP if available.
+            if obp_model_state is not None:
+                fc1_weight = obp_model_state.get("fc1.weight", None)
+                if fc1_weight is None:
+                    raise ValueError("OBP state dict missing fc1.weight")
+                obp_hidden_dim = get_hidden_dim_from_state_dict(obp_model_state, layer_prefix='fc1')
+                if fc1_weight.shape[1] == config.OPPONENT_INPUT_DIM + config.STRATEGY_DIM:
+                    # New OBP with memory
+                    obp_model = OpponentBehaviorPredictor(
+                        input_dim=config.OPPONENT_INPUT_DIM,
+                        hidden_dim=obp_hidden_dim,
+                        output_dim=2,
+                        memory_dim=config.STRATEGY_DIM
+                    ).to(device)
+                elif fc1_weight.shape[1] == config.OPPONENT_INPUT_DIM:
+                    obp_model = OpponentBehaviorPredictor(
+                        input_dim=config.OPPONENT_INPUT_DIM,
+                        hidden_dim=obp_hidden_dim,
+                        output_dim=2
+                    ).to(device)
+                else:
+                    raise ValueError(f"Unexpected OBP input dimension: {fc1_weight.shape[1]}")
+                obp_model.load_state_dict(obp_model_state)
+                obp_model.eval()
+
+            # Determine observation version using one of the policy networks.
+            any_policy = next(iter(policy_nets.values()))
+            actual_input_dim = any_policy['fc1.weight'].shape[1]
+            if actual_input_dim == 18:
+                obs_version = 1
+            elif actual_input_dim in (16, 24, 26):
+                obs_version = 2
+            else:
+                raise ValueError(f"Unknown input dimension: {actual_input_dim}")
+
+            # Process each agent in the checkpoint.
+            for agent_name, policy_state_dict in policy_nets.items():
+                uses_memory = ("fc4.weight" in policy_state_dict)
+                use_aux_classifier = "fc_classifier.weight" in policy_state_dict
+                num_opponent_classes = config.NUM_OPPONENT_CLASSES if use_aux_classifier else None
+                policy_hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, layer_prefix='fc1')
+
+                policy_net = PolicyNetwork(
+                    input_dim=actual_input_dim,
+                    hidden_dim=policy_hidden_dim,
+                    output_dim=config.OUTPUT_DIM,
+                    use_lstm=True,
+                    use_dropout=True,
+                    use_layer_norm=True,
+                    use_aux_classifier=use_aux_classifier,
+                    num_opponent_classes=num_opponent_classes
+                ).to(device)
+                policy_net.load_state_dict(policy_state_dict, strict=False)
+                policy_net.eval()
+
+                value_state_dict = value_nets[agent_name]
+                value_hidden_dim = get_hidden_dim_from_state_dict(value_state_dict, layer_prefix='fc1')
+                value_net = ValueNetwork(
+                    input_dim=actual_input_dim,
+                    hidden_dim=value_hidden_dim,
+                    use_dropout=True,
+                    use_layer_norm=True
+                ).to(device)
+                value_net.load_state_dict(value_state_dict, strict=False)
+                value_net.eval()
+
+                # Construct player_id using the identifier_prefix.
+                # (In recursive mode, identifier_prefix is the subdirectory name; in flat mode it is the file name.)
+                player_id = f"{identifier_prefix}_player_{agent_name.replace('player_', '')}"
+                rating = model.rating(name=player_id)
+                local_players[player_id] = {
+                    'policy_net': policy_net,
+                    'value_net': value_net,
+                    'obp_model': obp_model,
+                    'obs_version': obs_version,
+                    'rating': rating,
+                    'uses_memory': uses_memory,
+                    # Tournament-specific fields:
+                    'score': rating.ordinal(),
+                    'wins': 0,
+                    'games_played': 0,
+                }
+            return local_players
+        except Exception as e:
+            logger.error(f"Failed to process checkpoint {checkpoint_path}: {e}")
+            return {}
+
+    if has_subdirs:
+        # Recursive mode: iterate each subdirectory.
+        for sub in items:
+            sub_path = os.path.join(base_dir, sub)
+            if os.path.isdir(sub_path):
+                for file in os.listdir(sub_path):
+                    if file.endswith(".pth"):
+                        checkpoint_path = os.path.join(sub_path, file)
+                        players.update(process_checkpoint(checkpoint_path, identifier_prefix=sub))
+    else:
+        # Flat mode: checkpoint files are directly under base_dir.
+        for file in items:
+            if file.endswith(".pth") and file != "transformer_classifier.pth":
+                checkpoint_path = os.path.join(base_dir, file)
+                players.update(process_checkpoint(checkpoint_path, identifier_prefix=file))
+    return players
+# ----------------------------
+# Unified Evaluation Function
 # ----------------------------
 
 def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournament=False):
@@ -493,10 +661,9 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
     # Memory initialization: Clear persistent memory for agents using memory (obs_version == 2).
     for env_agent in agent_to_player:
         pid = agent_to_player[env_agent]
-        if players_in_this_game[pid].get('uses_memory', False) and players_in_this_game[pid]['obs_version'] == OBS_VERSION_2:
+        if players_in_this_game[pid].get('uses_memory', False) and players_in_this_game[pid]['obs_version'] == 2:
             get_opponent_memory(env_agent).memory.clear()
 
-    # Tracking structures for action counts, wins, and steps.
     action_counts = {pid: defaultdict(int) for pid in player_ids}
     cumulative_wins = {pid: 0 for pid in player_ids}
     total_steps = 0
@@ -535,11 +702,9 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
             # ===== Handle Hardcoded Bot =====
             if player_data.get('hardcoded_bot', False):
                 mask = info.get('action_mask', [1] * config.OUTPUT_DIM)
-                # Optionally, pass table card if available in the environment
                 table_card = getattr(env, 'table_card', None)
                 action = player_data['agent'].play_turn(observation, mask, table_card)
-                if action in action_counts[player_id]:
-                    action_counts[player_id][action] += 1
+                action_counts[player_id][action] += 1
                 env.step(action)
                 continue
             # ===================================
@@ -554,7 +719,6 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
             if obp_model is not None:
                 fc1_weight = obp_model.state_dict().get("fc1.weight", None)
                 if fc1_weight is not None and fc1_weight.shape[1] == config.OPPONENT_INPUT_DIM + config.STRATEGY_DIM:
-                    # The OBP model requires memory embedding.
                     use_tournament = True
                 else:
                     use_tournament = is_tournament
@@ -571,12 +735,11 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                     obp_model, converted_obs, device, env.num_players, version, agent, env
                 )
             
+            # Build default base observation by concatenating converted_obs and OBP output.
             default_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32)], axis=0)
-            expected_dim = player_data['policy_net'].fc1.in_features
-
+            
             # Memory integration for agents using persistent memory (obs_version == 2).
-            if player_data.get('uses_memory', False) and version == OBS_VERSION_2:
-                required_mem_dim = expected_dim - (len(converted_obs) + len(obp_probs))
+            if player_data.get('uses_memory', False) and version == 2:
                 transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
                 global global_response2idx, global_action2idx, global_event_encoder, global_strategy_transformer
                 if global_response2idx is None or global_action2idx is None:
@@ -587,7 +750,6 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                     else:
                         global_response2idx = {}
                         global_action2idx = {}
-                from src.env.liars_deck_env_utils import query_opponent_memory_full
                 mem_features_list = []
                 for opp in env.possible_agents:
                     if opp != agent:
@@ -596,7 +758,6 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                         if features_list:
                             feature_tensor = torch.tensor(features_list, dtype=torch.float, device=device).unsqueeze(0)
                             if global_event_encoder is None:
-                                from src.training.train_transformer import EventEncoder
                                 global_event_encoder = EventEncoder(
                                     response_vocab_size=len(global_response2idx),
                                     action_vocab_size=len(global_action2idx),
@@ -607,7 +768,6 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                                     global_event_encoder.load_state_dict(ckpt["event_encoder_state_dict"])
                                     global_event_encoder.eval()
                             if global_strategy_transformer is None:
-                                from src.model.new_models import StrategyTransformer
                                 global_strategy_transformer = StrategyTransformer(
                                     num_tokens=config.STRATEGY_NUM_TOKENS,
                                     token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM,
@@ -627,39 +787,55 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                             with torch.no_grad():
                                 projected = global_event_encoder(feature_tensor)
                                 strategy_embedding, _ = global_strategy_transformer(projected)
-                            mem_features_list.append(strategy_embedding.cpu().numpy().flatten())
+                            emb = strategy_embedding.cpu().numpy().flatten()
+                            mem_features_list.append(emb)
                         else:
                             mem_features_list.append(np.zeros(config.STRATEGY_DIM, dtype=np.float32))
                 if mem_features_list:
                     mem_features = np.concatenate(mem_features_list, axis=0)
                 else:
                     mem_features = np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
-                current_mem_dim = mem_features.shape[0]
-                if current_mem_dim < required_mem_dim:
-                    pad = np.zeros(required_mem_dim - current_mem_dim, dtype=np.float32)
-                    mem_features = np.concatenate([mem_features, pad], axis=0)
-                elif current_mem_dim > required_mem_dim:
-                    mem_features = mem_features[:required_mem_dim]
-                    scaler = StandardScaler()
-                    if mem_features.size > 0:
-                        normalized_transformer_features = scaler.fit_transform(np.array(mem_features).reshape(1, -1)).flatten()
-                        mem_features = normalized_transformer_features
-                final_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32), mem_features], axis=0)
+                # Normalize the 1D memory features using min–max scaling.
+                min_val = mem_features.min()
+                max_val = mem_features.max()
+                logger.debug(f"Memory min: {min_val}, max: {max_val}")
+                if max_val - min_val == 0:
+                    normalized_mem = mem_features.flatten()
+                else:
+                    normalized_mem = (mem_features - min_val) / (max_val - min_val)
+                logger.debug(f"Normalized memory shape: {normalized_mem.shape}, sum: {np.sum(normalized_mem)}")
+                final_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32), normalized_mem], axis=0)
+                logger.debug("did use memory")
             else:
+                logger.debug("didn't use memory")
                 final_obs = default_obs
 
-            if len(final_obs) != expected_dim:
-                raise ValueError(
-                    f"Observation dimension mismatch for {player_id}. Expected {expected_dim}, got {len(final_obs)}. Version: {version}"
-                )
-
-            obs_tensor = torch.tensor(final_obs, dtype=torch.float32).unsqueeze(0).to(device)
+            # ----------------------------
+            # UPDATED: Convert final_obs to tensor and initialize proper hidden state for LSTM.
+            # ----------------------------
+            if isinstance(final_obs, tuple):
+                base_obs_tensor = torch.tensor(final_obs[0], dtype=torch.float32, device=device).unsqueeze(0)
+            else:
+                base_obs_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
             policy_net = player_data['policy_net']
+            # Initialize LSTM hidden state tuple (h0, c0)
+            num_layers = policy_net.lstm.num_layers
+            batch_size = base_obs_tensor.size(0)
+            hidden_size = policy_net.lstm.hidden_size
+            hidden_state = (
+                torch.zeros(num_layers, batch_size, hidden_size, device=device),
+                torch.zeros(num_layers, batch_size, hidden_size, device=device)
+            )
+            logger.debug(f"Base observation tensor shape: {base_obs_tensor.shape}")
+            logger.debug(f"Hidden state shapes: {hidden_state[0].shape}, {hidden_state[1].shape}")
             with torch.no_grad():
-                probs, _, _ = policy_net(obs_tensor, None)
+                # Extract the actual output probabilities from the tuple returned by the policy network.
+                probs, _, _ = policy_net(base_obs_tensor, hidden_state)
+            # ----------------------------
+            
             probs = torch.clamp(probs, 1e-8, 1.0)
             mask = info.get('action_mask', [1] * config.OUTPUT_DIM)
-            mask_tensor = torch.tensor(mask, dtype=torch.float32).to(device)
+            mask_tensor = torch.tensor(mask, dtype=torch.float32, device=device)
             masked_probs = probs * mask_tensor
             if masked_probs.sum() <= 0:
                 logger.warning(f"All actions masked for {agent}; using uniform.")
@@ -675,16 +851,12 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
             winner_player = agent_to_player.get(winner_agent, None)
             if winner_player:
                 game_wins[winner_player] += 1
-                if is_tournament:
-                    players_in_this_game[winner_player]['wins'] += 1
             else:
                 logger.error(f"Winner agent {winner_agent} not found.")
         else:
             logger.warning("No winner detected.")
         for pid in player_ids:
             cumulative_wins[pid] += game_wins[pid]
-            if is_tournament:
-                players_in_this_game[pid]['games_played'] += 1
         total_steps += steps_in_game
         game_wins_list.append(game_wins)
 
