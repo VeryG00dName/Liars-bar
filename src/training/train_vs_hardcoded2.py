@@ -76,7 +76,7 @@ def convert_memory_to_features(memory, response_mapping, action_mapping):
 # 4: RandomAgent
 # 5: TableNonTableAgent
 # 6: Classic
-HARD_CODED_BOT_INDEX = 6  # <-- Change this number to choose the bot.
+HARD_CODED_BOT_INDEX = 4  # <-- Change this number to choose the bot.
 HARD_CODED_BOT_NAMES = {
     0: "GreedyCardSpammer",
     1: "TableFirstConservativeChallenger",
@@ -97,6 +97,10 @@ HARD_CODED_BOT_CLASSES = {
 }
 TRAINING_BOT_NAME = HARD_CODED_BOT_NAMES[HARD_CODED_BOT_INDEX]
 TRAINING_BOT_CLASS = HARD_CODED_BOT_CLASSES[HARD_CODED_BOT_INDEX]
+
+# ---------------------------
+# Additional constant: number of consecutive log intervals with 0% win rate before culling.
+CULL_CONSECUTIVE_ZERO_WIN = 3  # You can adjust this threshold.
 
 # ---------------------------
 # Instantiate the device.
@@ -208,7 +212,6 @@ def train_agent(env, device, target_win_rate=0.95, load_checkpoint_flag=False, l
     writer = get_tensorboard_writer(log_dir=config.TENSORBOARD_RUNS_DIR) if log_tensorboard else None
     checkpoint_dir = config.CHECKPOINT_DIR
 
-    
     start_episode = 1
 
     static_entropy_coef = config.INIT_ENTROPY_COEF
@@ -217,6 +220,7 @@ def train_agent(env, device, target_win_rate=0.95, load_checkpoint_flag=False, l
     interval_steps_sum = 0
     interval_episode_count = 0
     win_history = deque(maxlen=200)  # Rolling window for win rate
+    consecutive_zero_win_count = 0   # Count of consecutive log intervals with 0% win rate
 
     global_step = 0
     episode = start_episode
@@ -245,7 +249,7 @@ def train_agent(env, device, target_win_rate=0.95, load_checkpoint_flag=False, l
             action_mask = env.infos[current_agent]['action_mask']
 
             if current_agent == rl_agent:
-                # For the RL agent, process opponent memory and transformer embeddings.
+                # Process opponent memory and transformer embeddings.
                 transformer_embeddings = []
                 obp_memory_embeddings = []
                 for opp in bot_agents:
@@ -255,7 +259,6 @@ def train_agent(env, device, target_win_rate=0.95, load_checkpoint_flag=False, l
                         feature_tensor = torch.tensor(features_list, dtype=torch.float32, device=device).unsqueeze(0)
                         with torch.no_grad():
                             projected = event_encoder(feature_tensor)
-                            # strategy_transformer returns just the embedding.
                             strategy_embedding = strategy_transformer(projected)
                     else:
                         strategy_embedding = torch.zeros(1, config.STRATEGY_DIM, device=device)
@@ -310,9 +313,11 @@ def train_agent(env, device, target_win_rate=0.95, load_checkpoint_flag=False, l
                     action_mask=action_mask
                 )
             else:
-                pending_rewards[current_agent] += env.rewards[current_agent]
+                pending_rewards[rl_agent] += env.rewards[rl_agent]
+            # When it's NOT the RL agent's turn, we still accumulate rewards for it
             for p in players:
-                episode_rewards[p] += env.rewards[p]
+                episode_rewards[p] += env.rewards[p]  # Track rewards for all agents
+
 
         episode_obp_data = extract_obp_training_data(env)
         obp_memory.extend(episode_obp_data)
@@ -339,21 +344,47 @@ def train_agent(env, device, target_win_rate=0.95, load_checkpoint_flag=False, l
             avg_steps = interval_steps_sum / interval_episode_count
             elapsed = time.time() - last_log_time
             steps_per_sec = interval_steps_sum / elapsed if elapsed > 0 else 0.0
+            current_win_rate = np.mean(win_history)
+            # Check if rolling win rate is 0%.
+            if current_win_rate == 0.0 and episode > config.LOG_INTERVAL:
+                consecutive_zero_win_count += 1
+            else:
+                consecutive_zero_win_count = 0
             if writer is not None:
                 writer.add_scalar("Reward/Average", avg_reward, episode)
                 writer.add_scalar("Stats/StepsPerEpisode", avg_steps, episode)
                 writer.add_scalar("Stats/StepsPerSecond", steps_per_sec, episode)
-            logger.info(f"Episode {episode} | Avg Reward: {avg_reward:.2f} | Avg Steps/Ep: {avg_steps:.2f} | Time: {elapsed:.2f}s | Steps/s: {steps_per_sec:.2f}")
+            logger.info(f"Episode {episode} | Avg Reward: {avg_reward:.2f} | Avg Steps/Ep: {avg_steps:.2f} | Time: {elapsed:.2f}s | Steps/s: {steps_per_sec:.2f} | Win rate: {current_win_rate*100:.1f}% consecutive zero win intervals: {consecutive_zero_win_count}")
             interval_reward_sum = 0
             interval_steps_sum = 0
             interval_episode_count = 0
             last_log_time = time.time()
+            # Cull (restart) agent if consecutive zero win intervals exceed threshold.
+            if consecutive_zero_win_count >= CULL_CONSECUTIVE_ZERO_WIN:
+                logger.info("Consecutive zero win intervals reached threshold. Restarting RL agent...")
+                policy_net = PolicyNetwork(
+                    input_dim=config.INPUT_DIM,
+                    hidden_dim=config.HIDDEN_DIM,
+                    output_dim=config.OUTPUT_DIM,
+                    use_lstm=True,
+                    use_dropout=True,
+                    use_layer_norm=True
+                ).to(device)
+                value_net = ValueNetwork(
+                    input_dim=config.INPUT_DIM,
+                    hidden_dim=config.HIDDEN_DIM,
+                    use_dropout=True,
+                    use_layer_norm=True
+                ).to(device)
+                optimizer_policy = optim.Adam(policy_net.parameters(), lr=config.LEARNING_RATE)
+                optimizer_value = optim.Adam(value_net.parameters(), lr=config.LEARNING_RATE)
+                memory = RolloutMemory([rl_agent])
+                consecutive_zero_win_count = 0
+                win_history.clear()
 
-        current_win_rate = np.mean(win_history)
-        logger.info(f"Rolling win rate over last {len(win_history)} episodes: {current_win_rate*100:.1f}%")
-        if current_win_rate >= target_win_rate and episode >= 100:
-            logger.info(f"Target win rate of {target_win_rate*100:.1f}% reached. Ending training.")
-            break
+            if current_win_rate >= target_win_rate and episode >= 100:
+                logger.info(f"Target win rate of {target_win_rate*100:.1f}% reached. Ending training.")
+                break
 
         rewards = memory.rewards[rl_agent]
         dones = memory.is_terminals[rl_agent]
