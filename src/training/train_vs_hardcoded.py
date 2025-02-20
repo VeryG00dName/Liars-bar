@@ -164,7 +164,7 @@ def configure_logger():
 # ---------------------------
 # Main training loop.
 # ---------------------------
-def train_agents(env, device, num_episodes=1000, baseline=None, load_checkpoint=True, load_directory=None, log_tensorboard=True):
+def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_directory=None, log_tensorboard=True):
     set_seed()
     obs, infos = env.reset()
     agents = env.agents
