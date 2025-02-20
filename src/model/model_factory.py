@@ -88,15 +88,3 @@ class ModelFactory:
                 new_state[key] = model_state[key]
         model.load_state_dict(new_state)
         return model
-
-# Example usage:
-if __name__ == "__main__":
-    hidden_dim = 64
-    policy_net = ModelFactory.create_policy_network(use_aux_classifier=False, hidden_dim=hidden_dim)
-    print(f"Created policy network with input dim {policy_net.fc1.in_features} and output dim {config.OUTPUT_DIM}")
-    value_net = ModelFactory.create_value_network(hidden_dim=hidden_dim)
-    print(f"Created value network with input dim {value_net.fc1.in_features}")
-    obp_model_with_memory = ModelFactory.create_obp(use_transformer_memory=True, hidden_dim=hidden_dim)
-    print(f"Created NEW OBP (with memory) with input dim {obp_model_with_memory.fc1.in_features}")
-    obp_model_no_memory = ModelFactory.create_obp(use_transformer_memory=False, hidden_dim=hidden_dim)
-    print(f"Created OLD OBP (without memory) with input dim {obp_model_no_memory.fc1.in_features}")
