@@ -3,9 +3,12 @@
 """
 swiss_accuracy_script.py
 
-Runs a Swiss tournament using real agents & environment.
-Compares rankings with 'true rankings' from scoreboard.json.
-Tracks rank correlation (Spearman/Kendall) across rounds.
+Runs two Swiss tournament simulations using real agents & environment.
+One simulation updates ratings after each game (per-game update) while the
+other updates ratings only after 11 games (per-match update).
+Rank correlations (Spearman/Kendall) are computed after every round against the
+'ture rankings' from scoreboard.json, so you can compare which update frequency
+yields rankings closer to the true scoreboard.
 
 Usage:
   python swiss_accuracy_script.py
@@ -17,22 +20,19 @@ import os
 import json
 import logging
 import torch
-import numpy as np
-import random
+import copy
 from typing import Dict, List, Tuple
 from scipy.stats import spearmanr, kendalltau
 
-# --- Import Swiss logic from evaluate_tournament ---
-from src.evaluation.evaluate_tournament import (
-    run_group_swiss_tournament,
-    evaluate_agents_tournament as evaluate_agents,  # Correct function reference
-    update_openskill_ratings,
-    openskill_model,
-    swiss_grouping
+# --- Import Swiss logic from evaluate_utils ---
+from src.evaluation.evaluate_utils import (
+    initialize_players,
+    evaluate_agents,
+    model as openskill_model
 )
 
-# --- Import initialize_players from evaluate.py ---
-from src.evaluation.evaluate import initialize_players
+# --- Import unified initialize_players from evaluate.py ---
+from src.evaluation.evaluate_tournament import swiss_grouping
 
 # --- Import environment & config ---
 from src.env.liars_deck_env_core import LiarsDeckEnv
@@ -82,87 +82,130 @@ def measure_rank_correlation(
     return rho, tau
 
 
-def run_swiss_tournament_with_rank_correlation(
+def run_tournament_per_game(
     env: LiarsDeckEnv,
     device: torch.device,
     players: Dict[str, dict],
-    scoreboard_ranks: Dict[str, int],
-    num_games_per_match: int = 5,
-    NUM_ROUNDS: int = 7
+    num_games: int,
+    NUM_ROUNDS: int
 ) -> Tuple[List[float], List[float]]:
     """
-    Runs a Swiss tournament and tracks ranking correlation after each round.
-    In each round, players are grouped using a greedy Swiss grouping method (swiss_grouping)
-    that minimizes repeated matchups while forming groups of size env.num_players.
-    
-    Returns lists of Spearman & Kendall correlation values.
+    Runs a Swiss tournament where for each group match the simulation is run game-by-game,
+    updating ratings after each individual game.
+    Returns lists of Spearman and Kendall correlations after each round.
     """
     spearman_list = []
     kendall_list = []
 
-    # Measure initial rank correlation before any rounds.
-    rho0, tau0 = measure_rank_correlation(players, scoreboard_ranks)
+    match_history = {pid: set() for pid in players}
+    # Update initial correlation
+    rho0, tau0 = measure_rank_correlation(players, true_scoreboard)
     spearman_list.append(rho0)
     kendall_list.append(tau0)
-    logging.info(f"Initial Rank Correlation => Spearman={rho0:.3f}, Kendall={tau0:.3f}")
-
-    player_ids = list(players.keys())
-    group_size = env.num_players  # e.g. 3.
-    # Initialize match history.
-    match_history = {pid: set() for pid in players}
 
     for round_num in range(1, NUM_ROUNDS + 1):
-        logging.info(f"=== Starting Round {round_num}/{NUM_ROUNDS} ===")
-
-        groups = swiss_grouping(players, match_history, group_size)
-        logging.info(f"Formed {len(groups)} groups this round: {groups}")
-
+        logging.info(f"=== Starting Round {round_num}/{NUM_ROUNDS} (Per-Game Update) ===")
+        groups = swiss_grouping(players, match_history, env.num_players)
         for group in groups:
-            if len(group) != group_size:
-                logging.warning(f"Skipping group {group} as it does not have the required size {group_size}.")
+            if len(group) != env.num_players:
                 continue
 
-            logging.info(f"Group match: {group}")
-            players_in_this_game = {pid: players[pid] for pid in group}
-            cumulative_wins, action_counts, game_wins_list, avg_steps = evaluate_agents(
+            # For each game in the match, run a single episode and update ratings immediately.
+            for game in range(num_games):
+                players_in_game = {pid: players[pid] for pid in group}
+                # Evaluate a single game (episode=1)
+                cumulative_wins, _, _, avg_steps, _ = evaluate_agents(
+                    env=env,
+                    device=device,
+                    players_in_this_game=players_in_game,
+                    episodes=1
+                )
+                # Update win stats (each game counts individually)
+                for pid in group:
+                    players[pid]["wins"] += cumulative_wins[pid]
+                    players[pid]["games_played"] += 1
+                # Determine group ranking for this game
+                game_ranking = sorted(group, key=lambda pid: cumulative_wins[pid], reverse=True)
+                # Update rating immediately for this game.
+                match_ratings = [[players[pid]["rating"]] for pid in group]
+                ranks = [game_ranking.index(pid) for pid in group]
+                new_ratings = openskill_model.rate(match_ratings, ranks=ranks)
+                for idx, pid in enumerate(group):
+                    players[pid]["rating"] = new_ratings[idx][0]
+                    players[pid]["score"] = players[pid]["rating"].ordinal()
+            # Update match history
+            for pid in group:
+                for other in group:
+                    if other != pid:
+                        match_history[pid].add(other)
+        rho, tau = measure_rank_correlation(players, true_scoreboard)
+        spearman_list.append(rho)
+        kendall_list.append(tau)
+    return spearman_list, kendall_list
+
+
+def run_tournament_per_match(
+    env: LiarsDeckEnv,
+    device: torch.device,
+    players: Dict[str, dict],
+    num_games: int,
+    NUM_ROUNDS: int
+) -> Tuple[List[float], List[float]]:
+    """
+    Runs a Swiss tournament where for each group match the simulation is run for all games
+    together (num_games per match) and ratings are updated only once after the match.
+    Returns lists of Spearman and Kendall correlations after each round.
+    """
+    spearman_list = []
+    kendall_list = []
+
+    match_history = {pid: set() for pid in players}
+    # Update initial correlation
+    rho0, tau0 = measure_rank_correlation(players, true_scoreboard)
+    spearman_list.append(rho0)
+    kendall_list.append(tau0)
+
+    for round_num in range(1, NUM_ROUNDS + 1):
+        logging.info(f"=== Starting Round {round_num}/{NUM_ROUNDS} (Per-Match Update) ===")
+        groups = swiss_grouping(players, match_history, env.num_players)
+        for group in groups:
+            if len(group) != env.num_players:
+                continue
+
+            players_in_match = {pid: players[pid] for pid in group}
+            # Evaluate the entire match at once (num_games episodes)
+            cumulative_wins, _, _, avg_steps, _ = evaluate_agents(
                 env=env,
                 device=device,
-                players_in_this_game=players_in_this_game,
-                episodes=num_games_per_match
+                players_in_this_game=players_in_match,
+                episodes=num_games
             )
+            # Update win stats (each match counts as one match played)
             for pid in group:
                 players[pid]["wins"] += cumulative_wins[pid]
-                players[pid]["games_played"] += num_games_per_match
+                players[pid]["games_played"] += 1
             group_ranking = sorted(group, key=lambda pid: cumulative_wins[pid], reverse=True)
-            logging.info(
-                "Group Results: " + ", ".join([f"{pid} wins={cumulative_wins[pid]}" for pid in group]) +
-                f", Winner: {group_ranking[0]}, Avg Steps/Ep: {avg_steps:.2f}"
-            )
-            # Update ratings for this group.
+            # Update rating once for this match.
             match_ratings = [[players[pid]["rating"]] for pid in group]
             ranks = [group_ranking.index(pid) for pid in group]
             new_ratings = openskill_model.rate(match_ratings, ranks=ranks)
             for idx, pid in enumerate(group):
                 players[pid]["rating"] = new_ratings[idx][0]
                 players[pid]["score"] = players[pid]["rating"].ordinal()
-
             # Update match history.
             for pid in group:
                 for other in group:
                     if other != pid:
                         match_history[pid].add(other)
-
-        rho, tau = measure_rank_correlation(players, scoreboard_ranks)
+        rho, tau = measure_rank_correlation(players, true_scoreboard)
         spearman_list.append(rho)
         kendall_list.append(tau)
-        logging.info(f"Round {round_num} => Spearman={rho:.3f}, Kendall={tau:.3f}")
-
     return spearman_list, kendall_list
 
 
 def main():
     """
-    Main function to run the Swiss tournament and measure ranking accuracy.
+    Main function to run both Swiss tournament simulations and measure ranking accuracy.
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -171,8 +214,9 @@ def main():
     logger = logging.getLogger("SwissAccuracyScript")
 
     scoreboard_path = "scoreboard.json"
-    true_ranks = load_scoreboard_ranks(scoreboard_path)
-    logger.info(f"Loaded {len(true_ranks)} ranked players from {scoreboard_path}")
+    global true_scoreboard
+    true_scoreboard = load_scoreboard_ranks(scoreboard_path)
+    logger.info(f"Loaded {len(true_scoreboard)} ranked players from {scoreboard_path}")
 
     env = LiarsDeckEnv(num_players=config.NUM_PLAYERS, render_mode=None)
     env.reset()
@@ -188,41 +232,62 @@ def main():
     logger.info(f"Using device: {device}")
 
     players_dir = config.PLAYERS_DIR
-    players = initialize_players(players_dir, device)
-    logger.info(f"Loaded {len(players)} players from {players_dir}")
+    base_players = initialize_players(players_dir, device)
+    logger.info(f"Loaded {len(base_players)} players from {players_dir}")
 
-    # Initialize each player's rating stats
-    for pid, pdata in players.items():
+    # Initialize each player's rating stats.
+    for pid, pdata in base_players.items():
         pdata["score"] = pdata["rating"].ordinal()
         pdata["wins"] = 0
         pdata["games_played"] = 0
 
-    NUM_GAMES_PER_MATCH = 11
+    NUM_GAMES_PER_MATCH = 11  # For per-match update simulation.
+    NUM_GAMES_PER_GAME = 11    # For per-game update simulation.
     NUM_ROUNDS = 10
 
-    spearman_list, kendall_list = run_swiss_tournament_with_rank_correlation(
+    # Create two independent copies of the players dictionary.
+    players_per_game = copy.deepcopy(base_players)
+    players_per_match = copy.deepcopy(base_players)
+
+    logger.info("Running tournament with per-game updates...")
+    spearman_game, kendall_game = run_tournament_per_game(
         env=env,
         device=device,
-        players=players,
-        scoreboard_ranks=true_ranks,
-        num_games_per_match=NUM_GAMES_PER_MATCH,
+        players=players_per_game,
+        num_games=NUM_GAMES_PER_GAME,
+        NUM_ROUNDS=NUM_ROUNDS
+    )
+
+    # Reset environment between tournaments if needed.
+    env.reset()
+
+    logger.info("Running tournament with per-match updates...")
+    spearman_match, kendall_match = run_tournament_per_match(
+        env=env,
+        device=device,
+        players=players_per_match,
+        num_games=NUM_GAMES_PER_MATCH,
         NUM_ROUNDS=NUM_ROUNDS
     )
 
     print("\n=== Rank Correlation vs. Scoreboard Over Swiss Rounds ===")
-    for r, (rho, tau) in enumerate(zip(spearman_list, kendall_list)):
+    print("Per-Game Update (rating updated after each game):")
+    for r, (rho, tau) in enumerate(zip(spearman_game, kendall_game)):
+        print(f"Round {r}: Spearman={rho:.3f}, Kendall={tau:.3f}")
+    print("\nPer-Match Update (rating updated after 11 games):")
+    for r, (rho, tau) in enumerate(zip(spearman_match, kendall_match)):
         print(f"Round {r}: Spearman={rho:.3f}, Kendall={tau:.3f}")
 
-    final_sorted = sorted(players.items(), key=lambda x: x[1]["score"], reverse=True)
-    print("\n=== Final Swiss Rankings vs. Old Scoreboard Rankings ===")
-    print(f"{'Rank':<5}{'Player ID':<50}{'New Rank':<10}{'Old Rank':<10}{'Version':<10}")
+    final_sorted_game = sorted(players_per_game.items(), key=lambda x: x[1]["score"], reverse=True)
+    final_sorted_match = sorted(players_per_match.items(), key=lambda x: x[1]["score"], reverse=True)
+
+    print("\n=== Final Swiss Rankings Comparison ===")
+    print(f"{'Method':<15}{'Rank':<5}{'Player ID':<50}{'Score':<10}{'Version':<10}")
     print("-" * 90)
-    # Changed enumeration to start at 0 for new ranks.
-    for rank, (pid, pdata) in enumerate(final_sorted):
-        old_rank = true_ranks.get(pid, "N/A")
-        # Include observation version (v1 or v2) in the output
-        version = f"v{pdata.get('obs_version', 'unknown')}"
-        print(f"{rank:<5}{pid:<50}{rank:<10}{old_rank:<10}{version:<10}")
+    for method, final_sorted in [("Per-Game", final_sorted_game), ("Per-Match", final_sorted_match)]:
+        for rank, (pid, pdata) in enumerate(final_sorted):
+            version = f"v{pdata.get('obs_version', 'unknown')}"
+            print(f"{method:<15}{rank:<5}{pid:<50}{pdata['score']:<10}{version:<10}")
 
 
 if __name__ == "__main__":
