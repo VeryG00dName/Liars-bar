@@ -211,21 +211,3 @@ class StrategyTransformer(nn.Module):
             pooled = encoded.mean(dim=1)
         strategy_embedding = self.strategy_head(pooled)
         return strategy_embedding
-
-# ----------------------------
-# MetaController: Selects Specialized Agent
-# ----------------------------
-class MetaController(nn.Module):
-    def __init__(self, embedding_dim, num_specialists):
-        """
-        Given an opponent’s strategy embedding, the meta-controller outputs a probability distribution
-        over the specialized agents.
-        """
-        super(MetaController, self).__init__()
-        self.fc = nn.Linear(embedding_dim, num_specialists)
-    
-    def forward(self, embedding):
-        # embedding: (batch, embedding_dim)
-        logits = self.fc(embedding)
-        selection_probs = F.softmax(logits, dim=-1)
-        return selection_probs
