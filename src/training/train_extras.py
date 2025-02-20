@@ -3,7 +3,6 @@
 import random
 import numpy as np
 import torch
-from src.env.liars_deck_env_utils_2 import decode_action, select_cards_to_play, validate_claim
 from src import config
 
 def set_seed(seed=42):
