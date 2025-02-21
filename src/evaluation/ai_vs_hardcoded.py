@@ -8,6 +8,7 @@ from tkinterdnd2 import TkinterDnD, DND_FILES
 import threading
 import torch
 import numpy as np
+
 from src.env.liars_deck_env_core import LiarsDeckEnv
 from src import config
 
@@ -27,10 +28,15 @@ from src.evaluation.evaluate_utils import (
     evaluate_agents
 )
 
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+torch.backends.cudnn.benchmark = True
+
 # Import the unified ModelFactory API.
 from src.model.model_factory import ModelFactory
 
-import logging
+# Import the historical models loader from our training script.
+from src.training.train_vs_everyone import load_specific_historical_models
+
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(name)s %(levelname)s: %(message)s")
 logger = logging.getLogger("AgentBattleground")
@@ -41,7 +47,7 @@ global_event_encoder = None
 global_response2idx = None
 global_action2idx = None
 
-# --- New helper: Convert memory events into 4D continuous features ---
+# --- Helper: Convert memory events into 4D continuous features ---
 def convert_memory_to_features(memory, response_mapping, action_mapping):
     """
     Convert the opponent memory (a list of events) to a list of 4-dimensional feature vectors.
@@ -65,7 +71,7 @@ class AgentBattlegroundGUI:
         self.root = root
         self.root.title("Agent Battleground")
         self.root.geometry("1000x650")  # Wider and taller window
-        
+
         self.loaded_models = {}
         self.hardcoded_agents = {
             "GreedySpammer": GreedyCardSpammer,
@@ -76,7 +82,14 @@ class AgentBattlegroundGUI:
             "Classic": Classic,
             "Random": RandomAgent
         }
-        
+        # Load historical models using the same function as in training.
+        # These models are expected to be PPO models in evaluation mode.
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.historical_models = {}  # mapping from identifier to model instance
+        hist_models_list = load_specific_historical_models(config.HISTORICAL_MODEL_DIR, device)
+        for model, identifier in hist_models_list:
+            self.historical_models[identifier] = model
+
         self.create_file_drop_zone()
         self.create_model_info_panel()
         self.create_ai_selection()
@@ -251,37 +264,48 @@ class AgentBattlegroundGUI:
 
             rounds = int(self.rounds_var.get())
             results = {}
-            total_matches = rounds * len(self.hardcoded_agents)
+            # Combine hardcoded and historical opponents.
+            combined_opponents = {}
+            # First add hardcoded agents.
+            for name, cls in self.hardcoded_agents.items():
+                combined_opponents[name] = ("hardcoded", cls)
+            # Then add historical models.
+            for identifier, hist_model in self.historical_models.items():
+                combined_opponents[identifier] = ("historical", hist_model)
+
+            total_matches = rounds * len(combined_opponents)
             self.progress['value'] = 0
             self.progress['maximum'] = total_matches
             progress_counter = 0
 
-            for hc_name, hc_class in self.hardcoded_agents.items():
-                wins = [0, 0, 0]  # [AI1 Wins, AI2 Wins, Hardcoded Wins]
+            for opp_name, (opp_type, opp_obj) in combined_opponents.items():
+                wins = [0, 0, 0]  # [AI1 Wins, AI2 Wins, Opponent Wins]
                 for _ in range(rounds):
-                    winner = self.run_match(ai_agents, hc_class(hc_name))
+                    winner = self.run_match(ai_agents, opp_type, opp_obj, opp_name)
                     if winner == "player_0":
                         wins[0] += 1
                     elif winner == "player_1":
                         wins[1] += 1
-                    elif winner == "hardcoded_agent":
+                    elif winner == "opponent":
                         wins[2] += 1
                     else:
                         logger.warning(f"Unknown winner identifier: {winner}")
                     progress_counter += 1
                     self.progress['value'] = progress_counter
                     self.root.update_idletasks()
-                results[hc_name] = wins
+                results[opp_name] = wins
 
             self.display_results(results)
 
         except Exception as e:
             self.show_info(f"Error: {str(e)}")
 
-    def run_match(self, ai_agents, hardcoded_agent):
+    def run_match(self, ai_agents, opponent_type, opponent_obj, opponent_name):
         """
-        Constructs a players dictionary for a 3-player match (2 AI and 1 hardcoded),
+        Constructs a players dictionary for a 3-player match (2 AI and 1 opponent),
         then runs one episode using evaluate_agents and determines the winner.
+        For hardcoded opponents, opponent_obj is a class (or a lambda) used to instantiate the bot.
+        For historical opponents, opponent_obj is a PPO model instance.
         """
         env = LiarsDeckEnv(num_players=3, render_mode=None)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -293,13 +317,13 @@ class AgentBattlegroundGUI:
         for key in ["player_0", "player_1"]:
             agent_data = ai_agents[key]
             hidden_dim = get_hidden_dim_from_state_dict(agent_data["policy_net"], "fc1")
-            num_opponents = env.num_players - 1
-            # Use the full input_dim from checkpoint so fc1 dimensions match.
             obs_dim = agent_data["input_dim"]
             policy_net = ModelFactory.create_policy_network(
                 input_dim=obs_dim,
                 hidden_dim=hidden_dim,
-                output_dim=env.action_spaces[key].n
+                output_dim=env.action_spaces[key].n,
+                use_aux_classifier=True,  # same as PPO agents
+                num_opponent_classes=config.NUM_OPPONENT_CLASSES
             )
             policy_net.load_state_dict(agent_data["policy_net"], strict=False)
             policy_net.to(device).eval()
@@ -330,47 +354,85 @@ class AgentBattlegroundGUI:
                 obp_model = None
 
             players_in_this_game[key] = {
-                "policy_net": policy_net,  # use our wrapper here
+                "policy_net": policy_net,
                 "obp_model": obp_model,
                 "obs_version": agent_data["obs_version"],
                 "rating": None,
                 "uses_memory": agent_data["uses_memory"]
             }
 
-        # Hardcoded agent as player_2.
-        players_in_this_game["player_2"] = {
-            "hardcoded_bot": True,
-            "agent": hardcoded_agent,
-            "obs_version": 2,
-            "rating": None,
-            "uses_memory": False
-        }
+        # Opponent as player_2.
+        if opponent_type == "hardcoded":
+            opponent_instance = opponent_obj(opponent_name)
+            players_in_this_game["player_2"] = {
+                "hardcoded_bot": True,
+                "agent": opponent_instance,
+                "obs_version": 2,
+                "rating": None,
+                "uses_memory": False
+            }
+        elif opponent_type == "historical":
+            # For historical opponents, recreate the policy network and also create an OBP network.
+            hist_state_dict = opponent_obj.state_dict()
+            hidden_dim = get_hidden_dim_from_state_dict(hist_state_dict, "fc1")
+            obs_dim = hist_state_dict["fc1.weight"].shape[1]
+            policy_net = ModelFactory.create_policy_network(
+                input_dim=obs_dim,
+                hidden_dim=hidden_dim,
+                output_dim=env.action_spaces["player_2"].n,
+                use_aux_classifier=True,  # ensure auxiliary classifier is on as with PPO agents
+                num_opponent_classes=config.NUM_OPPONENT_CLASSES
+            )
+            policy_net.load_state_dict(hist_state_dict, strict=False)
+            policy_net.to(device).eval()
+
+            # Create an OBP network for the historical model (with transformer memory enabled).
+            obp_model = ModelFactory.create_obp(
+                use_transformer_memory=True,
+                input_dim=config.OPPONENT_INPUT_DIM,
+                hidden_dim=config.OPPONENT_HIDDEN_DIM,
+                output_dim=2
+            )
+            # If you have a historical OBP state to load, do so here.
+            # Otherwise, the OBP network will use its initial weights.
+            obp_model.to(device).eval()
+
+            players_in_this_game["player_2"] = {
+                "policy_net": policy_net,
+                "obp_model": obp_model,
+                "obs_version": 2,  # Adjust if necessary
+                "rating": None,
+                "uses_memory": True  # Now historical opponents use memory and OBP like PPO agents
+            }
+        else:
+            raise ValueError(f"Unknown opponent type: {opponent_type}")
 
         cumulative_wins, _, _, _, _ = evaluate_agents(env, device, players_in_this_game, episodes=1)
 
+        # Map winner from the evaluation to a simplified identifier.
         winner = max(cumulative_wins, key=cumulative_wins.get)
         if winner in ["player_0", "player_1"]:
             return winner
         elif winner == "player_2":
-            return "hardcoded_agent"
+            return "opponent"
         else:
-            return "unknown_agent"
-
+            return "unknown"
 
     def display_results(self, results):
         self.results_text.config(state=tk.NORMAL)
         self.results_text.delete(1.0, tk.END)
-        header = "Hardcoded Agent | AI1 Wins | AI2 Wins | Hardcoded Wins | AI1 Win Rate | AI2 Win Rate | Hardcoded Win Rate\n"
+        header = ("Opponent Name         | AI1 Wins | AI2 Wins | Opponent Wins | "
+                  "AI1 Win Rate | AI2 Win Rate | Opponent Win Rate\n")
         self.results_text.insert(tk.END, header)
-        self.results_text.insert(tk.END, "-"*100 + "\n")
-        for hc_name, wins in results.items():
-            ai1_wins, ai2_wins, hc_wins = wins
-            total = ai1_wins + ai2_wins + hc_wins
+        self.results_text.insert(tk.END, "-" * 100 + "\n")
+        for opp_name, wins in results.items():
+            ai1_wins, ai2_wins, opp_wins = wins
+            total = ai1_wins + ai2_wins + opp_wins
             rate1 = ai1_wins / total if total > 0 else 0.0
             rate2 = ai2_wins / total if total > 0 else 0.0
-            rate_hc = hc_wins / total if total > 0 else 0.0
-            line = (f"{hc_name:20} | {ai1_wins:^9} | {ai2_wins:^9} | {hc_wins:^15} | "
-                    f"{rate1:12.2%} | {rate2:12.2%} | {rate_hc:18.2%}\n")
+            rate_opp = opp_wins / total if total > 0 else 0.0
+            line = (f"{opp_name:20} | {ai1_wins:^9} | {ai2_wins:^9} | {opp_wins:^15} | "
+                    f"{rate1:12.2%} | {rate2:12.2%} | {rate_opp:18.2%}\n")
             self.results_text.insert(tk.END, line)
         self.results_text.config(state=tk.DISABLED)
 
