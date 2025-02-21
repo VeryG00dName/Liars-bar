@@ -308,8 +308,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                                        for _ in range(env.num_players - 1)]
                 )
             else:
-                transformer_embeddings = []
-                obp_memory_embeddings = []
+                embeddings_list = []
                 for opp in env.possible_agents:
                     if opp != agent:
                         mem_summary = query_opponent_memory_full(agent, opp)
@@ -323,21 +322,41 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                             strategy_embedding = None
 
                         if strategy_embedding is not None:
-                            obp_memory_embeddings.append(strategy_embedding)
-                            transformer_embeddings.append(strategy_embedding.cpu().detach().numpy().flatten())
+                            embeddings_list.append(strategy_embedding.cpu().detach().numpy().flatten())
+                            # --- Log similarity if this opponent is the tracked agent ---
+                            if tracked_agent is not None and opp == tracked_agent:
+                                if agent in tracked_agent_last_embeddings:
+                                    prev_emb = tracked_agent_last_embeddings[agent]
+                                    similarity = F.cosine_similarity(strategy_embedding, prev_emb, dim=1).item()
+                                    if writer is not None:
+                                        writer.add_scalar(f"MemorySimilarity/{agent}/{tracked_agent}", similarity, global_step)
+                                tracked_agent_last_embeddings[agent] = strategy_embedding.detach()
                         else:
-                            zero_emb = torch.zeros(1, config.STRATEGY_DIM, device=device)
-                            obp_memory_embeddings.append(zero_emb)
-                            transformer_embeddings.append(np.zeros(config.STRATEGY_DIM, dtype=np.float32))
+                            embeddings_list.append(np.zeros(config.STRATEGY_DIM, dtype=np.float32))
 
-                        # --- NEW: If this opponent is the tracked agent, compute & log similarity --- 
-                        if tracked_agent is not None and opp == tracked_agent and strategy_embedding is not None:
-                            if agent in tracked_agent_last_embeddings:
-                                prev_emb = tracked_agent_last_embeddings[agent]
-                                similarity = F.cosine_similarity(strategy_embedding, prev_emb, dim=1).item()
-                                if writer is not None:
-                                    writer.add_scalar(f"MemorySimilarity/{agent}/{tracked_agent}", similarity, global_step)
-                            tracked_agent_last_embeddings[agent] = strategy_embedding.detach()
+                if embeddings_list:
+                    # Concatenate embeddings into one flat vector.
+                    embeddings_arr = np.concatenate(embeddings_list, axis=0)
+                    # Apply min-max normalization over the entire concatenated array.
+                    min_val = embeddings_arr.min()
+                    max_val = embeddings_arr.max()
+                    if max_val - min_val == 0:
+                        normalized_arr = embeddings_arr  # All values are identical.
+                    else:
+                        normalized_arr = (embeddings_arr - min_val) / (max_val - min_val)
+                else:
+                    normalized_arr = np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
+
+                # Split the normalized array back into segments per opponent.
+                num_opponents = len(env.possible_agents) - 1
+                segment_size = config.STRATEGY_DIM
+                normalized_segments = []
+                for i in range(num_opponents):
+                    seg = normalized_arr[i * segment_size:(i + 1) * segment_size]
+                    normalized_segments.append(torch.tensor(seg, dtype=torch.float32, device=device).unsqueeze(0))
+                # Use the same normalized array for both OBP and final observation.
+                obp_memory_embeddings = normalized_segments
+                transformer_features = normalized_arr
                 obp_probs = run_obp_inference(obp_model, observation, device, env.num_players,
                                               memory_embeddings=obp_memory_embeddings)
 
@@ -350,12 +369,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 mem_features = np.zeros(missing_dim, dtype=np.float32)
                 final_obs = np.concatenate([base_obs, obp_arr, mem_features], axis=0)
             else:
-                transformer_features = (np.concatenate(transformer_embeddings, axis=0)
-                                        if transformer_embeddings
-                                        else np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32))
-                scaler = StandardScaler()
-                normalized_transformer_features = scaler.fit_transform(np.array(transformer_features).reshape(1, -1)).flatten()
-                final_obs = np.concatenate([observation, np.array(obp_probs, dtype=np.float32), normalized_transformer_features], axis=0)
+                final_obs = np.concatenate([observation, np.array(obp_probs, dtype=np.float32), transformer_features], axis=0)
             
             # 4) Decide action.
             if agent == current_hardcoded_agent_id:
@@ -594,7 +608,6 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 f"Avg Steps/Ep: {avg_steps_per_episode:.2f}\t"
                 f"Time since last log: {elapsed_time:.2f} seconds\t"
                 f"Steps/s: {steps_per_second:.2f}"
-                f"accuracy: {accuracy:.2f}"
             )
     
             if log_tensorboard and writer is not None:
