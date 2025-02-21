@@ -9,6 +9,7 @@ from tkinter import ttk, messagebox
 import traceback
 from tkinterdnd2 import TkinterDnD, DND_FILES
 import torch
+import torch.nn.functional as F
 import numpy as np
 import random
 import pickle
@@ -26,20 +27,25 @@ from src.model.hard_coded_agents import (
     Classic
 )
 
-from src.evaluation.evaluate import run_obp_inference
 from src.evaluation.evaluate_utils import (
     adapt_observation_for_version,
-    get_hidden_dim_from_state_dict
+    get_hidden_dim_from_state_dict,
+    get_opponent_memory_embedding,
+    run_obp_inference,
+    run_obp_inference_tournament
 )
+
+# Import ModelFactory for OBP creation.
+from src.model.model_factory import ModelFactory
 
 # Import the opponent memory query helper from memory.py
 from src.model.memory import get_opponent_memory
 
-# New parameters for early culling (for non-GUI parts remain unchanged):
-viable_segment_threshold = 5  # Agent must generate at least this many segments
-game_threshold = 50            # Within this many games, otherwise cull
+# New parameters for early culling:
+viable_segment_threshold = 5
+game_threshold = 50
 
-logging.basicConfig(level=logging.INFO)  # Set to DEBUG for detailed logs
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AgentBattleground")
 
 
@@ -47,41 +53,39 @@ class AgentBattlegroundGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Agent Battleground")
-        self.root.geometry("900x700")
+        self.root.geometry("900x750")
         
         self.loaded_models = {}
         self.hardcoded_agents = {
             "GreedySpammer": GreedyCardSpammer,
             "TableFirst": TableFirstConservativeChallenger,
-            "Strategic": lambda name: StrategicChallenger(name, 3, 2),  # Pass agent_index=2
+            "Strategic": lambda name: StrategicChallenger(name, 3, 2),
             "Conservative": lambda name: TableFirstConservativeChallenger(name),
             "TableNonTableAgent": TableNonTableAgent,
             "Classic": Classic,
             "Random": RandomAgent
         }
         
-        # This list will accumulate training examples.
-        # Each element is a tuple: (memory_segment, label)
         self.training_data = []
-        # Will hold the transformer instance once loaded.
         self.strategy_transformer = None
-        # Will store the current environment for memory queries.
         self.current_env = None
-        # Initialize a counter for games played per agent since last memory collection.
         self.games_since_last_collection = {}
+        self.target_segments = 500  # Default value; also set via parameters box
+        
+        # New: maintain a set of culled agents (by label)
+        self.culled_agents = set()
 
         self.create_file_drop_zone()
         self.create_model_info_panel()
-        self.create_ai_selection()  # now a multi-select listbox
+        self.create_ai_selection()
         self.create_match_options()
-        self.create_parameters_box()  # <-- New parameters input box for target_segments
+        self.create_parameters_box()
+        self.create_progress_and_culling_controls()
         self.create_control_buttons()
         self.create_results_display()
-        # Add a button to print a summary of training data.
         self.create_summary_button()
 
     def get_hidden_dim_from_state_dict(self, state_dict, layer_prefix='fc1'):
-        """Extracts hidden dimension from model weights using imported utility."""
         return get_hidden_dim_from_state_dict(state_dict, layer_prefix)
 
     def create_file_drop_zone(self):
@@ -104,7 +108,6 @@ class AgentBattlegroundGUI:
     def create_ai_selection(self):
         frame = ttk.LabelFrame(self.root, text="PPO Agents Selection", padding=10)
         frame.pack(fill=tk.X, padx=10, pady=5)
-        # Use a Listbox with multiple selection.
         self.agent_listbox = tk.Listbox(frame, selectmode=tk.MULTIPLE, width=50)
         self.agent_listbox.pack(fill=tk.X, padx=5, pady=5)
 
@@ -117,22 +120,82 @@ class AgentBattlegroundGUI:
         ttk.Checkbutton(frame, text="Include Matches among PPO Agents", variable=self.include_ppo).pack(anchor=tk.W, pady=2)
 
     def create_parameters_box(self):
-        """Creates a GUI box to set parameters, such as target_segments per agent."""
         frame = ttk.LabelFrame(self.root, text="Parameters", padding=10)
         frame.pack(fill=tk.X, padx=10, pady=5)
         target_label = ttk.Label(frame, text="Target Segments per Agent:")
         target_label.pack(side=tk.LEFT, padx=5)
-        # Use a StringVar to hold the value (default "500")
         self.target_segments_var = tk.StringVar(value="500")
         target_entry = ttk.Entry(frame, textvariable=self.target_segments_var, width=10)
         target_entry.pack(side=tk.LEFT)
+        target_entry.bind("<FocusOut>", self.update_target_segments)
+
+    def update_target_segments(self, event):
+        try:
+            self.target_segments = int(self.target_segments_var.get())
+        except ValueError:
+            self.show_info("Invalid target segments value, using default of 500.")
+            self.target_segments = 500
+
+    def create_progress_and_culling_controls(self):
+        # New frame for progress bar, dropdown to select an agent, and a button to cull the agent.
+        frame = ttk.LabelFrame(self.root, text="Agent Progress & Culling", padding=10)
+        frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(frame, text="Select Agent:").pack(side=tk.LEFT, padx=5)
+        self.agent_combobox = ttk.Combobox(frame, state="readonly")
+        self.agent_combobox.pack(side=tk.LEFT, padx=5)
+        self.cull_button = ttk.Button(frame, text="Cull Agent", command=self.cull_selected_agent)
+        self.cull_button.pack(side=tk.LEFT, padx=5)
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(frame, variable=self.progress_var, maximum=100)
+        self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        self.update_agent_combobox()
+
+    def update_agent_combobox(self):
+        # Only include agents that are not culled.
+        agents = self.load_selected_agents()
+        if agents:
+            labels = [data["label"] for data in agents.values() if data["label"] not in self.culled_agents]
+            self.agent_combobox["values"] = labels
+            if labels:
+                self.agent_combobox.current(0)
+                self.update_progress_bar()
+            else:
+                self.agent_combobox.set("")
+                self.progress_var.set(0)
+        else:
+            self.agent_combobox["values"] = []
+
+    def update_progress_bar(self):
+        selected = self.agent_combobox.get()
+        if not selected:
+            self.progress_var.set(0)
+            return
+        current_count = sum(1 for seg, lbl in self.training_data if lbl == selected)
+        percentage = (current_count / self.target_segments) * 100
+        self.progress_var.set(min(percentage, 100))
+
+    def cull_selected_agent(self):
+        # Instead of deleting training samples, flag the agent as culled.
+        selected = self.agent_combobox.get()
+        if not selected:
+            self.show_info("No agent selected for culling.")
+            return
+        self.culled_agents.add(selected)
+        self.show_info(f"Agent {selected} has been culled and will no longer generate new samples.")
+        self.update_agent_combobox()
 
     def create_control_buttons(self):
         frame = ttk.Frame(self.root)
         frame.pack(pady=10)
-        ttk.Button(frame, text="Refresh Agents", command=self.update_agent_selectors).pack(side=tk.LEFT, padx=5)
+        ttk.Button(frame, text="Refresh Agents", command=self.refresh_all).pack(side=tk.LEFT, padx=5)
         ttk.Button(frame, text="Start Battleground", command=self.start_battleground_async).pack(side=tk.LEFT, padx=5)
         ttk.Button(frame, text="Save Training Data", command=self.save_training_data).pack(side=tk.LEFT, padx=5)
+
+    def refresh_all(self):
+        self.update_agent_selectors()
+        self.update_agent_combobox()
 
     def create_summary_button(self):
         frame = ttk.Frame(self.root)
@@ -163,6 +226,7 @@ class AgentBattlegroundGUI:
             self.load_model(file_path)
             self.file_list.insert(tk.END, os.path.basename(file_path))
             self.update_agent_selectors()
+            self.update_agent_combobox()
             self.show_info(f"Loaded: {os.path.basename(file_path)}")
         except Exception as e:
             self.show_info(f"Error: {str(e)}")
@@ -171,27 +235,25 @@ class AgentBattlegroundGUI:
         checkpoint = torch.load(file_path, map_location="cpu")
         if not isinstance(checkpoint, dict):
             raise ValueError("Invalid checkpoint format")
-        required_keys = ["policy_nets"]
+        required_keys = ["policy_nets", "obp_model"]
         if any(k not in checkpoint for k in required_keys):
             raise ValueError("Missing required keys in checkpoint")
         
-        # Determine the observation version based on policy network's input dimension
         any_policy = next(iter(checkpoint["policy_nets"].values()))
         input_dim = any_policy['fc1.weight'].shape[1]
         
         if input_dim == 18:
-            obs_version = 1  # OBS_VERSION_1
+            obs_version = 1
         elif input_dim in (16, 24, 26):
-            obs_version = 2  # OBS_VERSION_2
+            obs_version = 2
         else:
             raise ValueError(f"Unknown input_dim {input_dim} for model {file_path}")
         
-        # Check if the model uses memory by looking for "fc4.weight"
-        uses_memory = ("fc4.weight" in any_policy)
+        uses_memory = True
         
         self.loaded_models[file_path] = {
             "policy_nets": checkpoint["policy_nets"],
-            "obp_model": checkpoint.get("obp_model", None),  # Handle missing OBP
+            "obp_model": checkpoint["obp_model"],
             "obs_version": obs_version,
             "input_dim": input_dim,
             "uses_memory": uses_memory
@@ -215,11 +277,10 @@ class AgentBattlegroundGUI:
             self.agent_listbox.insert(tk.END, option)
 
     def print_data_summary(self):
-        """Print a summary of self.training_data for debugging."""
         total_samples = len(self.training_data)
         label_counts = Counter(label for _, label in self.training_data)
         lengths = [len(seg) for seg, _ in self.training_data]
-        avg_length = sum(lengths)/len(lengths) if lengths else 0
+        avg_length = sum(lengths) / len(lengths) if lengths else 0
         min_length = min(lengths) if lengths else 0
         max_length = max(lengths) if lengths else 0
         summary = (
@@ -232,7 +293,6 @@ class AgentBattlegroundGUI:
         summary += f"Average sequence length: {avg_length:.2f}\n"
         summary += f"Minimum sequence length: {min_length}\n"
         summary += f"Maximum sequence length: {max_length}\n"
-        # Print first 5 samples for inspection.
         summary += "First 5 samples:\n"
         for i, (seg, label) in enumerate(self.training_data[:5]):
             summary += f"  Sample {i}: {seg} -> {label}\n"
@@ -247,7 +307,6 @@ class AgentBattlegroundGUI:
             return None
         ai_agents = {}
         all_options = self.agent_listbox.get(0, tk.END)
-        # Use the order of selection to assign player IDs
         for i, idx in enumerate(selections):
             selection = all_options[idx]
             parts = selection.split(" - ")
@@ -266,7 +325,6 @@ class AgentBattlegroundGUI:
                 self.show_info(f"Agent '{agent_name}' not found in model {file_name}. Available keys: {available_keys}. Skipping.")
                 continue
             policy_net = model_data["policy_nets"][agent_name]
-            # Remap key to match environment (player_0, player_1, etc.)
             key = f"player_{i}"
             ai_agents[key] = {
                 "policy_net": policy_net,
@@ -288,23 +346,21 @@ class AgentBattlegroundGUI:
 
     def start_battleground(self):
         try:
-            # Get the target_segments value from the GUI. Use 500 as default if conversion fails.
             try:
                 target_segments_val = int(self.target_segments_var.get())
             except ValueError:
                 self.show_info("Invalid target segments value, using default of 500.")
                 target_segments_val = 500
+            self.target_segments = target_segments_val
 
             overall_results = {}
-            # -------------------------------
-            # Matches vs. Hardcoded Opponents
-            # -------------------------------
+
+            # --- Hardcoded Agents Matches (Unchanged) ---
             if self.include_hardcoded.get():
                 hardcoded_results = {}
                 ai_agents_all = self.load_selected_agents()
                 if not ai_agents_all:
                     return
-                # Choose first two agents.
                 ai_agents = {}
                 for i, key in enumerate(ai_agents_all.keys()):
                     if i < 2:
@@ -313,7 +369,7 @@ class AgentBattlegroundGUI:
                     self.show_info("Need at least two PPO agents for matches vs. hardcoded opponents.")
                     return
                 for hc_name, hc_class in self.hardcoded_agents.items():
-                    wins = [0, 0, 0]  # [PPO1 Wins, PPO2 Wins, Hardcoded Wins]
+                    wins = [0, 0, 0]
                     match_count = 0
                     while True:
                         current_segments = sum(1 for seg, label in self.training_data if label == hc_name)
@@ -322,7 +378,7 @@ class AgentBattlegroundGUI:
                         match_count += 1
                         if match_count >= game_threshold and current_segments < viable_segment_threshold:
                             logger.info(f"[Hardcoded:{hc_name}] Early culled: Only {current_segments} segments in {match_count} matches.")
-                            self.training_data = [ (seg, label) for seg, label in self.training_data if label != hc_name ]
+                            self.training_data = [(seg, label) for seg, label in self.training_data if label != hc_name]
                             break
                         winner = self.run_match(ai_agents, hardcoded_agent=hc_class(hc_name), hardcoded_label=hc_name)
                         if winner == list(ai_agents.keys())[0]:
@@ -335,31 +391,49 @@ class AgentBattlegroundGUI:
                     hardcoded_results[hc_name] = wins
                 overall_results["hardcoded"] = hardcoded_results
 
-            # -------------------------------
-            # Matches among PPO Agents
-            # -------------------------------
+            # --- PPO-Only Matches: Use the 3 PPO agents with the fewest sample counts (ignoring culled agents) ---
             if self.include_ppo.get():
                 all_agents = self.load_selected_agents()
                 if not all_agents:
                     return
-                from itertools import combinations
-                selected_keys = list(all_agents.keys())
-                if len(selected_keys) > 3:
-                    agent_combos = list(combinations(selected_keys, 3))
-                else:
-                    agent_combos = [tuple(selected_keys)]
-                ppo_results = { all_agents[k]['label']: 0 for k in selected_keys }
+
+                def sample_count(agent_data):
+                    label = agent_data['label']
+                    # If the agent is culled, assign a high count to exclude it.
+                    if label in self.culled_agents:
+                        return float('inf')
+                    return sum(1 for seg, lbl in self.training_data if lbl == label)
+
                 overall_match_count = 0
-                for combo in agent_combos:
+
+                # Continue while there are at least 3 agents (from all_agents) that haven't reached the target.
+                while True:
+                    # Filter out agents that are culled or have reached target segments.
+                    available_agents = {
+                        k: v for k, v in all_agents.items()
+                        if v['label'] not in self.culled_agents and
+                        sum(1 for seg, lbl in self.training_data if lbl == v['label']) < target_segments_val
+                    }
+                    if len(available_agents) < 3:
+                        self.show_info("Not enough non-culled PPO agents remain for further matches.")
+                        break
+
+                    # Select the 3 agents with the fewest samples among the available ones.
+                    selected_keys = sorted(available_agents.keys(), key=lambda k: sample_count(available_agents[k]))[:3]
+
+                    # Set up the current combination.
                     new_subset = {}
                     mapping = {}
-                    for i, key in enumerate(combo):
+                    for i, key in enumerate(selected_keys):
                         new_key = f"player_{i}"
-                        new_subset[new_key] = all_agents[key]
-                        mapping[new_key] = all_agents[key]['label']
-                    match_count = 0
+                        new_subset[new_key] = available_agents[key]
+                        mapping[new_key] = available_agents[key]['label']
+
                     local_game_counts = { new_key: 0 for new_key in new_subset }
-                    while any(
+                    match_count = 0
+
+                    # Run matches for this combination while each agent hasn't reached target.
+                    while all(
                         sum(1 for seg, lbl in self.training_data if lbl == mapping[new_key]) < target_segments_val
                         for new_key in new_subset
                     ):
@@ -374,29 +448,26 @@ class AgentBattlegroundGUI:
                                 to_remove.append(new_key)
                         for rem in to_remove:
                             del new_subset[rem]
-                        if not new_subset:
-                            logger.info(f"[PPO] All agents in combination {combo} culled early.")
+                        if len(new_subset) < 3:
+                            logger.info("PPO-only match: Not enough agents remain in current combination after early culling, ending this combination match loop.")
                             break
                         try:
                             winner = self.run_match(new_subset, hardcoded_agent=None, hardcoded_label=None)
                         except Exception as e:
-                            logger.error(f"Error running match for combination {combo}: {e}")
+                            logger.error(f"Error running match for selected agents: {e}")
                             break
-                        if winner in new_subset:
-                            orig_label = mapping[winner]
-                            ppo_results[orig_label] += 1
-                        logger.info("[PPO] Combo {}: After {} matches, training segments: {}".format(
-                            combo,
+                        logger.info("[PPO] After {} matches in current combination, training segments: {}".format(
                             match_count,
                             ", ".join(f"{mapping[new_key]}: {sum(1 for seg, lbl in self.training_data if lbl == mapping[new_key])}" 
-                                      for new_key in new_subset)
+                                    for new_key in new_subset)
                         ))
-                    logger.info(f"Finished combination {combo} after {match_count} matches.")
-                overall_results["ppo"] = {"wins": ppo_results, "matches": overall_match_count}
+                    # End of current combination—continue outer loop to reselect a new combination if possible.
+                overall_results["ppo"] = {"matches": overall_match_count}
             
             self.display_results(overall_results)
             total_examples = len(self.training_data)
             self.show_info(f"Battleground complete. Generated {total_examples} training examples.")
+            self.update_progress_bar()
         except Exception as e:
             self.show_info(f"Error: {str(e)}")
 
@@ -406,7 +477,6 @@ class AgentBattlegroundGUI:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             self.current_env = env
 
-            # Set up policy and OBP models for each PPO-controlled agent.
             policy_nets = {}
             obp_models = {}
             obs_versions = {}
@@ -424,18 +494,30 @@ class AgentBattlegroundGUI:
                     use_lstm=True,
                     use_layer_norm=True
                 )
-                policy_net.load_state_dict(agent_data["policy_net"])
+                policy_net.load_state_dict(agent_data["policy_net"], strict=False)
                 policy_net.to(device).eval()
                 policy_nets[agent_id] = policy_net
 
                 obp_model_state = agent_data["obp_model"]
                 if obp_model_state:
-                    obp_input_dim = 5 if agent_data["obs_version"] == 1 else 4
-                    obp_model = OpponentBehaviorPredictor(
-                        input_dim=obp_input_dim,
-                        hidden_dim=config.OPPONENT_HIDDEN_DIM,
-                        output_dim=2
-                    )
+                    obp_input_dim = obp_model_state["fc1.weight"].shape[1]
+                    obp_hidden_dim = self.get_hidden_dim_from_state_dict(obp_model_state, "fc1")
+                    if obp_input_dim == config.OPPONENT_INPUT_DIM + config.STRATEGY_DIM:
+                        obp_model = ModelFactory.create_obp(
+                            use_transformer_memory=True,
+                            input_dim=config.OPPONENT_INPUT_DIM,
+                            hidden_dim=obp_hidden_dim,
+                            output_dim=2
+                        )
+                    elif obp_input_dim == config.OPPONENT_INPUT_DIM:
+                        obp_model = ModelFactory.create_obp(
+                            use_transformer_memory=False,
+                            input_dim=config.OPPONENT_INPUT_DIM,
+                            hidden_dim=obp_hidden_dim,
+                            output_dim=2
+                        )
+                    else:
+                        raise ValueError(f"Unexpected OBP input dimension: {obp_input_dim}")
                     obp_model.load_state_dict(obp_model_state)
                     obp_model.to(device).eval()
                     obp_models[agent_id] = obp_model
@@ -480,30 +562,21 @@ class AgentBattlegroundGUI:
             winners = [agent for agent, reward in env.rewards.items() if reward == max_reward]
             winner = winners[0]
 
-            # --- Updated Memory Collection: Process Each Opponent Separately ---
             for agent in env.agents:
-                # (We no longer label by the current agent; instead we label each sample by the opponent's identity.)
-                # Update the game counter for this agent.
                 if agent not in self.games_since_last_collection:
                     self.games_since_last_collection[agent] = 0
                 self.games_since_last_collection[agent] += 1
 
                 memory_obj = get_opponent_memory(agent)
-                # Process each opponent's memory individually.
                 for opp, events in memory_obj.memory.items():
                     events_list = list(events)
-                    # Check if the events for this opponent meet our threshold.
                     if events_list and (len(events_list) >= 50 or self.games_since_last_collection[agent] >= 5):
-                        # Determine the opponent's label:
                         if opp in ai_agents:
                             opp_label = ai_agents[opp]['label']
                         else:
                             opp_label = hardcoded_label
-                        # Append a training sample labeled with the opponent's identity.
                         self.training_data.append((events_list, opp_label))
-                        # Clear the memory for this opponent.
                         events.clear()
-                        # Reset the aggregates for this opponent.
                         memory_obj.aggregates[opp] = {
                             'early_total': 0,
                             'late_total': 0,
@@ -512,14 +585,10 @@ class AgentBattlegroundGUI:
                             'early_three_card_trigger_count': 0,
                             'late_three_card_trigger_count': 0
                         }
-                # After processing all opponents for this agent, reset its game counter.
                 self.games_since_last_collection[agent] = 0
 
-            hardcoded_agent_id = f"player_{env.num_players - 1}"
             if winner in ai_agents:
                 return winner
-            elif winner == hardcoded_agent_id:
-                return "hardcoded_agent"
             else:
                 return "unknown_agent"
 
@@ -529,123 +598,95 @@ class AgentBattlegroundGUI:
             self.show_info(f"Error in run_match: {e}\nTraceback:\n{tb}")
             raise
 
-    def choose_action(self, agent_id, policy_net, obp_model, observation, action_mask, device, num_players, obs_version, input_dim, uses_memory):
-        logging.debug(f"Converted observation (length {len(adapt_observation_for_version(observation, num_players, obs_version))}): {adapt_observation_for_version(observation, num_players, obs_version)}")
-        obp_probs = run_obp_inference(obp_model, adapt_observation_for_version(observation, num_players, obs_version), device, num_players, obs_version)
-        logging.debug(f"OBP probabilities: {obp_probs}")
-        if obs_version == 2 and uses_memory:
-            required_mem_dim = input_dim - (len(adapt_observation_for_version(observation, num_players, obs_version)) + len(obp_probs))
-            if required_mem_dim == config.STRATEGY_DIM * (num_players - 1):
-                from src.env.liars_deck_env_utils import query_opponent_memory_full
-
-                class Vocabulary:
-                    def __init__(self, max_size):
-                        self.token2idx = {"<PAD>": 0, "<UNK>": 1}
-                        self.idx2token = {0: "<PAD>", 1: "<UNK>"}
-                        self.max_size = max_size
-                    def encode(self, token):
-                        if token in self.token2idx:
-                            return self.token2idx[token]
-                        else:
-                            if len(self.token2idx) < self.max_size:
-                                idx = len(self.token2idx)
-                                self.token2idx[token] = idx
-                                self.idx2token[idx] = token
-                                return idx
-                            else:
-                                return self.token2idx["<UNK>"]
-
-                def convert_memory_to_tokens(memory, vocab):
-                    tokens = []
-                    for event in memory:
-                        if isinstance(event, dict):
-                            sorted_items = sorted(event.items())
-                            token_str = "_".join(f"{k}-{v}" for k, v in sorted_items)
-                        else:
-                            token_str = str(event)
-                        tokens.append(vocab.encode(token_str))
-                    return tokens
-
-                vocab_inst = Vocabulary(max_size=config.STRATEGY_NUM_TOKENS)
-                mem_features_list = []
-                for opp in self.current_env.possible_agents:
-                    if opp != agent_id:
-                        mem_summary = query_opponent_memory_full(agent_id, opp)
-                        token_seq = convert_memory_to_tokens(mem_summary, vocab_inst)
-                        token_tensor = torch.tensor(token_seq, dtype=torch.long, device=device).unsqueeze(0)
-                        if self.strategy_transformer is None:
-                            from src.model.new_models import StrategyTransformer
-                            self.strategy_transformer = StrategyTransformer(
-                                num_tokens=config.STRATEGY_NUM_TOKENS,
-                                token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM,
-                                nhead=config.STRATEGY_NHEAD,
-                                num_layers=config.STRATEGY_NUM_LAYERS,
-                                strategy_dim=config.STRATEGY_DIM,
-                                num_classes=config.STRATEGY_NUM_CLASSES,
-                                dropout=config.STRATEGY_DROPOUT,
-                                use_cls_token=True
-                            ).to(device)
-                            transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
-                            if os.path.exists(transformer_checkpoint_path):
-                                state_dict = torch.load(transformer_checkpoint_path, map_location=device)
-                                self.strategy_transformer.load_state_dict(state_dict)
-                                logging.info(f"Loaded transformer from '{transformer_checkpoint_path}'.")
-                            else:
-                                logging.warning("Transformer checkpoint not found, using randomly initialized transformer.")
-                            self.strategy_transformer.classification_head = None
-                            self.strategy_transformer.eval()
-                        with torch.no_grad():
-                            embedding, _ = self.strategy_transformer(token_tensor)
-                        mem_features_list.append(embedding.cpu().numpy().flatten())
-                if mem_features_list:
-                    mem_features = np.concatenate(mem_features_list, axis=0)
-                else:
-                    mem_features = np.zeros(config.STRATEGY_DIM * (num_players - 1), dtype=np.float32)
-            else:
-                from src.env.liars_deck_env_utils import query_opponent_memory
-                mem_features_list = []
-                for opp in self.current_env.possible_agents:
-                    if opp != agent_id:
-                        mem_summary = query_opponent_memory(agent_id, opp)
-                        mem_features_list.append(mem_summary)
-                if mem_features_list:
-                    mem_features = np.concatenate(mem_features_list, axis=0)
-                else:
-                    mem_features = np.array([], dtype=np.float32)
-            current_mem_dim = mem_features.shape[0]
-            if current_mem_dim < required_mem_dim:
-                pad = np.zeros(required_mem_dim - current_mem_dim, dtype=np.float32)
-                mem_features = np.concatenate([mem_features, pad], axis=0)
-            elif current_mem_dim > required_mem_dim:
-                mem_features = mem_features[:required_mem_dim]
-            final_obs = np.concatenate([adapt_observation_for_version(observation, num_players, obs_version), np.array(obp_probs, dtype=np.float32), mem_features], axis=0)
-        else:
-            final_obs = np.concatenate([adapt_observation_for_version(observation, num_players, obs_version), np.array(obp_probs, dtype=np.float32)], axis=0)
-        logging.debug(f"Final observation (length {len(final_obs)}): {final_obs}")
+    def choose_action(self, agent, policy_net, obp_model, observation, action_mask, device, num_players, obs_version, input_dim, uses_memory):
+        base_obs = adapt_observation_for_version(observation, num_players, obs_version)
         
-        expected_dim = input_dim
-        actual_dim = final_obs.shape[0]
-        logging.debug(f"Expected dim: {expected_dim}, Actual dim: {actual_dim}")
-        assert actual_dim == expected_dim, f"Expected observation dimension {expected_dim}, got {actual_dim}"
-        observation_tensor = torch.tensor(final_obs, dtype=torch.float32).unsqueeze(0).to(device)
+        from src import config
+        transformer_features = np.zeros(config.STRATEGY_DIM * (num_players - 1), dtype=np.float32)
+        obp_memory_embeddings = None
+
+        if obs_version == 2 and uses_memory:
+            opponents = [opp for opp in self.current_env.possible_agents if opp != agent]
+            emb_list = []
+            for opp in opponents:
+                emb_tensor = get_opponent_memory_embedding(agent, opp, device)
+                emb_arr = emb_tensor.squeeze(0).cpu().numpy()
+                emb_list.append(emb_arr)
+            if emb_list:
+                emb_concat = np.concatenate(emb_list, axis=0)
+                min_val = emb_concat.min()
+                max_val = emb_concat.max()
+                logger.debug(f"Memory embedding min: {min_val}, max: {max_val}")
+                if max_val - min_val == 0:
+                    normalized_emb = emb_concat
+                else:
+                    normalized_emb = (emb_concat - min_val) / (max_val - min_val)
+                segment_size = config.STRATEGY_DIM
+                obp_memory_embeddings = []
+                for i in range(len(opponents)):
+                    seg = normalized_emb[i * segment_size:(i + 1) * segment_size]
+                    obp_memory_embeddings.append(torch.tensor(seg, dtype=torch.float32, device=device).unsqueeze(0))
+                transformer_features = normalized_emb
+            else:
+                obp_memory_embeddings = [torch.zeros(1, config.STRATEGY_DIM, device=device) for _ in range(num_players - 1)]
+                transformer_features = np.zeros(config.STRATEGY_DIM * (num_players - 1), dtype=np.float32)
+            
+            obp_probs = run_obp_inference(
+                obp_model,
+                base_obs,
+                device,
+                num_players,
+                obs_version,
+                agent,
+                self.current_env,
+                memory_embeddings=obp_memory_embeddings
+            )
+            
+            final_obs = np.concatenate([
+                np.array(base_obs, dtype=np.float32),
+                np.array(obp_probs, dtype=np.float32),
+                transformer_features
+            ], axis=0)
+        else:
+            obp_probs = run_obp_inference(
+                obp_model,
+                base_obs,
+                device,
+                num_players,
+                obs_version,
+                agent,
+                self.current_env
+            )
+            final_obs = np.concatenate([
+                np.array(base_obs, dtype=np.float32),
+                np.array(obp_probs, dtype=np.float32)
+            ], axis=0)
+        
+        observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
         with torch.no_grad():
-            action_probs, _ = policy_net(observation_tensor)
-        mask_tensor = torch.tensor(action_mask, dtype=torch.float32).to(device)
-        masked_probs = action_probs * mask_tensor
+            probs, _, _ = policy_net(observation_tensor, None)
+            probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
+        
+        mask_tensor = torch.tensor(action_mask, dtype=torch.float32, device=device)
+        masked_probs = probs * mask_tensor
         if masked_probs.sum() == 0:
-            masked_probs = mask_tensor / mask_tensor.sum()
+            valid_indices = torch.nonzero(mask_tensor, as_tuple=True)[0]
+            if len(valid_indices) > 0:
+                masked_probs[valid_indices] = 1.0 / valid_indices.numel()
+            else:
+                masked_probs = torch.ones_like(probs) / probs.size(0)
         else:
             masked_probs /= masked_probs.sum()
+        
         m = torch.distributions.Categorical(masked_probs)
         action = m.sample().item()
-        logging.debug(f"Action probabilities: {masked_probs.cpu().numpy()}")
-        logging.debug(f"Selected action: {action}")
-        if action_mask[action] == 6:
-            logging.debug("Challenge Action Selected")
+        logger.debug(f"Final observation (length {len(final_obs)}): {final_obs}")
+        logger.debug(f"Action probabilities: {masked_probs.cpu().numpy()}")
+        logger.debug(f"Selected action: {action}")
+        
         return action
 
     def save_training_data(self):
-        """Append the accumulated training data to the file instead of overwriting it."""
         file_path = os.path.join(os.getcwd(), "opponent_training_data.pkl")
         if os.path.exists(file_path):
             try:
@@ -662,6 +703,7 @@ class AgentBattlegroundGUI:
                 pickle.dump(combined_data, f)
             self.show_info(f"Training data saved to {file_path} (appended {len(self.training_data)} new samples)")
             self.training_data.clear()
+            self.update_progress_bar()
         except Exception as e:
             self.show_info(f"Error saving training data: {str(e)}")
 
@@ -686,13 +728,11 @@ class AgentBattlegroundGUI:
             output += "\n"
         if "ppo" in results:
             output += "Matches among PPO Agents:\n"
-            header = "PPO Agent             | Wins | Win Rate\n"
+            header = "PPO Agent             | Matches\n"
             output += header
             output += "-" * 50 + "\n"
             total_matches = results["ppo"]["matches"]
-            for agent_label, wins in results["ppo"]["wins"].items():
-                win_rate = wins / total_matches if total_matches > 0 else 0.0
-                output += f"{agent_label:22} | {wins:^4} | {win_rate:8.2%}\n"
+            output += f"Total Matches: {total_matches}\n"
         self.results_text.insert(tk.END, output)
         self.results_text.config(state=tk.DISABLED)
 
