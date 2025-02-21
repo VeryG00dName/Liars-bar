@@ -610,7 +610,11 @@ def initialize_players(base_dir, device):
             for agent_name, policy_state_dict in policy_nets.items():
                 uses_memory = ("fc4.weight" in policy_state_dict)
                 use_aux_classifier = "fc_classifier.weight" in policy_state_dict
-                num_opponent_classes = config.NUM_OPPONENT_CLASSES if use_aux_classifier else None
+                if use_aux_classifier:
+                    # Infer the number of opponent classes from the first dimension of the classifier weight.
+                    num_opponent_classes = policy_state_dict["fc_classifier.weight"].shape[0]
+                else:
+                    num_opponent_classes = None
                 policy_hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, layer_prefix='fc1')
 
                 policy_net = PolicyNetwork(
