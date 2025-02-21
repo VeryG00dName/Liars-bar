@@ -1,4 +1,4 @@
-# src/training/train_vs_hardcoded.py
+# src/training/train_vs_everyone.py 
 
 import logging
 import time
@@ -71,7 +71,7 @@ def convert_memory_to_features(memory, response_mapping, action_mapping):
 
 # ---------------------------
 # Define a mapping from hard-coded agent class names to integer labels.
-# (Make sure config.NUM_OPPONENT_CLASSES matches the number of entries here.)
+# (Make sure config.NUM_OPPONENT_CLASSES equals number of hard-coded classes + number of historical models.)
 HARD_CODED_LABELS = {
     "GreedyCardSpammer": 0,
     "StrategicChallenger": 1,
@@ -80,6 +80,10 @@ HARD_CODED_LABELS = {
     "TableFirstConservativeChallenger": 4,
     "SelectiveTableConservativeChallenger": 5,
 }
+# The historical models will be assigned distinct labels.
+# (For example, if you have 3 historical models, their labels will be 6, 7, and 8.)
+# This mapping will be created after loading the historical models.
+historical_label_mapping = {}
 
 # ---------------------------
 # Instantiate the device.
@@ -200,6 +204,10 @@ def load_specific_historical_models(players_dir, device):
 historical_models = load_specific_historical_models(config.HISTORICAL_MODEL_DIR, device)
 print(f"Loaded {len(historical_models)} historical PPO models: {', '.join([id for _, id in historical_models])}")
 
+# Build a mapping from historical model identifier to unique label.
+for idx, (_, identifier) in enumerate(historical_models):
+    historical_label_mapping[identifier] = len(HARD_CODED_LABELS) + idx
+
 # ---------------------------
 # Logger configuration.
 # ---------------------------
@@ -216,6 +224,34 @@ def configure_logger():
     return logger
 
 # ---------------------------
+# Helper function: Select injected bot based on win rates.
+# ---------------------------
+def select_injected_bot(agent, injected_bots, win_stats, match_stats):
+    """
+    For the given agent, compute weights for each injected bot candidate based on
+    win rate against that candidate (win rate = wins / matches, default to 0.5 if no data).
+    Weight = 1 - win_rate, so lower win rate means higher chance.
+    """
+    weights = []
+    for candidate in injected_bots:
+        bot_type, bot_data = candidate
+        if bot_type == "historical":
+            opponent_key = bot_data[1]  # unique identifier
+        else:
+            opponent_key = bot_data.__name__
+        matches = match_stats[agent].get(opponent_key, 0)
+        wins = win_stats[agent].get(opponent_key, 0)
+        win_rate = wins / matches if matches > 0 else 0.5
+        weight = 1 - win_rate
+        weights.append(weight)
+    total_weight = sum(weights)
+    if total_weight == 0:
+        return random.choice(injected_bots)
+    normalized = [w / total_weight for w in weights]
+    index = np.random.choice(len(injected_bots), p=normalized)
+    return injected_bots[index]
+
+# ---------------------------
 # Main training loop.
 # ---------------------------
 def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_directory=None, log_tensorboard=True):
@@ -225,6 +261,10 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
     assert len(agents) == config.NUM_PLAYERS, f"Expected {config.NUM_PLAYERS} agents, but got {len(agents)} agents."
     num_opponents = config.NUM_PLAYERS - 1
     config.set_derived_config(env.observation_spaces[agents[0]], env.action_spaces[agents[0]], num_opponents)
+
+    # Initialize win tracking: for each agent, we track wins and matches vs every injected opponent type.
+    win_stats = {agent: {} for agent in agents}
+    match_stats = {agent: {} for agent in agents}
 
     # Initialize networks, optimizers, and memories for each agent.
     policy_nets = {}
@@ -299,7 +339,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
     original_agent_order = list(env.agents)
 
     # Combine hardcoded agents and historical models for injected bots.
-    hardcoded_agent_classes = [GreedyCardSpammer, StrategicChallenger, TableNonTableAgent, TableNonTableAgent, Classic,Classic,
+    hardcoded_agent_classes = [GreedyCardSpammer, GreedyCardSpammer, StrategicChallenger, TableNonTableAgent, Classic,
                                TableFirstConservativeChallenger, SelectiveTableConservativeChallenger]
     injected_bots = []
     for cls in hardcoded_agent_classes:
@@ -311,6 +351,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
     current_injected_agent_id = None
     current_injected_agent_instance = None
     current_injected_bot_type = None  # "hardcoded" or "historical"
+    current_injected_bot_identifier = None  # For historical bots, track identifier
 
     global_step = 0
     tracked_agent = None  
@@ -321,14 +362,16 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
         agents = env.agents
         pending_rewards = {agent: 0.0 for agent in agents}
 
-        # Every 5 episodes, choose a new injected bot.
+        # Every 5 episodes, choose a new injected bot for one randomly selected agent.
         if (episode - start_episode) % 5 == 0:
+            # Choose a learning agent at random.
             current_injected_agent_id = random.choice(agents)
             tracked_agent = current_injected_agent_id
-            bot_choice = random.choice(injected_bots)
-            current_injected_bot_type = bot_choice[0]
+            # Instead of a uniform random selection, select based on win rates.
+            selected_bot = select_injected_bot(current_injected_agent_id, injected_bots, win_stats, match_stats)
+            current_injected_bot_type = selected_bot[0]
             if current_injected_bot_type == "hardcoded":
-                bot_class = bot_choice[1]
+                bot_class = selected_bot[1]
                 if bot_class == StrategicChallenger:
                     current_injected_agent_instance = bot_class(
                         agent_name=current_injected_agent_id, 
@@ -337,9 +380,10 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     )
                 else:
                     current_injected_agent_instance = bot_class(agent_name=current_injected_agent_id)
+                current_injected_bot_identifier = bot_class.__name__
             else:
-                current_injected_agent_instance = bot_choice[1][0]
-            #logger.info(f"Episode {episode}: Injecting {current_injected_bot_type} bot for agent {current_injected_agent_id}")
+                current_injected_agent_instance, current_injected_bot_identifier = selected_bot[1]
+            #logger.info(f"Episode {episode}: Injecting {current_injected_bot_type} bot ({current_injected_bot_identifier}) for agent {current_injected_agent_id}")
 
         episode_rewards = {agent: 0 for agent in agents}
         steps_in_episode = 0
@@ -478,15 +522,33 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                         )
                     episode_rewards[ag] += reward
 
-        episode_obp_data = extract_obp_training_data(env)
-        obp_memory.extend(episode_obp_data)
+        # --- Update win tracking after the episode using env.winner ---
+        winners = env.winner
+        if not isinstance(winners, list):
+            winners = [winners]
+
+        if current_injected_agent_id is not None:
+            # Create a unique opponent key:
+            if current_injected_bot_type == "historical":
+                opponent_key = current_injected_bot_identifier
+            else:
+                opponent_key = current_injected_agent_instance.__class__.__name__
+            for agent in agents:
+                if agent == current_injected_agent_id:
+                    continue
+                match_stats[agent].setdefault(opponent_key, 0)
+                match_stats[agent][opponent_key] += 1
+                if agent in winners and current_injected_agent_id not in winners:
+                    win_stats[agent].setdefault(opponent_key, 0)
+                    win_stats[agent][opponent_key] += 1
+
         for agent in agents:
             recent_rewards[agent].append(episode_rewards[agent])
             if len(recent_rewards[agent]) > 100:
                 recent_rewards[agent].pop(0)
         avg_rewards = {agent: np.mean(recent_rewards[agent]) if recent_rewards[agent] else 0.0 for agent in agents}
 
-        # Compute GAE for agents that are being trained.
+        # Compute GAE for agents being trained.
         for agent in agents:
             if agent == current_injected_agent_id:
                 continue
@@ -508,8 +570,10 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
             )
             memory.advantages[agent] = advantages
             memory.returns[agent] = returns_
-
-        # Periodically update RL agents.
+            
+        episode_obp_data = extract_obp_training_data(env)
+        obp_memory.extend(episode_obp_data)
+        
         if episode % config.UPDATE_STEPS == 0:
             for agent in agents:
                 if agent == current_injected_agent_id:
@@ -556,12 +620,12 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     value_loss = nn.MSELoss()(state_values, returns_)
     
                     if opponent_logits is not None:
-                        if current_injected_agent_instance is not None:
-                            label_name = current_injected_agent_instance.__class__.__name__
-                            hardcoded_label = HARD_CODED_LABELS.get(label_name, 0)
+                        if current_injected_bot_type == "historical":
+                            target_label = historical_label_mapping[current_injected_bot_identifier]
                         else:
-                            hardcoded_label = 0
-                        target_labels = torch.full((opponent_logits.size(0),), hardcoded_label, dtype=torch.long, device=device)
+                            label_name = current_injected_agent_instance.__class__.__name__
+                            target_label = HARD_CODED_LABELS.get(label_name, 0)
+                        target_labels = torch.full((opponent_logits.size(0),), target_label, dtype=torch.long, device=device)
                         classification_loss = F.cross_entropy(opponent_logits, target_labels)
                         classification_losses.append(classification_loss.item())
                         predicted_labels = opponent_logits.argmax(dim=1)
@@ -635,6 +699,17 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 f"Time since last log: {elapsed_time:.2f} seconds\t"
                 f"Steps/s: {steps_per_second:.2f}"
             )
+            # Log win rates vs each injected opponent for every learning agent.
+            for agent in agents:
+                if agent == current_injected_agent_id:
+                    continue
+                for opp_key in match_stats[agent]:
+                    wins = win_stats[agent].get(opp_key, 0)
+                    total = match_stats[agent].get(opp_key, 1)
+                    rate = wins / total * 100
+                    if writer is not None:
+                        writer.add_scalar(f"WinRate/{agent}_vs_{opp_key}", rate, episode)
+    
             if writer is not None:
                 for agent, reward in avg_rewards.items():
                     writer.add_scalar(f"Average Reward/{agent}", reward, episode)
