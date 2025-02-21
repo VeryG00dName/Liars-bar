@@ -18,8 +18,11 @@ from src.training.train_extras import set_seed
 from src.misc.tune_eval import run_group_swiss_tournament, openskill_model
 from src import config
 
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+# For visualization
+import networkx as nx
+import matplotlib.pyplot as plt
 
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 torch.backends.cudnn.benchmark = True
 
 # Tournament configuration
@@ -48,7 +51,6 @@ def move_agent_to_device(agent, device):
     """Helper to move an agent's networks to the specified device."""
     agent['policy_net'].to(device)
     agent['value_net'].to(device)
-
     move_optimizer_state(agent['optimizer_policy'], device)
     move_optimizer_state(agent['optimizer_value'], device)
 
@@ -60,30 +62,25 @@ def move_pool_to_device(player_pool, device):
 def move_optimizer_state(optimizer, device):
     """Move all state tensors in an optimizer to a given device."""
     for param_key, param_state in optimizer.state.items():
-        # Each param_state is a dict
         for state_key, state_value in param_state.items():
             if torch.is_tensor(state_value):
                 param_state[state_key] = state_value.to(device)
 
 def initialize_obp(device):
-    """Initialize Opponent Behavior Predictor model and optimizer on GPU (or CPU if desired)."""
+    """Initialize Opponent Behavior Predictor model and optimizer on the given device."""
     obp_model = OpponentBehaviorPredictor(
-        input_dim=config.OPPONENT_INPUT_DIM,
-        hidden_dim=config.OPPONENT_HIDDEN_DIM,
-        output_dim=2
+        input_dim=config.OPPONENT_INPUT_DIM, 
+        hidden_dim=config.OPPONENT_HIDDEN_DIM, 
+        output_dim=2,
+        memory_dim=config.STRATEGY_DIM  # Transformer memory embedding dimension.
     ).to(device)
-    
-    obp_optimizer = torch.optim.Adam(
-        obp_model.parameters(),
-        lr=config.OPPONENT_LEARNING_RATE
-    )
+    obp_optimizer = torch.optim.Adam(obp_model.parameters(), lr=config.OPPONENT_LEARNING_RATE)
     return obp_model, obp_optimizer
 
 def generate_agent_name(source_id=None):
     """Generate structured agent names with lineage tracking."""
     if source_id is None:
         return f"new_{int(time.time())}_{uuid.uuid4().hex[:6]}"
-    
     if source_id.startswith("clone"):
         parts = source_id.split("_")
         try:
@@ -95,7 +92,6 @@ def generate_agent_name(source_id=None):
     else:
         orig = source_id
         gen = 1
-    
     return f"clone_v{gen}_orig_{orig}_{uuid.uuid4().hex[:4]}"
 
 def create_new_agent(on_device='cpu'):
@@ -108,14 +104,12 @@ def create_new_agent(on_device='cpu'):
         use_dropout=True,
         use_layer_norm=True
     ).to(on_device)
-    
     value_net = ValueNetwork(
         input_dim=config.INPUT_DIM,
         hidden_dim=config.HIDDEN_DIM,
         use_dropout=True,
         use_layer_norm=True
     ).to(on_device)
-    
     return {
         'policy_net': policy_net,
         'value_net': value_net,
@@ -128,7 +122,6 @@ def create_new_agent(on_device='cpu'):
 def clone_agent(source_agent, source_id, on_device='cpu'):
     """Create a clone with architecture preservation on CPU by default."""
     clone_id = generate_agent_name(source_id)
-    
     policy_net = PolicyNetwork(
         input_dim=config.INPUT_DIM,
         hidden_dim=config.HIDDEN_DIM,
@@ -138,7 +131,6 @@ def clone_agent(source_agent, source_id, on_device='cpu'):
         use_layer_norm=True
     ).to(on_device)
     policy_net.load_state_dict(source_agent['policy_net'].state_dict())
-    
     value_net = ValueNetwork(
         input_dim=config.INPUT_DIM,
         hidden_dim=config.HIDDEN_DIM,
@@ -146,9 +138,7 @@ def clone_agent(source_agent, source_id, on_device='cpu'):
         use_layer_norm=True
     ).to(on_device)
     value_net.load_state_dict(source_agent['value_net'].state_dict())
-    
     CLONE_REGISTRY[source_id] += 1
-    
     return {
         'policy_net': policy_net,
         'value_net': value_net,
@@ -163,26 +153,24 @@ def clone_agent(source_agent, source_id, on_device='cpu'):
     }
 
 def run_tournament(env, device, player_pool, obp_model, logger):
-    """Evaluate all agents in Swiss-style tournament on GPU or CPU as desired."""
-    
-    # Move all agents to GPU for faster evaluation, if you want.
+    """Evaluate all agents in a Swiss-style tournament."""
+    # Move agents to device for evaluation
     for pid, agent in player_pool.items():
         move_agent_to_device(agent, device)
-    
     logger.info("Initializing tournament with %d agents...", len(player_pool))
-    
     players = {}
     for pid, agent in player_pool.items():
         players[pid] = {
-            'policy_net': agent['policy_net'],
-            'value_net': agent['value_net'],
-            'obp_model': obp_model,  # OBP is already on device
-            'rating': openskill_model.rating(name=pid),
-            'score': 0.0,
-            'wins': 0,
-            'games_played': 0
-        }
-    
+        'policy_net': agent['policy_net'],
+        'value_net': agent['value_net'],
+        'obp_model': obp_model,
+        'rating': openskill_model.rating(name=pid),
+        'score': 0.0,
+        'wins': 0,
+        'games_played': 0,
+        'obs_version': agent.get('obs_version', 2),
+        'uses_memory': True
+    }
     final_rankings = run_group_swiss_tournament(
         env=env,
         device=device,
@@ -190,41 +178,32 @@ def run_tournament(env, device, player_pool, obp_model, logger):
         num_games_per_match=11,
         NUM_ROUNDS=5
     )
-    
-    # move agents back to CPU if you do not need them on GPU anymore
+    # Move agents back to CPU after evaluation
     for pid, agent in player_pool.items():
         move_agent_to_device(agent, 'cpu')
-    
     return final_rankings
 
 def maintain_player_pool_size(player_pool, group_size):
-    """Ensure player count is always a multiple of group_size"""
+    """Ensure player count is always a multiple of group_size."""
     current_size = len(player_pool)
     remainder = current_size % group_size
-    
     if remainder != 0:
         needed = (group_size - remainder) % group_size
         for i in range(needed):
             new_id = generate_agent_name()
             player_pool[new_id] = create_new_agent(on_device='cpu')
-    
     return player_pool
 
 def cull_and_replace(player_pool, rankings, device, logger):
-    """Evolutionary replacement with size maintenance"""
+    """Evolutionary replacement with size maintenance."""
     num_agents = len(rankings)
     num_cull = int(num_agents * CULL_PERCENTAGE)
-    
-    # Make sure we cull a multiple of GROUP_SIZE
     num_cull = num_cull - (num_cull % GROUP_SIZE)
     num_cull = max(GROUP_SIZE, num_cull)
-    
     culled_ids = rankings[-num_cull:]
     logger.info("Culling %d agents: %s...", num_cull, culled_ids[-3:])
-    
     for pid in culled_ids:
         del player_pool[pid]
-    
     new_players = {}
     for i in range(num_cull):
         if i < int(num_cull * CLONE_PERCENTAGE):
@@ -235,13 +214,11 @@ def cull_and_replace(player_pool, rankings, device, logger):
             new_players[generate_agent_name(source_id)] = clone_agent(
                 player_pool[source_id], source_id, on_device='cpu'
             )
-    
     player_pool.update(new_players)
     player_pool = maintain_player_pool_size(player_pool, GROUP_SIZE)
-    
     logger.info("Population updated: %d agents (%d new, %d clones)", 
-               len(player_pool), int(num_cull * CLONE_PERCENTAGE), 
-               num_cull - int(num_cull * CLONE_PERCENTAGE))
+                len(player_pool), int(num_cull * CLONE_PERCENTAGE), 
+                num_cull - int(num_cull * CLONE_PERCENTAGE))
     return player_pool
 
 def save_best_checkpoint(player_pool, obp_model, obp_optimizer, max_rating, checkpoint_dir):
@@ -252,7 +229,8 @@ def save_best_checkpoint(player_pool, obp_model, obp_optimizer, max_rating, chec
             'policy_net': agent['policy_net'].state_dict(),
             'value_net': agent['value_net'].state_dict(),
             'entropy_coef': agent['entropy_coef'],
-            'architecture': agent.get('architecture', 'LSTM_v1')
+            'architecture': agent.get('architecture', 'LSTM_v1'),
+            'rating': agent.get('rating')
         } for pid, agent in player_pool.items()},
         'obp_model': obp_model.state_dict(),
         'obp_optimizer': obp_optimizer.state_dict(),
@@ -265,7 +243,7 @@ def load_best_checkpoint(device, checkpoint_dir):
     if not os.path.exists(checkpoint_path):
         return None, None, None, None
     
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')  # Load to CPU
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
     player_pool = {}
     for pid, agent_state in checkpoint['player_pool'].items():
         policy_net = PolicyNetwork(
@@ -292,9 +270,10 @@ def load_best_checkpoint(device, checkpoint_dir):
             'optimizer_policy': torch.optim.Adam(policy_net.parameters(), lr=config.LEARNING_RATE),
             'optimizer_value': torch.optim.Adam(value_net.parameters(), lr=config.LEARNING_RATE),
             'entropy_coef': agent_state['entropy_coef'],
-            'architecture': agent_state['architecture']
+            'architecture': agent_state['architecture'],
+            'rating': agent_state.get('rating'),
+            'obs_version': agent_state.get('obs_version', getattr(config, 'OBS_VERSION', 2))
         }
-    
     obp_model = OpponentBehaviorPredictor(
         input_dim=config.OPPONENT_INPUT_DIM,
         hidden_dim=config.OPPONENT_HIDDEN_DIM,
@@ -304,16 +283,12 @@ def load_best_checkpoint(device, checkpoint_dir):
     
     obp_optimizer = torch.optim.Adam(obp_model.parameters(), lr=config.OPPONENT_LEARNING_RATE)
     obp_optimizer.load_state_dict(checkpoint['obp_optimizer'])
-    
     return player_pool, obp_model, obp_optimizer, checkpoint['max_rating']
 
 def trim_pool_by_rankings(player_pool, rankings, total_players, logger):
     """
-    Given a player_pool (dict mapping player IDs to agents) and a ranking list
-    (assumed sorted best to worst), trim the pool so that only the top total_players
-    remain. If the pool is smaller than total_players, add new agents.
+    Trim the pool to the top total_players, ensuring the pool size is a multiple of GROUP_SIZE.
     """
-    # Filter the ranking list so it only contains players present in the pool.
     filtered_rankings = [pid for pid in rankings if pid in player_pool]
     if len(filtered_rankings) >= total_players:
         top_ids = filtered_rankings[:total_players]
@@ -321,21 +296,46 @@ def trim_pool_by_rankings(player_pool, rankings, total_players, logger):
         logger.info("Trimmed pool from %d to %d players.", len(player_pool), len(trimmed_pool))
         return trimmed_pool
     else:
-        # If somehow the pool is too small, add new agents until it reaches total_players.
         while len(player_pool) < total_players:
             new_pid = generate_agent_name()
             player_pool[new_pid] = create_new_agent(on_device='cpu')
         logger.info("Expanded pool to %d players.", total_players)
         return player_pool
 
+#######################
+# Lineage Visualization
+#######################
+def build_lineage_graph(player_pool, output_file='lineage_graph.png'):
+    """
+    Build and save a lineage graph of the agents using NetworkX.
+    Each node represents an agent, and an edge from A to B indicates that B was cloned from A.
+    """
+    G = nx.DiGraph()
+    # Add nodes for all agents.
+    for pid in player_pool.keys():
+        G.add_node(pid)
+    # Add edges for cloned agents.
+    for pid, agent in player_pool.items():
+        if 'lineage' in agent:
+            source = agent['lineage'].get('source')
+            if source is not None:
+                G.add_edge(source, pid)
+    # Draw the graph.
+    plt.figure(figsize=(12, 8))
+    pos = nx.spring_layout(G, k=0.5, iterations=50)
+    nx.draw(G, pos, with_labels=True, node_color='lightblue', edge_color='gray', arrows=True, font_size=8)
+    plt.title('Agent Lineage Graph')
+    plt.savefig(output_file)
+    plt.close()
+    print(f"Lineage graph saved to {output_file}")
+
+#######################
+# Main Training Loop
+#######################
 def main():
     set_seed()
     logger = configure_logger()
-    
-    # The device for active training/evaluation
     device = torch.device(config.DEVICE)  # e.g., 'cuda' or 'cpu'
-    
-    # Initialize OBP model on the GPU (or CPU)
     obp_model, obp_optimizer = initialize_obp(device)
     
     base_env = LiarsDeckEnv(num_players=GROUP_SIZE, render_mode=None)
@@ -345,20 +345,15 @@ def main():
         num_opponents=GROUP_SIZE - 1
     )
     
-    # Create the initial pool on CPU
     player_pool = {f"player_{i}": create_new_agent(on_device='cpu') for i in range(TOTAL_PLAYERS)}
     
     start_batch, loaded_entropy_coefs, obp_state, obp_optim_state = load_multi_checkpoint(
         player_pool, config.CHECKPOINT_DIR, GROUP_SIZE
     )
-    
-    # Restore entropies if available
     if loaded_entropy_coefs is not None:
         for agent, coef in loaded_entropy_coefs.items():
             if agent in player_pool:
                 player_pool[agent]['entropy_coef'] = coef
-    
-    # Restore OBP state if available
     if obp_state is not None:
         obp_model.load_state_dict(obp_state)
     if obp_optim_state is not None:
@@ -367,31 +362,26 @@ def main():
     writer = SummaryWriter(log_dir=config.MULTI_LOG_DIR)
     block_episode_offset = (start_batch - 1) * 2000
     best_max_rating = -float('inf')
-
+    
     try:
         for batch_id in range(start_batch, 20):
             logger.info("\n=== Starting Batch %d ===", batch_id)
-            
             player_pool = maintain_player_pool_size(player_pool, GROUP_SIZE)
-            
             all_ids = list(player_pool.keys())
             random.shuffle(all_ids)
             groups = [all_ids[i:i + GROUP_SIZE] for i in range(0, len(all_ids), GROUP_SIZE)]
             
+            # Sequentially train each group on the designated device
             for group_idx, group in enumerate(groups):
                 if len(group) != GROUP_SIZE:
                     logger.error("Invalid group size %d, skipping", len(group))
                     continue
-                
                 logger.info("Training Group %d: %s", group_idx + 1, group)
                 env = LiarsDeckEnv(num_players=GROUP_SIZE, render_mode=None)
                 agent_map = {env.agents[i]: group[i] for i in range(GROUP_SIZE)}
-                
-                # Move only this group's agents to GPU
+                # Move agents in the group to the training device
                 for pid in group:
                     move_agent_to_device(player_pool[pid], device)
-                
-                # Train
                 train(
                     agents_dict={pid: player_pool[pid] for pid in group},
                     env=env,
@@ -402,11 +392,10 @@ def main():
                     writer=writer,
                     logger=logger,
                     agent_mapping=agent_map,
-                    obp_model=obp_model,       # OBP is already on GPU
+                    obp_model=obp_model,
                     obp_optimizer=obp_optimizer
                 )
-                
-                # Move them back to CPU after training
+                # Move trained agents back to CPU
                 for pid in group:
                     move_agent_to_device(player_pool[pid], 'cpu')
             
@@ -415,45 +404,29 @@ def main():
             if batch_id % TOURNAMENT_INTERVAL == 0:
                 logger.info("\n--- Running Evolution Tournament ---")
                 tournament_env = LiarsDeckEnv(num_players=GROUP_SIZE, render_mode=None)
-                
-                # Copy pool before merging in the saved best agents.
                 temp_pool = player_pool.copy()
                 temp_pool = maintain_player_pool_size(temp_pool, GROUP_SIZE)
-                
-                # Load the best checkpoint so far if available
                 best_agents, best_obp_model, best_obp_optim, loaded_max_rating = load_best_checkpoint(device, config.CHECKPOINT_DIR)
                 if best_agents:
-                    # Rename agents from best checkpoint to avoid collisions.
                     for pid in list(best_agents.keys()):
                         new_pid = generate_agent_name(source_id=pid)
                         best_agents[new_pid] = best_agents.pop(pid)
                     temp_pool.update(best_agents)
                     temp_pool = maintain_player_pool_size(temp_pool, GROUP_SIZE)
-                
-                # Run tournament on GPU (agents are moved back to CPU inside run_tournament)
                 rankings = run_tournament(tournament_env, device, temp_pool, obp_model, logger)
                 for pid, agent in temp_pool.items():
                     if 'rating' not in agent:
                         agent['rating'] = openskill_model.rating(name=pid)
-                
                 current_max_rating = max([agent['rating'].mu for agent in temp_pool.values()])
-                
                 if current_max_rating > best_max_rating:
                     best_max_rating = current_max_rating
                     save_best_checkpoint(temp_pool, obp_model, obp_optimizer, best_max_rating, config.CHECKPOINT_DIR)
                     logger.info("New best checkpoint saved with rating: %.2f", best_max_rating)
-                
-                # First, trim the pool to exactly TOTAL_PLAYERS based on tournament rankings.
                 trimmed_pool = trim_pool_by_rankings(temp_pool, rankings, TOTAL_PLAYERS, logger)
-                # Filter rankings to only those players in the trimmed pool.
                 filtered_rankings = [pid for pid in rankings if pid in trimmed_pool]
-                
-                # Now, perform evolutionary culling replacement:
-                # Remove the bottom CULL_PERCENTAGE and add back new agents and clones with CLONE_PERCENTAGE.
                 player_pool = cull_and_replace(trimmed_pool, filtered_rankings, device, logger)
                 logger.info("New population after evolutionary replacement: %s", list(player_pool.keys())[:6] + ["..."])
             
-            # Save a checkpoint of everything
             save_multi_checkpoint(
                 player_pool=player_pool,
                 obp_model=obp_model,
@@ -463,11 +436,13 @@ def main():
                 group_size=GROUP_SIZE
             )
             logger.info("Checkpoint saved for batch %d", batch_id)
-            
+    
     finally:
         writer.close()
         logger.info("Training session completed")
+        # Build and save the lineage graph for visualization.
+        build_lineage_graph(player_pool, output_file='lineage_graph.png')
+        logger.info("Lineage graph has been built and saved.")
 
 if __name__ == "__main__":
     main()
-    
