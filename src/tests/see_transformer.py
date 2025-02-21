@@ -174,7 +174,7 @@ if debug_mode:
 # For visualization, assign a color to each bot type.
 # ---------------------------
 bot_types = list(bot_counts.keys())
-colors = plt.colormaps["tab10"](np.linspace(0, 1, len(bot_types)))
+colors = plt.colormaps["tab20"](np.linspace(0, 1, len(bot_types)))
 bot_color_map = {bot: colors[i] for i, bot in enumerate(bot_types)}
 
 # ---------------------------
@@ -259,7 +259,13 @@ for cls, count in pred_dist.items():
 # ---------------------------
 correct_counts = defaultdict(int)
 total_counts = defaultdict(int)
+skipped_labels = set()
+
 for gt_label, pred in zip(ground_truth_labels, predicted_classes):
+    if gt_label not in label2idx:
+        skipped_labels.add(gt_label)
+        #print(f"Warning: Ground truth label '{gt_label}' not found in label2idx mapping. Skipping sample for accuracy computation.")
+        continue
     total_counts[gt_label] += 1
     if pred == label2idx[gt_label]:
         correct_counts[gt_label] += 1
@@ -315,6 +321,12 @@ for i, gt_label in enumerate(ground_truth_labels):
 plt.xlabel("Dimension 1")
 plt.ylabel("Dimension 2")
 plt.title("Transformer Strategy Embeddings (Colored by Bot Type)")
-plt.legend(handles=list(legend_handles.values()), loc="best", fontsize=8)
+plt.legend(
+    handles=list(legend_handles.values()),
+    loc='center left',
+    bbox_to_anchor=(1.0, 0.5),  # Shift the legend outside the plot
+    fontsize=8
+)
+plt.tight_layout()  # Helps ensure nothing is clipped
 plt.grid()
 plt.show()
