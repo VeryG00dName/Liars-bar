@@ -463,7 +463,13 @@ def main(args):
         plt.xlabel("Dimension 1")
         plt.ylabel("Dimension 2")
         plt.title("Transformer Strategy Embeddings (Evaluation Set)")
-        plt.legend(handles=list(legend_handles.values()), loc="best", fontsize=8)
+        plt.legend(
+            handles=list(legend_handles.values()),
+            loc='center left',
+            bbox_to_anchor=(1.0, 0.5),  # Shift the legend outside the plot
+            fontsize=8
+        )
+        plt.tight_layout()  # Helps ensure nothing is clipped
         plt.grid()
         plt.show()
     else:
