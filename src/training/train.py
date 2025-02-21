@@ -23,7 +23,7 @@ from src.model.new_models import StrategyTransformer
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 torch.backends.cudnn.benchmark = True
 
-# ---- Define a helper function to convert memory events into 4D feature vectors ----
+# ---- Helper: Convert memory events into 4D feature vectors ----
 def convert_memory_to_features(memory, response_mapping, action_mapping):
     """
     Convert the opponent memory (a list of events) to a list of 4-dimensional feature vectors.
@@ -65,18 +65,18 @@ def train(
     agents = env.possible_agents
     original_agent_order = list(env.agents)
     
-    # Extract components from agents_dict
+    # Extract components from agents_dict.
     policy_nets = {agent: agents_dict[agent]['policy_net'] for agent in agents_dict}
     value_nets = {agent: agents_dict[agent]['value_net'] for agent in agents_dict}
     optimizers_policy = {agent: agents_dict[agent]['optimizer_policy'] for agent in agents_dict}
     optimizers_value = {agent: agents_dict[agent]['optimizer_value'] for agent in agents_dict}
 
-    # Determine pool agents based on agent_mapping
+    # Determine pool agents based on agent_mapping.
     pool_agents = list({agent_mapping[agent] if agent_mapping is not None else agent for agent in agents})
-    num_opponents = len(pool_agents) - 1  # For example, in a 2+ agent setting
+    num_opponents = len(pool_agents) - 1  # e.g., in a 2+ agent setting.
     config.set_derived_config(env.observation_spaces[agents[0]], env.action_spaces[agents[0]], num_opponents)
 
-    # Initialize RolloutMemory for each pool agent
+    # Initialize RolloutMemory for each pool agent.
     memories = {pool_agent: RolloutMemory([pool_agent]) for pool_agent in pool_agents}
     obp_memory = []
     
@@ -84,7 +84,7 @@ def train(
     steps_since_log = 0
     episodes_since_log = 0
     
-    # Initialize periodic statistics
+    # Initialize periodic statistics.
     invalid_action_counts_periodic = {pool_agent: 0 for pool_agent in pool_agents}
     action_counts_periodic = {
         pool_agent: {a: 0 for a in range(config.OUTPUT_DIM)} 
@@ -110,7 +110,7 @@ def train(
     transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
     if os.path.exists(transformer_checkpoint_path):
         checkpoint = torch.load(transformer_checkpoint_path, map_location=device)
-        # Load the transformer state dict in non-strict mode to ignore missing keys.
+        # Load transformer state dict in non-strict mode (to ignore missing keys).
         strategy_transformer.load_state_dict(checkpoint["transformer_state_dict"], strict=False)
         logger.info(f"Loaded transformer from {transformer_checkpoint_path}")
         if "response2idx" in checkpoint and "action2idx" in checkpoint:
@@ -119,7 +119,7 @@ def train(
             logger.info("Loaded response and action mappings from checkpoint.")
         else:
             raise ValueError("Checkpoint is missing categorical mappings.")
-        # Load EventEncoder
+        # Load EventEncoder.
         from src.training.train_transformer import EventEncoder
         event_encoder = EventEncoder(
             response_vocab_size=len(response2idx),
@@ -130,7 +130,6 @@ def train(
         event_encoder.eval()
     else:
         logger.info("Transformer checkpoint not found, using randomly initialized transformer.")
-        # As a fallback, create dummy mappings and an event encoder.
         response2idx = {}
         action2idx = {}
         from src.training.train_transformer import EventEncoder
@@ -168,41 +167,58 @@ def train(
             observation = observation_dict[env_agent]
             action_mask = env.infos[env_agent].get('action_mask', [1] * config.OUTPUT_DIM)
 
-            # --- OBP Inference ---
-            obp_probs = run_obp_inference(obp_model, observation, device, env.num_players)
-
-            # --- Transformer Integration: Query Opponent Memory ---
+            # --- OBP and Transformer Integration ---
+            # Compute memory embeddings for OBP inference and final transformer features.
+            obp_memory_embeddings = []
             transformer_embeddings = []
             for opp in env.possible_agents:
                 if opp != env_agent:
                     mem_summary = query_opponent_memory_full(env_agent, opp)
                     features_list = convert_memory_to_features(mem_summary, response2idx, action2idx)
                     if features_list:
-                        feature_tensor = torch.tensor(features_list, dtype=torch.float, device=device).unsqueeze(0)
+                        feature_tensor = torch.tensor(features_list, dtype=torch.float32, device=device).unsqueeze(0)
                         with torch.no_grad():
                             projected = event_encoder(feature_tensor)
                             strategy_embedding, _ = strategy_transformer(projected)
-                        transformer_embeddings.append(strategy_embedding.cpu().numpy().flatten())
                     else:
+                        strategy_embedding = None
+
+                    if strategy_embedding is not None:
+                        obp_memory_embeddings.append(strategy_embedding)
+                        transformer_embeddings.append(strategy_embedding.cpu().detach().numpy().flatten())
+                    else:
+                        zero_emb = torch.zeros(1, config.STRATEGY_DIM, device=device)
+                        obp_memory_embeddings.append(zero_emb)
                         transformer_embeddings.append(np.zeros(config.STRATEGY_DIM, dtype=np.float32))
+            
+            # OBP inference using the computed memory embeddings.
+            obp_probs = run_obp_inference(obp_model, observation, device, env.num_players, memory_embeddings=obp_memory_embeddings)
+
+            # Normalize transformer embeddings using min–max normalization.
             if transformer_embeddings:
-                transformer_features = np.concatenate(transformer_embeddings, axis=0)
+                embeddings_arr = np.concatenate(transformer_embeddings, axis=0)
+                min_val = embeddings_arr.min()
+                max_val = embeddings_arr.max()
+                if max_val - min_val == 0:
+                    normalized_transformer_features = embeddings_arr
+                else:
+                    normalized_transformer_features = (embeddings_arr - min_val) / (max_val - min_val)
             else:
-                transformer_features = np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
+                normalized_transformer_features = np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
 
             # --- Form the final observation ---
             final_obs = np.concatenate([
                 observation,
                 np.array(obp_probs, dtype=np.float32),
-                transformer_features
+                normalized_transformer_features
             ], axis=0)
             
             assert final_obs.shape[0] == config.INPUT_DIM, \
                 f"Expected observation dimension {config.INPUT_DIM}, got {final_obs.shape[0]}"
             observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
             
-            # --- Action selection ---
-            probs, _ = policy_nets[pool_agent](observation_tensor, None)
+            # --- Action Selection ---
+            probs, _, _ = policy_nets[pool_agent](observation_tensor, None)
             probs = torch.clamp(probs, min=1e-8, max=1.0).squeeze(0)
             
             action_mask_tensor = torch.tensor(action_mask, dtype=torch.float32, device=device)
@@ -222,16 +238,17 @@ def train(
             log_prob = m.log_prob(torch.tensor(action, device=device))
             state_value = value_nets[pool_agent](observation_tensor).item()
             
+            # Update periodic action counts.
             action_counts_periodic[pool_agent][action] += 1
             env.step(action)
             reward = env.rewards[env_agent]
             done_or_truncated = env.terminations[env_agent] or env.truncations[env_agent]
             
-            # Update invalid action counts if any (if applicable)
+            # Update invalid action counts (if applicable).
             if 'penalty' in env.infos.get(env_agent, {}) and 'Invalid' in env.infos[env_agent]['penalty']:
                 invalid_action_counts_periodic[pool_agent] += 1
             
-            # Store transition in memory
+            # Store transition in memory.
             memories[pool_agent].store_transition(
                 agent=pool_agent,
                 state=final_obs,
@@ -301,8 +318,16 @@ def train(
                 advantages_ = (advantages_ - advantages_.mean()) / (advantages_.std() + 1e-5)
                 action_masks_ = torch.tensor(np.array(memory.action_masks[pool_agent], dtype=np.float32), device=device)
                 
+                kl_divs = []
+                policy_grad_norms = []
+                value_grad_norms = []
+                policy_losses = []
+                value_losses = []
+                entropies = []
+                classification_losses = []  # For auxiliary classifier
+
                 for _ in range(config.K_EPOCHS):
-                    probs, _ = policy_nets[pool_agent](states, None)
+                    probs, _, opponent_logits = policy_nets[pool_agent](states, None)
                     probs = torch.clamp(probs, 1e-8, 1.0)
                     masked_probs = probs * action_masks_
                     row_sums = masked_probs.sum(dim=-1, keepdim=True)
@@ -311,9 +336,11 @@ def train(
                         masked_probs / row_sums,
                         torch.ones_like(masked_probs) / masked_probs.shape[1]
                     )
-                    m = Categorical(masked_probs)
-                    new_log_probs = m.log_prob(actions_)
-                    entropy = m.entropy().mean()
+                    m_dist = Categorical(masked_probs)
+                    new_log_probs = m_dist.log_prob(actions_)
+                    entropy = m_dist.entropy().mean()
+                    kl_div = torch.mean(old_log_probs - new_log_probs)
+                    kl_divs.append(kl_div.item())
                     ratios = torch.exp(new_log_probs - old_log_probs)
                     surr1 = ratios * advantages_
                     surr2 = torch.clamp(ratios, 1 - config.EPS_CLIP, 1 + config.EPS_CLIP) * advantages_
@@ -321,40 +348,91 @@ def train(
                     policy_loss -= static_entropy_coef * entropy
                     state_values = value_nets[pool_agent](states).squeeze()
                     value_loss = torch.nn.MSELoss()(state_values, returns_)
-                    total_loss = policy_loss + 0.5 * value_loss
-                    optimizers_policy[pool_agent].zero_grad()
-                    optimizers_value[pool_agent].zero_grad()
+                    
+                    # Compute auxiliary classification loss if available.
+                    if opponent_logits is not None:
+                        # Without injected bots, use a fallback label (e.g. 0) as target.
+                        hardcoded_label = 0  
+                        target_labels = torch.full((opponent_logits.size(0),), hardcoded_label, dtype=torch.long, device=device)
+                        classification_loss = torch.nn.CrossEntropyLoss()(opponent_logits, target_labels)
+                        classification_losses.append(classification_loss.item())
+                        predicted_labels = opponent_logits.argmax(dim=1)
+                        accuracy = (predicted_labels == target_labels).float().mean().item()
+                        if log_tensorboard and writer is not None:
+                            writer.add_scalar(f"Accuracy/Classification/{pool_agent}", accuracy, episode)
+                        total_loss = policy_loss + 0.5 * value_loss + config.AUX_LOSS_WEIGHT * classification_loss
+                    else:
+                        total_loss = policy_loss + 0.5 * value_loss
+
+                    policy_losses.append(policy_loss.item())
+                    value_losses.append(value_loss.item())
+                    entropies.append(entropy.item())
                     total_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(
-                        policy_nets[pool_agent].parameters(), 
-                        max_norm=config.MAX_NORM
-                    )
-                    torch.nn.utils.clip_grad_norm_(
-                        value_nets[pool_agent].parameters(), 
-                        max_norm=config.MAX_NORM
-                    )
+
+                    p_grad_norm = 0.0
+                    for param in policy_nets[pool_agent].parameters():
+                        if param.grad is not None:
+                            p_grad_norm += param.grad.data.norm(2).item() ** 2
+                    p_grad_norm = p_grad_norm ** 0.5
+                    policy_grad_norms.append(p_grad_norm)
+
+                    v_grad_norm = 0.0
+                    for param in value_nets[pool_agent].parameters():
+                        if param.grad is not None:
+                            v_grad_norm += param.grad.data.norm(2).item() ** 2
+                    v_grad_norm = v_grad_norm ** 0.5
+                    value_grad_norms.append(v_grad_norm)
+
+                    torch.nn.utils.clip_grad_norm_(policy_nets[pool_agent].parameters(), max_norm=config.MAX_NORM)
+                    torch.nn.utils.clip_grad_norm_(value_nets[pool_agent].parameters(), max_norm=config.MAX_NORM)
                     optimizers_policy[pool_agent].step()
                     optimizers_value[pool_agent].step()
                 
-                if log_tensorboard and writer:
-                    writer.add_scalar(f"Loss/Policy_{pool_agent}", policy_loss.item(), current_episode)
-                    writer.add_scalar(f"Loss/Value_{pool_agent}", value_loss.item(), current_episode)
-                    writer.add_scalar(f"Entropy/{pool_agent}", entropy.item(), current_episode)
-                    writer.add_scalar(f"Entropy_Coef/{pool_agent}", static_entropy_coef, current_episode)
-            
-            if len(obp_memory) > 100:
-                avg_loss_obp, accuracy = train_obp(obp_model, obp_optimizer, obp_memory, device, logger)
-                if log_tensorboard and writer:
-                    writer.add_scalar("OBP/Loss", avg_loss_obp, current_episode)
-                    writer.add_scalar("OBP/Accuracy", accuracy, current_episode)
-                obp_memory = []
-            
-            for pool_agent in pool_agents:
+                avg_policy_loss = np.mean(policy_losses)
+                avg_value_loss = np.mean(value_losses)
+                avg_entropy = np.mean(entropies)
+                avg_kl_div = np.mean(kl_divs)
+                avg_policy_grad_norm = np.mean(policy_grad_norms)
+                avg_value_grad_norm = np.mean(value_grad_norms)
+                avg_classification_loss = np.mean(classification_losses) if classification_losses else 0.0
+
+                if log_tensorboard and writer is not None:
+                    writer.add_scalar(f"Loss/Policy/{pool_agent}", avg_policy_loss, episode)
+                    writer.add_scalar(f"Loss/Value/{pool_agent}", avg_value_loss, episode)
+                    writer.add_scalar(f"Entropy/{pool_agent}", avg_entropy, episode)
+                    writer.add_scalar(f"Entropy_Coef/{pool_agent}", static_entropy_coef, episode)
+                    writer.add_scalar(f"KL_Divergence/{pool_agent}", avg_kl_div, episode)
+                    writer.add_scalar(f"Gradient_Norms/Policy/{pool_agent}", avg_policy_grad_norm, episode)
+                    writer.add_scalar(f"Gradient_Norms/Value/{pool_agent}", avg_value_grad_norm, episode)
+                    writer.add_scalar(f"Loss/Classification/{pool_agent}", avg_classification_loss, episode)
+                    
+                # Reset memory for the agent.
                 memories[pool_agent].reset()
-        
+                
+                # Train OBP if sufficient data has been collected.
+                if len(obp_memory) > 100:
+                    avg_loss_obp, accuracy = train_obp(obp_model, obp_optimizer, obp_memory, device, logger)
+                    if avg_loss_obp is not None and accuracy is not None and log_tensorboard and writer is not None:
+                        writer.add_scalar("OBP/Loss", avg_loss_obp, episode)
+                        writer.add_scalar("OBP/Accuracy", accuracy, episode)
+                    obp_memory = []
+
+        if episode % config.CHECKPOINT_INTERVAL == 0:
+            from src.training.train_utils import save_checkpoint
+            save_checkpoint(
+                policy_nets,
+                value_nets,
+                optimizers_policy,
+                optimizers_value,
+                obp_model,
+                obp_optimizer,
+                episode,
+                checkpoint_dir=config.CHECKPOINT_DIR
+            )
+            logger.info(f"Saved global checkpoint at episode {episode}.")
+
         steps_since_log += steps_in_episode
         episodes_since_log += 1
-        
         if episode % config.LOG_INTERVAL == 0:
             logged_pool_agents = []
             for agent in original_agent_order:
