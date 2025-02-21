@@ -321,29 +321,33 @@ def get_opponent_memory_embedding(current_agent, opponent, device):
 # OBP Inference Functions (unchanged except normalization)
 # ----------------------------
 
-def run_obp_inference(obp_model, obs, device, num_players, agent_version, current_agent, env):
+def run_obp_inference(obp_model, obs, device, num_players, agent_version, current_agent, env, memory_embeddings=None):
     """
-    Runs OBP inference for an observation using the regular method.
-    (This function is used if the OBP model does NOT require a memory embedding.)
+    Runs OBP inference for an observation.
+    If memory_embeddings is provided (and the OBP model was trained with transformer memory),
+    it will be passed to the OBP model.
     """
     logger = logging.getLogger("Evaluate")
     if obp_model is None:
         num_opponents = num_players - 1
         logger.debug(f"No OBP model available for agent version {agent_version}. Returning default 0.0s.")
         return [0.0] * num_opponents
+
     if agent_version == 1:
         opp_feature_dim = 5
     elif agent_version == 2:
         opp_feature_dim = 4
     else:
         raise ValueError(f"Unknown agent_version: {agent_version}")
+
+    # Determine whether the OBP model requires memory.
     fc1_weight = obp_model.state_dict().get("fc1.weight", None)
     is_new_obp = False
     if fc1_weight is not None:
         input_dim = fc1_weight.shape[1]
-        # If the input dimension requires memory integration, we must supply it.
         if input_dim == config.OPPONENT_INPUT_DIM + config.STRATEGY_DIM:
             is_new_obp = True
+
     num_opponents = num_players - 1
     opp_features_start = len(obs) - (num_opponents * opp_feature_dim)
     opponents = [opp for opp in env.possible_agents if opp != current_agent]
@@ -354,25 +358,26 @@ def run_obp_inference(obp_model, obs, device, num_players, agent_version, curren
         opp_vec = obs[start_idx:end_idx]
         opp_vec_tensor = torch.tensor(opp_vec, dtype=torch.float32, device=device).unsqueeze(0)
         with torch.no_grad():
-            if is_new_obp:
-                # Fall back to tournament inference if memory is required.
-                obp_probs.append(run_obp_inference_tournament(obp_model, obs, device, num_players, agent_version, current_agent, opponents)[i])
+            if is_new_obp and memory_embeddings is not None:
+                mem_emb = memory_embeddings[i]
+                logits = obp_model(opp_vec_tensor, mem_emb)
             else:
                 logits = obp_model(opp_vec_tensor)
-                probs = torch.softmax(logits, dim=-1)
-                obp_probs.append(probs[0, 1].item())
+            probs = torch.softmax(logits, dim=-1)
+            obp_probs.append(probs[0, 1].item())
     return obp_probs
 
-def run_obp_inference_tournament(obp_model, obs, device, num_players, obs_version, current_agent, opponents):
+def run_obp_inference_tournament(obp_model, obs, device, num_players, obs_version, current_agent, opponents, memory_embeddings=None):
     """
     Specialized OBP inference for tournament mode.
-    This version supplies the required memory_embedding to the OBP model.
+    If memory_embeddings is provided and the OBP model requires memory,
+    each opponent's memory embedding is passed along with its observation vector.
     """
     if obp_model is None:
         return []
-    if obs_version == OBS_VERSION_1 or obs_version == 1:
+    if obs_version == 1 or obs_version == "OBS_VERSION_1":
         opp_feature_dim = 5
-    elif obs_version == OBS_VERSION_2 or obs_version == 2:
+    elif obs_version == 2 or obs_version == "OBS_VERSION_2":
         opp_feature_dim = 4
     else:
         raise ValueError(f"Unknown observation version: {obs_version}")
@@ -394,14 +399,9 @@ def run_obp_inference_tournament(obp_model, obs, device, num_players, obs_versio
         opp_vec = obs[start_idx:end_idx]
         opp_vec_tensor = torch.tensor(opp_vec, dtype=torch.float32, device=device).unsqueeze(0)
         with torch.no_grad():
-            if is_new_obp:
-                memory_emb = get_opponent_memory_embedding(current_agent, opp, device)
-                # Normalize the memory embedding using min–max scaling.
-                mem_min = memory_emb.min()
-                mem_max = memory_emb.max()
-                if mem_max - mem_min != 0:
-                    memory_emb = (memory_emb - mem_min) / (mem_max - mem_min)
-                logits = obp_model(opp_vec_tensor, memory_emb)
+            if is_new_obp and memory_embeddings is not None:
+                mem_emb = memory_embeddings[i]
+                logits = obp_model(opp_vec_tensor, mem_emb)
             else:
                 logits = obp_model(opp_vec_tensor)
             probs = torch.softmax(logits, dim=-1)
@@ -464,20 +464,48 @@ class RichProgressScoreboard:
         table.add_column("Rank", style="dim")
         table.add_column("Player ID", min_width=20)
         table.add_column("Skill", justify="right")
-        table.add_column("Win Rate", justify="right")
+        table.add_column("Match Win Rate", justify="right")
+        table.add_column("Round Win Rate", justify="right")
         table.add_column("Δ Rank", justify="right")
+        
         sorted_players = sorted(self.players.items(), key=lambda x: x[1]['rating'].ordinal(), reverse=True)
         for rank, (pid, data) in enumerate(sorted_players, 1):
             skill = data['rating'].ordinal()
-            win_rate = data.get('win_rate', 0.0)
-            diff = differences.get(pid, {}) if differences else {}
-            rank_change = format_rank_change(diff.get('rank_change', None))
+            # Retrieve the two win rates.
+            match_win_rate = data.get('win_rate_match', 0.0)
+            round_win_rate = data.get('win_rate_total', 0.0)
+            
+            # Determine rank change using differences (if provided)
+            if differences and pid in differences:
+                rank_change = differences[pid].get("rank_change")
+                if rank_change is None:
+                    rank_change_str = "New"
+                elif rank_change > 0:
+                    rank_change_str = f"[green]+{rank_change}[/green]"
+                elif rank_change < 0:
+                    rank_change_str = f"[red]{rank_change}[/red]"
+                else:
+                    rank_change_str = "0"
+            else:
+                rank_change_str = ""
+            
+            # Color code the rank number based on position.
+            if rank == 1:
+                rank_str = f"[bold gold1]{rank}[/bold gold1]"
+            elif rank == 2:
+                rank_str = f"[bold silver]{rank}[/bold silver]"
+            elif rank == 3:
+                rank_str = f"[bold dark_orange]{rank}[/bold dark_orange]"
+            else:
+                rank_str = str(rank)
+            
             table.add_row(
-                str(rank),
+                rank_str,
                 pid,
                 f"{skill:.2f}",
-                f"{win_rate:.2%}",
-                rank_change
+                f"{match_win_rate:.2%}",
+                f"{round_win_rate:.2%}",
+                rank_change_str
             )
         return table
 
@@ -622,8 +650,11 @@ def initialize_players(base_dir, device):
                     'uses_memory': uses_memory,
                     # Tournament-specific fields:
                     'score': rating.ordinal(),
-                    'wins': 0,
-                    'games_played': 0,
+                    'wins_match': 0,           # Counts one win per match (i.e. match-level win)
+                    'total_round_wins': 0,     # Cumulative total of rounds won across matches
+                    'games_played': 0,         # Number of matches played
+                    'win_rate_match': 0.0,     # wins_match / games_played (match win rate)
+                    'win_rate_total': 0.0      # total_round_wins / (num_games_per_match * games_played) (round win rate)
                 }
             return local_players
         except Exception as e:
@@ -651,14 +682,19 @@ def initialize_players(base_dir, device):
 # ----------------------------
 
 def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournament=False):
-    """Unified evaluation function used by both regular evaluation and tournaments"""
+    """
+    Unified evaluation function used by both regular evaluation and tournaments.
+    This version computes memory embeddings per opponent using get_opponent_memory_embedding,
+    applies min–max normalization, and then passes the normalized embeddings to OBP inference,
+    exactly as during training.
+    """
     logger = logging.getLogger("Evaluate")
     player_ids = list(players_in_this_game.keys())
     
-    # Environment setup: Map environment agent names to player IDs.
+    # Map environment agent names to player IDs.
     agent_to_player = {f'player_{i}': player_ids[i] for i in range(env.num_players)}
     
-    # Memory initialization: Clear persistent memory for agents using memory (obs_version == 2).
+    # Clear persistent memory for agents that use memory.
     for env_agent in agent_to_player:
         pid = agent_to_player[env_agent]
         if players_in_this_game[pid].get('uses_memory', False) and players_in_this_game[pid]['obs_version'] == 2:
@@ -687,7 +723,6 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                 env.step(None)
                 continue
 
-            # Process observation.
             observation = env.observe(agent)
             if isinstance(observation, dict):
                 observation = observation.get(agent, None)
@@ -699,7 +734,7 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
             player_id = agent_to_player[agent]
             player_data = players_in_this_game[player_id]
             
-            # ===== Handle Hardcoded Bot =====
+            # Hardcoded agent handling.
             if player_data.get('hardcoded_bot', False):
                 mask = info.get('action_mask', [1] * config.OUTPUT_DIM)
                 table_card = getattr(env, 'table_card', None)
@@ -707,132 +742,81 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                 action_counts[player_id][action] += 1
                 env.step(action)
                 continue
-            # ===================================
 
             obp_model = player_data.get('obp_model', None)
             version = player_data['obs_version']
-
-            # Adapt the observation.
             converted_obs = adapt_observation_for_version(observation, env.num_players, version)
             
-            # Decide which OBP inference to use.
+            # Decide whether OBP model uses transformer memory.
+            fc1_weight = None
+            use_tournament = is_tournament
+            memory_embeddings = None
             if obp_model is not None:
                 fc1_weight = obp_model.state_dict().get("fc1.weight", None)
                 if fc1_weight is not None and fc1_weight.shape[1] == config.OPPONENT_INPUT_DIM + config.STRATEGY_DIM:
                     use_tournament = True
+                    # Compute memory embeddings for each opponent using get_opponent_memory_embedding.
+                    opponents = [opp for opp in env.possible_agents if opp != agent]
+                    mem_emb_list = []
+                    for opp in opponents:
+                        emb = get_opponent_memory_embedding(agent, opp, device)
+                        # emb has shape (1, config.STRATEGY_DIM)
+                        mem_emb_list.append(emb.cpu().numpy().flatten())
+                    # Concatenate embeddings into one 1D array.
+                    mem_concat = np.concatenate(mem_emb_list, axis=0)
+                    # Min-max normalization.
+                    mem_min = mem_concat.min()
+                    mem_max = mem_concat.max()
+                    logger.debug(f"Memory min: {mem_min}, max: {mem_max}")
+                    if mem_max - mem_min == 0:
+                        norm_mem = mem_concat
+                    else:
+                        norm_mem = (mem_concat - mem_min) / (mem_max - mem_min)
+                    # Split back into per–opponent segments.
+                    segment_size = config.STRATEGY_DIM
+                    memory_embeddings = []
+                    for i in range(len(opponents)):
+                        seg = norm_mem[i * segment_size:(i + 1) * segment_size]
+                        memory_embeddings.append(torch.tensor(seg, dtype=torch.float32, device=device).unsqueeze(0))
                 else:
                     use_tournament = is_tournament
-            else:
-                use_tournament = False
 
             if use_tournament:
                 opponents = [opp for opp in env.possible_agents if opp != agent]
                 obp_probs = run_obp_inference_tournament(
-                    obp_model, converted_obs, device, env.num_players, version, agent, opponents
+                    obp_model, converted_obs, device, env.num_players, version, agent, opponents,
+                    memory_embeddings=memory_embeddings
                 )
             else:
                 obp_probs = run_obp_inference(
-                    obp_model, converted_obs, device, env.num_players, version, agent, env
+                    obp_model, converted_obs, device, env.num_players, version, agent, env,
+                    memory_embeddings=memory_embeddings
                 )
             
-            # Build default base observation by concatenating converted_obs and OBP output.
+            # Build default observation.
             default_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32)], axis=0)
             
-            # Memory integration for agents using persistent memory (obs_version == 2).
-            if player_data.get('uses_memory', False) and version == 2:
-                transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
-                global global_response2idx, global_action2idx, global_event_encoder, global_strategy_transformer
-                if global_response2idx is None or global_action2idx is None:
-                    if os.path.exists(transformer_checkpoint_path):
-                        ckpt = torch.load(transformer_checkpoint_path, map_location=device)
-                        global_response2idx = ckpt.get("response2idx", {})
-                        global_action2idx = ckpt.get("action2idx", {})
-                    else:
-                        global_response2idx = {}
-                        global_action2idx = {}
-                mem_features_list = []
-                for opp in env.possible_agents:
-                    if opp != agent:
-                        mem_summary = query_opponent_memory_full(agent, opp)
-                        features_list = convert_memory_to_features(mem_summary, global_response2idx, global_action2idx)
-                        if features_list:
-                            feature_tensor = torch.tensor(features_list, dtype=torch.float, device=device).unsqueeze(0)
-                            if global_event_encoder is None:
-                                global_event_encoder = EventEncoder(
-                                    response_vocab_size=len(global_response2idx),
-                                    action_vocab_size=len(global_action2idx),
-                                    token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM
-                                ).to(device)
-                                if os.path.exists(transformer_checkpoint_path):
-                                    ckpt = torch.load(transformer_checkpoint_path, map_location=device)
-                                    global_event_encoder.load_state_dict(ckpt["event_encoder_state_dict"])
-                                    global_event_encoder.eval()
-                            if global_strategy_transformer is None:
-                                global_strategy_transformer = StrategyTransformer(
-                                    num_tokens=config.STRATEGY_NUM_TOKENS,
-                                    token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM,
-                                    nhead=config.STRATEGY_NHEAD,
-                                    num_layers=config.STRATEGY_NUM_LAYERS,
-                                    strategy_dim=config.STRATEGY_DIM,
-                                    num_classes=config.STRATEGY_NUM_CLASSES,
-                                    dropout=config.STRATEGY_DROPOUT,
-                                    use_cls_token=True
-                                ).to(device)
-                                if os.path.exists(transformer_checkpoint_path):
-                                    ckpt = torch.load(transformer_checkpoint_path, map_location=device)
-                                    global_strategy_transformer.load_state_dict(ckpt.get("transformer_state_dict", ckpt), strict=False)
-                                    global_strategy_transformer.eval()
-                                global_strategy_transformer.token_embedding = torch.nn.Identity()
-                                global_strategy_transformer.classification_head = None
-                            with torch.no_grad():
-                                projected = global_event_encoder(feature_tensor)
-                                strategy_embedding, _ = global_strategy_transformer(projected)
-                            emb = strategy_embedding.cpu().numpy().flatten()
-                            mem_features_list.append(emb)
-                        else:
-                            mem_features_list.append(np.zeros(config.STRATEGY_DIM, dtype=np.float32))
-                if mem_features_list:
-                    mem_features = np.concatenate(mem_features_list, axis=0)
-                else:
-                    mem_features = np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
-                # Normalize the 1D memory features using min–max scaling.
-                min_val = mem_features.min()
-                max_val = mem_features.max()
-                logger.debug(f"Memory min: {min_val}, max: {max_val}")
-                if max_val - min_val == 0:
-                    normalized_mem = mem_features.flatten()
-                else:
-                    normalized_mem = (mem_features - min_val) / (max_val - min_val)
-                logger.debug(f"Normalized memory shape: {normalized_mem.shape}, sum: {np.sum(normalized_mem)}")
-                final_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32), normalized_mem], axis=0)
-                logger.debug("did use memory")
+            # If persistent memory is used (obs_version==2), concatenate transformer features.
+            if player_data.get('uses_memory', False) and version == 2 and memory_embeddings is not None:
+                # For consistency, flatten the concatenated normalized memory embeddings.
+                transformer_features = np.concatenate([emb.cpu().numpy().flatten() for emb in memory_embeddings], axis=0)
+                final_obs = np.concatenate([default_obs, transformer_features], axis=0)
             else:
-                logger.debug("didn't use memory")
                 final_obs = default_obs
 
-            # ----------------------------
-            # UPDATED: Convert final_obs to tensor and initialize proper hidden state for LSTM.
-            # ----------------------------
-            if isinstance(final_obs, tuple):
-                base_obs_tensor = torch.tensor(final_obs[0], dtype=torch.float32, device=device).unsqueeze(0)
-            else:
-                base_obs_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
+            # Convert final_obs to tensor.
+            final_obs_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
             policy_net = player_data['policy_net']
-            # Initialize LSTM hidden state tuple (h0, c0)
+            # Initialize LSTM hidden state.
             num_layers = policy_net.lstm.num_layers
-            batch_size = base_obs_tensor.size(0)
+            batch_size = final_obs_tensor.size(0)
             hidden_size = policy_net.lstm.hidden_size
             hidden_state = (
                 torch.zeros(num_layers, batch_size, hidden_size, device=device),
                 torch.zeros(num_layers, batch_size, hidden_size, device=device)
             )
-            logger.debug(f"Base observation tensor shape: {base_obs_tensor.shape}")
-            logger.debug(f"Hidden state shapes: {hidden_state[0].shape}, {hidden_state[1].shape}")
             with torch.no_grad():
-                # Extract the actual output probabilities from the tuple returned by the policy network.
-                probs, _, _ = policy_net(base_obs_tensor, hidden_state)
-            # ----------------------------
-            
+                probs, _, _ = policy_net(final_obs_tensor, hidden_state)
             probs = torch.clamp(probs, 1e-8, 1.0)
             mask = info.get('action_mask', [1] * config.OUTPUT_DIM)
             mask_tensor = torch.tensor(mask, dtype=torch.float32, device=device)
@@ -860,8 +844,7 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
         total_steps += steps_in_game
         game_wins_list.append(game_wins)
 
-    end_time = time.time()
-    elapsed_time = end_time - start_time
+    elapsed_time = time.time() - start_time
     steps_per_sec = total_steps / elapsed_time if elapsed_time > 0 else 0
     avg_steps = total_steps / episodes if episodes > 0 else 0
     return cumulative_wins, action_counts, game_wins_list, avg_steps, steps_per_sec
