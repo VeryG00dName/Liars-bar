@@ -30,7 +30,9 @@ from src.evaluation.evaluate_utils import (
 # Import the unified ModelFactory API.
 from src.model.model_factory import ModelFactory
 
-logging.basicConfig(level=logging.INFO)  # Set to DEBUG for detailed logs
+import logging
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(name)s %(levelname)s: %(message)s")
 logger = logging.getLogger("AgentBattleground")
 
 # --- Global transformer/event encoder variables for transformer‐based memory integration ---
@@ -176,7 +178,7 @@ class AgentBattlegroundGUI:
         else:
             raise ValueError(f"Unknown input_dim {input_dim} for model {file_path}")
         
-        uses_memory = ("fc4.weight" in any_policy)
+        uses_memory = True
         
         self.loaded_models[file_path] = {
             "policy_nets": checkpoint["policy_nets"],
@@ -278,7 +280,6 @@ class AgentBattlegroundGUI:
 
     def run_match(self, ai_agents, hardcoded_agent):
         """
-        Refactored to use evaluate_agents from evaluate_utils.py.
         Constructs a players dictionary for a 3-player match (2 AI and 1 hardcoded),
         then runs one episode using evaluate_agents and determines the winner.
         """
@@ -292,15 +293,13 @@ class AgentBattlegroundGUI:
         for key in ["player_0", "player_1"]:
             agent_data = ai_agents[key]
             hidden_dim = get_hidden_dim_from_state_dict(agent_data["policy_net"], "fc1")
+            num_opponents = env.num_players - 1
+            # Use the full input_dim from checkpoint so fc1 dimensions match.
+            obs_dim = agent_data["input_dim"]
             policy_net = ModelFactory.create_policy_network(
-                use_aux_classifier=True,
-                num_opponent_classes=config.NUM_OPPONENT_CLASSES,
-                input_dim=agent_data["input_dim"],
+                input_dim=obs_dim,
                 hidden_dim=hidden_dim,
-                output_dim=env.action_spaces[key].n,
-                use_lstm=True,
-                use_dropout=True,
-                use_layer_norm=True
+                output_dim=env.action_spaces[key].n
             )
             policy_net.load_state_dict(agent_data["policy_net"], strict=False)
             policy_net.to(device).eval()
@@ -331,7 +330,7 @@ class AgentBattlegroundGUI:
                 obp_model = None
 
             players_in_this_game[key] = {
-                "policy_net": policy_net,
+                "policy_net": policy_net,  # use our wrapper here
                 "obp_model": obp_model,
                 "obs_version": agent_data["obs_version"],
                 "rating": None,
@@ -356,6 +355,7 @@ class AgentBattlegroundGUI:
             return "hardcoded_agent"
         else:
             return "unknown_agent"
+
 
     def display_results(self, results):
         self.results_text.config(state=tk.NORMAL)
