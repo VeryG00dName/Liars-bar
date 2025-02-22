@@ -167,23 +167,42 @@ class PositionalEncoding(nn.Module):
 
 class StrategyTransformer(nn.Module):
     """
-    Transformer that compresses sequences of opponent events into a fixed-size strategy embedding.
+    Transformer model that compresses sequences of action tokens into a fixed-size strategy embedding.
     """
-    def __init__(self, num_tokens, token_embedding_dim, nhead, num_layers, strategy_dim, dropout=0.1, use_cls_token=True):
+    def __init__(
+        self,
+        num_tokens,             # Vocabulary size for action tokens.
+        token_embedding_dim,    # Dimension of token embeddings.
+        nhead,                  # Number of attention heads.
+        num_layers,             # Number of Transformer encoder layers.
+        strategy_dim,           # Desired dimension for the final strategy embedding (e.g. 5 or 10).
+        num_classes=25,         # Number of classes for the classification head.
+        dropout=0.1,
+        use_cls_token=True      # If True, a learnable [CLS] token is prepended for pooling.
+    ):
         super(StrategyTransformer, self).__init__()
         self.use_cls_token = use_cls_token
         self.token_embedding = nn.Embedding(num_tokens, token_embedding_dim)
         self.pos_encoder = PositionalEncoding(token_embedding_dim, dropout=dropout)
-        
+
         if self.use_cls_token:
+            # Learnable classification token that will serve as the summary representation.
             self.cls_token = nn.Parameter(torch.zeros(1, 1, token_embedding_dim))
-        
-        encoder_layer = nn.TransformerEncoderLayer(d_model=token_embedding_dim, nhead=nhead, dropout=dropout)
+
+        # ✅ Update: Enable batch_first=True
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=token_embedding_dim,
+            nhead=nhead,
+            dropout=dropout,
+            batch_first=True
+        )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        
+
+        # Projects the pooled output into the fixed-size strategy embedding.
         self.strategy_head = nn.Linear(token_embedding_dim, strategy_dim)
-        # Classification head removed as per updated design.
-        
+        # Classification head used only during training.
+        self.classification_head = nn.Linear(strategy_dim, num_classes)
+
         self.init_weights()
 
     def init_weights(self):
@@ -193,21 +212,43 @@ class StrategyTransformer(nn.Module):
             nn.init.normal_(self.cls_token, std=0.02)
         self.strategy_head.weight.data.uniform_(-initrange, initrange)
         self.strategy_head.bias.data.zero_()
+        self.classification_head.weight.data.uniform_(-initrange, initrange)
+        self.classification_head.bias.data.zero_()
 
     def forward(self, src):
-        # src: (batch, seq_len) token indices
+        """
+        Args:
+            src: Tensor of shape (batch_size, seq_length) containing token indices.
+        Returns:
+            strategy_embedding: Tensor of shape (batch_size, strategy_dim) – the compressed representation.
+            classification_logits: Tensor of shape (batch_size, num_classes) for training purposes, or None if classification_head is disabled.
+        """
+        batch_size = src.size(0)
+        
+        # Embed tokens: (batch_size, seq_length, token_embedding_dim)
         x = self.token_embedding(src)
+
         if self.use_cls_token:
-            cls_tokens = self.cls_token.expand(x.size(0), -1, -1)
-            x = torch.cat((cls_tokens, x), dim=1)
+            # Prepend the [CLS] token to each sequence.
+            cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # (batch_size, 1, token_embedding_dim)
+            x = torch.cat((cls_tokens, x), dim=1)  # (batch_size, 1 + seq_length, token_embedding_dim)
+
+        # Add positional encoding.
         x = self.pos_encoder(x)
-        # Transformer expects (seq_len, batch, embedding_dim)
-        x = x.transpose(0, 1)
-        encoded = self.transformer_encoder(x)
-        encoded = encoded.transpose(0, 1)
+
+        # ✅ Remove transpose(0,1), since batch_first=True now
+        encoded = self.transformer_encoder(x)  # Now works with (batch_size, seq_length, token_embedding_dim)
+
         if self.use_cls_token:
-            pooled = encoded[:, 0, :]
+            pooled = encoded[:, 0, :]  # Use CLS token representation
         else:
-            pooled = encoded.mean(dim=1)
+            pooled = encoded.mean(dim=1)  # Mean pooling over sequence
+
         strategy_embedding = self.strategy_head(pooled)
-        return strategy_embedding
+
+        if self.classification_head is not None:
+            classification_logits = self.classification_head(strategy_embedding)
+        else:
+            classification_logits = None
+
+        return strategy_embedding, classification_logits
