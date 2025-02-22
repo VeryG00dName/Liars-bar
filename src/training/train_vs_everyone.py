@@ -39,7 +39,7 @@ from src.model.hard_coded_agents import (
 # Import query_opponent_memory for opponent memory integration
 from src.env.liars_deck_env_utils import query_opponent_memory_full
 
-torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.benchmark = False
 
 # Imports from our refactored files
 from src.training.train_utils import (
@@ -259,8 +259,8 @@ def select_injected_bot(agent, injected_bots, win_stats, match_stats):
 # Main training loop.
 # ---------------------------
 def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_directory=None, log_tensorboard=True):
-    set_seed()
-    obs, infos = env.reset()
+    set_seed(config.SEED)
+    obs, infos = env.reset(seed=config.SEED)
     agents = env.agents
     assert len(agents) == config.NUM_PLAYERS, f"Expected {config.NUM_PLAYERS} agents, but got {len(agents)} agents."
     num_opponents = config.NUM_PLAYERS - 1
@@ -269,6 +269,8 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
     # Initialize win tracking: for each agent, we track wins and matches vs every injected opponent type.
     win_stats = {agent: {} for agent in agents}
     match_stats = {agent: {} for agent in agents}
+    # New dictionary to count games played over a moving window of 100 episodes.
+    games_played_counter = {agent: {} for agent in agents}
 
     # Initialize networks, optimizers, and memories for each agent.
     policy_nets = {}
@@ -369,7 +371,8 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
     tracked_agent_last_embeddings = {}
 
     for episode in range(start_episode, num_episodes + 1):
-        obs, infos = env.reset()
+        env_seed = config.SEED + episode
+        obs, infos = env.reset(seed=env_seed)
         agents = env.agents
         pending_rewards = {agent: 0.0 for agent in agents}
 
@@ -549,6 +552,9 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     continue
                 match_stats[agent].setdefault(opponent_key, 0)
                 match_stats[agent][opponent_key] += 1
+                # Also update games played counter (to track over 100 episodes)
+                games_played_counter[agent].setdefault(opponent_key, 0)
+                games_played_counter[agent][opponent_key] += 1
                 if agent in winners and current_injected_agent_id not in winners:
                     win_stats[agent].setdefault(opponent_key, 0)
                     win_stats[agent][opponent_key] += 1
@@ -641,8 +647,15 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                         classification_losses.append(classification_loss.item())
                         predicted_labels = opponent_logits.argmax(dim=1)
                         accuracy = (predicted_labels == target_labels).float().mean().item()
+                        # Log overall classification accuracy...
                         if writer is not None:
                             writer.add_scalar(f"Accuracy/Classification/{agent}", accuracy, episode)
+                            # Also log per opponent classification accuracy.
+                            if current_injected_bot_type == "historical":
+                                opp_key = current_injected_bot_identifier
+                            else:
+                                opp_key = current_injected_agent_instance.__class__.__name__
+                            writer.add_scalar(f"Accuracy/Classification/{agent}_vs_{opp_key}", accuracy, episode)
                         total_loss = policy_loss + 0.5 * value_loss + config.AUX_LOSS_WEIGHT * classification_loss
                     else:
                         total_loss = policy_loss + 0.5 * value_loss
@@ -738,6 +751,13 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
             last_log_time = time.time()
             steps_since_log = 0
             episodes_since_log = 0
+            # Log games played over the last 100 episodes.
+            for agent in games_played_counter:
+                for opp_key, count in games_played_counter[agent].items():
+                    if writer is not None:
+                        writer.add_scalar(f"games_played/{agent}_vs_{opp_key}", count, episode)
+                # Reset the 100-episode counter.
+            games_played_counter = {agent: {} for agent in agents}
             if episode % config.CULL_INTERVAL == 0:
                 average_rewards = {agent: (sum(recent_rewards[agent]) / len(recent_rewards[agent]) if recent_rewards[agent] else 0.0) for agent in agents}
                 lowest_agent = min(average_rewards, key=average_rewards.get)

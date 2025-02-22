@@ -2,7 +2,10 @@
 
 import numpy as np
 import random
-
+from src import config
+if config.SEED:
+    random.seed(config.SEED)
+    np.random.seed(config.SEED)
 class GreedyCardSpammer:
     def __init__(self, agent_name):
         self.name = agent_name

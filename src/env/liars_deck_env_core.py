@@ -183,7 +183,11 @@ class LiarsDeckEnv(AECEnv):
         return self.action_spaces[agent]
 
     def reset(self, seed=None, options=None):
-        self.np_random, seed = np.random.default_rng(seed), seed
+        if seed is None:
+            seed = np.random.randint(0,1000000)
+        np.random.seed(seed)
+        self.np_random = np.random.default_rng(seed)
+        random.seed(seed)
         self.deck = create_deck(self.np_random)
         self.penalties = {agent: 0 for agent in self.possible_agents}
         self.penalty_thresholds = {agent: 3 for agent in self.possible_agents}

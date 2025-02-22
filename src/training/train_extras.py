@@ -4,6 +4,7 @@ import random
 import numpy as np
 import torch
 from src import config
+import os
 
 def set_seed(seed=42):
     """
@@ -14,6 +15,11 @@ def set_seed(seed=42):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True)
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
 
 def convert_memory_to_features(memory, response_mapping, action_mapping):
     """
