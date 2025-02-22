@@ -3,6 +3,12 @@
 import logging
 import time
 import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+import warnings
+# Suppress PyTorch warnings.
+warnings.filterwarnings("ignore", category=UserWarning, module="torch.nn.modules.transformer")
+warnings.filterwarnings("ignore", category=FutureWarning)
 import random
 import numpy as np
 from sklearn.discriminant_analysis import StandardScaler
@@ -34,7 +40,6 @@ from src.model.hard_coded_agents import (
 # Import query_opponent_memory for opponent memory integration
 from src.env.liars_deck_env_utils import query_opponent_memory_full
 
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 torch.backends.cudnn.benchmark = True
 
 # Imports from our refactored files
