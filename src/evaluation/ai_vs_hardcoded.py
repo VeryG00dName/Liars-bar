@@ -169,6 +169,10 @@ class BattlegroundWorker(QThread):
                     raise ValueError(f"Unexpected OBP input dimension: {obp_input_dim}")
                 obp_model = ModelFactory.load_obp_state_dict(obp_model, obp_state)
                 obp_model.to(device).eval()
+                example_observation = torch.randn(1, config.OPPONENT_INPUT_DIM).to(device)
+                example_memory_embedding = torch.randn(1, config.STRATEGY_DIM).to(device)
+
+                obp_model = torch.jit.trace(obp_model, (example_observation, example_memory_embedding))
             else:
                 obp_model = None
 
