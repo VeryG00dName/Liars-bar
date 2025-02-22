@@ -10,3 +10,5 @@ tensorboard
 openskill
 tkinterdnd2
 scikit-learn
+rich
+PyQt5
