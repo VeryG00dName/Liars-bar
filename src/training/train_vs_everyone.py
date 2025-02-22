@@ -11,7 +11,6 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torch.nn.modules
 warnings.filterwarnings("ignore", category=FutureWarning)
 import random
 import numpy as np
-from sklearn.discriminant_analysis import StandardScaler
 import torch
 import torch.nn as nn
 import torch.nn.functional as F  # For cosine similarity and loss functions.
