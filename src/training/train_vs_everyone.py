@@ -85,8 +85,6 @@ HARD_CODED_LABELS = {
     "SelectiveTableConservativeChallenger": 5,
 }
 # The historical models will be assigned distinct labels.
-# (For example, if you have 3 historical models, their labels will be 6, 7, and 8.)
-# This mapping will be created after loading the historical models.
 historical_label_mapping = {}
 
 # ---------------------------
@@ -464,13 +462,22 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 obp_probs = run_obp_inference(obp_model, observation, device, env.num_players,
                                               memory_embeddings=obp_memory_embeddings)
 
+            # Build final observation based on the agent type.
             if agent == current_injected_agent_id:
                 base_obs = observation
                 obp_arr = np.array(obp_probs, dtype=np.float32)
+                # For historical models, use their expected input dim; for hardcoded, use config.INPUT_DIM.
+                if current_injected_bot_type == "historical":
+                    expected_input_dim = current_injected_agent_instance.fc1.weight.shape[1]
+                else:
+                    expected_input_dim = config.INPUT_DIM
                 current_dim = base_obs.shape[0] + obp_arr.shape[0]
-                missing_dim = config.INPUT_DIM - current_dim
-                mem_features = np.zeros(missing_dim, dtype=np.float32)
-                final_obs = np.concatenate([base_obs, obp_arr, mem_features], axis=0)
+                missing_dim = expected_input_dim - current_dim
+                if missing_dim > 0:
+                    mem_features = np.zeros(missing_dim, dtype=np.float32)
+                    final_obs = np.concatenate([base_obs, obp_arr, mem_features], axis=0)
+                else:
+                    final_obs = np.concatenate([base_obs, obp_arr], axis=0)
             else:
                 final_obs = np.concatenate([observation, np.array(obp_probs, dtype=np.float32), transformer_features], axis=0)
 
@@ -604,7 +611,12 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 returns_ = torch.tensor(np.array(memory.returns[agent], dtype=np.float32), device=device)
                 advantages_ = torch.tensor(np.array(memory.advantages[agent], dtype=np.float32), device=device)
                 action_masks_ = torch.tensor(np.array(memory.action_masks[agent], dtype=np.float32), device=device)
-                advantages_ = (advantages_ - advantages_.mean()) / (advantages_.std() + 1e-5)
+                # Safely normalize advantages.
+                adv_std = advantages_.std()
+                if adv_std < 1e-5:
+                    normalized_advantages = advantages_
+                else:
+                    normalized_advantages = (advantages_ - advantages_.mean()) / (adv_std + 1e-5)
 
                 kl_divs = []
                 policy_grad_norms = []
@@ -630,8 +642,8 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     kl_div = torch.mean(old_log_probs - new_log_probs)
                     kl_divs.append(kl_div.item())
                     ratios = torch.exp(new_log_probs - old_log_probs)
-                    surr1 = ratios * advantages_
-                    surr2 = torch.clamp(ratios, 1 - config.EPS_CLIP, 1 + config.EPS_CLIP) * advantages_
+                    surr1 = ratios * normalized_advantages
+                    surr2 = torch.clamp(ratios, 1 - config.EPS_CLIP, 1 + config.EPS_CLIP) * normalized_advantages
                     policy_loss = -torch.min(surr1, surr2).mean() - static_entropy_coef * entropy
                     state_values = value_nets[agent](states).squeeze()
                     value_loss = nn.MSELoss()(state_values, returns_)
@@ -647,10 +659,8 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                         classification_losses.append(classification_loss.item())
                         predicted_labels = opponent_logits.argmax(dim=1)
                         accuracy = (predicted_labels == target_labels).float().mean().item()
-                        # Log overall classification accuracy...
                         if writer is not None:
                             writer.add_scalar(f"Accuracy/Classification/{agent}", accuracy, episode)
-                            # Also log per opponent classification accuracy.
                             if current_injected_bot_type == "historical":
                                 opp_key = current_injected_bot_identifier
                             else:
@@ -723,7 +733,6 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 f"Time since last log: {elapsed_time:.2f} seconds\t"
                 f"Steps/s: {steps_per_second:.2f}"
             )
-            # Log win rates vs each injected opponent for every learning agent.
             for agent in agents:
                 if agent == current_injected_agent_id:
                     continue
@@ -751,12 +760,10 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
             last_log_time = time.time()
             steps_since_log = 0
             episodes_since_log = 0
-            # Log games played over the last 100 episodes.
             for agent in games_played_counter:
                 for opp_key, count in games_played_counter[agent].items():
                     if writer is not None:
                         writer.add_scalar(f"games_played/{agent}_vs_{opp_key}", count, episode)
-                # Reset the 100-episode counter.
             games_played_counter = {agent: {} for agent in agents}
             if episode % config.CULL_INTERVAL == 0:
                 average_rewards = {agent: (sum(recent_rewards[agent]) / len(recent_rewards[agent]) if recent_rewards[agent] else 0.0) for agent in agents}
