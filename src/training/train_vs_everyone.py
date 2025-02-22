@@ -346,7 +346,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
     original_agent_order = list(env.agents)
 
     # Combine hardcoded agents and historical models for injected bots.
-    hardcoded_agent_classes = [GreedyCardSpammer, GreedyCardSpammer, StrategicChallenger, TableNonTableAgent, Classic,
+    hardcoded_agent_classes = [GreedyCardSpammer, StrategicChallenger, TableNonTableAgent, Classic,
                                TableFirstConservativeChallenger, SelectiveTableConservativeChallenger]
     injected_bots = []
     for cls in hardcoded_agent_classes:
