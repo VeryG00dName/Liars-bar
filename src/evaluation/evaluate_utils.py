@@ -685,12 +685,16 @@ def initialize_players(base_dir, device):
 # Unified Evaluation Function
 # ----------------------------
 
-def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournament=False):
+def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournament=False, two_player=None):
     """
     Unified evaluation function used by both regular evaluation and tournaments.
     This version computes memory embeddings per opponent using get_opponent_memory_embedding,
     applies min–max normalization, and then passes the normalized embeddings to OBP inference,
     exactly as during training.
+
+    Optional:
+        two_player: if provided (e.g., "player_1"), that player will be eliminated (penalties set to threshold)
+                    immediately after each environment reset.
     """
     logger = logging.getLogger("Evaluate")
     player_ids = list(players_in_this_game.keys())
@@ -712,6 +716,12 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
 
     for game_idx in range(1, episodes + 1):
         env.reset()
+        # If two_player is provided, pre-eliminate that agent.
+        if two_player is not None and two_player in env.penalties:
+            env.penalties[two_player] = env.penalty_thresholds[two_player]
+            env.terminations[two_player] = True
+            logger.debug(f"Pre-eliminated {two_player} for a 2-player game.")
+        
         env.agents = list(agent_to_player.keys())
         env._agent_selector = agent_selector(env.agents)
         env.agent_selection = env._agent_selector.next() if env.agents else None

@@ -1,14 +1,15 @@
-#!/usr/bin/env python
+# src/evaluation/ai_vs_hardcoded.py
 import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import logging
 import torch
 import numpy as np
+import matplotlib.pyplot as plt
 
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5 import QtWidgets
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
 # Import your environment, agents, evaluation helpers, and model factory.
-# Make sure these imports match your project structure.
 from src.env.liars_deck_env_core import LiarsDeckEnv
 from src import config
 from src.model.hard_coded_agents import (
@@ -26,7 +27,6 @@ from src.evaluation.evaluate_utils import (
 from src.model.model_factory import ModelFactory
 from src.training.train_vs_everyone import load_specific_historical_models
 
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 torch.backends.cudnn.benchmark = True
 
 logging.basicConfig(level=logging.INFO,
@@ -86,12 +86,14 @@ class BattlegroundWorker(QThread):
     results_signal = pyqtSignal(dict)
     error_signal = pyqtSignal(str)
     
-    def __init__(self, ai_agents, historical_models, hardcoded_agents, rounds, parent=None):
+    # Now include an extra parameter "two_player"
+    def __init__(self, ai_agents, historical_models, hardcoded_agents, rounds, two_player=None, parent=None):
         super().__init__(parent)
         self.ai_agents = ai_agents
         self.historical_models = historical_models
         self.hardcoded_agents = hardcoded_agents
         self.rounds = rounds
+        self.two_player = two_player  # if not None, pass the player id to eliminate
 
     def run(self):
         try:
@@ -220,7 +222,8 @@ class BattlegroundWorker(QThread):
         else:
             raise ValueError(f"Unknown opponent type: {opponent_type}")
 
-        cumulative_wins, _, _, _, _ = evaluate_agents(env, device, players_in_this_game, episodes=1)
+        # Pass our two_player flag to evaluate_agents.
+        cumulative_wins, _, _, _, _ = evaluate_agents(env, device, players_in_this_game, episodes=1, two_player=self.two_player)
         winner = max(cumulative_wins, key=cumulative_wins.get)
         if winner in ["player_0", "player_1"]:
             return winner
@@ -235,7 +238,6 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("Agent Battleground")
         self.resize(1000, 700)
-
         self.loaded_models = {}
         self.hardcoded_agents = {
             "GreedySpammer": GreedyCardSpammer,
@@ -246,13 +248,15 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
             "Classic": Classic,
             "Random": RandomAgent
         }
-
-        # Load historical models (assumed to be PPO models in evaluation mode).
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.historical_models = {}
         hist_models_list = load_specific_historical_models(config.HISTORICAL_MODEL_DIR, device)
         for model, identifier in hist_models_list:
             self.historical_models[identifier] = model
+
+        # Store previous results for comparison.
+        self.previous_results = None
+        self.current_results = None
 
         self.initUI()
 
@@ -293,7 +297,7 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
             self.agent_selectors[i] = combo
         main_layout.addWidget(ai_selection_group)
 
-        # --- Control Buttons Layout ---
+        # --- Control Buttons and Options Layout ---
         control_layout = QtWidgets.QHBoxLayout()
         refresh_button = QtWidgets.QPushButton("Refresh Agents")
         refresh_button.clicked.connect(self.update_agent_selectors)
@@ -308,6 +312,23 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         self.rounds_spinbox.setMaximum(1000)
         self.rounds_spinbox.setValue(20)
         control_layout.addWidget(self.rounds_spinbox)
+
+        # --- New Checkboxes ---
+        self.two_player_checkbox = QtWidgets.QCheckBox("2 Player Mode")
+        control_layout.addWidget(self.two_player_checkbox)
+        self.combine_ai_checkbox = QtWidgets.QCheckBox("Combine AI Columns")
+        control_layout.addWidget(self.combine_ai_checkbox)
+        self.combine_ai_checkbox.stateChanged.connect(self.update_results_display)
+        # Disable combine checkbox when 2 Player is active.
+        self.two_player_checkbox.stateChanged.connect(
+            lambda state: self.combine_ai_checkbox.setEnabled(state == Qt.Unchecked)
+        )
+
+        # --- Compare Results Button ---
+        self.compare_button = QtWidgets.QPushButton("Compare Results")
+        self.compare_button.clicked.connect(self.compare_results)
+        control_layout.addWidget(self.compare_button)
+
         main_layout.addLayout(control_layout)
 
         # --- Progress Bar ---
@@ -323,9 +344,8 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         results_layout = QtWidgets.QVBoxLayout(results_group)
         self.results_text = QtWidgets.QTextEdit()
         self.results_text.setReadOnly(True)
-        self.results_text.setMinimumHeight(300)
-        self.results_text.setSizePolicy(QtWidgets.QSizePolicy.Expanding, 
-                                QtWidgets.QSizePolicy.Expanding)
+        self.results_text.setFixedHeight(320)
+        self.results_text.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         results_layout.addWidget(self.results_text)
         main_layout.addWidget(results_group)
 
@@ -422,12 +442,24 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         ai_agents = self.load_selected_agents()
         if not ai_agents:
             return
+
+        # Determine two_player parameter from checkbox:
+        two_player_param = "player_1" if self.two_player_checkbox.isChecked() else None
+
         rounds = self.rounds_spinbox.value()
         total_matches = rounds * (len(self.hardcoded_agents) + len(self.historical_models))
         self.progress_bar.setMaximum(total_matches)
         self.progress_bar.setValue(0)
+        # If there are already results, store them for later comparison.
+        if self.results_text.toPlainText().strip():
+            try:
+                # For simplicity, assume previous results have been stored in self.current_results.
+                self.previous_results = self.current_results
+            except Exception:
+                self.previous_results = None
         self.results_text.clear()
-        self.worker = BattlegroundWorker(ai_agents, self.historical_models, self.hardcoded_agents, rounds)
+        # Pass two_player_param to the worker.
+        self.worker = BattlegroundWorker(ai_agents, self.historical_models, self.hardcoded_agents, rounds, two_player=two_player_param)
         self.worker.progress_signal.connect(self.update_progress)
         self.worker.results_signal.connect(self.display_results)
         self.worker.error_signal.connect(lambda msg: self.show_info(f"Error: {msg}"))
@@ -436,50 +468,158 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
     def update_progress(self, value):
         self.progress_bar.setValue(value)
 
-    # --- Here is the HTML table approach for displaying results ---
+    # --- Display results with optional combining ---
     def display_results(self, results):
-        # Build an HTML table with some inline styling
-        html = """
-        <table style="border: 1px solid #7289da; border-collapse: collapse; width: 100%;">
-          <thead>
-            <tr style="background-color: #4f545c;">
-              <th style="border: 1px solid #7289da; padding: 8px;">Opponent Name</th>
-              <th style="border: 1px solid #7289da; padding: 8px;">AI1 Wins</th>
-              <th style="border: 1px solid #7289da; padding: 8px;">AI2 Wins</th>
-              <th style="border: 1px solid #7289da; padding: 8px;">Opponent Wins</th>
-              <th style="border: 1px solid #7289da; padding: 8px;">AI1 Win Rate</th>
-              <th style="border: 1px solid #7289da; padding: 8px;">AI2 Win Rate</th>
-              <th style="border: 1px solid #7289da; padding: 8px;">Opponent Win Rate</th>
-            </tr>
-          </thead>
-          <tbody>
-        """
-
-        for opp_name, wins in results.items():
-            ai1_wins, ai2_wins, opp_wins = wins
-            total = ai1_wins + ai2_wins + opp_wins
-            rate1 = ai1_wins / total if total > 0 else 0.0
-            rate2 = ai2_wins / total if total > 0 else 0.0
-            rate_opp = opp_wins / total if total > 0 else 0.0
-
-            row = f"""
-            <tr>
-              <td style="border: 1px solid #7289da; padding: 6px;">{opp_name}</td>
-              <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{ai1_wins}</td>
-              <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{ai2_wins}</td>
-              <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp_wins}</td>
-              <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{rate1:.2%}</td>
-              <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{rate2:.2%}</td>
-              <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{rate_opp:.2%}</td>
-            </tr>
+        self.current_results = results  # Save the current results
+        # Determine whether to combine AI columns.
+        combine = (not self.two_player_checkbox.isChecked()) and self.combine_ai_checkbox.isChecked()
+        
+        if combine:
+            html = """
+            <table style="border: 1px solid #7289da; border-collapse: collapse; width: 100%;">
+            <thead>
+                <tr style="background-color: #4f545c;">
+                <th style="border: 1px solid #7289da; padding: 8px;">Opponent Name</th>
+                <th style="border: 1px solid #7289da; padding: 8px;">Combined AI Wins</th>
+                <th style="border: 1px solid #7289da; padding: 8px;">Opponent Wins</th>
+                <th style="border: 1px solid #7289da; padding: 8px;">Combined AI Win Rate</th>
+                <th style="border: 1px solid #7289da; padding: 8px;">Opponent Win Rate</th>
+                <th style="border: 1px solid #7289da; padding: 8px;">Result</th>
+                </tr>
+            </thead>
+            <tbody>
             """
-            html += row
-
-        html += """
-          </tbody>
-        </table>
-        """
+            for opp_name, wins in results.items():
+                combined_ai_wins = wins[0] + wins[1]
+                opp_wins = wins[2]
+                total = combined_ai_wins + opp_wins
+                combined_rate = combined_ai_wins / total if total > 0 else 0.0
+                opp_rate = opp_wins / total if total > 0 else 0.0
+                result_str = "Win" if combined_rate > 0.5 else "Loss"
+                row = f"""
+                <tr>
+                <td style="border: 1px solid #7289da; padding: 6px;">{opp_name}</td>
+                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{combined_ai_wins}</td>
+                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp_wins}</td>
+                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{combined_rate:.2%}</td>
+                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp_rate:.2%}</td>
+                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{result_str}</td>
+                </tr>
+                """
+                html += row
+            html += """
+            </tbody>
+            </table>
+            """
+        else:
+            html = """
+            <table style="border: 1px solid #7289da; border-collapse: collapse; width: 100%;">
+            <thead>
+                <tr style="background-color: #4f545c;">
+                <th style="border: 1px solid #7289da; padding: 8px;">Opponent Name</th>
+                <th style="border: 1px solid #7289da; padding: 8px;">AI1 Wins</th>
+                <th style="border: 1px solid #7289da; padding: 8px;">AI2 Wins</th>
+                <th style="border: 1px solid #7289da; padding: 8px;">Opponent Wins</th>
+                <th style="border: 1px solid #7289da; padding: 8px;">AI1 Win Rate</th>
+                <th style="border: 1px solid #7289da; padding: 8px;">AI2 Win Rate</th>
+                <th style="border: 1px solid #7289da; padding: 8px;">Opponent Win Rate</th>
+                <th style="border: 1px solid #7289da; padding: 8px;">Result</th>
+                </tr>
+            </thead>
+            <tbody>
+            """
+            for opp_name, wins in results.items():
+                ai1_wins, ai2_wins, opp_wins = wins
+                total = ai1_wins + ai2_wins + opp_wins
+                rate1 = ai1_wins / total if total > 0 else 0.0
+                rate2 = ai2_wins / total if total > 0 else 0.0
+                rate_opp = opp_wins / total if total > 0 else 0.0
+                # Calculate combined AI win rate regardless of display mode.
+                combined_rate = (ai1_wins + ai2_wins) / total if total > 0 else 0.0
+                result_str = "Win" if combined_rate > 0.5 else "Loss"
+                row = f"""
+                <tr>
+                <td style="border: 1px solid #7289da; padding: 6px;">{opp_name}</td>
+                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{ai1_wins}</td>
+                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{ai2_wins}</td>
+                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp_wins}</td>
+                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{rate1:.2%}</td>
+                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{rate2:.2%}</td>
+                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{rate_opp:.2%}</td>
+                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{result_str}</td>
+                </tr>
+                """
+                html += row
+            html += """
+            </tbody>
+            </table>
+            """
         self.results_text.setHtml(html)
+        
+    def update_results_display(self):
+        """ Updates the displayed results when Combine AI Columns is toggled. """
+        if self.current_results:
+            self.display_results(self.current_results)  # Reformat and display results
+        
+    def compare_results(self):
+        # Compare previous_results and current_results and plot two bar charts.
+        if self.previous_results is None or self.current_results is None:
+            QtWidgets.QMessageBox.information(self, "Comparison", "No previous results to compare. Run at least two battles.")
+            self.previous_results = self.current_results
+            return
+
+        opp_names = list(self.current_results.keys())
+        ai_prev_rates = []
+        opp_prev_rates = []
+        ai_curr_rates = []
+        opp_curr_rates = []
+        
+        for opp in opp_names:
+            prev = self.previous_results.get(opp, [0, 0, 0])
+            curr = self.current_results.get(opp, [0, 0, 0])
+            # Combined AI wins (sum of AI1 and AI2) and Opponent wins.
+            prev_ai_wins = prev[0] + prev[1]
+            curr_ai_wins = curr[0] + curr[1]
+            prev_total = prev_ai_wins + prev[2]
+            curr_total = curr_ai_wins + curr[2]
+            ai_prev = prev_ai_wins / prev_total if prev_total > 0 else 0
+            opp_prev = prev[2] / prev_total if prev_total > 0 else 0
+            ai_curr = curr_ai_wins / curr_total if curr_total > 0 else 0
+            opp_curr = curr[2] / curr_total if curr_total > 0 else 0
+            ai_prev_rates.append(ai_prev)
+            opp_prev_rates.append(opp_prev)
+            ai_curr_rates.append(ai_curr)
+            opp_curr_rates.append(opp_curr)
+
+        x = np.arange(len(opp_names))
+        width = 0.35
+
+        # Create two subplots: one for AI win rates, one for Opponent win rates.
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+
+        # Graph for Combined AI win rates.
+        ax1.bar(x - width/2, ai_prev_rates, width, label='Previous AI Win Rate')
+        ax1.bar(x + width/2, ai_curr_rates, width, label='Current AI Win Rate')
+        ax1.set_xticks(x)
+        ax1.set_xticklabels(opp_names, rotation=45)
+        ax1.set_ylabel("Win Rate")
+        ax1.set_title("Combined AI Win Rate Comparison")
+        ax1.legend()
+
+        # Graph for Opponent win rates.
+        ax2.bar(x - width/2, opp_prev_rates, width, label='Previous Opponent Win Rate')
+        ax2.bar(x + width/2, opp_curr_rates, width, label='Current Opponent Win Rate')
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(opp_names, rotation=45)
+        ax2.set_ylabel("Win Rate")
+        ax2.set_title("Opponent Win Rate Comparison")
+        ax2.legend()
+
+        plt.tight_layout()
+        plt.show()
+
+        # Update previous_results with current_results for future comparisons.
+        self.previous_results = self.current_results
 
 if __name__ == "__main__":
     import sys
