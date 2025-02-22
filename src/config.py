@@ -17,6 +17,7 @@ OPTUNA_RESULTS_FILE = os.path.join(BASE_DIR, "optuna_results.json")
 EVALUATION_LOG_FILE = os.path.join(BASE_DIR, "evaluation.log")
 TENSORBOARD_RUNS_DIR = os.path.join(LOG_DIR, "liars_deck_training")
 TRANSFORMER_CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "transformer_classifier.pth")
+HISTORICAL_MODEL_DIR = PLAYERS_DIR
 # Helper to ensure directories exist
 def ensure_dirs():
     dirs = [CHECKPOINT_DIR, LOG_DIR, PLAYERS_DIR]
@@ -80,7 +81,7 @@ STRATEGY_TOKEN_EMBEDDING_DIM = 64       # Dimension of token embeddings.
 STRATEGY_NHEAD = 4                      # Number of attention heads.
 STRATEGY_NUM_LAYERS = 2                 # Number of transformer encoder layers.
 STRATEGY_DIM = 5                       # Final dimension of the strategy embedding.
-STRATEGY_NUM_CLASSES = 10                # Unused after removing the classification head.
+STRATEGY_NUM_CLASSES = 25                # Unused after removing the classification head.
 STRATEGY_DROPOUT = 0.1                  # Dropout rate in the transformer.
 
 # ----------------------------
@@ -91,7 +92,7 @@ GAMMA = 0.99                  # Discount factor
 GAE_LAMBDA = 0.95             # GAE lambda parameter
 EPS_CLIP = 0.1                # PPO clip parameter
 K_EPOCHS = 4                  # Number of PPO epochs per update
-NUM_EPISODES = 20000         # Total number of training episodes
+NUM_EPISODES = 10000         # Total number of training episodes
 UPDATE_STEPS = 3              # Number of episodes before PPO update
 MAX_NORM = 0.3                # Maximum norm for gradient clipping
 
@@ -122,11 +123,11 @@ NUM_GAMES_PER_MATCH = 11      # Number of games per match
 # ----------------------------
 # Tournament Configuration
 # ----------------------------
-TOURNAMENT_INTERVAL = 2
+TOURNAMENT_INTERVAL = 1
 CULL_PERCENTAGE = 0.2
 CLONE_PERCENTAGE = 0.5
 GROUP_SIZE = 3
-TOTAL_PLAYERS = 15
+TOTAL_PLAYERS = 12
 
 # ----------------------------
 # Self-play Configuration
@@ -142,7 +143,7 @@ WIN_RATE_THRESHOLD = 0.55
 # ----------------------------
 SEED = 42                     # Seed for reproducibility
 DEVICE = "cuda"               # Device for training (CPU/GPU)
-NUM_OPPONENT_CLASSES = 6
+NUM_OPPONENT_CLASSES = 9
 AUX_LOSS_WEIGHT = 0.1         # Weight for the auxiliary loss
 # ----------------------------
 # Derived Configurations
