@@ -92,7 +92,7 @@ GAMMA = 0.99                  # Discount factor
 GAE_LAMBDA = 0.95             # GAE lambda parameter
 EPS_CLIP = 0.1                # PPO clip parameter
 K_EPOCHS = 4                  # Number of PPO epochs per update
-NUM_EPISODES = 10000         # Total number of training episodes
+NUM_EPISODES = 350000         # Total number of training episodes
 UPDATE_STEPS = 3              # Number of episodes before PPO update
 MAX_NORM = 0.3                # Maximum norm for gradient clipping
 
@@ -110,7 +110,7 @@ ENTROPY_CLIP_MAX = 0.3          # Maximum allowed value for entropy coefficient
 # Logging and Checkpointing
 # ----------------------------
 CULL_INTERVAL = 20001             # Number of episodes between each culling event
-CHECKPOINT_INTERVAL = 2500       # Episodes between saving checkpoints
+CHECKPOINT_INTERVAL = 10000       # Episodes between saving checkpoints
 LOG_INTERVAL = 100                # Episodes between logging to TensorBoard
 
 # ----------------------------
@@ -144,7 +144,7 @@ WIN_RATE_THRESHOLD = 0.55
 SEED = 42                     # Seed for reproducibility
 DEVICE = "cuda"               # Device for training (CPU/GPU)
 NUM_OPPONENT_CLASSES = 9
-AUX_LOSS_WEIGHT = 0.1         # Weight for the auxiliary loss
+AUX_LOSS_WEIGHT = 0.3         # Weight for the auxiliary loss
 # ----------------------------
 # Derived Configurations
 # ----------------------------
