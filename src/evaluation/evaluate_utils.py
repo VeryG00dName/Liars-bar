@@ -573,6 +573,8 @@ def initialize_players(base_dir, device):
 
             # Process OBP if available.
             if obp_model_state is not None:
+                example_observation = torch.randn(1, config.OPPONENT_INPUT_DIM).to(device)
+                example_memory_embedding = torch.randn(1, config.STRATEGY_DIM).to(device)
                 fc1_weight = obp_model_state.get("fc1.weight", None)
                 if fc1_weight is None:
                     raise ValueError("OBP state dict missing fc1.weight")
@@ -585,17 +587,19 @@ def initialize_players(base_dir, device):
                         output_dim=2,
                         memory_dim=config.STRATEGY_DIM
                     ).to(device)
+                    obp_model.eval()
+                    obp_model = torch.jit.trace(obp_model, (example_observation, example_memory_embedding))
                 elif fc1_weight.shape[1] == config.OPPONENT_INPUT_DIM:
                     obp_model = OpponentBehaviorPredictor(
                         input_dim=config.OPPONENT_INPUT_DIM,
                         hidden_dim=obp_hidden_dim,
                         output_dim=2
                     ).to(device)
+                    obp_model.eval()
+                    obp_model = torch.jit.trace(obp_model, example_observation)
                 else:
                     raise ValueError(f"Unexpected OBP input dimension: {fc1_weight.shape[1]}")
                 obp_model.load_state_dict(obp_model_state)
-                obp_model.eval()
-
             # Determine observation version using one of the policy networks.
             any_policy = next(iter(policy_nets.values()))
             actual_input_dim = any_policy['fc1.weight'].shape[1]
@@ -687,26 +691,29 @@ def initialize_players(base_dir, device):
 
 def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournament=False, two_player=None):
     """
-    Unified evaluation function used by both regular evaluation and tournaments.
-    This version computes memory embeddings per opponent using get_opponent_memory_embedding,
-    applies min–max normalization, and then passes the normalized embeddings to OBP inference,
-    exactly as during training.
-
-    Optional:
-        two_player: if provided (e.g., "player_1"), that player will be eliminated (penalties set to threshold)
-                    immediately after each environment reset.
+    Optimized evaluation function with minimized CPU/GPU transfers and vectorized operations.
     """
     logger = logging.getLogger("Evaluate")
     player_ids = list(players_in_this_game.keys())
-    
-    # Map environment agent names to player IDs.
     agent_to_player = {f'player_{i}': player_ids[i] for i in range(env.num_players)}
     
-    # Clear persistent memory for agents that use memory.
-    for env_agent in agent_to_player:
-        pid = agent_to_player[env_agent]
-        if players_in_this_game[pid].get('uses_memory', False) and players_in_this_game[pid]['obs_version'] == 2:
+    # Clear memory for relevant agents
+    for env_agent, pid in agent_to_player.items():
+        player_data = players_in_this_game[pid]
+        if player_data.get('uses_memory', False) and player_data['obs_version'] == 2:
             get_opponent_memory(env_agent).memory.clear()
+    
+    # Precompute tournament mode
+    player_tournament_mode = {}
+    for pid in player_ids:
+        player_data = players_in_this_game[pid]
+        obp_model = player_data.get('obp_model', None)
+        if obp_model:
+            fc1_weight = obp_model.state_dict().get("fc1.weight", None)
+            player_tournament_mode[pid] = (fc1_weight is not None and 
+                                           fc1_weight.shape[1] == config.OPPONENT_INPUT_DIM + config.STRATEGY_DIM)
+        else:
+            player_tournament_mode[pid] = is_tournament
 
     action_counts = {pid: defaultdict(int) for pid in player_ids}
     cumulative_wins = {pid: 0 for pid in player_ids}
@@ -714,149 +721,128 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
     game_wins_list = []
     start_time = time.time()
 
-    for game_idx in range(1, episodes + 1):
-        env.reset()
-        # If two_player is provided, pre-eliminate that agent.
-        if two_player is not None and two_player in env.penalties:
-            env.penalties[two_player] = env.penalty_thresholds[two_player]
-            env.terminations[two_player] = True
-            logger.debug(f"Pre-eliminated {two_player} for a 2-player game.")
-        
-        env.agents = list(agent_to_player.keys())
-        env._agent_selector = agent_selector(env.agents)
-        env.agent_selection = env._agent_selector.next() if env.agents else None
+    with torch.no_grad():
+        for game_idx in range(1, episodes + 1):
+            env.reset()
+            if two_player is not None and two_player in env.penalties:
+                env.penalties[two_player] = env.penalty_thresholds[two_player]
+                env.terminations[two_player] = True
+                logger.debug(f"Pre-eliminated {two_player} for 2-player game.")
 
-        steps_in_game = 0
-        game_wins = {pid: 0 for pid in player_ids}
+            env.agents = list(agent_to_player.keys())
+            env._agent_selector = agent_selector(env.agents)
+            env.agent_selection = env._agent_selector.next() if env.agents else None
 
-        while env.agent_selection is not None:
-            steps_in_game += 1
-            agent = env.agent_selection
-            obs, reward, termination, truncation, info = env.last()
-            if env.terminations.get(agent, False) or env.truncations.get(agent, False):
-                env.step(None)
-                continue
+            steps_in_game = 0
+            game_wins = {pid: 0 for pid in player_ids}
 
-            observation = env.observe(agent)
-            if isinstance(observation, dict):
-                observation = observation.get(agent, None)
-            if not isinstance(observation, np.ndarray):
-                logger.error(f"Expected np.ndarray, got {type(observation)}.")
-                env.step(None)
-                continue
+            while env.agent_selection is not None:
+                steps_in_game += 1
+                agent = env.agent_selection
+                obs, reward, termination, truncation, info = env.last()
+                if env.terminations.get(agent, False) or env.truncations.get(agent, False):
+                    env.step(None)
+                    continue
 
-            player_id = agent_to_player[agent]
-            player_data = players_in_this_game[player_id]
-            
-            # Hardcoded agent handling.
-            if player_data.get('hardcoded_bot', False):
+                observation = env.observe(agent)
+                if isinstance(observation, dict):
+                    observation = observation.get(agent, None)
+                if not isinstance(observation, np.ndarray):
+                    logger.error(f"Unexpected observation type: {type(observation)}")
+                    env.step(None)
+                    continue
+
+                player_id = agent_to_player[agent]
+                player_data = players_in_this_game[player_id]
+
+                if player_data.get('hardcoded_bot', False):
+                    mask = info.get('action_mask', [1] * config.OUTPUT_DIM)
+                    table_card = getattr(env, 'table_card', None)
+                    action = player_data['agent'].play_turn(observation, mask, table_card)
+                    action_counts[player_id][action] += 1
+                    env.step(action)
+                    continue
+
+                obp_model = player_data.get('obp_model', None)
+                version = player_data['obs_version']
+                converted_obs = adapt_observation_for_version(observation, env.num_players, version)
+                use_tournament = player_tournament_mode[player_id]
+                mem_tensor = None  # To reuse in transformer features
+
+                if obp_model is not None and use_tournament:
+                    opponents = [opp for opp in env.possible_agents if opp != agent]
+                    if opponents:
+                        mem_emb_list = [get_opponent_memory_embedding(agent, opp, device) for opp in opponents]
+                        mem_tensor = torch.cat(mem_emb_list, dim=0)
+                        if mem_tensor.numel() > 0:
+                            mem_min, mem_max = mem_tensor.min(), mem_tensor.max()
+                            if (mem_max - mem_min).item() != 0:
+                                mem_tensor = (mem_tensor - mem_min) / (mem_max - mem_min)
+                            else:
+                                mem_tensor = torch.zeros_like(mem_tensor)
+                        memory_embeddings = torch.split(mem_tensor, 1, dim=0) if mem_tensor is not None else []
+                    else:
+                        memory_embeddings = []
+                else:
+                    memory_embeddings = None
+
+                # OBP Inference
+                if use_tournament:
+                    obp_probs = run_obp_inference_tournament(
+                        obp_model, converted_obs, device, env.num_players, version, agent, opponents,
+                        memory_embeddings=memory_embeddings
+                    )
+                else:
+                    obp_probs = run_obp_inference(
+                        obp_model, converted_obs, device, env.num_players, version, agent, env,
+                        memory_embeddings=memory_embeddings
+                    )
+
+                converted_obs_tensor = torch.from_numpy(converted_obs).float().to(device)
+                obp_probs_tensor = torch.as_tensor(obp_probs, dtype=torch.float32, device=device)
+                default_obs_tensor = torch.cat([converted_obs_tensor, obp_probs_tensor], dim=0)
+
+                # Build final observation tensor
+                if player_data.get('uses_memory', False) and version == 2 and mem_tensor is not None:
+                    transformer_features_tensor = mem_tensor.flatten()
+                    final_obs_tensor = torch.cat([default_obs_tensor, transformer_features_tensor], dim=0)
+                else:
+                    final_obs_tensor = default_obs_tensor
+
+                final_obs_tensor = final_obs_tensor.unsqueeze(0)  # Add batch dimension
+
+                # Policy network inference
+                policy_net = player_data['policy_net']
+                num_layers = policy_net.lstm.num_layers
+                batch_size = final_obs_tensor.size(0)
+                hidden_size = policy_net.lstm.hidden_size
+                hidden_state = (
+                    torch.zeros(num_layers, batch_size, hidden_size, device=device),
+                    torch.zeros(num_layers, batch_size, hidden_size, device=device)
+                )
+
+                probs, _, _ = policy_net(final_obs_tensor, hidden_state)
+                probs = probs.clamp(1e-8, 1.0)
                 mask = info.get('action_mask', [1] * config.OUTPUT_DIM)
-                table_card = getattr(env, 'table_card', None)
-                action = player_data['agent'].play_turn(observation, mask, table_card)
+                mask_tensor = torch.as_tensor(mask, dtype=torch.float32, device=device)
+                masked_probs = probs * mask_tensor
+                if masked_probs.sum() <= 0:
+                    masked_probs = mask_tensor + 1e-8
+                masked_probs /= masked_probs.sum()
+                action = torch.distributions.Categorical(masked_probs).sample().item()
                 action_counts[player_id][action] += 1
                 env.step(action)
-                continue
 
-            obp_model = player_data.get('obp_model', None)
-            version = player_data['obs_version']
-            converted_obs = adapt_observation_for_version(observation, env.num_players, version)
-            
-            # Decide whether OBP model uses transformer memory.
-            fc1_weight = None
-            use_tournament = is_tournament
-            memory_embeddings = None
-            if obp_model is not None:
-                fc1_weight = obp_model.state_dict().get("fc1.weight", None)
-                if fc1_weight is not None and fc1_weight.shape[1] == config.OPPONENT_INPUT_DIM + config.STRATEGY_DIM:
-                    use_tournament = True
-                    # Compute memory embeddings for each opponent using get_opponent_memory_embedding.
-                    opponents = [opp for opp in env.possible_agents if opp != agent]
-                    mem_emb_list = []
-                    for opp in opponents:
-                        emb = get_opponent_memory_embedding(agent, opp, device)
-                        # emb has shape (1, config.STRATEGY_DIM)
-                        mem_emb_list.append(emb.cpu().numpy().flatten())
-                    # Concatenate embeddings into one 1D array.
-                    mem_concat = np.concatenate(mem_emb_list, axis=0)
-                    # Min-max normalization.
-                    mem_min = mem_concat.min()
-                    mem_max = mem_concat.max()
-                    logger.debug(f"Memory min: {mem_min}, max: {mem_max}")
-                    if mem_max - mem_min == 0:
-                        norm_mem = mem_concat
-                    else:
-                        norm_mem = (mem_concat - mem_min) / (mem_max - mem_min)
-                    # Split back into per–opponent segments.
-                    segment_size = config.STRATEGY_DIM
-                    memory_embeddings = []
-                    for i in range(len(opponents)):
-                        seg = norm_mem[i * segment_size:(i + 1) * segment_size]
-                        memory_embeddings.append(torch.tensor(seg, dtype=torch.float32, device=device).unsqueeze(0))
-                else:
-                    use_tournament = is_tournament
-
-            if use_tournament:
-                opponents = [opp for opp in env.possible_agents if opp != agent]
-                obp_probs = run_obp_inference_tournament(
-                    obp_model, converted_obs, device, env.num_players, version, agent, opponents,
-                    memory_embeddings=memory_embeddings
-                )
-            else:
-                obp_probs = run_obp_inference(
-                    obp_model, converted_obs, device, env.num_players, version, agent, env,
-                    memory_embeddings=memory_embeddings
-                )
-            
-            # Build default observation.
-            default_obs = np.concatenate([converted_obs, np.array(obp_probs, dtype=np.float32)], axis=0)
-            
-            # If persistent memory is used (obs_version==2), concatenate transformer features.
-            if player_data.get('uses_memory', False) and version == 2 and memory_embeddings is not None:
-                # For consistency, flatten the concatenated normalized memory embeddings.
-                transformer_features = np.concatenate([emb.cpu().numpy().flatten() for emb in memory_embeddings], axis=0)
-                final_obs = np.concatenate([default_obs, transformer_features], axis=0)
-            else:
-                final_obs = default_obs
-
-            # Convert final_obs to tensor.
-            final_obs_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
-            policy_net = player_data['policy_net']
-            # Initialize LSTM hidden state.
-            num_layers = policy_net.lstm.num_layers
-            batch_size = final_obs_tensor.size(0)
-            hidden_size = policy_net.lstm.hidden_size
-            hidden_state = (
-                torch.zeros(num_layers, batch_size, hidden_size, device=device),
-                torch.zeros(num_layers, batch_size, hidden_size, device=device)
-            )
-            with torch.no_grad():
-                probs, _, _ = policy_net(final_obs_tensor, hidden_state)
-            probs = torch.clamp(probs, 1e-8, 1.0)
-            mask = info.get('action_mask', [1] * config.OUTPUT_DIM)
-            mask_tensor = torch.tensor(mask, dtype=torch.float32, device=device)
-            masked_probs = probs * mask_tensor
-            if masked_probs.sum() <= 0:
-                logger.warning(f"All actions masked for {agent}; using uniform.")
-                masked_probs = mask_tensor + 1e-8
-            masked_probs /= masked_probs.sum()
-            m = torch.distributions.Categorical(masked_probs)
-            action = m.sample().item()
-            action_counts[player_id][action] += 1
-            env.step(action)
-
-        winner_agent = env.winner
-        if winner_agent:
-            winner_player = agent_to_player.get(winner_agent, None)
-            if winner_player:
-                game_wins[winner_player] += 1
-            else:
-                logger.error(f"Winner agent {winner_agent} not found.")
-        else:
-            logger.warning("No winner detected.")
-        for pid in player_ids:
-            cumulative_wins[pid] += game_wins[pid]
-        total_steps += steps_in_game
-        game_wins_list.append(game_wins)
+            # Track game results
+            winner_agent = env.winner
+            if winner_agent:
+                winner_player = agent_to_player.get(winner_agent, None)
+                if winner_player:
+                    game_wins[winner_player] += 1
+            for pid in player_ids:
+                cumulative_wins[pid] += game_wins[pid]
+            total_steps += steps_in_game
+            game_wins_list.append(game_wins)
 
     elapsed_time = time.time() - start_time
     steps_per_sec = total_steps / elapsed_time if elapsed_time > 0 else 0
