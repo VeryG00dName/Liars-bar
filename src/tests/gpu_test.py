@@ -177,7 +177,9 @@ def measure_training_speed(hidden_dim, device, use_cudnn_benchmark=True, use_mix
     
     # Profiling accumulators
     total_env_reset_time = 0.0
-    total_obp_transformer_time = 0.0
+    total_obs_time = 0.0
+    total_transformer_time = 0.0
+    total_obp_time = 0.0
     total_action_time = 0.0
     total_ppo_update_time = 0.0
     total_obp_training_time = 0.0
@@ -196,14 +198,15 @@ def measure_training_speed(hidden_dim, device, use_cudnn_benchmark=True, use_mix
                 env.step(None)
                 continue
             
-            # Simplified observation processing
-            t_obs = time.perf_counter()
+            # Profile observation time (getting the observation and action mask)
+            t_obs_start = time.perf_counter()
             observation = env.observe(agent)[agent]
             action_mask = env.infos[agent]['action_mask']
-            t_obs_done = time.perf_counter()
+            t_obs = time.perf_counter() - t_obs_start
+            total_obs_time += t_obs
             
-            # --- Compute OBP and Transformer Integration ---
-            t_transformer_start = time.perf_counter()
+            # --- Transformer Inference ---
+            t_trans_start = time.perf_counter()
             obp_memory_embeddings = []
             transformer_embeddings = []
             for opp in env.possible_agents:
@@ -225,12 +228,18 @@ def measure_training_speed(hidden_dim, device, use_cudnn_benchmark=True, use_mix
                     zero_emb = torch.zeros(1, config.STRATEGY_DIM, device=device)
                     obp_memory_embeddings.append(zero_emb)
                     transformer_embeddings.append(np.zeros(config.STRATEGY_DIM, dtype=np.float32))
+            t_trans = time.perf_counter() - t_trans_start
+            total_transformer_time += t_trans
+            
+            # --- OBP Inference ---
+            t_obp_start = time.perf_counter()
             with torch.no_grad():
                 obp_probs = run_obp_inference(
                     obp_model, observation, device, env.num_players, 
                     memory_embeddings=obp_memory_embeddings
                 )
-            total_obp_transformer_time += time.perf_counter() - t_transformer_start
+            t_obp = time.perf_counter() - t_obp_start
+            total_obp_time += t_obp
             
             # Normalize transformer embeddings using min–max normalization.
             if transformer_embeddings:
@@ -351,8 +360,10 @@ def measure_training_speed(hidden_dim, device, use_cudnn_benchmark=True, use_mix
     overall_time = time.perf_counter() - overall_start
     logger.info(f"Total steps: {total_steps}, Overall time: {overall_time:.4f}s")
     logger.info(f"Avg env reset time: {total_env_reset_time/NUM_EPISODES:.4f}s")
-    logger.info(f"Avg OBP & Transformer inference time: {total_obp_transformer_time/NUM_EPISODES:.4f}s")
-    logger.info(f"Avg action selection time: {total_action_time/total_steps:.6f}s")
+    logger.info(f"Avg observation time: {total_obs_time/total_steps:.6f}s per step")
+    logger.info(f"Avg Transformer inference time: {total_transformer_time/NUM_EPISODES:.4f}s per episode")
+    logger.info(f"Avg OBP inference time: {total_obp_time/NUM_EPISODES:.4f}s per episode")
+    logger.info(f"Avg action selection time: {total_action_time/total_steps:.6f}s per step")
     logger.info(f"Avg PPO update time (per update): {total_ppo_update_time/(NUM_EPISODES/UPDATE_STEPS):.4f}s")
     logger.info(f"Avg OBP training time (per update): {total_obp_training_time/(NUM_EPISODES/OBP_UPDATE_STEPS):.4f}s")
     
