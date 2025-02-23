@@ -65,7 +65,9 @@ save_checkpoint_signal = False
 
 def ctrlc_handler(sig, frame):
     global save_checkpoint_signal
-    logging.info("Ctrl+C detected! Checkpoint will be saved at the end of the current episode, and training will exit gracefully.")
+    logging.getLogger("Train").info(
+        "Ctrl+C detected! Checkpoint will be saved at the end of the current episode, and training will exit gracefully."
+    )
     save_checkpoint_signal = True
 
 # Register the signal handler.
@@ -248,6 +250,7 @@ def select_injected_bot(agent, injected_bots, win_stats, match_stats, temperatur
     - Lower win rate means higher probability of selection.
     - Temperature controls how sharply probability scales with win rate differences.
     """
+    logger = logging.getLogger("Train.injected_bot_selection")
     weights = []
     
     for candidate in injected_bots:
@@ -257,7 +260,8 @@ def select_injected_bot(agent, injected_bots, win_stats, match_stats, temperatur
         matches = match_stats[agent].get(opponent_key, 0)
         wins = win_stats[agent].get(opponent_key, 0)
         win_rate = wins / matches if matches > 0 else 0.5  # Default win rate if no data
-        
+        if matches == 0:
+            logger.warning(f"No matches found for agent {agent} vs. opponent {opponent_key}. Using default win rate of 0.5.")
         # Compute selection weight using softmax
         weight = np.exp((1 - win_rate) / temperature)
         weights.append(weight)
@@ -424,20 +428,19 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
             return select_injected_action(final_obs, action_mask, observation)
         return select_policy_action(final_obs, action_mask, agent)
     # ----------------------------------------------------
-
+    avg_rewards = {agent: 0.0 for agent in agents}
     for episode in range(start_episode, num_episodes + 1):
         env_seed = config.SEED + episode
         obs, infos = env.reset(seed=env_seed)
         agents = env.agents
         pending_rewards = {agent: 0.0 for agent in agents}
-
         # Every 5 episodes, choose a new injected bot for one randomly selected agent.
         if (episode - start_episode) % 5 == 0:
             # Choose a learning agent at random.
             current_injected_agent_id = random.choice(agents)
-            tracked_agent = current_injected_agent_id
+            tracked_agent =  max(agents, key=lambda a: avg_rewards[a] if avg_rewards[a] else 0.0)
             # Instead of a uniform random selection, select based on win rates.
-            selected_bot = select_injected_bot(current_injected_agent_id, injected_bots, win_stats, match_stats)
+            selected_bot = select_injected_bot(tracked_agent, injected_bots, win_stats, match_stats)
             current_injected_bot_type = selected_bot[0]
             if current_injected_bot_type == "hardcoded":
                 bot_class = selected_bot[1]
@@ -452,7 +455,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 current_injected_bot_identifier = bot_class.__name__
             else:
                 current_injected_agent_instance, current_injected_bot_identifier = selected_bot[1]
-            #logger.info(f"Episode {episode}: Injecting {current_injected_bot_type} bot ({current_injected_bot_identifier}) for agent {current_injected_agent_id}")
+            logger.debug(f"Episode {episode}: Injecting {current_injected_bot_type} bot ({current_injected_bot_identifier}) for agent {current_injected_agent_id}")
 
         episode_rewards = {agent: 0 for agent in agents}
         steps_in_episode = 0
@@ -581,8 +584,6 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
             else:
                 opponent_key = current_injected_agent_instance.__class__.__name__
             for agent in agents:
-                if agent == current_injected_agent_id:
-                    continue
                 match_stats[agent].setdefault(opponent_key, 0)
                 match_stats[agent][opponent_key] += 1
                 # Also update games played counter (to track over 100 episodes)
