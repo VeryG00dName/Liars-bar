@@ -240,40 +240,6 @@ def configure_logger():
     logger.propagate = False
     return logger
 
-# ---------------------------
-# Helper function: Select injected bot based on win rates.
-# ---------------------------
-def select_injected_bot(agent, injected_bots, win_stats, match_stats, temperature=0.3):
-    """
-    Selects an injected bot based on win rates, using softmax with temperature.
-    
-    - Lower win rate means higher probability of selection.
-    - Temperature controls how sharply probability scales with win rate differences.
-    """
-    logger = logging.getLogger("Train.injected_bot_selection")
-    weights = []
-    
-    for candidate in injected_bots:
-        bot_type, bot_data = candidate
-        opponent_key = bot_data[1] if bot_type == "historical" else bot_data.__name__
-        
-        matches = match_stats[agent].get(opponent_key, 0)
-        wins = win_stats[agent].get(opponent_key, 0)
-        win_rate = wins / matches if matches > 0 else 0.5  # Default win rate if no data
-        if matches == 0:
-            logger.warning(f"No matches found for agent {agent} vs. opponent {opponent_key}. Using default win rate of 0.5.")
-        # Compute selection weight using softmax
-        weight = np.exp((1 - win_rate) / temperature)
-        weights.append(weight)
-
-    # Normalize into probabilities
-    weights = np.array(weights)
-    probabilities = weights / np.sum(weights)
-
-    # Select an injected bot based on computed probabilities
-    index = np.random.choice(len(injected_bots), p=probabilities)
-    
-    return injected_bots[index]
 
 # ---------------------------
 # Main training loop.
@@ -438,9 +404,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
         if (episode - start_episode) % 5 == 0:
             # Choose a learning agent at random.
             current_injected_agent_id = random.choice(agents)
-            tracked_agent =  max(agents, key=lambda a: avg_rewards[a] if avg_rewards[a] else 0.0)
-            # Instead of a uniform random selection, select based on win rates.
-            selected_bot = select_injected_bot(tracked_agent, injected_bots, win_stats, match_stats)
+            selected_bot = injected_bots[np.random.choice(len(injected_bots))]
             current_injected_bot_type = selected_bot[0]
             if current_injected_bot_type == "hardcoded":
                 bot_class = selected_bot[1]
