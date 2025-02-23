@@ -58,21 +58,6 @@ from src.training.train_extras import (
 # ---- Import EventEncoder (used to project raw opponent memory features) ----
 from src.training.train_transformer import EventEncoder
 
-import signal
-
-# Global flag to indicate interruption.
-save_checkpoint_signal = False
-
-def ctrlc_handler(sig, frame):
-    global save_checkpoint_signal
-    logging.getLogger("Train").info(
-        "Ctrl+C detected! Checkpoint will be saved at the end of the current episode, and training will exit gracefully."
-    )
-    save_checkpoint_signal = True
-
-# Register the signal handler.
-signal.signal(signal.SIGINT, ctrlc_handler)
-
 # ---- Helper function to convert memory events into 4D feature vectors ----
 def convert_memory_to_features(memory, response_mapping, action_mapping):
     features = []
@@ -240,6 +225,33 @@ def configure_logger():
     logger.propagate = False
     return logger
 
+# ---------------------------
+# Helper function: Select injected bot based on win rates.
+# ---------------------------
+def select_injected_bot(agent, injected_bots, win_stats, match_stats):
+    """
+    For the given agent, compute weights for each injected bot candidate based on
+    win rate against that candidate (win rate = wins / matches, default to 0.5 if no data).
+    Weight = 1 - win_rate, so lower win rate means higher chance.
+    """
+    weights = []
+    for candidate in injected_bots:
+        bot_type, bot_data = candidate
+        if bot_type == "historical":
+            opponent_key = bot_data[1]  # unique identifier
+        else:
+            opponent_key = bot_data.__name__
+        matches = match_stats[agent].get(opponent_key, 0)
+        wins = win_stats[agent].get(opponent_key, 0)
+        win_rate = wins / matches if matches > 0 else 0.5
+        weight = 1 - win_rate
+        weights.append(weight)
+    total_weight = sum(weights)
+    if total_weight == 0:
+        return random.choice(injected_bots)
+    normalized = [w / total_weight for w in weights]
+    index = np.random.choice(len(injected_bots), p=normalized)
+    return injected_bots[index]
 
 # ---------------------------
 # Main training loop.
@@ -356,55 +368,19 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
     tracked_agent = None  
     tracked_agent_last_embeddings = {}
 
-    # ------ Helper functions for action selection ------
-    def sample_action_from_probs(probs, action_mask):
-        probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
-        mask_t = torch.tensor(action_mask, dtype=torch.float32, device=device)
-        masked_probs = probs * mask_t
-        if masked_probs.sum() == 0:
-            valid_indices = torch.nonzero(mask_t, as_tuple=True)[0]
-            if valid_indices.numel() > 0:
-                masked_probs[valid_indices] = 1.0 / valid_indices.numel()
-            else:
-                masked_probs = torch.ones_like(probs) / probs.size(0)
-        else:
-            masked_probs /= masked_probs.sum()
-        m = Categorical(masked_probs)
-        action = m.sample().item()
-        return action, m.log_prob(torch.tensor(action, device=device)).item()
-
-    def select_injected_action(final_obs, action_mask, observation):
-        if current_injected_bot_type == "hardcoded":
-            action = current_injected_agent_instance.play_turn(observation, action_mask, table_card=None)
-            return action, 0.0
-        else:
-            with torch.no_grad():
-                observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
-                probs, _, _ = current_injected_agent_instance(observation_tensor, None)
-            return sample_action_from_probs(probs, action_mask)
-
-    def select_policy_action(final_obs, action_mask, agent):
-        with torch.no_grad():
-            observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
-            probs, _, _ = policy_nets[agent](observation_tensor, None)
-        return sample_action_from_probs(probs, action_mask)
-
-    def select_action(agent, final_obs, action_mask, observation):
-        if agent == current_injected_agent_id:
-            return select_injected_action(final_obs, action_mask, observation)
-        return select_policy_action(final_obs, action_mask, agent)
-    # ----------------------------------------------------
-    avg_rewards = {agent: 0.0 for agent in agents}
     for episode in range(start_episode, num_episodes + 1):
         env_seed = config.SEED + episode
         obs, infos = env.reset(seed=env_seed)
         agents = env.agents
         pending_rewards = {agent: 0.0 for agent in agents}
+
         # Every 5 episodes, choose a new injected bot for one randomly selected agent.
         if (episode - start_episode) % 5 == 0:
             # Choose a learning agent at random.
             current_injected_agent_id = random.choice(agents)
-            selected_bot = injected_bots[np.random.choice(len(injected_bots))]
+            tracked_agent = current_injected_agent_id
+            # Instead of a uniform random selection, select based on win rates.
+            selected_bot = select_injected_bot(current_injected_agent_id, injected_bots, win_stats, match_stats)
             current_injected_bot_type = selected_bot[0]
             if current_injected_bot_type == "hardcoded":
                 bot_class = selected_bot[1]
@@ -419,7 +395,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 current_injected_bot_identifier = bot_class.__name__
             else:
                 current_injected_agent_instance, current_injected_bot_identifier = selected_bot[1]
-            logger.debug(f"Episode {episode}: Injecting {current_injected_bot_type} bot ({current_injected_bot_identifier}) for agent {current_injected_agent_id}")
+            #logger.info(f"Episode {episode}: Injecting {current_injected_bot_type} bot ({current_injected_bot_identifier}) for agent {current_injected_agent_id}")
 
         episode_rewards = {agent: 0 for agent in agents}
         steps_in_episode = 0
@@ -439,12 +415,11 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
 
             # Integrate OBP memory (or use zeros for the injected bot).
             if agent == current_injected_agent_id:
-                with torch.no_grad():
-                    obp_probs = run_obp_inference(
-                        obp_model, observation, device, env.num_players,
-                        memory_embeddings=[torch.zeros(1, config.STRATEGY_DIM, device=device)
-                                           for _ in range(env.num_players - 1)]
-                    )
+                obp_probs = run_obp_inference(
+                    obp_model, observation, device, env.num_players,
+                    memory_embeddings=[torch.zeros(1, config.STRATEGY_DIM, device=device)
+                                       for _ in range(env.num_players - 1)]
+                )
             else:
                 embeddings_list = []
                 for opp in env.possible_agents:
@@ -484,9 +459,8 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     normalized_segments.append(torch.tensor(seg, dtype=torch.float32, device=device).unsqueeze(0))
                 obp_memory_embeddings = normalized_segments
                 transformer_features = normalized_arr
-                with torch.no_grad():
-                    obp_probs = run_obp_inference(obp_model, observation, device, env.num_players,
-                                                  memory_embeddings=obp_memory_embeddings)
+                obp_probs = run_obp_inference(obp_model, observation, device, env.num_players,
+                                              memory_embeddings=obp_memory_embeddings)
 
             # Build final observation based on the agent type.
             if agent == current_injected_agent_id:
@@ -507,8 +481,41 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
             else:
                 final_obs = np.concatenate([observation, np.array(obp_probs, dtype=np.float32), transformer_features], axis=0)
 
-            # Decide action using helper functions.
-            action, log_prob_value = select_action(agent, final_obs, action_mask, observation)
+            # Decide action.
+            if agent == current_injected_agent_id:
+                if current_injected_bot_type == "hardcoded":
+                    action = current_injected_agent_instance.play_turn(observation, action_mask, table_card=None)
+                    log_prob_value = 0.0
+                else:
+                    observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
+                    with torch.no_grad():
+                        probs, _, _ = current_injected_agent_instance(observation_tensor, None)
+                    probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
+                    mask_t = torch.tensor(action_mask, dtype=torch.float32, device=device)
+                    masked_probs = probs * mask_t
+                    if masked_probs.sum() == 0:
+                        valid_indices = torch.nonzero(mask_t, as_tuple=True)[0]
+                        masked_probs[valid_indices] = 1.0 / valid_indices.numel() if len(valid_indices) > 0 else torch.ones_like(probs) / probs.size(0)
+                    else:
+                        masked_probs /= masked_probs.sum()
+                    m = Categorical(masked_probs)
+                    action = m.sample().item()
+                    log_prob_value = m.log_prob(torch.tensor(action, device=device)).item()
+                # Do not store transitions for injected bots.
+            else:
+                observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
+                probs, _, _ = policy_nets[agent](observation_tensor, None)
+                probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
+                mask_t = torch.tensor(action_mask, dtype=torch.float32, device=device)
+                masked_probs = probs * mask_t
+                if masked_probs.sum() == 0:
+                    valid_indices = torch.nonzero(mask_t, as_tuple=True)[0]
+                    masked_probs[valid_indices] = 1.0 / valid_indices.numel() if len(valid_indices) > 0 else torch.ones_like(probs) / probs.size(0)
+                else:
+                    masked_probs /= masked_probs.sum()
+                m = Categorical(masked_probs)
+                action = m.sample().item()
+                log_prob_value = m.log_prob(torch.tensor(action, device=device)).item()
 
             action_counts_periodic[agent][action] += 1
             env.step(action)
@@ -548,6 +555,8 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
             else:
                 opponent_key = current_injected_agent_instance.__class__.__name__
             for agent in agents:
+                if agent == current_injected_agent_id:
+                    continue
                 match_stats[agent].setdefault(opponent_key, 0)
                 match_stats[agent][opponent_key] += 1
                 # Also update games played counter (to track over 100 episodes)
@@ -782,33 +791,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     optimizers_value[lowest_agent] = optim.Adam(value_nets[lowest_agent].parameters(), lr=config.LEARNING_RATE)
                     memories[lowest_agent] = RolloutMemory([lowest_agent])
                     recent_rewards[lowest_agent] = []
-                    
-        if save_checkpoint_signal:
-            # Save checkpoint with current episode number.
-            save_checkpoint(
-                policy_nets,
-                value_nets,
-                optimizers_policy,
-                optimizers_value,
-                obp_model,
-                obp_optimizer,
-                episode,  # current episode
-                checkpoint_dir=checkpoint_dir
-            )
-            logger.info(f"Checkpoint saved at episode {episode} due to interruption.")
-            # Optionally, close any resources (like tensorboard writer) before exiting.
-            if writer is not None:
-                writer.close()
-            # Return the current training state and exit the function.
-            return {
-                'agents': {agent: {'policy_net': policy_nets[agent],
-                                   'value_net': value_nets[agent],
-                                   'obp_model': obp_model} for agent in agents},
-                'optimizers_policy': optimizers_policy,
-                'optimizers_value': optimizers_value,
-                'obp_optimizer': obp_optimizer
-            }
-            
+    
     if writer is not None:
         writer.close()
     
