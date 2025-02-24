@@ -285,7 +285,6 @@ class LiarsDeckEnv(AECEnv):
             self.players_hands[agent] = self.deck[:hand_size]
             self.deck = self.deck[hand_size:]
 
-        self.rewards = {agent: 0 for agent in self.possible_agents}
         self.infos = {agent: {} for agent in self.possible_agents}
 
         self.logger.info("Starting a new round.")

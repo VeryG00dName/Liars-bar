@@ -525,13 +525,15 @@ def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_di
 
             action_counts_periodic[agent][action] += 1
             env.step(action)
-
+            
+            step_rewards = env.rewards.copy()
+            env.rewards = {agent: 0 for agent in env.possible_agents}
             # Update pending rewards.
             for ag in agents:
                 if ag != agent:
-                    pending_rewards[ag] += env.rewards[ag]
+                    pending_rewards[ag] += step_rewards[ag]
                 else:
-                    reward = env.rewards[agent] + pending_rewards[agent]
+                    reward = step_rewards[agent] + pending_rewards[agent]
                     pending_rewards[agent] = 0
                     if agent != current_injected_agent_id:
                         memories[agent].store_transition(
