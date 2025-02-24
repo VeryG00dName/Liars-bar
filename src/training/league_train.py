@@ -12,7 +12,7 @@ from src.env.liars_deck_env_core import LiarsDeckEnv
 from src.model.new_models import PolicyNetwork, ValueNetwork, OpponentBehaviorPredictor
 from src.training.train_multi_utils import save_multi_checkpoint, load_multi_checkpoint
 from src.training.train_extras import set_seed
-from src.misc.tune_eval import run_group_swiss_tournament, openskill_model
+from tune.tune_eval import run_group_swiss_tournament, openskill_model
 from src.training.train import train
 from src import config
 

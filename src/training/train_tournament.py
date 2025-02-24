@@ -15,7 +15,7 @@ from src.model.new_models import PolicyNetwork, ValueNetwork, OpponentBehaviorPr
 from src.training.train_multi_utils import save_multi_checkpoint, load_multi_checkpoint
 from src.training.train import train
 from src.training.train_extras import set_seed
-from src.misc.tune_eval import run_group_swiss_tournament, openskill_model
+from tune.tune_eval import run_group_swiss_tournament, openskill_model
 from src import config
 
 # For visualization
