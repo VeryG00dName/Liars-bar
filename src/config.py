@@ -37,9 +37,9 @@ DEFAULT_SCORING_PARAMS = {
     "play_reward_per_card": 0,
     "play_reward": 0,
     "invalid_play_penalty": 0, # -6
-    "challenge_success_challenger_reward": 3, # 2
+    "challenge_success_challenger_reward": 1, # 2
     "challenge_success_claimant_penalty": 0, # -6
-    "challenge_fail_challenger_penalty": -2,
+    "challenge_fail_challenger_penalty": -1,
     "challenge_fail_claimant_reward": 0, # 5
     "forced_challenge_success_challenger_reward": 1, # 1
     "forced_challenge_success_claimant_penalty": -3, # -3
