@@ -15,7 +15,7 @@ from src.env.liars_deck_env_core import LiarsDeckEnv
 from src import config
 
 # Import Swiss tournament functions and OpenSkill model from evaluate_tournament.py
-from src.misc.tune_eval import (
+from tune.tune_eval import (
     run_group_swiss_tournament,
     openskill_model  # Ensure this is exposed in evaluate_tournament.py
 )
