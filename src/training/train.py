@@ -12,7 +12,7 @@ from src.env.liars_deck_env_core import LiarsDeckEnv
 from src.training.train_utils import compute_gae, train_obp
 from src.model.models import PolicyNetwork, ValueNetwork, OpponentBehaviorPredictor
 from src.model.memory import RolloutMemory
-from src.training.train_extras import set_seed, extract_obp_training_data, run_obp_inference
+from src.training.train_extras import set_seed, extract_obp_training_data, run_obp_inference, convert_memory_to_features
 from src import config
 
 # New import for querying opponent memory
@@ -23,25 +23,6 @@ from src.model.new_models import StrategyTransformer
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 torch.backends.cudnn.benchmark = True
 
-# ---- Helper: Convert memory events into 4D feature vectors ----
-def convert_memory_to_features(memory, response_mapping, action_mapping):
-    """
-    Convert the opponent memory (a list of events) to a list of 4-dimensional feature vectors.
-    Each event is expected to be a dictionary with keys: "response", "triggering_action", "penalties", and "card_count".
-    """
-    features = []
-    for event in memory:
-        if not isinstance(event, dict):
-            raise ValueError(f"Memory event is not a dictionary: {event}.")
-        resp = event.get("response", "")
-        act = event.get("triggering_action", "")
-        penalties = float(event.get("penalties", 0))
-        card_count = float(event.get("card_count", 0))
-        # Map categorical features to indices (or floats)
-        resp_val = float(response_mapping.get(resp, 0))
-        act_val = float(action_mapping.get(act, 0))
-        features.append([resp_val, act_val, penalties, card_count])
-    return features
 
 def train(
     agents_dict,
@@ -55,12 +36,12 @@ def train(
     logger=None,
     episode_offset=0,
     agent_mapping=None
+):
     """
     Trains agents using reinforcement learning.
     Runs multiple episodes, collects experience, updates policies, and saves checkpoints.
     Integrates opponent behavior prediction and strategy embeddings.
     """
-):
     set_seed()
     
     if logger is None:
