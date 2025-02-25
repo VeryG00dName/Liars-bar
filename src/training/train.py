@@ -44,11 +44,6 @@ def convert_memory_to_features(memory, response_mapping, action_mapping):
     return features
 
 def train(
-    """
-    Trains agents using reinforcement learning.
-    Runs multiple episodes, collects experience, updates policies, and saves checkpoints.
-    Integrates opponent behavior prediction and strategy embeddings.
-    """
     agents_dict,
     env,
     device,
@@ -60,6 +55,12 @@ def train(
     logger=None,
     episode_offset=0,
     agent_mapping=None
+):
+    """
+    Trains agents using reinforcement learning.
+    Runs multiple episodes, collects experience, updates policies, and saves checkpoints.
+    Integrates opponent behavior prediction and strategy embeddings.
+    """
 ):
     set_seed()
     
