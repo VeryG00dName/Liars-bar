@@ -16,6 +16,7 @@ from src.model.hard_coded_agents import (
     GreedyCardSpammer,
     TableFirstConservativeChallenger,
     StrategicChallenger,
+    SelectiveTableConservativeChallenger,
     RandomAgent,
     TableNonTableAgent,
     Classic
@@ -247,7 +248,7 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
             "GreedySpammer": GreedyCardSpammer,
             "TableFirst": TableFirstConservativeChallenger,
             "Strategic": lambda name: StrategicChallenger(name, 3, 2),
-            "Conservative": lambda name: TableFirstConservativeChallenger(name),
+            "Conservative": lambda name: SelectiveTableConservativeChallenger(name),
             "TableNonTableAgent": TableNonTableAgent,
             "Classic": Classic,
             "Random": RandomAgent
