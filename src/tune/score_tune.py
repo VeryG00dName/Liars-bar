@@ -1,5 +1,4 @@
-# src/misc/score_tune.py
-
+# src/tune/score_tune.py
 import os
 import optuna
 import logging
@@ -38,6 +37,8 @@ def save_trial_results(path: str, data: dict):
     except Exception as e:
         logging.warning(f"Could not save trial results to {path}: {e}")
 
+original_log_dir = config.TENSORBOARD_RUNS_DIR
+
 def objective(trial: optuna.trial.Trial) -> float:
     """
     Objective function for tuning scoring parameters.
@@ -47,40 +48,59 @@ def objective(trial: optuna.trial.Trial) -> float:
     """
     # --- 1) Sample scoring parameters using Optuna ---
     scoring_params = {
-        "play_reward_per_card": trial.suggest_int("play_reward_per_card", -2, 2),
-        "play_reward": trial.suggest_int("play_reward", -2, 2),
-        "invalid_play_penalty": trial.suggest_int("invalid_play_penalty", -10, 1),
-        "challenge_success_challenger_reward": trial.suggest_int("challenge_success_challenger_reward", -1, 10),
-        "challenge_success_claimant_penalty": trial.suggest_int("challenge_success_claimant_penalty", -10, 1),
-        "challenge_fail_challenger_penalty": trial.suggest_int("challenge_fail_challenger_penalty", -10, 1),
-        "challenge_fail_claimant_reward": trial.suggest_int("challenge_fail_claimant_reward", -1, 10),
-        "forced_challenge_success_challenger_reward": trial.suggest_int("forced_challenge_success_challenger_reward", -1, 5),
-        "forced_challenge_success_claimant_penalty": trial.suggest_int("forced_challenge_success_claimant_penalty", -10, 1),
-        "forced_challenge_fail_challenger_penalty": trial.suggest_int("forced_challenge_fail_challenger_penalty", -10, 1),
-        "forced_challenge_fail_claimant_reward": trial.suggest_int("forced_challenge_fail_claimant_reward", -1, 5),
-        "invalid_challenge_penalty": trial.suggest_int("invalid_challenge_penalty", -10, 1),
-        "termination_penalty": trial.suggest_int("termination_penalty", -10, 1),
-        "game_win_bonus": trial.suggest_int("game_win_bonus", 5, 20),
-        "game_lose_penalty": trial.suggest_int("game_lose_penalty", -20, -1),
-        "hand_empty_bonus": trial.suggest_int("hand_empty_bonus", -2, 2),
-        "consecutive_action_penalty": trial.suggest_int("consecutive_action_penalty", -5, 1),
-        "successful_bluff_reward": trial.suggest_int("successful_bluff_reward", -1, 5),
-        "unchallenged_bluff_penalty": trial.suggest_int("unchallenged_bluff_penalty", -5, 1)
+        "play_reward_per_card": trial.suggest_int("play_reward_per_card", -4, 2),  # default -1: [-4, 2]
+        "play_reward": trial.suggest_int("play_reward", -2, 4),  # default 1: [-2, 4]
+        "challenge_success_challenger_reward": trial.suggest_int("challenge_success_challenger_reward", 7, 13),  # default 10: [7, 13]
+        "challenge_success_claimant_penalty": trial.suggest_int("challenge_success_claimant_penalty", -3, 3),  # default 0: [-3, 3]
+        "challenge_fail_challenger_penalty": trial.suggest_int("challenge_fail_challenger_penalty", -3, 3),  # default 0: [-3, 3]
+        "challenge_fail_claimant_reward": trial.suggest_int("challenge_fail_claimant_reward", 2, 8),  # default 5: [2, 8]
+        "forced_challenge_success_challenger_reward": trial.suggest_int("forced_challenge_success_challenger_reward", -3, 3),  # default 0: [-3, 3]
+        "forced_challenge_success_claimant_penalty": trial.suggest_int("forced_challenge_success_claimant_penalty", -13, -7),  # default -10: [-13, -7]
+        "forced_challenge_fail_challenger_penalty": trial.suggest_int("forced_challenge_fail_challenger_penalty", -6, 0),  # default -3: [-6, 0]
+        "forced_challenge_fail_claimant_reward": trial.suggest_int("forced_challenge_fail_claimant_reward", -3, 3),  # default 0: [-3, 3]
+        "termination_penalty": trial.suggest_int("termination_penalty", -4, 2),  # default -1: [-4, 2]
+        "game_win_bonus": trial.suggest_int("game_win_bonus", 13, 19),  # default 16: [13, 19]
+        "game_lose_penalty": trial.suggest_int("game_lose_penalty", -14, -8),  # default -11: [-14, -8]
+        "hand_empty_bonus": trial.suggest_int("hand_empty_bonus", -3, 3),  # default 0: [-3, 3]
+        "consecutive_action_penalty": trial.suggest_int("consecutive_action_penalty", -2, 4),  # default 1: [-2, 4]
+        "successful_bluff_reward": trial.suggest_int("successful_bluff_reward", -3, 3),  # default 0: [-3, 3]
+        "unchallenged_bluff_penalty": trial.suggest_int("unchallenged_bluff_penalty", -5, 1)  # default -2: [-5, 1]
     }
     logging.info(f"Trial {trial.number} scoring parameters: {scoring_params}")
 
-    # --- 2) Create training environment with these parameters ---
+    # --- 2) Create a trial-specific TensorBoard log directory ---
+    config.TENSORBOARD_RUNS_DIR = os.path.join(original_log_dir, f"trial_{trial.number}")
+    os.makedirs(config.TENSORBOARD_RUNS_DIR, exist_ok=True)
+    
+    # Create a SummaryWriter for logging without modifying the global config.
+    from torch.utils.tensorboard import SummaryWriter
+    writer = SummaryWriter(log_dir=config.TENSORBOARD_RUNS_DIR)
+    logger = logging.getLogger("ScoreTune")
+    param_str = "\n".join([f"{key}: {value}" for key, value in scoring_params.items()])
+    writer.add_text("Scoring_Params", param_str, global_step=trial.number)
+    
+    # --- 3) Create training environment with these parameters ---
     train_env = LiarsDeckEnv(num_players=3, scoring_params=scoring_params)
-    device = torch.device(config.DEVICE)
+    
+    # Determine the GPU device to use:
+    gpu_count = torch.cuda.device_count()
+    if gpu_count > 0:
+        # Distribute trials across available GPUs by using trial.number modulo gpu_count
+        gpu_id = trial.number % gpu_count
+        device = torch.device(f'cuda:{gpu_id}')
+    else:
+        device = torch.device('cpu')
+    
     TUNE_NUM_EPISODES = 5000
 
-    # --- 3) Run the new tune_train training routine ---
+    # --- 4) Run the new tune_train training routine ---
     set_seed(config.SEED)  # Ensure reproducibility
-    training_results = tune_train(train_env, device, num_episodes=TUNE_NUM_EPISODES, log_tensorboard=False)
+    training_results = tune_train(train_env, device, num_episodes=TUNE_NUM_EPISODES,
+                                  log_tensorboard=True, logger=logger)
     best_win_rate = training_results.get('best_win_rate', 0.0)
     logging.info(f"Trial {trial.number}: Best win rate = {best_win_rate*100:.2f}%")
 
-    # --- 4) Optionally store trial results persistently ---
+    # --- 5) Optionally store trial results persistently ---
     trial_results = load_trial_results(TRIAL_RESULTS_PATH)
     trial_results[trial.number] = {
         "scoring_params": scoring_params,
@@ -88,6 +108,7 @@ def objective(trial: optuna.trial.Trial) -> float:
     }
     save_trial_results(TRIAL_RESULTS_PATH, trial_results)
 
+    writer.close()
     return best_win_rate
 
 def main():
@@ -119,8 +140,15 @@ def main():
         logger.error(f"Error loading study: {e}")
         raise e
 
+    study.enqueue_trial(config.DEFAULT_SCORING_PARAMS)
     N_TRIALS = 50
-    study.optimize(objective, n_trials=N_TRIALS - len(study.trials), show_progress_bar=True)
+
+    # Determine number of GPUs and set n_jobs accordingly (at least 1)
+    gpu_count = torch.cuda.device_count()
+    n_jobs = gpu_count if gpu_count > 0 else 1
+    logger.info(f"Running trials in parallel on {n_jobs} device(s).")
+
+    study.optimize(objective, n_trials=N_TRIALS - len(study.trials), n_jobs=n_jobs, show_progress_bar=True)
 
     logger.info("Scoring parameter tuning completed!")
     if study.best_value is not None:
