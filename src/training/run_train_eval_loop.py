@@ -17,7 +17,7 @@ from src import config
 from src.env.liars_deck_env_core import LiarsDeckEnv
 from src.env.reward_restriction_wrapper_2 import RewardRestrictionWrapper2
 from src.training.train_main import train_agents
-from src.evaluation.evaluate_tournament import (
+from src.eval.evaluate_tournament import (
     initialize_players,
     run_group_swiss_tournament,
 )

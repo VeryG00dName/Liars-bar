@@ -25,14 +25,14 @@ from typing import Dict, List, Tuple
 from scipy.stats import spearmanr, kendalltau
 
 # --- Import Swiss logic from evaluate_utils ---
-from src.evaluation.evaluate_utils import (
+from src.eval.evaluate_utils import (
     initialize_players,
     evaluate_agents,
     model as openskill_model
 )
 
 # --- Import unified initialize_players from evaluate.py ---
-from src.evaluation.evaluate_tournament import swiss_grouping
+from src.eval.evaluate_tournament import swiss_grouping
 
 # --- Import environment & config ---
 from src.env.liars_deck_env_core import LiarsDeckEnv

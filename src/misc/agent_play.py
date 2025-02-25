@@ -23,8 +23,8 @@ legacy_PolicyNetwork = legacy_module.PolicyNetwork
 legacy_OpponentBehaviorPredictor = legacy_module.OpponentBehaviorPredictor
 
 # Import evaluation utilities for observation conversion and hidden dim extraction.
-from src.evaluation.evaluate_utils import adapt_observation_for_version, get_hidden_dim_from_state_dict
-from src.evaluation.evaluate import run_obp_inference  # New import for OBP inference
+from src.eval.evaluate_utils import adapt_observation_for_version, get_hidden_dim_from_state_dict
+from src.eval.evaluate import run_obp_inference  # New import for OBP inference
 from src import config
 
 

@@ -149,7 +149,7 @@ strategy_transformer.eval()
 # ---------------------------
 # Historical PPO Model Loader (inspired by your evaluation script)
 # ---------------------------
-from src.evaluation.evaluate_utils import load_combined_checkpoint  # Ensure this is imported
+from src.eval.evaluate_utils import load_combined_checkpoint  # Ensure this is imported
 
 def load_specific_historical_models(players_dir, device):
     """

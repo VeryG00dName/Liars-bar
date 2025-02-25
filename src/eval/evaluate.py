@@ -7,7 +7,7 @@ import random
 
 from collections import defaultdict
 from src.env.liars_deck_env_core import LiarsDeckEnv
-from src.evaluation.evaluate_utils import (
+from src.eval.evaluate_utils import (
     assign_final_ranks,
     update_openskill_batch,
     save_scoreboard,

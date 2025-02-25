@@ -21,12 +21,12 @@ from typing import Dict, List, Tuple
 from scipy.stats import spearmanr
 
 # --- Import Swiss tournament functions and player initialization ---
-from src.evaluation.evaluate_tournament import (
+from src.eval.evaluate_tournament import (
     evaluate_agents_tournament as evaluate_agents,  # function to simulate a group match
     openskill_model,
     swiss_grouping
 )
-from src.evaluation.evaluate import initialize_players
+from src.eval.evaluate import initialize_players
 
 # --- Import environment & configuration ---
 from src.env.liars_deck_env_core import LiarsDeckEnv

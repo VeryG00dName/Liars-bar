@@ -10,7 +10,7 @@ import torch
 import numpy as np
 from PIL import Image, ImageTk
 
-from src.evaluation.gui_evaluate import TournamentManager
+from src.eval.gui_evaluate import TournamentManager
 from src.env.liars_deck_env_core import LiarsDeckEnv
 from src.model.models import PolicyNetwork, ValueNetwork, OpponentBehaviorPredictor
 from src.training.train import train

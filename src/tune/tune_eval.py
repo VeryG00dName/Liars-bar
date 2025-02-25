@@ -22,7 +22,7 @@ from openskill.models import PlackettLuce
 openskill_model = PlackettLuce(mu=25.0, sigma=25.0/3, beta=25.0/6)
 
 # Import the shared evaluate_agents function from evaluate_utils
-from src.evaluation.evaluate_utils import evaluate_agents
+from src.eval.evaluate_utils import evaluate_agents
 
 __all__ = [
     'run_group_swiss_tournament',

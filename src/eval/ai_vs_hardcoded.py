@@ -21,7 +21,7 @@ from src.model.hard_coded_agents import (
     TableNonTableAgent,
     Classic
 )
-from src.evaluation.evaluate_utils import (
+from src.eval.evaluate_utils import (
     get_hidden_dim_from_state_dict,
     evaluate_agents
 )

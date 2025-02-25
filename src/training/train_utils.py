@@ -255,7 +255,7 @@ def load_specific_historical_models(players_dir, device):
             for checkpoint_file in checkpoint_files:
                 checkpoint_path = os.path.join(version_path, checkpoint_file)
                 try:
-                    from src.evaluation.evaluate_utils import load_combined_checkpoint
+                    from src.eval.evaluate_utils import load_combined_checkpoint
                     checkpoint = load_combined_checkpoint(checkpoint_path, device)
                     policy_nets = checkpoint['policy_nets']
 

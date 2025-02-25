@@ -10,7 +10,7 @@ from pettingzoo.utils import agent_selector
 from src.env.liars_deck_env_core import LiarsDeckEnv
 from src.model.models import PolicyNetwork, OpponentBehaviorPredictor, ValueNetwork
 from src import config
-from src.evaluation.evaluate_tournament import (
+from src.eval.evaluate_tournament import (
     evaluate_agents_tournament,
     update_openskill_ratings
 )

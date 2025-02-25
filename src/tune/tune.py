@@ -10,7 +10,7 @@ from src.training.train import train
 from src.training.train_extras import set_seed
 from src.model.new_models import PolicyNetwork, ValueNetwork, OpponentBehaviorPredictor
 
-from src.evaluation.evaluate import evaluate_agents
+from src.eval.evaluate import evaluate_agents
 from src.env.liars_deck_env_core import LiarsDeckEnv
 from src import config
 

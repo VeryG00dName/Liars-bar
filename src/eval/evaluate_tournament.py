@@ -9,7 +9,7 @@ from src.env.liars_deck_env_core import LiarsDeckEnv
 from src import config
 
 # Import shared functions from evaluate_utils.py (including RichProgressScoreboard and evaluate_agents)
-from src.evaluation.evaluate_utils import (
+from src.eval.evaluate_utils import (
     model as openskill_model,  # Shared OpenSkill model
     RichProgressScoreboard,
     evaluate_agents,

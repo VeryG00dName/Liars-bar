@@ -28,7 +28,7 @@ from src.model.hard_coded_agents import (
     Classic
 )
 
-from src.evaluation.evaluate_utils import (
+from src.eval.evaluate_utils import (
     adapt_observation_for_version,
     get_hidden_dim_from_state_dict,
     get_opponent_memory_embedding,
