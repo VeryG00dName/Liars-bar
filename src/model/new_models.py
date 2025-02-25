@@ -1,5 +1,6 @@
 # src/model/new_models.py
 import math
+torch.set_float32_matmul_precision("high")
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

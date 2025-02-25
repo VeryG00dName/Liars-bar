@@ -163,7 +163,7 @@ def train(
                     features_list = convert_memory_to_features(mem_summary, response2idx, action2idx)
                     if features_list:
                         feature_tensor = torch.tensor(features_list, dtype=torch.float32, device=device).unsqueeze(0)
-                        with torch.no_grad():
+                        with torch.inference_mode():
                             projected = event_encoder(feature_tensor)
                             strategy_embedding, _ = strategy_transformer(projected)
                     else:
@@ -171,14 +171,15 @@ def train(
 
                     if strategy_embedding is not None:
                         obp_memory_embeddings.append(strategy_embedding)
-                        transformer_embeddings.append(strategy_embedding.cpu().detach().numpy().flatten())
+                        transformer_embeddings.append(strategy_embedding.flatten().tolist())
                     else:
                         zero_emb = torch.zeros(1, config.STRATEGY_DIM, device=device)
                         obp_memory_embeddings.append(zero_emb)
                         transformer_embeddings.append(np.zeros(config.STRATEGY_DIM, dtype=np.float32))
             
             # OBP inference using the computed memory embeddings.
-            obp_probs = run_obp_inference(obp_model, observation, device, env.num_players, memory_embeddings=obp_memory_embeddings)
+            with torch.no_grad():
+                obp_probs = run_obp_inference(obp_model, observation, device, env.num_players, memory_embeddings=obp_memory_embeddings)
 
             # Normalize transformer embeddings using min–max normalization.
             if transformer_embeddings:

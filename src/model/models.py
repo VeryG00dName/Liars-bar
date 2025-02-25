@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.enabled = True
 
 class PolicyNetwork(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, use_lstm=True, use_dropout=True, use_layer_norm=True):
@@ -24,7 +25,7 @@ class PolicyNetwork(nn.Module):
         self.use_layer_norm = use_layer_norm
 
         # Define the network layers
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc1 = torch.compile(nn.Linear(input_dim, hidden_dim))
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
 
         if self.use_lstm:

@@ -179,7 +179,7 @@ def train_obp(obp_model, obp_optimizer, obp_memory, device, logger):
     memories_tensor = torch.tensor(np.array(all_memories, dtype=np.float32)).to(device)
     labels_tensor = torch.tensor(np.array(all_labels, dtype=np.int64)).to(device)
 
-    perm = torch.randperm(features_tensor.size(0))
+    perm = torch.randperm(features_tensor.size(0), device=features_tensor.device)
     features_tensor = features_tensor[perm]
     memories_tensor = memories_tensor[perm]
     labels_tensor = labels_tensor[perm]
@@ -188,7 +188,7 @@ def train_obp(obp_model, obp_optimizer, obp_memory, device, logger):
     obp_epochs = 5
 
     dataset = TensorDataset(features_tensor, memories_tensor, labels_tensor)
-    dataloader = DataLoader(dataset, batch_size=obp_batch_size, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=obp_batch_size, shuffle=True, pin_memory=True)
 
     obp_model.train()
     total_loss_obp = 0.0
