@@ -56,6 +56,8 @@ def objective(trial: optuna.trial.Trial) -> float:
         "challenge_fail_claimant_reward": trial.suggest_int("challenge_fail_claimant_reward", -1, 10),
         "forced_challenge_success_challenger_reward": trial.suggest_int("forced_challenge_success_challenger_reward", -1, 5),
         "forced_challenge_success_claimant_penalty": trial.suggest_int("forced_challenge_success_claimant_penalty", -10, 1),
+        "forced_challenge_fail_challenger_penalty": trial.suggest_int("forced_challenge_fail_challenger_penalty", -10, 1),
+        "forced_challenge_fail_claimant_reward": trial.suggest_int("forced_challenge_fail_claimant_reward", -1, 5),
         "invalid_challenge_penalty": trial.suggest_int("invalid_challenge_penalty", -10, 1),
         "termination_penalty": trial.suggest_int("termination_penalty", -10, 1),
         "game_win_bonus": trial.suggest_int("game_win_bonus", 5, 20),
@@ -70,7 +72,7 @@ def objective(trial: optuna.trial.Trial) -> float:
     # --- 2) Create training environment with these parameters ---
     train_env = LiarsDeckEnv(num_players=3, scoring_params=scoring_params)
     device = torch.device(config.DEVICE)
-    TUNE_NUM_EPISODES = 10000
+    TUNE_NUM_EPISODES = 5000
 
     # --- 3) Run the new tune_train training routine ---
     set_seed(config.SEED)  # Ensure reproducibility
@@ -117,7 +119,7 @@ def main():
         logger.error(f"Error loading study: {e}")
         raise e
 
-    N_TRIALS = 20
+    N_TRIALS = 50
     study.optimize(objective, n_trials=N_TRIALS - len(study.trials), show_progress_bar=True)
 
     logger.info("Scoring parameter tuning completed!")
