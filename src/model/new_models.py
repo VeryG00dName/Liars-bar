@@ -3,7 +3,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-torch.set_float32_matmul_precision("high")
 class PolicyNetwork(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, use_lstm=True, use_dropout=True, use_layer_norm=True,
                  use_aux_classifier=False, num_opponent_classes=None):
