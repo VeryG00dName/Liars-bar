@@ -702,6 +702,11 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
     }
 
 def main():
+    """
+    Trains agents against a variety of opponents, including hardcoded bots and historical models.
+    Uses reinforcement learning with opponent behavior prediction and strategy embeddings.
+    Logs training progress and saves checkpoints.
+    """
     set_seed()
     device = torch.device(config.DEVICE)
     if config.USE_WRAPPER: 

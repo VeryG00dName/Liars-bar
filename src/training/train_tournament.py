@@ -333,6 +333,11 @@ def build_lineage_graph(player_pool, output_file='lineage_graph.png'):
 # Main Training Loop
 #######################
 def main():
+    """
+    Runs a tournament-based training loop.
+    Trains agents in groups, evaluates them in a Swiss-style tournament, and evolves the population.
+    Saves checkpoints and maintains a lineage graph of agent evolution.
+    """
     set_seed()
     logger = configure_logger()
     device = torch.device(config.DEVICE)  # e.g., 'cuda' or 'cpu'

@@ -110,6 +110,11 @@ def run_evaluation(env, device, players, num_games_per_triple=11):
     return global_action_counts, agent_head_to_head
 
 def main():
+    """
+    Runs the evaluation process for trained agents.
+    Loads the environment, initializes players, and evaluates their performance.
+    Saves the final scoreboard and generates a heatmap of agent matchups.
+    """
     # Simplified logging setup.
     logging.basicConfig(
         level=logging.WARNING,

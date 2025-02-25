@@ -515,6 +515,11 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
     }
 
 def main():
+    """
+    Main training loop for reinforcement learning agents.
+    Initializes the environment, loads models, and trains agents over multiple episodes.
+    Saves checkpoints and logs training progress.
+    """
     set_seed()
     device = torch.device(config.DEVICE)
     if config.USE_WRAPPER: 

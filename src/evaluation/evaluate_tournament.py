@@ -282,6 +282,11 @@ def rich_print_scoreboard_action_counts(players, action_counts):
     rich_print_action_counts(players, action_counts)
 
 def main():
+    """
+    Runs a Swiss-style tournament evaluation.
+    Loads players, runs multiple rounds of matches, updates ratings, and saves results.
+    Optionally deletes weaker checkpoints based on performance.
+    """
     global args  # So that run_group_swiss_tournament can access args
     parser = argparse.ArgumentParser(description="ET - Evaluate Tournament")
     parser.add_argument("--default", action="store_true", help="Load players from config.PLAYERS_DIR instead of config.CHECKPOINT_DIR")
