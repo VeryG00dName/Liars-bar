@@ -749,12 +749,31 @@ def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_di
             for agent in agents:
                 if agent == current_injected_agent_id:
                     continue
+                
+                total_wins = sum(win_stats[agent].values())
+                total_matches = sum(match_stats[agent].values())
+
+                overall_rate = (total_wins / total_matches * 100) if total_matches > 0 else 0
+
+                if writer is not None:
+                    writer.add_scalar(f"WinRate/{agent}_Overall", overall_rate, episode)
+                
                 for opp_key in match_stats[agent]:
                     wins = win_stats[agent].get(opp_key, 0)
                     total = match_stats[agent].get(opp_key, 1)
                     rate = wins / total * 100
                     if writer is not None:
                         writer.add_scalar(f"WinRate/{agent}_vs_{opp_key}", rate, episode)
+                
+                # --- New weighted win rate logging ---
+                opp_rates = [win_stats[agent].get(opp_key, 0) / match_stats[agent][opp_key]
+                             for opp_key in match_stats[agent] if match_stats[agent][opp_key] > 0]
+                if opp_rates:
+                    weighted_rate = max(np.mean(opp_rates) - np.std(opp_rates), 0) * 100
+                else:
+                    weighted_rate = 0.0
+                if writer is not None:
+                    writer.add_scalar(f"WinRate/{agent}_Weighted", weighted_rate, episode)
     
             if writer is not None:
                 for agent, reward in avg_rewards.items():
@@ -808,12 +827,22 @@ def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_di
     if writer is not None:
         writer.close()
     
-    # At the end of training, compute win rates for each learning agent.
+    # --- Compute weighted win rates for each learning agent ---
+    # For each agent, we compute the win rate against each opponent type and then combine them as:
+    # weighted_win_rate = mean(win_rates) - std(win_rates), clamped to a minimum of 0.
     agent_win_rates = {}
     for agent in agents:
-        total_wins = sum(win_stats[agent].values())
-        total_matches = sum(match_stats[agent].values())
-        agent_win_rates[agent] = total_wins / total_matches if total_matches > 0 else 0.0
+        opponent_rates = []
+        for opp_key in match_stats[agent]:
+            matches = match_stats[agent][opp_key]
+            wins = win_stats[agent].get(opp_key, 0)
+            rate = wins / matches if matches > 0 else 0.5
+            opponent_rates.append(rate)
+        if opponent_rates:
+            weighted_rate = max(np.mean(opponent_rates) - np.std(opponent_rates), 0)
+        else:
+            weighted_rate = 0.0
+        agent_win_rates[agent] = weighted_rate
     best_win_rate = max(agent_win_rates.values()) if agent_win_rates else 0.0
 
     trained_agents = {}
@@ -824,7 +853,7 @@ def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_di
             'obp_model': obp_model
         }
     
-    # Return the trained agents along with the win statistics and best win rate.
+    # Return the trained agents along with the win statistics and best weighted win rate.
     return {
         'agents': trained_agents,
         'optimizers_policy': optimizers_policy,
@@ -863,8 +892,8 @@ def main():
     agent_win_rates = training_results['agent_win_rates']
     logger.info("Training complete.")
     for agent, rate in agent_win_rates.items():
-        logger.info(f"Agent {agent} win rate: {rate*100:.2f}%")
-    logger.info(f"Best win rate among learning agents: {best_win_rate*100:.2f}%")
+        logger.info(f"Agent {agent} weighted win rate: {rate*100:.2f}%")
+    logger.info(f"Best weighted win rate among learning agents: {best_win_rate*100:.2f}%")
 
     # Optionally, save the final checkpoint.
     trained_agents = training_results['agents']
