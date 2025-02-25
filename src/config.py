@@ -36,14 +36,16 @@ USE_WRAPPER = False           # Set to True to use the reward restriction wrappe
 DEFAULT_SCORING_PARAMS = {
     "play_reward_per_card": 0,
     "play_reward": 0,
-    "invalid_play_penalty": 0, # -6
-    "challenge_success_challenger_reward": 1, # 2
-    "challenge_success_claimant_penalty": 0, # -6
+    "invalid_play_penalty": 0,
+    "challenge_success_challenger_reward": 2, # 2
+    "challenge_success_claimant_penalty": -1, # -6
     "challenge_fail_challenger_penalty": -1,
-    "challenge_fail_claimant_reward": 0, # 5
-    "forced_challenge_success_challenger_reward": 1, # 1
-    "forced_challenge_success_claimant_penalty": -3, # -3
-    "invalid_challenge_penalty": -5, # -5
+    "challenge_fail_claimant_reward": 2, # 5
+    "forced_challenge_success_challenger_reward": 2, # 1
+    "forced_challenge_success_claimant_penalty": -1, # -3
+    "forced_challenge_fail_challenger_penalty": -1,
+    "forced_challenge_fail_claimant_reward": 2,
+    "invalid_challenge_penalty": 0,
     "termination_penalty": 0, # -6
     "game_win_bonus": 7, # 7
     "game_lose_penalty": -5, # -1
