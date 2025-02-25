@@ -188,7 +188,7 @@ def train_obp(obp_model, obp_optimizer, obp_memory, device, logger):
     obp_epochs = 5
 
     dataset = TensorDataset(features_tensor, memories_tensor, labels_tensor)
-    dataloader = DataLoader(dataset, batch_size=obp_batch_size, shuffle=True, pin_memory=True)
+    dataloader = DataLoader(dataset, batch_size=obp_batch_size, shuffle=True)
 
     obp_model.train()
     total_loss_obp = 0.0
