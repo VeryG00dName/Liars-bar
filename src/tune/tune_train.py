@@ -165,7 +165,7 @@ def load_specific_historical_models(players_dir, device):
     }
 
     historical_models = []
-    logger = logging.getLogger("Train.Historical")
+    hist_logger = logging.getLogger("Train.Historical")
 
     for version, player_name in required_models.items():
         version_path = os.path.join(players_dir, version)
@@ -201,12 +201,12 @@ def load_specific_historical_models(players_dir, device):
                         hist_policy.is_historical = True  # Prevent training
                         identifier = f"{version}_{player_name}"
                         historical_models.append((hist_policy, identifier))
-                        logger.debug(f"Loaded {player_name} from {version} ({checkpoint_path})")
+                        hist_logger.debug(f"Loaded {player_name} from {version} ({checkpoint_path})")
                         break  # Stop after finding the required player model
                 except Exception as e:
-                    logger.error(f"Error loading {checkpoint_path}: {str(e)}")
+                    hist_logger.error(f"Error loading {checkpoint_path}: {str(e)}")
         else:
-            logger.warning(f"Version {version} not found in {players_dir}")
+            hist_logger.warning(f"Version {version} not found in {players_dir}")
 
     return historical_models
 
@@ -263,7 +263,13 @@ def select_injected_bot(agent, injected_bots, win_stats, match_stats):
 # ---------------------------
 # Main training loop.
 # ---------------------------
-def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_directory=None, log_tensorboard=False):
+def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_directory=None, log_tensorboard=True, logger=None):
+    # If no logger is passed in, configure one.
+    if logger is None:
+        logger = logging.getLogger('Train')
+        if not logger.hasHandlers():
+            logger = configure_logger()
+
     set_seed(config.SEED)
     obs, infos = env.reset(seed=config.SEED)
     agents = env.agents
@@ -324,7 +330,6 @@ def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_di
     obp_model = torch.jit.trace(obp_model, (example_observation, example_memory_embedding))
     obp_model.train(True)
 
-    logger = logging.getLogger('Train')
     writer = get_tensorboard_writer(log_dir=config.TENSORBOARD_RUNS_DIR) if log_tensorboard else None
     checkpoint_dir = load_directory if load_directory is not None else config.CHECKPOINT_DIR
 
@@ -847,7 +852,8 @@ def main():
         device=device,
         num_episodes=config.NUM_EPISODES,
         load_checkpoint=True,
-        log_tensorboard=True
+        log_tensorboard=True,
+        logger=logger
     )
     if training_results is None:
         logger.error("Training results are None. Exiting.")
