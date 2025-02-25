@@ -1,5 +1,6 @@
 # src/training/train_utils.py
 
+import random
 import torch
 import os
 import re
@@ -19,11 +20,11 @@ def compute_gae(rewards, dones, values, next_values, gamma=0.99, lam=0.95):
     advantages = []
     gae = 0
     for step in reversed(range(len(rewards))):
-        if step < len(values) - 1:  # Ensure step index is valid
-            next_val = next_values[step] if step < len(next_values) else 0  # Safe index access
+        if step < len(values) - 1:
+            next_val = next_values[step] if step < len(next_values) else 0
             delta = rewards[step] + gamma * next_val * (1 - dones[step]) - values[step]
         else:
-            delta = rewards[step] - values[step] if step < len(rewards) else 0  # Ensure reward index is valid
+            delta = rewards[step] - values[step] if step < len(rewards) else 0
         gae = delta + gamma * lam * (1 - dones[step]) * gae
         advantages.insert(0, gae)
     returns = [adv + val for adv, val in zip(advantages, values)]
@@ -32,18 +33,6 @@ def compute_gae(rewards, dones, values, next_values, gamma=0.99, lam=0.95):
 def save_checkpoint(policy_nets, value_nets, optimizers_policy, optimizers_value, obp_model, obp_optimizer, episode, checkpoint_dir=config.CHECKPOINT_DIR, checkpoint_filename=None):
     """
     Saves the current state of the training process, including models and optimizers.
-    Note: Entropy coefficients are no longer saved.
-
-    Args:
-        policy_nets (dict): Dictionary of policy networks per agent.
-        value_nets (dict): Dictionary of value networks per agent.
-        optimizers_policy (dict): Dictionary of policy optimizers per agent.
-        optimizers_value (dict): Dictionary of value optimizers per agent.
-        obp_model (OpponentBehaviorPredictor): The Opponent Behavior Predictor model.
-        obp_optimizer (torch.optim.Optimizer): The optimizer for the OBP model.
-        episode (int): Current episode number.
-        checkpoint_dir (str): Directory to save the checkpoint.
-        checkpoint_filename (str, optional): Optional checkpoint filename. If not provided, a default name is used.
     """
     os.makedirs(checkpoint_dir, exist_ok=True)
     if checkpoint_filename is None:
@@ -66,31 +55,15 @@ def save_checkpoint(policy_nets, value_nets, optimizers_policy, optimizers_value
 def load_checkpoint_if_available(policy_nets, value_nets, optimizers_policy, optimizers_value, obp_model, obp_optimizer, checkpoint_dir=config.CHECKPOINT_DIR):
     """
     Loads the latest checkpoint if available and restores the state of models and optimizers.
-    Any entropy coefficient information present in an old checkpoint is ignored.
-
-    Args:
-        policy_nets (dict): Dictionary of policy networks per agent.
-        value_nets (dict): Dictionary of value networks per agent.
-        optimizers_policy (dict): Dictionary of policy optimizers per agent.
-        optimizers_value (dict): Dictionary of value optimizers per agent.
-        obp_model (OpponentBehaviorPredictor): The Opponent Behavior Predictor model.
-        obp_optimizer (torch.optim.Optimizer): The optimizer for the OBP model.
-        checkpoint_dir (str): Directory to load the checkpoint from.
-
-    Returns:
-        tuple: (start_episode (int), entropy_coefs (dict))
-               The returned entropy_coefs are initialized with default values.
     """
     if not os.path.isdir(checkpoint_dir):
         logging.info("Checkpoint directory does not exist. Starting training from scratch.")
-        # Initialize entropy coefficients with default values
         entropy_coefs = {agent: config.INIT_ENTROPY_COEF for agent in policy_nets.keys()}
         return 1, entropy_coefs
 
     checkpoint_files = [f for f in os.listdir(checkpoint_dir) if f.startswith("checkpoint_episode_") and f.endswith(".pth")]
     if not checkpoint_files:
         logging.info("No checkpoint files found. Starting training from scratch.")
-        # Initialize entropy coefficients with default values
         entropy_coefs = {agent: config.INIT_ENTROPY_COEF for agent in policy_nets.keys()}
         return 1, entropy_coefs
 
@@ -102,16 +75,13 @@ def load_checkpoint_if_available(policy_nets, value_nets, optimizers_policy, opt
 
     if not episode_numbers:
         logging.info("No valid checkpoint files found. Starting training from scratch.")
-        # Initialize entropy coefficients with default values
         entropy_coefs = {agent: config.INIT_ENTROPY_COEF for agent in policy_nets.keys()}
         return 1, entropy_coefs
 
     latest_episode = max(episode_numbers)
     latest_checkpoint = os.path.join(checkpoint_dir, f"checkpoint_episode_{latest_episode}.pth")
-
     checkpoint = torch.load(latest_checkpoint, map_location='cpu')
 
-    # Load policy networks
     for agent, net in policy_nets.items():
         mapped_agent = AGENT_NAME_MAPPING.get(agent, agent)
         if mapped_agent in checkpoint['policy_nets']:
@@ -129,7 +99,6 @@ def load_checkpoint_if_available(policy_nets, value_nets, optimizers_policy, opt
         else:
             logging.warning(f"Policy Network for {agent} not found in checkpoint. Skipping.")
 
-    # Load value networks
     for agent, net in value_nets.items():
         mapped_agent = AGENT_NAME_MAPPING.get(agent, agent)
         if mapped_agent in checkpoint['value_nets']:
@@ -147,7 +116,6 @@ def load_checkpoint_if_available(policy_nets, value_nets, optimizers_policy, opt
         else:
             logging.warning(f"Value Network for {agent} not found in checkpoint. Skipping.")
 
-    # Load policy optimizers
     for agent, opt in optimizers_policy.items():
         mapped_agent = AGENT_NAME_MAPPING.get(agent, agent)
         if mapped_agent in checkpoint['optimizers_policy']:
@@ -160,7 +128,6 @@ def load_checkpoint_if_available(policy_nets, value_nets, optimizers_policy, opt
         else:
             logging.warning(f"Policy Optimizer for {agent} not found in checkpoint. Skipping.")
 
-    # Load value optimizers
     for agent, opt in optimizers_value.items():
         mapped_agent = AGENT_NAME_MAPPING.get(agent, agent)
         if mapped_agent in checkpoint['optimizers_value']:
@@ -173,7 +140,6 @@ def load_checkpoint_if_available(policy_nets, value_nets, optimizers_policy, opt
         else:
             logging.warning(f"Value Optimizer for {agent} not found in checkpoint. Skipping.")
 
-    # Load OBP model and optimizer
     if 'obp_model' in checkpoint and 'obp_optimizer' in checkpoint:
         try:
             obp_model.load_state_dict(checkpoint['obp_model'])
@@ -186,13 +152,10 @@ def load_checkpoint_if_available(policy_nets, value_nets, optimizers_policy, opt
     else:
         logging.warning("Opponent Behavior Predictor model and/or optimizer not found in checkpoint. Skipping.")
 
-    # Even if the checkpoint contains entropy coefficients, ignore them.
     if 'entropy_coefs' in checkpoint:
         logging.info("Ignoring entropy coefficients found in checkpoint.")
 
-    # Initialize entropy coefficients with default values.
     entropy_coefs = {agent: config.INIT_ENTROPY_COEF for agent in policy_nets.keys()}
-
     logging.info(f"Resuming training from episode {latest_episode + 1}.")
     return latest_episode + 1, entropy_coefs
 
@@ -208,7 +171,6 @@ def train_obp(obp_model, obp_optimizer, obp_memory, device, logger):
         logger.info(f"Insufficient OBP training samples ({len(obp_memory)}). Skipping training.")
         return None, None
 
-    # Expecting each sample as (features, memory, label)
     all_features = [f for (f, m, l) in obp_memory]
     all_memories = [m for (f, m, l) in obp_memory]
     all_labels = [l for (f, m, l) in obp_memory]
@@ -254,3 +216,97 @@ def train_obp(obp_model, obp_optimizer, obp_memory, device, logger):
     logger.debug(f"OBP trained on {len(obp_memory)} samples, Avg Loss: {avg_loss_obp:.4f}, Accuracy: {accuracy * 100:.2f}%")
 
     return avg_loss_obp, accuracy
+
+def configure_logger():
+    """
+    Configures and returns a logger for training.
+    """
+    logger = logging.getLogger('Train')
+    logger.setLevel(logging.INFO)
+    if logger.hasHandlers():
+        logger.handlers.clear()
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(levelname)s:%(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.propagate = False
+    return logger
+
+def load_specific_historical_models(players_dir, device):
+    """
+    Loads specific historical player models based on predefined versions.
+    - player_1 from Version_E
+    - player_0 from Version_B
+    - player_0 from Version_A
+    """
+    required_models = {
+        "Version_E": "player_1",
+        "Version_B": "player_0",
+        "Version_A": "player_0",
+    }
+
+    historical_models = []
+    logger = logging.getLogger("Train.Historical")
+
+    for version, player_name in required_models.items():
+        version_path = os.path.join(players_dir, version)
+        if os.path.isdir(version_path):
+            checkpoint_files = [f for f in os.listdir(version_path) if f.endswith(".pth")]
+            for checkpoint_file in checkpoint_files:
+                checkpoint_path = os.path.join(version_path, checkpoint_file)
+                try:
+                    from src.evaluation.evaluate_utils import load_combined_checkpoint
+                    checkpoint = load_combined_checkpoint(checkpoint_path, device)
+                    policy_nets = checkpoint['policy_nets']
+
+                    if player_name in policy_nets:
+                        policy_state_dict = policy_nets[player_name]
+                        actual_input_dim = policy_state_dict['fc1.weight'].shape[1]
+                        from src.model.new_models import PolicyNetwork
+                        hist_policy = PolicyNetwork(
+                            input_dim=actual_input_dim,
+                            hidden_dim=config.HIDDEN_DIM,
+                            output_dim=config.OUTPUT_DIM,
+                            use_lstm=True,
+                            use_dropout=True,
+                            use_layer_norm=True,
+                            use_aux_classifier=False,
+                            num_opponent_classes=config.NUM_OPPONENT_CLASSES
+                        ).to(device)
+                        hist_policy.load_state_dict(policy_state_dict, strict=False)
+                        hist_policy.eval()
+                        hist_policy.is_historical = True
+                        identifier = f"{version}_{player_name}"
+                        historical_models.append((hist_policy, identifier))
+                        logger.debug(f"Loaded {player_name} from {version} ({checkpoint_path})")
+                        break
+                except Exception as e:
+                    logger.error(f"Error loading {checkpoint_path}: {str(e)}")
+        else:
+            logger.warning(f"Version {version} not found in {players_dir}")
+
+    return historical_models
+
+def select_injected_bot(agent, injected_bots, win_stats, match_stats):
+    """
+    Selects an injected bot for the given agent based on win rates.
+    Weight is computed as 1 - win_rate (default win_rate = 0.5 if no data).
+    """
+    weights = []
+    for candidate in injected_bots:
+        bot_type, bot_data = candidate
+        if bot_type == "historical":
+            opponent_key = bot_data[1]
+        else:
+            opponent_key = bot_data.__name__
+        matches = match_stats[agent].get(opponent_key, 0)
+        wins = win_stats[agent].get(opponent_key, 0)
+        win_rate = wins / matches if matches > 0 else 0.5
+        weight = 1 - win_rate
+        weights.append(weight)
+    total_weight = sum(weights)
+    if total_weight == 0:
+        return random.choice(injected_bots)
+    normalized = [w / total_weight for w in weights]
+    index = np.random.choice(len(injected_bots), p=normalized)
+    return injected_bots[index]
