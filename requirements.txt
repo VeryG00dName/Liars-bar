@@ -12,3 +12,4 @@ tkinterdnd2
 scikit-learn
 rich
 PyQt5
+optuna
