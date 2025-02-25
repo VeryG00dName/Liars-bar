@@ -876,10 +876,11 @@ def main():
     logger = configure_logger()
     logger.info("Starting training process...")
 
-    training_results = tune_train(
+    training_results = train_agents(
         env=env,
         device=device,
         num_episodes=config.NUM_EPISODES,
+        load_checkpoint=True,
         log_tensorboard=True,
         logger=logger
     )
