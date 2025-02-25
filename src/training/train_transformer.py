@@ -238,7 +238,7 @@ def convert_memory_to_features(memory, response_mapping, action_mapping):
 # -------------------------------
 # Step 7. Training Function (with Prediction Distribution Debug)
 # -------------------------------
-def train_transformer(model, event_encoder, dataloader, optimizer, criterion, device, num_epochs=10):
+def train_transformer(model, event_encoder, dataloader, optimizer, criterion, device, num_epochs=15):
     model.train()
     event_encoder.train()
     for epoch in range(1, num_epochs + 1):
