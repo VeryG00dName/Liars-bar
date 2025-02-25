@@ -21,6 +21,7 @@ from src import config
 from src.model.hard_coded_agents import (
     GreedyCardSpammer,
     TableFirstConservativeChallenger,
+    SelectiveTableConservativeChallenger,
     StrategicChallenger,
     RandomAgent,
     TableNonTableAgent,
@@ -57,10 +58,12 @@ class AgentBattlegroundGUI:
         
         self.loaded_models = {}
         self.hardcoded_agents = {
+            # We still keep all definitions here in case you want them later,
+            # but we'll only use "Conservative" in the battleground loop.
             "GreedySpammer": GreedyCardSpammer,
             "TableFirst": TableFirstConservativeChallenger,
             "Strategic": lambda name: StrategicChallenger(name, 3, 2),
-            "Conservative": lambda name: TableFirstConservativeChallenger(name),
+            "Conservative": lambda name: SelectiveTableConservativeChallenger(name),
             "TableNonTableAgent": TableNonTableAgent,
             "Classic": Classic,
             "Random": RandomAgent
@@ -355,7 +358,8 @@ class AgentBattlegroundGUI:
 
             overall_results = {}
 
-            # --- Hardcoded Agents Matches (Unchanged) ---
+            # --- Hardcoded Agents Matches ---
+            # We'll ONLY generate data vs. "Conservative" (SelectiveTableConservativeChallenger).
             if self.include_hardcoded.get():
                 hardcoded_results = {}
                 ai_agents_all = self.load_selected_agents()
@@ -363,12 +367,18 @@ class AgentBattlegroundGUI:
                     return
                 ai_agents = {}
                 for i, key in enumerate(ai_agents_all.keys()):
+                    # We'll just pick up to 2 PPO agents
                     if i < 2:
                         ai_agents[key] = ai_agents_all[key]
                 if len(ai_agents) < 2:
                     self.show_info("Need at least two PPO agents for matches vs. hardcoded opponents.")
                     return
+
+                # Filter out everything but "Conservative"
                 for hc_name, hc_class in self.hardcoded_agents.items():
+                    if hc_name != "Conservative":
+                        continue  # Skip all other hardcoded bots
+
                     wins = [0, 0, 0]
                     match_count = 0
                     while True:
@@ -387,11 +397,14 @@ class AgentBattlegroundGUI:
                             wins[1] += 1
                         elif winner == "hardcoded_agent":
                             wins[2] += 1
-                        logger.info(f"[Hardcoded:{hc_name}] After {match_count} matches, training segments: {sum(1 for seg, label in self.training_data if label == hc_name)}")
+                        logger.info(
+                            f"[Hardcoded:{hc_name}] After {match_count} matches, training segments: "
+                            f"{sum(1 for seg, label in self.training_data if label == hc_name)}"
+                        )
                     hardcoded_results[hc_name] = wins
                 overall_results["hardcoded"] = hardcoded_results
 
-            # --- PPO-Only Matches: Use the 3 PPO agents with the fewest sample counts (ignoring culled agents) ---
+            # --- PPO-Only Matches: We can keep this or remove it, as desired.
             if self.include_ppo.get():
                 all_agents = self.load_selected_agents()
                 if not all_agents:
@@ -399,16 +412,14 @@ class AgentBattlegroundGUI:
 
                 def sample_count(agent_data):
                     label = agent_data['label']
-                    # If the agent is culled, assign a high count to exclude it.
                     if label in self.culled_agents:
                         return float('inf')
                     return sum(1 for seg, lbl in self.training_data if lbl == label)
 
                 overall_match_count = 0
 
-                # Continue while there are at least 3 agents (from all_agents) that haven't reached the target.
+                # We'll keep the logic to do PPO vs PPO matches if you still want them.
                 while True:
-                    # Filter out agents that are culled or have reached target segments.
                     available_agents = {
                         k: v for k, v in all_agents.items()
                         if v['label'] not in self.culled_agents and
@@ -418,10 +429,8 @@ class AgentBattlegroundGUI:
                         self.show_info("Not enough non-culled PPO agents remain for further matches.")
                         break
 
-                    # Select the 3 agents with the fewest samples among the available ones.
                     selected_keys = sorted(available_agents.keys(), key=lambda k: sample_count(available_agents[k]))[:3]
 
-                    # Set up the current combination.
                     new_subset = {}
                     mapping = {}
                     for i, key in enumerate(selected_keys):
@@ -432,7 +441,6 @@ class AgentBattlegroundGUI:
                     local_game_counts = { new_key: 0 for new_key in new_subset }
                     match_count = 0
 
-                    # Run matches for this combination while each agent hasn't reached target.
                     while all(
                         sum(1 for seg, lbl in self.training_data if lbl == mapping[new_key]) < target_segments_val
                         for new_key in new_subset
@@ -444,12 +452,15 @@ class AgentBattlegroundGUI:
                             local_game_counts[new_key] += 1
                             curr_segments = sum(1 for seg, lbl in self.training_data if lbl == mapping[new_key])
                             if local_game_counts[new_key] >= game_threshold and curr_segments < viable_segment_threshold:
-                                logger.info(f"[PPO] Early culling {mapping[new_key]}: Only {curr_segments} segments in {local_game_counts[new_key]} matches.")
+                                logger.info(
+                                    f"[PPO] Early culling {mapping[new_key]}: "
+                                    f"Only {curr_segments} segments in {local_game_counts[new_key]} matches."
+                                )
                                 to_remove.append(new_key)
                         for rem in to_remove:
                             del new_subset[rem]
                         if len(new_subset) < 3:
-                            logger.info("PPO-only match: Not enough agents remain in current combination after early culling, ending this combination match loop.")
+                            logger.info("PPO-only match: Not enough agents remain in current combination after early culling.")
                             break
                         try:
                             winner = self.run_match(new_subset, hardcoded_agent=None, hardcoded_label=None)
@@ -458,10 +469,12 @@ class AgentBattlegroundGUI:
                             break
                         logger.info("[PPO] After {} matches in current combination, training segments: {}".format(
                             match_count,
-                            ", ".join(f"{mapping[new_key]}: {sum(1 for seg, lbl in self.training_data if lbl == mapping[new_key])}" 
-                                    for new_key in new_subset)
+                            ", ".join(
+                                f"{mapping[new_key]}: "
+                                f"{sum(1 for seg, lbl in self.training_data if lbl == mapping[new_key])}"
+                                for new_key in new_subset
+                            )
                         ))
-                    # End of current combination—continue outer loop to reselect a new combination if possible.
                 overall_results["ppo"] = {"matches": overall_match_count}
             
             self.display_results(overall_results)
