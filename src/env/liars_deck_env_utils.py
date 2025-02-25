@@ -20,19 +20,20 @@ def record_action_history(env, agent, action_type, card_category, count, was_cha
     if len(env.public_opponent_histories[agent]) > H:
         env.public_opponent_histories[agent].pop(0)
 
-def apply_challenge(env, challenger_agent, claimant_agent):
+def apply_challenge(env, challenger_agent, claimant_agent, forced=False):
     """
     Applies the challenge logic between two agents.
     
-    Args:
-        env (LiarsDeckEnv): The environment instance.
-        challenger_agent (str): The agent initiating the challenge.
-        claimant_agent (str): The agent being challenged.
+    If 'forced' is True, we apply forced-challenge rewards/penalties.
+    Otherwise, we apply normal challenge rewards/penalties.
     """
     claimed_cards = env.last_played_cards.get(claimant_agent, [])
-    env.logger.debug(f"Applying challenge: {challenger_agent} vs {claimant_agent}, claimed_cards={claimed_cards}")
+    env.logger.debug(
+        f"Applying {'FORCED ' if forced else ''}challenge: "
+        f"{challenger_agent} vs {claimant_agent}, claimed_cards={claimed_cards}"
+    )
 
-    # Find the last play entry in the histories
+    # Helper function to find the last 'Play' entry in an agent's history
     def find_last_play_entry(hist):
         for entry in reversed(hist):
             if entry['action_type'] == "Play":
@@ -42,97 +43,164 @@ def apply_challenge(env, challenger_agent, claimant_agent):
     private_last_play = find_last_play_entry(env.private_opponent_histories.get(claimant_agent, []))
     public_last_play = find_last_play_entry(env.public_opponent_histories.get(claimant_agent, []))
 
+    # --- If the claimant played no cards (or the environment thinks so) ---
     if not claimed_cards:
-        # Claimant played no cards; invalid scenario
+        # We treat this as a "forced success" scenario for the challenger,
+        # because the claimant has no defense to show.
         env.penalties[claimant_agent] += 1
         env.failed_bluffs[claimant_agent] += 1
         env.successful_challenges[challenger_agent] += 1
-        env.rewards[challenger_agent] += env.scoring_params['forced_challenge_success_challenger_reward']
-        env.rewards[claimant_agent] += env.scoring_params['forced_challenge_success_claimant_penalty']
-        env.logger.info(f"{challenger_agent} challenged {claimant_agent} but no cards were played.")
 
+        if forced:
+            # Use forced-challenge success rewards/penalties
+            env.rewards[challenger_agent] += env.scoring_params.get(
+                'forced_challenge_success_challenger_reward', 0
+            )
+            env.rewards[claimant_agent] += env.scoring_params.get(
+                'forced_challenge_success_claimant_penalty', 0
+            )
+            env.logger.info(
+                f"[FORCED] {challenger_agent} challenged {claimant_agent} with no cards. "
+                "Applying forced challenge success rewards/penalties."
+            )
+        else:
+            # Or if it’s not forced, just treat it like a normal success challenge
+            env.rewards[challenger_agent] += env.scoring_params.get(
+                'challenge_success_challenger_reward', 0
+            )
+            env.rewards[claimant_agent] += env.scoring_params.get(
+                'challenge_success_claimant_penalty', 0
+            )
+            env.logger.info(
+                f"{challenger_agent} challenged {claimant_agent} with no cards. "
+                "Applying normal challenge success rewards/penalties."
+            )
+
+        # Possibly terminate or penalize the claimant if over threshold
         if env.penalties[claimant_agent] >= env.penalty_thresholds[claimant_agent]:
             env.terminations[claimant_agent] = True
-            env.rewards[claimant_agent] += env.scoring_params['termination_penalty']
+            env.rewards[claimant_agent] += env.scoring_params.get('termination_penalty', 0)
             env.logger.info(f"{claimant_agent} has been terminated due to excessive penalties.")
 
-        # Reveal was_bluff (True) in the public history (claimant lied by not playing cards)
+        # Mark was_bluff = True in the public history
         if public_last_play:
             public_last_play['was_bluff'] = True
             env.logger.debug(f"Updated public history for {claimant_agent}: was_bluff=True")
 
-        # --- MEMORY UPDATE: Record that claimant did not play any cards ---
+        # Memory updates ...
         for observer in env.possible_agents:
             if observer != claimant_agent:
-                # Retrieve the last play entry from the public history for claimant
                 if public_last_play and 'count' in public_last_play:
                     triggering_str = "Play_" + str(public_last_play['count'])
                 else:
                     triggering_str = "None"
                 get_opponent_memory(observer).update(
                     opponent=claimant_agent,
-                    response="Challenge",           # Fixed response value for challenges
-                    triggering_action=triggering_str, # Triggering action from the last play
+                    response="Challenge",
+                    triggering_action=triggering_str,
                     penalties=env.penalties.get(claimant_agent, 0),
                     card_count=len(env.players_hands.get(claimant_agent, []))
                 )
+
         env.start_new_round()
         return
 
+    # --- Otherwise, the claimant did play cards. Check if valid or bluff. ---
     is_valid = validate_claim(claimed_cards, env.table_card)
+
     if is_valid:
-        # Challenger was wrong
+        # The challenger was wrong
         env.penalties[challenger_agent] += 1
         env.failed_challenges[challenger_agent] += 1
-        env.rewards[challenger_agent] += env.scoring_params['challenge_fail_challenger_penalty']
-        env.rewards[claimant_agent] += env.scoring_params['challenge_fail_claimant_reward']
-        env.logger.info(f"{challenger_agent} failed to challenge {claimant_agent}'s valid play.")
 
+        if forced:
+            # This is a forced challenge that FAILED
+            env.rewards[challenger_agent] += env.scoring_params.get(
+                'forced_challenge_fail_challenger_penalty', 0
+            )
+            env.rewards[claimant_agent] += env.scoring_params.get(
+                'forced_challenge_fail_claimant_reward', 0
+            )
+            env.logger.info(
+                f"[FORCED] {challenger_agent} failed to challenge a valid play by {claimant_agent}. "
+                "Applying forced challenge fail rewards/penalties."
+            )
+        else:
+            # Normal challenge fail
+            env.rewards[challenger_agent] += env.scoring_params.get(
+                'challenge_fail_challenger_penalty', 0
+            )
+            env.rewards[claimant_agent] += env.scoring_params.get(
+                'challenge_fail_claimant_reward', 0
+            )
+            env.logger.info(
+                f"{challenger_agent} failed to challenge a valid play by {claimant_agent}."
+            )
+
+        # Possibly terminate or penalize challenger
         if env.penalties[challenger_agent] >= env.penalty_thresholds[challenger_agent]:
             env.terminations[challenger_agent] = True
-            env.rewards[challenger_agent] += env.scoring_params['termination_penalty']
+            env.rewards[challenger_agent] += env.scoring_params.get('termination_penalty', 0)
             env.logger.info(f"{challenger_agent} has been terminated due to excessive penalties.")
 
         if public_last_play:
             public_last_play['was_bluff'] = False
             env.logger.debug(f"Updated public history for {claimant_agent}: was_bluff=False")
-        outcome = "Truthful"
+
     else:
-        # Claimant was bluffing
+        # The claimant was bluffing
         env.penalties[claimant_agent] += 1
         env.failed_bluffs[claimant_agent] += 1
         env.successful_challenges[challenger_agent] += 1
-        env.rewards[challenger_agent] += env.scoring_params['challenge_success_challenger_reward']
-        env.rewards[claimant_agent] += env.scoring_params['challenge_success_claimant_penalty']
-        env.logger.info(f"{challenger_agent} successfully challenged {claimant_agent}'s bluff.")
 
+        if forced:
+            # This is a forced challenge that SUCCEEDED
+            env.rewards[challenger_agent] += env.scoring_params.get(
+                'forced_challenge_success_challenger_reward', 0
+            )
+            env.rewards[claimant_agent] += env.scoring_params.get(
+                'forced_challenge_success_claimant_penalty', 0
+            )
+            env.logger.info(
+                f"[FORCED] {challenger_agent} successfully challenged {claimant_agent}'s bluff. "
+                "Applying forced challenge success rewards/penalties."
+            )
+        else:
+            # Normal challenge success
+            env.rewards[challenger_agent] += env.scoring_params.get(
+                'challenge_success_challenger_reward', 0
+            )
+            env.rewards[claimant_agent] += env.scoring_params.get(
+                'challenge_success_claimant_penalty', 0
+            )
+            env.logger.info(
+                f"{challenger_agent} successfully challenged {claimant_agent}'s bluff."
+            )
+
+        # Possibly terminate or penalize claimant
         if env.penalties[claimant_agent] >= env.penalty_thresholds[claimant_agent]:
             env.terminations[claimant_agent] = True
-            env.rewards[claimant_agent] += env.scoring_params['termination_penalty']
+            env.rewards[claimant_agent] += env.scoring_params.get('termination_penalty', 0)
             env.logger.info(f"{claimant_agent} has been terminated due to excessive penalties.")
 
         if public_last_play:
             public_last_play['was_bluff'] = True
             env.logger.debug(f"Updated public history for {claimant_agent}: was_bluff=True")
-        outcome = "Bluff"
 
-    # --- MEMORY UPDATE: Record the outcome of the challenge for claimant ---
-    from src.model.memory import get_opponent_memory
+    # --- Memory updates ...
     for observer in env.possible_agents:
         if observer != claimant_agent:
-            # Retrieve the last play entry from the public history for claimant
             if public_last_play and 'count' in public_last_play:
                 triggering_str = "Play_" + str(public_last_play['count'])
             else:
                 triggering_str = "None"
             get_opponent_memory(observer).update(
                 opponent=claimant_agent,
-                response="Challenge",           # Fixed response value for challenges
-                triggering_action=triggering_str, # Triggering action from the last play
+                response="Challenge",
+                triggering_action=triggering_str,
                 penalties=env.penalties.get(claimant_agent, 0),
                 card_count=len(env.players_hands.get(claimant_agent, []))
             )
-
 
     env.start_new_round()
     eligible_agents = [ag for ag in env.possible_agents if not env.terminations[ag]]
@@ -227,7 +295,7 @@ def apply_action(env, agent, action):
                     claimant_agent = agent
                     challenger_agent = [ag for ag in active_agents if ag != claimant_agent][0]
                     env.logger.info(f"Forced challenge triggered by {challenger_agent} against {claimant_agent}")
-                    apply_challenge(env, challenger_agent, claimant_agent)
+                    apply_challenge(env, challenger_agent, claimant_agent, forced=True)
                     if not env.terminations.get(claimant_agent, False):
                         env.round_eliminated[claimant_agent] = True
                         env.logger.debug(f"{claimant_agent} round eliminated after forced challenge resolution.")
@@ -246,7 +314,7 @@ def apply_action(env, agent, action):
             challenger = agent
             claimant = env.last_action_agent
             env.logger.info(f"{challenger} initiated a challenge against {claimant}")
-            apply_challenge(env, challenger, claimant)
+            apply_challenge(env, challenger, claimant, forced=False)
         else:
             env.penalties[agent] += 1
             info["penalty"] = "Invalid Challenge (No claim available)"
