@@ -37,19 +37,19 @@ DEFAULT_SCORING_PARAMS = {
     "play_reward_per_card": -1,
     "play_reward": 0,
     "invalid_play_penalty": 0,
-    "challenge_success_challenger_reward": 12,
+    "challenge_success_challenger_reward": 10,
     "challenge_success_claimant_penalty": 0,
     "challenge_fail_challenger_penalty": -1,
     "challenge_fail_claimant_reward": 5,
     "forced_challenge_success_challenger_reward": 3,
-    "forced_challenge_success_claimant_penalty": -11,
+    "forced_challenge_success_claimant_penalty": -10,
     "forced_challenge_fail_challenger_penalty": 0,
     "forced_challenge_fail_claimant_reward": 2,
     "invalid_challenge_penalty": 0,
-    "termination_penalty": 2,
+    "termination_penalty": -2,
     "game_win_bonus": 16,
     "game_lose_penalty": -10,
-    "hand_empty_bonus": -3,
+    "hand_empty_bonus": 1,
     "consecutive_action_penalty": 2,
     "successful_bluff_reward": -1,
     "unchallenged_bluff_penalty": 0
@@ -60,7 +60,7 @@ DEFAULT_SCORING_PARAMS = {
 # ----------------------------
 # Neural Network Configuration
 # ----------------------------
-HIDDEN_DIM = 800             # Number of hidden units in neural networks
+HIDDEN_DIM = 300             # Number of hidden units in neural networks
 
 # The INPUT_DIM will be set dynamically based on the environment.
 # It is computed as: base observation dimension + 2 (for OBP output) + (STRATEGY_DIM * num_opponents)
