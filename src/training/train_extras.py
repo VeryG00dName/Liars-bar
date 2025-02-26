@@ -138,7 +138,7 @@ def search_and_lookahead(env, agent, policy_nets, depth=2):
 
         env_copy = copy.deepcopy(env)
         env_copy.step(action)
-        future_value = search_and_lookahead(env_copy, agent, policy_nets, depth - 1)
+        future_value = search_and_lookahead(env_copy, agent, depth - 1)
 
         observation_tensor = torch.tensor(current_obs, dtype=torch.float32, device=config.DEVICE).unsqueeze(0)
         with torch.no_grad():
