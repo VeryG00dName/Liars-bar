@@ -376,7 +376,7 @@ class AgentBattlegroundGUI:
 
                 # Filter out everything but "Conservative"
                 for hc_name, hc_class in self.hardcoded_agents.items():
-                    if hc_name != "Conservative":
+                    if hc_name != "Strategic":
                         continue  # Skip all other hardcoded bots
 
                     wins = [0, 0, 0]
