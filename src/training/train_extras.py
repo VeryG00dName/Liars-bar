@@ -119,3 +119,31 @@ def run_obp_inference(obp_model, obs_array, device, num_players, memory_embeddin
         bluff_prob = probs[0, 1].item()
         obp_probs.append(bluff_prob)
     return obp_probs
+def search_and_lookahead(env, agent, depth=2):
+    """
+    Performs a limited-depth lookahead search to evaluate future game states.
+    Uses the agent's policy network to estimate action values.
+    """
+    if depth == 0 or env.terminations[agent] or env.truncations[agent]:
+        return 0  # Base case: return zero if at max depth or terminal state.
+
+    best_value = float('-inf')
+    current_obs = env.observe(agent)[agent]
+    action_mask = env.infos[agent]['action_mask']
+
+    for action in range(len(action_mask)):
+        if action_mask[action] == 0:
+            continue  # Skip invalid actions.
+
+        env_copy = env.clone()
+        env_copy.step(action)
+        future_value = search_and_lookahead(env_copy, agent, depth - 1)
+
+        observation_tensor = torch.tensor(current_obs, dtype=torch.float32, device=config.DEVICE).unsqueeze(0)
+        with torch.no_grad():
+            action_probs, _, _ = policy_nets[agent](observation_tensor, None)
+        action_value = action_probs[0, action].item() + future_value
+
+        best_value = max(best_value, action_value)
+
+    return best_value

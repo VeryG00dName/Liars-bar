@@ -55,7 +55,8 @@ from src.training.train_extras import (
     set_seed,
     extract_obp_training_data,
     run_obp_inference,
-    convert_memory_to_features
+    convert_memory_to_features,
+    search_and_lookahead
 )
 
 # ---- Import EventEncoder (used to project raw opponent memory features) ----
@@ -388,6 +389,10 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
                 probs, _, _ = policy_nets[agent](observation_tensor, None)
                 probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
+
+                # Apply lookahead search to refine action selection.
+                lookahead_values = [search_and_lookahead(env, agent, depth=2) for _ in range(config.OUTPUT_DIM)]
+                probs = probs + torch.tensor(lookahead_values, dtype=torch.float32, device=device)
                 mask_t = torch.tensor(action_mask, dtype=torch.float32, device=device)
                 masked_probs = probs * mask_t
                 if masked_probs.sum() == 0:
