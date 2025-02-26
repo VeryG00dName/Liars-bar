@@ -176,3 +176,4 @@ tournament_scoreboard.json
 opponent_training_data.pkl
 .aider*
 *.pkl
+/logs
