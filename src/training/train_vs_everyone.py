@@ -391,7 +391,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
 
                 # Apply lookahead search to refine action selection.
-                lookahead_values = [search_and_lookahead(env, agent, policy_nets, depth=2) for _ in range(config.OUTPUT_DIM)]
+                lookahead_values = [search_and_lookahead(env, agent, depth=2) for _ in range(config.OUTPUT_DIM)]
                 probs = probs + torch.tensor(lookahead_values, dtype=torch.float32, device=device)
                 mask_t = torch.tensor(action_mask, dtype=torch.float32, device=device)
                 masked_probs = probs * mask_t
