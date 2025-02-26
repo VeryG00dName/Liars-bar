@@ -54,31 +54,20 @@ from src.training.train_utils import (
     save_checkpoint,
     load_checkpoint_if_available,
     get_tensorboard_writer,
-    train_obp
+    train_obp,
+    load_specific_historical_models,
+    select_injected_bot,
+    configure_logger
 )
 from src.training.train_extras import (
     set_seed,
     extract_obp_training_data,
-    run_obp_inference
+    run_obp_inference,
+    convert_memory_to_features
 )
 
 # ---- Import EventEncoder (used to project raw opponent memory features) ----
 from src.training.train_transformer import EventEncoder
-
-# ---- Helper function to convert memory events into 4D feature vectors ----
-def convert_memory_to_features(memory, response_mapping, action_mapping):
-    features = []
-    for event in memory:
-        if not isinstance(event, dict):
-            raise ValueError(f"Memory event is not a dictionary: {event}. Please fix the data generation.")
-        resp = event.get("response", "")
-        act = event.get("triggering_action", "")
-        penalties = float(event.get("penalties", 0))
-        card_count = float(event.get("card_count", 0))
-        resp_val = float(response_mapping.get(resp, 0))
-        act_val = float(action_mapping.get(act, 0))
-        features.append([resp_val, act_val, penalties, card_count])
-    return features
 
 # ---------------------------
 # Define a mapping from hard-coded agent class names to integer labels.
@@ -151,64 +140,6 @@ strategy_transformer.eval()
 # ---------------------------
 from src.eval.evaluate_utils import load_combined_checkpoint  # Ensure this is imported
 
-def load_specific_historical_models(players_dir, device):
-    """
-    Loads specific player models from specific versions:
-    - player_1 from Version_E
-    - player_0 from Version_B
-    - player_0 from Version_A
-    """
-    required_models = {
-        "Version_E": "player_1",
-        "Version_B": "player_0",
-        "Version_A": "player_0",
-    }
-
-    historical_models = []
-    hist_logger = logging.getLogger("Train.Historical")
-
-    for version, player_name in required_models.items():
-        version_path = os.path.join(players_dir, version)
-        if os.path.isdir(version_path):
-            checkpoint_files = [f for f in os.listdir(version_path) if f.endswith(".pth")]
-            for checkpoint_file in checkpoint_files:
-                checkpoint_path = os.path.join(version_path, checkpoint_file)
-                try:
-                    # Load the combined checkpoint (as done in evaluation)
-                    checkpoint = load_combined_checkpoint(checkpoint_path, device)
-                    policy_nets = checkpoint['policy_nets']
-
-                    if player_name in policy_nets:
-                        policy_state_dict = policy_nets[player_name]
-
-                        # Determine input dimension from fc1 weight shape
-                        actual_input_dim = policy_state_dict['fc1.weight'].shape[1]
-
-                        # Create a PolicyNetwork instance
-                        hist_policy = PolicyNetwork(
-                            input_dim=actual_input_dim,
-                            hidden_dim=config.HIDDEN_DIM,
-                            output_dim=config.OUTPUT_DIM,
-                            use_lstm=True,
-                            use_dropout=True,
-                            use_layer_norm=True,
-                            use_aux_classifier=False,  # No auxiliary classifier for historical models
-                            num_opponent_classes=config.NUM_OPPONENT_CLASSES
-                        ).to(device)
-
-                        hist_policy.load_state_dict(policy_state_dict, strict=False)
-                        hist_policy.eval()
-                        hist_policy.is_historical = True  # Prevent training
-                        identifier = f"{version}_{player_name}"
-                        historical_models.append((hist_policy, identifier))
-                        hist_logger.debug(f"Loaded {player_name} from {version} ({checkpoint_path})")
-                        break  # Stop after finding the required player model
-                except Exception as e:
-                    hist_logger.error(f"Error loading {checkpoint_path}: {str(e)}")
-        else:
-            hist_logger.warning(f"Version {version} not found in {players_dir}")
-
-    return historical_models
 
 historical_models = load_specific_historical_models(config.HISTORICAL_MODEL_DIR, device)
 print(f"Loaded {len(historical_models)} historical PPO models: {', '.join([id for _, id in historical_models])}")
@@ -217,48 +148,6 @@ print(f"Loaded {len(historical_models)} historical PPO models: {', '.join([id fo
 for idx, (_, identifier) in enumerate(historical_models):
     historical_label_mapping[identifier] = len(HARD_CODED_LABELS) + idx
 
-# ---------------------------
-# Logger configuration.
-# ---------------------------
-def configure_logger():
-    logger = logging.getLogger('Train')
-    logger.setLevel(logging.INFO)
-    if logger.hasHandlers():
-        logger.handlers.clear()
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter('%(levelname)s:%(message)s')
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    logger.propagate = False
-    return logger
-
-# ---------------------------
-# Helper function: Select injected bot based on win rates.
-# ---------------------------
-def select_injected_bot(agent, injected_bots, win_stats, match_stats):
-    """
-    For the given agent, compute weights for each injected bot candidate based on
-    win rate against that candidate (win rate = wins / matches, default to 0.5 if no data).
-    Weight = 1 - win_rate, so lower win rate means higher chance.
-    """
-    weights = []
-    for candidate in injected_bots:
-        bot_type, bot_data = candidate
-        if bot_type == "historical":
-            opponent_key = bot_data[1]  # unique identifier
-        else:
-            opponent_key = bot_data.__name__
-        matches = match_stats[agent].get(opponent_key, 0)
-        wins = win_stats[agent].get(opponent_key, 0)
-        win_rate = wins / matches if matches > 0 else 0.5
-        weight = 1 - win_rate
-        weights.append(weight)
-    total_weight = sum(weights)
-    if total_weight == 0:
-        return random.choice(injected_bots)
-    normalized = [w / total_weight for w in weights]
-    index = np.random.choice(len(injected_bots), p=normalized)
-    return injected_bots[index]
 
 # ---------------------------
 # Main training loop.
