@@ -140,7 +140,14 @@ def search_and_lookahead(env, agent, policy_nets, depth=2):
         env_copy.step(action)
         future_value = search_and_lookahead(env_copy, agent, policy_nets, depth - 1)
 
-        observation_tensor = torch.tensor(current_obs, dtype=torch.float32, device=config.DEVICE).unsqueeze(0)
+        obp_probs = run_obp_inference(
+            obp_model, current_obs, config.DEVICE, env.num_players,
+            memory_embeddings=[torch.zeros(1, config.STRATEGY_DIM, device=config.DEVICE)
+                               for _ in range(env.num_players - 1)]
+        )
+        obp_arr = np.array(obp_probs, dtype=np.float32)
+        final_obs = np.concatenate([current_obs, obp_arr], axis=0)
+        observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=config.DEVICE).unsqueeze(0)
         with torch.no_grad():
             action_probs, _, _ = policy_nets[agent](observation_tensor, None)
         action_value = action_probs[0, action].item() + future_value
