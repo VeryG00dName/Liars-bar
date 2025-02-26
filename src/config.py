@@ -34,23 +34,25 @@ NUM_PLAYERS = 3               # Number of players in the game
 RENDER_MODE = None            # Set to 'human' to enable rendering
 USE_WRAPPER = False           # Set to True to use the reward restriction wrapper
 DEFAULT_SCORING_PARAMS = {
-    "play_reward_per_card": 0,
-    "play_reward": 0,
-    "invalid_play_penalty": 0, # -6
-    "challenge_success_challenger_reward": 1, # 2
-    "challenge_success_claimant_penalty": 0, # -6
-    "challenge_fail_challenger_penalty": -1,
-    "challenge_fail_claimant_reward": 0, # 5
-    "forced_challenge_success_challenger_reward": 1, # 1
-    "forced_challenge_success_claimant_penalty": -3, # -3
-    "invalid_challenge_penalty": -5, # -5
-    "termination_penalty": 0, # -6
-    "game_win_bonus": 7, # 7
-    "game_lose_penalty": -5, # -1
-    "hand_empty_bonus": 0,
-    "consecutive_action_penalty": 0, # 1
-    "successful_bluff_reward": 1, # 3
-    "unchallenged_bluff_penalty": -0.1  # -2
+    "play_reward_per_card": -3,
+    "play_reward": -2,
+    "invalid_play_penalty": 1,
+    "challenge_success_challenger_reward": 13,
+    "challenge_success_claimant_penalty": -3,
+    "challenge_fail_challenger_penalty": -2,
+    "challenge_fail_claimant_reward": 8,
+    "forced_challenge_success_challenger_reward": 3,
+    "forced_challenge_success_claimant_penalty": -12,
+    "forced_challenge_fail_challenger_penalty": 0,
+    "forced_challenge_fail_claimant_reward": 3,
+    "invalid_challenge_penalty": -8,
+    "termination_penalty": 2,
+    "game_win_bonus": 14,
+    "game_lose_penalty": -8,
+    "hand_empty_bonus": 1,
+    "consecutive_action_penalty": 4,
+    "successful_bluff_reward": 2,
+    "unchallenged_bluff_penalty": 1
 }
 
 # ----------------------------
