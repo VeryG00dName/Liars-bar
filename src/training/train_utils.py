@@ -299,14 +299,22 @@ def select_injected_bot(agent, injected_bots, win_stats, match_stats):
             opponent_key = bot_data[1]
         else:
             opponent_key = bot_data.__name__
+        
         matches = match_stats[agent].get(opponent_key, 0)
         wins = win_stats[agent].get(opponent_key, 0)
-        win_rate = wins / matches if matches > 0 else 0.5
+        win_rate = (sum(wins) / matches) if matches > 0 else 0.5
+        
+        # Ensure win_rate is in [0, 1] so that weight = 1 - win_rate is non-negative.
+        win_rate = min(max(win_rate, 0), 1)
         weight = 1 - win_rate
         weights.append(weight)
+    
     total_weight = sum(weights)
     if total_weight == 0:
         return random.choice(injected_bots)
+    
     normalized = [w / total_weight for w in weights]
+    
+    # The normalized list should be non-negative and sum to 1.
     index = np.random.choice(len(injected_bots), p=normalized)
     return injected_bots[index]
