@@ -270,3 +270,161 @@ class StrategyTransformer(nn.Module):
             classification_logits = None
 
         return strategy_embedding, classification_logits
+    
+class BeliefStateModel(nn.Module):
+    """
+    Models probability distributions over opponents' hands based on game history.
+    Tracks only probabilities, not exact card counts.
+    """
+    def __init__(self, input_dim, hidden_dim, deck_size, num_players, use_dropout=True, use_layer_norm=True):
+        super(BeliefStateModel, self).__init__()
+        self.deck_size = deck_size  # Total number of cards in deck
+        self.num_players = num_players
+        
+        # Define card types (King, Queen, Ace, Joker)
+        self.card_types = 4
+        
+        # Encoder for observations and actions
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim) if use_layer_norm else nn.Identity(),
+            nn.Dropout(0.2) if use_dropout else nn.Identity(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim) if use_layer_norm else nn.Identity(),
+            nn.Dropout(0.2) if use_dropout else nn.Identity(),
+        )
+        
+        # Belief update network - outputs logits for card type probabilities per opponent
+        self.belief_update = nn.Linear(hidden_dim, (num_players-1) * self.card_types)
+        
+        # Initialize with uniform prior
+        self.register_buffer('prior_belief', torch.ones(1, num_players-1, self.card_types) / self.card_types)
+        
+    def forward(self, x, prev_beliefs=None):
+        """
+        Update beliefs based on new observations.
+        
+        Args:
+            x: Current observation tensor [batch_size, obs_dim]
+            prev_beliefs: Previous belief state [batch_size, num_opponents, card_types] or None
+            
+        Returns:
+            Updated belief state [batch_size, num_opponents, card_types]
+        """
+        batch_size = x.size(0)
+        
+        # Get features from observation
+        features = self.encoder(x)
+        
+        # Initialize beliefs if not provided
+        if prev_beliefs is None:
+            prev_beliefs = self.prior_belief.expand(batch_size, -1, -1)
+        
+        # Get belief update logits
+        update_logits = self.belief_update(features)
+        update_logits = update_logits.view(batch_size, self.num_players-1, self.card_types)
+        
+        # Apply softmax to get probabilities (per opponent)
+        belief_update = F.softmax(update_logits, dim=-1)
+        
+        # Combine with previous beliefs using element-wise multiplication and renormalization
+        updated_beliefs = prev_beliefs * belief_update
+        # Normalize to ensure valid probability distribution
+        updated_beliefs = updated_beliefs / (updated_beliefs.sum(dim=-1, keepdim=True) + 1e-10)
+        
+        return updated_beliefs
+    
+    def infer_belief_from_game_state(self, observation, agent_idx, env):
+        """
+        Infer belief state directly from game state for ground truth training.
+        This creates target beliefs based on known information.
+        
+        Args:
+            observation: Current observation
+            agent_idx: Index of the agent 
+            env: Environment instance with full state
+            
+        Returns:
+            Belief state representing ground truth probabilities
+        """
+        # Get the observing agent's name and remaining opponents
+        agent_name = env.possible_agents[agent_idx]
+        opponents = [ag for ag in env.possible_agents if ag != agent_name]
+        num_opponents = len(opponents)
+        
+        # Initialize beliefs with uniform distribution
+        beliefs = torch.ones(1, num_opponents, self.card_types) / self.card_types
+        
+        # For each opponent, adjust belief based on observed information
+        for i, opponent in enumerate(opponents):
+            # Get public history of this opponent's actions
+            history = env.public_opponent_histories.get(opponent, [])
+            
+            # Remaining hand size (affects probabilities) - normalize by max hand size 5
+            cards_remaining = len(env.players_hands.get(opponent, [])) / 5.0
+            
+            # If any actions revealed bluffing or truth-telling, update beliefs accordingly
+            for entry in history:
+                if entry['action_type'] == "Play" and entry.get('was_bluff') is not None:
+                    if entry['count'] is not None:
+                        count = entry['count']
+                        
+                        # If caught bluffing, they didn't have table cards
+                        if entry['was_bluff'] is True:
+                            # Reduce probability of having table card (index 0=King, 1=Queen, 2=Ace, 3=Joker)
+                            table_idx = ["King", "Queen", "Ace", "Joker"].index(env.table_card)
+                            beliefs[0, i, table_idx] *= 0.5  # Reduce probability
+                        else:
+                            # If truthful play, increase probability they have that card type
+                            table_idx = ["King", "Queen", "Ace", "Joker"].index(env.table_card)
+                            beliefs[0, i, table_idx] *= 1.5  # Increase probability
+            
+            # Renormalize for this opponent
+            beliefs[0, i] = beliefs[0, i] / beliefs[0, i].sum()
+            
+        return beliefs
+
+
+class CFRValueNetwork(nn.Module):
+    """
+    Estimates counterfactual values for belief states.
+    """
+    def __init__(self, input_dim, belief_dim, hidden_dim, output_dim=1):
+        super(CFRValueNetwork, self).__init__()
+        
+        # Combined input: observations + belief state
+        combined_dim = input_dim + belief_dim
+        
+        # Network architecture
+        self.network = nn.Sequential(
+            nn.Linear(combined_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, output_dim)
+        )
+    
+    def forward(self, obs, beliefs):
+        """
+        Args:
+            obs: Observation tensor
+            beliefs: Belief state tensor
+            
+        Returns:
+            Estimated counterfactual value
+        """
+        # Flatten belief tensor for concatenation
+        beliefs_flat = beliefs.reshape(beliefs.size(0), -1)
+        
+        # Concatenate observation and beliefs
+        combined = torch.cat([obs, beliefs_flat], dim=-1)
+        
+        # Forward pass
+        value = self.network(combined)
+        return value
