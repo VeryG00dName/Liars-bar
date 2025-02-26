@@ -154,7 +154,8 @@ for idx, (_, identifier) in enumerate(historical_models):
 # ---------------------------
 # Main training loop.
 # ---------------------------
-def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_directory=None, log_tensorboard=True, logger=None, trial=None):
+def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_directory=None, 
+                 log_tensorboard=True, logger=None, trial=None):
     # If no logger is passed in, configure one.
     if logger is None:
         logger = logging.getLogger('Train')
@@ -183,6 +184,7 @@ def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_di
     optimizers_policy = {}
     optimizers_value = {}
     memories = {}
+    best_win_rate = 0
 
     for agent in agents:
         policy_net = PolicyNetwork(
@@ -282,10 +284,8 @@ def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_di
 
         # Every 5 episodes, choose a new injected bot for one randomly selected agent.
         if (episode - start_episode) % 5 == 0:
-            # Choose a learning agent at random.
             current_injected_agent_id = random.choice(agents)
             tracked_agent = current_injected_agent_id
-            # Instead of a uniform random selection, select based on win rates.
             selected_bot = select_injected_bot(current_injected_agent_id, injected_bots, win_stats, match_stats)
             current_injected_bot_type = selected_bot[0]
             if current_injected_bot_type == "hardcoded":
@@ -371,7 +371,6 @@ def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_di
             if agent == current_injected_agent_id:
                 base_obs = observation
                 obp_arr = np.array(obp_probs, dtype=np.float32)
-                # For historical models, use their expected input dim; for hardcoded, use config.INPUT_DIM.
                 if current_injected_bot_type == "historical":
                     expected_input_dim = current_injected_agent_instance.fc1.weight.shape[1]
                 else:
@@ -406,7 +405,6 @@ def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_di
                     m = Categorical(masked_probs)
                     action = m.sample().item()
                     log_prob_value = m.log_prob(torch.tensor(action, device=device)).item()
-                # Do not store transitions for injected bots.
             else:
                 observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
                 probs, _, _ = policy_nets[agent](observation_tensor, None)
@@ -427,7 +425,6 @@ def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_di
             
             step_rewards = env.rewards.copy()
             env.rewards = {agent: 0 for agent in env.possible_agents}
-            # Update pending rewards.
             for ag in agents:
                 if ag != agent:
                     pending_rewards[ag] += step_rewards[ag]
@@ -450,13 +447,12 @@ def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_di
                         )
                     episode_rewards[ag] += reward
 
-        # --- Update win tracking after the episode using env.winner ---
+        # Update win tracking after the episode using env.winner.
         winners = env.winner
         if not isinstance(winners, list):
             winners = [winners]
 
         if current_injected_agent_id is not None:
-            # Create a unique opponent key:
             if current_injected_bot_type == "historical":
                 opponent_key = current_injected_bot_identifier
             else:
@@ -466,9 +462,7 @@ def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_di
                     continue
                 if opponent_key not in recent_results[agent]:
                     recent_results[agent][opponent_key] = deque(maxlen=100)
-                
                 recent_results[agent][opponent_key].append(1 if agent in winners and current_injected_agent_id not in winners else 0)
-
                 match_stats[agent][opponent_key] = len(recent_results[agent][opponent_key])
                 win_stats[agent][opponent_key] = sum(recent_results[agent][opponent_key])
 
@@ -517,7 +511,6 @@ def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_di
                 returns_ = torch.tensor(np.array(memory.returns[agent], dtype=np.float32), device=device)
                 advantages_ = torch.tensor(np.array(memory.advantages[agent], dtype=np.float32), device=device)
                 action_masks_ = torch.tensor(np.array(memory.action_masks[agent], dtype=np.float32), device=device)
-                # Safely normalize advantages.
                 adv_std = advantages_.std()
                 if adv_std < 1e-5:
                     normalized_advantages = advantages_
@@ -633,33 +626,36 @@ def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_di
             avg_steps_per_episode = steps_since_log / episodes_since_log
             elapsed_time = time.time() - last_log_time
             steps_per_second = steps_since_log / elapsed_time if elapsed_time > 0 else 0.0
+            
+            # Compute best win rate every log interval.
+            agent_win_rates = {}
+            for agent in agents:
+                opponent_rates = []
+                for opp_key in match_stats[agent]:
+                    if match_stats[agent][opp_key] > 0:
+                        opponent_rates.append(win_stats[agent].get(opp_key, 0) / match_stats[agent][opp_key])
+                if opponent_rates:
+                    weighted_rate = max(np.mean(opponent_rates) - np.std(opponent_rates), 0)
+                else:
+                    weighted_rate = 0.0
+                agent_win_rates[agent] = weighted_rate
+            best_win_rate = max(agent_win_rates.values()) if agent_win_rates else 0.0
+            
             logger.info(
                 f"Episode {episode}\tAverage Rewards: [{avg_rewards_str}]\t"
+                f"Best Win Rate: {best_win_rate*100:.2f}%\t"
                 f"Avg Steps/Ep: {avg_steps_per_episode:.2f}\t"
                 f"Time since last log: {elapsed_time:.2f} seconds\t"
                 f"Steps/s: {steps_per_second:.2f}"
             )
             
-            # --- Multi-fidelity reporting and early culling ---
-            if trial is not None:
-                agent_win_rates = {}
-                for agent in agents:
-                    opponent_rates = []
-                    for opp_key in match_stats[agent]:
-                        if match_stats[agent][opp_key] > 0:
-                            opponent_rates.append(win_stats[agent].get(opp_key, 0) / match_stats[agent][opp_key])
-                    if opponent_rates:
-                        weighted_rate = max(np.mean(opponent_rates) - np.std(opponent_rates), 0)
-                    else:
-                        weighted_rate = 0.0
-                    agent_win_rates[agent] = weighted_rate
-                current_best = max(agent_win_rates.values()) if agent_win_rates else 0.0
-                trial.report(current_best, episode)
+            # Only report and possibly prune if episode >= 2500.
+            if trial is not None and episode >= 2500:
+                trial.report(best_win_rate, episode)
                 if trial.should_prune():
-                    logger.info(f"Pruning trial at episode {episode} with best win rate {current_best}")
+                    logger.info(f"Pruning trial at episode {episode} with best win rate {best_win_rate}")
                     raise optuna.TrialPruned()
-            # -------------------------------------------------
-            
+    
             for agent in agents:
                 if agent == current_injected_agent_id:
                     continue
@@ -735,7 +731,7 @@ def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_di
     if writer is not None:
         writer.close()
     
-    # --- Compute weighted win rates for each learning agent ---
+    # --- Compute weighted win rates for each learning agent at the end ---
     agent_win_rates = {}
     for agent in agents:
         opponent_rates = []
