@@ -248,13 +248,6 @@ def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_di
     obp_optimizer = optim.Adam(obp_model.parameters(), lr=config.OPPONENT_LEARNING_RATE)
     obp_memory = []
 
-    obp_model.eval()  # Disable dropout, batch norm randomness
-    example_observation = torch.randn(1, config.OPPONENT_INPUT_DIM).to(device)
-    example_memory_embedding = torch.randn(1, config.STRATEGY_DIM).to(device)
-
-    obp_model = torch.jit.trace(obp_model, (example_observation, example_memory_embedding))
-    obp_model.train(True)
-
     writer = get_tensorboard_writer(log_dir=config.TENSORBOARD_RUNS_DIR) if log_tensorboard else None
     checkpoint_dir = load_directory if load_directory is not None else config.CHECKPOINT_DIR
 
