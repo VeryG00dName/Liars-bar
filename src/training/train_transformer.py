@@ -499,7 +499,7 @@ if __name__ == "__main__":
     parser.add_argument("--training_data_path", type=str, default="opponent_training_data.pkl",
                         help="Path to the pickle file with training data.")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training.")
-    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs.")
+    parser.add_argument("--epochs", type=int, default=15, help="Number of training epochs.")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
     parser.add_argument("--max_seq_length", type=int, default=None, help="Maximum sequence length (None for variable).")
     parser.add_argument("--save_dir", type=str, default="checkpoints", help="Directory to save the trained model.")
