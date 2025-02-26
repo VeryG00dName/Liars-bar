@@ -23,7 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F  # For cosine similarity and loss functions.
 import torch.optim as optim
 from torch.distributions import Categorical
-
+from collections import deque
 # Environment & model imports
 from src.env.reward_restriction_wrapper_2 import RewardRestrictionWrapper2
 from src.env.liars_deck_env_core import LiarsDeckEnv
@@ -282,7 +282,9 @@ def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_di
     match_stats = {agent: {} for agent in agents}
     # New dictionary to count games played over a moving window of 100 episodes.
     games_played_counter = {agent: {} for agent in agents}
-
+    window_size = 100
+    recent_wins = {agent: {} for agent in agents}
+    recent_matches = {agent: {} for agent in agents}
     # Initialize networks, optimizers, and memories for each agent.
     policy_nets = {}
     value_nets = {}
