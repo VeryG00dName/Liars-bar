@@ -705,7 +705,7 @@ def main():
     Uses reinforcement learning with opponent behavior prediction and strategy embeddings.
     Logs training progress and saves checkpoints.
     """
-    set_seed()
+    set_seed(config.SEED)
     device = torch.device(config.DEVICE)
     if config.USE_WRAPPER: 
         base_env = LiarsDeckEnv(num_players=config.NUM_PLAYERS, render_mode=config.RENDER_MODE)
