@@ -489,12 +489,12 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 memory = memories[agent]
                 if not memory.states[agent]:
                     continue
-                states = torch.from_numpy(np.array(memory.states[agent], dtype=np.float32)).to(device)
-                actions_ = torch.from_numpy(np.array(memory.actions[agent], dtype=np.int64)).to(device)
-                old_log_probs = torch.from_numpy(np.array(memory.log_probs[agent], dtype=np.float32)).to(device)
-                returns_ = torch.from_numpy(np.array(memory.returns[agent], dtype=np.float32)).to(device)
-                advantages_ = torch.from_numpy(np.array(memory.advantages[agent], dtype=np.float32)).to(device)
-                action_masks_ = torch.from_numpy(np.array(memory.action_masks[agent], dtype=np.float32)).to(device)
+                states = torch.tensor(np.array(memory.states[agent], dtype=np.float32), device=device)
+                actions_ = torch.tensor(np.array(memory.actions[agent], dtype=np.int64), device=device)
+                old_log_probs = torch.tensor(np.array(memory.log_probs[agent], dtype=np.float32), device=device)
+                returns_ = torch.tensor(np.array(memory.returns[agent], dtype=np.float32), device=device)
+                advantages_ = torch.tensor(np.array(memory.advantages[agent], dtype=np.float32), device=device)
+                action_masks_ = torch.tensor(np.array(memory.action_masks[agent], dtype=np.float32), device=device)
                 # Safely normalize advantages.
                 adv_std = advantages_.std()
                 if adv_std < 1e-5:
