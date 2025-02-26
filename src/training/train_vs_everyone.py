@@ -1,5 +1,3 @@
-# src/training/train_vs_everyone.py 
-
 import logging
 import time
 import os
@@ -16,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F  # For cosine similarity and loss functions.
 import torch.optim as optim
 from torch.distributions import Categorical
+from collections import deque  # For moving average win rate tracking
 
 # Environment & model imports
 from src.env.reward_restriction_wrapper_2 import RewardRestrictionWrapper2
@@ -146,9 +145,10 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
     num_opponents = config.NUM_PLAYERS - 1
     config.set_derived_config(env.observation_spaces[agents[0]], env.action_spaces[agents[0]], num_opponents)
 
-    # Initialize win tracking: for each agent, we track wins and matches vs every injected opponent type.
-    win_stats = {agent: {} for agent in agents}
-    match_stats = {agent: {} for agent in agents}
+    # Initialize moving average win tracking:
+    # For each agent (the learning agents) and each opponent type, we keep a deque (window=100) of binary win outcomes.
+    win_history = {agent: {} for agent in agents}
+
     # New dictionary to count games played over a moving window of 100 episodes.
     games_played_counter = {agent: {} for agent in agents}
 
@@ -262,7 +262,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
             current_injected_agent_id = random.choice(agents)
             tracked_agent = current_injected_agent_id
             # Instead of a uniform random selection, select based on win rates.
-            selected_bot = select_injected_bot(current_injected_agent_id, injected_bots, win_stats, match_stats)
+            selected_bot = select_injected_bot(current_injected_agent_id, injected_bots, win_history, games_played_counter)
             current_injected_bot_type = selected_bot[0]
             if current_injected_bot_type == "hardcoded":
                 bot_class = selected_bot[1]
@@ -427,13 +427,12 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                         )
                     episode_rewards[ag] += reward
 
-        # --- Update win tracking after the episode using env.winner ---
+        # --- Update moving average win tracking after the episode using env.winner ---
         winners = env.winner
         if not isinstance(winners, list):
             winners = [winners]
 
         if current_injected_agent_id is not None:
-            # Create a unique opponent key:
             if current_injected_bot_type == "historical":
                 opponent_key = current_injected_bot_identifier
             else:
@@ -441,14 +440,15 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
             for agent in agents:
                 if agent == current_injected_agent_id:
                     continue
-                match_stats[agent].setdefault(opponent_key, 0)
-                match_stats[agent][opponent_key] += 1
-                # Also update games played counter (to track over 100 episodes)
+                # Initialize the deque if it doesn't exist yet.
+                if opponent_key not in win_history[agent]:
+                    win_history[agent][opponent_key] = deque(maxlen=100)
+                # Determine win (1) or loss (0) for this episode.
+                win = 1 if (agent in winners and current_injected_agent_id not in winners) else 0
+                win_history[agent][opponent_key].append(win)
+                # Also update games played counter if needed.
                 games_played_counter[agent].setdefault(opponent_key, 0)
                 games_played_counter[agent][opponent_key] += 1
-                if agent in winners and current_injected_agent_id not in winners:
-                    win_stats[agent].setdefault(opponent_key, 0)
-                    win_stats[agent][opponent_key] += 1
 
         for agent in agents:
             recent_rewards[agent].append(episode_rewards[agent])
@@ -620,17 +620,15 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
             for agent in agents:
                 if agent == current_injected_agent_id:
                     continue
-                total_wins = sum(win_stats[agent].values())
-                total_matches = sum(match_stats[agent].values())
-
-                overall_rate = (total_wins / total_matches * 100) if total_matches > 0 else 0
-
+                # Compute overall moving average win rate over the last 100 episodes for this agent.
+                all_outcomes = []
+                for outcomes in win_history[agent].values():
+                    all_outcomes.extend(outcomes)
+                overall_rate = (sum(all_outcomes)/len(all_outcomes)*100) if all_outcomes else 0
                 if writer is not None:
                     writer.add_scalar(f"WinRate/{agent}_Overall", overall_rate, episode)
-                for opp_key in match_stats[agent]:
-                    wins = win_stats[agent].get(opp_key, 0)
-                    total = match_stats[agent].get(opp_key, 1)
-                    rate = wins / total * 100
+                for opp_key, outcomes in win_history[agent].items():
+                    rate = (sum(outcomes)/len(outcomes)*100) if outcomes else 0
                     if writer is not None:
                         writer.add_scalar(f"WinRate/{agent}_vs_{opp_key}", rate, episode)
     
