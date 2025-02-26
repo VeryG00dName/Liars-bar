@@ -3,6 +3,7 @@
 import random
 import numpy as np
 import torch
+import copy
 from src import config
 import os
 
@@ -135,7 +136,7 @@ def search_and_lookahead(env, agent, policy_nets, depth=2):
         if action_mask[action] == 0:
             continue  # Skip invalid actions.
 
-        env_copy = env.clone()
+        env_copy = copy.deepcopy(env)
         env_copy.step(action)
         future_value = search_and_lookahead(env_copy, agent, depth - 1)
 
