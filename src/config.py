@@ -85,7 +85,7 @@ STRATEGY_TOKEN_EMBEDDING_DIM = 64       # Dimension of token embeddings.
 STRATEGY_NHEAD = 4                      # Number of attention heads.
 STRATEGY_NUM_LAYERS = 2                 # Number of transformer encoder layers.
 STRATEGY_DIM = 5                       # Final dimension of the strategy embedding.
-STRATEGY_NUM_CLASSES = 25                # Unused after removing the classification head.
+STRATEGY_NUM_CLASSES = 42                # Unused after removing the classification head.
 STRATEGY_DROPOUT = 0.1                  # Dropout rate in the transformer.
 
 # ----------------------------
