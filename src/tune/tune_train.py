@@ -280,6 +280,7 @@ def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_di
     # Initialize win tracking: for each agent, we track wins and matches vs every injected opponent type.
     win_stats = {agent: {} for agent in agents}
     match_stats = {agent: {} for agent in agents}
+    recent_results = {agent: {} for agent in agents}  # Store last 100 results
     # New dictionary to count games played over a moving window of 100 episodes.
     games_played_counter = {agent: {} for agent in agents}
     window_size = 100
@@ -572,14 +573,13 @@ def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_di
             for agent in agents:
                 if agent == current_injected_agent_id:
                     continue
-                match_stats[agent].setdefault(opponent_key, 0)
-                match_stats[agent][opponent_key] += 1
-                # Also update games played counter (to track over 100 episodes)
-                games_played_counter[agent].setdefault(opponent_key, 0)
-                games_played_counter[agent][opponent_key] += 1
-                if agent in winners and current_injected_agent_id not in winners:
-                    win_stats[agent].setdefault(opponent_key, 0)
-                    win_stats[agent][opponent_key] += 1
+                if opponent_key not in recent_results[agent]:
+                    recent_results[agent][opponent_key] = deque(maxlen=100)
+                
+                recent_results[agent][opponent_key].append(1 if agent in winners and current_injected_agent_id not in winners else 0)
+
+                match_stats[agent][opponent_key] = len(recent_results[agent][opponent_key])
+                win_stats[agent][opponent_key] = sum(recent_results[agent][opponent_key])
 
         for agent in agents:
             recent_rewards[agent].append(episode_rewards[agent])
@@ -752,10 +752,10 @@ def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_di
                 if agent == current_injected_agent_id:
                     continue
                 
-                total_wins = sum(win_stats[agent].values())
-                total_matches = sum(match_stats[agent].values())
+                recent_wins = sum(win_stats[agent].values())
+                recent_matches = sum(match_stats[agent].values())
 
-                overall_rate = (total_wins / total_matches * 100) if total_matches > 0 else 0
+                overall_rate = (recent_wins / recent_matches * 100) if recent_matches > 0 else 0
 
                 if writer is not None:
                     writer.add_scalar(f"WinRate/{agent}_Overall", overall_rate, episode)
