@@ -24,6 +24,10 @@ import torch.nn.functional as F  # For cosine similarity and loss functions.
 import torch.optim as optim
 from torch.distributions import Categorical
 from collections import deque
+
+# Import optuna so we can raise TrialPruned if needed.
+import optuna
+
 # Environment & model imports
 from src.env.reward_restriction_wrapper_2 import RewardRestrictionWrapper2
 from src.env.liars_deck_env_core import LiarsDeckEnv
@@ -140,7 +144,6 @@ strategy_transformer.eval()
 # ---------------------------
 from src.eval.evaluate_utils import load_combined_checkpoint  # Ensure this is imported
 
-
 historical_models = load_specific_historical_models(config.HISTORICAL_MODEL_DIR, device)
 print(f"Loaded {len(historical_models)} historical PPO models: {', '.join([id for _, id in historical_models])}")
 
@@ -148,11 +151,10 @@ print(f"Loaded {len(historical_models)} historical PPO models: {', '.join([id fo
 for idx, (_, identifier) in enumerate(historical_models):
     historical_label_mapping[identifier] = len(HARD_CODED_LABELS) + idx
 
-
 # ---------------------------
 # Main training loop.
 # ---------------------------
-def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_directory=None, log_tensorboard=True, logger=None):
+def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_directory=None, log_tensorboard=True, logger=None, trial=None):
     # If no logger is passed in, configure one.
     if logger is None:
         logger = logging.getLogger('Train')
@@ -637,26 +639,41 @@ def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_di
                 f"Time since last log: {elapsed_time:.2f} seconds\t"
                 f"Steps/s: {steps_per_second:.2f}"
             )
+            
+            # --- Multi-fidelity reporting and early culling ---
+            if trial is not None:
+                agent_win_rates = {}
+                for agent in agents:
+                    opponent_rates = []
+                    for opp_key in match_stats[agent]:
+                        if match_stats[agent][opp_key] > 0:
+                            opponent_rates.append(win_stats[agent].get(opp_key, 0) / match_stats[agent][opp_key])
+                    if opponent_rates:
+                        weighted_rate = max(np.mean(opponent_rates) - np.std(opponent_rates), 0)
+                    else:
+                        weighted_rate = 0.0
+                    agent_win_rates[agent] = weighted_rate
+                current_best = max(agent_win_rates.values()) if agent_win_rates else 0.0
+                trial.report(current_best, episode)
+                if trial.should_prune():
+                    logger.info(f"Pruning trial at episode {episode} with best win rate {current_best}")
+                    raise optuna.TrialPruned()
+            # -------------------------------------------------
+            
             for agent in agents:
                 if agent == current_injected_agent_id:
                     continue
-                
                 recent_wins = sum(win_stats[agent].values())
                 recent_matches = sum(match_stats[agent].values())
-
                 overall_rate = (recent_wins / recent_matches * 100) if recent_matches > 0 else 0
-
                 if writer is not None:
                     writer.add_scalar(f"WinRate/{agent}_Overall", overall_rate, episode)
-                
                 for opp_key in match_stats[agent]:
                     wins = win_stats[agent].get(opp_key, 0)
                     total = match_stats[agent].get(opp_key, 1)
                     rate = wins / total * 100
                     if writer is not None:
                         writer.add_scalar(f"WinRate/{agent}_vs_{opp_key}", rate, episode)
-                
-                # --- New weighted win rate logging ---
                 opp_rates = [win_stats[agent].get(opp_key, 0) / match_stats[agent][opp_key]
                              for opp_key in match_stats[agent] if match_stats[agent][opp_key] > 0]
                 if opp_rates:
@@ -719,8 +736,6 @@ def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_di
         writer.close()
     
     # --- Compute weighted win rates for each learning agent ---
-    # For each agent, we compute the win rate against each opponent type and then combine them as:
-    # weighted_win_rate = mean(win_rates) - std(win_rates), clamped to a minimum of 0.
     agent_win_rates = {}
     for agent in agents:
         opponent_rates = []
