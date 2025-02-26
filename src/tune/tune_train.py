@@ -109,47 +109,64 @@ strategy_transformer = StrategyTransformer(
 # ---------------------------
 # Load the transformer checkpoint (and related mappings).
 # ---------------------------
-transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
-if os.path.exists(transformer_checkpoint_path):
+def load_strategy_transformer_and_event_encoder(device):
+    """
+    Loads the strategy transformer and associated mappings and event encoder
+    from the checkpoint. All tensors will be moved to the passed device.
+    Returns:
+        strategy_transformer, response2idx, action2idx, label_mapping, event_encoder
+    """
+    transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
+    if not os.path.exists(transformer_checkpoint_path):
+        raise FileNotFoundError(f"Transformer checkpoint not found at {transformer_checkpoint_path}")
+    
     checkpoint = torch.load(transformer_checkpoint_path, map_location=device)
+    
+    strategy_transformer = StrategyTransformer(
+        num_tokens=config.STRATEGY_NUM_TOKENS,
+        token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM,
+        nhead=config.STRATEGY_NHEAD,
+        num_layers=config.STRATEGY_NUM_LAYERS,
+        strategy_dim=config.STRATEGY_DIM,
+        num_classes=config.STRATEGY_NUM_CLASSES,  # Classification head removed below.
+        dropout=config.STRATEGY_DROPOUT,
+        use_cls_token=True
+    ).to(device)
+    
     strategy_transformer.load_state_dict(checkpoint["transformer_state_dict"], strict=False)
     print(f"Loaded transformer from {transformer_checkpoint_path}")
+    
     if "response2idx" in checkpoint and "action2idx" in checkpoint:
         response2idx = checkpoint["response2idx"]
         action2idx = checkpoint["action2idx"]
         print("Loaded response and action mappings from checkpoint.")
     else:
         raise ValueError("Checkpoint is missing response2idx and/or action2idx.")
+    
     if "label_mapping" in checkpoint:
         label_mapping = checkpoint["label_mapping"]
+        # For convenience, also unpack label2idx and idx2label.
         label2idx = label_mapping["label2idx"]
         idx2label = label_mapping["idx2label"]
         print("Loaded label mapping from checkpoint.")
+    else:
+        label_mapping = None  # or raise an error if required
+
+    # Load the event encoder and ensure it is on the correct device.
     event_encoder = EventEncoder(
         response_vocab_size=len(response2idx),
         action_vocab_size=len(action2idx),
         token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM
     ).to(device)
     event_encoder.load_state_dict(checkpoint["event_encoder_state_dict"])
-else:
-    raise FileNotFoundError(f"Transformer checkpoint not found at {transformer_checkpoint_path}")
-
-# Override the transformer's token embedding and remove its classification head.
-strategy_transformer.token_embedding = nn.Identity()
-strategy_transformer.classification_head = None
-strategy_transformer.eval()
-
-# ---------------------------
-# Historical PPO Model Loader (inspired by your evaluation script)
-# ---------------------------
-from src.eval.evaluate_utils import load_combined_checkpoint  # Ensure this is imported
-
-historical_models = load_specific_historical_models(config.HISTORICAL_MODEL_DIR, device)
-print(f"Loaded {len(historical_models)} historical PPO models: {', '.join([id for _, id in historical_models])}")
-
-# Build a mapping from historical model identifier to unique label.
-for idx, (_, identifier) in enumerate(historical_models):
-    historical_label_mapping[identifier] = len(HARD_CODED_LABELS) + idx
+    event_encoder = event_encoder.to(device)  # double-check that it's on the correct device
+    
+    # Override the transformer's token embedding and remove its classification head.
+    strategy_transformer.token_embedding = nn.Identity()
+    strategy_transformer.classification_head = None
+    strategy_transformer.eval()
+    
+    return strategy_transformer, response2idx, action2idx, label_mapping, event_encoder
 
 # ---------------------------
 # Main training loop.
@@ -161,7 +178,19 @@ def train_agents(env, device, num_episodes=10000, load_checkpoint=False, load_di
         logger = logging.getLogger('Train')
         if not logger.hasHandlers():
             logger = configure_logger()
+            
+    # ---------------------------
+    # Historical PPO Model Loader (inspired by your evaluation script)
+    # ---------------------------
 
+    historical_models = load_specific_historical_models(config.HISTORICAL_MODEL_DIR, device)
+    print(f"Loaded {len(historical_models)} historical PPO models: {', '.join([id for _, id in historical_models])}")
+
+    # Build a mapping from historical model identifier to unique label.
+    for idx, (_, identifier) in enumerate(historical_models):
+        historical_label_mapping[identifier] = len(HARD_CODED_LABELS) + idx
+        
+    strategy_transformer, response2idx, action2idx, label_mapping, event_encoder = load_strategy_transformer_and_event_encoder(device)
     set_seed(config.SEED)
     obs, infos = env.reset(seed=config.SEED)
     agents = env.agents
