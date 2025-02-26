@@ -119,7 +119,7 @@ def run_obp_inference(obp_model, obs_array, device, num_players, memory_embeddin
         bluff_prob = probs[0, 1].item()
         obp_probs.append(bluff_prob)
     return obp_probs
-def search_and_lookahead(env, agent, policy_nets, depth=2):
+def search_and_lookahead(env, agent, depth=2):
     """
     Performs a limited-depth lookahead search to evaluate future game states.
     Uses the agent's policy network to estimate action values.
