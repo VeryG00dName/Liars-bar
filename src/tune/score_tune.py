@@ -48,20 +48,20 @@ def objective(trial: optuna.trial.Trial) -> float:
     """
     # --- 1) Sample scoring parameters using Optuna ---
     scoring_params = {
-        "play_reward_per_card": trial.suggest_int("play_reward_per_card", -4, 2),  # default -1: [-4, 2]
-        "play_reward": trial.suggest_int("play_reward", -2, 4),  # default 1: [-2, 4]
-        "challenge_success_challenger_reward": trial.suggest_int("challenge_success_challenger_reward", 7, 13),  # default 10: [7, 13]
-        "challenge_success_claimant_penalty": trial.suggest_int("challenge_success_claimant_penalty", -3, 3),  # default 0: [-3, 3]
-        "challenge_fail_challenger_penalty": trial.suggest_int("challenge_fail_challenger_penalty", -3, 3),  # default 0: [-3, 3]
-        "challenge_fail_claimant_reward": trial.suggest_int("challenge_fail_claimant_reward", 2, 8),  # default 5: [2, 8]
+        "play_reward_per_card": trial.suggest_int("play_reward_per_card", -2, 2),  # default -1: [-4, 2]
+        "play_reward": trial.suggest_int("play_reward", -2, 2),  # default 1: [-2, 4]
+        "challenge_success_challenger_reward": trial.suggest_int("challenge_success_challenger_reward", -1, 10),  # default 10: [7, 13]
+        "challenge_success_claimant_penalty": trial.suggest_int("challenge_success_claimant_penalty", -6, 1),  # default 0: [-3, 3]
+        "challenge_fail_challenger_penalty": trial.suggest_int("challenge_fail_challenger_penalty", -6, 1),  # default 0: [-3, 3]
+        "challenge_fail_claimant_reward": trial.suggest_int("challenge_fail_claimant_reward", -1, 8),  # default 5: [2, 8]
         "forced_challenge_success_challenger_reward": trial.suggest_int("forced_challenge_success_challenger_reward", -3, 3),  # default 0: [-3, 3]
-        "forced_challenge_success_claimant_penalty": trial.suggest_int("forced_challenge_success_claimant_penalty", -13, -7),  # default -10: [-13, -7]
-        "forced_challenge_fail_challenger_penalty": trial.suggest_int("forced_challenge_fail_challenger_penalty", -6, 0),  # default -3: [-6, 0]
-        "forced_challenge_fail_claimant_reward": trial.suggest_int("forced_challenge_fail_claimant_reward", -3, 3),  # default 0: [-3, 3]
-        "termination_penalty": trial.suggest_int("termination_penalty", -4, 2),  # default -1: [-4, 2]
-        "game_win_bonus": trial.suggest_int("game_win_bonus", 13, 19),  # default 16: [13, 19]
-        "game_lose_penalty": trial.suggest_int("game_lose_penalty", -14, -8),  # default -11: [-14, -8]
-        "hand_empty_bonus": trial.suggest_int("hand_empty_bonus", -3, 3),  # default 0: [-3, 3]
+        "forced_challenge_success_claimant_penalty": trial.suggest_int("forced_challenge_success_claimant_penalty", -10, 1),  # default -10: [-13, -7]
+        "forced_challenge_fail_challenger_penalty": trial.suggest_int("forced_challenge_fail_challenger_penalty", -6, 1),  # default -3: [-6, 0]
+        "forced_challenge_fail_claimant_reward": trial.suggest_int("forced_challenge_fail_claimant_reward", -1, 3),  # default 0: [-3, 3]
+        "termination_penalty": trial.suggest_int("termination_penalty", -5, 1),  # default -1: [-4, 2]
+        "game_win_bonus": trial.suggest_int("game_win_bonus", 10, 20),  # default 16: [13, 19]
+        "game_lose_penalty": trial.suggest_int("game_lose_penalty", -20, -8),  # default -11: [-14, -8]
+        "hand_empty_bonus": trial.suggest_int("hand_empty_bonus", -1, 3),  # default 0: [-3, 3]
         "consecutive_action_penalty": trial.suggest_int("consecutive_action_penalty", -2, 4),  # default 1: [-2, 4]
         "successful_bluff_reward": trial.suggest_int("successful_bluff_reward", -3, 3),  # default 0: [-3, 3]
         "unchallenged_bluff_penalty": trial.suggest_int("unchallenged_bluff_penalty", -5, 1)  # default -2: [-5, 1]
@@ -72,7 +72,6 @@ def objective(trial: optuna.trial.Trial) -> float:
     config.TENSORBOARD_RUNS_DIR = os.path.join(original_log_dir, f"trial_{trial.number}")
     os.makedirs(config.TENSORBOARD_RUNS_DIR, exist_ok=True)
     
-    # Create a SummaryWriter for logging without modifying the global config.
     from torch.utils.tensorboard import SummaryWriter
     writer = SummaryWriter(log_dir=config.TENSORBOARD_RUNS_DIR)
     logger = logging.getLogger("ScoreTune")
@@ -85,18 +84,23 @@ def objective(trial: optuna.trial.Trial) -> float:
     # Determine the GPU device to use:
     gpu_count = torch.cuda.device_count()
     if gpu_count > 0:
-        # Distribute trials across available GPUs by using trial.number modulo gpu_count
         gpu_id = trial.number % gpu_count
         device = torch.device(f'cuda:{gpu_id}')
     else:
         device = torch.device('cpu')
     
-    TUNE_NUM_EPISODES = 5000
+    TUNE_NUM_EPISODES = 15000
 
-    # --- 4) Run the new tune_train training routine ---
+    # --- 4) Run the new tune_train training routine, passing the trial object ---
     set_seed(config.SEED)  # Ensure reproducibility
-    training_results = tune_train(train_env, device, num_episodes=TUNE_NUM_EPISODES,
-                                  log_tensorboard=True, logger=logger)
+    training_results = tune_train(
+        train_env, 
+        device, 
+        num_episodes=TUNE_NUM_EPISODES,
+        log_tensorboard=True, 
+        logger=logger,
+        trial=trial  # Pass trial so that intermediate reporting and pruning can occur
+    )
     best_win_rate = training_results.get('best_win_rate', 0.0)
     logging.info(f"Trial {trial.number}: Best win rate = {best_win_rate*100:.2f}%")
 
@@ -126,6 +130,13 @@ def main():
     storage_name = "sqlite:///my_optuna_study.db"
     study_name = "liars_deck_scoring_study"
 
+    # Create a Hyperband pruner that will not allow culling until after 2500 episodes.
+    pruner = optuna.pruners.HyperbandPruner(
+        min_resource=2500,  # No trial is pruned before 2500 episodes.
+        max_resource=15000,
+        reduction_factor=3
+    )
+    
     try:
         study = optuna.load_study(study_name=study_name, storage=storage_name)
         logger.info("Loaded existing Optuna study.")
@@ -134,7 +145,8 @@ def main():
         study = optuna.create_study(
             study_name=study_name, 
             storage=storage_name, 
-            direction="maximize"
+            direction="maximize",
+            pruner=pruner
         )
     except Exception as e:
         logger.error(f"Error loading study: {e}")
