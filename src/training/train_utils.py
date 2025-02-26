@@ -256,16 +256,21 @@ def load_specific_historical_models(players_dir, device):
                 checkpoint_path = os.path.join(version_path, checkpoint_file)
                 try:
                     from src.eval.evaluate_utils import load_combined_checkpoint
+                    # Import the helper function to determine the hidden dimension
+                    from src.eval.evaluate_utils import get_hidden_dim_from_state_dict
                     checkpoint = load_combined_checkpoint(checkpoint_path, device)
                     policy_nets = checkpoint['policy_nets']
 
                     if player_name in policy_nets:
                         policy_state_dict = policy_nets[player_name]
+                        # Get the input dimension from the existing state dict
                         actual_input_dim = policy_state_dict['fc1.weight'].shape[1]
+                        # Use the helper to determine the hidden dimension
+                        actual_hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, layer_prefix='fc1')
                         from src.model.new_models import PolicyNetwork
                         hist_policy = PolicyNetwork(
                             input_dim=actual_input_dim,
-                            hidden_dim=config.HIDDEN_DIM,
+                            hidden_dim=actual_hidden_dim,
                             output_dim=config.OUTPUT_DIM,
                             use_lstm=True,
                             use_dropout=True,
@@ -302,7 +307,10 @@ def select_injected_bot(agent, injected_bots, win_stats, match_stats):
         
         matches = match_stats[agent].get(opponent_key, 0)
         wins = win_stats[agent].get(opponent_key, 0)
-        win_rate = (sum(wins) / matches) if matches > 0 else 0.5
+        if isinstance(wins, int):
+            win_rate = (wins / matches) if matches > 0 else 0.5
+        else:
+            win_rate = (sum(wins) / matches) if matches > 0 else 0.5
         
         # Ensure win_rate is in [0, 1] so that weight = 1 - win_rate is non-negative.
         win_rate = min(max(win_rate, 0), 1)
