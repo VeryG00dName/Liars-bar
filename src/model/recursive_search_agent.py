@@ -52,7 +52,16 @@ class RecursiveSearchAgent:
             observation: Current observation
             action_mask: Mask of valid actions
         """
-        obs_tensor = torch.FloatTensor(observation).unsqueeze(0).to(self.device)
+        # Make sure observation is properly shaped
+        if isinstance(observation, dict):
+            # If observation is a dictionary (from env.observe()),
+            # extract the tensor part for the current agent
+            obs_data = observation[self.name]
+        else:
+            # Otherwise use as is
+            obs_data = observation
+        
+        obs_tensor = torch.FloatTensor(obs_data).unsqueeze(0).to(self.device)
         
         with torch.no_grad():
             if self.current_beliefs is None:
