@@ -179,3 +179,4 @@ opponent_training_data.pkl
 .qodo/history.sqlite
 /logs
 *.pt
+*.json
