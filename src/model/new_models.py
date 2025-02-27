@@ -428,3 +428,148 @@ class CFRValueNetwork(nn.Module):
         # Forward pass
         value = self.network(combined)
         return value
+
+
+class RebelPolicyNetwork(nn.Module):
+    """
+    Policy network specialized for belief-based decision making.
+    Takes both observations and belief states as input to make decisions.
+    """
+    def __init__(self, obs_dim, belief_dim, hidden_dim, action_dim, 
+                 use_residual=True, use_layer_norm=True, dropout_rate=0.2):
+        super(RebelPolicyNetwork, self).__init__()
+        self.obs_dim = obs_dim
+        self.belief_dim = belief_dim
+        self.action_dim = action_dim
+        self.use_residual = use_residual
+        self.residual_proj = nn.Linear(hidden_dim, action_dim)
+        # Process observation features
+        self.obs_encoder = nn.Sequential(
+            nn.Linear(obs_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim) if use_layer_norm else nn.Identity(),
+            nn.Dropout(dropout_rate)
+        )
+        
+        # Process belief features
+        self.belief_encoder = nn.Sequential(
+            nn.Linear(belief_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim) if use_layer_norm else nn.Identity(),
+            nn.Dropout(dropout_rate)
+        )
+        
+        # Combined processing
+        self.joint_encoder = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim) if use_layer_norm else nn.Identity(),
+            nn.Dropout(dropout_rate)
+        )
+        
+        # Action prediction with residual connection
+        self.action_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim) if use_layer_norm else nn.Identity(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, action_dim)
+        )
+        
+        # Value prediction (auxiliary output)
+        self.value_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim // 2) if use_layer_norm else nn.Identity(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+        
+        # Initialize with appropriate scaling
+        self._init_weights()
+    
+    def _init_weights(self):
+        # Orthogonal initialization for better gradient flow
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, gain=1.0)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+    
+    def forward(self, obs, beliefs=None, hidden_state=None):
+        """
+        Forward pass through the policy network.
+        
+        Args:
+            obs: Observation tensor [batch_size, obs_dim]
+            beliefs: Belief state tensor [batch_size, belief_dim] or None
+                    If None, model relies solely on observations
+            hidden_state: Not used, included for API compatibility
+            
+        Returns:
+            action_probs: Action probabilities [batch_size, action_dim]
+            value: State value estimate [batch_size, 1]
+            None: For compatibility with the original policy network
+        """
+        batch_size = obs.size(0)
+        
+        # Process observation
+        obs_features = self.obs_encoder(obs)
+        
+        # Process beliefs (if provided)
+        if beliefs is not None:
+            # Flatten beliefs into [batch_size, belief_dim]
+            if beliefs.dim() > 2:
+                beliefs_flat = beliefs.reshape(batch_size, -1)
+            else:
+                beliefs_flat = beliefs
+                
+            belief_features = self.belief_encoder(beliefs_flat)
+            
+            # Combine features
+            combined_features = torch.cat([obs_features, belief_features], dim=1)
+            joint_features = self.joint_encoder(combined_features)
+        else:
+            # If no beliefs, duplicate observation features
+            joint_features = self.joint_encoder(torch.cat([obs_features, obs_features], dim=1))
+        
+        # Action prediction with residual connection
+        if self.use_residual:
+            action_logits = self.action_head(joint_features) + self.residual_proj(joint_features)
+        else:
+            action_logits = self.action_head(joint_features)
+            
+        action_probs = F.softmax(action_logits, dim=1)
+        
+        # Value prediction
+        value = self.value_head(joint_features)
+        
+        return action_probs, value, None  # None for compatibility with original network
+    
+    def act(self, observation, beliefs=None):
+        """
+        Choose an action based on observation and beliefs.
+        
+        Args:
+            observation: Current observation tensor
+            beliefs: Current belief state
+            
+        Returns:
+            action: Selected action
+            action_prob: Probability of the selected action
+            state_value: Estimated state value
+        """
+        with torch.no_grad():
+            # Ensure observation is a tensor
+            if not isinstance(observation, torch.Tensor):
+                observation = torch.FloatTensor(observation).unsqueeze(0)
+            
+            # Get action probabilities
+            action_probs, state_value, _ = self.forward(observation, beliefs)
+            
+            # Sample action
+            action_dist = torch.distributions.Categorical(action_probs)
+            action = action_dist.sample().item()
+            action_prob = action_probs[0, action].item()
+            
+        return action, action_prob, state_value.item()
