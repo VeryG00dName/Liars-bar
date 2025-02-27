@@ -11,7 +11,7 @@ from collections import defaultdict
 from src import config
 from src.env.liars_deck_env_core import LiarsDeckEnv
 from src.env.liars_deck_env_utils_2 import decode_action
-from src.model.new_models import PolicyNetwork, ValueNetwork, BeliefStateModel, CFRValueNetwork
+from src.model.new_models import RebelPolicyNetwork, ValueNetwork, BeliefStateModel, CFRValueNetwork
 from src.model.recursive_search_agent import RecursiveSearchAgent
 from src.training.train_utils import save_checkpoint, get_tensorboard_writer
 
@@ -58,7 +58,7 @@ def collect_experience(env, agents, num_games=10):
             observations = env.observe(current_agent_id)
             infos = env.infos
             
-            obs = observations
+            obs = observations[current_agent_id]
             action_mask = infos[current_agent_id]['action_mask']
             
             # Update beliefs and choose action
@@ -136,7 +136,8 @@ def train_belief_model(belief_model, trajectories, optimizer, device, batch_size
         batch = transitions[i:i+batch_size]
         
         # Extract observations and targets
-        obs_batch = torch.FloatTensor([t['obs'] for t in batch]).to(device)
+        obs_batch = torch.FloatTensor(np.array([t['obs'] for t in batch])).to(device)
+
         
         # For training, we'll use a KL-divergence loss between:
         # 1. The model's predicted beliefs 
@@ -233,7 +234,7 @@ def train_value_network(value_net, trajectories, optimizer, device, gamma=0.99, 
         batch = processed_transitions[i:i+batch_size]
         
         # Extract data
-        obs_batch = torch.FloatTensor([t['obs'] for t in batch]).to(device)
+        obs_batch = torch.FloatTensor(np.array([t['obs'] for t in batch])).to(device)
         beliefs_batch = torch.cat([t['beliefs'] for t in batch]).to(device)
         returns_batch = torch.FloatTensor([t['return'] for t in batch]).unsqueeze(1).to(device)
         
@@ -255,7 +256,7 @@ def train_value_network(value_net, trajectories, optimizer, device, gamma=0.99, 
 
 def train_policy_network(policy_net, value_net, trajectories, optimizer, device, batch_size=32):
     """
-    Train the policy network using REINFORCE with baseline.
+    Train the policy network using REINFORCE with baseline and belief states.
     
     Args:
         policy_net: Policy network
@@ -286,26 +287,32 @@ def train_policy_network(policy_net, value_net, trajectories, optimizer, device,
         batch = transitions[i:i+batch_size]
         
         # Extract data
-        obs_batch = torch.FloatTensor([t['obs'] for t in batch]).to(device)
+        obs_batch = torch.FloatTensor(np.array([t['obs'] for t in batch])).to(device)
         action_batch = torch.LongTensor([t['action'] for t in batch]).to(device)
         reward_batch = torch.FloatTensor([t['reward'] for t in batch]).to(device)
         beliefs_batch = torch.cat([t['beliefs'] for t in batch]).to(device)
         
-        # Forward pass for policy
-        action_probs, _, _ = policy_net(obs_batch)
+        # Forward pass for policy with beliefs
+        action_probs, policy_values, _ = policy_net(obs_batch, beliefs_batch)
         
         # Get action log probabilities
-        log_probs = torch.log(action_probs.gather(1, action_batch.unsqueeze(1)).squeeze(1))
+        log_probs = torch.log(action_probs.gather(1, action_batch.unsqueeze(1)).squeeze(1) + 1e-10)
         
         # Compute baseline using value network
         with torch.no_grad():
             baseline = value_net(obs_batch, beliefs_batch).squeeze(1)
         
-        # Compute advantage (simplistic version - just use immediate reward)
+        # Compute advantage
         advantage = reward_batch - baseline
         
-        # Compute policy loss (negative because we're maximizing)
-        loss = -torch.mean(log_probs * advantage)
+        # Compute policy loss
+        policy_loss = -torch.mean(log_probs * advantage)
+        
+        # Add value prediction loss for joint training
+        value_loss = F.mse_loss(policy_values.squeeze(1), reward_batch)
+        
+        # Combined loss with value prediction as auxiliary task
+        loss = policy_loss + 0.5 * value_loss
         
         # Backward pass
         optimizer.zero_grad()
@@ -357,12 +364,29 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
     
     # For Liar's Deck, the number of cards would be:
     # (3 ranks × 6 each) + 2 jokers = 20 cards
-    num_cards = 20
-    
+    num_card_types = 4
     # Create networks
-    policy_net = PolicyNetwork(obs_dim, hidden_dim, action_dim).to(device)
-    belief_model = BeliefStateModel(obs_dim, hidden_dim, num_cards, num_players).to(device)
-    value_net = CFRValueNetwork(obs_dim, (num_players-1)*num_cards, hidden_dim).to(device)
+    policy_net = RebelPolicyNetwork(
+        obs_dim=obs_dim, 
+        belief_dim=(num_players-1)*num_card_types,  # Flattened belief dimension
+        hidden_dim=hidden_dim, 
+        action_dim=action_dim
+    ).to(device)
+
+    belief_model = BeliefStateModel(
+        input_dim=obs_dim, 
+        hidden_dim=hidden_dim, 
+        deck_size=20,  # Total deck size
+        num_players=num_players,
+        use_dropout=True, 
+        use_layer_norm=True
+    ).to(device)
+
+    value_net = CFRValueNetwork(
+        input_dim=obs_dim, 
+        belief_dim=(num_players-1)*num_card_types, 
+        hidden_dim=hidden_dim
+    ).to(device)
     
     # Create optimizers
     policy_optimizer = optim.Adam(policy_net.parameters(), lr=lr_policy)
@@ -416,13 +440,16 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
             os.makedirs(checkpoint_dir, exist_ok=True)
             
             # Save policy network using standard format
-            torch.save({
+            checkpoint_data = {
+                'policy_net': policy_net.state_dict(),
+                'policy_optimizer': policy_optimizer.state_dict(),
                 'belief_model': belief_model.state_dict(),
                 'belief_optimizer': belief_optimizer.state_dict(),
                 'value_net': value_net.state_dict(),
                 'value_optimizer': value_optimizer.state_dict(),
-                'epoch': epoch + 1
-            }, os.path.join(checkpoint_dir, f'rebel_extra_models_{epoch+1}.pt'))
+                'epoch': epoch + 1,
+            }
+            torch.save(checkpoint_data, os.path.join(checkpoint_dir, 'checkpoint_rebel.pt'))
     
     logger.info("Training complete!")
     return policy_net, belief_model, value_net, agents
