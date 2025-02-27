@@ -1,4 +1,4 @@
-import os
+import os 
 import torch
 import logging
 import argparse
@@ -6,7 +6,7 @@ import numpy as np
 from tqdm import tqdm
 
 from src.env.liars_deck_env_core import LiarsDeckEnv
-from src.model.new_models import RebelPolicyNetwork, BeliefStateModel, CFRValueNetwork
+from src.model.rebel_models import RebelPolicyNetwork, BeliefStateModel, CFRValueNetwork
 from src.model.recursive_search_agent import RecursiveSearchAgent
 from src.model.hard_coded_agents import (
     GreedyCardSpammer,
@@ -44,7 +44,6 @@ def load_rebel_agent(checkpoint_path, device, env):
         logger.error("Could not find the checkpoint file")
         return None
 
-    # Initialize models using the same dimensions as during training.
     num_players = env.num_players
     obs_dim = env.observation_spaces[env.possible_agents[0]].shape[0]
     action_dim = env.action_spaces[env.possible_agents[0]].n
@@ -52,10 +51,10 @@ def load_rebel_agent(checkpoint_path, device, env):
     num_card_types = 4  # Belief state uses 4 card types
     belief_dim = (num_players - 1) * num_card_types
 
-    # Create networks
+    # Create networks using updated Rebel models.
     policy_net = RebelPolicyNetwork(obs_dim, belief_dim, hidden_dim, action_dim).to(device)
     belief_model = BeliefStateModel(obs_dim, hidden_dim, deck_size=20, num_players=num_players).to(device)
-    value_net = CFRValueNetwork(obs_dim, belief_dim, hidden_dim).to(device)
+    value_net = CFRValueNetwork(obs_dim, belief_dim, hidden_dim, action_dim).to(device)
     
     # Load checkpoint containing all components
     checkpoint = torch.load(checkpoint_file, map_location=device)
@@ -65,12 +64,12 @@ def load_rebel_agent(checkpoint_path, device, env):
     
     logger.info(f"Loaded ReBeL agent from {checkpoint_path}")
 
-    # Create the agent with the loaded networks
+    # Create and return the agent with the loaded networks.
     return RecursiveSearchAgent(
         policy_net=policy_net,
         belief_model=belief_model,
         value_net=value_net,
-        env_creator=create_env,
+        env_creator=lambda: create_env(),
         device=device,
         search_depth=6,
         num_simulations=60,
@@ -82,16 +81,16 @@ def evaluate_rebel_vs_hardcoded(rebel_agent, num_games=20):
     logger = configure_logger()
     logger.info(f"Evaluating ReBeL agent against hardcoded bots ({num_games} games per opponent)")
     
-    # Wrap hardcoded bots that require extra parameters
+    # Wrap hardcoded bots that require extra parameters.
     hardcoded_bots = {
-            "GreedySpammer": GreedyCardSpammer,
-            "TableFirst": TableFirstConservativeChallenger,
-            "Strategic": lambda name: StrategicChallenger(name, 3, 2),
-            "Conservative": lambda name: SelectiveTableConservativeChallenger(name),
-            "TableNonTableAgent": TableNonTableAgent,
-            "Classic": Classic,
-            "Random": RandomAgent
-        }
+        "GreedySpammer": GreedyCardSpammer,
+        "TableFirst": TableFirstConservativeChallenger,
+        "Strategic": lambda name: StrategicChallenger(name, 3, 2),
+        "Conservative": lambda name: SelectiveTableConservativeChallenger(name),
+        "TableNonTableAgent": TableNonTableAgent,
+        "Classic": Classic,
+        "Random": RandomAgent
+    }
 
     results = {}
 
@@ -114,7 +113,7 @@ def evaluate_rebel_vs_hardcoded(rebel_agent, num_games=20):
                 "player_2": BotClass("Hardcoded_Bot")
             }
 
-            # Set agent names for identification.
+            # Set agent names/indices for identification.
             rebel_agent.name = "player_0"
             rebel_agent.agent_index = 0
             
@@ -130,17 +129,19 @@ def evaluate_rebel_vs_hardcoded(rebel_agent, num_games=20):
                 current_agent_id = env.agent_selection
                 current_agent = agents[current_agent_id]
                 
-                # Refresh observation and info
+                # Refresh observation and info.
                 obs_dict = env.observe(current_agent_id)
-                obs = obs_dict.get(current_agent_id, None)
-                if obs is None:
-                    obs = np.zeros(env.observation_spaces[current_agent_id].shape, dtype=np.float32)
-                # Ensure action mask is retrieved; default to all ones if missing.
+                obs = obs_dict.get(current_agent_id, np.zeros(env.observation_spaces[current_agent_id].shape, dtype=np.float32))
                 action_mask = env.infos.get(current_agent_id, {}).get('action_mask', [1] * env.action_spaces[current_agent_id].n)
                 
                 # Choose action.
-                action = current_agent.play_turn(obs, action_mask, env.table_card)
-                
+                # For the ReBeL agent, extract the selected action from the returned dictionary.
+                action_output = current_agent.play_turn(obs, action_mask, env.table_card)
+                if isinstance(action_output, dict):
+                    action = action_output['selected_action']
+                else:
+                    action = action_output
+
                 # Execute action.
                 env.step(action)
                 
