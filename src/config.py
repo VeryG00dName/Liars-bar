@@ -67,8 +67,9 @@ HIDDEN_DIM = 300             # Number of hidden units in neural networks
 INPUT_DIM = 26               
 
 # OUTPUT_DIM will be set dynamically based on the environment.
-OUTPUT_DIM = 7                
-
+OUTPUT_DIM = 7
+                
+NUM_OPPONENT_CLASSES = 9
 # ----------------------------
 # Opponent Model Configurations
 # ----------------------------
@@ -96,10 +97,10 @@ GAMMA = 0.99                  # Discount factor
 GAE_LAMBDA = 0.95             # GAE lambda parameter
 EPS_CLIP = 0.1                # PPO clip parameter
 K_EPOCHS = 4                  # Number of PPO epochs per update
-NUM_EPISODES = 20000         # Total number of training episodes
+NUM_EPISODES = 40000         # Total number of training episodes
 UPDATE_STEPS = 3              # Number of episodes before PPO update
 MAX_NORM = 0.3                # Maximum norm for gradient clipping
-
+AUX_LOSS_WEIGHT = 0.3         # Weight for the auxiliary loss
 # ----------------------------
 # Entropy Regularization
 # ----------------------------
@@ -147,8 +148,7 @@ WIN_RATE_THRESHOLD = 0.55
 # ----------------------------
 SEED = 42                     # Seed for reproducibility
 DEVICE = "cuda"               # Device for training (CPU/GPU)
-NUM_OPPONENT_CLASSES = 9
-AUX_LOSS_WEIGHT = 0.3         # Weight for the auxiliary loss
+TWO_PLAYER_MODE = True        # Set to True for two-player mode
 # ----------------------------
 # Derived Configurations
 # ----------------------------
