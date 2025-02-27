@@ -83,6 +83,8 @@ class RecursiveSearchAgent:
             Best action according to search
         """
         # Convert to PyTorch tensors
+        if isinstance(observation, dict):
+            observation = observation[self.name]
         obs_tensor = torch.FloatTensor(observation).unsqueeze(0).to(self.device)
         
         # Ensure beliefs are updated
@@ -202,6 +204,8 @@ class RecursiveSearchAgent:
             # For round end, just use value network to estimate remaining value
             # Since we can't effectively search past stochastic card drawing
             next_obs = env.observe(agent)
+            if isinstance(next_obs, dict):
+                next_obs = next_obs[self.name]
             next_obs_tensor = torch.FloatTensor(next_obs).unsqueeze(0).to(self.device)
             
             with torch.no_grad():
@@ -212,6 +216,10 @@ class RecursiveSearchAgent:
         
         # Otherwise, get next observation and update beliefs
         next_obs = env.observe(agent)
+        # Optionally, you could add a similar check here:
+        if isinstance(next_obs, dict):
+            next_obs = next_obs[self.name]
+        
         action_mask = env.infos[agent]["action_mask"]
         
         next_obs_tensor = torch.FloatTensor(next_obs).unsqueeze(0).to(self.device)
