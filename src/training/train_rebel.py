@@ -35,7 +35,7 @@ def create_env_copy(original_env):
 def collect_experience(env, agents, num_games=10):
     """
     Collect experience by playing games with the current agents.
-    Augments each transition with additional search outcomes.
+    Now captures public and private belief states separately.
     """
     all_trajectories = []
     
@@ -62,16 +62,21 @@ def collect_experience(env, agents, num_games=10):
             obs = observations[current_agent_id]
             action_mask = infos[current_agent_id]['action_mask']
             
-            # Update beliefs and perform search-based action selection.
-            # play_turn now returns a dict with additional search outputs.
+            # Update beliefs and perform search-based action selection with CFR
             search_outputs = current_agent.play_turn(obs, action_mask, env.table_card)
             selected_action = search_outputs['selected_action']
-            search_policy = search_outputs['search_policy']
+            search_policy = search_outputs['search_policy']  # This is now the CFR average strategy
             search_value = search_outputs['value_estimate']
             counterfactual_regrets = search_outputs['counterfactual_regrets']
+            cfr_strategy = search_outputs['cfr_strategy']
+            public_state_key = search_outputs['public_state_key']
             
-            # Record state and current beliefs (detach so training is independent)
-            agent_beliefs = current_agent.current_beliefs.detach().cpu()
+            # Split the observation
+            public_obs, private_obs = current_agent.split_observation(obs)
+            
+            # Record both belief types (detach to avoid autograd history)
+            full_beliefs = current_agent.current_beliefs.detach().cpu()
+            public_beliefs = current_agent.current_public_beliefs.detach().cpu()
             
             # Compute ground truth belief target using full game state
             belief_target = current_agent.belief_model.infer_belief_from_game_state(obs, current_agent.agent_index, env)
@@ -90,20 +95,25 @@ def collect_experience(env, agents, num_games=10):
             reward = env.rewards[current_agent_id]
             done = env.terminations[current_agent_id]
             
-            # Store transition with additional search fields and ground-truth belief target
+            # Store transition with public/private separation
             transition = {
                 'agent_id': current_agent_id,
                 'obs': obs,
+                'public_obs': public_obs,
+                'private_obs': private_obs,
                 'action': selected_action,
                 'reward': reward,
                 'done': done,
-                'beliefs': agent_beliefs,
-                'belief_target': belief_target,  # New ground truth belief target
+                'full_beliefs': full_beliefs,
+                'public_beliefs': public_beliefs,
+                'belief_target': belief_target,
                 'action_mask': action_mask,
                 'round_ended': round_ended,
-                'search_policy': search_policy,         # Search-derived action distribution
-                'search_value': search_value,           # Search-derived value estimate
-                'counterfactual_regrets': counterfactual_regrets  # Regrets per action
+                'search_policy': search_policy,
+                'search_value': search_value,
+                'counterfactual_regrets': counterfactual_regrets,
+                'cfr_strategy': cfr_strategy,
+                'public_state_key': public_state_key
             }
             trajectory.append(transition)
             
@@ -117,8 +127,7 @@ def collect_experience(env, agents, num_games=10):
 def train_belief_model(belief_model, trajectories, optimizer, device, batch_size=32):
     """
     Train the belief model using collected trajectories and simulation-based targets.
-    
-    Uses the ground truth belief computed from the full game state.
+    Now handles public and private belief states separately.
     """
     belief_model.train()
     
@@ -128,6 +137,8 @@ def train_belief_model(belief_model, trajectories, optimizer, device, batch_size
         return 0.0
     
     total_loss = 0.0
+    public_loss = 0.0
+    full_loss = 0.0
     num_batches = 0
     
     # Shuffle transitions
@@ -136,36 +147,60 @@ def train_belief_model(belief_model, trajectories, optimizer, device, batch_size
     for i in range(0, len(transitions), batch_size):
         batch = transitions[i:i+batch_size]
         
+        # Full observation batch
         obs_batch = torch.FloatTensor(np.array([t['obs'] for t in batch])).to(device)
         target_batch = torch.cat([t['belief_target'] for t in batch]).to(device)
         
-        pred_beliefs = belief_model(obs_batch)
+        # Forward pass for full beliefs
+        pred_full_beliefs = belief_model(obs_batch)
         
+        # Also do a public-only belief update
+        pred_public_beliefs = belief_model.get_public_belief_state(obs_batch)
+        
+        # Calculate KL divergence loss for both
         epsilon = 1e-10
-        pred_log_probs = torch.log(pred_beliefs + epsilon)
+        full_log_probs = torch.log(pred_full_beliefs + epsilon)
+        public_log_probs = torch.log(pred_public_beliefs + epsilon)
         
-        loss = F.kl_div(
-            pred_log_probs.reshape(-1, pred_beliefs.size(-1)),
+        # Full belief loss (main objective)
+        full_belief_loss = F.kl_div(
+            full_log_probs.reshape(-1, pred_full_beliefs.size(-1)),
             target_batch.reshape(-1, target_batch.size(-1)),
             reduction='batchmean',
             log_target=False
         )
+        
+        # Public belief loss (auxiliary objective)
+        public_belief_loss = F.kl_div(
+            public_log_probs.reshape(-1, pred_public_beliefs.size(-1)),
+            target_batch.reshape(-1, target_batch.size(-1)),
+            reduction='batchmean',
+            log_target=False
+        )
+        
+        # Combined loss (higher weight on full beliefs)
+        loss = 0.7 * full_belief_loss + 0.3 * public_belief_loss
         
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         
         total_loss += loss.item()
+        full_loss += full_belief_loss.item()
+        public_loss += public_belief_loss.item()
         num_batches += 1
     
-    return total_loss / max(num_batches, 1)
+    # Return detailed losses
+    return {
+        'total': total_loss / max(num_batches, 1),
+        'full': full_loss / max(num_batches, 1),
+        'public': public_loss / max(num_batches, 1)
+    }
 
 def train_value_network(value_net, trajectories, optimizer, device, gamma=0.99, batch_size=32):
     """
-    Train the value network using collected trajectories.
-    
-    Blends the traditional discounted return loss with an additional loss term that
-    minimizes the difference between the network's output and the search-derived value.
+    Train the value network using collected trajectories and integrated CFR outputs.
+    Updated to handle public and private belief states.
     """
     value_net.train()
     
@@ -184,9 +219,14 @@ def train_value_network(value_net, trajectories, optimizer, device, gamma=0.99, 
                     G += (gamma ** t) * future['reward']
                 processed = {
                     'obs': transition['obs'],
-                    'beliefs': transition['beliefs'],
+                    'public_obs': transition['public_obs'],
+                    'private_obs': transition['private_obs'],
+                    'full_beliefs': transition['full_beliefs'],
+                    'public_beliefs': transition['public_beliefs'],
                     'return': G,
-                    'search_value': transition['search_value']  # Search-derived value target
+                    'search_value': transition['search_value'],
+                    'action_mask': transition['action_mask'],
+                    'counterfactual_regrets': transition['counterfactual_regrets']
                 }
                 processed_transitions.append(processed)
     
@@ -194,41 +234,90 @@ def train_value_network(value_net, trajectories, optimizer, device, gamma=0.99, 
         return 0.0
     
     total_loss = 0.0
+    full_value_loss = 0.0
+    public_value_loss = 0.0
+    regret_loss = 0.0
     num_batches = 0
-    lambda_value = 0.5  # Weight for search-derived value loss term
+    
+    # Weights for different loss components
+    lambda_public = 0.3   # Weight for public-only evaluation
+    lambda_search = 0.5   # Weight for search-derived value
+    lambda_regret = 0.5   # Weight for regret prediction
     
     np.random.shuffle(processed_transitions)
     
     for i in range(0, len(processed_transitions), batch_size):
         batch = processed_transitions[i:i+batch_size]
         
+        # Prepare full observation and belief batches
         obs_batch = torch.FloatTensor(np.array([t['obs'] for t in batch])).to(device)
-        beliefs_batch = torch.cat([t['beliefs'] for t in batch]).to(device)
+        full_beliefs_batch = torch.cat([t['full_beliefs'] for t in batch]).to(device)
+        public_obs_batch = torch.FloatTensor(np.array([t['public_obs'] for t in batch])).to(device)
+        public_beliefs_batch = torch.cat([t['public_beliefs'] for t in batch]).to(device)
+        
+        # Targets
         returns_batch = torch.FloatTensor([t['return'] for t in batch]).unsqueeze(1).to(device)
         search_value_batch = torch.FloatTensor([t['search_value'] for t in batch]).unsqueeze(1).to(device)
+        regrets_batch = torch.FloatTensor(np.array([t['counterfactual_regrets'] for t in batch])).to(device)
+        action_mask_batch = torch.FloatTensor(np.array([t['action_mask'] for t in batch])).to(device)
         
-        # Extract the predicted value; value_net now returns (value, regrets)
-        pred_value, _ = value_net(obs_batch, beliefs_batch)
+        # Full evaluation
+        pred_full_value, pred_full_regrets = value_net(obs_batch, full_beliefs_batch)
         
-        mse_return = F.mse_loss(pred_value, returns_batch)
-        mse_search = F.mse_loss(pred_value, search_value_batch)
-        loss = mse_return + lambda_value * mse_search
+        # Public-only evaluation
+        with torch.no_grad():
+            # Create dummy observation with zeros for private part
+            batch_size = public_obs_batch.size(0)
+            private_dim = 2
+            dummy_private = torch.zeros(batch_size, private_dim).to(device)
+            dummy_full_obs = torch.cat([dummy_private, public_obs_batch], dim=1)
+        
+        pred_public_value, _ = value_net.evaluate_public_state(public_obs_batch, public_beliefs_batch)
+        
+        # Value prediction losses
+        mse_full_return = F.mse_loss(pred_full_value, returns_batch)
+        mse_public_return = F.mse_loss(pred_public_value, returns_batch)
+        mse_search = F.mse_loss(pred_full_value, search_value_batch)
+        
+        # Regret prediction loss (only for valid actions)
+        # Apply action mask to only consider regrets for valid actions
+        masked_pred_regrets = pred_full_regrets * action_mask_batch
+        masked_target_regrets = regrets_batch * action_mask_batch
+        
+        # Calculate MSE for regrets only considering valid actions
+        valid_actions_count = action_mask_batch.sum(dim=1, keepdim=True)
+        regret_squared_error = ((masked_pred_regrets - masked_target_regrets) ** 2).sum(dim=1, keepdim=True)
+        mse_regrets = (regret_squared_error / valid_actions_count.clamp(min=1)).mean()
+        
+        # Combined loss
+        loss = (0.7 * mse_full_return + 
+                lambda_public * mse_public_return + 
+                lambda_search * mse_search + 
+                lambda_regret * mse_regrets)
         
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         
+        # Track individual loss components
         total_loss += loss.item()
+        full_value_loss += mse_full_return.item()
+        public_value_loss += mse_public_return.item()
+        regret_loss += mse_regrets.item()
         num_batches += 1
     
-    return total_loss / max(num_batches, 1)
+    # Return detailed losses
+    return {
+        'total': total_loss / max(num_batches, 1),
+        'full_value': full_value_loss / max(num_batches, 1),
+        'public_value': public_value_loss / max(num_batches, 1),
+        'regret': regret_loss / max(num_batches, 1)
+    }
 
 def train_policy_network(policy_net, value_net, trajectories, optimizer, device, batch_size=32):
     """
-    Train the policy network using REINFORCE with baseline and belief states.
-    
-    Adds a term that penalizes the difference between the network's action probabilities
-    and the search-derived action distribution.
+    Train the policy network using CFR-derived policies and values.
+    Updated to handle public and private belief separation.
     """
     policy_net.train()
     value_net.eval()
@@ -238,69 +327,123 @@ def train_policy_network(policy_net, value_net, trajectories, optimizer, device,
         return 0.0
     
     total_loss = 0.0
+    full_policy_loss = 0.0
+    public_policy_loss = 0.0
+    value_loss = 0.0
     num_batches = 0
-    lambda_policy = 1.0  # Weight for search policy loss term
+    
+    # Loss weighting parameters
+    lambda_cfr = 2.0  # Higher weight for learning from CFR strategy
+    lambda_public = 0.5  # Weight for public policy learning
+    lambda_value = 0.5  # Weight for value prediction accuracy
     
     np.random.shuffle(transitions)
     
     for i in range(0, len(transitions), batch_size):
         batch = transitions[i:i+batch_size]
         
+        # Prepare regular observation and belief batches
         obs_batch = torch.FloatTensor(np.array([t['obs'] for t in batch])).to(device)
+        public_obs_batch = torch.FloatTensor(np.array([t['public_obs'] for t in batch])).to(device)
+        
         action_batch = torch.LongTensor([t['action'] for t in batch]).to(device)
         reward_batch = torch.FloatTensor([t['reward'] for t in batch]).to(device)
-        beliefs_batch = torch.cat([t['beliefs'] for t in batch]).to(device)
-        search_policy_targets = torch.FloatTensor(np.array([t['search_policy'] for t in batch])).to(device)
         
-        action_probs, policy_values, _ = policy_net(obs_batch, beliefs_batch)
+        full_beliefs_batch = torch.cat([t['full_beliefs'] for t in batch]).to(device)
+        public_beliefs_batch = torch.cat([t['public_beliefs'] for t in batch]).to(device)
         
-        log_probs = torch.log(action_probs.gather(1, action_batch.unsqueeze(1)).squeeze(1) + 1e-10)
+        action_mask_batch = torch.FloatTensor(np.array([t['action_mask'] for t in batch])).to(device)
         
+        # Use CFR average strategy as target
+        cfr_strategy_targets = torch.FloatTensor(np.array([t['search_policy'] for t in batch])).to(device)
+        
+        # Forward pass through policy network for full policy
+        action_probs, policy_values, _ = policy_net(obs_batch, full_beliefs_batch)
+        
+        # Also get public-only policy
+        public_action_probs, _, _ = policy_net.public_policy(public_obs_batch, public_beliefs_batch)
+        
+        # Apply action mask to probabilities
+        masked_action_probs = action_probs * action_mask_batch
+        masked_action_probs = masked_action_probs / masked_action_probs.sum(dim=1, keepdim=True).clamp(min=1e-10)
+        
+        masked_public_probs = public_action_probs * action_mask_batch
+        masked_public_probs = masked_public_probs / masked_public_probs.sum(dim=1, keepdim=True).clamp(min=1e-10)
+        
+        # Cross-entropy loss for selected actions
+        action_log_probs = torch.log(masked_action_probs.gather(1, action_batch.unsqueeze(1)).squeeze(1) + 1e-10)
+        
+        # KL divergence loss between policy and CFR average strategy (full policy)
+        full_cfr_loss = F.kl_div(
+            torch.log(masked_action_probs + 1e-10), 
+            cfr_strategy_targets, 
+            reduction='batchmean', 
+            log_target=False
+        )
+        
+        # KL divergence for public policy
+        public_cfr_loss = F.kl_div(
+            torch.log(masked_public_probs + 1e-10), 
+            cfr_strategy_targets, 
+            reduction='batchmean', 
+            log_target=False
+        )
+        
+        # Baseline policy gradient loss (reduced importance)
         with torch.no_grad():
-            baseline, _ = value_net(obs_batch, beliefs_batch)
+            baseline, _ = value_net(obs_batch, full_beliefs_batch)
             baseline = baseline.squeeze(1)
         
         advantage = reward_batch - baseline
-        policy_loss = -torch.mean(log_probs * advantage)
-        value_loss = F.mse_loss(policy_values.squeeze(1), reward_batch)
+        policy_gradient_loss = -torch.mean(action_log_probs * advantage)
         
-        # Additional loss term: KL divergence between policy output and search-derived policy target
-        search_policy_loss = F.kl_div(torch.log(action_probs + 1e-10), search_policy_targets, reduction='batchmean', log_target=False)
+        # Value prediction loss
+        value_prediction_loss = F.mse_loss(policy_values.squeeze(1), reward_batch)
         
-        loss = policy_loss + 0.5 * value_loss + lambda_policy * search_policy_loss
+        # Combined loss with higher emphasis on CFR strategy
+        loss = (0.2 * policy_gradient_loss + 
+                lambda_value * value_prediction_loss + 
+                lambda_cfr * full_cfr_loss + 
+                lambda_public * public_cfr_loss)
         
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         
+        # Track individual loss components
         total_loss += loss.item()
+        full_policy_loss += full_cfr_loss.item()
+        public_policy_loss += public_cfr_loss.item()
+        value_loss += value_prediction_loss.item()
         num_batches += 1
     
-    return total_loss / max(num_batches, 1)
+    # Return detailed losses
+    return {
+        'total': total_loss / max(num_batches, 1),
+        'full_policy': full_policy_loss / max(num_batches, 1),
+        'public_policy': public_policy_loss / max(num_batches, 1),
+        'value': value_loss / max(num_batches, 1)
+    }
 
 def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10, 
                       lr_policy=1e-4, lr_belief=1e-4, lr_value=1e-4,
-                      search_depth=3, num_simulations=30, log_interval=5,
+                      search_depth=4, num_simulations=30, log_interval=5,
                       checkpoint_interval=20, log_tensorboard=True):
     """
-    Train a ReBeL-inspired agent with belief tracking and recursive search.
-    
-    This updated training loop collects augmented transitions that include search-derived
-    policy, value, and regret information. The training functions are updated to use these
-    extra signals.
+    Train a ReBeL agent with proper CFR implementation and public/private belief separation.
     """
     logger = configure_logger()
-    logger.info(f"Starting ReBeL training on {device}")
+    logger.info(f"Starting ReBeL training with CFR and public/private belief separation on {device}")
     
     writer = None
     if log_tensorboard:
-        writer = get_tensorboard_writer(log_dir=os.path.join(config.TENSORBOARD_RUNS_DIR, 'rebel'))
+        writer = get_tensorboard_writer(log_dir=os.path.join(config.TENSORBOARD_RUNS_DIR, 'rebel_cfr_pub_priv'))
     
     num_players = env.num_players
     obs_dim = env.observation_spaces[env.possible_agents[0]].shape[0]
     action_dim = env.action_spaces[env.possible_agents[0]].n
     hidden_dim = 128
-    num_card_types = 4  # For Liar's Deck
+    num_card_types = 2  # Binary: table card or non-table card
     
     policy_net = RebelPolicyNetwork(
         obs_dim=obs_dim, 
@@ -343,26 +486,57 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
             agent_index=i
         )
     
+    # Track overall regret reduction
+    regret_tracker = defaultdict(list)
+    
     for epoch in tqdm(range(num_epochs)):
+        # Collect experience with CFR-guided search and public/private beliefs
         trajectories = collect_experience(env, agents, num_games=games_per_epoch)
         
-        belief_loss = train_belief_model(belief_model, trajectories, belief_optimizer, device)
-        value_loss = train_value_network(value_net, trajectories, value_optimizer, device)
-        policy_loss = train_policy_network(policy_net, value_net, trajectories, policy_optimizer, device)
+        # Train all three networks, now with detailed loss breakdowns
+        belief_losses = train_belief_model(belief_model, trajectories, belief_optimizer, device)
+        value_losses = train_value_network(value_net, trajectories, value_optimizer, device)
+        policy_losses = train_policy_network(policy_net, value_net, trajectories, policy_optimizer, device)
+        
+        # Calculate and track average regret
+        avg_regret = 0.0
+        regret_count = 0
+        for traj in trajectories:
+            for trans in traj:
+                avg_regret += np.mean(np.abs(trans['counterfactual_regrets']))
+                regret_count += 1
+        
+        if regret_count > 0:
+            avg_regret /= regret_count
+            regret_tracker[epoch] = avg_regret
         
         if (epoch + 1) % log_interval == 0:
             logger.info(f"Epoch {epoch+1}/{num_epochs}")
-            logger.info(f"  Belief Loss: {belief_loss:.6f}")
-            logger.info(f"  Value Loss: {value_loss:.6f}")
-            logger.info(f"  Policy Loss: {policy_loss:.6f}")
+            logger.info(f"  Belief Loss: Total={belief_losses['total']:.6f}, Full={belief_losses['full']:.6f}, Public={belief_losses['public']:.6f}")
+            logger.info(f"  Value Loss: Total={value_losses['total']:.6f}, Full={value_losses['full_value']:.6f}, Public={value_losses['public_value']:.6f}, Regret={value_losses['regret']:.6f}")
+            logger.info(f"  Policy Loss: Total={policy_losses['total']:.6f}, Full={policy_losses['full_policy']:.6f}, Public={policy_losses['public_policy']:.6f}, Value={policy_losses['value']:.6f}")
+            logger.info(f"  Average Regret: {avg_regret:.6f}")
             
             if writer:
-                writer.add_scalar('Loss/Belief', belief_loss, epoch)
-                writer.add_scalar('Loss/Value', value_loss, epoch)
-                writer.add_scalar('Loss/Policy', policy_loss, epoch)
+                # Log detailed breakdown of losses
+                writer.add_scalar('Loss/Belief/Total', belief_losses['total'], epoch)
+                writer.add_scalar('Loss/Belief/Full', belief_losses['full'], epoch)
+                writer.add_scalar('Loss/Belief/Public', belief_losses['public'], epoch)
+                
+                writer.add_scalar('Loss/Value/Total', value_losses['total'], epoch)
+                writer.add_scalar('Loss/Value/Full', value_losses['full_value'], epoch)
+                writer.add_scalar('Loss/Value/Public', value_losses['public_value'], epoch)
+                writer.add_scalar('Loss/Value/Regret', value_losses['regret'], epoch)
+                
+                writer.add_scalar('Loss/Policy/Total', policy_losses['total'], epoch)
+                writer.add_scalar('Loss/Policy/Full', policy_losses['full_policy'], epoch)
+                writer.add_scalar('Loss/Policy/Public', policy_losses['public_policy'], epoch)
+                writer.add_scalar('Loss/Policy/Value', policy_losses['value'], epoch)
+                
+                writer.add_scalar('Metrics/AverageRegret', avg_regret, epoch)
         
         if (epoch + 1) % checkpoint_interval == 0:
-            checkpoint_dir = os.path.join(config.CHECKPOINT_DIR, 'rebel')
+            checkpoint_dir = os.path.join(config.CHECKPOINT_DIR, 'rebel_cfr_pub_priv')
             os.makedirs(checkpoint_dir, exist_ok=True)
             checkpoint_data = {
                 'policy_net': policy_net.state_dict(),
@@ -372,10 +546,18 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
                 'value_net': value_net.state_dict(),
                 'value_optimizer': value_optimizer.state_dict(),
                 'epoch': epoch + 1,
+                # Save the CFR data for all agents
+                'agent_data': {
+                    agent_id: {
+                        'cumulative_regrets': dict(agents[agent_id].cumulative_regrets),
+                        'average_strategy': dict(agents[agent_id].average_strategy),
+                        'strategy_update_count': dict(agents[agent_id].strategy_update_count)
+                    } for agent_id in agents
+                }
             }
-            torch.save(checkpoint_data, os.path.join(checkpoint_dir, 'checkpoint_rebel.pt'))
+            torch.save(checkpoint_data, os.path.join(checkpoint_dir, f'checkpoint_rebel_cfr_pub_priv_{epoch+1}.pt'))
     
-    logger.info("Training complete!")
+    logger.info("ReBeL training with CFR and public/private belief separation complete!")
     return policy_net, belief_model, value_net, agents
 
 def main():
@@ -389,7 +571,7 @@ def main():
     policy_net, belief_model, value_net, agents = train_rebel_agent(
         env=env,
         device=device,
-        num_epochs=200,
+        num_epochs=20,
         games_per_epoch=10,
         search_depth=6,
         num_simulations=60,
@@ -398,7 +580,7 @@ def main():
         log_tensorboard=True
     )
     
-    logger.info("ReBeL training completed successfully")
+    logger.info("ReBeL training with CFR and public/private belief separation completed successfully")
 
 if __name__ == "__main__":
     main()

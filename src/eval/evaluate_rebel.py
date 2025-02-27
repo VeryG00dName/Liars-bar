@@ -48,7 +48,7 @@ def load_rebel_agent(checkpoint_path, device, env):
     obs_dim = env.observation_spaces[env.possible_agents[0]].shape[0]
     action_dim = env.action_spaces[env.possible_agents[0]].n
     hidden_dim = 128
-    num_card_types = 4  # Belief state uses 4 card types
+    num_card_types = 2  # Belief state uses 4 card types
     belief_dim = (num_players - 1) * num_card_types
 
     # Create networks using updated Rebel models.
@@ -71,8 +71,8 @@ def load_rebel_agent(checkpoint_path, device, env):
         value_net=value_net,
         env_creator=lambda: create_env(),
         device=device,
-        search_depth=6,
-        num_simulations=60,
+        search_depth=8,
+        num_simulations=120,
         agent_name="ReBeL_Agent"
     )
 
@@ -187,7 +187,7 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate ReBeL agent against hardcoded bots")
     parser.add_argument("--checkpoint", type=str, default="checkpoints",
                         help="Path to checkpoint directory")
-    parser.add_argument("--games", type=int, default=100,
+    parser.add_argument("--games", type=int, default=20,
                         help="Number of games per opponent")
     args = parser.parse_args()
     

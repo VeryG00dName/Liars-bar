@@ -1,13 +1,16 @@
 # src/model/recursive_search_agent.py
 import torch
 import numpy as np
+from collections import defaultdict
 
 class RecursiveSearchAgent:
     def __init__(self, policy_net, belief_model, value_net, env_creator, 
-                 device, search_depth=3, num_simulations=30, c_puct=1.0,
+                 device, search_depth=4, num_simulations=30, c_puct=1.0,
                  agent_name=None, agent_index=None):
         """
         Agent that uses belief-based recursive search for decision making.
+        Implements proper Counterfactual Regret Minimization (CFR) with
+        public/private belief state separation.
         
         Args:
             policy_net: Policy network to generate prior probabilities
@@ -32,19 +35,49 @@ class RecursiveSearchAgent:
         self.name = agent_name
         self.agent_index = agent_index
         
+        # Belief state tracking
         self.current_beliefs = None
+        self.current_public_beliefs = None
         self.action_history = []
         self.search_statistics = {}
+        
+        # Key additions for CFR
+        self.cumulative_regrets = defaultdict(lambda: np.zeros(7))  # For 7 possible actions
+        self.average_strategy = defaultdict(lambda: np.zeros(7))
+        self.strategy_update_count = defaultdict(int)
+        
+        # State encoding function (for dictionary keys)
+        self.public_state_to_key = lambda public_obs, public_beliefs: hash(str(public_obs.tolist()) + str(public_beliefs.cpu().numpy().tolist()))
     
     def reset(self):
         """Reset agent state at the beginning of a new game."""
         self.current_beliefs = None
+        self.current_public_beliefs = None
         self.action_history = []
         self.search_statistics = {}
+        # Note: We don't reset cumulative_regrets or average_strategy as they persist across games
+    
+    def split_observation(self, observation):
+        """
+        Split observation into public and private components.
+        
+        Args:
+            observation: Full observation (NumPy array)
+            
+        Returns:
+            (public_obs, private_obs): Tuple of public and private observation tensors
+        """
+        # First two elements are the player's hand information (table cards, non-table cards)
+        private_obs = observation[:2]
+        
+        # Remaining elements are public information
+        public_obs = observation[2:]
+        
+        return public_obs, private_obs
     
     def update_beliefs(self, observation, action_mask=None):
         """
-        Update belief states based on new observation.
+        Update both public and private belief states based on new observation.
         
         Args:
             observation: Current observation
@@ -59,14 +92,102 @@ class RecursiveSearchAgent:
         obs_tensor = torch.FloatTensor(obs_data).unsqueeze(0).to(self.device)
         
         with torch.no_grad():
+            # Update full belief state (using both public and private info)
             if self.current_beliefs is None:
                 self.current_beliefs = self.belief_model(obs_tensor)
             else:
                 self.current_beliefs = self.belief_model(obs_tensor, self.current_beliefs)
+            
+            # Also update the public belief state (only uses public info)
+            if self.current_public_beliefs is None:
+                self.current_public_beliefs = self.belief_model.get_public_belief_state(obs_tensor)
+            else:
+                self.current_public_beliefs = self.belief_model.get_public_belief_state(
+                    obs_tensor, self.current_public_beliefs)
+    
+    def compute_cfr_strategy(self, state_key, action_mask):
+        """
+        Compute a strategy according to the CFR algorithm using cumulative regrets.
+        
+        Args:
+            state_key: A unique identifier for the current state
+            action_mask: Boolean mask of valid actions
+            
+        Returns:
+            numpy array: A probability distribution over actions
+        """
+        # Get cumulative regrets for this state
+        regrets = self.cumulative_regrets[state_key]
+        
+        # Only consider positive regrets (regret matching)
+        positive_regrets = np.maximum(regrets, 0) * action_mask
+        regret_sum = positive_regrets.sum()
+        
+        # If sum is zero or state not seen before, use uniform random over valid actions
+        if regret_sum <= 0:
+            valid_actions = np.where(action_mask)[0]
+            strategy = np.zeros_like(action_mask, dtype=np.float32)
+            strategy[valid_actions] = 1.0 / len(valid_actions)
+        else:
+            # Normalize by sum of positive regrets (regret matching)
+            strategy = positive_regrets / regret_sum
+        
+        return strategy
+    
+    def update_average_strategy(self, state_key, current_strategy):
+        """
+        Update the average strategy for a state.
+        
+        Args:
+            state_key: A unique identifier for the current state
+            current_strategy: The current strategy for this state
+        """
+        # Increment counter for this state
+        self.strategy_update_count[state_key] += 1
+        
+        # Update running average: weighted by count to properly compute average
+        count = self.strategy_update_count[state_key]
+        self.average_strategy[state_key] = (
+            (count - 1) / count * self.average_strategy[state_key] + 
+            (1 / count) * current_strategy
+        )
+    
+    def get_average_strategy(self, state_key, action_mask):
+        """
+        Get the average strategy for a state.
+        
+        Args:
+            state_key: A unique identifier for the current state
+            action_mask: Boolean mask of valid actions
+            
+        Returns:
+            numpy array: A probability distribution over actions
+        """
+        strategy = self.average_strategy[state_key]
+        
+        # If state never seen, use uniform random over valid actions
+        if np.sum(strategy) <= 0:
+            valid_actions = np.where(action_mask)[0]
+            strategy = np.zeros_like(action_mask, dtype=np.float32)
+            strategy[valid_actions] = 1.0 / len(valid_actions)
+            return strategy
+        
+        # Ensure the strategy is valid for current action mask
+        masked_strategy = strategy * action_mask
+        
+        # If no valid actions in strategy, use uniform over valid actions
+        if np.sum(masked_strategy) <= 0:
+            valid_actions = np.where(action_mask)[0]
+            masked_strategy = np.zeros_like(action_mask, dtype=np.float32)
+            masked_strategy[valid_actions] = 1.0 / len(valid_actions)
+            return masked_strategy
+        
+        # Normalize to ensure it's a valid probability distribution
+        return masked_strategy / np.sum(masked_strategy)
     
     def mcts_search(self, observation, action_mask):
         """
-        Perform Monte Carlo Tree Search with belief states.
+        Perform Monte Carlo Tree Search with public/private belief states and CFR.
         
         Args:
             observation: Current observation
@@ -74,10 +195,11 @@ class RecursiveSearchAgent:
             
         Returns:
             Dictionary with search outcomes:
-              - selected_action: the chosen action (int)
-              - search_policy: distribution over actions (np.array)
-              - value_estimate: value from subgame solver (float)
-              - counterfactual_regrets: vector of per-action regrets (np.array)
+            - selected_action: the chosen action (int)
+            - search_policy: distribution over actions (np.array)
+            - value_estimate: value from subgame solver (float)
+            - counterfactual_regrets: vector of per-action regrets (np.array)
+            - cfr_strategy: strategy based on regret matching (np.array)
         """
         # Convert observation appropriately
         if isinstance(observation, dict):
@@ -87,12 +209,25 @@ class RecursiveSearchAgent:
         # Ensure beliefs are updated
         self.update_beliefs(observation, action_mask)
         
-        # Get prior probabilities from policy network
+        # Split observation into public and private parts
+        public_obs, private_obs = self.split_observation(observation)
+        public_obs_tensor = torch.FloatTensor(public_obs).unsqueeze(0).to(self.device)
+        
+        # Create a unique key for this PUBLIC state (key for CFR)
+        public_state_key = self.public_state_to_key(
+            np.array(public_obs), self.current_public_beliefs)
+        
+        # Get policy network's action priors
         with torch.no_grad():
+            # Use the full policy (with private info) for priors
             priors, _, _ = self.policy_net(obs_tensor)
             priors = priors.squeeze(0).cpu().numpy()
+            
+            # Also get public-only policy for comparison
+            public_priors, _, _ = self.policy_net.public_policy(public_obs_tensor, self.current_public_beliefs)
+            public_priors = public_priors.squeeze(0).cpu().numpy()
         
-        # Apply action mask
+        # Apply action mask to priors
         masked_priors = priors * action_mask
         if np.sum(masked_priors) > 0:
             masked_priors = masked_priors / np.sum(masked_priors)
@@ -106,89 +241,117 @@ class RecursiveSearchAgent:
         W = {a: 0.0 for a in range(len(action_mask))}
         Q = {a: 0.0 for a in range(len(action_mask))}
         
-        # Exploration parameter (adjusted dynamically)
-        total_visits = 0
-        c_puct = self.c_puct
+        # Track counterfactual values across all simulations
+        cf_values = {}
         
         # Run MCTS simulations
         for _ in range(self.num_simulations):
             sim_env = self.env_creator()  # Clone environment for simulation
-            # Select action using PUCT formula
+            
+            # Compute current CFR strategy using PUBLIC state key
+            cfr_strategy = self.compute_cfr_strategy(public_state_key, action_mask)
+            
+            # Select action using PUCT formula but with CFR strategy as prior
             valid_actions = np.where(action_mask)[0]
             best_score = -float('inf')
             best_action = valid_actions[0]
             
             for action in valid_actions:
                 if N[action] > 0:
+                    # Use PUCT formula with CFR strategy as prior
                     exploitation = Q[action]
-                    exploration = c_puct * masked_priors[action] * np.sqrt(sum(N.values())) / (1 + N[action])
+                    exploration = self.c_puct * cfr_strategy[action] * np.sqrt(sum(N.values())) / (1 + N[action])
                     score = exploitation + exploration
                 else:
-                    score = c_puct * masked_priors[action] * np.sqrt(sum(N.values()) + 1e-5)
+                    score = self.c_puct * cfr_strategy[action] * np.sqrt(sum(N.values()) + 1e-5)
                 
                 if score > best_score:
                     best_score = score
                     best_action = action
             
-            # Simulate taking the best_action recursively
-            sim_value = self._simulate(sim_env, best_action, observation, self.current_beliefs, self.search_depth)
+            # Simulate taking the best_action recursively with subgame solving
+            sim_value, action_cf_values = self._simulate(
+                sim_env, best_action, observation, public_obs, 
+                self.current_beliefs, self.current_public_beliefs, 
+                self.search_depth, reach_prob=1.0)
             
             # Update statistics for the selected action
             N[best_action] += 1
             W[best_action] += sim_value
             Q[best_action] = W[best_action] / N[best_action]
-            total_visits += 1
-        
-        # Compute search policy as normalized visit counts
-        visit_array = np.array([N[a] for a in range(len(action_mask))], dtype=np.float32)
-        if visit_array.sum() > 0:
-            search_policy = visit_array / visit_array.sum()
-        else:
-            search_policy = masked_priors
+            
+            # Update counterfactual values
+            for a, value in action_cf_values.items():
+                if a not in cf_values:
+                    cf_values[a] = 0
+                cf_values[a] += value / self.num_simulations
         
         # Compute overall value estimate as weighted average of Q-values
-        value_estimate = sum(N[a] * Q[a] for a in range(len(action_mask))) / (visit_array.sum() + 1e-10)
+        value_estimate = sum(N[a] * Q[a] for a in range(len(action_mask))) / max(sum(N.values()), 1)
         
-        # Compute counterfactual regrets: difference between each action's Q and the baseline value
-        regrets = np.array([Q[a] - value_estimate for a in range(len(action_mask))], dtype=np.float32)
+        # Compute counterfactual regrets based on final counterfactual values
+        # Regret is difference between action's counterfactual value and expected value
+        immediate_regrets = np.zeros(len(action_mask), dtype=np.float32)
+        for a in range(len(action_mask)):
+            if a in cf_values:
+                immediate_regrets[a] = cf_values[a] - value_estimate
         
-        # Store search statistics for later analysis/training
-        self.search_statistics = {'N': N, 'Q': Q, 'masked_priors': masked_priors,
-                                  'search_policy': search_policy, 'value_estimate': value_estimate,
-                                  'counterfactual_regrets': regrets}
+        # Update cumulative regrets (core CFR update step)
+        self.cumulative_regrets[public_state_key] += immediate_regrets * action_mask
         
-        # Action selection: using temperature-based sampling (for now, set temperature = 1.0)
-        temperature = 1.0
-        if temperature < 0.01:
-            selected_action = max(N.items(), key=lambda x: x[1])[0]
-        else:
-            visit_counts = visit_array ** (1.0 / temperature)
-            if visit_counts.sum() > 0:
-                probs = visit_counts / visit_counts.sum()
-                selected_action = np.random.choice(len(action_mask), p=probs)
-            else:
-                selected_action = np.argmax(masked_priors)
+        # Compute current strategy using regret matching
+        cfr_strategy = self.compute_cfr_strategy(public_state_key, action_mask)
+        
+        # Update average strategy
+        self.update_average_strategy(public_state_key, cfr_strategy)
+        
+        # Get the average strategy (this is what we use for actual play)
+        average_strategy = self.get_average_strategy(public_state_key, action_mask)
+        
+        # Store search statistics
+        self.search_statistics = {
+            'N': N, 'Q': Q, 
+            'masked_priors': masked_priors,
+            'public_priors': public_priors,
+            'value_estimate': value_estimate,
+            'immediate_regrets': immediate_regrets,
+            'cfr_strategy': cfr_strategy,
+            'average_strategy': average_strategy,
+            'counterfactual_values': cf_values
+        }
+        
+        # For actual play, sample from the average strategy
+        selected_action = np.random.choice(len(action_mask), p=average_strategy)
         
         return {
             'selected_action': selected_action,
-            'search_policy': search_policy,
+            'search_policy': average_strategy,  # Using average strategy as the policy
             'value_estimate': value_estimate,
-            'counterfactual_regrets': regrets
+            'counterfactual_regrets': immediate_regrets,
+            'cfr_strategy': cfr_strategy,
+            'public_state_key': str(public_state_key),  # Include public state key for analysis
+            'counterfactual_values': cf_values
         }
     
-    def _simulate(self, env, action, observation, beliefs, depth):
+    def _simulate(self, env, action, observation, public_obs, beliefs, public_beliefs, depth, reach_prob=1.0, parent_values=None):
         """
-        Simulate taking an action and recursively evaluate the resulting state.
+        Simulate taking an action and recursively evaluate the resulting state with proper subgame solving.
         
         Args:
             env: Cloned environment for simulation
             action: Action to simulate
-            observation: Current observation
-            beliefs: Current belief state
+            observation: Full observation
+            public_obs: Public part of the observation
+            beliefs: Full belief state
+            public_beliefs: Public belief state
             depth: Remaining search depth
+            reach_prob: Current reach probability for this state
+            parent_values: Value estimates from parent subgame for boundary conditions
             
         Returns:
-            Estimated value after taking the action (float)
+            Tuple of (value, counterfactual_values) where:
+                - value: Estimated value after taking the action (float)
+                - counterfactual_values: Dict mapping actions to their counterfactual values
         """
         agent = self.name
         original_agent_selection = env.agent_selection
@@ -198,42 +361,127 @@ class RecursiveSearchAgent:
         reward = env.rewards[agent]
         done = env.terminations[agent]
         
-        # If terminal state or max depth reached, return immediate reward
-        if done or depth == 0:
-            return reward
+        # Initialize counterfactual values
+        cf_values = {}
         
-        # If round ended, use the value network to estimate remaining value
+        # Terminal state handling
+        if done:
+            return reward, cf_values
+        
+        # Depth limit reached - boundary condition
+        if depth == 0:
+            # At boundary, use value network to estimate counterfactual values
+            next_obs = env.observe(agent)
+            if isinstance(next_obs, dict):
+                next_obs = next_obs[agent]
+            next_obs_tensor = torch.FloatTensor(next_obs).unsqueeze(0).to(self.device)
+            action_mask = env.infos[agent]["action_mask"]
+            
+            with torch.no_grad():
+                # Update beliefs for the new state
+                next_beliefs = self.belief_model(next_obs_tensor, beliefs)
+                
+                # Use value network to get value and regrets (counterfactual values)
+                value, regrets = self.value_net(next_obs_tensor, next_beliefs)
+                
+                # Convert regrets to counterfactual values
+                avg_value = value.item()
+                regrets_np = regrets.squeeze(0).cpu().numpy() * action_mask
+                
+                # For each valid action, calculate counterfactual value
+                valid_actions = np.where(action_mask)[0]
+                for a in valid_actions:
+                    cf_values[a] = avg_value + regrets_np[a]  # CV = V + Regret
+                    
+                return avg_value, cf_values
+        
+        # If round ended or agent changed, we've reached a subgame boundary
         if env.agent_selection is None or env.agent_selection != original_agent_selection:
             next_obs = env.observe(agent)
             if isinstance(next_obs, dict):
-                next_obs = next_obs[self.name]
+                next_obs = next_obs[agent]
             next_obs_tensor = torch.FloatTensor(next_obs).unsqueeze(0).to(self.device)
+            
             with torch.no_grad():
+                # Update beliefs for the new state
                 next_beliefs = self.belief_model(next_obs_tensor, beliefs)
+                
+                # Get subgame value estimate
                 value, _ = self.value_net(next_obs_tensor, next_beliefs)
-            return reward + value.item()
+                subgame_value = value.item()
+                
+                # Apply safety constraint if we have parent values
+                if parent_values is not None:
+                    # Ensure new value doesn't decrease expected value from parent's perspective
+                    if action in parent_values and subgame_value < parent_values[action]:
+                        subgame_value = parent_values[action]
+                
+                return reward + subgame_value, cf_values
         
-        # Otherwise, get next observation, update beliefs, and recurse
+        # Continue recursive simulation within the current subgame
         next_obs = env.observe(agent)
         if isinstance(next_obs, dict):
-            next_obs = next_obs[self.name]
+            next_obs = next_obs[agent]
         action_mask = env.infos[agent]["action_mask"]
         next_obs_tensor = torch.FloatTensor(next_obs).unsqueeze(0).to(self.device)
-        with torch.no_grad():
-            next_beliefs = self.belief_model(next_obs_tensor, beliefs)
-            priors, _, _ = self.policy_net(next_obs_tensor)
-            priors = priors.squeeze(0).cpu().numpy()
-            masked_priors = priors * action_mask
-            if np.sum(masked_priors) > 0:
-                masked_priors = masked_priors / np.sum(masked_priors)
-            else:
-                valid_actions = np.where(action_mask)[0]
-                masked_priors = np.zeros_like(priors)
-                masked_priors[valid_actions] = 1.0 / len(valid_actions)
-            next_action = np.random.choice(len(masked_priors), p=masked_priors)
-            next_value = self._simulate(env, next_action, next_obs, next_beliefs, depth - 1)
         
-        return reward + next_value
+        with torch.no_grad():
+            # Split observation into public and private parts
+            next_public_obs, _ = self.split_observation(next_obs)
+            next_public_tensor = torch.FloatTensor(next_public_obs).unsqueeze(0).to(self.device)
+            
+            # Update both belief types
+            next_beliefs = self.belief_model(next_obs_tensor, beliefs)
+            next_public_beliefs = self.belief_model.get_public_belief_state(next_obs_tensor, public_beliefs)
+            
+            # Create a unique key for this new PUBLIC state
+            next_public_state_key = self.public_state_to_key(
+                np.array(next_public_obs), next_public_beliefs)
+            
+            # Get the CFR strategy for this state
+            cfr_strategy = self.compute_cfr_strategy(next_public_state_key, action_mask)
+            
+            # Calculate counterfactual values for each action
+            action_cf_values = {}
+            valid_actions = np.where(action_mask)[0]
+            
+            if len(valid_actions) == 0:
+                return reward, cf_values
+            
+            # Ensure the strategy is valid for the action mask
+            masked_strategy = cfr_strategy * action_mask
+            if np.sum(masked_strategy) <= 0:
+                masked_strategy = np.zeros_like(action_mask, dtype=np.float32)
+                masked_strategy[valid_actions] = 1.0 / len(valid_actions)
+            else:
+                masked_strategy = masked_strategy / np.sum(masked_strategy)
+            
+            # Calculate value for each action with appropriate reach probabilities
+            total_value = 0
+            for a in valid_actions:
+                # New reach probability for this action
+                action_reach = reach_prob * masked_strategy[a]
+                
+                # Skip actions with negligible reach probability for efficiency
+                if action_reach < 1e-6:
+                    continue
+                    
+                # Clone the environment for this action
+                action_env = env.clone()
+                
+                # Recursive simulation
+                action_value, action_cf_values = self._simulate(
+                    action_env, a, next_obs, next_public_obs, 
+                    next_beliefs, next_public_beliefs, depth - 1, 
+                    action_reach, parent_values=action_cf_values)
+                
+                # Record counterfactual value for this action
+                cf_values[a] = action_value
+                
+                # Add to expected value
+                total_value += masked_strategy[a] * action_value
+        
+        return reward + total_value, cf_values
 
     def play_turn(self, observation, action_mask, table_card):
         """
@@ -248,25 +496,33 @@ class RecursiveSearchAgent:
         Returns:
             A dictionary containing:
               - selected_action: Chosen action.
-              - search_policy: Distribution over actions at the root.
+              - search_policy: Distribution over actions based on CFR average strategy.
               - value_estimate: Value estimate from the subgame solver.
               - counterfactual_regrets: Computed regrets for available actions.
+              - cfr_strategy: Current CFR strategy based on regret matching.
         """
         # Update beliefs based on the latest observation
         self.update_beliefs(observation, action_mask)
         
-        # Run MCTS search to obtain search outputs
+        # Run MCTS search with CFR to obtain search outputs
         search_outcomes = self.mcts_search(observation, action_mask)
+        
+        # Split observation for logging
+        public_obs, private_obs = self.split_observation(observation)
         
         # Record complete transition for later training
         self.action_history.append({
             'observation': observation,
+            'public_observation': public_obs,
+            'private_observation': private_obs,
             'action_mask': action_mask,
             'table_card': table_card,
             'selected_action': search_outcomes['selected_action'],
             'search_policy': search_outcomes['search_policy'],
             'value_estimate': search_outcomes['value_estimate'],
-            'counterfactual_regrets': search_outcomes['counterfactual_regrets']
+            'counterfactual_regrets': search_outcomes['counterfactual_regrets'],
+            'cfr_strategy': search_outcomes['cfr_strategy'],
+            'public_state_key': search_outcomes['public_state_key']
         })
         
         return search_outcomes
