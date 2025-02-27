@@ -1,4 +1,6 @@
+# src/training/train_rebel.py
 import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import logging
 import torch
 import torch.nn as nn
@@ -11,7 +13,7 @@ from collections import defaultdict
 from src import config
 from src.env.liars_deck_env_core import LiarsDeckEnv
 from src.env.liars_deck_env_utils_2 import decode_action
-from src.model.new_models import RebelPolicyNetwork, ValueNetwork, BeliefStateModel, CFRValueNetwork
+from src.model.rebel_models import RebelPolicyNetwork, BeliefStateModel, CFRValueNetwork
 from src.model.recursive_search_agent import RecursiveSearchAgent
 from src.training.train_utils import save_checkpoint, get_tensorboard_writer
 
@@ -28,12 +30,12 @@ def configure_logger():
 
 def create_env_copy(original_env):
     """Create a copy of the environment for simulations."""
-    # Use the new clone method to make an exact copy of the environment state
     return original_env.clone()
 
 def collect_experience(env, agents, num_games=10):
     """
     Collect experience by playing games with the current agents.
+    Augments each transition with additional search outcomes.
     """
     all_trajectories = []
     
@@ -54,52 +56,59 @@ def collect_experience(env, agents, num_games=10):
             current_agent_id = env.agent_selection
             current_agent = agents[current_agent_id]
             
-            # Get proper observation for current agent
+            # Get proper observation and info for current agent
             observations = env.observe(current_agent_id)
             infos = env.infos
-            
             obs = observations[current_agent_id]
             action_mask = infos[current_agent_id]['action_mask']
             
-            # Update beliefs and choose action
-            current_agent.update_beliefs(obs)
-            action = current_agent.play_turn(obs, action_mask, env.table_card)
+            # Update beliefs and perform search-based action selection.
+            # play_turn now returns a dict with additional search outputs.
+            search_outputs = current_agent.play_turn(obs, action_mask, env.table_card)
+            selected_action = search_outputs['selected_action']
+            search_policy = search_outputs['search_policy']
+            search_value = search_outputs['value_estimate']
+            counterfactual_regrets = search_outputs['counterfactual_regrets']
             
-            # Record state and beliefs before taking action
+            # Record state and current beliefs (detach so training is independent)
             agent_beliefs = current_agent.current_beliefs.detach().cpu()
             
-            # Save initial state to detect if round ends after this action
+            # Compute ground truth belief target using full game state
+            belief_target = current_agent.belief_model.infer_belief_from_game_state(obs, current_agent.agent_index, env)
+            
+            # Save initial deck length to detect if round ends after this action
             round_start = len(env.deck)
             
-            # Execute action
-            env.step(action)
+            # Execute the selected action
+            env.step(selected_action)
             
             # Check if round ended (new cards were dealt)
             round_ended = len(env.deck) != round_start
             
-            # Check if game is done
+            # Get reward and termination flag
             next_agent_id = env.agent_selection if env.agents else None
             reward = env.rewards[current_agent_id]
             done = env.terminations[current_agent_id]
             
-            # Store transition
+            # Store transition with additional search fields and ground-truth belief target
             transition = {
                 'agent_id': current_agent_id,
                 'obs': obs,
-                'action': action,
+                'action': selected_action,
                 'reward': reward,
                 'done': done,
                 'beliefs': agent_beliefs,
+                'belief_target': belief_target,  # New ground truth belief target
                 'action_mask': action_mask,
-                'round_ended': round_ended
+                'round_ended': round_ended,
+                'search_policy': search_policy,         # Search-derived action distribution
+                'search_value': search_value,           # Search-derived value estimate
+                'counterfactual_regrets': counterfactual_regrets  # Regrets per action
             }
             trajectory.append(transition)
             
             if next_agent_id is None:
                 game_done = True
-            else:
-                # Update for next iteration - already handled at the beginning of loop
-                pass
         
         all_trajectories.append(trajectory)
     
@@ -109,15 +118,7 @@ def train_belief_model(belief_model, trajectories, optimizer, device, batch_size
     """
     Train the belief model using collected trajectories and simulation-based targets.
     
-    Args:
-        belief_model: Belief state model
-        trajectories: List of game trajectories
-        optimizer: Optimizer for the belief model
-        device: Training device
-        batch_size: Training batch size
-        
-    Returns:
-        Average loss
+    Uses the ground truth belief computed from the full game state.
     """
     belief_model.train()
     
@@ -135,32 +136,14 @@ def train_belief_model(belief_model, trajectories, optimizer, device, batch_size
     for i in range(0, len(transitions), batch_size):
         batch = transitions[i:i+batch_size]
         
-        # Extract observations and targets
         obs_batch = torch.FloatTensor(np.array([t['obs'] for t in batch])).to(device)
-
+        target_batch = torch.cat([t['belief_target'] for t in batch]).to(device)
         
-        # For training, we'll use a KL-divergence loss between:
-        # 1. The model's predicted beliefs 
-        # 2. The "true" beliefs based on subsequent observations/outcomes
-        
-        # When we have ground truth information (e.g. from successful challenges or end of game),
-        # we can create a better belief target
-        if 'belief_target' in batch[0]:
-            # Use provided belief targets
-            target_batch = torch.stack([t['belief_target'] for t in batch]).to(device)
-        else:
-            # Use agent's beliefs as a proxy
-            target_batch = torch.cat([t['beliefs'] for t in batch]).to(device)
-        
-        # Forward pass
         pred_beliefs = belief_model(obs_batch)
         
-        # Compute loss (KL divergence between predicted and target distributions)
-        # Add epsilon to avoid log(0)
         epsilon = 1e-10
         pred_log_probs = torch.log(pred_beliefs + epsilon)
         
-        # KL divergence: sum(target * log(target/pred))
         loss = F.kl_div(
             pred_log_probs.reshape(-1, pred_beliefs.size(-1)),
             target_batch.reshape(-1, target_batch.size(-1)),
@@ -168,7 +151,6 @@ def train_belief_model(belief_model, trajectories, optimizer, device, batch_size
             log_target=False
         )
         
-        # Backward pass
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -182,42 +164,29 @@ def train_value_network(value_net, trajectories, optimizer, device, gamma=0.99, 
     """
     Train the value network using collected trajectories.
     
-    Args:
-        value_net: Value network
-        trajectories: List of game trajectories
-        optimizer: Optimizer for the value network
-        device: Training device
-        gamma: Discount factor
-        batch_size: Training batch size
-        
-    Returns:
-        Average loss
+    Blends the traditional discounted return loss with an additional loss term that
+    minimizes the difference between the network's output and the search-derived value.
     """
     value_net.train()
     
-    # Flatten and process trajectories
     processed_transitions = []
     
     for trajectory in trajectories:
-        # Group by agent
         agent_trajectories = defaultdict(list)
         for transition in trajectory:
             agent_id = transition['agent_id']
             agent_trajectories[agent_id].append(transition)
         
-        # Compute returns for each agent
         for agent_id, agent_traj in agent_trajectories.items():
             for i, transition in enumerate(agent_traj):
-                # Compute discounted return
                 G = 0.0
                 for t, future in enumerate(agent_traj[i:]):
                     G += (gamma ** t) * future['reward']
-                
-                # Store processed transition
                 processed = {
                     'obs': transition['obs'],
                     'beliefs': transition['beliefs'],
-                    'return': G
+                    'return': G,
+                    'search_value': transition['search_value']  # Search-derived value target
                 }
                 processed_transitions.append(processed)
     
@@ -226,25 +195,25 @@ def train_value_network(value_net, trajectories, optimizer, device, gamma=0.99, 
     
     total_loss = 0.0
     num_batches = 0
+    lambda_value = 0.5  # Weight for search-derived value loss term
     
-    # Shuffle transitions
     np.random.shuffle(processed_transitions)
     
     for i in range(0, len(processed_transitions), batch_size):
         batch = processed_transitions[i:i+batch_size]
         
-        # Extract data
         obs_batch = torch.FloatTensor(np.array([t['obs'] for t in batch])).to(device)
         beliefs_batch = torch.cat([t['beliefs'] for t in batch]).to(device)
         returns_batch = torch.FloatTensor([t['return'] for t in batch]).unsqueeze(1).to(device)
+        search_value_batch = torch.FloatTensor([t['search_value'] for t in batch]).unsqueeze(1).to(device)
         
-        # Forward pass
-        pred_values = value_net(obs_batch, beliefs_batch)
+        # Extract the predicted value; value_net now returns (value, regrets)
+        pred_value, _ = value_net(obs_batch, beliefs_batch)
         
-        # Compute loss
-        loss = F.mse_loss(pred_values, returns_batch)
+        mse_return = F.mse_loss(pred_value, returns_batch)
+        mse_search = F.mse_loss(pred_value, search_value_batch)
+        loss = mse_return + lambda_value * mse_search
         
-        # Backward pass
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -258,63 +227,48 @@ def train_policy_network(policy_net, value_net, trajectories, optimizer, device,
     """
     Train the policy network using REINFORCE with baseline and belief states.
     
-    Args:
-        policy_net: Policy network
-        value_net: Value network (for baseline)
-        trajectories: List of game trajectories
-        optimizer: Optimizer for the policy network
-        device: Training device
-        batch_size: Training batch size
-        
-    Returns:
-        Average loss
+    Adds a term that penalizes the difference between the network's action probabilities
+    and the search-derived action distribution.
     """
     policy_net.train()
     value_net.eval()
     
-    # Flatten trajectories
     transitions = [t for traj in trajectories for t in traj]
     if len(transitions) < batch_size:
         return 0.0
     
     total_loss = 0.0
     num_batches = 0
+    lambda_policy = 1.0  # Weight for search policy loss term
     
-    # Shuffle transitions
     np.random.shuffle(transitions)
     
     for i in range(0, len(transitions), batch_size):
         batch = transitions[i:i+batch_size]
         
-        # Extract data
         obs_batch = torch.FloatTensor(np.array([t['obs'] for t in batch])).to(device)
         action_batch = torch.LongTensor([t['action'] for t in batch]).to(device)
         reward_batch = torch.FloatTensor([t['reward'] for t in batch]).to(device)
         beliefs_batch = torch.cat([t['beliefs'] for t in batch]).to(device)
+        search_policy_targets = torch.FloatTensor(np.array([t['search_policy'] for t in batch])).to(device)
         
-        # Forward pass for policy with beliefs
         action_probs, policy_values, _ = policy_net(obs_batch, beliefs_batch)
         
-        # Get action log probabilities
         log_probs = torch.log(action_probs.gather(1, action_batch.unsqueeze(1)).squeeze(1) + 1e-10)
         
-        # Compute baseline using value network
         with torch.no_grad():
-            baseline = value_net(obs_batch, beliefs_batch).squeeze(1)
+            baseline, _ = value_net(obs_batch, beliefs_batch)
+            baseline = baseline.squeeze(1)
         
-        # Compute advantage
         advantage = reward_batch - baseline
-        
-        # Compute policy loss
         policy_loss = -torch.mean(log_probs * advantage)
-        
-        # Add value prediction loss for joint training
         value_loss = F.mse_loss(policy_values.squeeze(1), reward_batch)
         
-        # Combined loss with value prediction as auxiliary task
-        loss = policy_loss + 0.5 * value_loss
+        # Additional loss term: KL divergence between policy output and search-derived policy target
+        search_policy_loss = F.kl_div(torch.log(action_probs + 1e-10), search_policy_targets, reduction='batchmean', log_target=False)
         
-        # Backward pass
+        loss = policy_loss + 0.5 * value_loss + lambda_policy * search_policy_loss
+        
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -331,44 +285,26 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
     """
     Train a ReBeL-inspired agent with belief tracking and recursive search.
     
-    Args:
-        env: Game environment
-        device: Training device
-        num_epochs: Number of training epochs
-        games_per_epoch: Number of games to play per epoch
-        lr_policy: Learning rate for policy network
-        lr_belief: Learning rate for belief model
-        lr_value: Learning rate for value network
-        search_depth: Depth of recursive search
-        num_simulations: Number of simulations per search
-        log_interval: Log every N epochs
-        checkpoint_interval: Save checkpoint every N epochs
-        log_tensorboard: Whether to log metrics to TensorBoard
-        
-    Returns:
-        Trained agent components
+    This updated training loop collects augmented transitions that include search-derived
+    policy, value, and regret information. The training functions are updated to use these
+    extra signals.
     """
     logger = configure_logger()
     logger.info(f"Starting ReBeL training on {device}")
     
-    # Set up TensorBoard
     writer = None
     if log_tensorboard:
         writer = get_tensorboard_writer(log_dir=os.path.join(config.TENSORBOARD_RUNS_DIR, 'rebel'))
     
-    # Initialize models
     num_players = env.num_players
     obs_dim = env.observation_spaces[env.possible_agents[0]].shape[0]
     action_dim = env.action_spaces[env.possible_agents[0]].n
     hidden_dim = 128
+    num_card_types = 4  # For Liar's Deck
     
-    # For Liar's Deck, the number of cards would be:
-    # (3 ranks × 6 each) + 2 jokers = 20 cards
-    num_card_types = 4
-    # Create networks
     policy_net = RebelPolicyNetwork(
         obs_dim=obs_dim, 
-        belief_dim=(num_players-1)*num_card_types,  # Flattened belief dimension
+        belief_dim=(num_players - 1) * num_card_types,
         hidden_dim=hidden_dim, 
         action_dim=action_dim
     ).to(device)
@@ -376,7 +312,7 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
     belief_model = BeliefStateModel(
         input_dim=obs_dim, 
         hidden_dim=hidden_dim, 
-        deck_size=20,  # Total deck size
+        deck_size=20,  
         num_players=num_players,
         use_dropout=True, 
         use_layer_norm=True
@@ -384,16 +320,15 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
 
     value_net = CFRValueNetwork(
         input_dim=obs_dim, 
-        belief_dim=(num_players-1)*num_card_types, 
-        hidden_dim=hidden_dim
+        belief_dim=(num_players - 1) * num_card_types, 
+        hidden_dim=hidden_dim,
+        action_dim=action_dim
     ).to(device)
     
-    # Create optimizers
     policy_optimizer = optim.Adam(policy_net.parameters(), lr=lr_policy)
     belief_optimizer = optim.Adam(belief_model.parameters(), lr=lr_belief)
     value_optimizer = optim.Adam(value_net.parameters(), lr=lr_value)
     
-    # Create agents
     agents = {}
     for i, agent_id in enumerate(env.possible_agents):
         agents[agent_id] = RecursiveSearchAgent(
@@ -408,21 +343,13 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
             agent_index=i
         )
     
-    # Training loop
     for epoch in tqdm(range(num_epochs)):
-        # Collect experience
         trajectories = collect_experience(env, agents, num_games=games_per_epoch)
         
-        # Train belief model
         belief_loss = train_belief_model(belief_model, trajectories, belief_optimizer, device)
-        
-        # Train value network
         value_loss = train_value_network(value_net, trajectories, value_optimizer, device)
-        
-        # Train policy network
         policy_loss = train_policy_network(policy_net, value_net, trajectories, policy_optimizer, device)
         
-        # Logging
         if (epoch + 1) % log_interval == 0:
             logger.info(f"Epoch {epoch+1}/{num_epochs}")
             logger.info(f"  Belief Loss: {belief_loss:.6f}")
@@ -434,12 +361,9 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
                 writer.add_scalar('Loss/Value', value_loss, epoch)
                 writer.add_scalar('Loss/Policy', policy_loss, epoch)
         
-        # Save checkpoint
         if (epoch + 1) % checkpoint_interval == 0:
             checkpoint_dir = os.path.join(config.CHECKPOINT_DIR, 'rebel')
             os.makedirs(checkpoint_dir, exist_ok=True)
-            
-            # Save policy network using standard format
             checkpoint_data = {
                 'policy_net': policy_net.state_dict(),
                 'policy_optimizer': policy_optimizer.state_dict(),
@@ -456,24 +380,19 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
 
 def main():
     """Main entry point for the training script."""
-    # Configure logger
     logger = configure_logger()
-    
-    # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
     
-    # Create environment
     env = LiarsDeckEnv(num_players=3)
     
-    # Train agent
     policy_net, belief_model, value_net, agents = train_rebel_agent(
         env=env,
         device=device,
         num_epochs=200,
         games_per_epoch=10,
-        search_depth=3,
-        num_simulations=30,
+        search_depth=6,
+        num_simulations=60,
         log_interval=5,
         checkpoint_interval=20,
         log_tensorboard=True
