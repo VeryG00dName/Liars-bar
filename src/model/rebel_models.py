@@ -1,5 +1,6 @@
 # src/model/rebel_models.py
 import math
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,22 +8,22 @@ import torch.nn.functional as F
 class BeliefStateModel(nn.Module):
     """
     Models probability distributions over opponents' hands based on game history.
-    Separates public and private belief states for proper ReBeL implementation.
-    
-    Public belief: Information available to all players (action history, visible cards)
-    Private belief: Player-specific information and inferences
+    Now with added support for multi-agent belief correlation and physical constraints.
     """
     def __init__(self, input_dim, hidden_dim, deck_size, num_players, 
-                 use_dropout=True, use_layer_norm=True, update_mode='multiplicative'):
+                 use_dropout=True, use_layer_norm=True, update_mode='multiplicative',
+                 cards_per_type=None):
         super(BeliefStateModel, self).__init__()
         self.deck_size = deck_size  # Total number of cards in deck
         self.num_players = num_players
         self.card_types = 2  # Simplified: (table_card, non_table_card)
         self.update_mode = update_mode  # Options: 'multiplicative' or 'weighted'
         
+        # Card distribution information - critically important for correlation constraints
+        self.cards_per_type = cards_per_type or [10, 10]  # Default: 10 table cards, 10 non-table cards
+        assert sum(self.cards_per_type) == self.deck_size, "Cards per type must sum to deck size"
+        
         # Determine dimensions for public and private parts of the observation
-        # Public: opponent actions, table card, round info, etc.
-        # Private: player's hand, specific observations
         self.public_dim = input_dim - 2  # Subtract dimensions for player's hand
         self.private_dim = 2  # Player's hand (table cards, non-table cards)
         
@@ -49,8 +50,11 @@ class BeliefStateModel(nn.Module):
             nn.Dropout(0.2) if use_dropout else nn.Identity(),
         )
         
-        # Belief update network – outputs logits for card type probabilities per opponent
-        self.belief_update = nn.Linear(hidden_dim, (num_players - 1) * self.card_types)
+        # Belief update network – extended to model correlations
+        # Output shape: [batch, num_players * card_types * num_players * card_types]
+        # This allows modeling joint distributions between all players
+        correlation_dim = (num_players - 1) * self.card_types
+        self.belief_update = nn.Linear(hidden_dim, correlation_dim * correlation_dim)
         
         # Initialize with a uniform prior
         self.register_buffer('prior_belief', torch.ones(1, num_players - 1, self.card_types) / self.card_types)
@@ -64,12 +68,21 @@ class BeliefStateModel(nn.Module):
         Split observation into public and private components.
         
         Args:
-            x: Full observation tensor [batch_size, obs_dim]
-            
+            x: Full observation tensor [batch_size, obs_dim] or numpy array or list
+                
         Returns:
             (public_obs, private_obs): Tuple of public and private observation tensors
         """
-        batch_size = x.size(0)
+        # Convert to tensor if not already
+        if not isinstance(x, torch.Tensor):
+            if isinstance(x, np.ndarray):
+                x = torch.from_numpy(x).float()
+            else:
+                x = torch.tensor(x, dtype=torch.float)
+            
+            # Add batch dimension if needed
+            if x.dim() == 1:
+                x = x.unsqueeze(0)
         
         # First two elements are the player's hand information (table cards, non-table cards)
         private_obs = x[:, :self.private_dim]
@@ -79,9 +92,142 @@ class BeliefStateModel(nn.Module):
         
         return public_obs, private_obs
     
+    def apply_physical_constraints(self, beliefs, private_hand=None):
+        """
+        Apply physical constraints to ensure the beliefs respect card limits.
+        
+        Args:
+            beliefs: Belief tensor [batch_size, num_opponents, card_types]
+            private_hand: Observer's hand counts [batch_size, card_types] or None
+            
+        Returns:
+            Constrained beliefs respecting physical card limits
+        """
+        batch_size = beliefs.size(0)
+        device = beliefs.device
+        
+        # Clone the beliefs to avoid modifying the original
+        constrained_beliefs = beliefs.clone()
+        
+        # Get the total card counts from our configuration
+        total_cards = torch.tensor(self.cards_per_type, device=device)
+        
+        # Account for the cards in the observer's hand
+        if private_hand is not None:
+            # Convert private_hand to tensor if needed
+            if not isinstance(private_hand, torch.Tensor):
+                if isinstance(private_hand, np.ndarray):
+                    private_hand = torch.from_numpy(private_hand).float().to(device)
+                else:
+                    private_hand = torch.tensor(private_hand, dtype=torch.float).to(device)
+                
+                # Add batch dimension if needed
+                if private_hand.dim() == 1:
+                    private_hand = private_hand.unsqueeze(0)
+                
+            # Ensure private_hand has the right shape
+            if private_hand.size(1) != self.card_types:
+                # If it's the observation, use only first two elements
+                if private_hand.size(1) >= 2:
+                    private_hand = private_hand[:, :self.card_types]
+                else:
+                    private_hand = torch.zeros(batch_size, self.card_types, device=device)
+            
+            remaining_cards = total_cards.unsqueeze(0) - private_hand
+        else:
+            remaining_cards = total_cards.unsqueeze(0).expand(batch_size, -1)
+        
+        # Calculate the expected number of cards per type for each opponent
+        # This treats the beliefs as probabilities of having cards
+        expected_cards = torch.sum(constrained_beliefs, dim=1)  # [batch_size, card_types]
+        
+        # Scale beliefs to match the physical constraints
+        # If expected cards > remaining cards, scale down; if < remaining cards, scale up
+        scaling_factor = (remaining_cards / expected_cards.clamp(min=1e-8)).unsqueeze(1)
+        constrained_beliefs = constrained_beliefs * scaling_factor
+        
+        # Normalize each opponent's distribution
+        constrained_beliefs = constrained_beliefs / constrained_beliefs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        
+        return constrained_beliefs
+
+    def model_correlations(self, beliefs, private_hand=None):
+        """
+        Update beliefs to account for correlations between opponents' hands.
+        
+        Args:
+            beliefs: Independent belief tensor [batch_size, num_opponents, card_types]
+            private_hand: Observer's hand counts [batch_size, card_types] or None
+            
+        Returns:
+            Correlated beliefs respecting negative correlations between players
+        """
+        batch_size = beliefs.size(0)
+        num_opponents = beliefs.size(1)
+        device = beliefs.device
+        
+        # If only one opponent, no correlation modeling needed
+        if num_opponents <= 1:
+            return self.apply_physical_constraints(beliefs, private_hand)
+            
+        # Get total card counts
+        total_cards = torch.tensor(self.cards_per_type, device=device)
+        
+        # Account for observer's hand
+        if private_hand is not None:
+            # Convert private_hand to tensor if needed
+            if not isinstance(private_hand, torch.Tensor):
+                if isinstance(private_hand, np.ndarray):
+                    private_hand = torch.from_numpy(private_hand).float().to(device)
+                else:
+                    private_hand = torch.tensor(private_hand, dtype=torch.float).to(device)
+                
+                # Add batch dimension if needed
+                if private_hand.dim() == 1:
+                    private_hand = private_hand.unsqueeze(0)
+                    
+            # Ensure private_hand has the right shape [batch_size, card_types]
+            if private_hand.size(1) != self.card_types:
+                # If it's the observation, use only first two elements (table, non-table cards)
+                if private_hand.size(1) >= 2:
+                    private_hand = private_hand[:, :self.card_types]
+                else:
+                    private_hand = torch.zeros(batch_size, self.card_types, device=device)
+            
+            remaining_cards = total_cards.unsqueeze(0) - private_hand
+        else:
+            remaining_cards = total_cards.unsqueeze(0).expand(batch_size, -1)
+        
+        # Implement a negative correlation matrix
+        # The more cards one player has, the fewer are available for others
+        correlation_strength = 0.3  # Adjustable parameter
+        
+        # Start with independent beliefs
+        correlated_beliefs = beliefs.clone()
+        
+        # For each card type
+        for c in range(self.card_types):
+            # For each pair of opponents
+            for i in range(num_opponents):
+                for j in range(i+1, num_opponents):
+                    # Calculate negative correlation adjustment
+                    adjustment_i = correlation_strength * (correlated_beliefs[:, j, c] - 0.5)
+                    adjustment_j = correlation_strength * (correlated_beliefs[:, i, c] - 0.5)
+                    
+                    # Apply adjustment (higher belief for one player reduces belief for others)
+                    correlated_beliefs[:, i, c] = (correlated_beliefs[:, i, c] - adjustment_i).clamp(0.1, 0.9)
+                    correlated_beliefs[:, j, c] = (correlated_beliefs[:, j, c] - adjustment_j).clamp(0.1, 0.9)
+        
+        # Normalize and apply physical constraints
+        correlated_beliefs = correlated_beliefs / correlated_beliefs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        constrained_beliefs = self.apply_physical_constraints(correlated_beliefs, private_hand)
+        
+        return constrained_beliefs
+
     def get_public_belief_state(self, x, prev_beliefs=None):
         """
         Extract only the public belief state (independent of the player's private info).
+        Now with correlation constraints.
         
         Args:
             x: Observation tensor [batch_size, obs_dim]
@@ -91,15 +237,24 @@ class BeliefStateModel(nn.Module):
             Public belief state [batch_size, num_opponents, card_types]
         """
         batch_size = x.size(0)
-        public_obs, _ = self.split_observation(x)
+        public_obs, private_obs = self.split_observation(x)
         
         # Process only public information
         public_features = self.public_encoder(public_obs)
         
-        # Process directly to get belief update based only on public info
+        # Get independent belief updates based only on public info
         update_logits = self.belief_update(public_features)
-        update_logits = update_logits.view(batch_size, self.num_players - 1, self.card_types)
-        belief_update = F.softmax(update_logits, dim=-1)
+        
+        # Reshape to model correlations
+        correlation_dim = (self.num_players - 1) * self.card_types
+        update_logits = update_logits.view(batch_size, correlation_dim, correlation_dim)
+        
+        # Extract independent components for each opponent
+        independent_logits = torch.diagonal(update_logits, dim1=1, dim2=2)
+        independent_logits = independent_logits.view(batch_size, self.num_players - 1, self.card_types)
+        
+        # Convert to probabilities
+        belief_update = F.softmax(independent_logits, dim=-1)
         
         # If no previous beliefs, use the uniform prior
         if prev_beliefs is None:
@@ -113,13 +268,20 @@ class BeliefStateModel(nn.Module):
         else:
             updated_beliefs = prev_beliefs * belief_update  # Fallback
         
-        # Renormalize to ensure a valid probability distribution
+        # Renormalize
         updated_beliefs = updated_beliefs / (updated_beliefs.sum(dim=-1, keepdim=True) + 1e-10)
+        
+        # Apply correlation and physical constraints
+        # Extract private hand information - first two elements are the table cards and non-table cards
+        private_hand = x[:, :2]
+        updated_beliefs = self.model_correlations(updated_beliefs, private_hand)
+        
         return updated_beliefs
     
     def forward(self, x, prev_beliefs=None):
         """
         Full belief update using both public and private information.
+        Now with correlation constraints.
         
         Args:
             x: Observation tensor [batch_size, obs_dim]
@@ -141,8 +303,17 @@ class BeliefStateModel(nn.Module):
         
         # Generate belief update
         update_logits = self.belief_update(joint_features)
-        update_logits = update_logits.view(batch_size, self.num_players - 1, self.card_types)
-        belief_update = F.softmax(update_logits, dim=-1)
+        
+        # Reshape to model correlations
+        correlation_dim = (self.num_players - 1) * self.card_types
+        update_logits = update_logits.view(batch_size, correlation_dim, correlation_dim)
+        
+        # Extract independent components for each opponent
+        independent_logits = torch.diagonal(update_logits, dim1=1, dim2=2)
+        independent_logits = independent_logits.view(batch_size, self.num_players - 1, self.card_types)
+        
+        # Convert to probabilities
+        belief_update = F.softmax(independent_logits, dim=-1)
         
         # If no previous beliefs, use the uniform prior
         if prev_beliefs is None:
@@ -156,28 +327,122 @@ class BeliefStateModel(nn.Module):
         else:
             updated_beliefs = prev_beliefs * belief_update  # Fallback
         
-        # Renormalize to ensure a valid probability distribution
+        # Renormalize
         updated_beliefs = updated_beliefs / (updated_beliefs.sum(dim=-1, keepdim=True) + 1e-10)
+        
+        # Apply correlation and physical constraints
+        updated_beliefs = self.model_correlations(updated_beliefs, private_obs)
+        
         return updated_beliefs
+    
+    def sample_consistent_beliefs(self, beliefs, private_hand=None, num_samples=1):
+        """
+        Sample consistent belief states that respect physical constraints.
+        
+        Args:
+            beliefs: Current belief state [batch_size, num_opponents, card_types]
+            private_hand: Observer's hand counts [batch_size, card_types] or None
+            num_samples: Number of samples to generate
+            
+        Returns:
+            Sampled hands for each opponent [batch_size, num_samples, num_opponents, card_types]
+        """
+        batch_size = beliefs.size(0)
+        num_opponents = beliefs.size(1)
+        device = beliefs.device
+        
+        # Apply constraints to ensure beliefs respect physical limits
+        constrained_beliefs = self.model_correlations(beliefs, private_hand)
+        
+        # Get total card counts
+        total_cards = torch.tensor(self.cards_per_type, device=device)
+        
+        # Account for observer's hand
+        if private_hand is not None:
+            remaining_cards = total_cards.unsqueeze(0) - private_hand
+        else:
+            remaining_cards = total_cards.unsqueeze(0).expand(batch_size, -1)
+            
+        # Initialize sampled hands
+        sampled_hands = torch.zeros(batch_size, num_samples, num_opponents, self.card_types, device=device)
+        
+        # Sample multiple hands
+        for s in range(num_samples):
+            # Track remaining cards for this sample
+            cards_left = remaining_cards.clone()
+            
+            # Sample hands for each opponent
+            for i in range(num_opponents):
+                # Calculate how many cards this opponent can have based on beliefs
+                max_cards = torch.minimum(torch.ones_like(cards_left) * 5, cards_left)  # Max 5 cards per player
+                
+                # Calculate probabilities based on beliefs and remaining cards
+                probs = constrained_beliefs[:, i] * max_cards / max_cards.sum(dim=1, keepdim=True).clamp(min=1e-8)
+                
+                # Sample card counts for this opponent
+                opponent_hand = torch.zeros_like(probs)
+                for b in range(batch_size):
+                    # Sample from multinomial with the adjusted probabilities
+                    hand_distribution = torch.multinomial(
+                        probs[b].clamp(min=1e-8), 
+                        num_samples=5,  # Sample 5 cards
+                        replacement=True
+                    )
+                    
+                    # Count occurrences of each card type
+                    for card_idx in hand_distribution:
+                        opponent_hand[b, card_idx] += 1
+                
+                # Ensure we don't exceed remaining cards
+                opponent_hand = torch.minimum(opponent_hand, cards_left)
+                
+                # Update remaining cards
+                cards_left = cards_left - opponent_hand
+                
+                # Store sampled hand
+                sampled_hands[:, s, i] = opponent_hand
+        
+        return sampled_hands
     
     def infer_belief_from_game_state(self, observation, agent_idx, env):
         """
         Infer belief state directly from game state for ground truth training.
-        Creates target beliefs based on known information.
+        Now respects physical constraints.
         
         Args:
-            observation: Current observation.
+            observation: Current observation (can be numpy array, list, or tensor).
             agent_idx: Index of the agent.
             env: Environment instance with full state.
             
         Returns:
             Belief state representing ground truth probabilities for table/non-table cards.
         """
+        # Convert observation to tensor if needed
+        if not isinstance(observation, torch.Tensor):
+            if isinstance(observation, np.ndarray):
+                obs_tensor = torch.from_numpy(observation).float()
+            else:
+                obs_tensor = torch.tensor(observation, dtype=torch.float)
+            
+            # Add batch dimension if needed
+            if obs_tensor.dim() == 1:
+                obs_tensor = obs_tensor.unsqueeze(0)
+        else:
+            obs_tensor = observation
+            if obs_tensor.dim() == 1:
+                obs_tensor = obs_tensor.unsqueeze(0)
+        
         agent_name = env.possible_agents[agent_idx]
         opponents = [ag for ag in env.possible_agents if ag != agent_name]
         num_opponents = len(opponents)
+        
+        # Start with uniform beliefs
         beliefs = torch.ones(1, num_opponents, self.card_types) / self.card_types
         
+        # Extract observer's hand information
+        _, private_obs = self.split_observation(obs_tensor)
+        
+        # Update based on observed plays
         for i, opponent in enumerate(opponents):
             history = env.public_opponent_histories.get(opponent, [])
             cards_remaining = len(env.players_hands.get(opponent, [])) / 5.0  # Normalized hand size
@@ -196,8 +461,11 @@ class BeliefStateModel(nn.Module):
             
             # Normalize to ensure valid probabilities
             beliefs[0, i] = beliefs[0, i] / (beliefs[0, i].sum() + 1e-10)
-            
-        return beliefs
+        
+        # Apply correlation and physical constraints
+        constrained_beliefs = self.model_correlations(beliefs, private_obs)
+        
+        return constrained_beliefs
 
 
 class CFRValueNetwork(nn.Module):
