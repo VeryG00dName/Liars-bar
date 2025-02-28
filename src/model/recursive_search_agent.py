@@ -77,25 +77,52 @@ class RecursiveSearchAgent:
     
     def update_beliefs(self, observation, action_mask=None):
         """
-        Update both public and private belief states based on new observation.
-        Now maintains consistency across players.
-        
-        Args:
-            observation: Current observation
-            action_mask: Mask of valid actions
+        Optimized belief update with caching and faster processing.
         """
-        # If observation is a dict (from env.observe()), extract tensor for the current agent.
         if isinstance(observation, dict):
             obs_data = observation[self.name]
         else:
             obs_data = observation
-        
-        # Convert to tensor
+
+        # Quick conversion to tensor
         if not isinstance(obs_data, torch.Tensor):
-            obs_tensor = torch.FloatTensor(obs_data).unsqueeze(0).to(self.device)
+            self._last_obs_data = obs_data
+            if hasattr(self, '_last_obs_tensor') and self._last_obs_tensor is not None and len(obs_data) == self._last_obs_tensor.size(1):
+                self._last_obs_tensor[0].copy_(torch.tensor(obs_data, dtype=torch.float))
+                obs_tensor = self._last_obs_tensor
+            else:
+                obs_tensor = torch.FloatTensor(obs_data).unsqueeze(0).to(self.device)
+                self._last_obs_tensor = obs_tensor
         else:
             obs_tensor = obs_data.unsqueeze(0) if obs_data.dim() == 1 else obs_data
             obs_tensor = obs_tensor.to(self.device)
+
+        private_hand = obs_tensor[:, :2]
+
+        with torch.no_grad():
+            if not hasattr(self, '_belief_update_counter'):
+                self._belief_update_counter = 0
+            self._belief_update_counter += 1
+
+            is_full_update = self._belief_update_counter % 2 == 0 or not self.policy_net.training
+
+            if is_full_update:
+                if self.current_beliefs is None:
+                    self.current_beliefs = self.belief_model(obs_tensor)
+                else:
+                    self.current_beliefs = self.belief_model(obs_tensor, self.current_beliefs)
+
+                self.current_beliefs = self.belief_model.apply_physical_constraints_fast(
+                    self.current_beliefs, private_hand)
+
+            if self.current_public_beliefs is None:
+                self.current_public_beliefs = self.belief_model.get_public_belief_state(obs_tensor)
+            else:
+                self.current_public_beliefs = self.belief_model.get_public_belief_state(
+                    obs_tensor, self.current_public_beliefs)
+
+            self.current_public_beliefs = self.belief_model.apply_physical_constraints_fast(
+                self.current_public_beliefs, private_hand)
         
         # Extract private hand information for physical constraints
         # First two elements are the player's hand information (table cards, non-table cards)
