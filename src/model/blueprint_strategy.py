@@ -5,23 +5,19 @@ from collections import defaultdict
 import os
 import pickle
 
+# Update the BlueprintStrategy class to incorporate opponent identity
+
 class BlueprintStrategy:
     """
     Stores and provides access to a pre-computed strategy blueprint for the game.
-    This serves as a prior for real-time search during gameplay.
+    Now incorporates opponent identity for more specific strategies.
     """
     def __init__(self, policy_net=None, belief_model=None):
-        """
-        Initialize the blueprint strategy either empty or with networks.
-        
-        Args:
-            policy_net: Pre-trained policy network (optional)
-            belief_model: Pre-trained belief model (optional)
-        """
+        """Initialize the blueprint strategy either empty or with networks."""
         self.policy_net = policy_net
         self.belief_model = belief_model
         
-        # Storage for discrete state-action mappings
+        # Storage for state-action mappings with opponent identity
         self.strategy_map = defaultdict(lambda: np.zeros(7))  # For 7 actions
         self.value_map = {}
         self.visit_counts = defaultdict(int)
@@ -29,31 +25,38 @@ class BlueprintStrategy:
         # CFR-related data
         self.average_strategy = defaultdict(lambda: np.zeros(7))
         self.cumulative_regrets = defaultdict(lambda: np.zeros(7))
-        
-    def state_to_key(self, public_obs, beliefs=None):
+    
+    def state_to_key(self, public_obs, beliefs=None, opponent_id=None):
         """
         Convert public observation and belief state to a unique key for storage.
+        Now incorporates opponent identity when available.
         
         Args:
             public_obs: Public observation vector
             beliefs: Current belief state (optional)
+            opponent_id: The opponent's identity (optional)
         
         Returns:
             String key that uniquely identifies this public state
         """
-        # Simple hashing for storage - could be optimized
+        key_parts = [str(public_obs)]
+        
         if beliefs is not None:
             if isinstance(beliefs, torch.Tensor):
                 belief_arr = beliefs.cpu().numpy()
             else:
                 belief_arr = beliefs
-            return hash(str(public_obs) + str(belief_arr))
-        else:
-            return hash(str(public_obs))
+            key_parts.append(str(belief_arr))
+        
+        if opponent_id is not None:
+            key_parts.append(str(opponent_id))
+        
+        return hash("_".join(key_parts))
     
-    def update_strategy(self, public_obs, beliefs, strategy, value, visits=1):
+    def update_strategy(self, public_obs, beliefs, strategy, value, visits=1, opponent_id=None):
         """
         Update the blueprint with a new strategy for a given state.
+        Now incorporates opponent identity.
         
         Args:
             public_obs: Public observation vector
@@ -61,8 +64,9 @@ class BlueprintStrategy:
             strategy: Strategy (probability distribution over actions)
             value: Value estimate for this state
             visits: Number of visits to this state
+            opponent_id: The opponent's identity (optional)
         """
-        key = self.state_to_key(public_obs, beliefs)
+        key = self.state_to_key(public_obs, beliefs, opponent_id)
         
         # Incremental update weighted by visits
         current_visits = self.visit_counts[key]
@@ -85,24 +89,48 @@ class BlueprintStrategy:
         
         self.visit_counts[key] = total_visits
     
-    def query(self, public_obs, beliefs=None, action_mask=None):
+    def query(self, public_obs, beliefs=None, action_mask=None, opponent_id=None):
         """
         Query the blueprint for a strategy in the given state.
+        Now takes opponent identity into account.
         
         Args:
             public_obs: Public observation vector
             beliefs: Current belief state (optional)
             action_mask: Mask of valid actions (optional)
+            opponent_id: The opponent's identity (optional)
         
         Returns:
             Tuple of (strategy, value)
         """
-        key = self.state_to_key(public_obs, beliefs)
+        # Try opponent-specific key first
+        if opponent_id is not None:
+            opponent_key = self.state_to_key(public_obs, beliefs, opponent_id)
+            if opponent_key in self.strategy_map:
+                strategy = self.strategy_map[opponent_key]
+                value = self.value_map.get(opponent_key, 0.0)
+                
+                # Apply action mask if provided
+                if action_mask is not None:
+                    masked_strategy = strategy * action_mask
+                    if np.sum(masked_strategy) > 0:
+                        masked_strategy = masked_strategy / np.sum(masked_strategy)
+                    else:
+                        # Fallback to uniform over valid actions
+                        valid_actions = np.where(action_mask)[0]
+                        masked_strategy = np.zeros_like(strategy)
+                        masked_strategy[valid_actions] = 1.0 / len(valid_actions)
+                    return masked_strategy, value
+                
+                return strategy, value
+        
+        # Fall back to general state key without opponent identity
+        generic_key = self.state_to_key(public_obs, beliefs)
         
         # If state exists in our map
-        if key in self.strategy_map:
-            strategy = self.strategy_map[key]
-            value = self.value_map.get(key, 0.0)
+        if generic_key in self.strategy_map:
+            strategy = self.strategy_map[generic_key]
+            value = self.value_map.get(generic_key, 0.0)
             
             # Apply action mask if provided
             if action_mask is not None:
@@ -162,9 +190,10 @@ class BlueprintStrategy:
             else:
                 return np.ones(7) / 7, 0.0
     
-    def update_from_search(self, public_obs, beliefs, cfr_strategy, value, regrets, visits=1):
+    def update_from_search(self, public_obs, beliefs, cfr_strategy, value, regrets, visits=1, opponent_id=None):
         """
         Update blueprint from search results, including CFR information.
+        Now incorporates opponent identity.
         
         Args:
             public_obs: Public observation
@@ -173,11 +202,12 @@ class BlueprintStrategy:
             value: Value estimate
             regrets: Counterfactual regrets
             visits: Visit count for weighting
+            opponent_id: The opponent's identity (optional)
         """
-        key = self.state_to_key(public_obs, beliefs)
+        key = self.state_to_key(public_obs, beliefs, opponent_id)
         
         # Update strategy and value
-        self.update_strategy(public_obs, beliefs, cfr_strategy, value, visits)
+        self.update_strategy(public_obs, beliefs, cfr_strategy, value, visits, opponent_id)
         
         # Update CFR data
         self.average_strategy[key] = cfr_strategy

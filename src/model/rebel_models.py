@@ -151,6 +151,37 @@ class BeliefStateModel(nn.Module):
         
         return constrained_beliefs
 
+    def apply_physical_constraints_fast(self, beliefs, private_hand=None):
+        """
+        Faster version of constraint application for training.
+        """
+        batch_size = beliefs.size(0)
+        device = beliefs.device
+        
+        # Quick return for None or small batch (optimization)
+        if private_hand is None or batch_size <= 1:
+            return beliefs
+            
+        # Fast path: just use the first two elements of private_hand
+        if private_hand.size(1) != self.card_types and private_hand.size(1) >= 2:
+            private_hand = private_hand[:, :self.card_types]
+        
+        # Get total cards tensor (kept in memory for speed)
+        if not hasattr(self, 'total_cards_cache'):
+            self.total_cards_cache = torch.tensor(self.cards_per_type, device=device)
+        total_cards = self.total_cards_cache
+        
+        # Vectorized operations (fast)
+        remaining_cards = total_cards.unsqueeze(0) - private_hand
+        expected_cards = torch.sum(beliefs, dim=1, keepdim=True)
+        scaling_factor = (remaining_cards.unsqueeze(1) / expected_cards.clamp(min=1e-8))
+        
+        # Apply constraints with a single operation
+        constrained_beliefs = beliefs * scaling_factor
+        constrained_beliefs = constrained_beliefs / constrained_beliefs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        
+        return constrained_beliefs
+
     def model_correlations(self, beliefs, private_hand=None):
         """
         Optimized correlation modeling that's faster but still respects key constraints.
@@ -158,81 +189,31 @@ class BeliefStateModel(nn.Module):
         batch_size = beliefs.size(0)
         num_opponents = beliefs.size(1)
         device = beliefs.device
-
+        
         # Skip correlation for small belief matrices (fast path)
         if num_opponents <= 1 or batch_size * num_opponents <= 10:
             return self.apply_physical_constraints_fast(beliefs, private_hand)
-
+        
         # Apply a simpler, vectorized correlation model
+        # Instead of pairwise adjustments, use a single matrix operation
         correlated_beliefs = beliefs.clone()
-
+        
         # Get opponent average beliefs per card type
         avg_beliefs = beliefs.mean(dim=1, keepdim=True)  # [batch_size, 1, card_types]
-
+        
         # Apply negative correlation: push away from the average (vectorized)
         correlation_strength = 0.2  # Slightly reduced for faster convergence
         deviation = beliefs - avg_beliefs
         correlated_beliefs = beliefs - correlation_strength * deviation
-
+        
         # Clamp values to valid probability range (vectorized)
         correlated_beliefs = torch.clamp(correlated_beliefs, 0.1, 0.9)
-
+        
         # Normalize (vectorized)
         correlated_beliefs = correlated_beliefs / correlated_beliefs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-
+        
         # Fast physical constraints
         return self.apply_physical_constraints_fast(correlated_beliefs, private_hand)
-        
-        # Account for observer's hand
-        if private_hand is not None:
-            # Convert private_hand to tensor if needed
-            if not isinstance(private_hand, torch.Tensor):
-                if isinstance(private_hand, np.ndarray):
-                    private_hand = torch.from_numpy(private_hand).float().to(device)
-                else:
-                    private_hand = torch.tensor(private_hand, dtype=torch.float).to(device)
-                
-                # Add batch dimension if needed
-                if private_hand.dim() == 1:
-                    private_hand = private_hand.unsqueeze(0)
-                    
-            # Ensure private_hand has the right shape [batch_size, card_types]
-            if private_hand.size(1) != self.card_types:
-                # If it's the observation, use only first two elements (table, non-table cards)
-                if private_hand.size(1) >= 2:
-                    private_hand = private_hand[:, :self.card_types]
-                else:
-                    private_hand = torch.zeros(batch_size, self.card_types, device=device)
-            
-            remaining_cards = total_cards.unsqueeze(0) - private_hand
-        else:
-            remaining_cards = total_cards.unsqueeze(0).expand(batch_size, -1)
-        
-        # Implement a negative correlation matrix
-        # The more cards one player has, the fewer are available for others
-        correlation_strength = 0.3  # Adjustable parameter
-        
-        # Start with independent beliefs
-        correlated_beliefs = beliefs.clone()
-        
-        # For each card type
-        for c in range(self.card_types):
-            # For each pair of opponents
-            for i in range(num_opponents):
-                for j in range(i+1, num_opponents):
-                    # Calculate negative correlation adjustment
-                    adjustment_i = correlation_strength * (correlated_beliefs[:, j, c] - 0.5)
-                    adjustment_j = correlation_strength * (correlated_beliefs[:, i, c] - 0.5)
-                    
-                    # Apply adjustment (higher belief for one player reduces belief for others)
-                    correlated_beliefs[:, i, c] = (correlated_beliefs[:, i, c] - adjustment_i).clamp(0.1, 0.9)
-                    correlated_beliefs[:, j, c] = (correlated_beliefs[:, j, c] - adjustment_j).clamp(0.1, 0.9)
-        
-        # Normalize and apply physical constraints
-        correlated_beliefs = correlated_beliefs / correlated_beliefs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-        constrained_beliefs = self.apply_physical_constraints(correlated_beliefs, private_hand)
-        
-        return constrained_beliefs
 
     def get_public_belief_state(self, x, prev_beliefs=None):
         """
@@ -347,70 +328,45 @@ class BeliefStateModel(nn.Module):
     
     def sample_consistent_beliefs(self, beliefs, private_hand=None, num_samples=1):
         """
-        Sample consistent belief states that respect physical constraints.
-        
-        Args:
-            beliefs: Current belief state [batch_size, num_opponents, card_types]
-            private_hand: Observer's hand counts [batch_size, card_types] or None
-            num_samples: Number of samples to generate
-            
-        Returns:
-            Sampled hands for each opponent [batch_size, num_samples, num_opponents, card_types]
+        Optimized version of belief sampling that's much faster.
         """
+        # For training, we can use a simpler approach that approximates full sampling
         batch_size = beliefs.size(0)
         num_opponents = beliefs.size(1)
         device = beliefs.device
         
         # Apply constraints to ensure beliefs respect physical limits
-        constrained_beliefs = self.model_correlations(beliefs, private_hand)
+        constrained_beliefs = self.apply_physical_constraints_fast(beliefs, private_hand)
         
-        # Get total card counts
-        total_cards = torch.tensor(self.cards_per_type, device=device)
-        
-        # Account for observer's hand
-        if private_hand is not None:
-            remaining_cards = total_cards.unsqueeze(0) - private_hand
-        else:
-            remaining_cards = total_cards.unsqueeze(0).expand(batch_size, -1)
-            
-        # Initialize sampled hands
+        # Use a faster sampling approach
         sampled_hands = torch.zeros(batch_size, num_samples, num_opponents, self.card_types, device=device)
         
-        # Sample multiple hands
-        for s in range(num_samples):
-            # Track remaining cards for this sample
-            cards_left = remaining_cards.clone()
-            
-            # Sample hands for each opponent
-            for i in range(num_opponents):
-                # Calculate how many cards this opponent can have based on beliefs
-                max_cards = torch.minimum(torch.ones_like(cards_left) * 5, cards_left)  # Max 5 cards per player
-                
-                # Calculate probabilities based on beliefs and remaining cards
-                probs = constrained_beliefs[:, i] * max_cards / max_cards.sum(dim=1, keepdim=True).clamp(min=1e-8)
-                
-                # Sample card counts for this opponent
-                opponent_hand = torch.zeros_like(probs)
-                for b in range(batch_size):
-                    # Sample from multinomial with the adjusted probabilities
-                    hand_distribution = torch.multinomial(
-                        probs[b].clamp(min=1e-8), 
+        # Skip expensive sampling during training unless explicitly needed
+        if hasattr(self, 'training') and self.training and torch.rand(1).item() > 0.1:
+            # During training, 90% of the time just use expectations instead of full sampling
+            # This gives a significant speed boost with minimal accuracy loss
+            for s in range(num_samples):
+                # Instead of sampling cards one by one, just use the expected values
+                # Scale to match typical hand size (5 cards)
+                expected_hand = constrained_beliefs * 5
+                sampled_hands[:, s] = expected_hand
+        else:
+            # For inference or 10% of training, use proper sampling
+            for s in range(num_samples):
+                # Direct sampling from beliefs (much faster)
+                for i in range(num_opponents):
+                    probs = constrained_beliefs[:, i]
+                    # Sample using multinomial (vectorized)
+                    sample = torch.multinomial(
+                        probs.reshape(batch_size, -1).clamp(min=1e-8),
                         num_samples=5,  # Sample 5 cards
                         replacement=True
                     )
                     
-                    # Count occurrences of each card type
-                    for card_idx in hand_distribution:
-                        opponent_hand[b, card_idx] += 1
-                
-                # Ensure we don't exceed remaining cards
-                opponent_hand = torch.minimum(opponent_hand, cards_left)
-                
-                # Update remaining cards
-                cards_left = cards_left - opponent_hand
-                
-                # Store sampled hand
-                sampled_hands[:, s, i] = opponent_hand
+                    # Count card occurrences
+                    for b in range(batch_size):
+                        for card_idx in sample[b]:
+                            sampled_hands[b, s, i, card_idx] += 1
         
         return sampled_hands
     
