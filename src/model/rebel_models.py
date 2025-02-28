@@ -269,6 +269,149 @@ class BeliefStateModel(nn.Module):
         
         return updated_beliefs
     
+    def infer_belief_from_game_state(self, observation, agent_idx, env):
+        """
+        Infer belief state using counterfactual reasoning from game state.
+        
+        Args:
+            observation: Current observation
+            agent_idx: Index of the agent
+            env: Environment instance with full state
+            
+        Returns:
+            Belief state representing counterfactual belief distribution
+        """
+        # Convert observation to tensor
+        if not isinstance(observation, torch.Tensor):
+            if isinstance(observation, np.ndarray):
+                obs_tensor = torch.from_numpy(observation).float()
+            else:
+                obs_tensor = torch.tensor(observation, dtype=torch.float)
+            
+            if obs_tensor.dim() == 1:
+                obs_tensor = obs_tensor.unsqueeze(0)
+        else:
+            obs_tensor = observation
+            if obs_tensor.dim() == 1:
+                obs_tensor = obs_tensor.unsqueeze(0)
+        
+        agent_name = env.possible_agents[agent_idx]
+        opponents = [ag for ag in env.possible_agents if ag != agent_name]
+        num_opponents = len(opponents)
+        
+        # Initialize uniform beliefs
+        beliefs = torch.ones(1, num_opponents, self.card_types) / self.card_types
+        
+        # Extract observable history
+        action_history = self._extract_observable_history(env, opponents)
+        
+        # For each opponent, compute counterfactual beliefs
+        for i, opponent in enumerate(opponents):
+            # Get prior belief (uniform or from memory if available)
+            prior_belief = beliefs[0, i]
+            
+            # Traverse decision points and update beliefs using Bayes' rule
+            for decision_point in action_history.get(opponent, []):
+                action = decision_point['action']
+                action_type = decision_point.get('action_type')
+                count = decision_point.get('count')
+                
+                # Compute action probabilities for different possible hands
+                action_probs = self._compute_action_probabilities(action, action_type, count, opponent, env)
+                
+                # Update beliefs using Bayes' rule
+                prior_belief = self._update_beliefs_bayesian(prior_belief, action_probs)
+            
+            # Store updated beliefs
+            beliefs[0, i] = prior_belief
+        
+        # Extract observer's hand information for physical constraints
+        _, private_obs = self.split_observation(obs_tensor)
+        
+        # Apply correlation and physical constraints
+        constrained_beliefs = self.model_correlations(beliefs, private_obs)
+        
+        return constrained_beliefs
+
+    def _extract_observable_history(self, env, opponents):
+        """
+        Extract observable decision points from the environment history.
+        """
+        history = {}
+        for opponent in opponents:
+            history[opponent] = []
+            # Collect actions from public history
+            for entry in env.public_opponent_histories.get(opponent, []):
+                if entry['action_type'] in ["Play", "Challenge"]:
+                    history[opponent].append({
+                        'action_type': entry['action_type'],
+                        'count': entry.get('count'),
+                        'was_bluff': entry.get('was_bluff'),
+                        'was_challenged': entry.get('was_challenged', False)
+                    })
+        return history
+
+    def _compute_action_probabilities(self, action, action_type, count, opponent, env):
+        """
+        Compute probabilities of taking an action given different possible hands.
+        """
+        table_card = env.table_card
+        action_probs = torch.zeros(self.card_types)
+        
+        # Simplified version for illustration
+        if action_type == "Play" and count is not None:
+            # Probability of playing count cards if they have table_card/non-table cards
+            if count == 1:
+                # Probability of playing 1 card if they have table cards
+                action_probs[0] = 0.7  # Higher if they have table cards
+                # Probability of playing 1 card if they have non-table cards
+                action_probs[1] = 0.3  # Lower if they only have non-table cards
+            elif count == 2:
+                # Probability of playing 2 cards if they have table cards
+                action_probs[0] = 0.6  # Slightly lower for playing 2 table cards
+                # Probability of playing 2 cards if they have non-table cards
+                action_probs[1] = 0.2  # Even lower for playing 2 non-table cards
+            else:  # count == 3
+                # Probability of playing 3 cards if they have table cards
+                action_probs[0] = 0.5  # Even lower for playing 3 table cards
+                # Probability of playing 3 cards if they have non-table cards
+                action_probs[1] = 0.1  # Much lower for playing 3 non-table cards
+        elif action_type == "Challenge":
+            # Probability of challenging if they have table_card/non-table cards
+            action_probs[0] = 0.3  # Lower if they have table cards
+            action_probs[1] = 0.7  # Higher if they have non-table cards
+        
+        # In a real implementation, these probabilities would come from:
+        # - Policy network predictions
+        # - Blueprint strategy if available
+        # - Opponent modeling statistics
+        
+        return action_probs
+
+    def _update_beliefs_bayesian(self, prior_belief, action_probs):
+        """
+        Update beliefs using Bayes' rule.
+        
+        Args:
+            prior_belief: Current belief distribution
+            action_probs: P(action | hand) for different possible hands
+            
+        Returns:
+            Updated belief distribution
+        """
+        # Bayes' rule: P(hand | action) ∝ P(action | hand) × P(hand)
+        posterior = prior_belief * action_probs
+        
+        # Normalize to get a proper probability distribution
+        posterior_sum = posterior.sum()
+        if posterior_sum > 0:
+            posterior = posterior / posterior_sum
+        else:
+            # If all probabilities are zero, revert to prior
+            posterior = prior_belief
+        
+        return posterior
+    
     def forward(self, x, prev_beliefs=None):
         """
         Full belief update using both public and private information.
