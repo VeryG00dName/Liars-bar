@@ -415,7 +415,7 @@ class BeliefStateModel(nn.Module):
     def forward(self, x, prev_beliefs=None):
         """
         Full belief update using both public and private information.
-        Now with correlation constraints.
+        Now with correlation constraints and device consistency checks.
         
         Args:
             x: Observation tensor [batch_size, obs_dim]
@@ -425,6 +425,7 @@ class BeliefStateModel(nn.Module):
             Updated belief state [batch_size, num_opponents, card_types]
         """
         batch_size = x.size(0)
+        device = x.device  # Get the device of input tensor
         public_obs, private_obs = self.split_observation(x)
         
         # Process public and private information separately
@@ -452,6 +453,9 @@ class BeliefStateModel(nn.Module):
         # If no previous beliefs, use the uniform prior
         if prev_beliefs is None:
             prev_beliefs = self.prior_belief.expand(batch_size, -1, -1)
+        
+        # Ensure prev_beliefs is on the same device as belief_update
+        prev_beliefs = prev_beliefs.to(device)
         
         # Blend the previous beliefs with the new update
         if self.update_mode == 'multiplicative':

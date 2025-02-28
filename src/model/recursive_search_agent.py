@@ -288,6 +288,54 @@ class RecursiveSearchAgent:
         # Normalize to ensure it's a valid probability distribution
         return masked_strategy / np.sum(masked_strategy)
 
+    def _reconstruct_game_history(self, env):
+        """
+        Reconstruct the game history for counterfactual reasoning.
+        
+        Args:
+            env: Current game environment
+            
+        Returns:
+            Dictionary mapping opponents to their decision points
+        """
+        opponents = [ag for ag in env.possible_agents if ag != self.name]
+        history = {}
+        
+        # For each opponent, extract their decision points
+        for opponent in opponents:
+            history[opponent] = []
+            decisions = env.public_opponent_histories.get(opponent, [])
+            
+            for decision in decisions:
+                action_type = decision.get('action_type')
+                if action_type:
+                    decision_point = {
+                        'action_type': action_type,
+                        'count': decision.get('count'),
+                        'was_challenged': decision.get('was_challenged', False),
+                        'was_bluff': decision.get('was_bluff')
+                    }
+                    history[opponent].append(decision_point)
+        
+        return history
+
+    def _compute_counterfactual_beliefs(self, obs_tensor, current_beliefs, game_history, env):
+        """
+        Compute counterfactual beliefs based on game history.
+        
+        Args:
+            obs_tensor: Current observation tensor
+            current_beliefs: Current belief state
+            game_history: Reconstructed game history
+            env: Current game environment
+            
+        Returns:
+            Updated belief state using counterfactual reasoning
+        """
+        # This would call the belief model's counterfactual inference method
+        return self.belief_model.infer_belief_from_game_state(
+            obs_tensor, self.agent_index, env)
+
     def mcts_search(self, observation, action_mask):
         """
         Perform Monte Carlo Tree Search with blueprint priors, CFR, and opponent memory.
@@ -503,6 +551,10 @@ class RecursiveSearchAgent:
         agent = self.name
         original_agent_selection = env.agent_selection
         
+        # Move belief tensors to the device for consistency
+        beliefs = beliefs.to(self.device)
+        public_beliefs = public_beliefs.to(self.device)
+        
         # Skip expensive sampling for low reach probabilities or shallow depth
         skip_sampling = reach_prob < 0.05 or depth <= 1
         
@@ -547,6 +599,7 @@ class RecursiveSearchAgent:
                 # Update beliefs for the new state (optimized with caching)
                 if hasattr(self, '_cached_beliefs') and self._cached_beliefs is not None:
                     next_beliefs = self._cached_beliefs
+                    # Ensure all tensors are on the same device
                     next_beliefs.copy_(self.belief_model(next_obs_tensor, beliefs))
                 else:
                     next_beliefs = self.belief_model(next_obs_tensor, beliefs)
