@@ -113,8 +113,8 @@ class RecursiveSearchAgent:
 
     def update_beliefs(self, observation, action_mask=None):
         """
-        Update both public and private belief states based on new observation.
-        Now also updates opponent memory.
+        Update both public and private belief states based on new observation,
+        now with counterfactual reasoning.
         """
         # Extract observation
         if isinstance(observation, dict):
@@ -122,7 +122,7 @@ class RecursiveSearchAgent:
         else:
             obs_data = observation
         
-        # Quick conversion to tensor
+        # Convert to tensor
         if not isinstance(obs_data, torch.Tensor):
             self._last_obs_data = obs_data
             if hasattr(self, '_last_obs_tensor') and self._last_obs_tensor is not None and len(obs_data) == self._last_obs_tensor.size(1):
@@ -135,31 +135,51 @@ class RecursiveSearchAgent:
             obs_tensor = obs_data.unsqueeze(0) if obs_data.dim() == 1 else obs_data
             obs_tensor = obs_tensor.to(self.device)
         
-        # Extract private hand (just first two elements)
+        # Extract private hand
         private_hand = obs_tensor[:, :2]
         
         with torch.no_grad():
+            # Check if we need a full update
             if not hasattr(self, '_belief_update_counter'):
                 self._belief_update_counter = 0
             self._belief_update_counter += 1
             
             is_full_update = self._belief_update_counter % 2 == 0 or not self.policy_net.training
-                
+            
+            # Create environment instance for counterfactual reasoning
+            current_env = self.env_creator()
+            
             if is_full_update:
-                if self.current_beliefs is None:
-                    self.current_beliefs = self.belief_model(obs_tensor)
+                # Reconstruct game history for counterfactual reasoning
+                if hasattr(self, '_game_history'):
+                    game_history = self._game_history
                 else:
-                    self.current_beliefs = self.belief_model(obs_tensor, self.current_beliefs)
+                    game_history = self._reconstruct_game_history(current_env)
+                    self._game_history = game_history
                 
+                # Use counterfactual belief inference with game history
+                if self.current_beliefs is None:
+                    # For the first update, use the model directly
+                    self.current_beliefs = self.belief_model.infer_belief_from_game_state(
+                        obs_tensor, self.agent_index, current_env)
+                else:
+                    # For subsequent updates, use the Bayesian update
+                    # with counterfactual reasoning
+                    self.current_beliefs = self._compute_counterfactual_beliefs(
+                        obs_tensor, self.current_beliefs, game_history, current_env)
+                
+                # Apply physical constraints
                 self.current_beliefs = self.belief_model.apply_physical_constraints_fast(
                     self.current_beliefs, private_hand)
             
+            # Also update public beliefs
             if self.current_public_beliefs is None:
                 self.current_public_beliefs = self.belief_model.get_public_belief_state(obs_tensor)
             else:
                 self.current_public_beliefs = self.belief_model.get_public_belief_state(
                     obs_tensor, self.current_public_beliefs)
             
+            # Apply physical constraints to public beliefs as well
             self.current_public_beliefs = self.belief_model.apply_physical_constraints_fast(
                 self.current_public_beliefs, private_hand)
         
