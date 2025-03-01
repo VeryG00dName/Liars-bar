@@ -4,15 +4,15 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from src import config
 class BeliefStateModel(nn.Module):
     """
     Models probability distributions over opponents' hands based on game history.
     Now with added support for multi-agent belief correlation and physical constraints.
     """
     def __init__(self, input_dim, hidden_dim, deck_size, num_players, 
-                 use_dropout=True, use_layer_norm=True, update_mode='multiplicative',
-                 cards_per_type=None):
+             use_dropout=True, use_layer_norm=True, update_mode='multiplicative',
+             cards_per_type=None, use_transformer_memory=True):
         super(BeliefStateModel, self).__init__()
         self.deck_size = deck_size  # Total number of cards in deck
         self.num_players = num_players
@@ -56,6 +56,27 @@ class BeliefStateModel(nn.Module):
         
         # Initialize with a uniform prior
         self.register_buffer('prior_belief', torch.ones(1, num_players - 1, self.card_types) / self.card_types)
+        
+        self.use_transformer_memory = use_transformer_memory
+        self.use_transformer_memory = use_transformer_memory
+        if self.use_transformer_memory:
+            # Store the expected dimension of each opponent's embedding
+            self.strategy_dim = config.STRATEGY_DIM  # This should be 5 based on your error
+            
+            # Create a projection layer with MATCHING dimensions
+            self.transform_memory_projection = nn.Linear(self.strategy_dim, hidden_dim)
+            
+            # Create encoder with correct dimensions
+            self.transform_memory_encoder = nn.Sequential(
+                nn.LayerNorm(hidden_dim) if use_layer_norm else nn.Identity(),
+                nn.GELU(),
+                nn.Dropout(0.2) if use_dropout else nn.Identity(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.LayerNorm(hidden_dim) if use_layer_norm else nn.Identity(),
+                nn.Dropout(0.2) if use_dropout else nn.Identity(),
+                nn.Linear(hidden_dim, self.card_types)  # Project directly to card_types (2)
+            )
         
         # If using weighted blending, add a learnable parameter alpha
         if self.update_mode == 'weighted':
@@ -740,144 +761,175 @@ class BeliefStateModel(nn.Module):
         
         return correlated_beliefs
 
-    def infer_belief_from_game_state(self, observation, agent_idx, env):
+    def infer_belief_from_game_state(self, observation, agent_idx, env, transformer_features=None):
         """
-        Infer belief state using counterfactual reasoning from game state.
-        Implements optimized Bayesian belief updating with card counting.
+        Infer belief state using counterfactual reasoning from game state,
+        incorporating transformer-based memory features when available.
         
         Args:
             observation: Current observation (tensor or numpy array)
             agent_idx: Index of the agent
             env: Environment instance with full state
+            transformer_features: Optional transformer memory features
             
         Returns:
             torch.Tensor: Belief state representing counterfactual belief distribution
         """
-        # Default device and setup
+        # Setup device
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.device = device
-        
-        # Check for cached results - use key based on public observation
+
+        # Check for cached results using public state info
         cache_key = None
         if not self.training and hasattr(env, 'last_bid'):
-            # Create cache key using key state information
             public_state_str = f"{env.table_card}_{env.last_action_agent}_{env.last_action}"
             cache_key = hash(public_state_str)
-            
             if hasattr(self, '_belief_inference_cache') and cache_key in self._belief_inference_cache:
                 return self._belief_inference_cache[cache_key]
-        
-        # Convert observation to tensor
+
+        # Convert observation to tensor if needed
         if not isinstance(observation, torch.Tensor):
             if isinstance(observation, np.ndarray):
                 obs_tensor = torch.from_numpy(observation).float()
             else:
                 obs_tensor = torch.tensor(observation, dtype=torch.float)
-            
             if obs_tensor.dim() == 1:
                 obs_tensor = obs_tensor.unsqueeze(0)
         else:
-            obs_tensor = observation
-            if obs_tensor.dim() == 1:
-                obs_tensor = obs_tensor.unsqueeze(0)
-        
-        # Move to device
+            obs_tensor = observation if observation.dim() > 1 else observation.unsqueeze(0)
         obs_tensor = obs_tensor.to(device)
-        
-        # Get agent name and opponents
+
+        # Determine agent and opponent identities
         agent_name = env.possible_agents[agent_idx]
         opponents = [ag for ag in env.possible_agents if ag != agent_name]
         num_opponents = len(opponents)
-        
-        # Initialize beliefs with card distribution prior
+
+        # Initialize beliefs uniformly across card types for each opponent
         beliefs = torch.ones(1, num_opponents, self.card_types, device=device) / self.card_types
-        
-        # Get observer's hand to account for card constraints
+
+        # Get observer's hand details and table card
         observer_hand = env.players_hands.get(agent_name, [])
         table_card = env.table_card
-        
-        # Count cards in observer's hand by type
         observer_table_cards = sum(1 for c in observer_hand if c == table_card or c == "Joker")
         observer_non_table_cards = len(observer_hand) - observer_table_cards
-        
-        # Calculate remaining cards of each type in the game
+
+        # Calculate remaining cards in the game for each card type
         remaining_table_cards = self.cards_per_type[0] - observer_table_cards
         remaining_non_table_cards = self.cards_per_type[1] - observer_non_table_cards
-        
-        # Get opponent histories for Bayesian inference
-        # Use histories from public observation for speed
+
+        # Update beliefs per opponent using Bayesian inference on opponent history
         for i, opponent in enumerate(opponents):
-            # Get opponent's current hand size
             hand_size = len(env.players_hands.get(opponent, []))
             if hand_size == 0:
                 beliefs[0, i] = torch.ones(self.card_types, device=device) / self.card_types
                 continue
-                
-            # Use history entries from environment
+
             history_entries = []
             for entry in env.public_opponent_histories.get(opponent, []):
                 if entry['action_type'] in ["Play", "Challenge"]:
                     history_entries.append(entry)
-            
-            # Set initial prior based on card distribution
-            prior = torch.tensor([remaining_table_cards, remaining_non_table_cards], 
-                                device=device) / (remaining_table_cards + remaining_non_table_cards)
-            
-            # Fast Bayesian update based on history
+
+            # Set initial prior based on remaining card distribution
+            prior = torch.tensor([remaining_table_cards, remaining_non_table_cards], device=device) / \
+                    (remaining_table_cards + remaining_non_table_cards)
+
+            # Fast Bayesian update based on opponent history
             for entry in history_entries:
                 action_type = entry.get('action_type')
                 count = entry.get('count')
                 was_bluff = entry.get('was_bluff')
-                was_challenged = entry.get('was_challenged', False)
-                
-                # Skip entries without useful information
                 if action_type != "Play" or count is None:
                     continue
-                
-                # Compute likelihood P(action | hand) using action probabilities
+
                 if was_bluff is True:
-                    # Known bluffs - more likely to have non-table cards
                     likelihood = torch.tensor([0.2, 0.8], device=device)
                 elif was_bluff is False:
-                    # Known truth - more likely to have table cards
                     likelihood = torch.tensor([0.8, 0.2], device=device)
                 else:
-                    # Unknown - estimate based on count
                     table_prob = max(0.6 - (count * 0.1), 0.3)
                     likelihood = torch.tensor([table_prob, 1.0 - table_prob], device=device)
-                
-                # Bayesian update: posterior ∝ likelihood * prior
+
                 posterior = prior * likelihood
                 posterior_sum = torch.sum(posterior)
                 if posterior_sum > 0:
                     prior = posterior / posterior_sum
-            
-            # Store final belief
+
             beliefs[0, i] = prior
-        
-        # Apply correlation constraints
-        # Use vectorized operations for efficiency
+
+        # Apply correlation constraints to smooth opponent beliefs
         avg_beliefs = torch.mean(beliefs, dim=1, keepdim=True)
         correlation_strength = 0.2
         deviation = beliefs - avg_beliefs
         correlated_beliefs = beliefs - correlation_strength * deviation
         correlated_beliefs = torch.clamp(correlated_beliefs, 0.1, 0.9)
-        correlated_beliefs = correlated_beliefs / torch.sum(
-            correlated_beliefs, dim=-1, keepdim=True)
-        
-        # Apply physical constraints
+        correlated_beliefs = correlated_beliefs / torch.sum(correlated_beliefs, dim=-1, keepdim=True)
+
+        # Apply physical constraints using the observer's private hand
         private_hand = torch.FloatTensor([observer_table_cards, observer_non_table_cards]).unsqueeze(0).to(device)
         constrained_beliefs = self.apply_physical_constraints_fast(correlated_beliefs, private_hand)
+
+        # Incorporate transformer features if available
+        if transformer_features is not None and len(transformer_features) > 0 and self.use_transformer_memory:
+            try:
+                # Convert transformer_features to tensor if needed
+                if not isinstance(transformer_features, torch.Tensor):
+                    transformer_tensor = torch.FloatTensor(transformer_features).to(device)
+                else:
+                    transformer_tensor = transformer_features.to(device)
+                
+                # Split transformer features by opponent
+                num_opponents_expected = self.num_players - 1
+                
+                # Reshape if needed: if flat array, reshape to one row per opponent
+                if transformer_tensor.dim() == 1:
+                    transformer_tensor = transformer_tensor.reshape(num_opponents_expected, -1)
+                
+                # Create a memory prior with the same shape as constrained_beliefs
+                memory_prior = torch.ones_like(constrained_beliefs)
+                
+                # Process each opponent separately
+                for i in range(min(num_opponents_expected, transformer_tensor.size(0))):
+                    # Get this opponent's embedding (preserving batch dimension)
+                    opponent_embedding = transformer_tensor[i:i+1]
+                    
+                    # Project to hidden dimension
+                    projected_features = self.transform_memory_projection(opponent_embedding)
+                    
+                    # Process through encoder to get belief logits
+                    belief_logits = self.transform_memory_encoder(projected_features)
+                    
+                    # Convert logits to probability distribution
+                    opponent_belief = F.softmax(belief_logits, dim=-1)
+                    
+                    # Store in memory prior (assuming belief distribution shape matches)
+                    memory_prior[:, i, :] = opponent_belief
+                
+                # Blend transformer memory prior with constrained beliefs
+                memory_weight = 0.2  # Adjustable parameter
+                refined_beliefs = (1 - memory_weight) * constrained_beliefs + memory_weight * memory_prior
+                
+                # Renormalize the blended beliefs
+                refined_beliefs = refined_beliefs / torch.sum(refined_beliefs, dim=-1, keepdim=True).clamp(min=1e-8)
+                
+                # Cache refined beliefs if applicable
+                if cache_key is not None:
+                    if not hasattr(self, '_belief_inference_cache'):
+                        self._belief_inference_cache = {}
+                    if len(self._belief_inference_cache) > 20:
+                        self._belief_inference_cache = {}
+                    self._belief_inference_cache[cache_key] = refined_beliefs
+                
+                return refined_beliefs
+                
+            except Exception as e:
+                print(f"Error using transformer features in belief model: {e}")
         
-        # Cache the result for future reuse
+        # Cache and return original constrained beliefs if no transformer branch applied
         if cache_key is not None:
             if not hasattr(self, '_belief_inference_cache'):
                 self._belief_inference_cache = {}
-            
-            # Limit cache size
             if len(self._belief_inference_cache) > 20:
                 self._belief_inference_cache = {}
-                
             self._belief_inference_cache[cache_key] = constrained_beliefs
-        
+
         return constrained_beliefs

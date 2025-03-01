@@ -10,7 +10,8 @@ import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 from collections import defaultdict
-
+from src.model.new_models import StrategyTransformer
+from src.training.train_transformer import EventEncoder
 from src import config
 from src.env.liars_deck_env_core import LiarsDeckEnv
 from src.env.liars_deck_env_utils_2 import decode_action
@@ -856,7 +857,11 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
     """
     Train a ReBeL agent with improved learning dynamics.
     Implements CFR iteration sampling, linear weighting for strategies,
-    and adaptive learning rates.
+    adaptive learning rates, and two-stage blueprint generation:
+      1. Periodic blueprint updates during training.
+      2. A final blueprint generation phase using 500 games.
+    Additionally, the action probability model is retrained after training
+    to ensure its predictions reflect the final networks.
     
     Args:
         env: Game environment
@@ -871,8 +876,8 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
         log_interval: Logging interval in epochs
         checkpoint_interval: Checkpoint saving interval
         log_tensorboard: Whether to log to TensorBoard
-        blueprint_phase: Whether to use blueprint generation phase
-        blueprint_games: Number of games for blueprint generation
+        blueprint_phase: Whether to use blueprint guidance
+        blueprint_games: Number of games for final blueprint generation
         alpha: DCFR positive regret discount parameter
         beta: DCFR negative regret discount parameter
         gamma: DCFR average strategy discount parameter
@@ -885,7 +890,6 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
     
     # Initialize action probability model and data collector
     from src.model.rebel_models import ActionProbabilityModel, ActionProbabilityDataCollector
-    
     action_prob_model = ActionProbabilityModel(input_dim=11, hidden_dim=64).to(device)
     data_collector = ActionProbabilityDataCollector()
     
@@ -921,7 +925,8 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
         deck_size=20,  
         num_players=num_players,
         use_dropout=True, 
-        use_layer_norm=True
+        use_layer_norm=True,
+        use_transformer_memory=config.USE_TRANSFORMER_MEMORY
     ).to(device)
     
     # Add action probability model to belief model
@@ -947,7 +952,60 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
     value_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         value_optimizer, mode='min', factor=0.5, patience=5)
     
-    # Initialize agents with DCFR parameters
+    # (Optional) Transformer memory components initialization...
+    if config.USE_TRANSFORMER_MEMORY:
+        logger.info("Initializing transformer-based memory components")
+        transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
+        if os.path.exists(transformer_checkpoint_path):
+            checkpoint = torch.load(transformer_checkpoint_path, map_location=device)
+            response2idx = checkpoint["response2idx"]
+            action2idx = checkpoint["action2idx"]
+            strategy_transformer = StrategyTransformer(
+                num_tokens=config.STRATEGY_NUM_TOKENS,
+                token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM,
+                nhead=config.STRATEGY_NHEAD,
+                num_layers=config.STRATEGY_NUM_LAYERS,
+                strategy_dim=config.STRATEGY_DIM,
+                num_classes=config.STRATEGY_NUM_CLASSES,
+                dropout=config.STRATEGY_DROPOUT,
+                use_cls_token=True
+            ).to(device)
+            strategy_transformer.load_state_dict(checkpoint["transformer_state_dict"], strict=False)
+            event_encoder = EventEncoder(
+                response_vocab_size=len(response2idx),
+                action_vocab_size=len(action2idx),
+                token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM
+            ).to(device)
+            event_encoder.load_state_dict(checkpoint["event_encoder_state_dict"])
+            strategy_transformer.token_embedding = nn.Identity()
+            strategy_transformer.classification_head = None
+            strategy_transformer.eval()
+            belief_model.use_transformer_memory = True
+            belief_model.transform_memory_projection = nn.Linear(config.STRATEGY_DIM, hidden_dim).to(device)
+            belief_model.transform_memory_encoder = nn.Sequential(
+                nn.GELU(),
+                nn.LayerNorm(hidden_dim),
+                nn.Dropout(0.2),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.LayerNorm(hidden_dim),
+                nn.Dropout(0.2),
+                nn.Linear(hidden_dim, 2)
+            ).to(device)
+            logger.info("Successfully loaded transformer components")
+        else:
+            logger.warning(f"Transformer checkpoint not found. Disabling transformer memory.")
+            strategy_transformer = None
+            event_encoder = None
+            response2idx = None
+            action2idx = None
+    else:
+        strategy_transformer = None
+        event_encoder = None
+        response2idx = None
+        action2idx = None
+        
+    # Initialize agents with DCFR parameters (without blueprint initially)
     agents = {}
     for i, agent_id in enumerate(env.possible_agents):
         agents[agent_id] = RecursiveSearchAgent(
@@ -960,9 +1018,13 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
             num_simulations=num_simulations,
             agent_name=agent_id,
             agent_index=i,
-            alpha=alpha,  # DCFR positive regret discount
-            beta=beta,    # DCFR negative regret discount
-            gamma=gamma   # DCFR average strategy discount
+            alpha=alpha,
+            beta=beta,
+            gamma=gamma,
+            strategy_transformer=strategy_transformer,
+            event_encoder=event_encoder,
+            response2idx=response2idx,
+            action2idx=action2idx
         )
     
     # Tracking for regrets and exploration
@@ -970,107 +1032,72 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
     exploration_rate = 1.0  # Start with high exploration
     blueprint = None
 
-    # ------------------------------------------------------------------------------
-    # Data Collection Phase for Action Probability Model
-    # ------------------------------------------------------------------------------
-    logger.info("Collecting data for action probability model...")
-    for game in tqdm(range(min(10, games_per_epoch * 3))):  # Collect data from a subset of games
+    # -------------------------------------------------------------------------------
+    # Data Collection Phase for Action Probability Model (Pre-training)
+    # -------------------------------------------------------------------------------
+    logger.info("Collecting initial data for action probability model...")
+    for game in tqdm(range(min(10, games_per_epoch * 3))):
         observations, infos = env.reset()
         for agent in agents.values():
             agent.reset()
         game_done = False
-        
         while not game_done:
             if not env.agents:
                 break
-            
             current_agent_id = env.agent_selection
             current_agent = agents[current_agent_id]
-            
             observations = env.observe(current_agent_id)
             infos = env.infos
             obs = observations[current_agent_id]
             action_mask = infos[current_agent_id]['action_mask']
-            
-            # Get the agent to act
             search_outputs = current_agent.play_turn(obs, action_mask, env.table_card)
             selected_action = search_outputs['selected_action']
-            
-            # Record the action before stepping (to capture current state)
             action_type, _, count = decode_action(selected_action)
             data_collector.record_action(
                 action_type=action_type,
                 count=count,
                 hand=env.players_hands.get(current_agent_id, []),
                 table_card=env.table_card,
-                was_bluff=None,  # Will be filled after the action
+                was_bluff=None,  # To be filled later
                 hand_size=len(env.players_hands.get(current_agent_id, [])),
                 penalty_ratio=env.penalties.get(current_agent_id, 0) / env.penalty_thresholds.get(current_agent_id, 3),
                 opponent_id=current_agent_id,
-                opponent_memory=None  # Not using memory for data collection
+                opponent_memory=None
             )
-            
-            # Take the step
-            prev_agent = current_agent_id
             env.step(selected_action)
-            
-            # Check for bluff information and update the last record accordingly
             if action_type == "Play" and env.last_action_bluff is not None:
                 for i in range(len(data_collector.data) - 1, -1, -1):
                     entry = data_collector.data[i]
                     if entry['meta']['action_type'] == "Play" and 'was_bluff' not in entry['meta']:
                         entry['meta']['was_bluff'] = env.last_action_bluff
-                        if env.last_action_bluff:
-                            entry['target'] = [0.0, 1.0]  # [table_prob, non_table_prob]
-                        else:
-                            entry['target'] = [1.0, 0.0]  # [table_prob, non_table_prob]
+                        entry['meta']['target'] = [0.0, 1.0] if env.last_action_bluff else [1.0, 0.0]
                         break
-            
-            # Check if the game is finished
             next_agent_id = env.agent_selection if env.agents else None
             if next_agent_id is None:
                 game_done = True
 
-    # Train the action probability model with collected data
-    logger.info("Training action probability model...")
+    logger.info("Pre-training action probability model...")
     action_prob_model = train_action_probability_model(
-        action_prob_model, data_collector, device, 
-        lr=lr_belief, epochs=50, batch_size=32
+        action_prob_model, data_collector, device, lr=lr_belief, epochs=50, batch_size=32
     )
-    
-    # Update the action probability model in the belief model
     belief_model.action_prob_model = action_prob_model
 
-    # ------------------------------------------------------------------------------
-    # Phase 1: Initial Network Training
-    # ------------------------------------------------------------------------------
+    # -------------------------------------------------------------------------------
+    # Phase 1: Initial Network Training (Without Blueprint Guidance)
+    # -------------------------------------------------------------------------------
     logger.info("Phase 1: Initial network training without blueprint")
     initial_epochs = num_epochs // 3
     for epoch in tqdm(range(initial_epochs), desc="Phase 1 Training"):
-        # Decay exploration rate over time
         exploration_rate = max(0.1, exploration_rate * 0.95)
-        
-        # Sample CFR iterations for this epoch
-        # Weight toward later iterations which provide better strategies
         iteration_weights = np.array([(i+1)**2 for i in range(20)])
         iteration_dist = iteration_weights / iteration_weights.sum()
         cfr_iters = np.random.choice(20, size=games_per_epoch, p=iteration_dist)
-        
-        # Set CFR iterations for each agent
         for i, agent_id in enumerate(env.possible_agents):
             agents[agent_id].num_simulations = max(10, num_simulations - int(15 * (1 - exploration_rate)))
-        
-        # Collect experience with prioritized sampling
-        trajectories = collect_experience(
-            env, agents, num_games=games_per_epoch, prioritize_sampling=True)
-        
-        # Train networks with combined targets
+        trajectories = collect_experience(env, agents, num_games=games_per_epoch, prioritize_sampling=True)
         belief_losses = train_belief_model(belief_model, trajectories, belief_optimizer, device)
-        value_losses = train_value_network(
-            value_net, trajectories, value_optimizer, device, lambda_value=0.5)
+        value_losses = train_value_network(value_net, trajectories, value_optimizer, device, lambda_value=0.5)
         policy_losses = train_policy_network(policy_net, value_net, trajectories, policy_optimizer, device)
-        
-        # Track regrets for stopping criteria
         avg_regret = 0.0
         regret_count = 0
         for traj in trajectories:
@@ -1080,36 +1107,27 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
         if regret_count > 0:
             avg_regret /= regret_count
             regret_tracker[epoch] = avg_regret
-        
-        # Update learning rates based on loss
         policy_scheduler.step(policy_losses['total'])
         belief_scheduler.step(belief_losses['total'])
         value_scheduler.step(value_losses['total'])
-        
-        # Log progress
         if (epoch + 1) % log_interval == 0:
             logger.info(f"Phase 1 - Epoch {epoch+1}/{initial_epochs}")
-            logger.info(f"  Belief Loss: Total={belief_losses['total']:.6f}, Full={belief_losses['full']:.6f}, Public={belief_losses['public']:.6f}, Reg={belief_losses['reg']:.6f}")
-            logger.info(f"  Value Loss: Total={value_losses['total']:.6f}, Full={value_losses['full_value']:.6f}, Public={value_losses['public_value']:.6f}, Regret={value_losses['regret']:.6f}")
-            logger.info(f"  Policy Loss: Total={policy_losses['total']:.6f}, Full={policy_losses['full_policy']:.6f}, Public={policy_losses['public_policy']:.6f}, Value={policy_losses['value']:.6f}")
+            logger.info(f"  Belief Loss: Total={belief_losses['total']:.6f}, Full={belief_losses['full']:.6f}, "
+                        f"Public={belief_losses['public']:.6f}, Reg={belief_losses['reg']:.6f}")
+            logger.info(f"  Value Loss: Total={value_losses['total']:.6f}, Full={value_losses['full_value']:.6f}, "
+                        f"Public={value_losses['public_value']:.6f}, Regret={value_losses['regret']:.6f}")
+            logger.info(f"  Policy Loss: Total={policy_losses['total']:.6f}, Full={policy_losses['full_policy']:.6f}, "
+                        f"Public={policy_losses['public_policy']:.6f}, Value={policy_losses['value']:.6f}")
             logger.info(f"  Average Regret: {avg_regret:.6f}, Exploration Rate: {exploration_rate:.2f}")
-            
             if writer:
                 writer.add_scalar('Phase1/Loss/Belief/Total', belief_losses['total'], epoch)
                 writer.add_scalar('Phase1/Loss/Value/Total', value_losses['total'], epoch)
                 writer.add_scalar('Phase1/Loss/Policy/Total', policy_losses['total'], epoch)
                 writer.add_scalar('Phase1/Metrics/AverageRegret', avg_regret, epoch)
                 writer.add_scalar('Phase1/Metrics/ExplorationRate', exploration_rate, epoch)
-                
-                # Add learning rates
-                writer.add_scalar('Phase1/LearningRate/Policy', 
-                                policy_scheduler.get_last_lr()[0], epoch)
-                writer.add_scalar('Phase1/LearningRate/Belief', 
-                                belief_scheduler.get_last_lr()[0], epoch)
-                writer.add_scalar('Phase1/LearningRate/Value', 
-                                value_scheduler.get_last_lr()[0], epoch)
-        
-        # Save checkpoints
+                writer.add_scalar('Phase1/LearningRate/Policy', policy_scheduler.get_last_lr()[0], epoch)
+                writer.add_scalar('Phase1/LearningRate/Belief', belief_scheduler.get_last_lr()[0], epoch)
+                writer.add_scalar('Phase1/LearningRate/Value', value_scheduler.get_last_lr()[0], epoch)
         if (epoch + 1) % checkpoint_interval == 0 or (epoch + 1) == initial_epochs:
             checkpoint_data = {
                 'policy_net': policy_net.state_dict(),
@@ -1122,46 +1140,28 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
                 'epoch': epoch + 1,
                 'phase': 1,
                 'exploration_rate': exploration_rate,
-                'agent_data': {
-                    agent_id: {
+                'agent_data': {agent_id: {
                         'cumulative_regrets': dict(agents[agent_id].cumulative_regrets),
                         'average_strategy': dict(agents[agent_id].average_strategy),
                         'strategy_update_count': dict(agents[agent_id].strategy_update_count)
-                    } for agent_id in agents
-                }
+                    } for agent_id in agents}
             }
             torch.save(checkpoint_data, os.path.join(checkpoint_dir, f'checkpoint_phase1_{epoch+1}.pt'))
     
-    # ------------------------------------------------------------------------------
-    # Phase 2: Blueprint Generation
-    # ------------------------------------------------------------------------------
+    # -------------------------------------------------------------------------------
+    # Phase 2: (During Training) Periodic Blueprint Updates
+    # -------------------------------------------------------------------------------
+    # In this phase, blueprint guidance is introduced and updated periodically.
+    remaining_epochs = num_epochs - initial_epochs
+    logger.info(f"Phase 3: Training with blueprint guidance for {remaining_epochs} epochs")
+    blueprint_weight_schedule = np.linspace(0.8, 0.2, remaining_epochs)
+    
+    # If blueprint_phase is enabled but no blueprint exists yet, initialize it as empty.
+    if blueprint_phase and blueprint is None:
+        blueprint = BlueprintStrategy(policy_net=policy_net, belief_model=belief_model)
+    
+    # Re-initialize agents with blueprint (if blueprint guidance is used)
     if blueprint_phase:
-        logger.info("Phase 2: Blueprint generation")
-        if os.path.exists(blueprint_save_path):
-            logger.info(f"Loading existing blueprint from {blueprint_save_path}")
-            blueprint = BlueprintStrategy.load(
-                blueprint_save_path,
-                policy_net=policy_net,
-                belief_model=belief_model
-            )
-        else:
-            logger.info(f"Generating new blueprint with {blueprint_games} games")
-            # Generate blueprint with selective state sampling
-            blueprint = generate_blueprint(
-                env=env,
-                policy_net=policy_net,
-                belief_model=belief_model,
-                value_net=value_net,
-                device=device,
-                num_games=blueprint_games,
-                search_depth=search_depth,
-                num_simulations=num_simulations,
-                save_path=blueprint_save_path,
-                importance_threshold=0.01  # Prune low-importance states
-            )
-        
-        # Re-initialize agents with blueprint
-        agents = {}
         for i, agent_id in enumerate(env.possible_agents):
             agents[agent_id] = RecursiveSearchAgent(
                 policy_net=policy_net,
@@ -1176,42 +1176,25 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
                 blueprint=blueprint,
                 alpha=alpha,
                 beta=beta,
-                gamma=gamma
+                gamma=gamma,
+                strategy_transformer=strategy_transformer,
+                event_encoder=event_encoder,
+                response2idx=response2idx,
+                action2idx=action2idx
             )
-    
-    # ------------------------------------------------------------------------------
-    # Phase 3: Training with Blueprint Guidance
-    # ------------------------------------------------------------------------------
-    remaining_epochs = num_epochs - initial_epochs
-    logger.info(f"Phase 3: Training with blueprint guidance for {remaining_epochs} epochs")
-    
-    # Linear schedule for blueprint influence
-    blueprint_weight_schedule = np.linspace(0.8, 0.2, remaining_epochs)
     
     for epoch in tqdm(range(remaining_epochs), desc="Phase 3 Training"):
         global_epoch = initial_epochs + epoch
-        
-        # Update exploration rate - less exploration with blueprint
         exploration_rate = max(0.05, exploration_rate * 0.98)
-        
-        # Set blueprint weight
         blueprint_weight = blueprint_weight_schedule[epoch]
-        if blueprint:
+        if blueprint_phase and blueprint:
             for agent in agents.values():
                 if hasattr(agent, 'blueprint_weight'):
                     agent.blueprint_weight = blueprint_weight
-        
-        # Collect experience with blueprint guidance
-        trajectories = collect_experience(
-            env, agents, num_games=games_per_epoch, prioritize_sampling=True)
-        
-        # Train networks
+        trajectories = collect_experience(env, agents, num_games=games_per_epoch, prioritize_sampling=True)
         belief_losses = train_belief_model(belief_model, trajectories, belief_optimizer, device)
-        value_losses = train_value_network(
-            value_net, trajectories, value_optimizer, device, lambda_value=0.7)
+        value_losses = train_value_network(value_net, trajectories, value_optimizer, device, lambda_value=0.7)
         policy_losses = train_policy_network(policy_net, value_net, trajectories, policy_optimizer, device)
-        
-        # Track regrets
         avg_regret = 0.0
         regret_count = 0
         for traj in trajectories:
@@ -1221,111 +1204,74 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
         if regret_count > 0:
             avg_regret /= regret_count
             regret_tracker[global_epoch] = avg_regret
-        
-        # Update learning rates
         policy_scheduler.step(policy_losses['total'])
         belief_scheduler.step(belief_losses['total'])
         value_scheduler.step(value_losses['total'])
-        
-        # Update blueprint periodically
-        if blueprint and (epoch + 1) % blueprint_update_interval == 0:
+        if (epoch + 1) % blueprint_update_interval == 0 and blueprint_phase and blueprint:
             logger.info(f"Updating blueprint at epoch {global_epoch+1}")
-            
-            # Update blueprint selectively based on state importance
             important_states = set()
             state_values = defaultdict(list)
-            
-            # Collect important states from recent games
-            for game in range(games_per_epoch // 2):  # Use subset for efficiency
+            for game in range(games_per_epoch // 2):
                 observations, infos = env.reset()
                 for agent in agents.values():
                     agent.reset()
                 game_done = False
-                
                 while not game_done:
                     if not env.agents:
                         break
-                        
                     current_agent_id = env.agent_selection
                     current_agent = agents[current_agent_id]
-                    
                     observations = env.observe(current_agent_id)
                     infos = env.infos
                     obs = observations[current_agent_id]
                     action_mask = infos[current_agent_id]['action_mask']
-                    
-                    # Get action and create state key
                     search_outputs = current_agent.play_turn(obs, action_mask, env.table_card)
                     selected_action = search_outputs['selected_action']
-                    
                     public_obs, _ = current_agent.split_observation(obs)
                     public_beliefs = current_agent.current_public_beliefs.cpu().numpy()
                     state_key = blueprint.state_to_key(public_obs, public_beliefs)
-                    
-                    # Record state importance based on search depth and value
                     state_depth = len(state_values)
-                    importance = 1.0 / (1.0 + state_depth)  # More important if earlier in game
-                    
-                    # Track important states
+                    importance = 1.0 / (1.0 + state_depth)
                     important_states.add(state_key)
                     state_values[state_key].append(search_outputs['value_estimate'])
-                    
-                    # Update blueprint with search results
                     blueprint.update_from_search(
                         public_obs,
                         public_beliefs,
                         search_outputs['search_policy'],
                         search_outputs['value_estimate'],
                         search_outputs['counterfactual_regrets'],
-                        visits=importance * 10,  # Weight by importance
+                        visits=importance * 10,
                         opponent_id=current_agent_id
                     )
-                    
-                    # Take step in environment
                     env.step(selected_action)
-                    
-                    # Check if game is done
                     next_agent_id = env.agent_selection if env.agents else None
                     if next_agent_id is None:
                         game_done = True
-            
-            # Save updated blueprint
             update_path = os.path.join(checkpoint_dir, f'blueprint_epoch{global_epoch+1}.pkl')
             blueprint.save(update_path)
-            
-            # Log blueprint update statistics
             logger.info(f"Updated blueprint saved to {update_path}")
             logger.info(f"Blueprint size: {len(blueprint.strategy_map)} states")
             logger.info(f"Important states identified: {len(important_states)}")
-        
-        # Log progress
         if (epoch + 1) % log_interval == 0:
             logger.info(f"Phase 3 - Epoch {global_epoch+1}/{num_epochs}")
-            logger.info(f"  Belief Loss: Total={belief_losses['total']:.6f}, Full={belief_losses['full']:.6f}, Public={belief_losses['public']:.6f}, Reg={belief_losses['reg']:.6f}")
-            logger.info(f"  Value Loss: Total={value_losses['total']:.6f}, Full={value_losses['full_value']:.6f}, Public={value_losses['public_value']:.6f}, Regret={value_losses['regret']:.6f}")
-            logger.info(f"  Policy Loss: Total={policy_losses['total']:.6f}, Full={policy_losses['full_policy']:.6f}, Public={policy_losses['public_policy']:.6f}, Value={policy_losses['value']:.6f}")
+            logger.info(f"  Belief Loss: Total={belief_losses['total']:.6f}, Full={belief_losses['full']:.6f}, "
+                        f"Public={belief_losses['public']:.6f}, Reg={belief_losses['reg']:.6f}")
+            logger.info(f"  Value Loss: Total={value_losses['total']:.6f}, Full={value_losses['full_value']:.6f}, "
+                        f"Public={value_losses['public_value']:.6f}, Regret={value_losses['regret']:.6f}")
+            logger.info(f"  Policy Loss: Total={policy_losses['total']:.6f}, Full={policy_losses['full_policy']:.6f}, "
+                        f"Public={policy_losses['public_policy']:.6f}, Value={policy_losses['value']:.6f}")
             logger.info(f"  Average Regret: {avg_regret:.6f}, Blueprint Weight: {blueprint_weight:.2f}")
-            
             if writer:
                 writer.add_scalar('Phase3/Loss/Belief/Total', belief_losses['total'], global_epoch)
                 writer.add_scalar('Phase3/Loss/Value/Total', value_losses['total'], global_epoch)
                 writer.add_scalar('Phase3/Loss/Policy/Total', policy_losses['total'], global_epoch)
                 writer.add_scalar('Phase3/Metrics/AverageRegret', avg_regret, global_epoch)
                 writer.add_scalar('Phase3/Metrics/BlueprintWeight', blueprint_weight, global_epoch)
-                
-                # Add learning rates
-                writer.add_scalar('Phase3/LearningRate/Policy', 
-                                policy_optimizer.param_groups[0]['lr'], global_epoch)
-                writer.add_scalar('Phase3/LearningRate/Belief', 
-                                belief_optimizer.param_groups[0]['lr'], global_epoch)
-                writer.add_scalar('Phase3/LearningRate/Value', 
-                                value_optimizer.param_groups[0]['lr'], global_epoch)
-                
+                writer.add_scalar('Phase3/LearningRate/Policy', policy_optimizer.param_groups[0]['lr'], global_epoch)
+                writer.add_scalar('Phase3/LearningRate/Belief', belief_optimizer.param_groups[0]['lr'], global_epoch)
+                writer.add_scalar('Phase3/LearningRate/Value', value_optimizer.param_groups[0]['lr'], global_epoch)
                 if blueprint:
-                    blueprint_size = len(blueprint.strategy_map)
-                    writer.add_scalar('Phase3/Blueprint/Size', blueprint_size, global_epoch)
-        
-        # Save checkpoints
+                    writer.add_scalar('Phase3/Blueprint/Size', len(blueprint.strategy_map), global_epoch)
         if (epoch + 1) % checkpoint_interval == 0 or (epoch + 1) == remaining_epochs:
             checkpoint_data = {
                 'policy_net': policy_net.state_dict(),
@@ -1339,18 +1285,82 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
                 'phase': 3,
                 'exploration_rate': exploration_rate,
                 'blueprint_weight': blueprint_weight,
-                'agent_data': {
-                    agent_id: {
+                'agent_data': {agent_id: {
                         'cumulative_regrets': dict(agents[agent_id].cumulative_regrets),
                         'average_strategy': dict(agents[agent_id].average_strategy),
                         'strategy_update_count': dict(agents[agent_id].strategy_update_count)
-                    } for agent_id in agents
-                }
+                    } for agent_id in agents}
             }
             torch.save(checkpoint_data, os.path.join(checkpoint_dir, f'checkpoint_phase3_{global_epoch+1}.pt'))
     
-    logger.info("ReBeL training with blueprint strategy complete!")
+    logger.info("Main training with blueprint guidance complete!")
     
+    # -------------------------------------------------------------------------------
+    # Final Blueprint Generation (500 games) and Retraining Action Prob Model
+    # -------------------------------------------------------------------------------
+    if blueprint_phase:
+        logger.info(f"Generating final blueprint with {blueprint_games} games...")
+        blueprint = generate_blueprint(
+            env=env,
+            policy_net=policy_net,
+            belief_model=belief_model,
+            value_net=value_net,
+            device=device,
+            num_games=blueprint_games,
+            search_depth=search_depth,
+            num_simulations=num_simulations,
+            save_path=blueprint_save_path,
+            importance_threshold=0.01
+        )
+    
+    # Retrain the action probability model after training for updated predictions.
+    logger.info("Collecting new data for final retraining of the action probability model...")
+    final_data_collector = ActionProbabilityDataCollector()
+    for game in tqdm(range(min(10, games_per_epoch * 3))):
+        observations, infos = env.reset()
+        for agent in agents.values():
+            agent.reset()
+        game_done = False
+        while not game_done:
+            if not env.agents:
+                break
+            current_agent_id = env.agent_selection
+            current_agent = agents[current_agent_id]
+            observations = env.observe(current_agent_id)
+            infos = env.infos
+            obs = observations[current_agent_id]
+            action_mask = infos[current_agent_id]['action_mask']
+            search_outputs = current_agent.play_turn(obs, action_mask, env.table_card)
+            selected_action = search_outputs['selected_action']
+            action_type, _, count = decode_action(selected_action)
+            final_data_collector.record_action(
+                action_type=action_type,
+                count=count,
+                hand=env.players_hands.get(current_agent_id, []),
+                table_card=env.table_card,
+                was_bluff=None,
+                hand_size=len(env.players_hands.get(current_agent_id, [])),
+                penalty_ratio=env.penalties.get(current_agent_id, 0) / env.penalty_thresholds.get(current_agent_id, 3),
+                opponent_id=current_agent_id,
+                opponent_memory=None
+            )
+            env.step(selected_action)
+            if action_type == "Play" and env.last_action_bluff is not None:
+                for i in range(len(final_data_collector.data) - 1, -1, -1):
+                    entry = final_data_collector.data[i]
+                    if entry['meta']['action_type'] == "Play" and 'was_bluff' not in entry['meta']:
+                        entry['meta']['was_bluff'] = env.last_action_bluff
+                        entry['meta']['target'] = [0.0, 1.0] if env.last_action_bluff else [1.0, 0.0]
+                        break
+            next_agent_id = env.agent_selection if env.agents else None
+            if next_agent_id is None:
+                game_done = True
+    logger.info("Retraining the action probability model with new data...")
+    action_prob_model = train_action_probability_model(
+        action_prob_model, final_data_collector, device, lr=lr_belief, epochs=50, batch_size=32
+    )
+    belief_model.action_prob_model = action_prob_model
+
     # Save final models including action probability model
     final_checkpoint = os.path.join(checkpoint_dir, 'final_model.pt')
     checkpoint_data = {
@@ -1362,12 +1372,13 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
     torch.save(checkpoint_data, final_checkpoint)
     logger.info(f"Final model checkpoint saved to {final_checkpoint}")
     
-    if blueprint:
+    if blueprint_phase and blueprint:
         final_blueprint_path = os.path.join(checkpoint_dir, 'blueprint_final.pkl')
         blueprint.save(final_blueprint_path)
         logger.info(f"Final blueprint saved to {final_blueprint_path}")
     
     return policy_net, belief_model, value_net, agents, blueprint
+
 
 
 def main():
@@ -1381,12 +1392,12 @@ def main():
     policy_net, belief_model, value_net, agents, blueprint = train_rebel_agent(
         env=env,
         device=device,
-        num_epochs=200,
+        num_epochs=20,
         games_per_epoch=20,
         search_depth=3,
         num_simulations=30,
         log_interval=5,
-        checkpoint_interval=20,
+        checkpoint_interval=5,
         log_tensorboard=True,
         blueprint_phase=True,
         blueprint_games=500

@@ -2,14 +2,16 @@
 import torch
 import numpy as np
 from collections import defaultdict, namedtuple
-
+from src.training.train_transformer import convert_memory_to_features
 from src.env.liars_deck_env_utils_2 import decode_action
-
+from src.env.liars_deck_env_utils import query_opponent_memory_full
 class RecursiveSearchAgent:
     def __init__(self, policy_net, belief_model, value_net, env_creator, 
-                device, search_depth=4, num_simulations=30, c_puct=1.0,
-                agent_name=None, agent_index=None, blueprint=None,
-                alpha=1.5, beta=0.5, gamma=2.0):
+            device, search_depth=4, num_simulations=30, c_puct=1.0,
+            agent_name=None, agent_index=None, blueprint=None,
+            alpha=1.5, beta=0.5, gamma=2.0,
+            strategy_transformer=None, event_encoder=None,
+            response2idx=None, action2idx=None):
         """
         Agent that uses belief-based recursive search for decision making.
         Implements proper Counterfactual Regret Minimization (CFR) with
@@ -42,7 +44,10 @@ class RecursiveSearchAgent:
         self.name = agent_name
         self.agent_index = agent_index
         self.blueprint = blueprint
-        
+        self.strategy_transformer = strategy_transformer
+        self.event_encoder = event_encoder
+        self.response2idx = response2idx
+        self.action2idx = action2idx
         # DCFR parameters
         self.alpha = alpha  # Positive regret discount (typically 1.5)
         self.beta = beta    # Negative regret discount (typically 0.5)
@@ -71,8 +76,6 @@ class RecursiveSearchAgent:
         self.strategy_update_count = defaultdict(int)
         
         # Add opponent memory support
-        from src.model.rebel_memory import get_opponent_memory
-        self.opponent_memory = get_opponent_memory(agent_name)
         
         # Define a TreeNode class for persistent tree structure
         self.TreeNode = namedtuple('TreeNode', ['state', 'player_id', 'children', 'parent', 'depth'])
@@ -89,6 +92,60 @@ class RecursiveSearchAgent:
         self.action_history = []
         self.search_statistics = {}
         # Note: We don't reset cumulative_regrets or average_strategy as they persist across games
+
+    def get_transformer_memory_embeddings(self, env):
+        """
+        Generate transformer-based memory embeddings for all opponents.
+        Ensures we get embeddings for every opponent.
+        """
+        
+        # Skip if we don't have transformer components
+        if not all([self.strategy_transformer, self.event_encoder, 
+                self.response2idx, self.action2idx]):
+            return [], np.zeros(0, dtype=np.float32)
+        
+        embeddings_list = []
+        opponents = [ag for ag in env.possible_agents if ag != self.name]
+        strategy_dim = self.strategy_transformer.strategy_head.out_features
+        
+        # Process each opponent
+        for opp in opponents:
+            try:
+                # Get opponent memory events 
+                mem_summary = query_opponent_memory_full(self.name, opp)
+                
+                # Convert memory to feature format expected by EventEncoder
+                features_list = convert_memory_to_features(mem_summary, self.response2idx, self.action2idx)
+                
+                if features_list:
+                    # Create proper tensor for event encoder
+                    feature_tensor = torch.tensor(features_list, dtype=torch.float32, device=self.device).unsqueeze(0)
+                    
+                    # Process through event encoder then transformer
+                    with torch.no_grad():
+                        projected = self.event_encoder(feature_tensor)
+                        strategy_embedding, _ = self.strategy_transformer(projected)
+                    
+                    # Store embedding
+                    embeddings_list.append(strategy_embedding.cpu().detach().numpy().flatten())
+                else:
+                    # Use zeros for empty memory
+                    embeddings_list.append(np.zeros(strategy_dim, dtype=np.float32))
+            except Exception as e:
+                print(f"Error processing memory for {opp}: {e}")
+                embeddings_list.append(np.zeros(strategy_dim, dtype=np.float32))
+        
+        # Concatenate all embeddings into a single array
+        if embeddings_list:
+            embeddings_arr = np.concatenate(embeddings_list, axis=0)
+        else:
+            # Create zeroed embeddings for each opponent if needed
+            embeddings_arr = np.zeros(len(opponents) * strategy_dim, dtype=np.float32)
+        
+        # Print debugging info
+        #print(f"Transformer embeddings shape: {embeddings_arr.shape}, expected: {len(opponents) * strategy_dim}")
+        
+        return embeddings_list, embeddings_arr
 
     def _update_value_statistics(self, state_key, value):
         """Update running statistics for a state."""
@@ -220,14 +277,14 @@ class RecursiveSearchAgent:
     def update_beliefs(self, observation, action_mask=None):
         """
         Update both public and private belief states based on new observation,
-        now with counterfactual reasoning.
+        now with transformer-based memory.
         """
         # Extract observation
         if isinstance(observation, dict):
             obs_data = observation[self.name]
         else:
             obs_data = observation
-        
+
         # Convert to tensor
         if not isinstance(obs_data, torch.Tensor):
             self._last_obs_data = obs_data
@@ -240,21 +297,24 @@ class RecursiveSearchAgent:
         else:
             obs_tensor = obs_data.unsqueeze(0) if obs_data.dim() == 1 else obs_data
             obs_tensor = obs_tensor.to(self.device)
-        
+
         # Extract private hand
         private_hand = obs_tensor[:, :2]
-        
+
         with torch.no_grad():
             # Check if we need a full update
             if not hasattr(self, '_belief_update_counter'):
                 self._belief_update_counter = 0
             self._belief_update_counter += 1
-            
+
             is_full_update = self._belief_update_counter % 2 == 0 or not self.policy_net.training
-            
-            # Create environment instance for counterfactual reasoning
+
+            # Create environment instance for counterfactual reasoning and transformer memory extraction
             current_env = self.env_creator()
-            
+
+            # Get transformer memory embeddings
+            embeddings_list, normalized_arr = self.get_transformer_memory_embeddings(current_env)
+
             if is_full_update:
                 # Reconstruct game history for counterfactual reasoning
                 if hasattr(self, '_game_history'):
@@ -262,22 +322,22 @@ class RecursiveSearchAgent:
                 else:
                     game_history = self._reconstruct_game_history(current_env)
                     self._game_history = game_history
-                
+
                 # Use counterfactual belief inference with game history
                 if self.current_beliefs is None:
-                    # For the first update, use the model directly
+                    # For the first update, use the model directly with transformer features
                     self.current_beliefs = self.belief_model.infer_belief_from_game_state(
-                        obs_tensor, self.agent_index, current_env)
+                        obs_tensor, self.agent_index, current_env, transformer_features=normalized_arr)
                 else:
-                    # For subsequent updates, use the Bayesian update
-                    # with counterfactual reasoning
+                    # For subsequent updates, use the Bayesian update with transformer features
                     self.current_beliefs = self._compute_counterfactual_beliefs(
-                        obs_tensor, self.current_beliefs, game_history, current_env)
-                
+                        obs_tensor, self.current_beliefs, game_history, current_env, 
+                        transformer_features=normalized_arr)
+
                 # Apply physical constraints
                 self.current_beliefs = self.belief_model.apply_physical_constraints_fast(
                     self.current_beliefs, private_hand)
-            
+
             # Also update public beliefs
             if self.current_public_beliefs is None:
                 self.current_public_beliefs = self.belief_model.get_public_belief_state(obs_tensor)
@@ -288,32 +348,18 @@ class RecursiveSearchAgent:
             # Apply physical constraints to public beliefs as well
             self.current_public_beliefs = self.belief_model.apply_physical_constraints_fast(
                 self.current_public_beliefs, private_hand)
-        
+
         # Infer and record opponent actions
         current_env = self.env_creator()
         last_action_agent = current_env.last_action_agent
         last_action = current_env.last_action
         last_action_bluff = current_env.last_action_bluff
-        
+
         if last_action_agent and last_action_agent != self.name:
             action_type = f"Play_{last_action}" if last_action is not None else "None"
             card_count = len(current_env.players_hands.get(last_action_agent, []))
             penalty_count = current_env.penalties.get(last_action_agent, 0)
             
-            self.opponent_memory.update(
-                opponent=last_action_agent,
-                response=action_type,
-                penalties=penalty_count,
-                card_count=card_count
-            )
-            
-            if last_action_bluff is not None and last_action is not None:
-                self.opponent_memory.record_bluff(
-                    opponent=last_action_agent,
-                    was_bluff=last_action_bluff,
-                    play_count=last_action
-                )
-
     def compute_cfr_strategy(self, state_key, action_mask):
         """
         Compute a strategy according to the DCFR algorithm using discounted regrets.
@@ -476,7 +522,7 @@ class RecursiveSearchAgent:
         
         return history
 
-    def _compute_counterfactual_beliefs(self, obs_tensor, current_beliefs, game_history, env):
+    def _compute_counterfactual_beliefs(self, obs_tensor, current_beliefs, game_history, env, transformer_features=None):
         """
         Compute counterfactual beliefs based on game history.
         
@@ -485,13 +531,13 @@ class RecursiveSearchAgent:
             current_beliefs: Current belief state
             game_history: Reconstructed game history
             env: Current game environment
+            transformer_features: Optional transformer-based memory features
             
         Returns:
             Updated belief state using counterfactual reasoning
         """
-        # This would call the belief model's counterfactual inference method
         return self.belief_model.infer_belief_from_game_state(
-            obs_tensor, self.agent_index, env)
+            obs_tensor, self.agent_index, env, transformer_features=transformer_features)
 
     def mcts_search(self, observation, action_mask):
         """
@@ -1128,32 +1174,10 @@ class RecursiveSearchAgent:
             card_count = len(current_env.players_hands.get(last_action_agent, []))
             penalty_count = current_env.penalties.get(last_action_agent, 0)
             
-            self.opponent_memory.update(
-                opponent=last_action_agent,
-                response=action_type,
-                penalties=penalty_count,
-                card_count=card_count
-            )
-            
-            # If we know whether it was a bluff, record that too
-            if last_action_bluff is not None and last_action is not None:
-                self.opponent_memory.record_bluff(
-                    opponent=last_action_agent,
-                    was_bluff=last_action_bluff,
-                    play_count=last_action
-                )
         
         # If we're about to make a challenge, record that information
         selected_action = search_outcomes['selected_action']
         action_type, _, count = decode_action(selected_action)
-        
-        if action_type == "Challenge" and last_action_agent:
-            # We're challenging someone - update our memory with this decision
-            self.opponent_memory.record_challenge_result(
-                opponent=self.name,  # We're the challenger
-                success=None,  # We don't know the outcome yet
-                target=last_action_agent  # Who we're challenging
-            )
         
         # Add search efficiency statistics to the search results
         search_outcomes['tree_stats'] = {

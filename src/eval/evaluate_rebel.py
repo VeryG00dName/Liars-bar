@@ -1,5 +1,6 @@
-import os 
+import os
 import torch
+import torch.nn as nn
 import logging
 import argparse
 import numpy as np
@@ -20,6 +21,10 @@ from src.model.hard_coded_agents import (
     TableNonTableAgent,
     Classic
 )
+# Import config and transformer components as used in training
+from src import config
+from src.model.new_models import StrategyTransformer
+from src.training.train_transformer import EventEncoder
 
 def configure_logger():
     """Configure and return logger."""
@@ -71,20 +76,30 @@ def load_rebel_agent(checkpoint_path, device, env):
     num_card_types = 2  # Belief state uses 2 card types
     belief_dim = (num_players - 1) * num_card_types
 
-    # Create networks using updated Rebel models
-    policy_net = RebelPolicyNetwork(obs_dim, belief_dim, hidden_dim, action_dim).to(device)
+    # Create networks using updated dimensions (as in training)
+    policy_net = RebelPolicyNetwork(
+        obs_dim=obs_dim,
+        belief_dim=belief_dim,
+        hidden_dim=hidden_dim,
+        action_dim=action_dim
+    ).to(device)
+    
     belief_model = BeliefStateModel(
         input_dim=obs_dim, 
         hidden_dim=hidden_dim, 
-        deck_size=20, 
+        deck_size=20,  
         num_players=num_players,
         use_dropout=True, 
-        use_layer_norm=True
+        use_layer_norm=True,
+        use_transformer_memory=config.USE_TRANSFORMER_MEMORY
     ).to(device)
-    value_net = CFRValueNetwork(obs_dim, belief_dim, hidden_dim, action_dim).to(device)
     
-    # Create action probability model
+    value_net = CFRValueNetwork(input_dim=obs_dim, belief_dim=belief_dim, hidden_dim=hidden_dim, action_dim=action_dim).to(device)
+
+    
+    # Create action probability model (as used during training)
     action_prob_model = ActionProbabilityModel(input_dim=11, hidden_dim=64).to(device)
+    
     # Load checkpoint containing all components
     checkpoint = torch.load(checkpoint_file, map_location=device)
     
@@ -92,16 +107,22 @@ def load_rebel_agent(checkpoint_path, device, env):
     if isinstance(checkpoint, dict) and 'policy_net' in checkpoint:
         policy_net.load_state_dict(checkpoint['policy_net'])
         belief_state_dict = checkpoint['belief_model']
-        filtered_state_dict = {k: v for k, v in belief_state_dict.items() if not k.startswith("action_prob_model.")}
-        belief_model.load_state_dict(filtered_state_dict)
-        value_net.load_state_dict(checkpoint['value_net'])
         
-        # Check if action_prob_model is in the checkpoint
-        if 'action_prob_model' in checkpoint:
-            action_prob_model.load_state_dict(checkpoint['action_prob_model'])
-            logger.info("Loaded action probability model from checkpoint")
-        else:
-            logger.warning("No action probability model found in checkpoint, using default initialization")
+        # Remove action probability model keys
+        filtered_state_dict = {k: v for k, v in belief_state_dict.items() if not k.startswith("action_prob_model.")}
+        
+        # Remap transformer memory encoder keys if they have a mismatched index
+        remapped_state_dict = {}
+        for k, v in filtered_state_dict.items():
+            # Check for keys starting with "transform_memory_encoder.1" and remap to "transform_memory_encoder.0"
+            if k.startswith("transform_memory_encoder.1"):
+                new_key = k.replace("transform_memory_encoder.1", "transform_memory_encoder.0")
+                remapped_state_dict[new_key] = v
+            else:
+                remapped_state_dict[k] = v
+        print(hidden_dim)
+        belief_model.load_state_dict(remapped_state_dict)
+        value_net.load_state_dict(checkpoint['value_net'])
     else:
         # Older format checkpoint
         policy_net.load_state_dict(checkpoint)
@@ -109,7 +130,7 @@ def load_rebel_agent(checkpoint_path, device, env):
     
     # Attach action probability model to belief model
     belief_model.action_prob_model = action_prob_model
-    
+
     logger.info(f"Loaded model weights from {checkpoint_file}")
     
     # Load blueprint strategy if it exists
@@ -123,7 +144,84 @@ def load_rebel_agent(checkpoint_path, device, env):
     else:
         logger.info(f"No blueprint file found at {blueprint_file}, proceeding without it")
 
-    # Create and return the agent with the loaded networks and DCFR parameters
+    # --------------------------------------------------------------------------
+    # Transformer Memory Initialization (if enabled) - same as training script
+    # --------------------------------------------------------------------------
+    strategy_transformer = None
+    event_encoder = None
+    response2idx = None
+    action2idx = None
+    if config.USE_TRANSFORMER_MEMORY:
+        logger.info("Initializing transformer-based memory components")
+        
+        # Load transformer checkpoint
+        transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
+        if os.path.exists(transformer_checkpoint_path):
+            checkpoint = torch.load(transformer_checkpoint_path, map_location=device)
+            
+            # Load mappings first
+            response2idx = checkpoint["response2idx"]
+            action2idx = checkpoint["action2idx"]
+            
+            # Create the transformer model with the right dimensions
+            strategy_transformer = StrategyTransformer(
+                num_tokens=config.STRATEGY_NUM_TOKENS,
+                token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM,
+                nhead=config.STRATEGY_NHEAD,
+                num_layers=config.STRATEGY_NUM_LAYERS,
+                strategy_dim=config.STRATEGY_DIM,
+                num_classes=config.STRATEGY_NUM_CLASSES,
+                dropout=config.STRATEGY_DROPOUT,
+                use_cls_token=True
+            ).to(device)
+            
+            # Load transformer weights
+            strategy_transformer.load_state_dict(checkpoint["transformer_state_dict"], strict=False)
+            
+            # Initialize event encoder
+            event_encoder = EventEncoder(
+                response_vocab_size=len(response2idx),
+                action_vocab_size=len(action2idx),
+                token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM
+            ).to(device)
+            
+            # Load event encoder weights
+            event_encoder.load_state_dict(checkpoint["event_encoder_state_dict"])
+            
+            # Configure transformer for inference
+            strategy_transformer.token_embedding = nn.Identity()
+            strategy_transformer.classification_head = None
+            strategy_transformer.eval()
+            # Add transformer dimensions to belief model initialization
+            belief_model.use_transformer_memory = True
+            belief_model.transform_memory_projection = nn.Linear(
+                config.STRATEGY_DIM, hidden_dim
+            ).to(device)
+            belief_model.transform_memory_encoder = nn.Sequential(
+                nn.GELU(),
+                nn.LayerNorm(hidden_dim),
+                nn.Dropout(0.2),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.LayerNorm(hidden_dim),
+                nn.Dropout(0.2),
+                nn.Linear(hidden_dim, 2)
+            ).to(device)
+            
+            logger.info("Successfully loaded transformer components")
+        else:
+            logger.warning(f"Transformer checkpoint not found. Disabling transformer memory.")
+            strategy_transformer = None
+            event_encoder = None
+            response2idx = None
+            action2idx = None
+    else:
+        strategy_transformer = None
+        event_encoder = None
+        response2idx = None
+        action2idx = None
+
+    # Create and return the agent with all loaded networks and components
     return RecursiveSearchAgent(
         policy_net=policy_net,
         belief_model=belief_model,
@@ -137,7 +235,11 @@ def load_rebel_agent(checkpoint_path, device, env):
         blueprint=blueprint,
         alpha=1.5,  # DCFR parameter
         beta=0.5,   # DCFR parameter
-        gamma=2.0   # DCFR parameter
+        gamma=2.0,  # DCFR parameter
+        strategy_transformer=strategy_transformer,
+        event_encoder=event_encoder,
+        response2idx=response2idx,
+        action2idx=action2idx
     )
 
 def evaluate_rebel_vs_hardcoded(rebel_agent, num_games=20):
@@ -331,7 +433,7 @@ def evaluate_rebel_vs_hardcoded(rebel_agent, num_games=20):
                                         # Check if chosen action was predicted as most likely
                                         if np.argmax(action_probs) == action:
                                             action_prob_metrics["top1_accuracy"] += 1
-                                        
+                                    
                                         # Check if chosen action was in top 3 predicted actions
                                         top3_actions = np.argsort(action_probs)[-3:]
                                         if action in top3_actions:
@@ -352,7 +454,7 @@ def evaluate_rebel_vs_hardcoded(rebel_agent, num_games=20):
                                         # Check if chosen action was predicted as most likely
                                         if np.argmax(action_probs) == action:
                                             action_prob_metrics["top1_accuracy"] += 1
-                                        
+                                    
                                         # Check if chosen action was in top 3 predicted actions
                                         top3_actions = np.argsort(action_probs)[-3:]
                                         if action in top3_actions:
@@ -526,8 +628,6 @@ def evaluate_rebel_vs_hardcoded(rebel_agent, num_games=20):
     logger.info(f"  Hardcoded Overall Win Rate: {overall_win_rate_hardcoded:.2f} ({overall_wins['Hardcoded']}/{overall_games})")
     
     return results
-
-
 
 def main():
     """Main entry point for evaluation."""
