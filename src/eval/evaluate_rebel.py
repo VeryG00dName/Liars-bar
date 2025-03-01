@@ -144,6 +144,8 @@ def evaluate_rebel_vs_hardcoded(rebel_agent, num_games=20):
     """
     Evaluate ReBeL agent (playing as two players) against various hardcoded bots.
     Improved bluff success tracking with more rigorous verification.
+    Also tracks challenges (action 6) and their success rates,
+    BeliefStateModel accuracy, and ActionProbabilityModel accuracy.
     
     Args:
         rebel_agent: Loaded RecursiveSearchAgent instance.
@@ -178,14 +180,31 @@ def evaluate_rebel_vs_hardcoded(rebel_agent, num_games=20):
         total_games = 0
         
         # Track challenge outcomes.
-        challenge_success = {
-            "ReBeL": {"count": 0, "success": 0},
-            "Hardcoded": {"count": 0, "success": 0}
+        challenge_stats = {
+            "ReBeL": {"attempts": 0, "successful": 0},
+            "Hardcoded": {"attempts": 0, "successful": 0}
         }
         # Track bluff outcomes with more detailed tracking.
         bluff_success = {
             "ReBeL": {"attempts": 0, "successful": 0},
             "Hardcoded": {"attempts": 0, "successful": 0}
+        }
+        
+        # Track model accuracy metrics
+        belief_model_metrics = {
+            "total_predictions": 0,
+            "correct_predictions": 0,  # Using a threshold for "correct"
+            "belief_error": 0.0,       # Mean absolute error
+            "belief_accuracy": 0.0,    # Overall accuracy at the end
+            "debug_info": []           # Store debugging information
+        }
+        
+        action_prob_metrics = {
+            "total_predictions": 0,
+            "log_likelihood": 0.0,     # Log likelihood of predicted vs actual actions
+            "top1_accuracy": 0,        # Times the highest probability action was chosen
+            "top3_accuracy": 0,        # Times one of the top 3 probability actions was chosen
+            "debug_info": []           # Store debugging information
         }
     
         for game_idx in tqdm(range(num_games)):
@@ -241,10 +260,112 @@ def evaluate_rebel_vs_hardcoded(rebel_agent, num_games=20):
                 action_mask = infos[current_agent_id].get('action_mask', [1] * env.action_spaces[current_agent_id].n)
     
                 if current_agent_id in ["player_0", "player_1"]:
-                    action_output = current_agent.play_turn(obs, action_mask, env.table_card)
-                    action = action_output['selected_action']
-                    rebel_action_type, rebel_card_category, rebel_count = decode_action(action)
-    
+                    # Debug checks for belief model 
+                    has_belief_model = hasattr(current_agent, 'belief_model')
+                    has_players_hands = hasattr(env, 'players_hands')
+                    
+                    # Before action, evaluate belief model accuracy (when playing as ReBeL)
+                    if has_belief_model and has_players_hands:
+                        try:
+                            belief_model_metrics["total_predictions"] += 1
+                            
+                            # Get the agent's belief about opponent's cards
+                            belief_obs = torch.FloatTensor(obs).unsqueeze(0).to(current_agent.device)
+                            agent_belief = current_agent.belief_model(belief_obs)
+                            
+                            # Check if agent_belief is a tensor and convert to numpy array
+                            if hasattr(agent_belief, 'detach'):
+                                agent_belief = agent_belief.detach().cpu().numpy().flatten()
+                            elif isinstance(agent_belief, dict) and 'belief' in agent_belief:
+                                # Some belief models might return a dictionary
+                                agent_belief = agent_belief['belief'].detach().cpu().numpy().flatten()
+                            
+                            # Get the ground truth - actual cards in opponents' hands
+                            opponent_indices = [i for i in range(env.num_players) if i != current_agent.agent_index]
+                            actual_cards = []
+                            
+                            for opp_idx in opponent_indices:
+                                agent_id = env.possible_agents[opp_idx]
+                                if agent_id in env.players_hands:
+                                    opp_hand = env.players_hands[agent_id]
+                                    # Convert actual cards to belief model format
+                                    actual_encoded = [1 if card == env.table_card else 0 for card in opp_hand]
+                                    actual_cards.extend(actual_encoded)
+                            
+                            # Calculate belief error (mean absolute error)
+                            if len(actual_cards) > 0 and len(agent_belief) == len(actual_cards):
+                                belief_error = np.mean(np.abs(agent_belief - np.array(actual_cards)))
+                                belief_model_metrics["belief_error"] += belief_error
+                                
+                                # Check if prediction is "correct" (using a threshold)
+                                threshold = 0.6  # Consider adjusting based on your model
+                                predicted_cards = (agent_belief > threshold).astype(int)
+                                if np.array_equal(predicted_cards, actual_cards):
+                                    belief_model_metrics["correct_predictions"] += 1
+                        except Exception as e:
+                            belief_model_metrics["debug_info"].append(f"Exception in belief model evaluation: {str(e)}")
+                    
+                    # Get action and predictions from the agent
+                    try:
+                        action_output = current_agent.play_turn(obs, action_mask, env.table_card)
+                        action = action_output['selected_action']
+                        rebel_action_type, rebel_card_category, rebel_count = decode_action(action)
+                        
+                        # Check if we have a search_policy or blueprint_strategy to evaluate
+                        has_search_policy = 'search_policy' in action_output
+                        has_blueprint_strategy = 'blueprint_strategy' in action_output
+                        
+                        # If available, evaluate action probability model using search_policy
+                        has_action_prob_model = hasattr(current_agent.belief_model, 'action_prob_model')
+                        if has_action_prob_model:
+                            if has_search_policy and isinstance(action_output['search_policy'], (list, np.ndarray)):
+                                try:
+                                    action_prob_metrics["total_predictions"] += 1
+                                    action_probs = action_output['search_policy']
+                                    
+                                    # Calculate log likelihood of the chosen action
+                                    if action < len(action_probs):
+                                        log_prob = np.log(max(action_probs[action], 1e-10))
+                                        action_prob_metrics["log_likelihood"] += log_prob
+                                    
+                                        # Check if chosen action was predicted as most likely
+                                        if np.argmax(action_probs) == action:
+                                            action_prob_metrics["top1_accuracy"] += 1
+                                        
+                                        # Check if chosen action was in top 3 predicted actions
+                                        top3_actions = np.argsort(action_probs)[-3:]
+                                        if action in top3_actions:
+                                            action_prob_metrics["top3_accuracy"] += 1
+                                except Exception as e:
+                                    action_prob_metrics["debug_info"].append(f"Exception in search_policy evaluation: {str(e)}")
+                            # If no search_policy, try blueprint_strategy
+                            elif has_blueprint_strategy and isinstance(action_output['blueprint_strategy'], (list, np.ndarray)):
+                                try:
+                                    action_prob_metrics["total_predictions"] += 1
+                                    action_probs = action_output['blueprint_strategy']
+                                    
+                                    # Calculate log likelihood of the chosen action
+                                    if action < len(action_probs):
+                                        log_prob = np.log(max(action_probs[action], 1e-10))
+                                        action_prob_metrics["log_likelihood"] += log_prob
+                                    
+                                        # Check if chosen action was predicted as most likely
+                                        if np.argmax(action_probs) == action:
+                                            action_prob_metrics["top1_accuracy"] += 1
+                                        
+                                        # Check if chosen action was in top 3 predicted actions
+                                        top3_actions = np.argsort(action_probs)[-3:]
+                                        if action in top3_actions:
+                                            action_prob_metrics["top3_accuracy"] += 1
+                                except Exception as e:
+                                    action_prob_metrics["debug_info"].append(f"Exception in blueprint_strategy evaluation: {str(e)}")
+                                    
+                    except Exception as e:
+                        # If there's an error in the main action block, log it and continue
+                        belief_model_metrics["debug_info"].append(f"Exception in play_turn: {str(e)}")
+                        action = 0  # Use a default action
+                        rebel_action_type, rebel_card_category, rebel_count = decode_action(action)
+                    
                     # Check for bluff attempts
                     current_played_cards = env.last_played_cards.get(current_agent_id, [])
                     if not all(card == env.table_card or card == "Joker" for card in current_played_cards):
@@ -256,22 +377,12 @@ def evaluate_rebel_vs_hardcoded(rebel_agent, num_games=20):
                         })
                         bluff_success["ReBeL"]["attempts"] += 1
     
+                    # Track challenge attempts (action_type = "Challenge", which corresponds to action 6)
                     if rebel_action_type == "Challenge":
-                        # Check if this challenge is against a bluff from another agent
-                        for agent_id, bluffs in bluff_attempts.items():
-                            if agent_id != current_agent_id and bluffs:
-                                # Look at the most recent bluff for this agent
-                                last_bluff = bluffs[-1]
-                                if last_bluff['turn'] == turn_count - 1 and not last_bluff['challenged']:
-                                    # Mark this bluff as challenged
-                                    last_bluff['challenged'] = True
-                                    # Check if the challenge is successful
-                                    if env.last_action_bluff:
-                                        # Bluff was caught
-                                        pass
-                                    else:
-                                        # Challenge failed, bluff was successful
-                                        bluff_success["ReBeL"]["successful"] += 1
+                        challenge_stats["ReBeL"]["attempts"] += 1
+                        # Check if challenge was successful
+                        if env.last_action_bluff:
+                            challenge_stats["ReBeL"]["successful"] += 1
     
                 else:
                     # Hardcoded bot's turn
@@ -288,20 +399,12 @@ def evaluate_rebel_vs_hardcoded(rebel_agent, num_games=20):
                         })
                         bluff_success["Hardcoded"]["attempts"] += 1
     
-                    # Check for challenges
+                    # Track challenge attempts (action_type = "Challenge", which corresponds to action 6)
                     if hardcoded_action_type == "Challenge":
-                        for agent_id, bluffs in bluff_attempts.items():
-                            if agent_id != current_agent_id and bluffs:
-                                last_bluff = bluffs[-1]
-                                if last_bluff['turn'] == turn_count - 1 and not last_bluff['challenged']:
-                                    last_bluff['challenged'] = True
-                                    # Check challenge success
-                                    if env.last_action_bluff:
-                                        # Bluff was caught
-                                        pass
-                                    else:
-                                        # Challenge failed, bluff was successful
-                                        bluff_success["Hardcoded"]["successful"] += 1
+                        challenge_stats["Hardcoded"]["attempts"] += 1
+                        # Check if challenge was successful
+                        if env.last_action_bluff:
+                            challenge_stats["Hardcoded"]["successful"] += 1
     
                 env.step(action)
                 turn_count += 1
@@ -337,6 +440,25 @@ def evaluate_rebel_vs_hardcoded(rebel_agent, num_games=20):
         
         bluff_rate_rebel = (bluff_success["ReBeL"]["successful"] / bluff_success["ReBeL"]["attempts"]) if bluff_success["ReBeL"]["attempts"] > 0 else 0
         bluff_rate_bot = (bluff_success["Hardcoded"]["successful"] / bluff_success["Hardcoded"]["attempts"]) if bluff_success["Hardcoded"]["attempts"] > 0 else 0
+        
+        # Calculate challenge success rates
+        challenge_rate_rebel = (challenge_stats["ReBeL"]["successful"] / challenge_stats["ReBeL"]["attempts"]) if challenge_stats["ReBeL"]["attempts"] > 0 else 0
+        challenge_rate_bot = (challenge_stats["Hardcoded"]["successful"] / challenge_stats["Hardcoded"]["attempts"]) if challenge_stats["Hardcoded"]["attempts"] > 0 else 0
+        
+        # Calculate model accuracy metrics
+        belief_accuracy = 0
+        belief_error = 0
+        if belief_model_metrics["total_predictions"] > 0:
+            belief_accuracy = belief_model_metrics["correct_predictions"] / belief_model_metrics["total_predictions"]
+            belief_error = belief_model_metrics["belief_error"] / belief_model_metrics["total_predictions"]
+        
+        action_prob_accuracy = 0
+        action_prob_top3 = 0
+        action_prob_log_likelihood = 0
+        if action_prob_metrics["total_predictions"] > 0:
+            action_prob_accuracy = action_prob_metrics["top1_accuracy"] / action_prob_metrics["total_predictions"]
+            action_prob_top3 = action_prob_metrics["top3_accuracy"] / action_prob_metrics["total_predictions"]
+            action_prob_log_likelihood = action_prob_metrics["log_likelihood"] / action_prob_metrics["total_predictions"]
     
         results[bot_name] = {
             "ReBeL Win Rate": win_rate_rebel,
@@ -346,7 +468,19 @@ def evaluate_rebel_vs_hardcoded(rebel_agent, num_games=20):
             "ReBeL Bluff Attempts": bluff_success["ReBeL"]["attempts"],
             "ReBeL Bluff Success Rate": bluff_rate_rebel,
             "Hardcoded Bluff Attempts": bluff_success["Hardcoded"]["attempts"],
-            "Hardcoded Bluff Success Rate": bluff_rate_bot
+            "Hardcoded Bluff Success Rate": bluff_rate_bot,
+            "ReBeL Challenge Attempts": challenge_stats["ReBeL"]["attempts"],
+            "ReBeL Challenge Success Rate": challenge_rate_rebel,
+            "Hardcoded Challenge Attempts": challenge_stats["Hardcoded"]["attempts"],
+            "Hardcoded Challenge Success Rate": challenge_rate_bot,
+            # Model accuracy metrics
+            "BeliefModel Predictions": belief_model_metrics["total_predictions"],
+            "BeliefModel Accuracy": belief_accuracy,
+            "BeliefModel Error": belief_error,
+            "ActionProb Predictions": action_prob_metrics["total_predictions"],
+            "ActionProb Top1 Accuracy": action_prob_accuracy,
+            "ActionProb Top3 Accuracy": action_prob_top3,
+            "ActionProb Log Likelihood": action_prob_log_likelihood
         }
     
         # Logging 
@@ -357,6 +491,32 @@ def evaluate_rebel_vs_hardcoded(rebel_agent, num_games=20):
         logger.info(f"  ReBeL Bluff Success Rate: {bluff_rate_rebel:.2f}")
         logger.info(f"  Hardcoded Bluff Attempts: {bluff_success['Hardcoded']['attempts']}")
         logger.info(f"  Hardcoded Bluff Success Rate: {bluff_rate_bot:.2f}")
+        logger.info(f"  ReBeL Challenge Attempts: {challenge_stats['ReBeL']['attempts']}")
+        logger.info(f"  ReBeL Challenge Success Rate: {challenge_rate_rebel:.2f}")
+        logger.info(f"  Hardcoded Challenge Attempts: {challenge_stats['Hardcoded']['attempts']}")
+        logger.info(f"  Hardcoded Challenge Success Rate: {challenge_rate_bot:.2f}")
+        
+        # Log model accuracy metrics
+        logger.info(f"  BeliefModel Predictions Made: {belief_model_metrics['total_predictions']}")
+        logger.info(f"  BeliefModel Accuracy: {belief_accuracy:.4f}")
+        logger.info(f"  BeliefModel Mean Error: {belief_error:.4f}")
+        logger.info(f"  ActionProb Predictions Made: {action_prob_metrics['total_predictions']}")
+        logger.info(f"  ActionProb Top1 Accuracy: {action_prob_accuracy:.4f}")
+        logger.info(f"  ActionProb Top3 Accuracy: {action_prob_top3:.4f}")
+        logger.info(f"  ActionProb Avg Log Likelihood: {action_prob_log_likelihood:.4f}")
+        
+        # Log debugging information
+        logger.info("  Belief Model Debug Info:")
+        for i, info in enumerate(belief_model_metrics["debug_info"][:5]):  # Print first 5 debug entries
+            logger.info(f"    {i}: {info}")
+        if len(belief_model_metrics["debug_info"]) > 5:
+            logger.info(f"    ... and {len(belief_model_metrics['debug_info']) - 5} more entries")
+            
+        logger.info("  Action Prob Model Debug Info:")
+        for i, info in enumerate(action_prob_metrics["debug_info"][:5]):  # Print first 5 debug entries
+            logger.info(f"    {i}: {info}")
+        if len(action_prob_metrics["debug_info"]) > 5:
+            logger.info(f"    ... and {len(action_prob_metrics['debug_info']) - 5} more entries")
     
     # Overall results logging
     overall_win_rate_rebel = overall_wins["ReBeL"] / overall_games
