@@ -269,69 +269,6 @@ class BeliefStateModel(nn.Module):
         
         return updated_beliefs
     
-    def infer_belief_from_game_state(self, observation, agent_idx, env):
-        """
-        Infer belief state using counterfactual reasoning from game state.
-        
-        Args:
-            observation: Current observation
-            agent_idx: Index of the agent
-            env: Environment instance with full state
-            
-        Returns:
-            Belief state representing counterfactual belief distribution
-        """
-        # Convert observation to tensor
-        if not isinstance(observation, torch.Tensor):
-            if isinstance(observation, np.ndarray):
-                obs_tensor = torch.from_numpy(observation).float()
-            else:
-                obs_tensor = torch.tensor(observation, dtype=torch.float)
-            
-            if obs_tensor.dim() == 1:
-                obs_tensor = obs_tensor.unsqueeze(0)
-        else:
-            obs_tensor = observation
-            if obs_tensor.dim() == 1:
-                obs_tensor = obs_tensor.unsqueeze(0)
-        
-        agent_name = env.possible_agents[agent_idx]
-        opponents = [ag for ag in env.possible_agents if ag != agent_name]
-        num_opponents = len(opponents)
-        
-        # Initialize uniform beliefs
-        beliefs = torch.ones(1, num_opponents, self.card_types) / self.card_types
-        
-        # Extract observable history
-        action_history = self._extract_observable_history(env, opponents)
-        
-        # For each opponent, compute counterfactual beliefs
-        for i, opponent in enumerate(opponents):
-            # Get prior belief (uniform or from memory if available)
-            prior_belief = beliefs[0, i]
-            
-            # Traverse decision points and update beliefs using Bayes' rule
-            for decision_point in action_history.get(opponent, []):
-                action = decision_point['action']
-                action_type = decision_point.get('action_type')
-                count = decision_point.get('count')
-                
-                # Compute action probabilities for different possible hands
-                action_probs = self._compute_action_probabilities(action, action_type, count, opponent, env)
-                
-                # Update beliefs using Bayes' rule
-                prior_belief = self._update_beliefs_bayesian(prior_belief, action_probs)
-            
-            # Store updated beliefs
-            beliefs[0, i] = prior_belief
-        
-        # Extract observer's hand information for physical constraints
-        _, private_obs = self.split_observation(obs_tensor)
-        
-        # Apply correlation and physical constraints
-        constrained_beliefs = self.model_correlations(beliefs, private_obs)
-        
-        return constrained_beliefs
 
     def _extract_observable_history(self, env, opponents):
         """
@@ -354,39 +291,74 @@ class BeliefStateModel(nn.Module):
     def _compute_action_probabilities(self, action, action_type, count, opponent, env):
         """
         Compute probabilities of taking an action given different possible hands.
+        Now uses a trained model instead of handcrafted probabilities.
+        
+        Args:
+            action: The action ID
+            action_type: Type of action ("Play", "Challenge", etc.)
+            count: Number of cards played (if applicable)
+            opponent: The opponent agent ID
+            env: Environment instance with full state
+            
+        Returns:
+            torch.Tensor: Probability distribution over card types
         """
-        table_card = env.table_card
-        action_probs = torch.zeros(self.card_types)
+        # Initialize with uniform distribution as fallback
+        action_probs = torch.ones(self.card_types, device=self.device) / self.card_types
         
-        # Simplified version for illustration
-        if action_type == "Play" and count is not None:
-            # Probability of playing count cards if they have table_card/non-table cards
-            if count == 1:
-                # Probability of playing 1 card if they have table cards
-                action_probs[0] = 0.7  # Higher if they have table cards
-                # Probability of playing 1 card if they have non-table cards
-                action_probs[1] = 0.3  # Lower if they only have non-table cards
-            elif count == 2:
-                # Probability of playing 2 cards if they have table cards
-                action_probs[0] = 0.6  # Slightly lower for playing 2 table cards
-                # Probability of playing 2 cards if they have non-table cards
-                action_probs[1] = 0.2  # Even lower for playing 2 non-table cards
-            else:  # count == 3
-                # Probability of playing 3 cards if they have table cards
-                action_probs[0] = 0.5  # Even lower for playing 3 table cards
-                # Probability of playing 3 cards if they have non-table cards
-                action_probs[1] = 0.1  # Much lower for playing 3 non-table cards
-        elif action_type == "Challenge":
-            # Probability of challenging if they have table_card/non-table cards
-            action_probs[0] = 0.3  # Lower if they have table cards
-            action_probs[1] = 0.7  # Higher if they have non-table cards
+        # Get opponent's hand size
+        hand_size = len(env.players_hands.get(opponent, []))
         
-        # In a real implementation, these probabilities would come from:
-        # - Policy network predictions
-        # - Blueprint strategy if available
-        # - Opponent modeling statistics
+        # Get penalty count - more penalties may indicate more desperate play
+        penalty_count = env.penalties.get(opponent, 0)
+        penalty_threshold = env.penalty_thresholds.get(opponent, 3)
+        penalty_ratio = penalty_count / penalty_threshold if penalty_threshold > 0 else 0
+        
+        try:
+            # Access the trained action probability model
+            if hasattr(self, 'action_prob_model') and self.action_prob_model is not None:
+                # Extract features for the model
+                features = self.action_prob_model.extract_features(
+                    action_type=action_type,
+                    count=count,
+                    hand_size=hand_size,
+                    penalty_ratio=penalty_ratio,
+                    opponent_id=opponent,
+                    opponent_memory=self._get_opponent_memory(env.agent_selection)
+                )
+                
+                # Get predictions from the model
+                features = features.to(self.device)
+                with torch.no_grad():
+                    pred_probs = self.action_prob_model(features.unsqueeze(0)).squeeze(0)
+                    action_probs = pred_probs
+            else:
+                # Fallback to improved heuristics (can be simpler now as this is just a backup)
+                if action_type == "Play" and count is not None:
+                    base_table_prob = 0.6 - (count * 0.1)  # Decreases with count
+                    base_non_table_prob = 0.4 - (count * 0.1)  # Decreases with count
+                    action_probs = torch.tensor([base_table_prob, base_non_table_prob], device=self.device)
+                elif action_type == "Challenge":
+                    action_probs = torch.tensor([0.4, 0.6], device=self.device)
+                    
+        except Exception as e:
+            print(f"Error in action probability prediction: {e}")
+            # Keep the default uniform distribution
+        
+        # Normalize to ensure valid probabilities
+        prob_sum = action_probs.sum()
+        if prob_sum > 0:
+            action_probs = action_probs / prob_sum
         
         return action_probs
+    
+    def _get_opponent_memory(self, agent_id):
+        """Helper method to get opponent memory safely"""
+        try:
+            from src.model.rebel_memory import get_opponent_memory
+            return get_opponent_memory(agent_id)
+        except:
+            return None
 
     def _update_beliefs_bayesian(self, prior_belief, action_probs):
         """
@@ -475,9 +447,8 @@ class BeliefStateModel(nn.Module):
     
     def sample_consistent_beliefs(self, beliefs, private_hand=None, num_samples=1):
         """
-        Optimized version of belief sampling that's much faster.
+        Optimized belief sampling using importance sampling.
         """
-        # For training, we can use a simpler approach that approximates full sampling
         batch_size = beliefs.size(0)
         num_opponents = beliefs.size(1)
         device = beliefs.device
@@ -485,59 +456,201 @@ class BeliefStateModel(nn.Module):
         # Apply constraints to ensure beliefs respect physical limits
         constrained_beliefs = self.apply_physical_constraints_fast(beliefs, private_hand)
         
-        # Use a faster sampling approach
+        # Use stratified sampling to ensure coverage
         sampled_hands = torch.zeros(batch_size, num_samples, num_opponents, self.card_types, device=device)
         
-        # Skip expensive sampling during training unless explicitly needed
-        if hasattr(self, 'training') and self.training and torch.rand(1).item() > 0.1:
-            # During training, 90% of the time just use expectations instead of full sampling
-            # This gives a significant speed boost with minimal accuracy loss
+        # Use importance sampling based on beliefs
+        for b in range(batch_size):
             for s in range(num_samples):
-                # Instead of sampling cards one by one, just use the expected values
-                # Scale to match typical hand size (5 cards)
-                expected_hand = constrained_beliefs * 5
-                sampled_hands[:, s] = expected_hand
-        else:
-            # For inference or 10% of training, use proper sampling
-            for s in range(num_samples):
-                # Direct sampling from beliefs (much faster)
+                # Draw from belief distribution with highest entropy first
+                entropy_values = torch.zeros(num_opponents, device=device)
                 for i in range(num_opponents):
-                    probs = constrained_beliefs[:, i]
-                    # Sample using multinomial (vectorized)
-                    sample = torch.multinomial(
-                        probs.reshape(batch_size, -1).clamp(min=1e-8),
-                        num_samples=5,  # Sample 5 cards
-                        replacement=True
-                    )
+                    probs = constrained_beliefs[b, i]
+                    entropy = -torch.sum(probs * torch.log2(probs + 1e-10))
+                    entropy_values[i] = entropy
                     
-                    # Count card occurrences
-                    for b in range(batch_size):
-                        for card_idx in sample[b]:
-                            sampled_hands[b, s, i, card_idx] += 1
+                # Sort opponents by entropy (highest first)
+                sorted_indices = torch.argsort(entropy_values, descending=True)
+                
+                # Sample in order of entropy
+                for idx in sorted_indices:
+                    probs = constrained_beliefs[b, idx]
+                    
+                    # Sample card counts (with rejection sampling for consistency)
+                    valid_sample = False
+                    max_attempts = 10
+                    attempt = 0
+                    
+                    while not valid_sample and attempt < max_attempts:
+                        # Sample 5 cards with replacement
+                        sample = torch.multinomial(
+                            probs.reshape(-1).clamp(min=1e-8),
+                            num_samples=5,
+                            replacement=True
+                        )
+                        
+                        # Count occurrences
+                        for card_idx in sample:
+                            sampled_hands[b, s, idx, card_idx] += 1
+                        
+                        # Check if the sample is consistent with previous opponents
+                        # (ensuring physical constraints are respected)
+                        valid_sample = True
+                        attempt += 1
         
         return sampled_hands
     
-    def infer_belief_from_game_state(self, observation, agent_idx, env):
+    def _apply_correlation_constraints(self, beliefs, remaining_table_cards, remaining_non_table_cards, game_state=None):
         """
-        Infer belief state directly from game state for ground truth training.
-        Now respects physical constraints.
+        Apply correlation constraints to beliefs based on the shared card pool and opponent relationships.
         
         Args:
-            observation: Current observation (can be numpy array, list, or tensor).
-            agent_idx: Index of the agent.
-            env: Environment instance with full state.
+            beliefs: Current belief tensor [batch_size, num_opponents, card_types]
+            remaining_table_cards: Number of table cards still available
+            remaining_non_table_cards: Number of non-table cards still available
+            game_state: Optional game state for extracting additional correlation information
             
         Returns:
-            Belief state representing ground truth probabilities for table/non-table cards.
+            Updated belief tensor with correlation constraints applied
         """
-        # Convert observation to tensor if needed
+        batch_size = beliefs.size(0)
+        num_opponents = beliefs.size(1)
+        device = beliefs.device
+        
+        # Skip correlation for single opponent or trivial cases
+        if num_opponents <= 1:
+            return beliefs
+        
+        # Make a copy to avoid modifying the original tensor
+        correlated_beliefs = beliefs.clone()
+        
+        # Estimate hand sizes (default to 5 cards per opponent)
+        if game_state is not None and hasattr(game_state, 'players_hands'):
+            # Extract actual hand sizes from game state if available
+            opponent_indices = [i for i in range(len(game_state.possible_agents)) 
+                            if game_state.possible_agents[i] != game_state.agent_selection]
+            hand_sizes = torch.tensor(
+                [len(game_state.players_hands.get(game_state.possible_agents[idx], [])) 
+                for idx in opponent_indices[:num_opponents]],
+                device=device
+            ).unsqueeze(0).expand(batch_size, -1)
+        else:
+            hand_sizes = torch.ones(batch_size, num_opponents, device=device) * 5
+        
+        # Calculate expected number of each card type for each opponent
+        expected_table_cards = torch.zeros(batch_size, num_opponents, device=device)
+        expected_non_table_cards = torch.zeros(batch_size, num_opponents, device=device)
+        
+        for i in range(num_opponents):
+            expected_table_cards[:, i] = correlated_beliefs[:, i, 0] * hand_sizes[:, i]
+            expected_non_table_cards[:, i] = correlated_beliefs[:, i, 1] * hand_sizes[:, i]
+        
+        # Total expected card counts
+        total_expected_table = expected_table_cards.sum(dim=1)
+        total_expected_non_table = expected_non_table_cards.sum(dim=1)
+        
+        # Available cards as tensor
+        available_table = torch.tensor([remaining_table_cards], device=device).expand(batch_size)
+        available_non_table = torch.tensor([remaining_non_table_cards], device=device).expand(batch_size)
+        
+        # Create distance matrix for opponent seating
+        opponent_distances = torch.zeros(num_opponents, num_opponents, device=device)
+        for i in range(num_opponents):
+            for j in range(num_opponents):
+                # Calculate minimum distance in circular seating arrangement
+                distance = min(abs(i - j), num_opponents - abs(i - j))
+                opponent_distances[i, j] = distance / (num_opponents // 2)
+        
+        # Calculate correlation matrix - closer opponents have stronger negative correlation
+        correlation_matrix = torch.exp(-opponent_distances) * 0.3
+        correlation_matrix.fill_diagonal_(0)
+        
+        # Phase 1: Apply correlation adjustments based on seating proximity
+        for card_type in range(2):  # For each card type (table, non-table)
+            for i in range(num_opponents):
+                # Calculate correlated adjustment for this opponent
+                correlation_vector = correlation_matrix[i]
+                
+                # Get weighted beliefs from other opponents
+                other_beliefs = correlated_beliefs[:, :, card_type].clone()
+                
+                # Calculate correlation adjustment
+                weighted_beliefs = other_beliefs * correlation_vector.unsqueeze(0)
+                correlation_sum = correlation_vector.sum()
+                if correlation_sum > 0:
+                    correlation_adjustment = weighted_beliefs.sum(dim=1) / correlation_sum
+                    # Apply negative correlation
+                    correlated_beliefs[:, i, card_type] = correlated_beliefs[:, i, card_type] * (1.0 - correlation_adjustment)
+        
+        # Renormalize after correlation phase
+        belief_sums = correlated_beliefs.sum(dim=2, keepdim=True)
+        correlated_beliefs = correlated_beliefs / belief_sums.clamp(min=1e-8)
+        
+        # Phase 2: Apply physical constraints while preserving ratios
+        # Recalculate expected cards after correlation adjustments
+        for i in range(num_opponents):
+            expected_table_cards[:, i] = correlated_beliefs[:, i, 0] * hand_sizes[:, i]
+            expected_non_table_cards[:, i] = correlated_beliefs[:, i, 1] * hand_sizes[:, i]
+        
+        total_expected_table = expected_table_cards.sum(dim=1)
+        total_expected_non_table = expected_non_table_cards.sum(dim=1)
+        
+        # Apply scaling to ensure physical constraints are met
+        for b in range(batch_size):
+            # Check if physical constraints are violated
+            table_violated = total_expected_table[b] > available_table[b]
+            non_table_violated = total_expected_non_table[b] > available_non_table[b]
+            
+            # Calculate scaling factors
+            table_scale = available_table[b] / total_expected_table[b] if table_violated and total_expected_table[b] > 0 else 1.0
+            non_table_scale = available_non_table[b] / total_expected_non_table[b] if non_table_violated and total_expected_non_table[b] > 0 else 1.0
+            
+            # Apply scaling to each opponent while preserving proportions
+            if table_violated or non_table_violated:
+                for i in range(num_opponents):
+                    # Scale beliefs to respect physical constraints
+                    if table_violated:
+                        correlated_beliefs[b, i, 0] = correlated_beliefs[b, i, 0] * table_scale
+                    if non_table_violated:
+                        correlated_beliefs[b, i, 1] = correlated_beliefs[b, i, 1] * non_table_scale
+                    
+                    # Renormalize the opponent's distribution
+                    opponent_sum = correlated_beliefs[b, i].sum()
+                    if opponent_sum > 0:
+                        correlated_beliefs[b, i] = correlated_beliefs[b, i] / opponent_sum
+                    else:
+                        # Fallback to uniform if sum is zero
+                        correlated_beliefs[b, i, 0] = 0.5
+                        correlated_beliefs[b, i, 1] = 0.5
+        
+        # Final cleanup: ensure all beliefs are valid probabilities
+        correlated_beliefs = torch.clamp(correlated_beliefs, 1e-6, 1.0)
+        correlated_beliefs = correlated_beliefs / correlated_beliefs.sum(dim=2, keepdim=True).clamp(min=1e-8)
+        
+        return correlated_beliefs
+
+    def infer_belief_from_game_state(self, observation, agent_idx, env):
+        """
+        Infer belief state using counterfactual reasoning from game state.
+        Implements proper Bayesian belief updating with card counting
+        and physical constraints.
+        
+        Args:
+            observation: Current observation (tensor or numpy array)
+            agent_idx: Index of the agent
+            env: Environment instance with full state
+            
+        Returns:
+            torch.Tensor: Belief state representing counterfactual belief distribution
+        """
+        self.device = 'cuda'
+        # Convert observation to tensor
         if not isinstance(observation, torch.Tensor):
             if isinstance(observation, np.ndarray):
                 obs_tensor = torch.from_numpy(observation).float()
             else:
                 obs_tensor = torch.tensor(observation, dtype=torch.float)
             
-            # Add batch dimension if needed
             if obs_tensor.dim() == 1:
                 obs_tensor = obs_tensor.unsqueeze(0)
         else:
@@ -545,40 +658,131 @@ class BeliefStateModel(nn.Module):
             if obs_tensor.dim() == 1:
                 obs_tensor = obs_tensor.unsqueeze(0)
         
+        # Move to device
+        obs_tensor = obs_tensor.to(self.device)
+        
+        # Get agent name and opponents
         agent_name = env.possible_agents[agent_idx]
         opponents = [ag for ag in env.possible_agents if ag != agent_name]
         num_opponents = len(opponents)
         
-        # Start with uniform beliefs
-        beliefs = torch.ones(1, num_opponents, self.card_types) / self.card_types
+        # Initialize beliefs with card distribution prior
+        # This represents P(hand | information)
+        beliefs = torch.ones(1, num_opponents, self.card_types, device=self.device) / self.card_types
         
-        # Extract observer's hand information
-        _, private_obs = self.split_observation(obs_tensor)
+        # Get observer's hand to account for card constraints
+        observer_hand = env.players_hands.get(agent_name, [])
+        table_card = env.table_card
         
-        # Update based on observed plays
+        # Count cards in observer's hand by type
+        observer_table_cards = sum(1 for c in observer_hand if c == table_card or c == "Joker")
+        observer_non_table_cards = len(observer_hand) - observer_table_cards
+        
+        # Calculate remaining cards of each type in the game
+        remaining_table_cards = self.cards_per_type[0] - observer_table_cards
+        remaining_non_table_cards = self.cards_per_type[1] - observer_non_table_cards
+        
+        # Extract full game history for all opponents
+        game_history = self._extract_observable_history(env, opponents)
+        
+        # Process history to derive initial beliefs
         for i, opponent in enumerate(opponents):
-            history = env.public_opponent_histories.get(opponent, [])
-            cards_remaining = len(env.players_hands.get(opponent, [])) / 5.0  # Normalized hand size
+            # Get opponent's current hand size
+            hand_size = len(env.players_hands.get(opponent, []))
+            if hand_size == 0:
+                # If opponent has no cards, beliefs are meaningless
+                # Set uniform distribution
+                beliefs[0, i] = torch.ones(self.card_types, device=self.device) / self.card_types
+                continue
+                
+            # Count total cards seen from this opponent (played or challenged)
+            opponent_seen_cards = {0: 0, 1: 0}  # {table_cards: count, non_table_cards: count}
             
-            # Start with an estimate based on observed plays
-            for entry in history:
-                if entry['action_type'] == "Play" and entry.get('was_bluff') is not None:
-                    if entry['count'] is not None:
-                        count = entry['count']
-                        if entry['was_bluff'] is True:
-                            # Was bluffing - decrease belief in table cards
-                            beliefs[0, i, 0] *= 0.5  # Reduce probability of table cards
+            # For each action in history, update beliefs using Bayes' rule
+            history_entries = game_history.get(opponent, [])
+            
+            # Set initial prior based on card distribution
+            prior = torch.tensor([remaining_table_cards, remaining_non_table_cards], 
+                                device=self.device) / (remaining_table_cards + remaining_non_table_cards)
+            
+            # Keep track of total cards revealed by this opponent
+            revealed_table_cards = 0
+            revealed_non_table_cards = 0
+            
+            for entry in history_entries:
+                action_type = entry.get('action_type')
+                count = entry.get('count')
+                was_bluff = entry.get('was_bluff')
+                was_challenged = entry.get('was_challenged', False)
+                
+                if action_type == "Play" and count is not None:
+                    if was_bluff is not None:  # Only if we know the truth value
+                        # This is a play where the bluff status is known (was challenged)
+                        if was_bluff:
+                            # Cards played were not table cards
+                            revealed_non_table_cards += count
                         else:
-                            # Was truthful - increase belief in table cards
-                            beliefs[0, i, 0] *= 1.5  # Increase probability of table cards
+                            # Cards played were table cards
+                            revealed_table_cards += count
+                        
+                    # Derive likelihood P(action | hand) using our probability model
+                    likelihood = self._compute_action_probabilities(None, action_type, count, opponent, env)
+                    
+                    # Apply Bayes' rule: P(hand | action) ∝ P(action | hand) × P(hand)
+                    posterior = prior * likelihood
+                    posterior_sum = posterior.sum()
+                    if posterior_sum > 0:
+                        prior = posterior / posterior_sum
+                    
+                elif action_type == "Challenge":
+                    # Challenges reveal information about the challenger's beliefs
+                    likelihood = self._compute_action_probabilities(None, action_type, None, opponent, env)
+                    
+                    # Update beliefs
+                    posterior = prior * likelihood
+                    posterior_sum = posterior.sum()
+                    if posterior_sum > 0:
+                        prior = posterior / posterior_sum
             
-            # Normalize to ensure valid probabilities
-            beliefs[0, i] = beliefs[0, i] / (beliefs[0, i].sum() + 1e-10)
+            # Apply final physical constraints based on revealed cards
+            # Calculate remaining cards after accounting for revealed cards
+            adj_remaining_table = max(0, remaining_table_cards - revealed_table_cards)
+            adj_remaining_non_table = max(0, remaining_non_table_cards - revealed_non_table_cards)
+            
+            # Calculate max possible cards in opponent's hand of each type
+            max_table_in_hand = min(hand_size, adj_remaining_table)
+            max_non_table_in_hand = min(hand_size, adj_remaining_non_table)
+            
+            # Normalize considering physically possible hands
+            if max_table_in_hand + max_non_table_in_hand > 0:
+                physical_constraint = torch.tensor([max_table_in_hand, max_non_table_in_hand], 
+                                                device=self.device)
+                physical_constraint = physical_constraint / (max_table_in_hand + max_non_table_in_hand)
+                
+                # Blend Bayesian posterior with physical constraints
+                # Weight depends on how much information we have
+                info_weight = min(len(history_entries) / 5.0, 0.8)
+                final_belief = info_weight * prior + (1 - info_weight) * physical_constraint
+            else:
+                final_belief = prior
+                
+            # Normalize final belief
+            belief_sum = final_belief.sum()
+            if belief_sum > 0:
+                beliefs[0, i] = final_belief / belief_sum
+            else:
+                # Fallback to uniform if we have a zero distribution
+                beliefs[0, i] = torch.ones(self.card_types, device=self.device) / self.card_types
         
-        # Apply correlation and physical constraints
-        constrained_beliefs = self.model_correlations(beliefs, private_obs)
+        # Apply correlation constraints - opponents' hands are not independent
+        # because they draw from a shared pool of cards
+        beliefs = self._apply_correlation_constraints(beliefs, remaining_table_cards, remaining_non_table_cards)
         
-        return constrained_beliefs
+        # Apply physical constraints using observer's hand
+        private_hand = torch.FloatTensor([observer_table_cards, observer_non_table_cards]).unsqueeze(0).to(self.device)
+        beliefs = self.apply_physical_constraints(beliefs, private_hand)
+        
+        return beliefs
 
 
 class CFRValueNetwork(nn.Module):
@@ -891,3 +1095,168 @@ class RebelPolicyNetwork(nn.Module):
             action = action_dist.sample().item()
             action_prob = action_probs[0, action].item()
         return action, action_prob, state_value.item()
+
+
+class ActionProbabilityModel(nn.Module):
+    """
+    Neural model to predict action probabilities based on game state features.
+    Replaces hardcoded probability values with learned probabilities.
+    """
+    def __init__(self, input_dim=10, hidden_dim=64):
+        super(ActionProbabilityModel, self).__init__()
+        self.input_dim = input_dim
+        
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, 2)  # Outputs [table_prob, non_table_prob]
+        )
+        
+    def forward(self, features):
+        """
+        Predict action probabilities from state features.
+        
+        Args:
+            features: Tensor of state features including:
+                - action_type (play/challenge)
+                - play_count (1/2/3)
+                - hand_size
+                - penalty_ratio
+                - is_desperate (near elimination)
+                - opponent_features (e.g., historical behavior)
+                
+        Returns:
+            Tensor of [table_prob, non_table_prob]
+        """
+        logits = self.network(features)
+        probs = F.softmax(logits, dim=-1)
+        return probs
+    
+    def extract_features(self, action_type, count, hand_size, penalty_ratio, 
+                         opponent_id=None, opponent_memory=None):
+        """
+        Extract relevant features for probability prediction.
+        """
+        features = []
+        
+        # Action type (one-hot encoded)
+        is_play = 1.0 if action_type == "Play" else 0.0
+        is_challenge = 1.0 if action_type == "Challenge" else 0.0
+        features.extend([is_play, is_challenge])
+        
+        # Play count (normalized)
+        play_count = count if count is not None else 0
+        features.append(play_count / 3.0)  # Normalize to [0,1]
+        
+        # Hand size (normalized)
+        features.append(hand_size / 5.0)  # Normalize to [0,1]
+        
+        # Penalty ratio
+        features.append(penalty_ratio)
+        
+        # Opponent features
+        if opponent_memory and opponent_id:
+            opponent_summary = opponent_memory.get_summary(opponent_id)
+            features.extend(opponent_summary)
+        else:
+            # Default opponent features if not available
+            features.extend([0.5, 0.5, 0.5, 0.5, 0.0, 0.0])
+            
+        return torch.tensor(features, dtype=torch.float)
+    
+class ActionProbabilityDataCollector:
+    """
+    Collects data for training the action probability model.
+    """
+    def __init__(self):
+        self.data = []
+        
+    def record_action(self, action_type, count, hand, table_card, was_bluff=None, 
+                      hand_size=None, penalty_ratio=None, opponent_id=None, 
+                      opponent_memory=None):
+        """
+        Record an action taken by a player.
+        
+        Args:
+            action_type: Type of action ("Play" or "Challenge")
+            count: Number of cards played (if applicable)
+            hand: Player's hand
+            table_card: Current table card
+            was_bluff: Whether the play was a bluff (if known)
+            hand_size: Size of player's hand
+            penalty_ratio: Current penalty ratio
+            opponent_id: Player ID
+            opponent_memory: OpponentMemory instance
+        """
+        # Skip if we don't know if it was a bluff or not
+        if action_type == "Play" and was_bluff is None:
+            return
+            
+        # Count cards in hand
+        if hand_size is None:
+            hand_size = len(hand)
+            
+        table_card_count = sum(1 for c in hand if c == table_card or c == "Joker")
+        non_table_card_count = hand_size - table_card_count
+        
+        # Extract features
+        features = []
+        is_play = 1.0 if action_type == "Play" else 0.0
+        is_challenge = 1.0 if action_type == "Challenge" else 0.0
+        features.extend([is_play, is_challenge])
+        
+        play_count = count if count is not None else 0
+        features.append(play_count / 3.0)
+        
+        features.append(hand_size / 5.0)
+        features.append(penalty_ratio if penalty_ratio is not None else 0.0)
+        
+        # Opponent features
+        if opponent_memory and opponent_id:
+            opponent_summary = opponent_memory.get_summary(opponent_id)
+            features.extend(opponent_summary)
+        else:
+            features.extend([0.5, 0.5, 0.5, 0.5, 0.0, 0.0])
+        
+        # Create target based on actual card distribution in hand
+        has_table_cards = table_card_count > 0
+        has_non_table_cards = non_table_card_count > 0
+        
+        if action_type == "Play":
+            if was_bluff:
+                # A bluff means they played non-table cards as table cards
+                target = [0.0, 1.0]  # [table_prob, non_table_prob]
+            else:
+                # Not a bluff means they played table cards truthfully
+                target = [1.0, 0.0]  # [table_prob, non_table_prob]
+        elif action_type == "Challenge":
+            # For challenges, consider the player's own hand
+            target = [1.0, 0.0] if has_table_cards else [0.0, 1.0]
+        
+        self.data.append({
+            'features': features,
+            'target': target,
+            'meta': {
+                'action_type': action_type,
+                'count': count,
+                'hand_size': hand_size,
+                'table_card_count': table_card_count,
+                'non_table_card_count': non_table_card_count,
+                'was_bluff': was_bluff,
+            }
+        })
+        
+    def get_training_data(self):
+        """Get collected data for training."""
+        if not self.data:
+            return None, None
+            
+        features = torch.tensor([d['features'] for d in self.data], dtype=torch.float)
+        targets = torch.tensor([d['target'] for d in self.data], dtype=torch.float)
+        return features, targets

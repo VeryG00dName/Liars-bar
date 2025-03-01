@@ -3,10 +3,13 @@ import torch
 import numpy as np
 from collections import defaultdict
 
+from src.env.liars_deck_env_utils_2 import decode_action
+
 class RecursiveSearchAgent:
     def __init__(self, policy_net, belief_model, value_net, env_creator, 
-                 device, search_depth=4, num_simulations=30, c_puct=1.0,
-                 agent_name=None, agent_index=None, blueprint=None):
+             device, search_depth=4, num_simulations=30, c_puct=1.0,
+             agent_name=None, agent_index=None, blueprint=None,
+             alpha=1.5, beta=0.5, gamma=2.0):
         """
         Agent that uses belief-based recursive search for decision making.
         Implements proper Counterfactual Regret Minimization (CFR) with
@@ -36,20 +39,25 @@ class RecursiveSearchAgent:
         self.name = agent_name
         self.agent_index = agent_index
         self.blueprint = blueprint
-        
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.transposition_table = {}
+        self.value_statistics = {}
+        self.last_observation = None
         # Belief state tracking
         self.current_beliefs = None
         self.current_public_beliefs = None
         self.action_history = []
         self.search_statistics = {}
-        
+        self.iterations = defaultdict(int)
         # Key additions for CFR
         self.cumulative_regrets = defaultdict(lambda: np.zeros(7))  # For 7 possible actions
         self.average_strategy = defaultdict(lambda: np.zeros(7))
         self.strategy_update_count = defaultdict(int)
         
         # State encoding function (for dictionary keys)
-        self.public_state_to_key = lambda public_obs, public_beliefs: hash(str(public_obs.tolist()) + str(public_beliefs.cpu().numpy().tolist()))
+        self.public_state_to_key = lambda public_obs, public_beliefs: hash(str(public_obs.tolist()) + str(public_beliefs.detach().cpu().numpy().tolist()))
         
         # Add opponent memory support
         from src.model.rebel_memory import get_opponent_memory
@@ -63,6 +71,19 @@ class RecursiveSearchAgent:
         self.search_statistics = {}
         # Note: We don't reset cumulative_regrets or average_strategy as they persist across games
 
+    def _update_value_statistics(self, state_key, value):
+        """Update running statistics for a state."""
+        if state_key not in self.value_statistics:
+            self.value_statistics[state_key] = [value, 0.0, 1]  # [mean, std, count]
+        else:
+            mean, std, count = self.value_statistics[state_key]
+            new_count = count + 1
+            delta = value - mean
+            new_mean = mean + delta / new_count
+            delta2 = value - new_mean
+            new_std = np.sqrt((std ** 2 * count + delta * delta2) / new_count)
+            self.value_statistics[state_key] = [new_mean, new_std, new_count]
+    
     def set_training_mode(self, training=True):
         """
         Set agent to training or evaluation mode.
@@ -210,8 +231,8 @@ class RecursiveSearchAgent:
 
     def compute_cfr_strategy(self, state_key, action_mask):
         """
-        Compute a strategy according to the CFR algorithm using cumulative regrets.
-        
+        Compute a strategy according to the DCFR algorithm using discounted regrets.
+
         Args:
             state_key: A unique identifier for the current state
             action_mask: Boolean mask of valid actions
@@ -221,11 +242,26 @@ class RecursiveSearchAgent:
         """
         # Get cumulative regrets for this state
         regrets = self.cumulative_regrets[state_key]
-        
-        # Only consider positive regrets (regret matching)
-        positive_regrets = np.maximum(regrets, 0) * action_mask
-        regret_sum = positive_regrets.sum()
-        
+
+        # Get iteration count for this state (increment first)
+        self.iterations[state_key] += 1
+        t = self.iterations[state_key]
+
+        # Apply DCFR discounting
+        positive_regrets = np.maximum(regrets, 0)
+        negative_regrets = np.minimum(regrets, 0)
+
+        # Discount positive and negative regrets differently
+        discounted_positive = positive_regrets * (t ** self.alpha)
+        discounted_negative = negative_regrets * (t ** self.beta)
+
+        # Combine discounted regrets
+        discounted_regrets = discounted_positive + discounted_negative
+
+        # Apply action mask
+        masked_regrets = discounted_regrets * action_mask
+        regret_sum = masked_regrets.sum()
+
         # If sum is zero or state not seen before, use uniform random over valid actions
         if regret_sum <= 0:
             valid_actions = np.where(action_mask)[0]
@@ -233,13 +269,13 @@ class RecursiveSearchAgent:
             strategy[valid_actions] = 1.0 / len(valid_actions)
         else:
             # Normalize by sum of positive regrets (regret matching)
-            strategy = positive_regrets / regret_sum
-        
+            strategy = masked_regrets / regret_sum
+
         return strategy
 
     def update_average_strategy(self, state_key, current_strategy):
         """
-        Update the average strategy for a state.
+        Update the average strategy for a state using DCFR discounting.
         
         Args:
             state_key: A unique identifier for the current state
@@ -247,17 +283,29 @@ class RecursiveSearchAgent:
         """
         # Increment counter for this state
         self.strategy_update_count[state_key] += 1
-        
-        # Update running average: weighted by count to properly compute average
         count = self.strategy_update_count[state_key]
+        
+        # Get iteration count
+        t = self.iterations[state_key]
+        
+        # Apply DCFR discounting - weight by t^gamma
+        contribution_weight = t ** self.gamma
+        
+        # Simple running average update (safer)
+        alpha = 1.0 / count
+        
+        # Update running average
         self.average_strategy[state_key] = (
-            (count - 1) / count * self.average_strategy[state_key] + 
-            (1 / count) * current_strategy
+            (1 - alpha) * self.average_strategy[state_key] + 
+            alpha * current_strategy
         )
+        
+        # Ensure the result is non-negative
+        self.average_strategy[state_key] = np.maximum(self.average_strategy[state_key], 0)
 
     def get_average_strategy(self, state_key, action_mask):
         """
-        Get the average strategy for a state.
+        Get the average strategy for a state (normalized).
         
         Args:
             state_key: A unique identifier for the current state
@@ -267,6 +315,9 @@ class RecursiveSearchAgent:
             numpy array: A probability distribution over actions
         """
         strategy = self.average_strategy[state_key]
+        
+        # Ensure all values are non-negative (fix for the error)
+        strategy = np.maximum(strategy, 0)
         
         # If state never seen, use uniform random over valid actions
         if np.sum(strategy) <= 0:
@@ -338,7 +389,7 @@ class RecursiveSearchAgent:
 
     def mcts_search(self, observation, action_mask):
         """
-        Perform Monte Carlo Tree Search with blueprint priors, CFR, and opponent memory.
+        Perform Monte Carlo Tree Search with blueprint priors, CFR, opponent memory, and virtual loss.
         
         Args:
             observation: Current observation.
@@ -374,8 +425,7 @@ class RecursiveSearchAgent:
         opponent_id = opponents[0] if opponents else None
         
         # Create a unique key for this PUBLIC state (key for CFR)
-        public_state_key = self.public_state_to_key(
-            np.array(public_obs), self.current_public_beliefs)
+        public_state_key = self.public_state_to_key(np.array(public_obs), self.current_public_beliefs)
         
         # Get policy network's action priors
         with torch.no_grad():
@@ -397,7 +447,7 @@ class RecursiveSearchAgent:
                 opponent_id  # Include opponent identity
             )
             # Use blueprint as prior (higher weight) combined with policy network
-            blueprint_weight = 0.7
+            blueprint_weight = 0.3
             combined_priors = blueprint_weight * blueprint_strategy + (1 - blueprint_weight) * priors
         else:
             # Use policy network normally if no blueprint
@@ -422,6 +472,9 @@ class RecursiveSearchAgent:
         # Track counterfactual values across all simulations
         cf_values = {}
         
+        # Add virtual loss tracking to discourage parallel exploration of the same path
+        virtual_loss = {a: 0.0 for a in range(len(action_mask))}
+        
         # Run MCTS simulations
         for _ in range(self.num_simulations):
             sim_env = self.env_creator()  # Clone environment for simulation
@@ -429,29 +482,47 @@ class RecursiveSearchAgent:
             # Compute current CFR strategy using PUBLIC state key
             cfr_strategy = self.compute_cfr_strategy(public_state_key, action_mask)
             
-            # Select action using PUCT formula but with CFR strategy as prior
+            # Select action using adaptive exploration in the PUCT formula
             valid_actions = np.where(action_mask)[0]
             best_score = -float('inf')
             best_action = valid_actions[0]
             
             for action in valid_actions:
-                if N[action] > 0:
-                    # Use PUCT formula with CFR strategy as prior
+                visit_count = N[action]
+                total_visits = sum(N.values())
+                
+                # Adaptive exploration factor that decreases with depth
+                adaptive_c = self.c_puct * (1.0 - 0.1 * len(self.action_history))
+                adaptive_c = max(0.5, adaptive_c)  # Ensure minimum exploration
+                
+                # Progressive widening coefficient
+                pw_coeff = 0.5
+                if visit_count > (total_visits ** pw_coeff):
                     exploitation = Q[action]
-                    exploration = self.c_puct * cfr_strategy[action] * np.sqrt(sum(N.values())) / (1 + N[action])
-                    score = exploitation + exploration
+                    exploration = adaptive_c * cfr_strategy[action] * np.sqrt(np.log(total_visits) / (visit_count + 1e-5))
                 else:
-                    score = self.c_puct * cfr_strategy[action] * np.sqrt(sum(N.values()) + 1e-5)
+                    exploitation = Q[action]
+                    exploration = adaptive_c * cfr_strategy[action] * np.sqrt(np.log(total_visits + 1) / (visit_count + 1e-5))
+                
+                # Apply virtual loss penalty in the selection by adjusting the Q value temporarily
+                temp_Q = Q[action] - (virtual_loss[action] * 0.1 / max(N[action], 1))
+                score = temp_Q + exploration
                 
                 if score > best_score:
                     best_score = score
                     best_action = action
             
-            # Simulate taking the best_action recursively with subgame solving
+            # Apply virtual loss for the selected action before simulation
+            virtual_loss[best_action] += 1.0
+            
+            # Run simulation from the selected node (with subgame solving)
             sim_value, action_cf_values = self._simulate(
                 sim_env, best_action, observation, public_obs, 
                 self.current_beliefs, self.current_public_beliefs, 
                 self.search_depth, reach_prob=1.0)
+            
+            # Remove virtual loss after simulation
+            virtual_loss[best_action] -= 1.0
             
             # Update statistics for the selected action
             N[best_action] += 1
@@ -527,214 +598,230 @@ class RecursiveSearchAgent:
             'blueprint_value': blueprint_value
         }
 
+    def _apply_progressive_pruning(self, strategy, valid_actions, depth):
+        """
+        Apply progressive pruning based on search depth and strategy values.
+        Deeper in the tree, we focus on fewer but more promising actions.
+        
+        Args:
+            strategy: The current probability distribution over actions.
+            valid_actions: Array of indices representing valid actions.
+            depth: Current remaining depth in the search.
+            
+        Returns:
+            Pruned and renormalized strategy.
+        """
+        # Do not prune if only a few actions or shallow search depth
+        if len(valid_actions) <= 2 or depth >= 3:
+            return strategy
+
+        # Adaptive threshold: becomes stricter as depth increases
+        pruning_threshold = 0.05 * (1 + (3 - depth))
+        
+        # Select actions with probability above threshold
+        significant_actions = [a for a in valid_actions if strategy[a] >= pruning_threshold]
+        
+        # Ensure at least two actions are preserved
+        if len(significant_actions) < 2:
+            sorted_actions = sorted(valid_actions, key=lambda a: strategy[a], reverse=True)
+            significant_actions = sorted_actions[:2]
+        
+        # Create a mask for significant actions
+        pruned_mask = np.zeros_like(strategy)
+        pruned_mask[significant_actions] = 1
+        
+        # Apply mask and renormalize the strategy
+        pruned_strategy = strategy * pruned_mask
+        pruned_strategy = pruned_strategy / np.clip(np.sum(pruned_strategy), 1e-8, None)
+        
+        return pruned_strategy
+
     def _simulate(self, env, action, observation, public_obs, beliefs, public_beliefs, depth, reach_prob=1.0, parent_values=None):
         """
         Simulate taking an action and recursively evaluate the resulting state with proper subgame solving.
         Optimized for performance while maintaining correlation-aware belief handling.
-        
+
         Args:
-            env: Cloned environment for simulation
-            action: Action to simulate
-            observation: Full observation
-            public_obs: Public part of the observation
-            beliefs: Full belief state
-            public_beliefs: Public belief state
-            depth: Remaining search depth
-            reach_prob: Current reach probability for this state
-            parent_values: Value estimates from parent subgame for boundary conditions
-            
+            env: Cloned environment for simulation.
+            action: Action to simulate.
+            observation: Full observation.
+            public_obs: Public part of the observation.
+            beliefs: Full belief state.
+            public_beliefs: Public belief state.
+            depth: Remaining search depth.
+            reach_prob: Current reach probability for this state.
+            parent_values: Value estimates from parent subgame for boundary conditions.
+
         Returns:
             Tuple of (value, counterfactual_values) where:
-                - value: Estimated value after taking the action (float)
-                - counterfactual_values: Dict mapping actions to their counterfactual values
+                - value: Estimated value after taking the action (float).
+                - counterfactual_values: Dict mapping actions to their counterfactual values.
         """
         agent = self.name
         original_agent_selection = env.agent_selection
-        
-        # Move belief tensors to the device for consistency
+
+        # Ensure belief tensors are on the correct device
         beliefs = beliefs.to(self.device)
         public_beliefs = public_beliefs.to(self.device)
-        
-        # Skip expensive sampling for low reach probabilities or shallow depth
-        skip_sampling = reach_prob < 0.05 or depth <= 1
-        
-        if not skip_sampling:
-            # Extract private hand for physical constraints (just first two elements)
+
+        # Variance-based early termination (principled statistical confidence)
+        if depth > 0 and hasattr(self, 'value_statistics'):
+            state_key = self.public_state_to_key(np.array(public_obs), public_beliefs)
+            if state_key in self.value_statistics:
+                mean_value, std_value, count = self.value_statistics[state_key]
+                std_error = std_value / np.sqrt(count)
+                confidence_threshold = 0.05  # 95% confidence interval threshold
+                if std_error < confidence_threshold and count >= 10:
+                    return env.rewards[agent] + mean_value, {}
+
+        # Sampling: perform expensive sampling only if depth > 1.
+        if depth > 1:
             private_hand = torch.FloatTensor(observation[:2]).unsqueeze(0).to(self.device)
-            
-            # Sample consistent hands only when needed (with optimized sampling)
             with torch.no_grad():
                 if hasattr(self.belief_model, 'sample_consistent_beliefs'):
-                    sampled_hands = self.belief_model.sample_consistent_beliefs(
-                        beliefs, private_hand, num_samples=1)
-                    sampled_hands = sampled_hands.squeeze(1)
+                    sampled_hands = self.belief_model.sample_consistent_beliefs(beliefs, private_hand, num_samples=1).squeeze(1)
                 else:
-                    # Fallback if sampling method not available
                     sampled_hands = None
         else:
             sampled_hands = None
-        
+
         # Execute the action in simulation
         env.step(action)
         reward = env.rewards[agent]
         done = env.terminations[agent]
-        
+
         # Initialize counterfactual values dictionary
         cf_values = {}
-        
-        # Terminal state handling (optimization: early return)
+
+        # Terminal state handling: if the game is done, return immediately.
         if done:
             return reward, cf_values
-        
-        # Depth limit reached - boundary condition
+
+        # Depth limit reached - use value network to estimate the value and regrets.
         if depth == 0:
-            # At boundary, use value network to estimate counterfactual values
             next_obs = env.observe(agent)
             if isinstance(next_obs, dict):
                 next_obs = next_obs[agent]
             next_obs_tensor = torch.FloatTensor(next_obs).unsqueeze(0).to(self.device)
             action_mask = env.infos[agent]["action_mask"]
-            
+
             with torch.no_grad():
-                # Update beliefs for the new state (optimized with caching)
-                if hasattr(self, '_cached_beliefs') and self._cached_beliefs is not None:
-                    next_beliefs = self._cached_beliefs
-                    # Ensure all tensors are on the same device
-                    next_beliefs.copy_(self.belief_model(next_obs_tensor, beliefs))
-                else:
-                    next_beliefs = self.belief_model(next_obs_tensor, beliefs)
-                    self._cached_beliefs = next_beliefs
-                
-                # Apply physical constraints for consistent beliefs
+                next_beliefs = self.belief_model(next_obs_tensor, beliefs)
                 private_hand = torch.FloatTensor(next_obs[:2]).unsqueeze(0).to(self.device)
                 next_beliefs = self.belief_model.apply_physical_constraints_fast(next_beliefs, private_hand)
-                
-                # Use value network to get value and regrets (counterfactual values)
                 value, regrets = self.value_net(next_obs_tensor, next_beliefs)
                 avg_value = value.item()
                 regrets_np = regrets.squeeze(0).cpu().numpy() * action_mask
-                
-                # For each valid action, calculate counterfactual value
+
                 valid_actions = np.where(action_mask)[0]
                 for a in valid_actions:
-                    cf_values[a] = avg_value + regrets_np[a]  # CV = V + Regret
-                    
-                return avg_value, cf_values
-        
-        # If round ended or agent changed, we've reached a subgame boundary
+                    cf_values[a] = avg_value + regrets_np[a]
+            return avg_value, cf_values
+
+        # Nested Subgame Solving: if the active agent changed or the round ended.
         if env.agent_selection is None or env.agent_selection != original_agent_selection:
             next_obs = env.observe(agent)
             if isinstance(next_obs, dict):
                 next_obs = next_obs[agent]
             next_obs_tensor = torch.FloatTensor(next_obs).unsqueeze(0).to(self.device)
-            
+
+            # Create a key for this subgame from the public observation and updated public belief state.
+            next_public_obs, _ = self.split_observation(next_obs)
+            updated_public_beliefs = self.belief_model.get_public_belief_state(next_obs_tensor)
+            subgame_key = self.public_state_to_key(np.array(next_public_obs), updated_public_beliefs)
+
+            # Check transposition table for a previously computed subgame value.
+            if hasattr(self, 'transposition_table') and subgame_key in self.transposition_table:
+                cached_value = self.transposition_table[subgame_key]
+                return env.rewards[agent] + cached_value, {}
+
             with torch.no_grad():
-                # Update beliefs for the new state (use fast update at boundaries)
                 next_beliefs = self.belief_model(next_obs_tensor, beliefs)
-                
-                # Apply physical constraints for consistent beliefs
                 private_hand = torch.FloatTensor(next_obs[:2]).unsqueeze(0).to(self.device)
                 next_beliefs = self.belief_model.apply_physical_constraints_fast(next_beliefs, private_hand)
-                
-                # Get subgame value estimate
                 value, _ = self.value_net(next_obs_tensor, next_beliefs)
                 subgame_value = value.item()
-                
-                # Apply safety constraint if we have parent values (safe subgame solving)
+
+                # Safety constraint: use parent's estimate if subgame value is lower.
                 if parent_values is not None and action in parent_values:
-                    if subgame_value < parent_values[action]:
-                        subgame_value = parent_values[action]
-                
-                return reward + subgame_value, cf_values
-        
-        # Continue recursive simulation within the current subgame
+                    parent_value = parent_values[action]
+                    if subgame_value < parent_value:
+                        correction = parent_value - subgame_value
+                        subgame_value = parent_value
+                        if not hasattr(self, 'subgame_corrections'):
+                            self.subgame_corrections = {}
+                        self.subgame_corrections[subgame_key] = correction
+
+                if not hasattr(self, 'transposition_table'):
+                    self.transposition_table = {}
+                self.transposition_table[subgame_key] = subgame_value
+
+                # Update value statistics for potential future early terminations.
+                self._update_value_statistics(subgame_key, subgame_value)
+
+                return env.rewards[agent] + subgame_value, {}
+
+        # Continue recursive simulation within the current subgame.
         next_obs = env.observe(agent)
         if isinstance(next_obs, dict):
             next_obs = next_obs[agent]
         action_mask = env.infos[agent]["action_mask"]
         next_obs_tensor = torch.FloatTensor(next_obs).unsqueeze(0).to(self.device)
-        
+
         with torch.no_grad():
-            # Split observation into public and private parts
             next_public_obs, _ = self.split_observation(next_obs)
-            
-            # Update both belief types with optimization for speed
-            if depth > 2:  # Full update for deeper nodes
+            if depth > 2:
                 next_beliefs = self.belief_model(next_obs_tensor, beliefs)
                 next_public_beliefs = self.belief_model.get_public_belief_state(next_obs_tensor, public_beliefs)
-                
                 private_hand = torch.FloatTensor(next_obs[:2]).unsqueeze(0).to(self.device)
                 next_beliefs = self.belief_model.apply_physical_constraints_fast(next_beliefs, private_hand)
                 next_public_beliefs = self.belief_model.apply_physical_constraints_fast(next_public_beliefs, private_hand)
-            else:  # Simplified update for shallow nodes
+            else:
                 next_beliefs = beliefs.clone()
                 next_public_beliefs = public_beliefs.clone()
-            
-            # Create a unique key for this new PUBLIC state
-            next_public_state_key = self.public_state_to_key(
-                np.array(next_public_obs), next_public_beliefs)
-            
-            # Get the CFR strategy for this state
+
+            next_public_state_key = self.public_state_to_key(np.array(next_public_obs), next_public_beliefs)
             cfr_strategy = self.compute_cfr_strategy(next_public_state_key, action_mask)
-            
-            # Calculate counterfactual values for each action
-            action_cf_values = {}
-            valid_actions = np.where(action_mask)[0]
-            
-            if len(valid_actions) == 0:
-                return reward, cf_values
-            
+
+            # Initial masked strategy based on CFR strategy and action mask.
             masked_strategy = cfr_strategy * action_mask
-            if np.sum(masked_strategy) <= 0:
+            if np.sum(masked_strategy) > 0:
+                masked_strategy = masked_strategy / np.sum(masked_strategy)
+            else:
+                valid_actions = np.where(action_mask)[0]
                 masked_strategy = np.zeros_like(action_mask, dtype=np.float32)
                 masked_strategy[valid_actions] = 1.0 / len(valid_actions)
-            else:
-                masked_strategy = masked_strategy / np.sum(masked_strategy)
-            
-            # Optimization: for very low reach probabilities, just estimate instead of recursing
-            if reach_prob < 0.01:
-                with torch.no_grad():
-                    value, regrets = self.value_net(next_obs_tensor, next_beliefs)
-                    base_value = value.item()
-                    regrets_np = regrets.squeeze(0).cpu().numpy() * action_mask
-                    
-                    for a in valid_actions:
-                        cf_values[a] = base_value + regrets_np[a]
-                    
-                    expected_value = base_value
-                    return reward + expected_value, cf_values
-            
+
+            valid_actions = np.where(action_mask)[0]
+            # Apply progressive pruning to focus on the most promising actions at deeper depths.
+            masked_strategy = self._apply_progressive_pruning(masked_strategy, valid_actions, depth)
+
+            action_cf_values = {}
             total_value = 0
-            if len(valid_actions) > 2 and depth < 3:
-                top_actions = np.argsort(masked_strategy)[-2:]  # Top 2 actions
-                top_mask = np.zeros_like(masked_strategy)
-                top_mask[top_actions] = 1
-                masked_strategy = masked_strategy * top_mask
-                masked_strategy = masked_strategy / np.sum(masked_strategy)
-            
             for a in valid_actions:
                 if masked_strategy[a] <= 0:
                     continue
-                
                 action_reach = reach_prob * masked_strategy[a]
                 if action_reach < 0.005:
                     continue
-                    
                 action_env = env.clone()
-                action_value, action_cf_values = self._simulate(
-                    action_env, a, next_obs, next_public_obs, 
-                    next_beliefs, next_public_beliefs, depth - 1, 
-                    action_reach, parent_values=action_cf_values)
-                
+                action_value, child_cf_values = self._simulate(
+                    action_env, a, next_obs, next_public_obs,
+                    next_beliefs, next_public_beliefs, depth - 1,
+                    action_reach, parent_values=action_cf_values
+                )
+                # Update counterfactual values with results from the child simulation.
                 cf_values[a] = action_value
                 total_value += masked_strategy[a] * action_value
-        
-        return reward + total_value, cf_values
+
+        return env.rewards[agent] + total_value, cf_values
+
 
     def play_turn(self, observation, action_mask, table_card):
         """
         Interface method compatible with the game environment.
-        Now updates opponent memory.
+        Now with improved search tree reuse between turns and
+        enhanced opponent memory updates.
         
         Args:
             observation: Current observation.
@@ -743,12 +830,33 @@ class RecursiveSearchAgent:
             
         Returns:
             A dictionary containing:
-              - selected_action: Chosen action.
-              - search_policy: Distribution over actions based on CFR average strategy.
-              - value_estimate: Value estimate from the subgame solver.
-              - counterfactual_regrets: Computed regrets for available actions.
-              - cfr_strategy: Current CFR strategy based on regret matching.
+            - selected_action: Chosen action.
+            - search_policy: Distribution over actions based on CFR average strategy.
+            - value_estimate: Value estimate from the subgame solver.
+            - counterfactual_regrets: Computed regrets for available actions.
+            - cfr_strategy: Current CFR strategy based on regret matching.
         """
+        # Check if we can reuse search tree from previous turn
+        can_reuse_tree = False
+        if hasattr(self, 'last_observation') and self.last_observation is not None and hasattr(self, 'transposition_table'):
+            # Extract public observations from current and last observation
+            last_public_obs = self.split_observation(self.last_observation)[0]
+            current_public_obs = self.split_observation(observation)[0]
+            
+            # If only private information changed, we can reuse the tree
+            if np.array_equal(last_public_obs[2:], current_public_obs[2:]):
+                can_reuse_tree = True
+                # Note: We keep the transposition_table and value_statistics
+                # but will update beliefs with new private information
+        
+        if not can_reuse_tree:
+            # If we can't reuse, clear the tables
+            self.transposition_table = {}
+            self.value_statistics = {}
+        
+        # Store current observation for next turn
+        self.last_observation = observation
+        
         # Update beliefs based on the latest observation
         self.update_beliefs(observation, action_mask)
         
@@ -773,6 +881,45 @@ class RecursiveSearchAgent:
             'public_state_key': search_outcomes['public_state_key']
         })
         
-        # Update opponent memory as needed using self.opponent_memory here
+        # Update opponent memory
+        current_env = self.env_creator()
+        
+        # Get information about the most recent action by opponents
+        last_action_agent = current_env.last_action_agent
+        last_action = current_env.last_action
+        last_action_bluff = current_env.last_action_bluff
+        
+        if last_action_agent and last_action_agent != self.name:
+            # Record the opponent's action in our memory
+            action_type = f"Play_{last_action}" if last_action is not None else "None"
+            card_count = len(current_env.players_hands.get(last_action_agent, []))
+            penalty_count = current_env.penalties.get(last_action_agent, 0)
+            
+            self.opponent_memory.update(
+                opponent=last_action_agent,
+                response=action_type,
+                penalties=penalty_count,
+                card_count=card_count
+            )
+            
+            # If we know whether it was a bluff, record that too
+            if last_action_bluff is not None and last_action is not None:
+                self.opponent_memory.record_bluff(
+                    opponent=last_action_agent,
+                    was_bluff=last_action_bluff,
+                    play_count=last_action
+                )
+        
+        # If we're about to make a challenge, record that information
+        selected_action = search_outcomes['selected_action']
+        action_type, _, count = decode_action(selected_action)
+        
+        if action_type == "Challenge" and last_action_agent:
+            # We're challenging someone - update our memory with this decision
+            self.opponent_memory.record_challenge_result(
+                opponent=self.name,  # We're the challenger
+                success=None,  # We don't know the outcome yet
+                target=last_action_agent  # Who we're challenging
+            )
         
         return search_outcomes

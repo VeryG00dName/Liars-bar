@@ -383,19 +383,85 @@ def train_policy_network(policy_net, value_net, trajectories, optimizer, device,
         'value': value_loss / max(num_batches, 1)
     }
 
+def train_action_probability_model(model, data_collector, device, lr=1e-4, epochs=50, batch_size=64):
+    """
+    Train the action probability model using collected data.
+    
+    Args:
+        model: ActionProbabilityModel instance
+        data_collector: ActionProbabilityDataCollector with data
+        device: Torch device for training
+        lr: Learning rate
+        epochs: Number of training epochs
+        batch_size: Batch size for training
+        
+    Returns:
+        Trained model
+    """
+    features, targets = data_collector.get_training_data()
+    if features is None:
+        return model
+        
+    features = features.to(device)
+    targets = targets.to(device)
+    
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    model.train()
+    
+    dataset_size = features.size(0)
+    indices = torch.randperm(dataset_size)
+    
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        for i in range(0, dataset_size, batch_size):
+            batch_indices = indices[i:i+batch_size]
+            batch_features = features[batch_indices]
+            batch_targets = targets[batch_indices]
+            
+            optimizer.zero_grad()
+            pred_probs = model(batch_features)
+            
+            # Cross-entropy loss
+            loss = F.binary_cross_entropy(pred_probs, batch_targets)
+            
+            loss.backward()
+            optimizer.step()
+            
+            epoch_loss += loss.item() * len(batch_indices)
+        
+        avg_epoch_loss = epoch_loss / dataset_size
+        if (epoch + 1) % 10 == 0:
+            print(f"Action Probability Model - Epoch {epoch+1}/{epochs}, Loss: {avg_epoch_loss:.6f}")
+    
+    return model
+
 def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10, 
                       lr_policy=1e-4, lr_belief=1e-4, lr_value=1e-4,
                       search_depth=4, num_simulations=30, log_interval=5,
                       checkpoint_interval=20, log_tensorboard=True,
-                      blueprint_phase=True, blueprint_games=500):
+                      blueprint_phase=True, blueprint_games=500,
+                      # Added parameters
+                      alpha=1.5, beta=0.5, gamma=2.0):
     """
-    Train a ReBeL agent with proper CFR implementation, public/private belief separation,
-    subgame solving, and blueprint strategy generation and usage.
+    Train a ReBeL agent with DCFR and learned action probabilities.
+    
+    Args:
+        env: Game environment
+        device: Torch device
+        # ... existing parameters ...
+        alpha: DCFR positive regret discount parameter
+        beta: DCFR negative regret discount parameter
+        gamma: DCFR average strategy discount parameter
     """
     logger = configure_logger()
-    logger.info(f"Starting ReBeL training with CFR, subgame solving, and blueprint strategy on {device}")
+    logger.info(f"Starting ReBeL training with DCFR and learned action probabilities on {device}")
     
-    # Use a fixed checkpoint directory and blueprint save path
+    # Initialize action probability model and data collector
+    from src.model.rebel_models import ActionProbabilityModel, ActionProbabilityDataCollector
+    
+    action_prob_model = ActionProbabilityModel(input_dim=11, hidden_dim=64).to(device)
+    data_collector = ActionProbabilityDataCollector()
+    
     checkpoint_dir = os.path.join(config.CHECKPOINT_DIR, 'rebel_blueprint')
     os.makedirs(checkpoint_dir, exist_ok=True)
     blueprint_save_path = os.path.join(checkpoint_dir, 'blueprint.pkl')
@@ -410,6 +476,7 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
     hidden_dim = 128
     num_card_types = 2  # Binary: table card or non-table card
     
+    # Initialize networks (policy, belief, value)
     policy_net = RebelPolicyNetwork(
         obs_dim=obs_dim, 
         belief_dim=(num_players - 1) * num_card_types,
@@ -425,6 +492,9 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
         use_dropout=True, 
         use_layer_norm=True
     ).to(device)
+    
+    # Add action probability model to belief model
+    belief_model.action_prob_model = action_prob_model
 
     value_net = CFRValueNetwork(
         input_dim=obs_dim, 
@@ -437,6 +507,7 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
     belief_optimizer = optim.Adam(belief_model.parameters(), lr=lr_belief)
     value_optimizer = optim.Adam(value_net.parameters(), lr=lr_value)
     
+    # Initialize agents with DCFR parameters
     agents = {}
     for i, agent_id in enumerate(env.possible_agents):
         agents[agent_id] = RecursiveSearchAgent(
@@ -448,13 +519,91 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
             search_depth=search_depth,
             num_simulations=num_simulations,
             agent_name=agent_id,
-            agent_index=i
+            agent_index=i,
+            # Add DCFR parameters
+            alpha=alpha,
+            beta=beta,
+            gamma=gamma
         )
     
     regret_tracker = defaultdict(list)
     blueprint = None
+
+    # ------------------------------------------------------------------------------
+    # Data Collection Phase for Action Probability Model
+    # ------------------------------------------------------------------------------
+    logger.info("Collecting data for action probability model...")
+    for game in tqdm(range(min(100, games_per_epoch * 3))):  # Collect data from a subset of games
+        observations, infos = env.reset()
+        for agent in agents.values():
+            agent.reset()
+        game_done = False
+        
+        while not game_done:
+            if not env.agents:
+                break
+            
+            current_agent_id = env.agent_selection
+            current_agent = agents[current_agent_id]
+            
+            observations = env.observe(current_agent_id)
+            infos = env.infos
+            obs = observations[current_agent_id]
+            action_mask = infos[current_agent_id]['action_mask']
+            
+            # Get the agent to act
+            search_outputs = current_agent.play_turn(obs, action_mask, env.table_card)
+            selected_action = search_outputs['selected_action']
+            
+            # Record the action before stepping (to capture current state)
+            action_type, _, count = decode_action(selected_action)
+            data_collector.record_action(
+                action_type=action_type,
+                count=count,
+                hand=env.players_hands.get(current_agent_id, []),
+                table_card=env.table_card,
+                was_bluff=None,  # Will be filled after the action
+                hand_size=len(env.players_hands.get(current_agent_id, [])),
+                penalty_ratio=env.penalties.get(current_agent_id, 0) / env.penalty_thresholds.get(current_agent_id, 3),
+                opponent_id=current_agent_id,
+                opponent_memory=None  # Not using memory for data collection
+            )
+            
+            # Take the step
+            prev_agent = current_agent_id
+            env.step(selected_action)
+            
+            # Check for bluff information and update the last record accordingly
+            if action_type == "Play" and env.last_action_bluff is not None:
+                for i in range(len(data_collector.data) - 1, -1, -1):
+                    entry = data_collector.data[i]
+                    if entry['meta']['action_type'] == "Play" and 'was_bluff' not in entry['meta']:
+                        entry['meta']['was_bluff'] = env.last_action_bluff
+                        if env.last_action_bluff:
+                            entry['target'] = [0.0, 1.0]  # [table_prob, non_table_prob]
+                        else:
+                            entry['target'] = [1.0, 0.0]  # [table_prob, non_table_prob]
+                        break
+            
+            # Check if the game is finished
+            next_agent_id = env.agent_selection if env.agents else None
+            if next_agent_id is None:
+                game_done = True
+
+    # Train the action probability model with collected data
+    logger.info("Training action probability model...")
+    action_prob_model = train_action_probability_model(
+        action_prob_model, data_collector, device, 
+        lr=lr_belief, epochs=50, batch_size=32
+    )
     
-    # Phase 1: Initial network training without blueprint
+    # Update the action probability model in the belief model
+    belief_model.action_prob_model = action_prob_model
+
+    # ------------------------------------------------------------------------------
+    # Normal Training Phases (Phase 1, 2, and 3)
+    # ------------------------------------------------------------------------------
+    # (Phase 1: Initial network training without blueprint)
     logger.info("Phase 1: Initial network training without blueprint")
     initial_epochs = num_epochs // 3
     for epoch in tqdm(range(initial_epochs)):
@@ -505,7 +654,7 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
             }
             torch.save(checkpoint_data, os.path.join(checkpoint_dir, f'checkpoint_phase1_{epoch+1}.pt'))
     
-    # Phase 2: Blueprint generation
+    # (Phase 2: Blueprint generation)
     if blueprint_phase:
         logger.info("Phase 2: Blueprint generation")
         if os.path.exists(blueprint_save_path):
@@ -563,10 +712,13 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
                 num_simulations=num_simulations,
                 agent_name=agent_id,
                 agent_index=i,
-                blueprint=blueprint
+                blueprint=blueprint,
+                alpha=alpha,
+                beta=beta,
+                gamma=gamma
             )
     
-    # Phase 3: Training with blueprint guidance
+    # (Phase 3: Training with blueprint guidance)
     remaining_epochs = num_epochs - initial_epochs
     logger.info(f"Phase 3: Training with blueprint guidance for {remaining_epochs} epochs")
     for epoch in tqdm(range(remaining_epochs)):
@@ -617,7 +769,6 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
                     if next_agent_id is None:
                         game_done = True
             update_path = os.path.join(checkpoint_dir, f'blueprint_epoch{global_epoch+1}.pkl')
-            # Replace torch.save with blueprint's save method
             blueprint.save(update_path)
             logger.info(f"Updated blueprint saved to {update_path}")
         
@@ -657,22 +808,25 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
             torch.save(checkpoint_data, os.path.join(checkpoint_dir, f'checkpoint_phase3_{global_epoch+1}.pt'))
     
     logger.info("ReBeL training with blueprint strategy complete!")
+    
+    # Save final models including action probability model
     final_checkpoint = os.path.join(checkpoint_dir, 'final_model.pt')
     checkpoint_data = {
         'policy_net': policy_net.state_dict(),
         'belief_model': belief_model.state_dict(),
-        'value_net': value_net.state_dict()
+        'value_net': value_net.state_dict(),
+        'action_prob_model': action_prob_model.state_dict()
     }
     torch.save(checkpoint_data, final_checkpoint)
     logger.info(f"Final model checkpoint saved to {final_checkpoint}")
     
     if blueprint:
         final_blueprint_path = os.path.join(checkpoint_dir, 'blueprint_final.pkl')
-        # Replace torch.save with blueprint's save method
         blueprint.save(final_blueprint_path)
         logger.info(f"Final blueprint saved to {final_blueprint_path}")
     
     return policy_net, belief_model, value_net, agents, blueprint
+
 
 def main():
     """Main entry point for the training script."""
@@ -685,8 +839,8 @@ def main():
     policy_net, belief_model, value_net, agents, blueprint = train_rebel_agent(
         env=env,
         device=device,
-        num_epochs=200,
-        games_per_epoch=10,
+        num_epochs=20,
+        games_per_epoch=20,
         search_depth=2,
         num_simulations=15,
         log_interval=5,
