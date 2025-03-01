@@ -1054,7 +1054,7 @@ class RecursiveSearchAgent:
     def play_turn(self, observation, action_mask, table_card):
         """
         Interface method compatible with game environment.
-        Now with integrated transformer embeddings.
+        Now with improved search tree reuse and opponent memory updates.
         
         Args:
             observation: Current observation.
@@ -1092,44 +1092,10 @@ class RecursiveSearchAgent:
         # Update beliefs based on the latest observation
         self.update_beliefs(observation, action_mask)
         
-        # Run MCTS search to obtain search outputs
+        # Run MCTS search with CFR to obtain search outputs
         search_outcomes = self.mcts_search(observation, action_mask)
         
-        # Add code to incorporate transformer embeddings
-        current_env = self.env_creator()
-        embeddings_list = []
-    
-        # Process each opponent with the transformer
-        for opp in current_env.possible_agents:
-            if opp != self.name:
-                # Get strategy embedding for this opponent
-                embedding = self.opponent_memory.get_strategy_embedding(opp)
-                embeddings_list.append(embedding)
-    
-        # Normalize and format embeddings
-        if embeddings_list:
-            # Concatenate all embeddings
-            embeddings_arr = np.concatenate(embeddings_list, axis=0)
-        
-            # Normalize to [0,1] range
-            min_val = embeddings_arr.min()
-            max_val = embeddings_arr.max()
-        
-            # Avoid division by zero
-            if max_val - min_val > 0:
-                normalized_arr = (embeddings_arr - min_val) / (max_val - min_val)
-            else:
-                normalized_arr = embeddings_arr
-        
-            # Store as a feature in search_outcomes
-            search_outcomes['transformer_memory'] = normalized_arr
-        else:
-            # If no embeddings, use zeros
-            search_outcomes['transformer_memory'] = np.zeros(
-                config.STRATEGY_DIM * (len(current_env.possible_agents) - 1), 
-                dtype=np.float32
-            )
-    
+        # Split observation for logging
         public_obs, private_obs = self.split_observation(observation)
         
         # Record complete transition for later training
