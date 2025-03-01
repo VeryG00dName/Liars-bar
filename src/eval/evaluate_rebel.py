@@ -6,7 +6,8 @@ import numpy as np
 from tqdm import tqdm
 
 from src.env.liars_deck_env_core import LiarsDeckEnv
-from src.model.rebel_models import RebelPolicyNetwork, BeliefStateModel, CFRValueNetwork
+from src.model.rebel_models import RebelPolicyNetwork, CFRValueNetwork, ActionProbabilityModel
+from src.model.belief_models import BeliefStateModel
 from src.model.recursive_search_agent import RecursiveSearchAgent
 from src.model.blueprint_strategy import BlueprintStrategy
 from src.env.liars_deck_env_utils_2 import decode_action  # Import the decode_action function
@@ -37,7 +38,8 @@ def create_env():
 
 def load_rebel_agent(checkpoint_path, device, env):
     """
-    Load a trained ReBeL agent from checkpoint files including blueprint strategy.
+    Load a trained ReBeL agent from checkpoint files including blueprint strategy
+    and ActionProbabilityModel.
     
     Args:
         checkpoint_path: Path to the directory containing checkpoints
@@ -49,12 +51,17 @@ def load_rebel_agent(checkpoint_path, device, env):
     """
     logger = configure_logger()
     
-    # Path to the combined checkpoint file
+    # Check for final_model.pt first (new format with action probability model)
+    final_model_path = os.path.join(checkpoint_path, 'final_model.pt')
     checkpoint_file = os.path.join(checkpoint_path, 'checkpoint_rebel.pt')
+    # If final model exists, use it instead
+    if os.path.exists(final_model_path):
+        checkpoint_file = final_model_path
+    
     blueprint_file = os.path.join(checkpoint_path, 'blueprint_final.pkl')
     
     if not os.path.exists(checkpoint_file):
-        logger.error(f"Could not find the checkpoint file: {checkpoint_file}")
+        logger.error(f"Could not find checkpoint file: {checkpoint_file}")
         return None
 
     num_players = env.num_players
@@ -76,11 +83,32 @@ def load_rebel_agent(checkpoint_path, device, env):
     ).to(device)
     value_net = CFRValueNetwork(obs_dim, belief_dim, hidden_dim, action_dim).to(device)
     
+    # Create action probability model
+    action_prob_model = ActionProbabilityModel(input_dim=11, hidden_dim=64).to(device)
     # Load checkpoint containing all components
     checkpoint = torch.load(checkpoint_file, map_location=device)
-    policy_net.load_state_dict(checkpoint['policy_net'])
-    belief_model.load_state_dict(checkpoint['belief_model'])
-    value_net.load_state_dict(checkpoint['value_net'])
+    
+    # Check which format the checkpoint is in and load accordingly
+    if isinstance(checkpoint, dict) and 'policy_net' in checkpoint:
+        policy_net.load_state_dict(checkpoint['policy_net'])
+        belief_state_dict = checkpoint['belief_model']
+        filtered_state_dict = {k: v for k, v in belief_state_dict.items() if not k.startswith("action_prob_model.")}
+        belief_model.load_state_dict(filtered_state_dict)
+        value_net.load_state_dict(checkpoint['value_net'])
+        
+        # Check if action_prob_model is in the checkpoint
+        if 'action_prob_model' in checkpoint:
+            action_prob_model.load_state_dict(checkpoint['action_prob_model'])
+            logger.info("Loaded action probability model from checkpoint")
+        else:
+            logger.warning("No action probability model found in checkpoint, using default initialization")
+    else:
+        # Older format checkpoint
+        policy_net.load_state_dict(checkpoint)
+        logger.warning("Using older checkpoint format without separate model components")
+    
+    # Attach action probability model to belief model
+    belief_model.action_prob_model = action_prob_model
     
     logger.info(f"Loaded model weights from {checkpoint_file}")
     
@@ -95,18 +123,21 @@ def load_rebel_agent(checkpoint_path, device, env):
     else:
         logger.info(f"No blueprint file found at {blueprint_file}, proceeding without it")
 
-    # Create and return the agent with the loaded networks
+    # Create and return the agent with the loaded networks and DCFR parameters
     return RecursiveSearchAgent(
         policy_net=policy_net,
         belief_model=belief_model,
         value_net=value_net,
         env_creator=lambda: create_env(),
         device=device,
-        search_depth=8,
-        num_simulations=120,
+        search_depth=10,
+        num_simulations=500,
         agent_name="ReBeL_Agent",
         agent_index=0,
-        blueprint=blueprint
+        blueprint=blueprint,
+        alpha=1.5,  # DCFR parameter
+        beta=0.5,   # DCFR parameter
+        gamma=2.0   # DCFR parameter
     )
 
 def evaluate_rebel_vs_hardcoded(rebel_agent, num_games=20):
@@ -160,6 +191,7 @@ def evaluate_rebel_vs_hardcoded(rebel_agent, num_games=20):
         for game_idx in tqdm(range(num_games)):
             env = create_env()
             # ReBeL agents: player_0 and player_1; hardcoded bot: player_2.
+            # Create a duplicate ReBeL agent with same parameters
             rebel_player_1 = RecursiveSearchAgent(
                 policy_net=rebel_agent.policy_net,
                 belief_model=rebel_agent.belief_model,
@@ -170,7 +202,10 @@ def evaluate_rebel_vs_hardcoded(rebel_agent, num_games=20):
                 num_simulations=rebel_agent.num_simulations,
                 agent_name="player_1",
                 agent_index=1,
-                blueprint=rebel_agent.blueprint
+                blueprint=rebel_agent.blueprint,
+                alpha=rebel_agent.alpha,  # Copy DCFR parameter
+                beta=rebel_agent.beta,    # Copy DCFR parameter
+                gamma=rebel_agent.gamma   # Copy DCFR parameter
             )
             agents = {
                 "player_0": rebel_agent,
@@ -341,10 +376,16 @@ def main():
                         help="Path to checkpoint directory")
     parser.add_argument("--games", type=int, default=20,
                         help="Number of games per opponent")
-    parser.add_argument("--search_depth", type=int, default=8,
+    parser.add_argument("--search_depth", type=int, default=5,
                         help="Search depth for ReBeL agent")
-    parser.add_argument("--simulations", type=int, default=120,
+    parser.add_argument("--simulations", type=int, default=200,
                         help="Number of simulations per decision for ReBeL agent")
+    parser.add_argument("--alpha", type=float, default=1.5,
+                        help="DCFR positive regret discount parameter")
+    parser.add_argument("--beta", type=float, default=0.5,
+                        help="DCFR negative regret discount parameter")
+    parser.add_argument("--gamma", type=float, default=2.0,
+                        help="DCFR average strategy discount parameter")
     args = parser.parse_args()
     
     logger = configure_logger()
@@ -367,8 +408,14 @@ def main():
         rebel_agent.search_depth = args.search_depth
     if args.simulations:
         rebel_agent.num_simulations = args.simulations
+    
+    # Update DCFR parameters if specified
+    rebel_agent.alpha = args.alpha
+    rebel_agent.beta = args.beta
+    rebel_agent.gamma = args.gamma
         
     logger.info(f"ReBeL agent configuration: search_depth={rebel_agent.search_depth}, simulations={rebel_agent.num_simulations}")
+    logger.info(f"DCFR parameters: alpha={rebel_agent.alpha}, beta={rebel_agent.beta}, gamma={rebel_agent.gamma}")
     
     # Evaluate against hardcoded bots
     results = evaluate_rebel_vs_hardcoded(rebel_agent, num_games=args.games)
