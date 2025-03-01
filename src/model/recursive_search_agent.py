@@ -1145,7 +1145,6 @@ class RecursiveSearchAgent:
         
         # If we're about to make a challenge, record that information
         selected_action = search_outcomes['selected_action']
-        from src.env.liars_deck_env_utils_2 import decode_action
         action_type, _, count = decode_action(selected_action)
         
         if action_type == "Challenge" and last_action_agent:
