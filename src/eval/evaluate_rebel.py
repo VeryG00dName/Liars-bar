@@ -635,9 +635,9 @@ def main():
                         help="Path to checkpoint directory")
     parser.add_argument("--games", type=int, default=20,
                         help="Number of games per opponent")
-    parser.add_argument("--search_depth", type=int, default=5,
+    parser.add_argument("--search_depth", type=int, default=2,
                         help="Search depth for ReBeL agent")
-    parser.add_argument("--simulations", type=int, default=200,
+    parser.add_argument("--simulations", type=int, default=15,
                         help="Number of simulations per decision for ReBeL agent")
     parser.add_argument("--alpha", type=float, default=1.5,
                         help="DCFR positive regret discount parameter")
@@ -668,6 +668,8 @@ def main():
     if args.simulations:
         rebel_agent.num_simulations = args.simulations
     
+    from src.misc.recursivesearchprofiler import RecursiveSearchProfiler
+    sim_profiler = RecursiveSearchProfiler(rebel_agent)
     # Update DCFR parameters if specified
     rebel_agent.alpha = args.alpha
     rebel_agent.beta = args.beta
@@ -678,7 +680,7 @@ def main():
     
     # Evaluate against hardcoded bots
     results = evaluate_rebel_vs_hardcoded(rebel_agent, num_games=args.games)
-    
+    sim_profiler.print_summary()
     # Print summary
     logger.info("\nEvaluation Summary:")
     for bot, stats in results.items():

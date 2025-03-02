@@ -625,7 +625,8 @@ class RecursiveSearchAgent:
         virtual_loss = {a: 0.0 for a in range(len(action_mask))}
         
         # Run MCTS simulations
-        for sim_idx in range(self.num_simulations):
+        from tqdm import tqdm
+        for sim_idx in tqdm(range(self.num_simulations), desc="MCTS simulations", leave=False):
             sim_env = self.env_creator()  # Clone environment for simulation
             
             # Compute current CFR strategy using PUBLIC state key
@@ -831,10 +832,10 @@ class RecursiveSearchAgent:
         return pruned_strategy
 
     def _simulate(self, env, action, observation, public_obs, beliefs, public_beliefs, 
-              depth, reach_prob=1.0, parent_values=None, has_played=False):
+              depth, reach_prob=1.0, parent_values=None):
         """
-        Simulate taking an action and recursively evaluate with proper subgame solving.
-        Optimized for performance while maintaining correlation-aware belief handling.
+        Simulate taking an action and recursively evaluate the resulting state.
+        This updated version removes the branch for subgame solving when the acting agent changes.
         
         Args:
             env: Cloned environment for simulation.
@@ -845,8 +846,7 @@ class RecursiveSearchAgent:
             public_beliefs: Public belief state.
             depth: Remaining search depth.
             reach_prob: Current reach probability for this state.
-            parent_values: Value estimates from parent subgame for boundary conditions.
-            has_played: Boolean flag indicating if a move has already been played in this round.
+            parent_values: Value estimates from parent subgame (unused in this simplified version).
             
         Returns:
             Tuple of (value, counterfactual_values) where:
@@ -854,73 +854,44 @@ class RecursiveSearchAgent:
                 - counterfactual_values: Dict mapping actions to their counterfactual values.
         """
         agent = self.name
-        original_agent_selection = env.agent_selection
-
         # Ensure belief tensors are on the correct device
         beliefs = beliefs.to(self.device)
         public_beliefs = public_beliefs.to(self.device)
 
         # Create a key for transposition table lookup
         state_key = self.create_node_key(np.array(public_obs), public_beliefs)
-        
-        # Check for early termination based on value confidence
+
+        # Check for early termination based on value statistics
         if depth > 0:
-            should_terminate, cached_value = self.check_early_termination(
-                state_key, depth, reach_prob)
+            should_terminate, cached_value = self.check_early_termination(state_key, depth, reach_prob)
             if should_terminate:
                 return cached_value, {}
-                
-        # Check transposition table for cached results
+
+        # If already computed for a deeper node, use the transposition table
         if depth > 1 and state_key in self.transposition_table:
             cached_value = self.transposition_table[state_key]
             return cached_value, {}
 
-        # For deeper nodes, use sampled beliefs for efficiency
+        # Optionally use sampled beliefs for deeper nodes for efficiency
         if depth > 1 and hasattr(self.belief_model, 'sample_consistent_beliefs'):
             private_hand = torch.FloatTensor(observation[:2]).unsqueeze(0).to(self.device)
             with torch.no_grad():
-                # Sample consistent beliefs for computational efficiency
-                sampled_hands = self.belief_model.sample_consistent_beliefs(
-                    beliefs, private_hand, num_samples=1).squeeze(1)
-        else:
-            sampled_hands = None
+                _ = self.belief_model.sample_consistent_beliefs(beliefs, private_hand, num_samples=1)
+        # Otherwise, proceed normally
 
-        # Execute the action in simulation
+        # Execute the chosen action in simulation
         env.step(action)
         reward = env.rewards[agent]
         done = env.terminations[agent]
 
         # Initialize counterfactual values dictionary
         cf_values = {}
-        # Terminal state handling: game over.
+
+        # Terminal state handling: if the simulation reaches a terminal state, return reward immediately.
         if done:
             return reward, cf_values
-        # Terminal state handling: round ended.
-        # We treat a round as ended when the agent's hand is 5 AND at least one move has been played.
-        current_hand = env.players_hands.get(agent, [])
-        if has_played and len(current_hand) == 5:
-            # Option: Use the value network to estimate the state value at round end.
-            next_obs = env.observe(agent)
-            if isinstance(next_obs, dict):
-                next_obs = next_obs[agent]
-            next_obs_tensor = torch.FloatTensor(next_obs).unsqueeze(0).to(self.device)
-            # Use action mask from env infos
-            action_mask = env.infos[agent]["action_mask"]
-            with torch.no_grad():
-                next_beliefs = self.belief_model(next_obs_tensor, beliefs)
-                private_hand = torch.FloatTensor(next_obs[:2]).unsqueeze(0).to(self.device)
-                next_beliefs = self.belief_model.apply_physical_constraints_fast(next_beliefs, private_hand)
-                value, regrets, variance = self.value_net(next_obs_tensor, next_beliefs)
-                avg_value = value.item()
-                # Process regrets for valid actions
-                regrets_np = regrets.squeeze(0).cpu().numpy() * action_mask
-                valid_actions = np.where(action_mask)[0]
-                cf_values = {}
-                for a in valid_actions:
-                    cf_values[a] = avg_value + regrets_np[a]
-            return avg_value, cf_values
 
-        # Depth limit reached - use value network estimation.
+        # Depth limit reached – use the value network to estimate state value.
         if depth == 0:
             next_obs = env.observe(agent)
             if isinstance(next_obs, dict):
@@ -931,7 +902,7 @@ class RecursiveSearchAgent:
                 next_beliefs = self.belief_model(next_obs_tensor, beliefs)
                 private_hand = torch.FloatTensor(next_obs[:2]).unsqueeze(0).to(self.device)
                 next_beliefs = self.belief_model.apply_physical_constraints_fast(next_beliefs, private_hand)
-                value, regrets, variance = self.value_net(next_obs_tensor, next_beliefs)
+                value, regrets, _ = self.value_net(next_obs_tensor, next_beliefs)
                 avg_value = value.item()
                 regrets_np = regrets.squeeze(0).cpu().numpy() * action_mask
                 valid_actions = np.where(action_mask)[0]
@@ -940,51 +911,19 @@ class RecursiveSearchAgent:
                     cf_values[a] = avg_value + regrets_np[a]
             return avg_value, cf_values
 
-        # Nested subgame solving: if agent changes or round ends.
-        if env.agent_selection is None or env.agent_selection != original_agent_selection:
-            next_obs = env.observe(agent)
-            if isinstance(next_obs, dict):
-                next_obs = next_obs[agent]
-            next_obs_tensor = torch.FloatTensor(next_obs).unsqueeze(0).to(self.device)
+        # (Note: The block for handling a change of agent/subgame solving has been removed.)
 
-            # Create key for this subgame
-            next_public_obs, _ = self.split_observation(next_obs)
-            updated_public_beliefs = self.belief_model.get_public_belief_state(
-                next_obs_tensor, public_beliefs)
-            subgame_key = self.create_node_key(np.array(next_public_obs), updated_public_beliefs)
-
-            # Check transposition table for this subgame
-            if subgame_key in self.transposition_table:
-                cached_value = self.transposition_table[subgame_key]
-                return env.rewards[agent] + cached_value, {}
-
-            with torch.no_grad():
-                next_beliefs = self.belief_model(next_obs_tensor, beliefs)
-                private_hand = torch.FloatTensor(next_obs[:2]).unsqueeze(0).to(self.device)
-                next_beliefs = self.belief_model.apply_physical_constraints_fast(next_beliefs, private_hand)
-                value, regrets, variance = self.value_net(next_obs_tensor, next_beliefs)
-                subgame_value = value.item()
-                if parent_values is not None and action in parent_values:
-                    parent_value = parent_values[action]
-                    if subgame_value < parent_value:
-                        subgame_value = 0.3 * subgame_value + 0.7 * parent_value
-                self.transposition_table[subgame_key] = subgame_value
-                self._update_value_statistics(subgame_key, subgame_value)
-                return env.rewards[agent] + subgame_value, {}
-
-        # Continue recursive simulation within the current subgame.
+        # Continue recursive simulation normally.
         next_obs = env.observe(agent)
         if isinstance(next_obs, dict):
             next_obs = next_obs[agent]
-        
         action_mask = env.infos[agent]["action_mask"]
         next_obs_tensor = torch.FloatTensor(next_obs).unsqueeze(0).to(self.device)
         with torch.no_grad():
             next_public_obs, _ = self.split_observation(next_obs)
             if depth > 2:
                 next_beliefs = self.belief_model(next_obs_tensor, beliefs)
-                next_public_beliefs = self.belief_model.get_public_belief_state(
-                    next_obs_tensor, public_beliefs)
+                next_public_beliefs = self.belief_model.get_public_belief_state(next_obs_tensor, public_beliefs)
                 private_hand = torch.FloatTensor(next_obs[:2]).unsqueeze(0).to(self.device)
                 next_beliefs = self.belief_model.apply_physical_constraints_fast(next_beliefs, private_hand)
                 next_public_beliefs = self.belief_model.apply_physical_constraints_fast(next_public_beliefs, private_hand)
@@ -1003,23 +942,22 @@ class RecursiveSearchAgent:
                 if len(valid_actions) > 0:
                     masked_strategy[valid_actions] = 1.0 / len(valid_actions)
             valid_actions = np.where(action_mask)[0]
-            masked_strategy = self._apply_progressive_pruning(
-                masked_strategy, valid_actions, depth)
+            masked_strategy = self._apply_progressive_pruning(masked_strategy, valid_actions, depth)
 
             cf_values = {}
             total_value = 0
-            
+
+            # For shallow searches, evaluate all valid actions; for deeper searches, sample a few.
             if depth <= 2 or len(valid_actions) <= 3:
                 for a in valid_actions:
                     if masked_strategy[a] <= 0:
                         continue
                     action_reach = reach_prob * masked_strategy[a]
                     action_env = env.clone()
-                    # Pass has_played=True since we have already taken one action.
                     action_value, child_cf_values = self._simulate(
                         action_env, a, next_obs, next_public_obs,
                         next_beliefs, next_public_beliefs, depth - 1,
-                        action_reach, parent_values=cf_values, has_played=True
+                        action_reach, parent_values=cf_values
                     )
                     cf_values[a] = action_value
                     total_value += masked_strategy[a] * action_value
@@ -1039,7 +977,7 @@ class RecursiveSearchAgent:
                     action_value, child_cf_values = self._simulate(
                         action_env, a, next_obs, next_public_obs,
                         next_beliefs, next_public_beliefs, depth - 1,
-                        action_reach, parent_values=cf_values, has_played=True
+                        action_reach, parent_values=cf_values
                     )
                     cf_values[a] = action_value
                     total_value += masked_strategy[a] * action_value
