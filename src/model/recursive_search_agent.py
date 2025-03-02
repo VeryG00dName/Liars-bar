@@ -220,7 +220,8 @@ class RecursiveSearchAgent:
 
     def check_early_termination(self, state_key, depth, reach_prob=1.0):
         """
-        Check if simulation can terminate early based on value statistics.
+        Enhanced check if simulation can terminate early based on value statistics.
+        Much more aggressive termination to reduce simulation costs.
         
         Args:
             state_key: The key identifying the state in transposition tables
@@ -230,26 +231,44 @@ class RecursiveSearchAgent:
         Returns:
             (should_terminate, value): Boolean indicating if we can terminate early and estimated value
         """
-        # Only apply early termination for non-root states with sufficient stats
+        # Aggressive early termination based on depth
+        # For deep nodes, frequently terminate early
+        if depth >= 3:
+            # For very deep nodes, terminate with 90% probability
+            if np.random.random() < 0.9:
+                # Use value from table if available, otherwise estimate as 0
+                if state_key in self.value_statistics:
+                    mean_value, _, _ = self.value_statistics[state_key]
+                    return True, mean_value
+                return True, 0.0
+        
+        # For medium-depth nodes, be somewhat aggressive
+        elif depth == 2:
+            # Terminate with 50% probability for depth 2
+            if np.random.random() < 0.5:
+                if state_key in self.value_statistics:
+                    mean_value, _, _ = self.value_statistics[state_key]
+                    return True, mean_value
+                return True, 0.0
+        
+        # Original early termination logic with relaxed criteria
         if depth <= 1 or state_key not in self.value_statistics:
             return False, 0.0
             
         # Get accumulated statistics
         mean_value, std_value, count = self.value_statistics[state_key]
         
-        # Calculate standard error
-        if count < 10:  # Need sufficient samples for reliable estimate
+        # Relax required sample count - need fewer samples for reliable estimate
+        if count < 5:  # Was 10
             return False, 0.0
             
         std_error = std_value / np.sqrt(count)
         
-        # Early termination criteria: confidence interval is small enough
-        # and we're at a deep enough node that approximation won't hurt much
-        confidence_threshold = 0.05  # 95% confidence
+        # Relax confidence threshold
+        confidence_threshold = 0.1  # Was 0.05 - doubled for faster termination
         
         # Scale threshold based on depth and reach probability
-        # Less visited/important states can use more approximation
-        adjusted_threshold = confidence_threshold * (1.0 + 0.5 * depth) / reach_prob
+        adjusted_threshold = confidence_threshold * (1.0 + depth) / reach_prob
         
         if std_error < adjusted_threshold:
             return True, mean_value
@@ -277,7 +296,7 @@ class RecursiveSearchAgent:
     def update_beliefs(self, observation, action_mask=None):
         """
         Update both public and private belief states based on new observation,
-        now with transformer-based memory.
+        now with transformer-based memory and caching optimizations.
         """
         # Extract observation
         if isinstance(observation, dict):
@@ -285,6 +304,32 @@ class RecursiveSearchAgent:
         else:
             obs_data = observation
 
+        # Check belief cache (optimization)
+        if not hasattr(self, '_belief_cache'):
+            self._belief_cache = {}
+            self._belief_cache_hits = 0
+            self._belief_cache_misses = 0
+        
+        # Create a cache key based on observation
+        # Using string representation of numpy array with reduced precision for better hash collisions
+        if isinstance(obs_data, np.ndarray):
+            obs_key = hash(str(np.round(obs_data, 3)))
+        else:
+            obs_key = hash(str(obs_data))
+        
+        # Check if we have a cached belief for this observation
+        if obs_key in self._belief_cache:
+            self._belief_cache_hits += 1
+            cached_data = self._belief_cache[obs_key]
+            # Only reuse if less than 5 updates old
+            if cached_data['age'] < 5:
+                self.current_beliefs = cached_data['beliefs']
+                self.current_public_beliefs = cached_data['public_beliefs']
+                cached_data['age'] += 1
+                return
+        
+        self._belief_cache_misses += 1
+        
         # Convert to tensor
         if not isinstance(obs_data, torch.Tensor):
             self._last_obs_data = obs_data
@@ -307,17 +352,24 @@ class RecursiveSearchAgent:
                 self._belief_update_counter = 0
             self._belief_update_counter += 1
 
-            is_full_update = self._belief_update_counter % 2 == 0 or not self.policy_net.training
+            # Reduce frequency of full updates (optimization)
+            is_full_update = self._belief_update_counter % 4 == 0 or not self.policy_net.training
 
             # Create environment instance for counterfactual reasoning and transformer memory extraction
             current_env = self.env_creator()
 
-            # Get transformer memory embeddings
-            embeddings_list, normalized_arr = self.get_transformer_memory_embeddings(current_env)
+            # Optimization: Cache transformer memory embeddings
+            if not hasattr(self, '_cached_transformer_embeddings') or self._belief_update_counter % 5 == 0:
+                # Only update transformer embeddings periodically
+                embeddings_list, normalized_arr = self.get_transformer_memory_embeddings(current_env)
+                self._cached_transformer_embeddings = (embeddings_list, normalized_arr)
+            else:
+                embeddings_list, normalized_arr = self._cached_transformer_embeddings
 
             if is_full_update:
                 # Reconstruct game history for counterfactual reasoning
-                if hasattr(self, '_game_history'):
+                if hasattr(self, '_game_history') and self._belief_update_counter % 8 != 0:
+                    # Reuse game history reconstruction for efficiency
                     game_history = self._game_history
                 else:
                     game_history = self._reconstruct_game_history(current_env)
@@ -337,32 +389,49 @@ class RecursiveSearchAgent:
                 # Apply physical constraints
                 self.current_beliefs = self.belief_model.apply_physical_constraints_fast(
                     self.current_beliefs, private_hand)
+            else:
+                # For non-full updates, use simple belief update
+                if self.current_beliefs is None:
+                    # First update must be full
+                    self.current_beliefs = self.belief_model.infer_belief_from_game_state(
+                        obs_tensor, self.agent_index, current_env, transformer_features=normalized_arr)
+                    self.current_beliefs = self.belief_model.apply_physical_constraints_fast(
+                        self.current_beliefs, private_hand)
+                else:
+                    # Simple forward pass for other updates
+                    self.current_beliefs = self.belief_model(obs_tensor, self.current_beliefs)
+                    self.current_beliefs = self.belief_model.apply_physical_constraints_fast(
+                        self.current_beliefs, private_hand)
 
             # Also update public beliefs
             if self.current_public_beliefs is None:
                 self.current_public_beliefs = self.belief_model.get_public_belief_state(obs_tensor)
             else:
-                self.current_public_beliefs = self.belief_model.get_public_belief_state(
-                    obs_tensor, self.current_public_beliefs)
-            
-            # Apply physical constraints to public beliefs as well
-            self.current_public_beliefs = self.belief_model.apply_physical_constraints_fast(
-                self.current_public_beliefs, private_hand)
-
-        # Infer and record opponent actions
-        current_env = self.env_creator()
-        last_action_agent = current_env.last_action_agent
-        last_action = current_env.last_action
-        last_action_bluff = current_env.last_action_bluff
-
-        if last_action_agent and last_action_agent != self.name:
-            action_type = f"Play_{last_action}" if last_action is not None else "None"
-            card_count = len(current_env.players_hands.get(last_action_agent, []))
-            penalty_count = current_env.penalties.get(last_action_agent, 0)
+                # Only do full public belief updates periodically
+                if self._belief_update_counter % 3 == 0:
+                    self.current_public_beliefs = self.belief_model.get_public_belief_state(
+                        obs_tensor, self.current_public_beliefs)
+                    
+                    # Apply physical constraints to public beliefs as well
+                    self.current_public_beliefs = self.belief_model.apply_physical_constraints_fast(
+                        self.current_public_beliefs, private_hand)
+        
+        # Cache the beliefs for future reuse
+        self._belief_cache[obs_key] = {
+            'beliefs': self.current_beliefs,
+            'public_beliefs': self.current_public_beliefs,
+            'age': 0
+        }
+        
+        # Manage cache size
+        if len(self._belief_cache) > 1000:
+            # Remove oldest entries
+            self._belief_cache = {k: v for k, v in self._belief_cache.items() if v['age'] < 3}
             
     def compute_cfr_strategy(self, state_key, action_mask):
         """
         Compute a strategy according to the DCFR algorithm using discounted regrets.
+        Optimized version with caching and simplified computation.
 
         Args:
             state_key: A unique identifier for the current state
@@ -371,27 +440,71 @@ class RecursiveSearchAgent:
         Returns:
             numpy array: A probability distribution over actions
         """
+        # Check strategy cache first (optimization)
+        if not hasattr(self, '_strategy_cache'):
+            self._strategy_cache = {}
+            self._strategy_cache_hits = 0
+            self._strategy_cache_misses = 0
+        
+        # Create a cache key that includes action mask hash
+        cache_key = (state_key, hash(tuple(action_mask)))
+        
+        if cache_key in self._strategy_cache:
+            self._strategy_cache_hits += 1
+            # If cache entry is new, use it directly
+            cache_entry = self._strategy_cache[cache_key]
+            if cache_entry['age'] < 5:
+                cache_entry['age'] += 1
+                return cache_entry['strategy'].copy()
+        
+        self._strategy_cache_misses += 1
+        
         # Get cumulative regrets for this state
         regrets = self.cumulative_regrets[state_key]
 
         # Get iteration count for this state (increment first)
         self.iterations[state_key] += 1
         t = self.iterations[state_key]
+        
+        # Optimization: for low iteration counts, use simplified calculation
+        if t <= 3:
+            # For early iterations, just use regret matching with minimal computation
+            positive_regrets = np.maximum(regrets, 0)
+            masked_regrets = positive_regrets * action_mask
+            regret_sum = np.sum(masked_regrets)
+            
+            if regret_sum <= 1e-8:
+                valid_actions = np.where(action_mask)[0]
+                strategy = np.zeros_like(action_mask, dtype=np.float32)
+                if len(valid_actions) > 0:
+                    strategy[valid_actions] = 1.0 / len(valid_actions)
+                # Cache the result
+                self._strategy_cache[cache_key] = {'strategy': strategy.copy(), 'age': 0}
+                return strategy
+            
+            strategy = masked_regrets / regret_sum
+            # Cache the result
+            self._strategy_cache[cache_key] = {'strategy': strategy.copy(), 'age': 0}
+            return strategy
 
         # Apply DCFR discounting - separate treatment for positive and negative regrets
         positive_regrets = np.maximum(regrets, 0)
         negative_regrets = np.minimum(regrets, 0)
 
-        # Discount positive and negative regrets differently
-        # R^T+ = R^(t-1)+ * (t/(t+1))^α
-        # R^T- = R^(t-1)- * (t/(t+1))^β
-        if t > 1:  # Only apply discounting after first iteration
-            discounted_positive = positive_regrets * (t ** self.alpha) / ((t+1) ** self.alpha)
-            discounted_negative = negative_regrets * (t ** self.beta) / ((t+1) ** self.beta)
+        # Optimization: use precomputed discount factors for common iteration counts
+        if t <= 100:
+            # For common iteration counts, use lookup table
+            alpha_discount = self._get_discount_factor(t, self.alpha)
+            beta_discount = self._get_discount_factor(t, self.beta)
         else:
-            discounted_positive = positive_regrets
-            discounted_negative = negative_regrets
-
+            # For high iteration counts, compute directly
+            alpha_discount = (t ** self.alpha) / ((t+1) ** self.alpha)
+            beta_discount = (t ** self.beta) / ((t+1) ** self.beta)
+        
+        # Apply discounts
+        discounted_positive = positive_regrets * alpha_discount
+        discounted_negative = negative_regrets * beta_discount
+        
         # Combine discounted regrets
         discounted_regrets = discounted_positive + discounted_negative
 
@@ -406,24 +519,63 @@ class RecursiveSearchAgent:
             strategy = np.zeros_like(action_mask, dtype=np.float32)
             if len(valid_actions) > 0:  # Safety check
                 strategy[valid_actions] = 1.0 / len(valid_actions)
+            # Cache the result
+            self._strategy_cache[cache_key] = {'strategy': strategy.copy(), 'age': 0}
             return strategy
 
         # Normalize by sum of positive regrets (regret matching)
         strategy = masked_regrets / regret_sum
         
-        # Update average strategy using DCFR weighting
-        # S^T = S^(t-1) + (t/(t+1))^γ * π^t
-        self.strategy_update_count[state_key] += 1
-        if self.strategy_update_count[state_key] > 1:
-            weight = (t ** self.gamma) / ((t+1) ** self.gamma)
-            self.average_strategy[state_key] = (
-                self.average_strategy[state_key] * weight +
-                strategy * (1 - weight)
-            )
-        else:
-            self.average_strategy[state_key] = strategy.copy()
-
+        # Optimization: Only update average strategy periodically to save computation
+        if t % 2 == 0:  # Only update every other iteration
+            # Update average strategy using DCFR weighting
+            self.strategy_update_count[state_key] += 1
+            if self.strategy_update_count[state_key] > 1:
+                weight = self._get_discount_factor(t, self.gamma)
+                self.average_strategy[state_key] = (
+                    self.average_strategy[state_key] * (1 - weight) +
+                    strategy * weight
+                )
+            else:
+                self.average_strategy[state_key] = strategy.copy()
+        
+        # Cache the result
+        self._strategy_cache[cache_key] = {'strategy': strategy.copy(), 'age': 0}
+        
+        # Manage cache size - periodically clear old entries
+        if len(self._strategy_cache) > 10000:
+            # Keep only recent entries
+            self._strategy_cache = {k: v for k, v in self._strategy_cache.items() if v['age'] < 3}
+        
         return strategy
+
+    def _get_discount_factor(self, t, exponent):
+        """
+        Helper method to get discount factors for CFR.
+        Uses precomputed values for common iteration counts.
+        
+        Args:
+            t: Current iteration count
+            exponent: Discount exponent (alpha, beta, or gamma)
+        
+        Returns:
+            float: Discount factor
+        """
+        # Initialize discount factor lookup table if not exists
+        if not hasattr(self, '_discount_factors'):
+            self._discount_factors = {}
+            # Precompute common discount factors for various t values and exponents
+            for exp in [self.alpha, self.beta, self.gamma]:
+                self._discount_factors[exp] = {}
+                for i in range(1, 101):
+                    self._discount_factors[exp][i] = (i ** exp) / ((i+1) ** exp)
+        
+        # Return precomputed value if available
+        if exponent in self._discount_factors and t in self._discount_factors[exponent]:
+            return self._discount_factors[exponent][t]
+        
+        # Compute directly otherwise
+        return (t ** exponent) / ((t+1) ** exponent)
 
     def update_average_strategy(self, state_key, current_strategy):
         """
@@ -831,54 +983,86 @@ class RecursiveSearchAgent:
         
         return pruned_strategy
 
+    def manage_simulation_cache(self):
+        """
+        Manage the simulation cache to prevent memory issues.
+        This function should be called periodically, such as after each game.
+        """
+        if not hasattr(self, '_simulation_cache'):
+            self._simulation_cache = {}
+            self._cache_hits = 0
+            self._cache_misses = 0
+            return
+        
+        # Print cache statistics
+        total_lookups = self._cache_hits + self._cache_misses
+        hit_rate = (self._cache_hits / max(1, total_lookups)) * 100
+        
+        print(f"Simulation cache stats:")
+        print(f"  - Size: {len(self._simulation_cache)} entries")
+        print(f"  - Hits: {self._cache_hits} ({hit_rate:.1f}%)")
+        print(f"  - Misses: {self._cache_misses}")
+        
+        # Clear cache if it gets too large
+        if len(self._simulation_cache) > 50000:
+            print(f"  - Clearing simulation cache ({len(self._simulation_cache)} entries)")
+            self._simulation_cache = {}
+            self._cache_hits = 0
+            self._cache_misses = 0
+        
+        # Optional: Keep only the most frequently accessed entries
+        # This requires additional tracking of access counts
+        
+        return hit_rate
+
     def _simulate(self, env, action, observation, public_obs, beliefs, public_beliefs, 
               depth, reach_prob=1.0, parent_values=None):
         """
         Simulate taking an action and recursively evaluate the resulting state.
-        This updated version removes the branch for subgame solving when the acting agent changes.
-        
-        Args:
-            env: Cloned environment for simulation.
-            action: Action to simulate.
-            observation: Full observation.
-            public_obs: Public part of the observation.
-            beliefs: Full belief state.
-            public_beliefs: Public belief state.
-            depth: Remaining search depth.
-            reach_prob: Current reach probability for this state.
-            parent_values: Value estimates from parent subgame (unused in this simplified version).
-            
-        Returns:
-            Tuple of (value, counterfactual_values) where:
-                - value: Estimated value after taking the action (float).
-                - counterfactual_values: Dict mapping actions to their counterfactual values.
+        This version adds neural network batching for depth=0 evaluations.
         """
         agent = self.name
+
         # Ensure belief tensors are on the correct device
         beliefs = beliefs.to(self.device)
         public_beliefs = public_beliefs.to(self.device)
 
         # Create a key for transposition table lookup
         state_key = self.create_node_key(np.array(public_obs), public_beliefs)
-
+        
+        # Create a cache key that includes depth and action for more specific caching
+        cache_key = (state_key, depth, action)
+        
+        # Check simulation cache first (optimization #1)
+        if not hasattr(self, '_simulation_cache'):
+            self._simulation_cache = {}
+            self._cache_hits = 0
+            self._cache_misses = 0
+        
+        if cache_key in self._simulation_cache:
+            self._cache_hits += 1
+            return self._simulation_cache[cache_key]
+        self._cache_misses += 1
+        
         # Check for early termination based on value statistics
         if depth > 0:
             should_terminate, cached_value = self.check_early_termination(state_key, depth, reach_prob)
             if should_terminate:
+                self._simulation_cache[cache_key] = (cached_value, {})
                 return cached_value, {}
-
+        
         # If already computed for a deeper node, use the transposition table
         if depth > 1 and state_key in self.transposition_table:
             cached_value = self.transposition_table[state_key]
+            self._simulation_cache[cache_key] = (cached_value, {})
             return cached_value, {}
-
+        
         # Optionally use sampled beliefs for deeper nodes for efficiency
         if depth > 1 and hasattr(self.belief_model, 'sample_consistent_beliefs'):
             private_hand = torch.FloatTensor(observation[:2]).unsqueeze(0).to(self.device)
             with torch.no_grad():
                 _ = self.belief_model.sample_consistent_beliefs(beliefs, private_hand, num_samples=1)
-        # Otherwise, proceed normally
-
+        
         # Execute the chosen action in simulation
         env.step(action)
         reward = env.rewards[agent]
@@ -889,6 +1073,7 @@ class RecursiveSearchAgent:
 
         # Terminal state handling: if the simulation reaches a terminal state, return reward immediately.
         if done:
+            self._simulation_cache[cache_key] = (reward, cf_values)
             return reward, cf_values
 
         # Depth limit reached – use the value network to estimate state value.
@@ -898,20 +1083,97 @@ class RecursiveSearchAgent:
                 next_obs = next_obs[agent]
             next_obs_tensor = torch.FloatTensor(next_obs).unsqueeze(0).to(self.device)
             action_mask = env.infos[agent]["action_mask"]
-            with torch.no_grad():
-                next_beliefs = self.belief_model(next_obs_tensor, beliefs)
-                private_hand = torch.FloatTensor(next_obs[:2]).unsqueeze(0).to(self.device)
-                next_beliefs = self.belief_model.apply_physical_constraints_fast(next_beliefs, private_hand)
-                value, regrets, _ = self.value_net(next_obs_tensor, next_beliefs)
-                avg_value = value.item()
-                regrets_np = regrets.squeeze(0).cpu().numpy() * action_mask
-                valid_actions = np.where(action_mask)[0]
-                cf_values = {}
-                for a in valid_actions:
-                    cf_values[a] = avg_value + regrets_np[a]
-            return avg_value, cf_values
-
-        # (Note: The block for handling a change of agent/subgame solving has been removed.)
+            
+            # Neural Network Batching Optimization
+            # Add to batch buffer instead of immediate evaluation
+            if not hasattr(self, '_nn_batch'):
+                self._nn_batch = {
+                    'observations': [],
+                    'beliefs': [],
+                    'private_hands': [],
+                    'action_masks': [],
+                    'batch_ids': []  # To track which batch entry belongs to which call
+                }
+                self._current_batch_id = 0
+                self._nn_results = {}  # Store results indexed by batch_id
+                self._nn_batch_size = 8  # Configurable batch size
+                
+            # Generate a unique ID for this batch item
+            batch_id = self._current_batch_id
+            self._current_batch_id += 1
+            
+            # Add to batch
+            self._nn_batch['observations'].append(next_obs_tensor)
+            self._nn_batch['beliefs'].append(beliefs)
+            self._nn_batch['private_hands'].append(torch.FloatTensor(next_obs[:2]).unsqueeze(0).to(self.device))
+            self._nn_batch['action_masks'].append(action_mask)
+            self._nn_batch['batch_ids'].append(batch_id)
+            
+            # Process batch if it reaches the threshold or if this is the root call
+            if len(self._nn_batch['observations']) >= self._nn_batch_size or depth >= self.search_depth - 1:
+                with torch.no_grad():
+                    # Process beliefs in batch
+                    batch_obs = torch.cat(self._nn_batch['observations'], dim=0)
+                    batch_beliefs = torch.cat(self._nn_batch['beliefs'], dim=0)
+                    batch_private_hands = torch.cat(self._nn_batch['private_hands'], dim=0)
+                    
+                    # Update beliefs in batch
+                    next_beliefs_batch = self.belief_model(batch_obs, batch_beliefs)
+                    
+                    # Apply physical constraints in batch
+                    next_beliefs_batch = self.belief_model.apply_physical_constraints_fast(
+                        next_beliefs_batch, batch_private_hands)
+                    
+                    # Evaluate value network in batch
+                    values_batch, regrets_batch, _ = self.value_net(batch_obs, next_beliefs_batch)
+                    
+                    # Store results for each batch item
+                    for i, bid in enumerate(self._nn_batch['batch_ids']):
+                        value = values_batch[i].item()
+                        regrets = regrets_batch[i].cpu().numpy() * self._nn_batch['action_masks'][i]
+                        
+                        # Create counterfactual values
+                        valid_actions = np.where(self._nn_batch['action_masks'][i])[0]
+                        cf_values_dict = {}
+                        for a in valid_actions:
+                            cf_values_dict[a] = value + regrets[a]
+                        
+                        # Store result
+                        self._nn_results[bid] = (value, cf_values_dict)
+                    
+                    # Clear batch
+                    self._nn_batch = {
+                        'observations': [],
+                        'beliefs': [],
+                        'private_hands': [],
+                        'action_masks': [],
+                        'batch_ids': []
+                    }
+            
+            # Check if result is available
+            if batch_id in self._nn_results:
+                avg_value, cf_values = self._nn_results[batch_id]
+                # Remove from results to free memory
+                del self._nn_results[batch_id]
+                
+                self._simulation_cache[cache_key] = (avg_value, cf_values)
+                return avg_value, cf_values
+            else:
+                # If result not available (uncommon), compute directly
+                with torch.no_grad():
+                    next_beliefs = self.belief_model(next_obs_tensor, beliefs)
+                    private_hand = torch.FloatTensor(next_obs[:2]).unsqueeze(0).to(self.device)
+                    next_beliefs = self.belief_model.apply_physical_constraints_fast(next_beliefs, private_hand)
+                    value, regrets, _ = self.value_net(next_obs_tensor, next_beliefs)
+                    avg_value = value.item()
+                    regrets_np = regrets.squeeze(0).cpu().numpy() * action_mask
+                    valid_actions = np.where(action_mask)[0]
+                    cf_values = {}
+                    for a in valid_actions:
+                        cf_values[a] = avg_value + regrets_np[a]
+                        
+                self._simulation_cache[cache_key] = (avg_value, cf_values)
+                return avg_value, cf_values
 
         # Continue recursive simulation normally.
         next_obs = env.observe(agent)
@@ -947,8 +1209,9 @@ class RecursiveSearchAgent:
             cf_values = {}
             total_value = 0
 
-            # For shallow searches, evaluate all valid actions; for deeper searches, sample a few.
-            if depth <= 2 or len(valid_actions) <= 3:
+            # Optimization #2: Simplified deep node evaluations
+            # For shallow searches, evaluate all valid actions; for deeper searches, only evaluate top 3
+            if depth <= 1 or len(valid_actions) <= 3:
                 for a in valid_actions:
                     if masked_strategy[a] <= 0:
                         continue
@@ -962,16 +1225,16 @@ class RecursiveSearchAgent:
                     cf_values[a] = action_value
                     total_value += masked_strategy[a] * action_value
             else:
-                sampled_actions = []
-                remaining_strategy = masked_strategy.copy()
-                for _ in range(min(3, len(valid_actions))):
-                    if np.sum(remaining_strategy) <= 0:
-                        break
-                    norm_strategy = remaining_strategy / np.sum(remaining_strategy)
-                    a = np.random.choice(len(action_mask), p=norm_strategy)
-                    sampled_actions.append(a)
-                    remaining_strategy[a] = 0
-                for a in sampled_actions:
+                top_actions = sorted(
+                    [a for a in valid_actions if masked_strategy[a] > 0],
+                    key=lambda a: masked_strategy[a],
+                    reverse=True
+                )[:3]
+                
+                if not top_actions and valid_actions.size > 0:
+                    top_actions = valid_actions[np.argsort(masked_strategy[valid_actions])[-3:]]
+                
+                for a in top_actions:
                     action_reach = reach_prob * masked_strategy[a]
                     action_env = env.clone()
                     action_value, child_cf_values = self._simulate(
@@ -981,6 +1244,12 @@ class RecursiveSearchAgent:
                     )
                     cf_values[a] = action_value
                     total_value += masked_strategy[a] * action_value
+
+            result = (env.rewards[agent] + total_value, cf_values)
+            self._simulation_cache[cache_key] = result
+            
+            if len(self._simulation_cache) > 1000000:
+                self._simulation_cache = {}
 
         return env.rewards[agent] + total_value, cf_values
 
