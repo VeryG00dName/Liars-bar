@@ -1316,7 +1316,7 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
     # Retrain the action probability model after training for updated predictions.
     logger.info("Collecting new data for final retraining of the action probability model...")
     final_data_collector = ActionProbabilityDataCollector()
-    for game in tqdm(range(min(10, games_per_epoch * 3))):
+    for game in tqdm(range(min(100, games_per_epoch * 3))):
         observations, infos = env.reset()
         for agent in agents.values():
             agent.reset()
@@ -1394,8 +1394,8 @@ def main():
         device=device,
         num_epochs=20,
         games_per_epoch=20,
-        search_depth=3,
-        num_simulations=30,
+        search_depth=5,
+        num_simulations=50,
         log_interval=5,
         checkpoint_interval=5,
         log_tensorboard=True,

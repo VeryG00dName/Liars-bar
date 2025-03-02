@@ -120,7 +120,6 @@ def load_rebel_agent(checkpoint_path, device, env):
                 remapped_state_dict[new_key] = v
             else:
                 remapped_state_dict[k] = v
-        print(hidden_dim)
         belief_model.load_state_dict(remapped_state_dict)
         value_net.load_state_dict(checkpoint['value_net'])
     else:

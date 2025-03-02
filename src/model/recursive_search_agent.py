@@ -831,7 +831,7 @@ class RecursiveSearchAgent:
         return pruned_strategy
 
     def _simulate(self, env, action, observation, public_obs, beliefs, public_beliefs, 
-              depth, reach_prob=1.0, parent_values=None):
+              depth, reach_prob=1.0, parent_values=None, has_played=False):
         """
         Simulate taking an action and recursively evaluate with proper subgame solving.
         Optimized for performance while maintaining correlation-aware belief handling.
@@ -846,6 +846,7 @@ class RecursiveSearchAgent:
             depth: Remaining search depth.
             reach_prob: Current reach probability for this state.
             parent_values: Value estimates from parent subgame for boundary conditions.
+            has_played: Boolean flag indicating if a move has already been played in this round.
             
         Returns:
             Tuple of (value, counterfactual_values) where:
@@ -891,46 +892,55 @@ class RecursiveSearchAgent:
 
         # Initialize counterfactual values dictionary
         cf_values = {}
-
-        # Terminal state handling
+        # Terminal state handling: game over.
         if done:
             return reward, cf_values
+        # Terminal state handling: round ended.
+        # We treat a round as ended when the agent's hand is 5 AND at least one move has been played.
+        current_hand = env.players_hands.get(agent, [])
+        if has_played and len(current_hand) == 5:
+            # Option: Use the value network to estimate the state value at round end.
+            next_obs = env.observe(agent)
+            if isinstance(next_obs, dict):
+                next_obs = next_obs[agent]
+            next_obs_tensor = torch.FloatTensor(next_obs).unsqueeze(0).to(self.device)
+            # Use action mask from env infos
+            action_mask = env.infos[agent]["action_mask"]
+            with torch.no_grad():
+                next_beliefs = self.belief_model(next_obs_tensor, beliefs)
+                private_hand = torch.FloatTensor(next_obs[:2]).unsqueeze(0).to(self.device)
+                next_beliefs = self.belief_model.apply_physical_constraints_fast(next_beliefs, private_hand)
+                value, regrets, variance = self.value_net(next_obs_tensor, next_beliefs)
+                avg_value = value.item()
+                # Process regrets for valid actions
+                regrets_np = regrets.squeeze(0).cpu().numpy() * action_mask
+                valid_actions = np.where(action_mask)[0]
+                cf_values = {}
+                for a in valid_actions:
+                    cf_values[a] = avg_value + regrets_np[a]
+            return avg_value, cf_values
 
-        # Depth limit reached - use value network
+        # Depth limit reached - use value network estimation.
         if depth == 0:
             next_obs = env.observe(agent)
             if isinstance(next_obs, dict):
                 next_obs = next_obs[agent]
             next_obs_tensor = torch.FloatTensor(next_obs).unsqueeze(0).to(self.device)
-            
-            # Use action mask from env infos
             action_mask = env.infos[agent]["action_mask"]
-
             with torch.no_grad():
-                # Update beliefs with new observation
                 next_beliefs = self.belief_model(next_obs_tensor, beliefs)
-                
-                # Apply physical constraints
                 private_hand = torch.FloatTensor(next_obs[:2]).unsqueeze(0).to(self.device)
-                next_beliefs = self.belief_model.apply_physical_constraints_fast(
-                    next_beliefs, private_hand)
-                
-                # Get value, regrets, and variance from value network
+                next_beliefs = self.belief_model.apply_physical_constraints_fast(next_beliefs, private_hand)
                 value, regrets, variance = self.value_net(next_obs_tensor, next_beliefs)
                 avg_value = value.item()
-                
-                # Process regrets for valid actions
                 regrets_np = regrets.squeeze(0).cpu().numpy() * action_mask
                 valid_actions = np.where(action_mask)[0]
-                
-                # Calculate counterfactual values
                 cf_values = {}
                 for a in valid_actions:
                     cf_values[a] = avg_value + regrets_np[a]
-                    
             return avg_value, cf_values
 
-        # Nested Subgame Solving: if agent changes or round ends
+        # Nested subgame solving: if agent changes or round ends.
         if env.agent_selection is None or env.agent_selection != original_agent_selection:
             next_obs = env.observe(agent)
             if isinstance(next_obs, dict):
@@ -948,154 +958,94 @@ class RecursiveSearchAgent:
                 cached_value = self.transposition_table[subgame_key]
                 return env.rewards[agent] + cached_value, {}
 
-            # Get value from value network
             with torch.no_grad():
                 next_beliefs = self.belief_model(next_obs_tensor, beliefs)
                 private_hand = torch.FloatTensor(next_obs[:2]).unsqueeze(0).to(self.device)
-                next_beliefs = self.belief_model.apply_physical_constraints_fast(
-                    next_beliefs, private_hand)
-                
-                # Evaluate value
+                next_beliefs = self.belief_model.apply_physical_constraints_fast(next_beliefs, private_hand)
                 value, regrets, variance = self.value_net(next_obs_tensor, next_beliefs)
                 subgame_value = value.item()
-
-                # Apply safeguards using parent's estimate if available
                 if parent_values is not None and action in parent_values:
                     parent_value = parent_values[action]
                     if subgame_value < parent_value:
-                        # Use a blend to avoid jerky estimates
                         subgame_value = 0.3 * subgame_value + 0.7 * parent_value
-
-                # Store in transposition table
                 self.transposition_table[subgame_key] = subgame_value
-                
-                # Update value statistics
                 self._update_value_statistics(subgame_key, subgame_value)
-
                 return env.rewards[agent] + subgame_value, {}
 
-        # Continue recursive simulation within the current subgame
+        # Continue recursive simulation within the current subgame.
         next_obs = env.observe(agent)
         if isinstance(next_obs, dict):
             next_obs = next_obs[agent]
         
-        # Get valid actions from the environment
         action_mask = env.infos[agent]["action_mask"]
-        
-        # Convert observation to tensor
         next_obs_tensor = torch.FloatTensor(next_obs).unsqueeze(0).to(self.device)
-
-        # Update beliefs and policy for this node
         with torch.no_grad():
-            # Split observation for public/private handling
             next_public_obs, _ = self.split_observation(next_obs)
-            
-            # Use full belief update for deeper nodes, fast update for shallow ones
             if depth > 2:
                 next_beliefs = self.belief_model(next_obs_tensor, beliefs)
                 next_public_beliefs = self.belief_model.get_public_belief_state(
                     next_obs_tensor, public_beliefs)
-                
-                # Apply physical constraints
                 private_hand = torch.FloatTensor(next_obs[:2]).unsqueeze(0).to(self.device)
-                next_beliefs = self.belief_model.apply_physical_constraints_fast(
-                    next_beliefs, private_hand)
-                next_public_beliefs = self.belief_model.apply_physical_constraints_fast(
-                    next_public_beliefs, private_hand)
+                next_beliefs = self.belief_model.apply_physical_constraints_fast(next_beliefs, private_hand)
+                next_public_beliefs = self.belief_model.apply_physical_constraints_fast(next_public_beliefs, private_hand)
             else:
-                # Fast path - just clone existing beliefs
                 next_beliefs = beliefs.clone()
                 next_public_beliefs = public_beliefs.clone()
 
-            # Get the public state key for CFR
             next_public_state_key = self.create_node_key(np.array(next_public_obs), next_public_beliefs)
-            
-            # Compute CFR strategy at this node
             cfr_strategy = self.compute_cfr_strategy(next_public_state_key, action_mask)
-
-            # Apply action mask to strategy
             masked_strategy = cfr_strategy * action_mask
             if np.sum(masked_strategy) > 0:
                 masked_strategy = masked_strategy / np.sum(masked_strategy)
             else:
                 valid_actions = np.where(action_mask)[0]
                 masked_strategy = np.zeros_like(action_mask, dtype=np.float32)
-                if len(valid_actions) > 0:  # Safety check
+                if len(valid_actions) > 0:
                     masked_strategy[valid_actions] = 1.0 / len(valid_actions)
-
-            # Get valid actions
             valid_actions = np.where(action_mask)[0]
-            
-            # Apply progressive pruning to focus on promising actions
             masked_strategy = self._apply_progressive_pruning(
                 masked_strategy, valid_actions, depth)
 
-            # Simulate all children actions using the strategy
-            action_cf_values = {}
+            cf_values = {}
             total_value = 0
             
-            # For shallow searches, evaluate all actions
-            # For deeper searches, sample actions based on strategy
             if depth <= 2 or len(valid_actions) <= 3:
-                # Evaluate all valid actions
                 for a in valid_actions:
                     if masked_strategy[a] <= 0:
                         continue
-                        
-                    # Weight by strategy probability
                     action_reach = reach_prob * masked_strategy[a]
-                    
-                    # Clone environment for this action
                     action_env = env.clone()
-                    
-                    # Simulate this action
+                    # Pass has_played=True since we have already taken one action.
                     action_value, child_cf_values = self._simulate(
                         action_env, a, next_obs, next_public_obs,
                         next_beliefs, next_public_beliefs, depth - 1,
-                        action_reach, parent_values=action_cf_values
+                        action_reach, parent_values=cf_values, has_played=True
                     )
-                    
-                    # Update counterfactual values
                     cf_values[a] = action_value
                     total_value += masked_strategy[a] * action_value
             else:
-                # Sample 3 actions based on strategy (more efficient for deep search)
                 sampled_actions = []
-                remaining_prob = 1.0
                 remaining_strategy = masked_strategy.copy()
-                
-                # Sample without replacement
                 for _ in range(min(3, len(valid_actions))):
                     if np.sum(remaining_strategy) <= 0:
                         break
-                        
-                    # Normalize remaining strategy
                     norm_strategy = remaining_strategy / np.sum(remaining_strategy)
-                    
-                    # Sample action
                     a = np.random.choice(len(action_mask), p=norm_strategy)
                     sampled_actions.append(a)
-                    
-                    # Update remaining strategy
-                    action_prob = masked_strategy[a]
                     remaining_strategy[a] = 0
-                    remaining_prob -= action_prob
-                
-                # Evaluate sampled actions
                 for a in sampled_actions:
                     action_reach = reach_prob * masked_strategy[a]
                     action_env = env.clone()
-                    
                     action_value, child_cf_values = self._simulate(
                         action_env, a, next_obs, next_public_obs,
                         next_beliefs, next_public_beliefs, depth - 1,
-                        action_reach, parent_values=action_cf_values
+                        action_reach, parent_values=cf_values, has_played=True
                     )
-                    
                     cf_values[a] = action_value
                     total_value += masked_strategy[a] * action_value
 
         return env.rewards[agent] + total_value, cf_values
+
 
     def play_turn(self, observation, action_mask, table_card):
         """
