@@ -330,22 +330,23 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                                 tracked_agent_last_embeddings[agent] = strategy_embedding.detach()
                         else:
                             embeddings_list.append(np.zeros(config.STRATEGY_DIM, dtype=np.float32))
-                        if embeddings_list:
-                            embeddings_arr = np.concatenate(embeddings_list, axis=0)
-                            norm = np.linalg.norm(embeddings_arr)
-                            normalized_arr = embeddings_arr if norm == 0 else embeddings_arr / norm
-                        else:
-                            normalized_arr = np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
-                        num_opponents = len(env.possible_agents) - 1
-                        segment_size = config.STRATEGY_DIM
-                        normalized_segments = []
-                        for i in range(num_opponents):
-                            seg = normalized_arr[i * segment_size:(i + 1) * segment_size]
-                            normalized_segments.append(torch.tensor(seg, dtype=torch.float32, device=device).unsqueeze(0))
-                        obp_memory_embeddings = normalized_segments
-                        transformer_features = normalized_arr
-                        obp_probs = run_obp_inference(obp_model, observation, device, env.num_players,
-                                                    memory_embeddings=obp_memory_embeddings)
+                if embeddings_list:
+                    embeddings_arr = np.concatenate(embeddings_list, axis=0)
+                    min_val = embeddings_arr.min()
+                    max_val = embeddings_arr.max()
+                    normalized_arr = embeddings_arr if (max_val - min_val)==0 else (embeddings_arr - min_val) / (max_val - min_val)
+                else:
+                    normalized_arr = np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
+                num_opponents = len(env.possible_agents) - 1
+                segment_size = config.STRATEGY_DIM
+                normalized_segments = []
+                for i in range(num_opponents):
+                    seg = normalized_arr[i * segment_size:(i + 1) * segment_size]
+                    normalized_segments.append(torch.tensor(seg, dtype=torch.float32, device=device).unsqueeze(0))
+                obp_memory_embeddings = normalized_segments
+                transformer_features = normalized_arr
+                obp_probs = run_obp_inference(obp_model, observation, device, env.num_players,
+                                              memory_embeddings=obp_memory_embeddings)
 
             # Build final observation based on the agent type.
             if agent == current_injected_agent_id:
