@@ -332,9 +332,8 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                             embeddings_list.append(np.zeros(config.STRATEGY_DIM, dtype=np.float32))
                 if embeddings_list:
                     embeddings_arr = np.concatenate(embeddings_list, axis=0)
-                    min_val = embeddings_arr.min()
-                    max_val = embeddings_arr.max()
-                    normalized_arr = embeddings_arr if (max_val - min_val)==0 else (embeddings_arr - min_val) / (max_val - min_val)
+                    norm_val = np.linalg.norm(embeddings_arr, ord=2)
+                    normalized_arr = embeddings_arr if norm_val == 0 else embeddings_arr / norm_val
                 else:
                     normalized_arr = np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
                 num_opponents = len(env.possible_agents) - 1
