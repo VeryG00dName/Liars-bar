@@ -238,11 +238,13 @@ def load_specific_historical_models(players_dir, device):
     - player_1 from Version_E
     - player_0 from Version_B
     - player_2 from Version_A
+    - player_0 from Version_D
     """
     required_models = {
         "Version_E": "player_1",
-        "Version_B": "player_0",
+        "Version_C": "player_0",
         "Version_A": "player_2",
+        "Version_D": "player_0"
     }
 
     historical_models = []
