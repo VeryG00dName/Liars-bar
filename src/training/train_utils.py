@@ -237,12 +237,12 @@ def load_specific_historical_models(players_dir, device):
     Loads specific historical player models based on predefined versions.
     - player_1 from Version_E
     - player_0 from Version_B
-    - player_0 from Version_A
+    - player_2 from Version_A
     """
     required_models = {
         "Version_E": "player_1",
         "Version_B": "player_0",
-        "Version_A": "player_0",
+        "Version_A": "player_2",
     }
 
     historical_models = []
