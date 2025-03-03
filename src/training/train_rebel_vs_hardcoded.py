@@ -346,7 +346,7 @@ def train_rebel_vs_hardcoded(device, num_epochs=50, episodes_per_epoch=20,
             "Win Rate": f"{stats['rebel_wins']/stats['episodes_played']:.2f}",
             "Explore": f"{exploration_rate:.2f}"
         })
-        
+        epoch_progress_bar.update(1)
         # Training steps after collecting all trajectories for the epoch
         if all_trajectories:
             belief_losses = train_belief_model(belief_model, all_trajectories, belief_optimizer, device)
