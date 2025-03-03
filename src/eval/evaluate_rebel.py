@@ -419,47 +419,30 @@ def evaluate_rebel_vs_hardcoded(rebel_agent, num_games=20):
                         # If available, evaluate action probability model using search_policy
                         has_action_prob_model = hasattr(current_agent.belief_model, 'action_prob_model')
                         if has_action_prob_model:
-                            if has_search_policy and isinstance(action_output['search_policy'], (list, np.ndarray)):
-                                try:
-                                    action_prob_metrics["total_predictions"] += 1
-                                    action_probs = action_output['search_policy']
-                                    
-                                    # Calculate log likelihood of the chosen action
-                                    if action < len(action_probs):
-                                        log_prob = np.log(max(action_probs[action], 1e-10))
-                                        action_prob_metrics["log_likelihood"] += log_prob
-                                    
-                                        # Check if chosen action was predicted as most likely
-                                        if np.argmax(action_probs) == action:
-                                            action_prob_metrics["top1_accuracy"] += 1
-                                    
-                                        # Check if chosen action was in top 3 predicted actions
-                                        top3_actions = np.argsort(action_probs)[-3:]
-                                        if action in top3_actions:
-                                            action_prob_metrics["top3_accuracy"] += 1
-                                except Exception as e:
-                                    action_prob_metrics["debug_info"].append(f"Exception in search_policy evaluation: {str(e)}")
-                            # If no search_policy, try blueprint_strategy
-                            elif has_blueprint_strategy and isinstance(action_output['blueprint_strategy'], (list, np.ndarray)):
-                                try:
-                                    action_prob_metrics["total_predictions"] += 1
-                                    action_probs = action_output['blueprint_strategy']
-                                    
-                                    # Calculate log likelihood of the chosen action
-                                    if action < len(action_probs):
-                                        log_prob = np.log(max(action_probs[action], 1e-10))
-                                        action_prob_metrics["log_likelihood"] += log_prob
-                                    
-                                        # Check if chosen action was predicted as most likely
-                                        if np.argmax(action_probs) == action:
-                                            action_prob_metrics["top1_accuracy"] += 1
-                                    
-                                        # Check if chosen action was in top 3 predicted actions
-                                        top3_actions = np.argsort(action_probs)[-3:]
-                                        if action in top3_actions:
-                                            action_prob_metrics["top3_accuracy"] += 1
-                                except Exception as e:
-                                    action_prob_metrics["debug_info"].append(f"Exception in blueprint_strategy evaluation: {str(e)}")
+                            if has_search_policy and 'search_policy' in action_output:
+                                action_probs = np.array(action_output['search_policy'])
+                                action_prob_metrics["total_predictions"] += 1
+                                if action < len(action_probs):
+                                    log_prob = np.log(max(action_probs[action], 1e-10))
+                                    action_prob_metrics["log_likelihood"] += log_prob
+                                if np.argmax(action_probs) == action:
+                                    action_prob_metrics["top1_accuracy"] += 1
+                                top3_actions = np.argsort(action_probs)[-3:]
+                                if action in top3_actions:
+                                    action_prob_metrics["top3_accuracy"] += 1
+                            elif has_blueprint_strategy and 'blueprint_strategy' in action_output:
+                                action_probs = np.array(action_output['blueprint_strategy'])
+                                action_prob_metrics["total_predictions"] += 1
+                                if action < len(action_probs):
+                                    log_prob = np.log(max(action_probs[action], 1e-10))
+                                    action_prob_metrics["log_likelihood"] += log_prob
+                                if np.argmax(action_probs) == action:
+                                    action_prob_metrics["top1_accuracy"] += 1
+                                top3_actions = np.argsort(action_probs)[-3:]
+                                if action in top3_actions:
+                                    action_prob_metrics["top3_accuracy"] += 1
+                            else:
+                                action_prob_metrics["debug_info"].append("Action probability model output missing or not in expected format")
                                     
                     except Exception as e:
                         # If there's an error in the main action block, log it and continue
@@ -635,9 +618,9 @@ def main():
                         help="Path to checkpoint directory")
     parser.add_argument("--games", type=int, default=20,
                         help="Number of games per opponent")
-    parser.add_argument("--search_depth", type=int, default=2,
+    parser.add_argument("--search_depth", type=int, default=4,
                         help="Search depth for ReBeL agent")
-    parser.add_argument("--simulations", type=int, default=15,
+    parser.add_argument("--simulations", type=int, default=60,
                         help="Number of simulations per decision for ReBeL agent")
     parser.add_argument("--alpha", type=float, default=1.5,
                         help="DCFR positive regret discount parameter")

@@ -529,13 +529,14 @@ class RebelPolicyNetwork(nn.Module):
 
 class ActionProbabilityModel(nn.Module):
     """
-    Neural model to predict action probabilities based on game state features.
-    Replaces hardcoded probability values with learned probabilities.
+    Neural model to predict action probabilities for all possible actions.
+    Updated to work with transformer embeddings.
     """
-    def __init__(self, input_dim=10, hidden_dim=64):
+    def __init__(self, input_dim=16, hidden_dim=128):  # Updated input_dim for new features (including 5-dim embeddings)
         super(ActionProbabilityModel, self).__init__()
         self.input_dim = input_dim
-        
+
+        # Adjust network to handle new input dimension
         self.network = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -545,33 +546,118 @@ class ActionProbabilityModel(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(0.2),
-            nn.Linear(hidden_dim, 2)  # Outputs [table_prob, non_table_prob]
+            nn.Linear(hidden_dim, 7)  # Output for all 7 possible actions
         )
-        
+
     def forward(self, features):
         """
         Predict action probabilities from state features.
-        
+
         Args:
-            features: Tensor of state features including:
-                - action_type (play/challenge)
-                - play_count (1/2/3)
-                - hand_size
-                - penalty_ratio
-                - is_desperate (near elimination)
-                - opponent_features (e.g., historical behavior)
-                
+            features: Tensor of state features including transformer embeddings
+
         Returns:
-            Tensor of [table_prob, non_table_prob]
+            Tensor of probabilities for all 7 possible actions
         """
         logits = self.network(features)
         probs = F.softmax(logits, dim=-1)
         return probs
     
-    def extract_features(self, action_type, count, hand_size, penalty_ratio, 
-                         opponent_id=None, opponent_memory=None):
+    def extract_features(self, action_type, count, hand, table_card,
+                        hand_size, penalty_ratio, transformer_embeddings=None,
+                        opponent_idx=None, last_action=None,
+                        last_action_agent=None, last_action_bluff=None):
         """
-        Extract relevant features for probability prediction.
+        Extract relevant features using transformer embeddings instead of opponent memory.
+        """
+        features = []
+
+        # Action type (one-hot encoded)
+        is_play = 1.0 if action_type == "Play" else 0.0
+        is_challenge = 1.0 if action_type == "Challenge" else 0.0
+        features.extend([is_play, is_challenge])
+
+        # Play count (normalized)
+        play_count = count if count is not None else 0
+        features.append(play_count / 3.0)  # Normalize to [0,1]
+
+        # Hand size (normalized)
+        features.append(hand_size / 5.0)  # Normalize to [0,1]
+
+        # Penalty ratio
+        features.append(penalty_ratio)
+
+        # Table card information
+        if hand and table_card:
+            # Count table cards in hand
+            table_card_count = sum(1 for c in hand if c == table_card or c == "Joker")
+            non_table_card_count = hand_size - table_card_count
+
+            # Normalized card counts
+            features.append(table_card_count / max(1, hand_size))
+            features.append(non_table_card_count / max(1, hand_size))
+        else:
+            features.extend([0.0, 0.0])
+
+        # Last action information
+        if last_action is not None:
+            features.append(last_action / 6.0)  # Normalize to [0,1]
+
+            # Was the last action a bluff?
+            if last_action_bluff is not None:
+                features.append(1.0 if last_action_bluff else 0.0)
+            else:
+                features.append(0.5)  # Unknown
+        else:
+            features.extend([0.0, 0.5])
+
+        # Transformer embeddings for opponent
+        if transformer_embeddings is not None and opponent_idx is not None:
+            # Check if we have a list of embeddings or a flattened array
+            if isinstance(transformer_embeddings, list) and opponent_idx < len(transformer_embeddings):
+                # Get the specific opponent's embedding
+                opponent_embedding = transformer_embeddings[opponent_idx]
+                if isinstance(opponent_embedding, np.ndarray) or isinstance(opponent_embedding, torch.Tensor):
+                    # Flatten if needed
+                    if len(opponent_embedding.shape) > 1:
+                        opponent_embedding = opponent_embedding.flatten()
+                    features.extend(opponent_embedding)
+                else:
+                    # Default embedding if format isn't as expected
+                    features.extend([0.0, 0.0, 0.0, 0.0, 0.0])  # 5-dim default
+            elif isinstance(transformer_embeddings, (np.ndarray, torch.Tensor)):
+                # If it's a tensor with all embeddings combined
+                # Extract the specific opponent's section
+                num_opponents = len(transformer_embeddings) // 5  # Assuming 5-dim per opponent
+                if opponent_idx < num_opponents:
+                    start_idx = opponent_idx * 5
+                    end_idx = start_idx + 5
+                    opponent_embedding = transformer_embeddings[start_idx:end_idx]
+                    features.extend(opponent_embedding)
+                else:
+                    # Default embedding if index out of range
+                    features.extend([0.0, 0.0, 0.0, 0.0, 0.0])
+            else:
+                # Default embedding if format isn't as expected
+                features.extend([0.0, 0.0, 0.0, 0.0, 0.0])
+        else:
+            # Default transformer embedding if none provided
+            features.extend([0.0, 0.0, 0.0, 0.0, 0.0])  # 5-dim default
+
+        return torch.tensor(features, dtype=torch.float)
+    
+class ActionProbabilityDataCollector:
+    """
+    Collects data for training the action probability model.
+    """
+    def __init__(self):
+        self.data = []
+     
+    def extract_features(self, action_type, count, hand, table_card, hand_size, 
+                         penalty_ratio, transformer_embeddings=None, opponent_idx=None, 
+                         last_action=None, last_action_agent=None, last_action_bluff=None):
+        """
+        Extract relevant features with transformer embeddings.
         """
         features = []
         
@@ -590,95 +676,118 @@ class ActionProbabilityModel(nn.Module):
         # Penalty ratio
         features.append(penalty_ratio)
         
-        # Opponent features
-        if opponent_memory and opponent_id:
-            opponent_summary = opponent_memory.get_summary(opponent_id)
-            features.extend(opponent_summary)
+        # Table card information
+        if hand and table_card:
+            # Count table cards in hand
+            table_card_count = sum(1 for c in hand if c == table_card or c == "Joker")
+            non_table_card_count = hand_size - table_card_count
+            
+            # Normalized card counts
+            features.append(table_card_count / max(1, hand_size))
+            features.append(non_table_card_count / max(1, hand_size))
         else:
-            # Default opponent features if not available
-            features.extend([0.5, 0.5, 0.5, 0.5, 0.0, 0.0])
-            
-        return torch.tensor(features, dtype=torch.float)
-    
-class ActionProbabilityDataCollector:
-    """
-    Collects data for training the action probability model.
-    """
-    def __init__(self):
-        self.data = []
+            features.extend([0.0, 0.0])
         
+        # Last action information
+        if last_action is not None:
+            features.append(last_action / 6.0)  # Normalize to [0,1]
+            
+            # Was the last action a bluff?
+            if last_action_bluff is not None:
+                features.append(1.0 if last_action_bluff else 0.0)
+            else:
+                features.append(0.5)  # Unknown
+        else:
+            features.extend([0.0, 0.5])
+        
+        # Transformer embeddings for opponent
+        if transformer_embeddings is not None and opponent_idx is not None:
+            # Check if we have a list of embeddings or a flattened array
+            if isinstance(transformer_embeddings, list) and opponent_idx < len(transformer_embeddings):
+                # Get the specific opponent's embedding
+                opponent_embedding = transformer_embeddings[opponent_idx]
+                if isinstance(opponent_embedding, (np.ndarray, torch.Tensor)):
+                    # Flatten if needed
+                    if hasattr(opponent_embedding, 'shape') and len(opponent_embedding.shape) > 1:
+                        if isinstance(opponent_embedding, torch.Tensor):
+                            opponent_embedding = opponent_embedding.flatten().detach().cpu().numpy()
+                        else:
+                            opponent_embedding = opponent_embedding.flatten()
+                    features.extend(opponent_embedding)
+                else:
+                    # Default embedding if format isn't as expected
+                    features.extend([0.0, 0.0, 0.0, 0.0, 0.0])  # 5-dim default
+            else:
+                # Default embedding if index out of range
+                features.extend([0.0, 0.0, 0.0, 0.0, 0.0])
+        else:
+            # Default transformer embedding if none provided
+            features.extend([0.0, 0.0, 0.0, 0.0, 0.0])  # 5-dim default
+            
+        # Return as a list, not as a tensor
+        return features
+
     def record_action(self, action_type, count, hand, table_card, was_bluff=None, 
-                      hand_size=None, penalty_ratio=None, opponent_id=None, 
-                      opponent_memory=None):
+                      hand_size=None, penalty_ratio=None, transformer_embeddings=None,
+                      opponent_idx=None, specific_action=None, last_action=None,
+                      last_action_agent=None, last_action_bluff=None):
         """
-        Record an action taken by a player.
+        Record an action with transformer embeddings instead of opponent memory.
+        """
+        # Determine specific action if not provided
+        if specific_action is None:
+            if action_type == "Challenge":
+                specific_action = 6
+            elif action_type == "Play" and count is not None:
+                # Determine if this was a table or non-table play based on was_bluff
+                if was_bluff is False:
+                    # Truthful play of table cards
+                    specific_action = count - 1  # Maps count 1,2,3 to actions 0,1,2
+                elif was_bluff is True:
+                    # Bluffing with non-table cards
+                    specific_action = count + 2  # Maps count 1,2,3 to actions 3,4,5
+                else:
+                    # Unknown if bluff or not, cannot determine exact action
+                    return
+            else:
+                # Cannot determine exact action
+                return
         
-        Args:
-            action_type: Type of action ("Play" or "Challenge")
-            count: Number of cards played (if applicable)
-            hand: Player's hand
-            table_card: Current table card
-            was_bluff: Whether the play was a bluff (if known)
-            hand_size: Size of player's hand
-            penalty_ratio: Current penalty ratio
-            opponent_id: Player ID
-            opponent_memory: OpponentMemory instance
-        """
-        # Skip if we don't know if it was a bluff or not
-        if action_type == "Play" and was_bluff is None:
-            return
-            
         # Count cards in hand
         if hand_size is None:
-            hand_size = len(hand)
+            hand_size = len(hand) if hand else 0
             
-        table_card_count = sum(1 for c in hand if c == table_card or c == "Joker")
-        non_table_card_count = hand_size - table_card_count
+        # Extract features using transformer embeddings
+        features = self.extract_features(
+            action_type=action_type,
+            count=count,
+            hand=hand,
+            table_card=table_card,
+            hand_size=hand_size,
+            penalty_ratio=penalty_ratio,
+            transformer_embeddings=transformer_embeddings,
+            opponent_idx=opponent_idx,
+            last_action=last_action,
+            last_action_agent=last_action_agent,
+            last_action_bluff=last_action_bluff
+        )
         
-        # Extract features
-        features = []
-        is_play = 1.0 if action_type == "Play" else 0.0
-        is_challenge = 1.0 if action_type == "Challenge" else 0.0
-        features.extend([is_play, is_challenge])
-        
-        play_count = count if count is not None else 0
-        features.append(play_count / 3.0)
-        
-        features.append(hand_size / 5.0)
-        features.append(penalty_ratio if penalty_ratio is not None else 0.0)
-        
-        # Opponent features
-        if opponent_memory and opponent_id:
-            opponent_summary = opponent_memory.get_summary(opponent_id)
-            features.extend(opponent_summary)
-        else:
-            features.extend([0.5, 0.5, 0.5, 0.5, 0.0, 0.0])
-        
-        # Create target based on actual card distribution in hand
-        has_table_cards = table_card_count > 0
-        has_non_table_cards = non_table_card_count > 0
-        
-        if action_type == "Play":
-            if was_bluff:
-                # A bluff means they played non-table cards as table cards
-                target = [0.0, 1.0]  # [table_prob, non_table_prob]
-            else:
-                # Not a bluff means they played table cards truthfully
-                target = [1.0, 0.0]  # [table_prob, non_table_prob]
-        elif action_type == "Challenge":
-            # For challenges, consider the player's own hand
-            target = [1.0, 0.0] if has_table_cards else [0.0, 1.0]
+        # Create target as one-hot encoded action
+        target = [0.0] * 7
+        if 0 <= specific_action < 7:  # Ensure action is valid
+            target[specific_action] = 1.0
         
         self.data.append({
-            'features': features,
+            'features': features,  # This is now a list, not a tensor
             'target': target,
             'meta': {
                 'action_type': action_type,
                 'count': count,
                 'hand_size': hand_size,
-                'table_card_count': table_card_count,
-                'non_table_card_count': non_table_card_count,
                 'was_bluff': was_bluff,
+                'specific_action': specific_action,
+                'last_action': last_action,
+                'last_action_agent': last_action_agent
             }
         })
         
@@ -687,6 +796,72 @@ class ActionProbabilityDataCollector:
         if not self.data:
             return None, None
             
+        # Each item in self.data['features'] is already a list, not a tensor
         features = torch.tensor([d['features'] for d in self.data], dtype=torch.float)
         targets = torch.tensor([d['target'] for d in self.data], dtype=torch.float)
         return features, targets
+        
+    def record_action(self, action_type, count, hand, table_card, was_bluff=None, 
+                  hand_size=None, penalty_ratio=None, transformer_embeddings=None,
+                  opponent_idx=None, specific_action=None, last_action=None,
+                  last_action_agent=None, last_action_bluff=None):
+        """
+        Record an action with transformer embeddings instead of opponent memory.
+        """
+        # Skip if we don't have the actual action and it can't be determined
+        if specific_action is None:
+            if action_type == "Challenge":
+                specific_action = 6
+            elif action_type == "Play" and count is not None:
+                # Determine if this was a table or non-table play based on was_bluff
+                if was_bluff is False:
+                    # Truthful play of table cards
+                    specific_action = count - 1  # Maps count 1,2,3 to actions 0,1,2
+                elif was_bluff is True:
+                    # Bluffing with non-table cards
+                    specific_action = count + 2  # Maps count 1,2,3 to actions 3,4,5
+                else:
+                    # Unknown if bluff or not, cannot determine exact action
+                    return
+            else:
+                # Cannot determine exact action
+                return
+        
+        # Count cards in hand
+        if hand_size is None:
+            hand_size = len(hand) if hand else 0
+            
+        # Extract features using transformer embeddings
+        features = self.extract_features(
+            action_type=action_type,
+            count=count,
+            hand=hand,
+            table_card=table_card,
+            hand_size=hand_size,
+            penalty_ratio=penalty_ratio,
+            transformer_embeddings=transformer_embeddings,
+            opponent_idx=opponent_idx,
+            last_action=last_action,
+            last_action_agent=last_action_agent,
+            last_action_bluff=last_action_bluff
+        )
+        
+        # Create target as one-hot encoded action
+        target = [0.0] * 7
+        if 0 <= specific_action < 7:  # Ensure action is valid
+            target[specific_action] = 1.0
+        
+        self.data.append({
+            'features': features,
+            'target': target,
+            'meta': {
+                'action_type': action_type,
+                'count': count,
+                'hand_size': hand_size,
+                'was_bluff': was_bluff,
+                'specific_action': specific_action,
+                'last_action': last_action,
+                'last_action_agent': last_action_agent
+            }
+        })
+        

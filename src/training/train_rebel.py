@@ -15,7 +15,7 @@ from src.training.train_transformer import EventEncoder
 from src import config
 from src.env.liars_deck_env_core import LiarsDeckEnv
 from src.env.liars_deck_env_utils_2 import decode_action
-from src.model.rebel_models import RebelPolicyNetwork,CFRValueNetwork
+from src.model.rebel_models import ActionProbabilityModel, RebelPolicyNetwork,CFRValueNetwork
 from src.model.belief_models import BeliefStateModel
 from src.model.recursive_search_agent import RecursiveSearchAgent
 from src.model.blueprint_strategy import BlueprintStrategy
@@ -797,24 +797,26 @@ def train_policy_network(policy_net, value_net, trajectories, optimizer, device,
     }
 
 def train_action_probability_model(model, data_collector, device, lr=1e-4, epochs=50, batch_size=64):
-    """
-    Train the action probability model using collected data.
-    
-    Args:
-        model: ActionProbabilityModel instance
-        data_collector: ActionProbabilityDataCollector with data
-        device: Torch device for training
-        lr: Learning rate
-        epochs: Number of training epochs
-        batch_size: Batch size for training
-        
-    Returns:
-        Trained model
-    """
+    """Train the action probability model using collected data."""
     features, targets = data_collector.get_training_data()
     if features is None:
         return model
-        
+    
+    # Check feature dimensions and adjust model if needed
+    if features.size(1) != model.input_dim:
+        print(f"Adjusting model input dimension from {model.input_dim} to {features.size(1)}")
+        old_model = model
+        # Create new model with correct input dimension
+        model = ActionProbabilityModel(input_dim=features.size(1), hidden_dim=128).to(device)
+        # Copy parameters where possible
+        if old_model.network[0].weight.size(1) <= features.size(1):
+            with torch.no_grad():
+                model.network[2:].load_state_dict(old_model.network[2:].state_dict())
+                # Copy first layer weights for matching dimensions
+                model.network[0].weight[:, :old_model.network[0].weight.size(1)].copy_(
+                    old_model.network[0].weight)
+                model.network[0].bias.copy_(old_model.network[0].bias)
+    
     features = features.to(device)
     targets = targets.to(device)
     
@@ -834,8 +836,8 @@ def train_action_probability_model(model, data_collector, device, lr=1e-4, epoch
             optimizer.zero_grad()
             pred_probs = model(batch_features)
             
-            # Cross-entropy loss
-            loss = F.binary_cross_entropy(pred_probs, batch_targets)
+            # Cross-entropy loss for multi-class classification
+            loss = F.cross_entropy(pred_probs, batch_targets.argmax(dim=1))
             
             loss.backward()
             optimizer.step()
@@ -890,7 +892,7 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
     
     # Initialize action probability model and data collector
     from src.model.rebel_models import ActionProbabilityModel, ActionProbabilityDataCollector
-    action_prob_model = ActionProbabilityModel(input_dim=11, hidden_dim=64).to(device)
+    action_prob_model = ActionProbabilityModel(input_dim=14, hidden_dim=128).to(device)
     data_collector = ActionProbabilityDataCollector()
     
     # Create checkpoint and logging directories
@@ -1053,6 +1055,28 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
             search_outputs = current_agent.play_turn(obs, action_mask, env.table_card)
             selected_action = search_outputs['selected_action']
             action_type, _, count = decode_action(selected_action)
+            # Get transformer embeddings for all agents
+            embeddings_list = []
+            embeddings_dict = {}
+            for idx, agent_id in enumerate(env.possible_agents):
+                if agent_id == current_agent_id:
+                    continue  # Skip current agent
+                
+                # Get opponent embeddings from the agent's transformer memory
+                agent_embeddings, _ = current_agent.get_transformer_memory_embeddings(env)
+                if agent_embeddings and idx < len(agent_embeddings):
+                    embeddings_list.append(agent_embeddings[idx])
+                    embeddings_dict[agent_id] = idx
+                else:
+                    # Empty embedding as fallback
+                    embeddings_list.append(np.zeros(5, dtype=np.float32))
+                    embeddings_dict[agent_id] = idx
+
+            # Determine opponent index
+            opponent_idx = 0  # Default to first opponent
+            if current_agent_id in embeddings_dict:
+                opponent_idx = embeddings_dict[current_agent_id]
+
             data_collector.record_action(
                 action_type=action_type,
                 count=count,
@@ -1061,8 +1085,11 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
                 was_bluff=None,  # To be filled later
                 hand_size=len(env.players_hands.get(current_agent_id, [])),
                 penalty_ratio=env.penalties.get(current_agent_id, 0) / env.penalty_thresholds.get(current_agent_id, 3),
-                opponent_id=current_agent_id,
-                opponent_memory=None
+                transformer_embeddings=embeddings_list,
+                opponent_idx=opponent_idx,
+                last_action=env.last_action,
+                last_action_agent=env.last_action_agent,
+                last_action_bluff=env.last_action_bluff
             )
             env.step(selected_action)
             if action_type == "Play" and env.last_action_bluff is not None:
@@ -1333,16 +1360,41 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
             search_outputs = current_agent.play_turn(obs, action_mask, env.table_card)
             selected_action = search_outputs['selected_action']
             action_type, _, count = decode_action(selected_action)
-            final_data_collector.record_action(
+            # Get transformer embeddings for all agents
+            embeddings_list = []
+            embeddings_dict = {}
+            for idx, agent_id in enumerate(env.possible_agents):
+                if agent_id == current_agent_id:
+                    continue  # Skip current agent
+                
+                # Get opponent embeddings from the agent's transformer memory
+                agent_embeddings, _ = current_agent.get_transformer_memory_embeddings(env)
+                if agent_embeddings and idx < len(agent_embeddings):
+                    embeddings_list.append(agent_embeddings[idx])
+                    embeddings_dict[agent_id] = idx
+                else:
+                    # Empty embedding as fallback
+                    embeddings_list.append(np.zeros(5, dtype=np.float32))
+                    embeddings_dict[agent_id] = idx
+
+            # Determine opponent index
+            opponent_idx = 0  # Default to first opponent
+            if current_agent_id in embeddings_dict:
+                opponent_idx = embeddings_dict[current_agent_id]
+
+            data_collector.record_action(
                 action_type=action_type,
                 count=count,
                 hand=env.players_hands.get(current_agent_id, []),
                 table_card=env.table_card,
-                was_bluff=None,
+                was_bluff=None,  # To be filled later
                 hand_size=len(env.players_hands.get(current_agent_id, [])),
                 penalty_ratio=env.penalties.get(current_agent_id, 0) / env.penalty_thresholds.get(current_agent_id, 3),
-                opponent_id=current_agent_id,
-                opponent_memory=None
+                transformer_embeddings=embeddings_list,
+                opponent_idx=opponent_idx,
+                last_action=env.last_action,
+                last_action_agent=env.last_action_agent,
+                last_action_bluff=env.last_action_bluff
             )
             env.step(selected_action)
             if action_type == "Play" and env.last_action_bluff is not None:
@@ -1392,12 +1444,12 @@ def main():
     policy_net, belief_model, value_net, agents, blueprint = train_rebel_agent(
         env=env,
         device=device,
-        num_epochs=200,
+        num_epochs=20,
         games_per_epoch=20,
         search_depth=4,
         num_simulations=60,
         log_interval=5,
-        checkpoint_interval=20,
+        checkpoint_interval=5,
         log_tensorboard=True,
         blueprint_phase=True,
         blueprint_games=500

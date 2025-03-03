@@ -89,6 +89,62 @@ class BeliefStateModel(nn.Module):
         self._belief_cache = {}
         self._update_counter = 0
     
+    def get_transformer_memory_embeddings(self, env):
+        """
+        Generate transformer-based memory embeddings for all opponents.
+        
+        Args:
+            env: Current game environment
+            
+        Returns:
+            Tuple of (list of embeddings, flattened embeddings array)
+        """
+        # Skip if we don't have transformer components
+        if not hasattr(self, 'strategy_transformer') or not self.strategy_transformer:
+            return [], np.zeros(0, dtype=np.float32)
+        
+        embeddings_list = []
+        opponents = [ag for ag in env.possible_agents if ag != env.agent_selection]
+        strategy_dim = self.strategy_transformer.strategy_head.out_features
+        
+        # Process each opponent
+        for opp in opponents:
+            try:
+                # Get opponent memory events 
+                from src.env.liars_deck_env_utils import query_opponent_memory_full
+                mem_summary = query_opponent_memory_full(env.agent_selection, opp)
+                
+                # Convert memory to feature format expected by EventEncoder
+                from src.training.train_transformer import convert_memory_to_features
+                features_list = convert_memory_to_features(mem_summary, self.response2idx, self.action2idx)
+                
+                if features_list:
+                    # Create proper tensor for event encoder
+                    feature_tensor = torch.tensor(features_list, dtype=torch.float32, device=self.device).unsqueeze(0)
+                    
+                    # Process through event encoder then transformer
+                    with torch.no_grad():
+                        projected = self.event_encoder(feature_tensor)
+                        strategy_embedding, _ = self.strategy_transformer(projected)
+                    
+                    # Store embedding
+                    embeddings_list.append(strategy_embedding.cpu().detach().numpy().flatten())
+                else:
+                    # Use zeros for empty memory
+                    embeddings_list.append(np.zeros(strategy_dim, dtype=np.float32))
+            except Exception as e:
+                print(f"Error processing memory for {opp}: {e}")
+                embeddings_list.append(np.zeros(strategy_dim, dtype=np.float32))
+        
+        # Concatenate all embeddings into a single array
+        if embeddings_list:
+            embeddings_arr = np.concatenate(embeddings_list, axis=0)
+        else:
+            # Create zeroed embeddings for each opponent if needed
+            embeddings_arr = np.zeros(len(opponents) * strategy_dim, dtype=np.float32)
+        
+        return embeddings_list, embeddings_arr
+    
     def split_observation(self, x):
         """
         Split observation into public and private components.
@@ -399,7 +455,7 @@ class BeliefStateModel(nn.Module):
     def _compute_action_probabilities(self, action, action_type, count, opponent, env):
         """
         Compute probabilities of taking an action given different possible hands.
-        Now uses a trained model instead of handcrafted probabilities.
+        Now uses transformer-based memory instead of opponent memory.
         
         Args:
             action: The action ID
@@ -412,51 +468,77 @@ class BeliefStateModel(nn.Module):
             torch.Tensor: Probability distribution over card types
         """
         # Initialize with uniform distribution as fallback
-        action_probs = torch.ones(self.card_types, device=self.device) / self.card_types
-        
-        # Get opponent's hand size
+        action_probs = torch.ones(
+            self.card_types, device=self.device) / self.card_types
+
+        # Get opponent's hand size and penalty ratio
         hand_size = len(env.players_hands.get(opponent, []))
-        
-        # Get penalty count - more penalties may indicate more desperate play
         penalty_count = env.penalties.get(opponent, 0)
         penalty_threshold = env.penalty_thresholds.get(opponent, 3)
         penalty_ratio = penalty_count / penalty_threshold if penalty_threshold > 0 else 0
-        
+
         try:
             # Access the trained action probability model
             if hasattr(self, 'action_prob_model') and self.action_prob_model is not None:
-                # Extract features for the model
+                # Get transformer embeddings for opponents
+                transformer_embeddings = None
+                opponent_idx = None
+
+                # Get transformer embeddings
+                if hasattr(self, 'get_transformer_memory_embeddings'):
+                    # Get all transformer embeddings and find the specific opponent's embedding
+                    embeddings_list, _ = self.get_transformer_memory_embeddings(
+                        env)
+                    transformer_embeddings = embeddings_list
+
+                    # Find opponent index
+                    opponent_list = [
+                        ag for ag in env.possible_agents if ag != env.agent_selection]
+                    if opponent in opponent_list:
+                        opponent_idx = opponent_list.index(opponent)
+
+                # Extract features with transformer embeddings
                 features = self.action_prob_model.extract_features(
                     action_type=action_type,
                     count=count,
+                    hand=env.players_hands.get(opponent, []),
+                    table_card=env.table_card,
                     hand_size=hand_size,
                     penalty_ratio=penalty_ratio,
-                    opponent_id=opponent
+                    transformer_embeddings=transformer_embeddings,
+                    opponent_idx=opponent_idx,
+                    last_action=env.last_action,
+                    last_action_agent=env.last_action_agent,
+                    last_action_bluff=env.last_action_bluff
                 )
-                
-                # Get predictions from the model
+
+                # Get full action predictions
                 features = features.to(self.device)
                 with torch.no_grad():
-                    pred_probs = self.action_prob_model(features.unsqueeze(0)).squeeze(0)
-                    action_probs = pred_probs
-            else:
-                # Fallback to improved heuristics (can be simpler now as this is just a backup)
-                if action_type == "Play" and count is not None:
-                    base_table_prob = 0.6 - (count * 0.1)  # Decreases with count
-                    base_non_table_prob = 0.4 - (count * 0.1)  # Decreases with count
-                    action_probs = torch.tensor([base_table_prob, base_non_table_prob], device=self.device)
-                elif action_type == "Challenge":
-                    action_probs = torch.tensor([0.4, 0.6], device=self.device)
-                    
+                    action_probs_full = self.action_prob_model(
+                        features.unsqueeze(0)).squeeze(0)
+
+                # Convert to card type probabilities
+                # Actions 0-2 are for table cards, 3-5 for non-table cards
+                table_prob = action_probs_full[0] + \
+                    action_probs_full[1] + action_probs_full[2]
+                non_table_prob = action_probs_full[3] + \
+                    action_probs_full[4] + action_probs_full[5]
+                total = table_prob + non_table_prob
+
+                if total > 0:
+                    action_probs = torch.tensor(
+                        [table_prob/total, non_table_prob/total], device=self.device)
+
         except Exception as e:
             print(f"Error in action probability prediction: {e}")
             # Keep the default uniform distribution
-        
+
         # Normalize to ensure valid probabilities
         prob_sum = action_probs.sum()
         if prob_sum > 0:
             action_probs = action_probs / prob_sum
-        
+
         return action_probs
 
     def _update_beliefs_bayesian(self, prior_belief, action_probs):
