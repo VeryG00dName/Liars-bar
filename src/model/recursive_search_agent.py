@@ -148,12 +148,8 @@ class RecursiveSearchAgent:
             embeddings_arr = np.zeros(len(opponents) * strategy_dim, dtype=np.float32)
         
         # Normalize using min-max scaling for the one-dimensional array
-        min_val = embeddings_arr.min()
-        max_val = embeddings_arr.max()
-        if (max_val - min_val) == 0:
-            normalized_arr = embeddings_arr
-        else:
-            normalized_arr = (embeddings_arr - min_val) / (max_val - min_val)
+        norm = np.linalg.norm(embeddings_arr)
+        normalized_arr = embeddings_arr if norm == 0 else embeddings_arr / norm
         
         return embeddings_list, normalized_arr
 
