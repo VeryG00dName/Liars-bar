@@ -854,14 +854,14 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
                       lr_policy=1e-4, lr_belief=1e-4, lr_value=1e-4,
                       search_depth=4, num_simulations=30, log_interval=5,
                       checkpoint_interval=20, log_tensorboard=True,
-                      blueprint_phase=True, blueprint_games=500,
+                      blueprint_phase=True, blueprint_games=50,
                       alpha=1.5, beta=0.5, gamma=2.0):
     """
     Train a ReBeL agent with improved learning dynamics.
     Implements CFR iteration sampling, linear weighting for strategies,
     adaptive learning rates, and two-stage blueprint generation:
       1. Periodic blueprint updates during training.
-      2. A final blueprint generation phase using 500 games.
+      2. A final blueprint generation phase using 50 games.
     Additionally, the action probability model is retrained after training
     to ensure its predictions reflect the final networks.
     
@@ -1323,7 +1323,7 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
     logger.info("Main training with blueprint guidance complete!")
     
     # -------------------------------------------------------------------------------
-    # Final Blueprint Generation (500 games) and Retraining Action Prob Model
+    # Final Blueprint Generation (50 games) and Retraining Action Prob Model
     # -------------------------------------------------------------------------------
     if blueprint_phase:
         logger.info(f"Generating final blueprint with {blueprint_games} games...")
@@ -1452,7 +1452,7 @@ def main():
         checkpoint_interval=5,
         log_tensorboard=True,
         blueprint_phase=True,
-        blueprint_games=500
+        blueprint_games=50
     )
     
     logger.info("ReBeL training with CFR and public/private belief separation completed successfully")

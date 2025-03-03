@@ -97,7 +97,7 @@ class BeliefStateModel(nn.Module):
             env: Current game environment
             
         Returns:
-            Tuple of (list of embeddings, flattened embeddings array)
+            Tuple of (list of embeddings, normalized flattened embeddings array)
         """
         # Skip if we don't have transformer components
         if not hasattr(self, 'strategy_transformer') or not self.strategy_transformer:
@@ -143,7 +143,15 @@ class BeliefStateModel(nn.Module):
             # Create zeroed embeddings for each opponent if needed
             embeddings_arr = np.zeros(len(opponents) * strategy_dim, dtype=np.float32)
         
-        return embeddings_list, embeddings_arr
+        # Normalize using min-max scaling for the one-dimensional array
+        min_val = embeddings_arr.min()
+        max_val = embeddings_arr.max()
+        if (max_val - min_val) == 0:
+            normalized_arr = embeddings_arr
+        else:
+            normalized_arr = (embeddings_arr - min_val) / (max_val - min_val)
+        
+        return embeddings_list, normalized_arr
     
     def split_observation(self, x):
         """

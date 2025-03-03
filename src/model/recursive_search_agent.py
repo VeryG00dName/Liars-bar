@@ -96,25 +96,30 @@ class RecursiveSearchAgent:
     def get_transformer_memory_embeddings(self, env):
         """
         Generate transformer-based memory embeddings for all opponents.
-        Ensures we get embeddings for every opponent.
-        """
         
+        Args:
+            env: Current game environment
+            
+        Returns:
+            Tuple of (list of embeddings, normalized flattened embeddings array)
+        """
         # Skip if we don't have transformer components
-        if not all([self.strategy_transformer, self.event_encoder, 
-                self.response2idx, self.action2idx]):
+        if not hasattr(self, 'strategy_transformer') or not self.strategy_transformer:
             return [], np.zeros(0, dtype=np.float32)
         
         embeddings_list = []
-        opponents = [ag for ag in env.possible_agents if ag != self.name]
+        opponents = [ag for ag in env.possible_agents if ag != env.agent_selection]
         strategy_dim = self.strategy_transformer.strategy_head.out_features
         
         # Process each opponent
         for opp in opponents:
             try:
                 # Get opponent memory events 
-                mem_summary = query_opponent_memory_full(self.name, opp)
+                from src.env.liars_deck_env_utils import query_opponent_memory_full
+                mem_summary = query_opponent_memory_full(env.agent_selection, opp)
                 
                 # Convert memory to feature format expected by EventEncoder
+                from src.training.train_transformer import convert_memory_to_features
                 features_list = convert_memory_to_features(mem_summary, self.response2idx, self.action2idx)
                 
                 if features_list:
@@ -142,10 +147,15 @@ class RecursiveSearchAgent:
             # Create zeroed embeddings for each opponent if needed
             embeddings_arr = np.zeros(len(opponents) * strategy_dim, dtype=np.float32)
         
-        # Print debugging info
-        #print(f"Transformer embeddings shape: {embeddings_arr.shape}, expected: {len(opponents) * strategy_dim}")
+        # Normalize using min-max scaling for the one-dimensional array
+        min_val = embeddings_arr.min()
+        max_val = embeddings_arr.max()
+        if (max_val - min_val) == 0:
+            normalized_arr = embeddings_arr
+        else:
+            normalized_arr = (embeddings_arr - min_val) / (max_val - min_val)
         
-        return embeddings_list, embeddings_arr
+        return embeddings_list, normalized_arr
 
     def _update_value_statistics(self, state_key, value):
         """Update running statistics for a state."""
