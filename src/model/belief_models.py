@@ -431,8 +431,7 @@ class BeliefStateModel(nn.Module):
                     count=count,
                     hand_size=hand_size,
                     penalty_ratio=penalty_ratio,
-                    opponent_id=opponent,
-                    opponent_memory=self._get_opponent_memory(env.agent_selection)
+                    opponent_id=opponent
                 )
                 
                 # Get predictions from the model
@@ -459,14 +458,6 @@ class BeliefStateModel(nn.Module):
             action_probs = action_probs / prob_sum
         
         return action_probs
-    
-    def _get_opponent_memory(self, agent_id):
-        """Helper method to get opponent memory safely"""
-        try:
-            from src.model.rebel_memory import get_opponent_memory
-            return get_opponent_memory(agent_id)
-        except:
-            return None
 
     def _update_beliefs_bayesian(self, prior_belief, action_probs):
         """
