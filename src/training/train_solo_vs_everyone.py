@@ -1,3 +1,4 @@
+# src/training/train_solo_vs_everyone.py
 import logging
 import time
 import os
@@ -134,37 +135,34 @@ for idx, (_, identifier) in enumerate(historical_models):
     historical_label_mapping[identifier] = len(HARD_CODED_LABELS) + idx
 
 # ------------------------------------------------------------------------
-# MODIFIED: We now choose only one learning agent (player_0) to train.
-# All other players will be controlled by injected bots.
-LEARNING_AGENT_ID = "player_0"
-# Use TWO_PLAYER_MODE flag to decide whether to alternate between two opponents.
-TWO_PLAYER_MODE = getattr(config, "TWO_PLAYER_MODE", False)
+# CONFIGURE LEARNING AGENT (self-play) and INJECTED BOT
 # ------------------------------------------------------------------------
+# We expect exactly 3 players:
+# - "player_0" and "player_1" are controlled by the learning agent (shared networks)
+# - "player_2" will be controlled by injected bots (hardcoded/historical)
+LEARNING_AGENT_IDS = ["player_0", "player_1"]
+# We'll store combined transitions for the two learning agents under a single key.
+PRIMARY_LEARNING_AGENT = "combined_learning"
 
 def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_directory=None, log_tensorboard=True):
     set_seed(config.SEED)
     obs, infos = env.reset(seed=config.SEED)
     agents = env.agents
+    # Ensure our learning agents exist.
+    for agent in LEARNING_AGENT_IDS:
+        assert agent in agents, f"{agent} must be one of the environment agents."
+    # We expect "player_2" to be controlled by injected bots.
+    opponent_ids = [agent for agent in agents if agent not in LEARNING_AGENT_IDS]
+    assert "player_2" in opponent_ids, "Expected 'player_2' to be controlled by injected bots."
 
-    # MODIFIED: Instead of expecting all agents to be learning, we require exactly one training agent.
-    assert LEARNING_AGENT_ID in agents, f"{LEARNING_AGENT_ID} must be one of the environment agents."
-    # Determine opponent ids. In two-player mode we alternate between two designated opponents.
-    if TWO_PLAYER_MODE:
-        opponent_ids = ["player_1", "player_2"]
-    else:
-        opponent_ids = [agent for agent in agents if agent != LEARNING_AGENT_ID]
+    # Initialize moving average win tracking for the combined learning agent...
+    win_history = {PRIMARY_LEARNING_AGENT: {}}
+    games_played_counter = {PRIMARY_LEARNING_AGENT: {}}
+    # ...and also per learning agent win tracking.
+    win_history_agents = {agent: {} for agent in LEARNING_AGENT_IDS}
+    games_played_counter_agents = {agent: {} for agent in LEARNING_AGENT_IDS}
 
-    # Initialize win tracking and games played counters for the learning agent.
-    win_history = {LEARNING_AGENT_ID: {}}
-    games_played_counter = {LEARNING_AGENT_ID: {}}
-
-    # Initialize networks, optimizers, and memory for the learning agent only.
-    policy_nets = {}
-    value_nets = {}
-    optimizers_policy = {}
-    optimizers_value = {}
-    memories = {}
-
+    # Initialize networks, optimizers, and a combined memory for our learning agents.
     policy_net = PolicyNetwork(
         input_dim=config.INPUT_DIM,
         hidden_dim=config.HIDDEN_DIM,
@@ -181,47 +179,43 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
         use_dropout=True,
         use_layer_norm=True
     ).to(device)
-    policy_nets[LEARNING_AGENT_ID] = policy_net
-    value_nets[LEARNING_AGENT_ID] = value_net
-    optimizers_policy[LEARNING_AGENT_ID] = optim.Adam(policy_net.parameters(), lr=config.LEARNING_RATE)
-    optimizers_value[LEARNING_AGENT_ID] = optim.Adam(value_net.parameters(), lr=config.LEARNING_RATE)
-    memories[LEARNING_AGENT_ID] = RolloutMemory([LEARNING_AGENT_ID])
+    optimizer_policy = optim.Adam(policy_net.parameters(), lr=config.LEARNING_RATE)
+    optimizer_value = optim.Adam(value_net.parameters(), lr=config.LEARNING_RATE)
+    # IMPORTANT: Initialize memory with the combined key.
+    memory = RolloutMemory([PRIMARY_LEARNING_AGENT])
 
     # Initialize Opponent Behavior Predictor (OBP)
     obp_model = OpponentBehaviorPredictor(
-        input_dim=config.OPPONENT_INPUT_DIM, 
-        hidden_dim=config.OPPONENT_HIDDEN_DIM, 
+        input_dim=config.OPPONENT_INPUT_DIM,
+        hidden_dim=config.OPPONENT_HIDDEN_DIM,
         output_dim=2,
         memory_dim=config.STRATEGY_DIM
     ).to(device)
     obp_optimizer = optim.Adam(obp_model.parameters(), lr=config.OPPONENT_LEARNING_RATE)
     obp_memory = []
 
-    obp_model.eval()  # Disable dropout, batch norm randomness
+    obp_model.eval()
     example_observation = torch.randn(1, config.OPPONENT_INPUT_DIM).to(device)
     example_memory_embedding = torch.randn(1, config.STRATEGY_DIM).to(device)
-
     obp_model = torch.jit.trace(obp_model, (example_observation, example_memory_embedding))
     obp_model.train(True)
 
-    logger = logging.getLogger('Train')
-    writer = get_tensorboard_writer(log_dir=config.TENSORBOARD_RUNS_DIR) if log_tensorboard else None
+    writer = get_tensorboard_writer(log_dir=config.TENSORBOARD_RUNS_DIR2) if log_tensorboard else None
     checkpoint_dir = load_directory if load_directory is not None else config.CHECKPOINT_DIR
 
-    # MODIFIED: Only load checkpoint for LEARNING_AGENT_ID (player_0).
     if load_checkpoint:
         checkpoint_data = load_checkpoint_if_available(
-            {LEARNING_AGENT_ID: policy_nets[LEARNING_AGENT_ID]},
-            {LEARNING_AGENT_ID: value_nets[LEARNING_AGENT_ID]},
-            {LEARNING_AGENT_ID: optimizers_policy[LEARNING_AGENT_ID]},
-            {LEARNING_AGENT_ID: optimizers_value[LEARNING_AGENT_ID]},
+            {PRIMARY_LEARNING_AGENT: policy_net},
+            {PRIMARY_LEARNING_AGENT: value_net},
+            {PRIMARY_LEARNING_AGENT: optimizer_policy},
+            {PRIMARY_LEARNING_AGENT: optimizer_value},
             obp_model,
             obp_optimizer,
             checkpoint_dir=checkpoint_dir
         )
         if checkpoint_data is not None:
             start_episode, _ = checkpoint_data
-            logger.info(f"Loaded checkpoint from episode {start_episode}")
+            logging.getLogger('Train').info(f"Loaded checkpoint from episode {start_episode}")
         else:
             start_episode = 1
     else:
@@ -232,24 +226,48 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
     steps_since_log = 0
     episodes_since_log = 0
 
-    invalid_action_counts_periodic = {LEARNING_AGENT_ID: 0}
-    action_counts_periodic = {LEARNING_AGENT_ID: {action: 0 for action in range(config.OUTPUT_DIM)}}
-    recent_rewards = {LEARNING_AGENT_ID: []}
+    invalid_action_counts_periodic = {PRIMARY_LEARNING_AGENT: 0}
+    action_counts_periodic = {PRIMARY_LEARNING_AGENT: {action: 0 for action in range(config.OUTPUT_DIM)}}
+    recent_rewards = {PRIMARY_LEARNING_AGENT: []}
+    original_agent_order = list(env.agents)
 
-    # MODIFIED: For opponent agents, we now maintain an injected bot mapping.
-    # injected_opponents maps opponent_id -> dict with keys: type, instance, identifier.
-    injected_opponents = {}
-    # In two-player mode, we will alternate the active opponent.
-    current_active_opponent = None
-
-    # Combine hardcoded agents and historical models for injected bots.
-    hardcoded_agent_classes = [GreedyCardSpammer, StrategicChallenger, TableNonTableAgent, Classic,
-                               TableFirstConservativeChallenger, SelectiveTableConservativeChallenger]
+    # Prepare injected bots (hardcoded and historical) for "player_2".
+    hardcoded_agent_classes = [GreedyCardSpammer, StrategicChallenger, TableNonTableAgent, Classic]
     injected_bots = []
     for cls in hardcoded_agent_classes:
         injected_bots.append(("hardcoded", cls))
     for hist_model, identifier in historical_models:
         injected_bots.append(("historical", (hist_model, identifier)))
+
+    # Variables to hold the current injected bot info.
+    current_injected_agent = "player_2"
+    current_injected_bot = None
+    current_injected_bot_type = None  # "hardcoded" or "historical"
+    current_injected_bot_identifier = None
+
+    # Every 5 episodes, select a new injected bot for player_2.
+    # Pass default empty dictionaries for win stats.
+    if opponent_ids:
+        selected_bot = select_injected_bot(
+            current_injected_agent,
+            injected_bots,
+            {current_injected_agent: {}},
+            {current_injected_agent: {}}
+        )
+        current_injected_bot_type = selected_bot[0]
+        if current_injected_bot_type == "hardcoded":
+            bot_class = selected_bot[1]
+            if bot_class == StrategicChallenger:
+                current_injected_bot = bot_class(
+                    agent_name=current_injected_agent,
+                    num_players=config.NUM_PLAYERS,
+                    agent_index=agents.index(current_injected_agent)
+                )
+            else:
+                current_injected_bot = bot_class(agent_name=current_injected_agent)
+            current_injected_bot_identifier = bot_class.__name__
+        else:
+            current_injected_bot, current_injected_bot_identifier = selected_bot[1]
 
     global_step = 0
     tracked_agent = None  
@@ -261,67 +279,28 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
         agents = env.agents
         pending_rewards = {agent: 0.0 for agent in agents}
 
-        # Every 5 episodes, swap out the injected bot(s) for the opponents.
+        # Reselect the injected bot for player_2 every 5 episodes.
         if (episode - start_episode) % 5 == 0:
-            if TWO_PLAYER_MODE:
-                # Toggle the active opponent between player_1 and player_2.
-                if current_active_opponent is None:
-                    current_active_opponent = opponent_ids[0]
-                else:
-                    current_active_opponent = opponent_ids[1] if current_active_opponent == opponent_ids[0] else opponent_ids[0]
-                # Disable the non-active opponent.
-                for opp in opponent_ids:
-                    if opp != current_active_opponent:
-                        env.penalties[opp] = env.penalty_thresholds[opp]
-                        env.terminations[opp] = True
-                # Pass the full win_history and games_played_counter dictionaries.
-                selected_bot = select_injected_bot(
-                    LEARNING_AGENT_ID, injected_bots,
-                    win_history, games_played_counter
-                )
-                if selected_bot[0] == "hardcoded":
-                    bot_class = selected_bot[1]
-                    if bot_class == StrategicChallenger:
-                        bot_instance = bot_class(
-                            agent_name=current_active_opponent, 
-                            num_players=config.NUM_PLAYERS, 
-                            agent_index=agents.index(current_active_opponent)
-                        )
-                    else:
-                        bot_instance = bot_class(agent_name=current_active_opponent)
-                    bot_identifier = bot_class.__name__
-                else:
-                    bot_instance, bot_identifier = selected_bot[1]
-                injected_opponents[current_active_opponent] = {
-                    "type": selected_bot[0],
-                    "instance": bot_instance,
-                    "identifier": bot_identifier
-                }
-            else:
-                # For all opponents, assign a new injected bot.
-                for opp in opponent_ids:
-                    selected_bot = select_injected_bot(
-                        LEARNING_AGENT_ID, injected_bots,
-                        win_history, games_played_counter
+            selected_bot = select_injected_bot(
+                current_injected_agent,
+                injected_bots,
+                {current_injected_agent: {}},
+                {current_injected_agent: {}}
+            )
+            current_injected_bot_type = selected_bot[0]
+            if current_injected_bot_type == "hardcoded":
+                bot_class = selected_bot[1]
+                if bot_class == StrategicChallenger:
+                    current_injected_bot = bot_class(
+                        agent_name=current_injected_agent,
+                        num_players=config.NUM_PLAYERS,
+                        agent_index=agents.index(current_injected_agent)
                     )
-                    if selected_bot[0] == "hardcoded":
-                        bot_class = selected_bot[1]
-                        if bot_class == StrategicChallenger:
-                            bot_instance = bot_class(
-                                agent_name=opp, 
-                                num_players=config.NUM_PLAYERS, 
-                                agent_index=agents.index(opp)
-                            )
-                        else:
-                            bot_instance = bot_class(agent_name=opp)
-                        bot_identifier = bot_class.__name__
-                    else:
-                        bot_instance, bot_identifier = selected_bot[1]
-                    injected_opponents[opp] = {
-                        "type": selected_bot[0],
-                        "instance": bot_instance,
-                        "identifier": bot_identifier
-                    }
+                else:
+                    current_injected_bot = bot_class(agent_name=current_injected_agent)
+                current_injected_bot_identifier = bot_class.__name__
+            else:
+                current_injected_bot, current_injected_bot_identifier = selected_bot[1]
 
         episode_rewards = {agent: 0 for agent in agents}
         steps_in_episode = 0
@@ -339,9 +318,14 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
             observation = observation_dict[agent]
             action_mask = env.infos[agent]['action_mask']
 
-            # Integrate OBP memory (or use zeros for opponents if needed).
-            if agent != LEARNING_AGENT_ID:
-                # Opponents get a similar OBP integration as before.
+            # ----- OBP Memory Integration with Transformer Embedding Normalization -----
+            if agent == current_injected_agent:
+                obp_probs = run_obp_inference(
+                    obp_model, observation, device, env.num_players,
+                    memory_embeddings=[torch.zeros(1, config.STRATEGY_DIM, device=device)
+                                       for _ in range(env.num_players - 1)]
+                )
+            else:
                 embeddings_list = []
                 for opp in env.possible_agents:
                     if opp != agent:
@@ -367,9 +351,8 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                             embeddings_list.append(np.zeros(config.STRATEGY_DIM, dtype=np.float32))
                 if embeddings_list:
                     embeddings_arr = np.concatenate(embeddings_list, axis=0)
-                    min_val = embeddings_arr.min()
-                    max_val = embeddings_arr.max()
-                    normalized_arr = embeddings_arr if (max_val - min_val)==0 else (embeddings_arr - min_val) / (max_val - min_val)
+                    norm_val = np.linalg.norm(embeddings_arr, ord=2)
+                    normalized_arr = embeddings_arr if norm_val == 0 else embeddings_arr / norm_val
                 else:
                     normalized_arr = np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
                 num_opponents = len(env.possible_agents) - 1
@@ -382,16 +365,10 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 transformer_features = normalized_arr
                 obp_probs = run_obp_inference(obp_model, observation, device, env.num_players,
                                               memory_embeddings=obp_memory_embeddings)
-            else:
-                # For the learning agent, do OBP inference as before.
-                obp_probs = run_obp_inference(
-                    obp_model, observation, device, env.num_players,
-                    memory_embeddings=[torch.zeros(1, config.STRATEGY_DIM, device=device)
-                                       for _ in range(env.num_players - 1)]
-                )
+            # ----- End OBP Integration -----
 
-            # Build final observation.
-            if agent == LEARNING_AGENT_ID:
+            # ----- Build Final Observation -----
+            if agent == current_injected_agent:
                 base_obs = observation
                 obp_arr = np.array(obp_probs, dtype=np.float32)
                 expected_input_dim = config.INPUT_DIM
@@ -404,50 +381,57 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     final_obs = np.concatenate([base_obs, obp_arr], axis=0)
             else:
                 final_obs = np.concatenate([observation, np.array(obp_probs, dtype=np.float32), transformer_features], axis=0)
+            # ----- End Final Observation -----
 
-            # Decide action.
-            if agent == LEARNING_AGENT_ID:
-                observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
-                probs, _, _ = policy_nets[LEARNING_AGENT_ID](observation_tensor, None)
-                probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
-                mask_t = torch.tensor(action_mask, dtype=torch.float32, device=device)
-                masked_probs = probs * mask_t
-                if masked_probs.sum() == 0:
-                    valid_indices = torch.nonzero(mask_t, as_tuple=True)[0]
-                    masked_probs[valid_indices] = 1.0 / valid_indices.numel() if len(valid_indices) > 0 else torch.ones_like(probs) / probs.size(0)
-                else:
-                    masked_probs /= masked_probs.sum()
-                m = Categorical(masked_probs)
-                action = m.sample().item()
-                log_prob_value = m.log_prob(torch.tensor(action, device=device)).item()
-            elif agent in injected_opponents:
-                bot_data = injected_opponents[agent]
-                if bot_data["type"] == "hardcoded":
-                    action = bot_data["instance"].play_turn(observation, action_mask, table_card=None)
+            # ----- Decide Action -----
+            if agent == current_injected_agent:
+                if current_injected_bot_type == "hardcoded":
+                    action = current_injected_bot.play_turn(observation, action_mask, table_card=None)
                     log_prob_value = 0.0
                 else:
                     observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
                     with torch.no_grad():
-                        probs, _, _ = bot_data["instance"](observation_tensor, None)
+                        probs, _, _ = current_injected_bot(observation_tensor, None)
                     probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
                     mask_t = torch.tensor(action_mask, dtype=torch.float32, device=device)
                     masked_probs = probs * mask_t
                     if masked_probs.sum() == 0:
                         valid_indices = torch.nonzero(mask_t, as_tuple=True)[0]
-                        masked_probs[valid_indices] = 1.0 / valid_indices.numel() if len(valid_indices) > 0 else torch.ones_like(probs) / probs.size(0)
+                        masked_probs[valid_indices] = 1.0 / valid_indices.numel()
                     else:
                         masked_probs /= masked_probs.sum()
                     m = Categorical(masked_probs)
                     action = m.sample().item()
                     log_prob_value = m.log_prob(torch.tensor(action, device=device)).item()
+                # Do not store transitions for injected bot.
             else:
-                env.step(None)
-                continue
+                observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
+                probs, _, _ = policy_net(observation_tensor, None)
+                probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
+                mask_t = torch.tensor(action_mask, dtype=torch.float32, device=device)
+                masked_probs = probs * mask_t
+                if masked_probs.sum() == 0:
+                    valid_indices = torch.nonzero(mask_t, as_tuple=True)[0]
+                    masked_probs[valid_indices] = 1.0 / valid_indices.numel()
+                else:
+                    masked_probs /= masked_probs.sum()
+                m = Categorical(masked_probs)
+                action = m.sample().item()
+                log_prob_value = m.log_prob(torch.tensor(action, device=device)).item()
+                # Store transition in the combined memory under PRIMARY_LEARNING_AGENT.
+                memory.store_transition(
+                    agent=PRIMARY_LEARNING_AGENT,
+                    state=final_obs,
+                    action=action,
+                    log_prob=log_prob_value,
+                    reward=0,  # Will be updated after reward collection.
+                    is_terminal=env.terminations[agent] or env.truncations[agent],
+                    state_value=value_net(torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)).item(),
+                    action_mask=action_mask
+                )
+            # ----- End Action Decision -----
 
-            action_counts_periodic.setdefault(LEARNING_AGENT_ID, {action: 0 for action in range(config.OUTPUT_DIM)})
-            if agent == LEARNING_AGENT_ID:
-                action_counts_periodic[LEARNING_AGENT_ID][action] += 1
-
+            action_counts_periodic[PRIMARY_LEARNING_AGENT][action] += 1
             env.step(action)
             
             step_rewards = env.rewards.copy()
@@ -458,67 +442,44 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 else:
                     reward = step_rewards[agent] + pending_rewards[agent]
                     pending_rewards[agent] = 0
-                    if agent == LEARNING_AGENT_ID:
-                        memories[LEARNING_AGENT_ID].store_transition(
-                            agent=agent,
-                            state=final_obs,
-                            action=action,
-                            log_prob=log_prob_value,
-                            reward=reward,
-                            is_terminal=env.terminations[agent] or env.truncations[agent],
-                            state_value=( 
-                                value_nets[LEARNING_AGENT_ID](torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)).item()
-                            ),
-                            action_mask=action_mask
-                        )
+                    if ag != current_injected_agent:
+                        memory.rewards[PRIMARY_LEARNING_AGENT][-1] = reward
                     episode_rewards[ag] += reward
 
-        # --- Update win tracking after the episode using env.winner ---
+        # ----- Update Win Tracking -----
         winners = env.winner
         if not isinstance(winners, list):
             winners = [winners]
-
-        if TWO_PLAYER_MODE:
-            active_opponents = [current_active_opponent] if current_active_opponent in injected_opponents else []
+        # Determine opponent key from the injected bot.
+        if current_injected_bot_type == "historical":
+            opponent_key = current_injected_bot_identifier
         else:
-            active_opponents = [opp for opp in opponent_ids if opp in injected_opponents]
-        for opp in active_opponents:
-            bot_data = injected_opponents[opp]
-            if bot_data["type"] == "historical":
-                opponent_key = bot_data["identifier"]
-            else:
-                opponent_key = bot_data["instance"].__class__.__name__
-            if opponent_key not in win_history[LEARNING_AGENT_ID]:
-                win_history[LEARNING_AGENT_ID][opponent_key] = deque(maxlen=100)
-            games_played_counter[LEARNING_AGENT_ID].setdefault(opponent_key, 0)
-            win = 1 if (LEARNING_AGENT_ID in winners and opp not in winners) else 0
-            win_history[LEARNING_AGENT_ID][opponent_key].append(win)
-            games_played_counter[LEARNING_AGENT_ID][opponent_key] += 1
+            opponent_key = current_injected_bot.__class__.__name__
+        # Update combined win history.
+        win = 1 if (PRIMARY_LEARNING_AGENT in winners and current_injected_agent not in winners) else 0
+        if opponent_key not in win_history[PRIMARY_LEARNING_AGENT]:
+            win_history[PRIMARY_LEARNING_AGENT][opponent_key] = deque(maxlen=100)
+        win_history[PRIMARY_LEARNING_AGENT][opponent_key].append(win)
+        games_played_counter[PRIMARY_LEARNING_AGENT].setdefault(opponent_key, 0)
+        games_played_counter[PRIMARY_LEARNING_AGENT][opponent_key] += 1
+        # Now update win tracking for each individual learning agent.
+        for agent in LEARNING_AGENT_IDS:
+            single_win = 1 if (agent in winners and current_injected_agent not in winners) else 0
+            if opponent_key not in win_history_agents[agent]:
+                win_history_agents[agent][opponent_key] = deque(maxlen=100)
+            win_history_agents[agent][opponent_key].append(single_win)
+            games_played_counter_agents[agent].setdefault(opponent_key, 0)
+            games_played_counter_agents[agent][opponent_key] += 1
 
-        recent_rewards[LEARNING_AGENT_ID].append(episode_rewards.get(LEARNING_AGENT_ID, 0))
-        if len(recent_rewards[LEARNING_AGENT_ID]) > 100:
-            recent_rewards[LEARNING_AGENT_ID].pop(0)
-        avg_rewards = {LEARNING_AGENT_ID: np.mean(recent_rewards[LEARNING_AGENT_ID]) if recent_rewards[LEARNING_AGENT_ID] else 0.0}
+        recent_rewards[PRIMARY_LEARNING_AGENT].append(episode_rewards.get(PRIMARY_LEARNING_AGENT, 0))
+        if len(recent_rewards[PRIMARY_LEARNING_AGENT]) > 100:
+            recent_rewards[PRIMARY_LEARNING_AGENT].pop(0)
+        avg_rewards = {PRIMARY_LEARNING_AGENT: np.mean(recent_rewards[PRIMARY_LEARNING_AGENT]) if recent_rewards[PRIMARY_LEARNING_AGENT] else 0.0}
 
-        # Compute overall win rate across all opponents.
-        if win_history[LEARNING_AGENT_ID]:
-            total_wins = sum(sum(deq) for deq in win_history[LEARNING_AGENT_ID].values())
-            total_games = sum(len(deq) for deq in win_history[LEARNING_AGENT_ID].values())
-            overall_rate = (total_wins / total_games * 100) if total_games > 0 else 0
-        else:
-            overall_rate = 0
-
-        # Log overall win rate and win rate against each opponent to TensorBoard.
-        if writer is not None:
-            writer.add_scalar(f"WinRate/{LEARNING_AGENT_ID}_Overall", overall_rate, episode)
-            for opp_key, outcomes in win_history[LEARNING_AGENT_ID].items():
-                opp_rate = (sum(outcomes) / len(outcomes) * 100) if outcomes else 0
-                writer.add_scalar(f"WinRate/{LEARNING_AGENT_ID}_vs_{opp_key}", opp_rate, episode)
-
-        memory = memories[LEARNING_AGENT_ID]
-        rewards_agent = memory.rewards[LEARNING_AGENT_ID]
-        dones_agent = memory.is_terminals[LEARNING_AGENT_ID]
-        values_agent = memory.state_values[LEARNING_AGENT_ID]
+        # ----- Compute GAE using the combined memory -----
+        rewards_agent = memory.rewards[PRIMARY_LEARNING_AGENT]
+        dones_agent = memory.is_terminals[PRIMARY_LEARNING_AGENT]
+        values_agent = memory.state_values[PRIMARY_LEARNING_AGENT]
         next_values_agent = values_agent[1:] + [0]
         mean_reward = np.mean(rewards_agent)
         std_reward = np.std(rewards_agent) + 1e-5
@@ -531,21 +492,21 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
             gamma=config.GAMMA,
             lam=config.GAE_LAMBDA,
         )
-        memory.advantages[LEARNING_AGENT_ID] = advantages
-        memory.returns[LEARNING_AGENT_ID] = returns_
-            
+        memory.advantages[PRIMARY_LEARNING_AGENT] = advantages
+        memory.returns[PRIMARY_LEARNING_AGENT] = returns_
+
         episode_obp_data = extract_obp_training_data(env)
         obp_memory.extend(episode_obp_data)
         
+        # ----- Update Policy/Value Networks -----
         if episode % config.UPDATE_STEPS == 0:
-            memory = memories[LEARNING_AGENT_ID]
-            if memory.states[LEARNING_AGENT_ID]:
-                states = torch.tensor(np.array(memory.states[LEARNING_AGENT_ID], dtype=np.float32), device=device)
-                actions_ = torch.tensor(np.array(memory.actions[LEARNING_AGENT_ID], dtype=np.int64), device=device)
-                old_log_probs = torch.tensor(np.array(memory.log_probs[LEARNING_AGENT_ID], dtype=np.float32), device=device)
-                returns_tensor = torch.tensor(np.array(memory.returns[LEARNING_AGENT_ID], dtype=np.float32), device=device)
-                advantages_tensor = torch.tensor(np.array(memory.advantages[LEARNING_AGENT_ID], dtype=np.float32), device=device)
-                action_masks_ = torch.tensor(np.array(memory.action_masks[LEARNING_AGENT_ID], dtype=np.float32), device=device)
+            if memory.states[PRIMARY_LEARNING_AGENT]:
+                states = torch.tensor(np.array(memory.states[PRIMARY_LEARNING_AGENT], dtype=np.float32), device=device)
+                actions_ = torch.tensor(np.array(memory.actions[PRIMARY_LEARNING_AGENT], dtype=np.int64), device=device)
+                old_log_probs = torch.tensor(np.array(memory.log_probs[PRIMARY_LEARNING_AGENT], dtype=np.float32), device=device)
+                returns_tensor = torch.tensor(np.array(memory.returns[PRIMARY_LEARNING_AGENT], dtype=np.float32), device=device)
+                advantages_tensor = torch.tensor(np.array(memory.advantages[PRIMARY_LEARNING_AGENT], dtype=np.float32), device=device)
+                action_masks_ = torch.tensor(np.array(memory.action_masks[PRIMARY_LEARNING_AGENT], dtype=np.float32), device=device)
                 adv_std = advantages_tensor.std()
                 if adv_std < 1e-5:
                     normalized_advantages = advantages_tensor
@@ -561,7 +522,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 classification_losses = []
 
                 for _ in range(config.K_EPOCHS):
-                    probs, _, opponent_logits = policy_nets[LEARNING_AGENT_ID](states, None)
+                    probs, _, opponent_logits = policy_net(states, None)
                     probs = torch.clamp(probs, 1e-8, 1.0)
                     masked_probs = probs * action_masks_
                     row_sums = masked_probs.sum(dim=-1, keepdim=True)
@@ -579,31 +540,22 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     surr1 = ratios * normalized_advantages
                     surr2 = torch.clamp(ratios, 1 - config.EPS_CLIP, 1 + config.EPS_CLIP) * normalized_advantages
                     policy_loss = -torch.min(surr1, surr2).mean() - static_entropy_coef * entropy
-                    state_values = value_nets[LEARNING_AGENT_ID](states).squeeze()
+                    state_values = value_net(states).squeeze()
                     value_loss = nn.MSELoss()(state_values, returns_tensor)
     
                     if opponent_logits is not None:
-                        if TWO_PLAYER_MODE:
-                            active_opp = current_active_opponent
+                        if current_injected_bot_type == "historical":
+                            target_label = historical_label_mapping[current_injected_bot_identifier]
                         else:
-                            active_opp = list(injected_opponents.keys())[0] if injected_opponents else None
-                        if active_opp is not None:
-                            bot_data = injected_opponents[active_opp]
-                            if bot_data["type"] == "historical":
-                                target_label = historical_label_mapping[bot_data["identifier"]]
-                            else:
-                                target_label = HARD_CODED_LABELS.get(bot_data["instance"].__class__.__name__, 0)
-                            target_labels = torch.full((opponent_logits.size(0),), target_label, dtype=torch.long, device=device)
-                            classification_loss = F.cross_entropy(opponent_logits, target_labels)
-                            classification_losses.append(classification_loss.item())
-                            predicted_labels = opponent_logits.argmax(dim=1)
-                            accuracy = (predicted_labels == target_labels).float().mean().item()
-                            if writer is not None:
-                                writer.add_scalar(f"Accuracy/Classification/{LEARNING_AGENT_ID}", accuracy, episode)
-                                writer.add_scalar(f"Accuracy/Classification/{LEARNING_AGENT_ID}_vs_{target_label}", accuracy, episode)
-                            total_loss = policy_loss + 0.5 * value_loss + config.AUX_LOSS_WEIGHT * classification_loss
-                        else:
-                            total_loss = policy_loss + 0.5 * value_loss
+                            target_label = HARD_CODED_LABELS.get(current_injected_bot.__class__.__name__, 0)
+                        target_labels = torch.full((opponent_logits.size(0),), target_label, dtype=torch.long, device=device)
+                        classification_loss = F.cross_entropy(opponent_logits, target_labels)
+                        classification_losses.append(classification_loss.item())
+                        predicted_labels = opponent_logits.argmax(dim=1)
+                        accuracy = (predicted_labels == target_labels).float().mean().item()
+                        if writer is not None:
+                            writer.add_scalar(f"Accuracy/Classification/{PRIMARY_LEARNING_AGENT}", accuracy, episode)
+                        total_loss = policy_loss + 0.5 * value_loss + config.AUX_LOSS_WEIGHT * classification_loss
                     else:
                         total_loss = policy_loss + 0.5 * value_loss
     
@@ -612,30 +564,29 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     entropies.append(entropy.item())
                     total_loss.backward()
     
-                    p_grad_norm = sum(param.grad.data.norm(2).item() ** 2 for param in policy_nets[LEARNING_AGENT_ID].parameters() if param.grad is not None) ** 0.5
+                    p_grad_norm = sum(param.grad.data.norm(2).item() ** 2 for param in policy_net.parameters() if param.grad is not None) ** 0.5
                     policy_grad_norms.append(p_grad_norm)
-                    v_grad_norm = sum(param.grad.data.norm(2).item() ** 2 for param in value_nets[LEARNING_AGENT_ID].parameters() if param.grad is not None) ** 0.5
+                    v_grad_norm = sum(param.grad.data.norm(2).item() ** 2 for param in value_net.parameters() if param.grad is not None) ** 0.5
                     value_grad_norms.append(v_grad_norm)
     
-                    torch.nn.utils.clip_grad_norm_(policy_nets[LEARNING_AGENT_ID].parameters(), max_norm=config.MAX_NORM)
-                    torch.nn.utils.clip_grad_norm_(value_nets[LEARNING_AGENT_ID].parameters(), max_norm=config.MAX_NORM)
-                    optimizers_policy[LEARNING_AGENT_ID].step()
-                    optimizers_value[LEARNING_AGENT_ID].step()
+                    torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=config.MAX_NORM)
+                    torch.nn.utils.clip_grad_norm_(value_net.parameters(), max_norm=config.MAX_NORM)
+                    optimizer_policy.step()
+                    optimizer_value.step()
     
                 if writer is not None:
-                    writer.add_scalar(f"Loss/Policy/{LEARNING_AGENT_ID}", np.mean(policy_losses), episode)
-                    writer.add_scalar(f"Loss/Value/{LEARNING_AGENT_ID}", np.mean(value_losses), episode)
-                    writer.add_scalar(f"Entropy/{LEARNING_AGENT_ID}", np.mean(entropies), episode)
-                    writer.add_scalar(f"Entropy_Coef/{LEARNING_AGENT_ID}", static_entropy_coef, episode)
-                    writer.add_scalar(f"KL_Divergence/{LEARNING_AGENT_ID}", np.mean(kl_divs), episode)
-                    writer.add_scalar(f"Gradient_Norms/Policy/{LEARNING_AGENT_ID}", np.mean(policy_grad_norms), episode)
-                    writer.add_scalar(f"Gradient_Norms/Value/{LEARNING_AGENT_ID}", np.mean(value_grad_norms), episode)
-                    writer.add_scalar(f"Loss/Classification/{LEARNING_AGENT_ID}", np.mean(classification_losses) if classification_losses else 0.0, episode)
-    
-                memories[LEARNING_AGENT_ID].reset()
+                    writer.add_scalar(f"Loss/Policy/{PRIMARY_LEARNING_AGENT}", np.mean(policy_losses), episode)
+                    writer.add_scalar(f"Loss/Value/{PRIMARY_LEARNING_AGENT}", np.mean(value_losses), episode)
+                    writer.add_scalar(f"Entropy/{PRIMARY_LEARNING_AGENT}", np.mean(entropies), episode)
+                    writer.add_scalar(f"Entropy_Coef/{PRIMARY_LEARNING_AGENT}", static_entropy_coef, episode)
+                    writer.add_scalar(f"KL_Divergence/{PRIMARY_LEARNING_AGENT}", np.mean(kl_divs), episode)
+                    writer.add_scalar(f"Gradient_Norms/Policy/{PRIMARY_LEARNING_AGENT}", np.mean(policy_grad_norms), episode)
+                    writer.add_scalar(f"Gradient_Norms/Value/{PRIMARY_LEARNING_AGENT}", np.mean(value_grad_norms), episode)
+                    writer.add_scalar(f"Loss/Classification/{PRIMARY_LEARNING_AGENT}", np.mean(classification_losses) if classification_losses else 0.0, episode)
+                memory.reset()
     
         if len(obp_memory) > 100:
-            avg_loss_obp, accuracy = train_obp(obp_model, obp_optimizer, obp_memory, device, logger)
+            avg_loss_obp, accuracy = train_obp(obp_model, obp_optimizer, obp_memory, device, logging.getLogger('Train'))
             if avg_loss_obp is not None and accuracy is not None and writer is not None:
                 writer.add_scalar("OBP/Loss", avg_loss_obp, episode)
                 writer.add_scalar("OBP/Accuracy", accuracy, episode)
@@ -643,80 +594,87 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
     
         if episode % config.CHECKPOINT_INTERVAL == 0 and load_checkpoint:
             save_checkpoint(
-                {LEARNING_AGENT_ID: policy_nets[LEARNING_AGENT_ID]},
-                {LEARNING_AGENT_ID: value_nets[LEARNING_AGENT_ID]},
-                {LEARNING_AGENT_ID: optimizers_policy[LEARNING_AGENT_ID]},
-                {LEARNING_AGENT_ID: optimizers_value[LEARNING_AGENT_ID]},
+                {PRIMARY_LEARNING_AGENT: policy_net},
+                {PRIMARY_LEARNING_AGENT: value_net},
+                {PRIMARY_LEARNING_AGENT: optimizer_policy},
+                {PRIMARY_LEARNING_AGENT: optimizer_value},
                 obp_model,
                 obp_optimizer,
                 episode,
                 checkpoint_dir=checkpoint_dir
             )
-            logger.info(f"Saved global checkpoint at episode {episode}.")
+            logging.getLogger('Train').info(f"Saved global checkpoint at episode {episode}.")
     
         steps_since_log += steps_in_episode
         episodes_since_log += 1
     
         if episode % config.LOG_INTERVAL == 0:
-            avg_rewards_str = f"{LEARNING_AGENT_ID}: {avg_rewards.get(LEARNING_AGENT_ID, 0.0):.2f}"
+            avg_rewards_str = f"{PRIMARY_LEARNING_AGENT}: {avg_rewards.get(PRIMARY_LEARNING_AGENT, 0.0):.2f}"
             avg_steps_per_episode = steps_since_log / episodes_since_log
             elapsed_time = time.time() - last_log_time
             steps_per_second = steps_since_log / elapsed_time if elapsed_time > 0 else 0.0
-            logger.info(
+            logging.getLogger('Train').info(
                 f"Episode {episode}\tAverage Rewards: [{avg_rewards_str}]\t"
                 f"Avg Steps/Ep: {avg_steps_per_episode:.2f}\t"
                 f"Time since last log: {elapsed_time:.2f} seconds\t"
                 f"Steps/s: {steps_per_second:.2f}"
             )
-            if writer is not None:
-                writer.add_scalar(f"WinRate/{LEARNING_AGENT_ID}_Overall", overall_rate, episode)
-                writer.add_scalar(f"Average Reward/{LEARNING_AGENT_ID}", avg_rewards.get(LEARNING_AGENT_ID, 0.0), episode)
-                for action in range(config.OUTPUT_DIM):
-                    writer.add_scalar(
-                        f"Action Counts/{LEARNING_AGENT_ID}/Action_{action}",
-                        action_counts_periodic[LEARNING_AGENT_ID][action],
-                        episode
-                    )
-            invalid_action_counts_periodic[LEARNING_AGENT_ID] = 0
+            writer.add_scalar(f"WinRate/{PRIMARY_LEARNING_AGENT}_Overall", avg_rewards.get(PRIMARY_LEARNING_AGENT, 0.0), episode)
+            writer.add_scalar(f"Average Reward/{PRIMARY_LEARNING_AGENT}", avg_rewards.get(PRIMARY_LEARNING_AGENT, 0.0), episode)
+            # Log combined win rates.
+            for opp_key, outcomes in win_history[PRIMARY_LEARNING_AGENT].items():
+                overall_rate = (sum(outcomes) / len(outcomes) * 100) if outcomes else 0
+                writer.add_scalar(f"WinRate/{PRIMARY_LEARNING_AGENT}_vs_{opp_key}", overall_rate, episode)
+            # Log win rates for each individual learning agent.
+            for agent in LEARNING_AGENT_IDS:
+                for opp_key, outcomes in win_history_agents[agent].items():
+                    rate = (sum(outcomes) / len(outcomes) * 100) if outcomes else 0
+                    writer.add_scalar(f"WinRate/{agent}_vs_{opp_key}", rate, episode)
+    
             for action in range(config.OUTPUT_DIM):
-                action_counts_periodic[LEARNING_AGENT_ID][action] = 0
+                writer.add_scalar(
+                    f"Action Counts/{PRIMARY_LEARNING_AGENT}/Action_{action}",
+                    action_counts_periodic[PRIMARY_LEARNING_AGENT][action],
+                    episode
+                )
+            invalid_action_counts_periodic[PRIMARY_LEARNING_AGENT] = 0
+            for action in range(config.OUTPUT_DIM):
+                action_counts_periodic[PRIMARY_LEARNING_AGENT][action] = 0
             last_log_time = time.time()
             steps_since_log = 0
             episodes_since_log = 0
-            for opp_key, count in games_played_counter[LEARNING_AGENT_ID].items():
-                if writer is not None:
-                    writer.add_scalar(f"games_played/{LEARNING_AGENT_ID}_vs_{opp_key}", count, episode)
-            games_played_counter[LEARNING_AGENT_ID] = {}
-            if episode % config.CULL_INTERVAL == 0:
-                avg_reward = np.mean(recent_rewards[LEARNING_AGENT_ID]) if recent_rewards[LEARNING_AGENT_ID] else 0.0
-                logger.info(f"Culling condition check for {LEARNING_AGENT_ID} with average reward {avg_reward:.2f}.")
+            for opp_key, count in games_played_counter[PRIMARY_LEARNING_AGENT].items():
+                writer.add_scalar(f"games_played/{PRIMARY_LEARNING_AGENT}_vs_{opp_key}", count, episode)
+            games_played_counter[PRIMARY_LEARNING_AGENT] = {}
     
     if writer is not None:
         writer.close()
     
     trained_agents = {
-        LEARNING_AGENT_ID: {
-            'policy_net': policy_nets[LEARNING_AGENT_ID],
-            'value_net': value_nets[LEARNING_AGENT_ID],
+        PRIMARY_LEARNING_AGENT: {
+            'policy_net': policy_net,
+            'value_net': value_net,
             'obp_model': obp_model
         }
     }
     
     return {
         'agents': trained_agents,
-        'optimizers_policy': optimizers_policy,
-        'optimizers_value': optimizers_value,
+        'optimizers_policy': {PRIMARY_LEARNING_AGENT: optimizer_policy},
+        'optimizers_value': {PRIMARY_LEARNING_AGENT: optimizer_value},
         'obp_optimizer': obp_optimizer
     }
 
 def main():
     """
-    Trains one learning agent (player_0) against injected opponent bots.
-    Opponents swap every 5 rounds; in two-player mode the active opponent alternates between player_1 and player_2.
+    Trains a single learning agent (with shared networks) controlling two players ("player_0" and "player_1")
+    against an injected opponent ("player_2"). Uses a memory system and transformer memory embedding normalization
+    adapted from train_vs_everyone.py.
+    Additionally, win rates per opponent are tracked separately for player_0 and player_1.
     """
     set_seed(config.SEED)
     device = torch.device(config.DEVICE)
-    if config.USE_WRAPPER: 
+    if config.USE_WRAPPER:
         base_env = LiarsDeckEnv(num_players=config.NUM_PLAYERS, render_mode=config.RENDER_MODE)
         env = RewardRestrictionWrapper2(base_env)
     else:
