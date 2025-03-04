@@ -775,11 +775,9 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                         mem_emb_list = [get_opponent_memory_embedding(agent, opp, device) for opp in opponents]
                         mem_tensor = torch.cat(mem_emb_list, dim=0)
                         if mem_tensor.numel() > 0:
-                            mem_min, mem_max = mem_tensor.min(), mem_tensor.max()
-                            if (mem_max - mem_min).item() != 0:
-                                mem_tensor = (mem_tensor - mem_min) / (mem_max - mem_min)
-                            else:
-                                mem_tensor = torch.zeros_like(mem_tensor)
+                            # L2 normalization for transformer embedding instead of min-max normalization
+                            norm_val = torch.norm(mem_tensor, p=2)
+                            mem_tensor = mem_tensor if norm_val.item() == 0 else mem_tensor / norm_val
                         memory_embeddings = torch.split(mem_tensor, 1, dim=0) if mem_tensor is not None else []
                     else:
                         memory_embeddings = []
