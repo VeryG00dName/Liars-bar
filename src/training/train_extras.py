@@ -5,6 +5,11 @@ import numpy as np
 import torch
 from src import config
 import os
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+from io import BytesIO
+from PIL import Image
 
 def set_seed(seed=42):
     """
@@ -119,3 +124,115 @@ def run_obp_inference(obp_model, obs_array, device, num_players, memory_embeddin
         bluff_prob = probs[0, 1].item()
         obp_probs.append(bluff_prob)
     return obp_probs
+
+def collect_strategy_embeddings(agents, opponents, embeddings_dict):
+    """
+    Collect strategy embeddings for visualization.
+
+    Args:
+        agents: List of agent IDs.
+        opponents: List of opponent IDs/types.
+        embeddings_dict: Dictionary mapping (agent, opponent) tuples to embeddings.
+
+    Returns:
+        X: Array of embeddings.
+        labels: List of (agent, opponent) pairs corresponding to each embedding.
+    """
+    X = []
+    labels = []
+    
+    for agent in agents:
+        for opponent in opponents:
+            if (agent, opponent) in embeddings_dict:
+                X.append(embeddings_dict[(agent, opponent)])
+                labels.append((agent, opponent))
+    
+    return np.array(X), labels
+
+REFERENCE_PCA = None
+
+def initialize_reference_pca(reference_embeddings):
+    """
+    Initialize the global reference PCA using the provided reference embeddings.
+
+    Args:
+        reference_embeddings (numpy.ndarray): A 2D array of reference embeddings.
+    """
+    global REFERENCE_PCA
+    if REFERENCE_PCA is None:
+        REFERENCE_PCA = PCA(n_components=2)
+        REFERENCE_PCA.fit(reference_embeddings)
+
+def visualize_strategy_embeddings(writer, embeddings_dict, agents, opponents, episode, reference_embeddings):
+    """
+    Visualize strategy embeddings using a fixed PCA transformation computed from a reference dataset.
+    The legend is placed outside the plot.
+
+    Args:
+        writer: TensorBoard writer.
+        embeddings_dict (dict): Mapping (agent, opponent) -> embedding (numpy array).
+        agents (list): List of agent IDs.
+        opponents (list): List of opponent IDs/types.
+        episode (int): Current episode number.
+        reference_embeddings (numpy.ndarray): A 2D array of reference embeddings to initialize the PCA.
+    """
+    # Initialize reference PCA once using the provided reference data.
+    initialize_reference_pca(reference_embeddings)
+    
+    # Collect current embeddings.
+    X, labels = collect_strategy_embeddings(agents, opponents, embeddings_dict)
+    if len(X) < 2:
+        return  # Need at least 2 points for projection.
+    
+    # Use the fixed PCA transform to project the current embeddings.
+    X_2d = REFERENCE_PCA.transform(X)
+    
+    # Create plot.
+    plt.figure(figsize=(10, 8))
+    
+    # Define unique agents and opponents for color and marker mapping.
+    unique_agents = list(set(label[0] for label in labels))
+    unique_opponents = list(set(label[1] for label in labels))
+    
+    colors = plt.cm.rainbow(np.linspace(0, 1, len(unique_agents)))
+    markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'h', 'H', '+', 'x', '|', '_']
+    
+    agent_to_color = {agent: colors[i] for i, agent in enumerate(unique_agents)}
+    opponent_to_marker = {opponent: markers[i % len(markers)] for i, opponent in enumerate(unique_opponents)}
+    
+    # Plot each point.
+    for (agent, opponent), point in zip(labels, X_2d):
+        plt.scatter(point[0], point[1], color=agent_to_color[agent],
+                    marker=opponent_to_marker[opponent], s=100)
+    
+    # Create legend handles.
+    agent_patches = [plt.Line2D([0], [0], marker='o', color='w',
+                      markerfacecolor=agent_to_color[agent], markersize=10,
+                      label=f'Agent {agent}') for agent in unique_agents]
+    opponent_patches = [plt.Line2D([0], [0], marker=opponent_to_marker[opponent],
+                         color='black', markersize=10,
+                         label=f'Opponent {opponent}') for opponent in unique_opponents]
+    
+    # Place the legend outside the plot.
+    plt.legend(handles=agent_patches + opponent_patches,
+               bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
+    plt.subplots_adjust(right=0.7)
+    
+    plt.title(f'Strategy Embeddings (PCA Reference) - Episode {episode}')
+    plt.xlabel('Component 1')
+    plt.ylabel('Component 2')
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    # Save plot to image buffer.
+    buf = BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    
+    # Convert to PIL Image and then to numpy array.
+    image = Image.open(buf)
+    image_array = np.array(image)
+    
+    # Add image to TensorBoard.
+    writer.add_image('Strategy_Embeddings_PCA', image_array, episode, dataformats='HWC')
+    
+    plt.close()

@@ -17,6 +17,13 @@ import torch.optim as optim
 from torch.distributions import Categorical
 from collections import deque  # For moving average win rate tracking
 
+# Additional imports for visualization.
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+from io import BytesIO
+from PIL import Image
+
 # Environment & model imports
 from src.env.reward_restriction_wrapper_2 import RewardRestrictionWrapper2
 from src.env.liars_deck_env_core import LiarsDeckEnv
@@ -63,15 +70,113 @@ from src.training.train_extras import (
 from src.training.train_transformer import EventEncoder
 
 # ---------------------------
+# Global variable for reference PCA.
+REFERENCE_PCA = None
+
+def initialize_reference_pca(reference_embeddings):
+    """
+    Initialize the global reference PCA using the provided reference embeddings.
+    """
+    global REFERENCE_PCA
+    if REFERENCE_PCA is None:
+        REFERENCE_PCA = PCA(n_components=2)
+        REFERENCE_PCA.fit(reference_embeddings)
+
+def collect_strategy_embeddings(agents, opponents, embeddings_dict):
+    """
+    Collect strategy embeddings for visualization.
+
+    Args:
+        agents (list): List of agent IDs.
+        opponents (list): List of opponent IDs/types.
+        embeddings_dict (dict): Mapping (agent, opponent) -> embedding (numpy array).
+
+    Returns:
+        X (numpy.ndarray): Array of embeddings.
+        labels (list): List of (agent, opponent) pairs corresponding to each embedding.
+    """
+    X = []
+    labels = []
+    for agent in agents:
+        for opponent in opponents:
+            if (agent, opponent) in embeddings_dict:
+                X.append(embeddings_dict[(agent, opponent)])
+                labels.append((agent, opponent))
+    return np.array(X), labels
+
+def visualize_strategy_embeddings(writer, embeddings_dict, agents, opponents, episode, method='tsne', reference_embeddings=None):
+    """
+    Visualize strategy embeddings using dimensionality reduction.
+    If method is 'pca', a fixed PCA transform is computed from reference_embeddings.
+    The legend is placed outside the plot.
+
+    Args:
+        writer: TensorBoard writer.
+        embeddings_dict (dict): Mapping (agent, opponent) -> embedding (numpy array).
+        agents (list): List of agent IDs.
+        opponents (list): List of opponent IDs/types.
+        episode (int): Current episode number.
+        method (str): 'pca' or 'tsne'.
+        reference_embeddings (numpy.ndarray): 2D array of embeddings for initializing PCA.
+    """
+    X, labels = collect_strategy_embeddings(agents, opponents, embeddings_dict)
+    if len(X) < 2:
+        return  # Need at least 2 points
+
+    if method == 'pca':
+        if reference_embeddings is None:
+            raise ValueError("Reference embeddings must be provided for PCA.")
+        initialize_reference_pca(reference_embeddings)
+        X_2d = REFERENCE_PCA.transform(X)
+    else:
+        reducer = TSNE(n_components=2, perplexity=min(30, len(X)-1) if len(X) > 1 else 1)
+        X_2d = reducer.fit_transform(X)
+
+    plt.figure(figsize=(10, 8))
+    unique_agents = list(set(label[0] for label in labels))
+    unique_opponents = list(set(label[1] for label in labels))
+    colors = plt.cm.rainbow(np.linspace(0, 1, len(unique_agents)))
+    markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'h', 'H', '+', 'x', '|', '_']
+    agent_to_color = {agent: colors[i] for i, agent in enumerate(unique_agents)}
+    opponent_to_marker = {opponent: markers[i % len(markers)] for i, opponent in enumerate(unique_opponents)}
+
+    for (agent, opponent), point in zip(labels, X_2d):
+        plt.scatter(point[0], point[1], color=agent_to_color[agent],
+                    marker=opponent_to_marker[opponent], s=100)
+
+    agent_patches = [plt.Line2D([0], [0], marker='o', color='w',
+                      markerfacecolor=agent_to_color[agent], markersize=10,
+                      label=f'Agent {agent}') for agent in unique_agents]
+    opponent_patches = [plt.Line2D([0], [0], marker=opponent_to_marker[opponent],
+                         color='black', markersize=10,
+                         label=f'Opponent {opponent}') for opponent in unique_opponents]
+    
+    plt.legend(handles=agent_patches + opponent_patches,
+               bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
+    plt.subplots_adjust(right=0.7)
+    
+    plt.title(f'Strategy Embeddings ({method.upper()}) - Episode {episode}')
+    plt.xlabel('Component 1')
+    plt.ylabel('Component 2')
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    buf = BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    image = Image.open(buf)
+    image_array = np.array(image)
+    writer.add_image(f'Strategy_Embeddings_{method.upper()}', image_array, episode, dataformats='HWC')
+    plt.close()
+
+# ---------------------------
 # Define a mapping from hard-coded agent class names to integer labels.
 HARD_CODED_LABELS = {
     "GreedyCardSpammer": 0,
-    "GreedyCardSpammer": 1,
-    #"StrategicChallenger": 1,
+    "StrategicChallenger": 1,
     "TableNonTableAgent": 2,
     "Classic": 3,
     "TableFirstConservativeChallenger": 4,
-    #"SelectiveTableConservativeChallenger": 5,
+    "SelectiveTableConservativeChallenger": 5,
 }
 # The historical models will be assigned distinct labels.
 historical_label_mapping = {}
@@ -131,7 +236,6 @@ strategy_transformer.eval()
 historical_models = load_specific_historical_models(config.HISTORICAL_MODEL_DIR, device)
 print(f"Loaded {len(historical_models)} historical PPO models: {', '.join([id for _, id in historical_models])}")
 
-# Build a mapping from historical model identifier to unique label.
 for idx, (_, identifier) in enumerate(historical_models):
     historical_label_mapping[identifier] = len(HARD_CODED_LABELS) + idx
 
@@ -145,34 +249,28 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
     assert len(agents) == config.NUM_PLAYERS, f"Expected {config.NUM_PLAYERS} agents, but got {len(agents)} agents."
     num_opponents = config.NUM_PLAYERS - 1
     config.set_derived_config(env.observation_spaces[agents[0]], env.action_spaces[agents[0]], num_opponents)
-
-
-    # Combine hardcoded agents and historical models for injected bots.
-    hardcoded_agent_classes = [GreedyCardSpammer, 
+    
+    hardcoded_agent_classes = [GreedyCardSpammer,
+                               TableFirstConservativeChallenger, 
                                StrategicChallenger, 
+                               SelectiveTableConservativeChallenger,
                                TableNonTableAgent, 
-                               Classic
-                               ]
+                               Classic]
     injected_bots = []
     for cls in hardcoded_agent_classes:
         injected_bots.append(("hardcoded", cls))
     for hist_model, identifier in historical_models:
         injected_bots.append(("historical", (hist_model, identifier)))
-
-    # Initialize moving average win tracking:
-    # For each agent (the learning agents) and each opponent type, we keep a deque (window=100) of binary win outcomes.
+    
     win_history = {agent: {} for agent in agents}
-
-    # New dictionary to count games played over a moving window of 100 episodes.
     games_played_counter = {agent: {} for agent in agents}
-
-    # Initialize networks, optimizers, and memories for each agent.
+    
     policy_nets = {}
     value_nets = {}
     optimizers_policy = {}
     optimizers_value = {}
     memories = {}
-
+    
     for agent in agents:
         policy_net = PolicyNetwork(
             input_dim=config.INPUT_DIM,
@@ -195,8 +293,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
         optimizers_policy[agent] = optim.Adam(policy_net.parameters(), lr=config.LEARNING_RATE)
         optimizers_value[agent] = optim.Adam(value_net.parameters(), lr=config.LEARNING_RATE)
         memories[agent] = RolloutMemory([agent])
-
-    # Initialize Opponent Behavior Predictor (OBP)
+    
     obp_model = OpponentBehaviorPredictor(
         input_dim=config.OPPONENT_INPUT_DIM, 
         hidden_dim=config.OPPONENT_HIDDEN_DIM, 
@@ -205,18 +302,17 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
     ).to(device)
     obp_optimizer = optim.Adam(obp_model.parameters(), lr=config.OPPONENT_LEARNING_RATE)
     obp_memory = []
-
-    obp_model.eval()  # Disable dropout, batch norm randomness
+    
+    obp_model.eval()
     example_observation = torch.randn(1, config.OPPONENT_INPUT_DIM).to(device)
     example_memory_embedding = torch.randn(1, config.STRATEGY_DIM).to(device)
-
     obp_model = torch.jit.trace(obp_model, (example_observation, example_memory_embedding))
     obp_model.train(True)
-
+    
     logger = logging.getLogger('Train')
     writer = get_tensorboard_writer(log_dir=config.TENSORBOARD_RUNS_DIR) if log_tensorboard else None
     checkpoint_dir = load_directory if load_directory is not None else config.CHECKPOINT_DIR
-
+    
     if load_checkpoint:
         checkpoint_data = load_checkpoint_if_available(
             policy_nets,
@@ -234,39 +330,38 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
             start_episode = 1
     else:
         start_episode = 1
-
+    
     static_entropy_coef = config.INIT_ENTROPY_COEF
     last_log_time = time.time()
     steps_since_log = 0
     episodes_since_log = 0
-
+    
     invalid_action_counts_periodic = {agent: 0 for agent in agents}
     action_counts_periodic = {agent: {action: 0 for action in range(config.OUTPUT_DIM)} for agent in agents}
     recent_rewards = {agent: [] for agent in agents}
     original_agent_order = list(env.agents)
-
-    # Variables to hold the current injected bot.
+    
     current_injected_agent_id = None
     current_injected_agent_instance = None
-    current_injected_bot_type = None  # "hardcoded" or "historical"
-    current_injected_bot_identifier = None  # For historical bots, track identifier
-
+    current_injected_bot_type = None  
+    current_injected_bot_identifier = None  
+    
     global_step = 0
     tracked_agent = None  
     tracked_agent_last_embeddings = {}
-
+    
+    # Dictionary for storing embeddings for visualization.
+    strategy_embeddings_by_agent_opponent = {}
+    
     for episode in range(start_episode, num_episodes + 1):
         env_seed = config.SEED + episode
         obs, infos = env.reset(seed=env_seed)
         agents = env.agents
         pending_rewards = {agent: 0.0 for agent in agents}
-
-        # Every 5 episodes, choose a new injected bot for one randomly selected agent.
+    
         if (episode - start_episode) % 5 == 0:
-            # Choose a learning agent at random.
             current_injected_agent_id = random.choice(agents)
             tracked_agent = current_injected_agent_id
-            # Instead of a uniform random selection, select based on win rates.
             selected_bot = select_injected_bot(current_injected_agent_id, injected_bots, win_history, games_played_counter)
             current_injected_bot_type = selected_bot[0]
             if current_injected_bot_type == "hardcoded":
@@ -282,25 +377,23 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 current_injected_bot_identifier = bot_class.__name__
             else:
                 current_injected_agent_instance, current_injected_bot_identifier = selected_bot[1]
-            #logger.info(f"Episode {episode}: Injecting {current_injected_bot_type} bot ({current_injected_bot_identifier}) for agent {current_injected_agent_id}")
-
+    
         episode_rewards = {agent: 0 for agent in agents}
         steps_in_episode = 0
-
+    
         while env.agent_selection is not None:
             steps_in_episode += 1
             global_step += 1
             agent = env.agent_selection
-
+    
             if env.terminations[agent] or env.truncations[agent]:
                 env.step(None)
                 continue
-
+    
             observation_dict = env.observe(agent)
             observation = observation_dict[agent]
             action_mask = env.infos[agent]['action_mask']
-
-            # Integrate OBP memory (or use zeros for the injected bot).
+    
             if agent == current_injected_agent_id:
                 obp_probs = run_obp_inference(
                     obp_model, observation, device, env.num_players,
@@ -329,6 +422,12 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                                     if writer is not None:
                                         writer.add_scalar(f"MemorySimilarity/{agent}/{tracked_agent}", similarity, global_step)
                                 tracked_agent_last_embeddings[agent] = strategy_embedding.detach()
+                            if current_injected_agent_id is not None:
+                                if current_injected_bot_type == "historical":
+                                    opponent_key = current_injected_bot_identifier
+                                else:
+                                    opponent_key = current_injected_agent_instance.__class__.__name__
+                                strategy_embeddings_by_agent_opponent[(agent, opponent_key)] = strategy_embedding.cpu().detach().numpy().flatten()
                         else:
                             embeddings_list.append(np.zeros(config.STRATEGY_DIM, dtype=np.float32))
                 if embeddings_list:
@@ -347,12 +446,10 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 transformer_features = normalized_arr
                 obp_probs = run_obp_inference(obp_model, observation, device, env.num_players,
                                               memory_embeddings=obp_memory_embeddings)
-
-            # Build final observation based on the agent type.
+    
             if agent == current_injected_agent_id:
                 base_obs = observation
                 obp_arr = np.array(obp_probs, dtype=np.float32)
-                # For historical models, use their expected input dim; for hardcoded, use config.INPUT_DIM.
                 if current_injected_bot_type == "historical":
                     expected_input_dim = current_injected_agent_instance.fc1.weight.shape[1]
                 else:
@@ -366,8 +463,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     final_obs = np.concatenate([base_obs, obp_arr], axis=0)
             else:
                 final_obs = np.concatenate([observation, np.array(obp_probs, dtype=np.float32), transformer_features], axis=0)
-
-            # Decide action.
+    
             if agent == current_injected_agent_id:
                 if current_injected_bot_type == "hardcoded":
                     action = current_injected_agent_instance.play_turn(observation, action_mask, table_card=None)
@@ -387,7 +483,6 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     m = Categorical(masked_probs)
                     action = m.sample().item()
                     log_prob_value = m.log_prob(torch.tensor(action, device=device)).item()
-                # Do not store transitions for injected bots.
             else:
                 observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
                 probs, _, _ = policy_nets[agent](observation_tensor, None)
@@ -402,13 +497,12 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 m = Categorical(masked_probs)
                 action = m.sample().item()
                 log_prob_value = m.log_prob(torch.tensor(action, device=device)).item()
-
+    
             action_counts_periodic[agent][action] += 1
             env.step(action)
             
             step_rewards = env.rewards.copy()
             env.rewards = {agent: 0 for agent in env.possible_agents}
-            # Update pending rewards.
             for ag in agents:
                 if ag != agent:
                     pending_rewards[ag] += step_rewards[ag]
@@ -430,12 +524,11 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                             action_mask=action_mask
                         )
                     episode_rewards[ag] += reward
-
-        # --- Update moving average win tracking after the episode using env.winner ---
+    
         winners = env.winner
         if not isinstance(winners, list):
             winners = [winners]
-
+    
         if current_injected_agent_id is not None:
             if current_injected_bot_type == "historical":
                 opponent_key = current_injected_bot_identifier
@@ -444,23 +537,19 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
             for agent in agents:
                 if agent == current_injected_agent_id:
                     continue
-                # Initialize the deque if it doesn't exist yet.
                 if opponent_key not in win_history[agent]:
                     win_history[agent][opponent_key] = deque(maxlen=100)
-                # Determine win (1) or loss (0) for this episode.
                 win = 1 if (agent in winners and current_injected_agent_id not in winners) else 0
                 win_history[agent][opponent_key].append(win)
-                # Also update games played counter if needed.
                 games_played_counter[agent].setdefault(opponent_key, 0)
                 games_played_counter[agent][opponent_key] += 1
-
+    
         for agent in agents:
             recent_rewards[agent].append(episode_rewards[agent])
             if len(recent_rewards[agent]) > 100:
                 recent_rewards[agent].pop(0)
         avg_rewards = {agent: np.mean(recent_rewards[agent]) if recent_rewards[agent] else 0.0 for agent in agents}
-
-        # Compute GAE for agents being trained.
+    
         for agent in agents:
             if agent == current_injected_agent_id:
                 continue
@@ -499,13 +588,12 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 returns_ = torch.tensor(np.array(memory.returns[agent], dtype=np.float32), device=device)
                 advantages_ = torch.tensor(np.array(memory.advantages[agent], dtype=np.float32), device=device)
                 action_masks_ = torch.tensor(np.array(memory.action_masks[agent], dtype=np.float32), device=device)
-                # Safely normalize advantages.
                 adv_std = advantages_.std()
                 if adv_std < 1e-5:
                     normalized_advantages = advantages_
                 else:
                     normalized_advantages = (advantages_ - advantages_.mean()) / (adv_std + 1e-5)
-
+    
                 kl_divs = []
                 policy_grad_norms = []
                 value_grad_norms = []
@@ -513,7 +601,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 value_losses = []
                 entropies = []
                 classification_losses = []
-
+    
                 for _ in range(config.K_EPOCHS):
                     probs, _, opponent_logits = policy_nets[agent](states, None)
                     probs = torch.clamp(probs, 1e-8, 1.0)
@@ -535,7 +623,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     policy_loss = -torch.min(surr1, surr2).mean() - static_entropy_coef * entropy
                     state_values = value_nets[agent](states).squeeze()
                     value_loss = nn.MSELoss()(state_values, returns_)
-    
+        
                     if opponent_logits is not None:
                         if current_injected_bot_type == "historical":
                             target_label = historical_label_mapping[current_injected_bot_identifier]
@@ -624,7 +712,6 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
             for agent in agents:
                 if agent == current_injected_agent_id:
                     continue
-                # Compute overall moving average win rate over the last 100 episodes for this agent.
                 all_outcomes = []
                 for outcomes in win_history[agent].values():
                     all_outcomes.extend(outcomes)
@@ -658,32 +745,18 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     if writer is not None:
                         writer.add_scalar(f"games_played/{agent}_vs_{opp_key}", count, episode)
             games_played_counter = {agent: {} for agent in agents}
-            if episode % config.CULL_INTERVAL == 0:
-                average_rewards = {agent: (sum(recent_rewards[agent]) / len(recent_rewards[agent]) if recent_rewards[agent] else 0.0) for agent in agents}
-                lowest_agent = min(average_rewards, key=average_rewards.get)
-                lowest_score = average_rewards[lowest_agent]
-                logger.info(f"Culling Agent '{lowest_agent}' with average reward {lowest_score:.2f}.")
-                if lowest_agent != current_injected_agent_id:
-                    policy_nets[lowest_agent] = PolicyNetwork(
-                        input_dim=config.INPUT_DIM,
-                        hidden_dim=config.HIDDEN_DIM,
-                        output_dim=config.OUTPUT_DIM,
-                        use_lstm=True,
-                        use_dropout=True,
-                        use_layer_norm=True,
-                        use_aux_classifier=True,
-                        num_opponent_classes=len(injected_bots)
-                    ).to(device)
-                    value_nets[lowest_agent] = ValueNetwork(
-                        input_dim=config.INPUT_DIM,
-                        hidden_dim=config.HIDDEN_DIM,
-                        use_dropout=True,
-                        use_layer_norm=True
-                    ).to(device)
-                    optimizers_policy[lowest_agent] = optim.Adam(policy_nets[lowest_agent].parameters(), lr=config.LEARNING_RATE)
-                    optimizers_value[lowest_agent] = optim.Adam(value_nets[lowest_agent].parameters(), lr=config.LEARNING_RATE)
-                    memories[lowest_agent] = RolloutMemory([lowest_agent])
-                    recent_rewards[lowest_agent] = []
+    
+        # Every 1000 episodes, visualize the strategy embeddings.
+        if episode % 1000 == 0 and writer is not None and len(strategy_embeddings_by_agent_opponent) > 1:
+            all_agents = [a for a in agents if a != current_injected_agent_id]
+            all_opponents = list(set([k[1] for k in strategy_embeddings_by_agent_opponent.keys()]))
+            # Use current embeddings as reference.
+            reference_embeddings = np.array(list(strategy_embeddings_by_agent_opponent.values()))
+            logger.info(f"Generating strategy embedding visualizations for episode {episode}")
+            visualize_strategy_embeddings(writer, strategy_embeddings_by_agent_opponent, all_agents, all_opponents, episode, method='pca', reference_embeddings=reference_embeddings)
+            visualize_strategy_embeddings(writer, strategy_embeddings_by_agent_opponent, all_agents, all_opponents, episode, method='tsne', reference_embeddings=reference_embeddings)
+            # Clear embeddings to avoid buildup.
+            strategy_embeddings_by_agent_opponent.clear()
     
     if writer is not None:
         writer.close()
@@ -718,7 +791,7 @@ def main():
         env = LiarsDeckEnv(num_players=config.NUM_PLAYERS, render_mode=config.RENDER_MODE)
     logger = configure_logger()
     logger.info("Starting training process...")
-
+    
     training_results = train_agents(
         env=env,
         device=device,
@@ -729,7 +802,7 @@ def main():
     if training_results is None:
         logger.error("Training results are None. Exiting.")
         return
-
+    
     trained_agents = training_results['agents']
     optimizers_policy = training_results['optimizers_policy']
     optimizers_value = training_results['optimizers_value']
