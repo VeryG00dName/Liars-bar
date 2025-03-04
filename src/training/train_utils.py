@@ -9,7 +9,8 @@ import logging
 import numpy as np
 from torch.utils.data import DataLoader, TensorDataset
 from src import config
-
+from src.model.new_models import PolicyNetwork
+from src.eval.evaluate_utils import load_combined_checkpoint, get_hidden_dim_from_state_dict
 AGENT_NAME_MAPPING = {
     'player_0': 'player_0',
     'player_1': 'player_1',
@@ -255,9 +256,6 @@ def load_specific_historical_models(players_dir, device):
             for checkpoint_file in checkpoint_files:
                 checkpoint_path = os.path.join(version_path, checkpoint_file)
                 try:
-                    from src.eval.evaluate_utils import load_combined_checkpoint
-                    # Import the helper function to determine the hidden dimension
-                    from src.eval.evaluate_utils import get_hidden_dim_from_state_dict
                     checkpoint = load_combined_checkpoint(checkpoint_path, device)
                     policy_nets = checkpoint['policy_nets']
 
@@ -267,7 +265,6 @@ def load_specific_historical_models(players_dir, device):
                         actual_input_dim = policy_state_dict['fc1.weight'].shape[1]
                         # Use the helper to determine the hidden dimension
                         actual_hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, layer_prefix='fc1')
-                        from src.model.new_models import PolicyNetwork
                         hist_policy = PolicyNetwork(
                             input_dim=actual_input_dim,
                             hidden_dim=actual_hidden_dim,
