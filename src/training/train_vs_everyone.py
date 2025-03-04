@@ -1,3 +1,4 @@
+# src/training/train_vs_everyone.py
 import logging
 import time
 import os
@@ -63,14 +64,14 @@ from src.training.train_transformer import EventEncoder
 
 # ---------------------------
 # Define a mapping from hard-coded agent class names to integer labels.
-# (Make sure config.NUM_OPPONENT_CLASSES equals number of hard-coded classes + number of historical models.)
 HARD_CODED_LABELS = {
     "GreedyCardSpammer": 0,
-    "StrategicChallenger": 1,
+    "GreedyCardSpammer": 1,
+    #"StrategicChallenger": 1,
     "TableNonTableAgent": 2,
     "Classic": 3,
     "TableFirstConservativeChallenger": 4,
-    "SelectiveTableConservativeChallenger": 5,
+    #"SelectiveTableConservativeChallenger": 5,
 }
 # The historical models will be assigned distinct labels.
 historical_label_mapping = {}
@@ -145,6 +146,19 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
     num_opponents = config.NUM_PLAYERS - 1
     config.set_derived_config(env.observation_spaces[agents[0]], env.action_spaces[agents[0]], num_opponents)
 
+
+    # Combine hardcoded agents and historical models for injected bots.
+    hardcoded_agent_classes = [GreedyCardSpammer, 
+                               StrategicChallenger, 
+                               TableNonTableAgent, 
+                               Classic
+                               ]
+    injected_bots = []
+    for cls in hardcoded_agent_classes:
+        injected_bots.append(("hardcoded", cls))
+    for hist_model, identifier in historical_models:
+        injected_bots.append(("historical", (hist_model, identifier)))
+
     # Initialize moving average win tracking:
     # For each agent (the learning agents) and each opponent type, we keep a deque (window=100) of binary win outcomes.
     win_history = {agent: {} for agent in agents}
@@ -168,7 +182,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
             use_dropout=True,
             use_layer_norm=True,
             use_aux_classifier=True,
-            num_opponent_classes=config.NUM_OPPONENT_CLASSES
+            num_opponent_classes=len(injected_bots)
         ).to(device)
         value_net = ValueNetwork(
             input_dim=config.INPUT_DIM,
@@ -230,19 +244,6 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
     action_counts_periodic = {agent: {action: 0 for action in range(config.OUTPUT_DIM)} for agent in agents}
     recent_rewards = {agent: [] for agent in agents}
     original_agent_order = list(env.agents)
-
-    # Combine hardcoded agents and historical models for injected bots.
-    hardcoded_agent_classes = [GreedyCardSpammer, 
-                               StrategicChallenger, 
-                               TableNonTableAgent, 
-                               Classic,
-                               TableFirstConservativeChallenger, 
-                               SelectiveTableConservativeChallenger]
-    injected_bots = []
-    for cls in hardcoded_agent_classes:
-        injected_bots.append(("hardcoded", cls))
-    for hist_model, identifier in historical_models:
-        injected_bots.append(("historical", (hist_model, identifier)))
 
     # Variables to hold the current injected bot.
     current_injected_agent_id = None
@@ -671,7 +672,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                         use_dropout=True,
                         use_layer_norm=True,
                         use_aux_classifier=True,
-                        num_opponent_classes=config.NUM_OPPONENT_CLASSES
+                        num_opponent_classes=len(injected_bots)
                     ).to(device)
                     value_nets[lowest_agent] = ValueNetwork(
                         input_dim=config.INPUT_DIM,
