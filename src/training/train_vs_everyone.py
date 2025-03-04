@@ -404,8 +404,8 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 embeddings_list = []
                 for opp in env.possible_agents:
                     if opp != agent:
-                        mem_summary = query_opponent_memory_full(agent, opp)
-                        features_list = convert_memory_to_features(mem_summary, response2idx, action2idx)
+                        memory_full = query_opponent_memory_full(agent, opp)
+                        features_list = convert_memory_to_features(memory_full, response2idx, action2idx)
                         if features_list:
                             feature_tensor = torch.tensor(features_list, dtype=torch.float32, device=device).unsqueeze(0)
                             with torch.no_grad():
