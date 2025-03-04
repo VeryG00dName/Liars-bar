@@ -399,7 +399,7 @@ def evaluate_rebel_vs_hardcoded(rebel_agent, num_games=20):
                                 belief_model_metrics["belief_error"] += belief_error
                                 
                                 # Check if prediction is "correct" (using a threshold)
-                                threshold = 0.6  # Consider adjusting based on your model
+                                threshold = 0.3  # Consider adjusting based on your model
                                 predicted_cards = (agent_belief > threshold).astype(int)
                                 if np.array_equal(predicted_cards, actual_cards):
                                     belief_model_metrics["correct_predictions"] += 1
@@ -618,7 +618,7 @@ def main():
                         help="Path to checkpoint directory")
     parser.add_argument("--games", type=int, default=20,
                         help="Number of games per opponent")
-    parser.add_argument("--search_depth", type=int, default=4,
+    parser.add_argument("--search_depth", type=int, default=8,
                         help="Search depth for ReBeL agent")
     parser.add_argument("--simulations", type=int, default=60,
                         help="Number of simulations per decision for ReBeL agent")

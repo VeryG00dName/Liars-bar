@@ -1409,7 +1409,7 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
                 game_done = True
     logger.info("Retraining the action probability model with new data...")
     action_prob_model = train_action_probability_model(
-        action_prob_model, final_data_collector, device, lr=lr_belief, epochs=50, batch_size=32
+        action_prob_model, final_data_collector, device, lr=lr_belief, epochs=100, batch_size=32
     )
     belief_model.action_prob_model = action_prob_model
 
