@@ -1,19 +1,18 @@
+# src/model/new_models.py
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-# ----------------------------
-# Policy Network: Specialized Agent (No Auxiliary Classifier)
-# ----------------------------
 class PolicyNetwork(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, use_lstm=True, use_dropout=True, use_layer_norm=True):
+    def __init__(self, input_dim, hidden_dim, output_dim, use_lstm=True, use_dropout=True, use_layer_norm=True,
+                 use_aux_classifier=False, num_opponent_classes=None):
         super(PolicyNetwork, self).__init__()
         self.use_lstm = use_lstm
         self.use_dropout = use_dropout
         self.use_layer_norm = use_layer_norm
+        self.use_aux_classifier = use_aux_classifier
 
-        # Core layers
+        # Core network layers.
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, hidden_dim)
@@ -31,27 +30,44 @@ class PolicyNetwork(nn.Module):
             self.layer_norm2 = nn.LayerNorm(hidden_dim)
             self.layer_norm3 = nn.LayerNorm(hidden_dim)
 
+        # Optional auxiliary classification head.
+        if self.use_aux_classifier:
+            if num_opponent_classes is None:
+                raise ValueError("num_opponent_classes must be provided when use_aux_classifier is True")
+            self.fc_classifier = nn.Linear(hidden_dim, num_opponent_classes)
+        else:
+            self.fc_classifier = None
+
     def forward(self, x, hidden_state=None):
+        # First layer.
         x = F.gelu(self.fc1(x))
         if self.use_layer_norm:
             x = self.layer_norm1(x)
         if self.use_dropout:
             x = self.dropout(x)
         
+        # Second layer.
         x = F.gelu(self.fc2(x))
         if self.use_layer_norm:
             x = self.layer_norm2(x)
         if self.use_dropout:
             x = self.dropout(x)
         
+        # Third layer.
         x = F.gelu(self.fc3(x))
         if self.use_layer_norm:
             x = self.layer_norm3(x)
         if self.use_dropout:
             x = self.dropout(x)
         
+        # Optionally, produce auxiliary classification logits using the hidden representation.
+        if self.use_aux_classifier:
+            opponent_logits = self.fc_classifier(x)
+        else:
+            opponent_logits = None
+        
+        # Continue with the original forward pass.
         if self.use_lstm:
-            # Add sequence dimension if needed
             x = x.unsqueeze(1)
             x, hidden_state = self.lstm(x, hidden_state)
             x = x.squeeze(1)
@@ -60,29 +76,28 @@ class PolicyNetwork(nn.Module):
             action_logits = self.fc4(x)
         
         action_probs = F.softmax(action_logits, dim=-1)
-        return action_probs, hidden_state
+        return action_probs, hidden_state, opponent_logits
 
-# ----------------------------
-# Value Network
-# ----------------------------
 class ValueNetwork(nn.Module):
     def __init__(self, input_dim, hidden_dim, use_dropout=True, use_layer_norm=True):
         super(ValueNetwork, self).__init__()
         self.use_dropout = use_dropout
         self.use_layer_norm = use_layer_norm
-        
+
+        # Enhanced layers
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, hidden_dim)
         self.value_head = nn.Linear(hidden_dim, 1)
-        
+
+        # Regularization
         if self.use_dropout:
             self.dropout = nn.Dropout(p=0.3)
         if self.use_layer_norm:
             self.layer_norm1 = nn.LayerNorm(hidden_dim)
             self.layer_norm2 = nn.LayerNorm(hidden_dim)
             self.layer_norm3 = nn.LayerNorm(hidden_dim)
-    
+
     def forward(self, x):
         x = F.gelu(self.fc1(x))
         if self.use_layer_norm:
@@ -104,11 +119,7 @@ class ValueNetwork(nn.Module):
         
         state_value = self.value_head(x)
         return state_value
-    
-# ----------------------------
-# Opponent Behavior Predictor
-# ----------------------------
-    
+
 class OpponentBehaviorPredictor(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim=2, memory_dim=0):
         """
@@ -146,22 +157,29 @@ class OpponentBehaviorPredictor(nn.Module):
         logits = self.output_layer(x)
         return logits
     
-# ----------------------------
-# Strategy Transformer for Opponent Memory Embedding
-# ----------------------------
 class PositionalEncoding(nn.Module):
+    """
+    Implements the standard sinusoidal positional encoding.
+    """
     def __init__(self, d_model, dropout=0.1, max_len=5000):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
-        pe = torch.zeros(max_len, d_model)  
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)  
+        
+        pe = torch.zeros(max_len, d_model)  # shape: (max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)  # shape: (max_len, 1)
         div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float) * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)  
-        pe[:, 1::2] = torch.cos(position * div_term)  
-        pe = pe.unsqueeze(0)  
+        pe[:, 0::2] = torch.sin(position * div_term)  # even indices
+        pe[:, 1::2] = torch.cos(position * div_term)  # odd indices
+        pe = pe.unsqueeze(0)  # shape: (1, max_len, d_model)
         self.register_buffer('pe', pe)
 
     def forward(self, x):
+        """
+        Args:
+            x: Tensor of shape (batch_size, seq_len, d_model)
+        Returns:
+            Tensor with positional encodings added.
+        """
         x = x + self.pe[:, :x.size(1)]
         return self.dropout(x)
 
