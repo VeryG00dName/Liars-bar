@@ -4,7 +4,13 @@ import os
 import random
 import numpy as np
 from collections import deque
-from sklearn.discriminant_analysis import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+from io import BytesIO
+from PIL import Image
+from sklearn.discriminant_analysis import StandardScaler  # (no longer used for transformer features)
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F  # For cosine similarity.
@@ -76,7 +82,7 @@ def convert_memory_to_features(memory, response_mapping, action_mapping):
 # 4: RandomAgent
 # 5: TableNonTableAgent
 # 6: Classic
-HARD_CODED_BOT_INDEX = 4  # <-- Change this number to choose the bot.
+HARD_CODED_BOT_INDEX = 6  # <-- Change this number to choose the bot.
 HARD_CODED_BOT_NAMES = {
     0: "GreedyCardSpammer",
     1: "TableFirstConservativeChallenger",
@@ -98,7 +104,6 @@ HARD_CODED_BOT_CLASSES = {
 TRAINING_BOT_NAME = HARD_CODED_BOT_NAMES[HARD_CODED_BOT_INDEX]
 TRAINING_BOT_CLASS = HARD_CODED_BOT_CLASSES[HARD_CODED_BOT_INDEX]
 
-# ---------------------------
 # Additional constant: number of consecutive log intervals with 0% win rate before culling.
 CULL_CONSECUTIVE_ZERO_WIN = 3  # You can adjust this threshold.
 
@@ -116,6 +121,7 @@ strategy_transformer = StrategyTransformer(
     nhead=config.STRATEGY_NHEAD,
     num_layers=config.STRATEGY_NUM_LAYERS,
     strategy_dim=config.STRATEGY_DIM,
+    num_classes=config.STRATEGY_NUM_CLASSES,  # Classification head removed below.
     dropout=config.STRATEGY_DROPOUT,
     use_cls_token=True
 ).to(device)
@@ -152,6 +158,76 @@ else:
 strategy_transformer.token_embedding = nn.Identity()
 strategy_transformer.classification_head = None
 strategy_transformer.eval()
+
+# ---------------------------
+# Helper functions for strategy embedding visualization.
+# ---------------------------
+REFERENCE_PCA = None
+def initialize_reference_pca(reference_embeddings):
+    global REFERENCE_PCA
+    if REFERENCE_PCA is None:
+        REFERENCE_PCA = PCA(n_components=2)
+        REFERENCE_PCA.fit(reference_embeddings)
+
+def collect_strategy_embeddings(agents, opponents, embeddings_dict):
+    X = []
+    labels = []
+    for agent in agents:
+        for opponent in opponents:
+            if (agent, opponent) in embeddings_dict:
+                X.append(embeddings_dict[(agent, opponent)])
+                labels.append((agent, opponent))
+    return np.array(X), labels
+
+def visualize_strategy_embeddings(writer, embeddings_dict, agents, opponents, episode, method='tsne', reference_embeddings=None):
+    X, labels = collect_strategy_embeddings(agents, opponents, embeddings_dict)
+    if len(X) < 2:
+        return  # Need at least 2 points
+
+    if method == 'pca':
+        if reference_embeddings is None:
+            raise ValueError("Reference embeddings must be provided for PCA.")
+        initialize_reference_pca(reference_embeddings)
+        X_2d = REFERENCE_PCA.transform(X)
+    else:
+        reducer = TSNE(n_components=2, perplexity=min(30, len(X)-1) if len(X) > 1 else 1)
+        X_2d = reducer.fit_transform(X)
+
+    plt.figure(figsize=(10, 8))
+    unique_agents = list(set(label[0] for label in labels))
+    unique_opponents = list(set(label[1] for label in labels))
+    colors = plt.cm.rainbow(np.linspace(0, 1, len(unique_agents)))
+    markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'h', 'H', '+', 'x', '|', '_']
+    agent_to_color = {agent: colors[i] for i, agent in enumerate(unique_agents)}
+    opponent_to_marker = {opponent: markers[i % len(markers)] for i, opponent in enumerate(unique_opponents)}
+
+    for (agent, opponent), point in zip(labels, X_2d):
+        plt.scatter(point[0], point[1], color=agent_to_color[agent],
+                    marker=opponent_to_marker[opponent], s=100)
+
+    agent_patches = [plt.Line2D([0], [0], marker='o', color='w',
+                      markerfacecolor=agent_to_color[agent], markersize=10,
+                      label=f'Agent {agent}') for agent in unique_agents]
+    opponent_patches = [plt.Line2D([0], [0], marker=opponent_to_marker[opponent],
+                         color='black', markersize=10,
+                         label=f'Opponent {opponent}') for opponent in unique_opponents]
+
+    plt.legend(handles=agent_patches + opponent_patches,
+               bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
+    plt.subplots_adjust(right=0.7)
+
+    plt.title(f'Strategy Embeddings ({method.upper()}) - Episode {episode}')
+    plt.xlabel('Component 1')
+    plt.ylabel('Component 2')
+    plt.grid(True, linestyle='--', alpha=0.7)
+
+    buf = BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    image = Image.open(buf)
+    image_array = np.array(image)
+    writer.add_image(f'Strategy_Embeddings_{method.upper()}', image_array, episode, dataformats='HWC')
+    plt.close()
 
 # ---------------------------
 # Logger configuration.
@@ -213,7 +289,6 @@ def train_agent(env, device, target_win_rate=0.95, load_checkpoint_flag=False, l
     checkpoint_dir = config.CHECKPOINT_DIR
 
     start_episode = 1
-
     static_entropy_coef = config.INIT_ENTROPY_COEF
     last_log_time = time.time()
     interval_reward_sum = 0
@@ -224,13 +299,19 @@ def train_agent(env, device, target_win_rate=0.95, load_checkpoint_flag=False, l
 
     global_step = 0
     episode = start_episode
+
+    # Dictionary for storing strategy embeddings for visualization.
+    strategy_embeddings_by_agent_opponent = {}
+
     while episode <= config.NUM_EPISODES:
         obs, infos = env.reset()
         # Set opponents: both bot players are instances of the selected hardcoded bot.
-        bot1_instance = TRAINING_BOT_CLASS("player_1") if TRAINING_BOT_CLASS != StrategicChallenger else \
-            StrategicChallenger("player_1", num_players=config.NUM_PLAYERS, agent_index=1)
-        bot2_instance = TRAINING_BOT_CLASS("player_2") if TRAINING_BOT_CLASS != StrategicChallenger else \
-            StrategicChallenger("player_2", num_players=config.NUM_PLAYERS, agent_index=2)
+        if TRAINING_BOT_CLASS == StrategicChallenger:
+            bot1_instance = StrategicChallenger("player_1", num_players=config.NUM_PLAYERS, agent_index=1)
+            bot2_instance = StrategicChallenger("player_2", num_players=config.NUM_PLAYERS, agent_index=2)
+        else:
+            bot1_instance = TRAINING_BOT_CLASS("player_1")
+            bot2_instance = TRAINING_BOT_CLASS("player_2")
         pending_rewards = {p: 0.0 for p in players}
         episode_rewards = {p: 0 for p in players}
         steps_in_episode = 0
@@ -249,7 +330,7 @@ def train_agent(env, device, target_win_rate=0.95, load_checkpoint_flag=False, l
             action_mask = env.infos[current_agent]['action_mask']
 
             if current_agent == rl_agent:
-                # Process opponent memory and transformer embeddings.
+                # Process opponent memory and get transformer embeddings.
                 transformer_embeddings = []
                 obp_memory_embeddings = []
                 for opp in bot_agents:
@@ -259,24 +340,32 @@ def train_agent(env, device, target_win_rate=0.95, load_checkpoint_flag=False, l
                         feature_tensor = torch.tensor(features_list, dtype=torch.float32, device=device).unsqueeze(0)
                         with torch.no_grad():
                             projected = event_encoder(feature_tensor)
-                            strategy_embedding = strategy_transformer(projected)
+                            # Note: using the same unpacking as in train_vs_everyone.
+                            strategy_embedding, _ = strategy_transformer(projected)
                     else:
                         strategy_embedding = torch.zeros(1, config.STRATEGY_DIM, device=device)
                     obp_memory_embeddings.append(strategy_embedding)
+                    # Store flattened embedding for visualization.
                     transformer_embeddings.append(strategy_embedding.cpu().detach().numpy().flatten())
+                    strategy_embeddings_by_agent_opponent[(rl_agent, TRAINING_BOT_NAME)] = strategy_embedding.cpu().detach().numpy().flatten()
+
+                # Instead of using StandardScaler here, normalize via L2 norm.
+                if transformer_embeddings:
+                    embeddings_arr = np.concatenate(transformer_embeddings, axis=0)
+                    norm_val = np.linalg.norm(embeddings_arr, ord=2)
+                    normalized_transformer_features = embeddings_arr if norm_val == 0 else embeddings_arr / norm_val
+                else:
+                    normalized_transformer_features = np.zeros(config.STRATEGY_DIM * len(bot_agents), dtype=np.float32)
+
                 obp_probs = run_obp_inference(
                     obp_model, observation, device, num_players=3,
                     memory_embeddings=obp_memory_embeddings
                 )
-                transformer_features = (np.concatenate(transformer_embeddings, axis=0)
-                                        if transformer_embeddings
-                                        else np.zeros(config.STRATEGY_DIM * 2, dtype=np.float32))
-                scaler = StandardScaler()
-                normalized_transformer_features = scaler.fit_transform(np.array(transformer_features).reshape(1, -1)).flatten()
+
                 final_obs = np.concatenate([observation, np.array(obp_probs, dtype=np.float32), normalized_transformer_features], axis=0)
 
                 obs_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
-                probs, _ = policy_net(obs_tensor, None)
+                probs, _, _ = policy_net(obs_tensor, None)
                 probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
                 mask_t = torch.tensor(action_mask, dtype=torch.float32, device=device)
                 masked_probs = probs * mask_t
@@ -314,10 +403,8 @@ def train_agent(env, device, target_win_rate=0.95, load_checkpoint_flag=False, l
                 )
             else:
                 pending_rewards[rl_agent] += env.rewards[rl_agent]
-            # When it's NOT the RL agent's turn, we still accumulate rewards for it
             for p in players:
-                episode_rewards[p] += env.rewards[p]  # Track rewards for all agents
-
+                episode_rewards[p] += env.rewards[p]
 
         episode_obp_data = extract_obp_training_data(env)
         obp_memory.extend(episode_obp_data)
@@ -345,7 +432,6 @@ def train_agent(env, device, target_win_rate=0.95, load_checkpoint_flag=False, l
             elapsed = time.time() - last_log_time
             steps_per_sec = interval_steps_sum / elapsed if elapsed > 0 else 0.0
             current_win_rate = np.mean(win_history)
-            # Check if rolling win rate is 0%.
             if current_win_rate == 0.0 and episode > config.LOG_INTERVAL:
                 consecutive_zero_win_count += 1
             else:
@@ -354,12 +440,11 @@ def train_agent(env, device, target_win_rate=0.95, load_checkpoint_flag=False, l
                 writer.add_scalar("Reward/Average", avg_reward, episode)
                 writer.add_scalar("Stats/StepsPerEpisode", avg_steps, episode)
                 writer.add_scalar("Stats/StepsPerSecond", steps_per_sec, episode)
-            logger.info(f"Episode {episode} | Avg Reward: {avg_reward:.2f} | Avg Steps/Ep: {avg_steps:.2f} | Time: {elapsed:.2f}s | Steps/s: {steps_per_sec:.2f} | Win rate: {current_win_rate*100:.1f}% consecutive zero win intervals: {consecutive_zero_win_count}")
+            logger.info(f"Episode {episode} | Avg Reward: {avg_reward:.2f} | Avg Steps/Ep: {avg_steps:.2f} | Time: {elapsed:.2f}s | Steps/s: {steps_per_sec:.2f} | Win rate: {current_win_rate*100:.1f}% | Consecutive zero win intervals: {consecutive_zero_win_count}")
             interval_reward_sum = 0
             interval_steps_sum = 0
             interval_episode_count = 0
             last_log_time = time.time()
-            # Cull (restart) agent if consecutive zero win intervals exceed threshold.
             if consecutive_zero_win_count >= CULL_CONSECUTIVE_ZERO_WIN:
                 logger.info("Consecutive zero win intervals reached threshold. Restarting RL agent...")
                 policy_net = PolicyNetwork(
@@ -385,6 +470,16 @@ def train_agent(env, device, target_win_rate=0.95, load_checkpoint_flag=False, l
             if current_win_rate >= target_win_rate and episode >= 100:
                 logger.info(f"Target win rate of {target_win_rate*100:.1f}% reached. Ending training.")
                 break
+
+            # Every 1000 episodes, visualize the strategy embeddings.
+            if episode % 1000 == 0 and writer is not None and len(strategy_embeddings_by_agent_opponent) > 1:
+                all_agents = [rl_agent]
+                all_opponents = list(set([k[1] for k in strategy_embeddings_by_agent_opponent.keys()]))
+                reference_embeddings = np.array(list(strategy_embeddings_by_agent_opponent.values()))
+                logger.info(f"Generating strategy embedding visualizations for episode {episode}")
+                visualize_strategy_embeddings(writer, strategy_embeddings_by_agent_opponent, all_agents, all_opponents, episode, method='pca', reference_embeddings=reference_embeddings)
+                visualize_strategy_embeddings(writer, strategy_embeddings_by_agent_opponent, all_agents, all_opponents, episode, method='tsne', reference_embeddings=reference_embeddings)
+                strategy_embeddings_by_agent_opponent.clear()
 
         rewards = memory.rewards[rl_agent]
         dones = memory.is_terminals[rl_agent]
@@ -419,7 +514,7 @@ def train_agent(env, device, target_win_rate=0.95, load_checkpoint_flag=False, l
             entropies = []
 
             for _ in range(config.K_EPOCHS):
-                probs, _ = policy_net(states, None)
+                probs, _, _ = policy_net(states, None)
                 probs = torch.clamp(probs, 1e-8, 1.0)
                 masked_probs = probs * action_masks
                 row_sums = masked_probs.sum(dim=-1, keepdim=True)
