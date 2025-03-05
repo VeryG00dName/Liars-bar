@@ -16,6 +16,7 @@ DEFAULT_CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "agents_checkpoint.pth")
 OPTUNA_RESULTS_FILE = os.path.join(BASE_DIR, "optuna_results.json")
 EVALUATION_LOG_FILE = os.path.join(BASE_DIR, "evaluation.log")
 TENSORBOARD_RUNS_DIR = os.path.join(LOG_DIR, "liars_deck_training")
+TENSORBOARD_RUNS_DIR2 = os.path.join(LOG_DIR, "liars_deck_training2")
 TRANSFORMER_CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "transformer_classifier.pth")
 HISTORICAL_MODEL_DIR = PLAYERS_DIR
 # Helper to ensure directories exist
@@ -60,7 +61,7 @@ DEFAULT_SCORING_PARAMS = {
 # ----------------------------
 # Neural Network Configuration
 # ----------------------------
-HIDDEN_DIM = 300             # Number of hidden units in neural networks
+HIDDEN_DIM = 500             # Number of hidden units in neural networks
 
 # The INPUT_DIM will be set dynamically based on the environment.
 # It is computed as: base observation dimension + 2 (for OBP output) + (STRATEGY_DIM * num_opponents)
@@ -92,19 +93,19 @@ STRATEGY_DROPOUT = 0.1                  # Dropout rate in the transformer.
 # ----------------------------
 # Training Hyperparameters
 # ----------------------------
-LEARNING_RATE = 0.0001        # Learning rate for policy/value networks
-GAMMA = 0.99                  # Discount factor
-GAE_LAMBDA = 0.95             # GAE lambda parameter
-EPS_CLIP = 0.1                # PPO clip parameter
-K_EPOCHS = 4                  # Number of PPO epochs per update
-NUM_EPISODES = 40000         # Total number of training episodes
+LEARNING_RATE = 0.00019        # Learning rate for policy/value networks
+GAMMA = 0.974                  # Discount factor
+GAE_LAMBDA = 0.98             # GAE lambda parameter
+EPS_CLIP = 0.3                # PPO clip parameter
+K_EPOCHS = 2                  # Number of PPO epochs per update
+NUM_EPISODES = 15000         # Total number of training episodes
 UPDATE_STEPS = 3              # Number of episodes before PPO update
 MAX_NORM = 0.3                # Maximum norm for gradient clipping
 AUX_LOSS_WEIGHT = 0.3         # Weight for the auxiliary loss
 # ----------------------------
 # Entropy Regularization
 # ----------------------------
-INIT_ENTROPY_COEF = 0.01        # Initial entropy coefficient
+INIT_ENTROPY_COEF = 0.005        # Initial entropy coefficient
 REWARD_ENTROPY_SCALE = 0.01     # Scale factor for reward-based entropy adjustments
 BASELINE_REWARD = -10           # Baseline reward for entropy coefficient updates
 ENTROPY_LR = 0.001              # Learning rate for entropy coefficient updates
@@ -134,21 +135,15 @@ CLONE_PERCENTAGE = 0.5
 GROUP_SIZE = 3
 TOTAL_PLAYERS = 12
 
-# ----------------------------
-# Self-play Configuration
-# ----------------------------
-HISTORICAL_POOL_SIZE = 12
-SELFPLAY_NUM_EPISODES = 10000
-SELFPLAY_EVAL_INTERVAL = 1000
-SELFPLAY_SNAPSHOT_INTERVAL = 1000
-WIN_RATE_THRESHOLD = 0.55
 
 # ----------------------------
 # Miscellaneous
 # ----------------------------
 SEED = 42                     # Seed for reproducibility
 DEVICE = "cuda"               # Device for training (CPU/GPU)
-TWO_PLAYER_MODE = True        # Set to True for two-player mode
+TWO_PLAYER_MODE = False       # Set to True for two-player mode
+USE_TRANSFORMER_MEMORY = True # Set to True to use the transformer memory
+GAMES_TO_STORE = 2
 # ----------------------------
 # Derived Configurations
 # ----------------------------
