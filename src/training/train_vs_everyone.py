@@ -77,6 +77,7 @@ HARD_CODED_LABELS = {
     "Classic": 3,
     "TableFirstConservativeChallenger": 4,
     "SelectiveTableConservativeChallenger": 5,
+    "RandomAgent": 6
 }
 historical_label_mapping = {}
 
@@ -145,6 +146,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
         StrategicChallenger,
         SelectiveTableConservativeChallenger,
         TableNonTableAgent,
+        RandomAgent,
         Classic
     ]
     injected_bots = []
@@ -163,7 +165,6 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
     optimizers_policy = {}
     optimizers_value = {}
     memories = {}
-    
     for agent in agents:
         policy_net = PolicyNetwork(
             input_dim=config.INPUT_DIM,
@@ -234,6 +235,10 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
     recent_rewards = {agent: [] for agent in agents}
     original_agent_order = list(env.agents)
     
+    # Initialize per-opponent expert activation tracking.
+    expert_activations_by_opponent = {agent: {} for agent in agents}
+    activation_counts_by_opponent = {agent: {} for agent in agents}
+    
     current_injected_agent_id = None
     current_injected_agent_instance = None
     current_injected_bot_type = None
@@ -287,8 +292,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
             observation = observation_dict[agent]
             action_mask = env.infos[agent]['action_mask']
     
-            # --- OBP Memory Gathering ---
-            # (This block remains to update OBP memory every episode.)
+            # --- OBP Memory Gathering (unchanged) ---
             if agent == current_injected_agent_id:
                 if current_injected_bot_type == "hardcoded":
                     obp_probs = []
@@ -401,7 +405,6 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     log_prob_value = 0.0
                 else:
                     observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
-                    # The new model returns (probs, hidden_state, gating_logits).
                     with torch.no_grad():
                         probs, _, _ = current_injected_agent_instance(observation_tensor, None)
                     probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
@@ -435,6 +438,17 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 m = Categorical(masked_probs)
                 action = m.sample().item()
                 log_prob_value = m.log_prob(torch.tensor(action, device=device)).item()
+                
+                # --- Update per-opponent expert activation tracking ---
+                with torch.no_grad():
+                    _, topk_indices = torch.topk(gating_logits, policy_nets[agent].top_n, dim=1)
+                    opponent_key = current_injected_bot_identifier
+                    if opponent_key not in expert_activations_by_opponent[agent]:
+                        expert_activations_by_opponent[agent][opponent_key] = [0] * policy_nets[agent].num_experts
+                        activation_counts_by_opponent[agent][opponent_key] = 0
+                    for expert_idx in topk_indices.squeeze(0).cpu().numpy():
+                        expert_activations_by_opponent[agent][opponent_key][int(expert_idx)] += 1
+                    activation_counts_by_opponent[agent][opponent_key] += 1
     
             action_counts_periodic[agent][action] += 1
             env.step(action)
@@ -486,17 +500,36 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 recent_rewards[agent].pop(0)
         avg_rewards = {agent: np.mean(recent_rewards[agent]) if recent_rewards[agent] else 0.0 for agent in agents}
     
-        # --- OBP Memory Update ---
+        # --- Compute Advantages using GAE ---
+        for agent in memories:
+            if memories[agent].states[agent]:
+                rewards_agent = memories[agent].rewards[agent]
+                dones_agent = memories[agent].is_terminals[agent]
+                values_agent = memories[agent].state_values[agent]
+                next_values_agent = values_agent[1:] + [0]
+                # Normalize rewards
+                mean_reward = np.mean(rewards_agent)
+                std_reward = np.std(rewards_agent) + 1e-5
+                normalized_rewards = (np.array(rewards_agent) - mean_reward) / std_reward
+                advantages, returns_ = compute_gae(
+                    rewards=normalized_rewards,
+                    dones=dones_agent,
+                    values=values_agent,
+                    next_values=next_values_agent,
+                    gamma=config.GAMMA,
+                    lam=config.GAE_LAMBDA,
+                )
+                memories[agent].advantages[agent] = advantages
+                memories[agent].returns[agent] = returns_
+    
+        # --- Extract OBP training data ---
         episode_obp_data = extract_obp_training_data(env)
         if episode_obp_data:
             obp_memory.extend(episode_obp_data)
-            logger.debug(f"Episode {episode}: Collected {len(episode_obp_data)} OBP samples. Total OBP memory size: {len(obp_memory)}")
     
         # --- PPO Update Loop: every UPDATE_STEPS episodes ---
         if episode % config.UPDATE_STEPS == 0:
             for agent in agents:
-                if agent == current_injected_agent_id:
-                    continue
                 memory = memories[agent]
                 states = torch.tensor(np.array(memory.states[agent], dtype=np.float32), device=device)
                 actions_ = torch.tensor(np.array(memory.actions[agent], dtype=np.int64), device=device)
@@ -526,8 +559,8 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 per_label_correct_counts = defaultdict(int)
                 per_label_total_counts = defaultdict(int)
     
+                # Accumulate gradients over K_EPOCHS iterations.
                 for _ in range(config.K_EPOCHS):
-                    # The new policy network returns (probs, hidden_state, gating_logits)
                     probs, _, gating_logits = policy_nets[agent](states, None)
                     probs = torch.clamp(probs, 1e-8, 1.0)
                     masked_probs = probs * action_masks_
@@ -548,9 +581,8 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     policy_loss = -torch.min(surr1, surr2).mean() - static_entropy_coef * entropy
                     state_values = value_nets[agent](states).squeeze()
                     value_loss = nn.MSELoss()(state_values, returns_)
-        
+                    
                     if gating_logits is not None:
-                        # Train the gating network using an auxiliary loss.
                         if current_injected_bot_type == "historical":
                             target_opponent_str = current_injected_bot_identifier
                         else:
@@ -558,6 +590,8 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                         target_label = (historical_label_mapping[current_injected_bot_identifier]
                                         if current_injected_bot_type == "historical"
                                         else HARD_CODED_LABELS.get(current_injected_agent_instance.__class__.__name__, 0))
+                        if target_label == 0 and current_injected_bot_identifier != "GreedyCardSpammer":
+                            logger.warning(f"Could not find hardcoded label for opponent {current_injected_bot_identifier}. Using 0 as default.")
                         target_labels = torch.full((gating_logits.size(0),), target_label, dtype=torch.long, device=device)
                         classification_loss = F.cross_entropy(gating_logits, target_labels)
                         classification_losses.append(classification_loss.item())
@@ -571,29 +605,48 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                                 if pred == actual:
                                     per_label_correct_counts[actual] += 1
     
-                        total_loss = policy_loss + 0.5 * value_loss + config.AUX_LOSS_WEIGHT * classification_loss
+                        total_loss_main = policy_loss + 0.5 * value_loss
+                        total_loss_aux = config.AUX_LOSS_WEIGHT * classification_loss
                     else:
-                        total_loss = policy_loss + 0.5 * value_loss
+                        total_loss_main = policy_loss + 0.5 * value_loss
+                        total_loss_aux = 0.0
+                        logger.warning(f"Agent {agent} does not have a gating network. Skipping auxiliary loss.")
+    
+                    optimizers_policy[agent].zero_grad()
+                    optimizers_value[agent].zero_grad()
+    
+                    total_loss_main.backward(retain_graph=True)
+    
+                    if total_loss_aux != 0.0:
+                        gating_params = list(policy_nets[agent].gating_net.parameters())
+                        aux_grads = torch.autograd.grad(total_loss_aux, gating_params, retain_graph=True)
+                        for param, grad in zip(gating_params, aux_grads):
+                            if param.grad is None:
+                                param.grad = grad
+                            else:
+                                param.grad += grad
+    
+                    optimizers_policy[agent].step()
+                    optimizers_value[agent].step()
     
                     policy_losses.append(policy_loss.item())
                     value_losses.append(value_loss.item())
                     entropies.append(entropy.item())
     
-                    total_loss.backward()
-    
-                    p_grad_norm = sum(param.grad.data.norm(2).item() ** 2
-                                      for param in policy_nets[agent].parameters()
-                                      if param.grad is not None) ** 0.5
-                    policy_grad_norms.append(p_grad_norm)
-                    v_grad_norm = sum(param.grad.data.norm(2).item() ** 2
-                                      for param in value_nets[agent].parameters()
-                                      if param.grad is not None) ** 0.5
-                    value_grad_norms.append(v_grad_norm)
-    
-                    torch.nn.utils.clip_grad_norm_(policy_nets[agent].parameters(), max_norm=config.MAX_NORM)
-                    torch.nn.utils.clip_grad_norm_(value_nets[agent].parameters(), max_norm=config.MAX_NORM)
-                    optimizers_policy[agent].step()
-                    optimizers_value[agent].step()
+                if writer is not None and gating_logits is not None:
+                    # Log gating network metrics.
+                    gating_params = list(policy_nets[agent].gating_net.parameters())
+                    gating_grad_norm = 0.0
+                    for param in gating_params:
+                        if param.grad is not None:
+                            gating_grad_norm += torch.sum(param.grad ** 2)
+                    gating_grad_norm = gating_grad_norm.sqrt().item()
+                    writer.add_scalar(f"Gradient_Norms/Gating/{agent}", gating_grad_norm, episode)
+                    
+                    p_gating = F.softmax(gating_logits, dim=-1)
+                    num_experts = policy_nets[agent].num_experts
+                    gating_kl = (p_gating * torch.log(p_gating * num_experts + 1e-8)).sum(dim=-1).mean().item()
+                    writer.add_scalar(f"KL_Divergence/Gating/{agent}", gating_kl, episode)
     
                 if writer is not None:
                     writer.add_scalar(f"Loss/Policy/{agent}", np.mean(policy_losses), episode)
@@ -611,10 +664,9 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                             acc = correct_ct / total_ct
                             writer.add_scalar(f"Accuracy/Classification/{agent}_vs_{target_opponent_str}", acc, episode)
     
-            # Reset memories after update.
-            for agent in agents:
-                if agent != current_injected_agent_id:
-                    memories[agent].reset()
+                for agent in agents:
+                    if agent != current_injected_agent_id:
+                        memories[agent].reset()
     
         if len(obp_memory) > 100:
             avg_loss_obp, accuracy = train_obp(obp_model, obp_optimizer, obp_memory, device, logger)
@@ -674,6 +726,25 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                             action_counts_periodic[agent][action],
                             episode
                         )
+    
+                for agent in agents:
+                    if agent == current_injected_agent_id:
+                        continue
+                    for opponent_key, counts in expert_activations_by_opponent[agent].items():
+                        total = activation_counts_by_opponent[agent][opponent_key]
+                        if total > 0:
+                            percentages = [count / total * 100 for count in counts]
+                            dominant_expert = int(np.argmax(percentages))
+                            dominant_percentage = percentages[dominant_expert]
+                            correct_expert = historical_label_mapping.get(opponent_key, 'N/A')
+                            if correct_expert == "N/A":
+                                correct_expert = HARD_CODED_LABELS.get(opponent_key, 0)
+                            logger.info(f"Agent {agent} vs {opponent_key}: Dominant expert is {dominant_expert} with {dominant_percentage:.2f}% activations. correct_expert: {correct_expert}")
+                            writer.add_scalar(f"Expert_Most_Activated/{agent}_vs_{opponent_key}", dominant_expert, episode)
+                            writer.add_scalar(f"Expert_Most_Activated_Percentage/{agent}_vs_{opponent_key}", dominant_percentage, episode)
+                    expert_activations_by_opponent[agent] = {}
+                    activation_counts_by_opponent[agent] = {}
+    
             for agent in agents:
                 invalid_action_counts_periodic[agent] = 0
                 for action in range(config.OUTPUT_DIM):
