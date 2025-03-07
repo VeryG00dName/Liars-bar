@@ -4,7 +4,7 @@ import logging
 import time
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-
+import sys
 import warnings
 # Suppress PyTorch warnings.
 warnings.filterwarnings("ignore", category=UserWarning, module="torch.nn.modules.transformer")
@@ -25,12 +25,10 @@ from io import BytesIO
 from PIL import Image
 
 # Environment & model imports
-from src.env.reward_restriction_wrapper_2 import RewardRestrictionWrapper2
 from src.env.liars_deck_env_core import LiarsDeckEnv
 # Use the new model from other_models.
 from src.model.other_models import PolicyNetwork, ValueNetwork, OpponentBehaviorPredictor, StrategyTransformer
 from src.model.memory import RolloutMemory
-from src.env.reward_restriction_wrapper import RewardRestrictionWrapper
 from src import config
 
 # Import our hard-coded agent classes
@@ -70,6 +68,25 @@ from src.training.train_extras import (
 
 # Strategy Transformer and event encoder
 from src.training.train_transformer import EventEncoder
+
+class ConsoleLogger:
+    def __init__(self):
+        self.last_messages = {}  # Track last message per agent
+        self.repeat_counts = {}  # Track repeat count per agent
+
+    def log(self, agent, message):
+        """Efficient logging that updates the last line if the message is the same for the same agent."""
+        if agent in self.last_messages and self.last_messages[agent] == message:
+            self.repeat_counts[agent] += 1
+            sys.stdout.write(f"\r{message} (x{self.repeat_counts[agent]})")  # Overwrites last line
+            sys.stdout.flush()
+        else:
+            if agent in self.last_messages:
+                sys.stdout.write("\n")  # Newline before printing new message for that agent
+            sys.stdout.write(message)
+            sys.stdout.flush()
+            self.last_messages[agent] = message
+            self.repeat_counts[agent] = 1
 
 def map_expert_index(raw_index):
     if raw_index <= 6:
@@ -140,10 +157,6 @@ transformer_classification_head = strategy_transformer.classification_head
 transformer_classification_head.eval()
 strategy_transformer.eval()
 
-# ---------------------------------------------------------------------------
-# No separate gating network is loaded.
-# ---------------------------------------------------------------------------
-
 historical_models = load_specific_historical_models(config.HISTORICAL_MODEL_DIR, device)
 print(f"Loaded {len(historical_models)} historical PPO models: {', '.join([id for _, id in historical_models])}")
 
@@ -181,7 +194,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
     # ------------------ NEW: Initialize Transformer Classification Accuracy Tracking ------------------
     transformer_accuracy_counts = defaultdict(lambda: {"correct": 0, "total": 0})
     # ------------------------------------------------------------------------------------------------------
-    
+    console_logger = ConsoleLogger()
     # Setup policy/value networks using the new mixture-of-experts model.
     policy_nets = {}
     value_nets = {}
@@ -200,7 +213,6 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
             use_dropout=True,
             use_layer_norm=True,
         ).to(device)
-        # (No gating network loading code is needed now.)
         value_net = ValueNetwork(
             input_dim=16,
             hidden_dim=config.HIDDEN_DIM,
@@ -423,7 +435,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                         projected = event_encoder(feature_tensor)
                         strategy_embedding, _ = strategy_transformer(projected)
                     # Each opponent’s memory embedding is 5 dims; take that 5-dim vector.
-                    learning_expert_input = strategy_embedding.cpu().detach().numpy().flatten()[:5]
+                    learning_expert_input = strategy_embedding.cpu().detach().numpy().flatten()
                 else:
                     learning_expert_input = np.zeros(5, dtype=np.float32)
                 
@@ -442,6 +454,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     transformer_accuracy_counts[current_injected_bot_identifier]["total"] += 1
                     if expert_index == expected_label:
                         transformer_accuracy_counts[current_injected_bot_identifier]["correct"] += 1
+                    console_logger.log(agent, f"Agent {agent} selected expert {raw_expert_index} for opponent {expected_label}")
                 # -------------------------------------------------------------------------------------
     
             # ---------- Action Selection ----------
@@ -597,14 +610,16 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     expert_inputs = torch.tensor(np.array(memory.expert_inputs[agent], dtype=np.float32), device=device)
                     with torch.no_grad():
                         expert_logits = transformer_classification_head(expert_inputs)
-                        raw_expert_index = expert_logits.argmax(dim=-1)[0].item()
+                        predictions = expert_logits.argmax(dim=-1)
+                        raw_expert_index = predictions.mode()[0].item()
                         expert_index = map_expert_index(raw_expert_index)
                         
                 else:
                     extracted_embedding = states[:, -config.STRATEGY_DIM:]
                     with torch.no_grad():
                         expert_logits = transformer_classification_head(extracted_embedding)
-                        raw_expert_index = expert_logits.argmax(dim=-1)[0].item()
+                        predictions = expert_logits.argmax(dim=-1)
+                        raw_expert_index = predictions.mode()[0].item()
                         expert_index = map_expert_index(raw_expert_index)
     
                 for _ in range(config.K_EPOCHS):
@@ -759,11 +774,8 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
 def main():
     set_seed(config.SEED)
     device = torch.device(config.DEVICE)
-    if config.USE_WRAPPER:
-        base_env = LiarsDeckEnv(num_players=config.NUM_PLAYERS, render_mode=config.RENDER_MODE)
-        env = RewardRestrictionWrapper2(base_env)
-    else:
-        env = LiarsDeckEnv(num_players=config.NUM_PLAYERS, render_mode=config.RENDER_MODE)
+
+    env = LiarsDeckEnv(num_players=config.NUM_PLAYERS, render_mode=config.RENDER_MODE)
     logger = configure_logger()
     logger.info("Starting training process...")
     
