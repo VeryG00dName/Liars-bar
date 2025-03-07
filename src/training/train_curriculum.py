@@ -61,6 +61,18 @@ from src.training.train_transformer import EventEncoder
 # Set device
 device = torch.device(config.DEVICE)
 
+# Define hardcoded labels and historical mapping (for auxiliary classification)
+HARD_CODED_LABELS = {
+    "GreedyCardSpammer": 0,
+    "StrategicChallenger": 1,
+    "TableNonTableAgent": 2,
+    "Classic": 3,
+    "TableFirstConservativeChallenger": 4,
+    "SelectiveTableConservativeChallenger": 5,
+    "RandomAgent": 6
+}
+historical_label_mapping = {}  # This can be populated if needed, e.g., when loading historical models
+
 # Define curriculum stages with increasing difficulty
 CURRICULUM = [
     {"name": "RandomAgent", "class": RandomAgent, "win_rate_threshold": 0.80, "min_games": 100},
@@ -82,7 +94,8 @@ for idx, (model, identifier) in enumerate(historical_models):
         "win_rate_threshold": 0.80,
         "min_games": 100
     })
-
+for idx, (_, identifier) in enumerate(historical_models):
+    historical_label_mapping[identifier] = len(HARD_CODED_LABELS) + idx
 # Load the strategy transformer and event encoder
 strategy_transformer = StrategyTransformer(
     num_tokens=config.STRATEGY_NUM_TOKENS,
@@ -108,9 +121,7 @@ if os.path.exists(transformer_checkpoint_path):
         raise ValueError("Checkpoint is missing response2idx and/or action2idx.")
     if "label_mapping" in checkpoint:
         label_mapping = checkpoint["label_mapping"]
-        label2idx = label_mapping["label2idx"]
-        idx2label = label_mapping["idx2label"]
-        print("Loaded label mapping from checkpoint.")
+        # Optionally, update historical_label_mapping here if needed.
     event_encoder = EventEncoder(
         response_vocab_size=len(response2idx),
         action_vocab_size=len(action2idx),
@@ -120,6 +131,7 @@ if os.path.exists(transformer_checkpoint_path):
 else:
     raise FileNotFoundError(f"Transformer checkpoint not found at {transformer_checkpoint_path}")
 
+# Remove the transformer token embedding and classification head.
 strategy_transformer.token_embedding = nn.Identity()
 strategy_transformer.classification_head = None
 strategy_transformer.eval()
@@ -145,10 +157,15 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
     
     # Setup policy/value networks (shared between player_0 and player_1)
     shared_policy_net = PolicyNetwork(
-        input_dim=config.INPUT_DIM,
-        hidden_dim=config.HIDDEN_DIM,
-        output_dim=config.OUTPUT_DIM
-    ).to(device)
+            input_dim=config.INPUT_DIM,
+            hidden_dim=config.HIDDEN_DIM,
+            output_dim=config.OUTPUT_DIM,
+            num_experts=10,  # one expert per injected bot
+            top_n=1,         # select only the top expert
+            use_lstm=True,
+            use_dropout=True,
+            use_layer_norm=True,
+        ).to(device)
     
     shared_value_net = ValueNetwork(
         input_dim=config.INPUT_DIM,
@@ -356,6 +373,7 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
                             projected = event_encoder(feature_tensor)
                             strategy_embedding, _ = strategy_transformer(projected)
                     else:
+                        logger.warning(f"No features found for opponent {opp} while computing OBP embedding. Using zero vector as padding.")
                         strategy_embedding = None
                         
                     if strategy_embedding is not None:
@@ -366,8 +384,11 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
             if embeddings_list:
                 embeddings_arr = np.concatenate(embeddings_list, axis=0)
                 norm_val = np.linalg.norm(embeddings_arr, ord=2)
-                normalized_arr = embeddings_arr if norm_val == 0 else embeddings_arr / norm_val
+                normalized_arr = embeddings_arr if norm_val != 0 else np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
+                if norm_val == 0:
+                    logger.warning("Computed embeddings have zero norm; using zero vector for OBP memory normalization.")
             else:
+                logger.warning("No embeddings found for any opponents; using zero vector for OBP memory.")
                 normalized_arr = np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
                 
             # Transform normalized array into segments for OBP
@@ -389,7 +410,8 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
             if agent in training_agents:
                 # Use policy network for training agents
                 observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
-                probs, _, _ = policy_nets[agent](observation_tensor, None)
+                # Note: The policy network now returns (probs, hidden_state, gating_logits)
+                probs, _, gating_logits = policy_nets[agent](observation_tensor, None)
                 probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
                 mask_t = torch.tensor(action_mask, dtype=torch.float32, device=device)
                 masked_probs = probs * mask_t
@@ -414,24 +436,11 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
                 if current_opponent_type == "hardcoded":
                     action = current_opponent.play_turn(observation, action_mask, table_card=None)
                     log_prob_value = 0.0
-                else:
-                    # Historical agent
-                    base_obs = observation
-                    obp_arr = np.array(obp_probs, dtype=np.float32)
-                    expected_input_dim = current_opponent.fc1.weight.shape[1]
-                    current_dim = base_obs.shape[0] + obp_arr.shape[0]
-                    missing_dim = expected_input_dim - current_dim
-                    
-                    if missing_dim > 0:
-                        mem_features = np.zeros(missing_dim, dtype=np.float32)
-                        historical_obs = np.concatenate([base_obs, obp_arr, mem_features], axis=0)
-                    else:
-                        historical_obs = np.concatenate([base_obs, obp_arr], axis=0)
-                    
-                    observation_tensor = torch.tensor(historical_obs, dtype=torch.float32, device=device).unsqueeze(0)
+                elif current_opponent_type == "historical":
+                    # Use the same final_obs as for learning agents
+                    observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
                     with torch.no_grad():
                         probs, _, _ = current_opponent(observation_tensor, None)
-                    
                     probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
                     mask_t = torch.tensor(action_mask, dtype=torch.float32, device=device)
                     masked_probs = probs * mask_t
@@ -502,6 +511,7 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
         for agent in training_agents:
             memory = memories[agent]
             if not memory.states[agent]:
+                logger.warning(f"Skipping PPO update for agent {agent} because memory is empty.")
                 continue
                 
             rewards_agent = memory.rewards[agent]
@@ -559,11 +569,13 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
                 policy_losses = []
                 value_losses = []
                 entropies = []
+                classification_losses = []  # For auxiliary classification loss
+                classification_accuracies = []  # To track auxiliary classification accuracy
                 
                 # PPO epochs
                 for _ in range(config.K_EPOCHS):
-                    # Forward pass
-                    probs, _, _ = policy_nets[agent](states, None)
+                    # Forward pass: now also retrieve gating_logits
+                    probs, _, gating_logits = policy_nets[agent](states, None)
                     probs = torch.clamp(probs, 1e-8, 1.0)
                     masked_probs = probs * action_masks_
                     
@@ -591,20 +603,36 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
                     state_values = value_nets[agent](states).squeeze()
                     value_loss = nn.MSELoss()(state_values, returns_)
                     
-                    # Combined loss
-                    total_loss = policy_loss + 0.5 * value_loss
+                    # Auxiliary classification loss using gating_logits
+                    if gating_logits is not None:
+                        if current_opponent_type == "historical":
+                            target_label = historical_label_mapping.get(current_opponent_name, 0)
+                            if target_label == 0 and current_opponent_name != "GreedyCardSpammer":
+                                logger.warning(f"Could not find historical label for opponent {current_opponent_name}. Using 0 as default.")
+                        else:
+                            target_label = HARD_CODED_LABELS.get(current_opponent_name, 0)
+                            if target_label == 0 and current_opponent_name != "GreedyCardSpammer":
+                                logger.warning(f"Could not find hardcoded label for opponent {current_opponent_name}. Using 0 as default.")
+                        target_labels = torch.full((gating_logits.size(0),), target_label, dtype=torch.long, device=device)
+                        classification_loss = F.cross_entropy(gating_logits, target_labels)
+                        classification_losses.append(classification_loss.item())
+                        total_loss = policy_loss + 0.5 * value_loss + config.AUX_LOSS_WEIGHT * classification_loss
+                        
+                        with torch.no_grad():
+                            predicted_labels = gating_logits.argmax(dim=1)
+                            correct = (predicted_labels == target_labels).sum().item()
+                            total = target_labels.size(0)
+                            accuracy = correct / total
+                            classification_accuracies.append(accuracy)
+                    else:
+                        total_loss = policy_loss + 0.5 * value_loss
                     
-                    # Track metrics
                     policy_losses.append(policy_loss.item())
                     value_losses.append(value_loss.item())
                     entropies.append(entropy.item())
                     
-                    # Backward pass
-                    optimizers_policy[agent].zero_grad()
-                    optimizers_value[agent].zero_grad()
                     total_loss.backward()
                     
-                    # Calculate gradient norms
                     p_grad_norm = sum(param.grad.data.norm(2).item() ** 2
                                       for param in policy_nets[agent].parameters()
                                       if param.grad is not None) ** 0.5
@@ -615,13 +643,15 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
                                       if param.grad is not None) ** 0.5
                     value_grad_norms.append(v_grad_norm)
                     
-                    # Clip gradients
                     torch.nn.utils.clip_grad_norm_(policy_nets[agent].parameters(), max_norm=config.MAX_NORM)
                     torch.nn.utils.clip_grad_norm_(value_nets[agent].parameters(), max_norm=config.MAX_NORM)
                     
-                    # Update parameters
                     optimizers_policy[agent].step()
                     optimizers_value[agent].step()
+                    
+                    # Zero gradients for next epoch
+                    optimizers_policy[agent].zero_grad()
+                    optimizers_value[agent].zero_grad()
                 
                 # Log metrics
                 if writer is not None:
@@ -631,6 +661,9 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
                     writer.add_scalar(f"KL_Divergence/{agent}", np.mean(kl_divs), episode)
                     writer.add_scalar(f"Gradient_Norms/Policy/{agent}", np.mean(policy_grad_norms), episode)
                     writer.add_scalar(f"Gradient_Norms/Value/{agent}", np.mean(value_grad_norms), episode)
+                    if classification_losses:
+                        writer.add_scalar(f"Loss/Classification/{agent}", np.mean(classification_losses), episode)
+                        writer.add_scalar(f"Accuracy/Classification/{agent}", np.mean(classification_accuracies), episode)
             
             # Reset memories after update
             for agent in training_agents:
