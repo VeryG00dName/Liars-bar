@@ -19,7 +19,7 @@ from torch.distributions import Categorical
 
 # Environment & model imports
 from src.env.liars_deck_env_core import LiarsDeckEnv
-from src.model.other_models import PolicyNetwork, ValueNetwork, OpponentBehaviorPredictor, StrategyTransformer
+from src.model.new_models import PolicyNetwork, ValueNetwork, OpponentBehaviorPredictor, StrategyTransformer
 from src.model.memory import RolloutMemory
 from src import config
 
