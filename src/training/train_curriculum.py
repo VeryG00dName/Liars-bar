@@ -1,4 +1,5 @@
 # src/training/train_curriculum.py
+
 import logging
 import time
 import os
@@ -61,6 +62,20 @@ from src.training.train_transformer import EventEncoder
 # Set device
 device = torch.device(config.DEVICE)
 
+# -------------------- NEW: Helper function for mapping raw expert indices --------------------
+def map_expert_index(raw_index):
+    if raw_index <= 6:
+        return raw_index
+    elif 7 <= raw_index <= 22:
+        return 7
+    elif 23 <= raw_index <= 38:
+        return 8
+    elif 39 <= raw_index <= 41:
+        return 9
+    else:
+        raise ValueError(f"Raw expert index {raw_index} out of expected range.")
+# ---------------------------------------------------------------------------------------------
+
 # Define hardcoded labels and historical mapping (for auxiliary classification)
 HARD_CODED_LABELS = {
     "GreedyCardSpammer": 0,
@@ -96,6 +111,7 @@ for idx, (model, identifier) in enumerate(historical_models):
     })
 for idx, (_, identifier) in enumerate(historical_models):
     historical_label_mapping[identifier] = len(HARD_CODED_LABELS) + idx
+
 # Load the strategy transformer and event encoder
 strategy_transformer = StrategyTransformer(
     num_tokens=config.STRATEGY_NUM_TOKENS,
@@ -121,7 +137,7 @@ if os.path.exists(transformer_checkpoint_path):
         raise ValueError("Checkpoint is missing response2idx and/or action2idx.")
     if "label_mapping" in checkpoint:
         label_mapping = checkpoint["label_mapping"]
-        # Optionally, update historical_label_mapping here if needed.
+        # Optionally update historical_label_mapping here.
     event_encoder = EventEncoder(
         response_vocab_size=len(response2idx),
         action_vocab_size=len(action2idx),
@@ -131,9 +147,10 @@ if os.path.exists(transformer_checkpoint_path):
 else:
     raise FileNotFoundError(f"Transformer checkpoint not found at {transformer_checkpoint_path}")
 
-# Remove the transformer token embedding and classification head.
+# Replace the token embedding with identity but KEEP the classification head.
 strategy_transformer.token_embedding = nn.Identity()
-strategy_transformer.classification_head = None
+transformer_classification_head = strategy_transformer.classification_head
+transformer_classification_head.eval()
 strategy_transformer.eval()
 
 def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load_directory=None, log_tensorboard=True):
@@ -151,41 +168,40 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
     writer = get_tensorboard_writer(log_dir=config.TENSORBOARD_RUNS_DIR) if log_tensorboard else None
     checkpoint_dir = load_directory if load_directory is not None else config.CHECKPOINT_DIR
     
-    # Define training agents (player_0 and player_1) and opponent (player_2)
+    # Define training agents and opponent agent names
     training_agents = ['player_0', 'player_1']
     opponent_agent = 'player_2'
     
-    # Setup policy/value networks (shared between player_0 and player_1)
+    # ------------------ NEW: Use the updated observation and expert input dims ------------------
+    # Use input_dim=16 (14-dim env observation + 2-dim OBP output)
     shared_policy_net = PolicyNetwork(
-            input_dim=config.INPUT_DIM,
+            input_dim=16,
             hidden_dim=config.HIDDEN_DIM,
             output_dim=config.OUTPUT_DIM,
             num_experts=10,  # one expert per injected bot
-            top_n=1,         # select only the top expert
             use_lstm=True,
             use_dropout=True,
             use_layer_norm=True,
         ).to(device)
     
     shared_value_net = ValueNetwork(
-        input_dim=config.INPUT_DIM,
+        input_dim=16,
         hidden_dim=config.HIDDEN_DIM,
         use_dropout=True,
         use_layer_norm=True
     ).to(device)
+    # -------------------------------------------------------------------------------------------
     
-    # Create policy networks dict (both training agents use the same network)
+    # Create shared policy/value networks for training agents
     policy_nets = {agent: shared_policy_net for agent in training_agents}
     value_nets = {agent: shared_value_net for agent in training_agents}
     
-    # Setup optimizers
     shared_optimizer_policy = optim.Adam(shared_policy_net.parameters(), lr=config.LEARNING_RATE)
     shared_optimizer_value = optim.Adam(shared_value_net.parameters(), lr=config.LEARNING_RATE)
     
     optimizers_policy = {agent: shared_optimizer_policy for agent in training_agents}
     optimizers_value = {agent: shared_optimizer_value for agent in training_agents}
     
-    # Setup memories
     memories = {agent: RolloutMemory([agent]) for agent in training_agents}
     
     # OBP model setup
@@ -198,14 +214,12 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
     obp_optimizer = optim.Adam(obp_model.parameters(), lr=config.OPPONENT_LEARNING_RATE)
     obp_memory = []
     
-    # JIT compile the OBP model
     obp_model.eval()
     example_observation = torch.randn(1, config.OPPONENT_INPUT_DIM).to(device)
     example_memory_embedding = torch.randn(1, config.STRATEGY_DIM).to(device)
     obp_model = torch.jit.trace(obp_model, (example_observation, example_memory_embedding))
     obp_model.train(True)
     
-    # Load checkpoint if available
     if load_checkpoint:
         checkpoint_data = load_checkpoint_if_available(
             policy_nets,
@@ -229,13 +243,12 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
     episodes_in_current_stage = 0
     curriculum_progress = {stage["name"]: {"win_history": deque(maxlen=100), "wins": 0, "games": 0, "threshold_met": False} for stage in CURRICULUM}
     
-    # Initialize current opponent
+    # Initialize current opponent (for player_2)
     current_stage = CURRICULUM[current_curriculum_stage]
     current_opponent_name = current_stage["name"]
     win_rate_threshold = current_stage["win_rate_threshold"]
     min_games = current_stage["min_games"]
     
-    # Create the opponent agent
     if "type" in current_stage and current_stage["type"] == "historical":
         current_opponent = current_stage["model"]
         current_opponent_type = "historical"
@@ -252,7 +265,6 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
     
     logger.info(f"Starting cycle {current_cycle+1}, opponent: {current_opponent_name} (threshold: {win_rate_threshold:.2f}, min games: {min_games})")
     
-    # Training loop setup
     static_entropy_coef = config.INIT_ENTROPY_COEF
     last_log_time = time.time()
     steps_since_log = 0
@@ -268,30 +280,23 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
         agents = env.agents
         pending_rewards = {agent: 0.0 for agent in agents}
         
-        # Check if we need to switch to the next curriculum stage
+        # Check curriculum progress and switch opponent if needed
         episodes_in_current_stage += 1
         progress = curriculum_progress[current_opponent_name]
-        
-        # Calculate rolling win rate from the last 100 games
         rolling_win_rate = sum(progress["win_history"]) / len(progress["win_history"]) if progress["win_history"] else 0
         
-        # Check if we've played enough games and met the win rate threshold
         if len(progress["win_history"]) >= min_games and rolling_win_rate >= win_rate_threshold:
             logger.info(f"Win rate threshold of {win_rate_threshold:.2f} met with {rolling_win_rate:.2f} for {current_opponent_name} after {len(progress['win_history'])} games")
             progress["threshold_met"] = True
-            # reset win rate history
             progress["win_history"].clear()
             progress["wins"] = 0
             progress["games"] = 0
             progress["threshold_met"] = False
-            # Move to next curriculum stage
             current_curriculum_stage = (current_curriculum_stage + 1) % len(CURRICULUM)
             episodes_in_current_stage = 0
             
-            # If we've completed a full cycle through all opponents
             if current_curriculum_stage == 0:
                 current_cycle += 1
-                # Save a special checkpoint at the end of each cycle
                 save_checkpoint(
                     policy_nets,
                     value_nets,
@@ -305,30 +310,23 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
                 )
                 logger.info(f"Completed cycle {current_cycle}! Saved cycle checkpoint.")
                 
-                # Log win rates for all opponents at end of cycle
                 all_thresholds_met = True
                 for opponent_name, stats in curriculum_progress.items():
                     opp_rolling_win_rate = sum(stats["win_history"]) / len(stats["win_history"]) if stats["win_history"] else 0
                     threshold = next((s["win_rate_threshold"] for s in CURRICULUM if s["name"] == opponent_name), 0.8)
                     logger.info(f"  {opponent_name}: {opp_rolling_win_rate:.2f} win rate (threshold: {threshold:.2f}, met: {stats['threshold_met']})")
                     all_thresholds_met = all_thresholds_met and stats["threshold_met"]
-                
                 if all_thresholds_met:
-                    logger.info(f"ALL THRESHOLDS MET! Agent has achieved target win rates against all opponents.")
-                
-                # Keep win history but reset threshold_met flags for the next cycle
+                    logger.info("ALL THRESHOLDS MET! Agent has achieved target win rates against all opponents.")
                 for stats in curriculum_progress.values():
                     stats["wins"] = 0
                     stats["games"] = 0
                     stats["threshold_met"] = False
             
-            # Set up the new opponent
             current_stage = CURRICULUM[current_curriculum_stage]
             current_opponent_name = current_stage["name"]
             win_rate_threshold = current_stage["win_rate_threshold"]
             min_games = current_stage["min_games"]
-            
-            # Create the new opponent agent
             if "type" in current_stage and current_stage["type"] == "historical":
                 current_opponent = current_stage["model"]
                 current_opponent_type = "historical"
@@ -342,7 +340,6 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
                 else:
                     current_opponent = current_stage["class"](agent_name=opponent_agent)
                 current_opponent_type = "hardcoded"
-            
             logger.info(f"Switching to opponent: {current_opponent_name} (threshold: {win_rate_threshold:.2f}, min games: {min_games})")
         
         episode_rewards = {agent: 0 for agent in agents}
@@ -361,7 +358,7 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
             observation = observation_dict[agent]
             action_mask = env.infos[agent]['action_mask']
             
-            # Generate memory embeddings for OBP
+            # -------------------- NEW: OBP Memory & New Observation Handling --------------------
             embeddings_list = []
             for opp in env.possible_agents:
                 if opp != agent:
@@ -373,25 +370,18 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
                             projected = event_encoder(feature_tensor)
                             strategy_embedding, _ = strategy_transformer(projected)
                     else:
-                        logger.warning(f"No features found for opponent {opp} while computing OBP embedding. Using zero vector as padding.")
                         strategy_embedding = None
-                        
                     if strategy_embedding is not None:
                         embeddings_list.append(strategy_embedding.cpu().detach().numpy().flatten())
                     else:
                         embeddings_list.append(np.zeros(config.STRATEGY_DIM, dtype=np.float32))
-            
             if embeddings_list:
                 embeddings_arr = np.concatenate(embeddings_list, axis=0)
                 norm_val = np.linalg.norm(embeddings_arr, ord=2)
                 normalized_arr = embeddings_arr if norm_val != 0 else np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
-                if norm_val == 0:
-                    logger.warning("Computed embeddings have zero norm; using zero vector for OBP memory normalization.")
             else:
-                logger.warning("No embeddings found for any opponents; using zero vector for OBP memory.")
                 normalized_arr = np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
-                
-            # Transform normalized array into segments for OBP
+            
             num_opponents = len(env.possible_agents) - 1
             segment_size = config.STRATEGY_DIM
             normalized_segments = []
@@ -399,23 +389,54 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
                 seg = normalized_arr[i * segment_size:(i + 1) * segment_size]
                 normalized_segments.append(torch.tensor(seg, dtype=torch.float32, device=device).unsqueeze(0))
             
-            # Run OBP inference
             obp_probs = run_obp_inference(obp_model, observation, device, env.num_players,
-                                      memory_embeddings=normalized_segments)
+                                          memory_embeddings=normalized_segments)
+            obp_arr = np.array(obp_probs, dtype=np.float32)
+            # Build final_obs exactly as in train_vs_everyone: observation (14 dims) + OBP output (2 dims) = 16 dims.
+            final_obs = np.concatenate([observation, obp_arr], axis=0)
+            # -------------------------------------------------------------------------------------
             
-            # Construct final observation with OBP outputs
-            final_obs = np.concatenate([observation, np.array(obp_probs, dtype=np.float32), normalized_arr], axis=0)
+            # -------------------- NEW: Compute Expert Input & Transformer Classification --------------------
+            # Select one opponent (prefer one that is terminated/truncated, otherwise choose previous)
+            selected_opp = None
+            for opp in env.possible_agents:
+                if opp == agent:
+                    continue
+                if env.terminations.get(opp, False) or env.truncations.get(opp, False):
+                    selected_opp = opp
+                    break
+            if selected_opp is None:
+                agent_index = env.agents.index(agent)
+                previous_index = (agent_index - 1) % len(env.agents)
+                if env.agents[previous_index] == agent:
+                    previous_index = (agent_index - 2) % len(env.agents)
+                selected_opp = env.agents[previous_index]
+            memory_full = query_opponent_memory_full(agent, selected_opp)
+            features_list = convert_memory_to_features(memory_full, response2idx, action2idx)
+            if features_list:
+                feature_tensor = torch.tensor(features_list, dtype=torch.float32, device=device).unsqueeze(0)
+                with torch.no_grad():
+                    projected = event_encoder(feature_tensor)
+                    strategy_embedding, _ = strategy_transformer(projected)
+                learning_expert_input = strategy_embedding.cpu().detach().numpy().flatten()[:5]
+            else:
+                learning_expert_input = np.zeros(5, dtype=np.float32)
             
-            # Choose action
+            learning_expert_tensor = torch.tensor(learning_expert_input, dtype=torch.float32, device=device).unsqueeze(0)
+            with torch.no_grad():
+                expert_logits = transformer_classification_head(learning_expert_tensor)
+                raw_expert_index = expert_logits.argmax(dim=-1).item()
+                expert_index = map_expert_index(raw_expert_index)
+            # -------------------------------------------------------------------------------------
+            
+            # -------------------- Action Selection --------------------
             if agent in training_agents:
-                # Use policy network for training agents
                 observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
-                # Note: The policy network now returns (probs, hidden_state, gating_logits)
-                probs, _, gating_logits = policy_nets[agent](observation_tensor, None)
+                # Now pass the computed expert_index into the policy network.
+                probs, _ = policy_nets[agent](observation_tensor, expert_index)
                 probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
                 mask_t = torch.tensor(action_mask, dtype=torch.float32, device=device)
                 masked_probs = probs * mask_t
-                
                 if masked_probs.sum() == 0:
                     valid_indices = torch.nonzero(mask_t, as_tuple=True)[0]
                     if len(valid_indices) > 0:
@@ -424,27 +445,22 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
                         masked_probs = torch.ones_like(probs) / probs.size(0)
                 else:
                     masked_probs /= masked_probs.sum()
-                
                 m = Categorical(masked_probs)
                 action = m.sample().item()
                 log_prob_value = m.log_prob(torch.tensor(action, device=device)).item()
-                
-                # Track action counts
                 action_counts_periodic[agent][action] += 1
             else:
-                # This is the opponent agent (player_2)
+                # Opponent agent: use its policy (hardcoded or historical)
                 if current_opponent_type == "hardcoded":
                     action = current_opponent.play_turn(observation, action_mask, table_card=None)
                     log_prob_value = 0.0
                 elif current_opponent_type == "historical":
-                    # Use the same final_obs as for learning agents
                     observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
                     with torch.no_grad():
                         probs, _, _ = current_opponent(observation_tensor, None)
                     probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
                     mask_t = torch.tensor(action_mask, dtype=torch.float32, device=device)
                     masked_probs = probs * mask_t
-                    
                     if masked_probs.sum() == 0:
                         valid_indices = torch.nonzero(mask_t, as_tuple=True)[0]
                         if len(valid_indices) > 0:
@@ -453,30 +469,26 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
                             masked_probs = torch.ones_like(probs) / probs.size(0)
                     else:
                         masked_probs /= masked_probs.sum()
-                    
                     m = Categorical(masked_probs)
                     action = m.sample().item()
                     log_prob_value = m.log_prob(torch.tensor(action, device=device)).item()
+            # ----------------------------------------------------------
             
-            # Take action in environment
             env.step(action)
             
-            # Process rewards
             step_rewards = env.rewards.copy()
             env.rewards = {agent: 0 for agent in env.possible_agents}
-            
             for ag in agents:
                 if ag != agent:
                     pending_rewards[ag] += step_rewards[ag]
                 else:
                     reward = step_rewards[agent] + pending_rewards[agent]
                     pending_rewards[agent] = 0
-                    
-                    # Store transitions for training agents
                     if ag in training_agents:
                         memories[ag].store_transition(
                             agent=ag,
                             state=final_obs,
+                            expert_input=learning_expert_input,  # NEW: store expert input for PPO updates
                             action=action,
                             log_prob=log_prob_value,
                             reward=reward,
@@ -484,47 +496,36 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
                             state_value=value_nets[ag](torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)).item(),
                             action_mask=action_mask
                         )
-                    
                     episode_rewards[ag] += reward
         
         # Update curriculum progress
         winners = env.winner
         if not isinstance(winners, list):
             winners = [winners]
-        
         curriculum_progress[current_opponent_name]["games"] += 1
-        
-        # Check if any training agent won
         win = 1 if any(winner in training_agents for winner in winners) else 0
         curriculum_progress[current_opponent_name]["win_history"].append(win)
         curriculum_progress[current_opponent_name]["wins"] += win
         
-        # Track recent rewards
         for agent in training_agents:
             recent_rewards[agent].append(episode_rewards[agent])
             if len(recent_rewards[agent]) > 100:
                 recent_rewards[agent].pop(0)
-        
         avg_rewards = {agent: np.mean(recent_rewards[agent]) if recent_rewards[agent] else 0.0 for agent in training_agents}
         
-        # Prepare for PPO update
+        # -------------------- PPO Update --------------------
         for agent in training_agents:
             memory = memories[agent]
             if not memory.states[agent]:
                 logger.warning(f"Skipping PPO update for agent {agent} because memory is empty.")
                 continue
-                
             rewards_agent = memory.rewards[agent]
             dones_agent = memory.is_terminals[agent]
             values_agent = memory.state_values[agent]
             next_values_agent = values_agent[1:] + [0]
-            
-            # Normalize rewards
             mean_reward = np.mean(rewards_agent)
             std_reward = np.std(rewards_agent) + 1e-5
             normalized_rewards = (np.array(rewards_agent) - mean_reward) / std_reward
-            
-            # Compute GAE
             advantages, returns_ = compute_gae(
                 rewards=normalized_rewards,
                 dones=dones_agent,
@@ -533,21 +534,17 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
                 gamma=config.GAMMA,
                 lam=config.GAE_LAMBDA,
             )
-            
             memory.advantages[agent] = advantages
             memory.returns[agent] = returns_
         
-        # Extract OBP training data
         episode_obp_data = extract_obp_training_data(env)
         obp_memory.extend(episode_obp_data)
         
-        # Perform PPO updates periodically
         if episode % config.UPDATE_STEPS == 0:
             for agent in training_agents:
                 memory = memories[agent]
                 if not memory.states[agent]:
                     continue
-                
                 states = torch.tensor(np.array(memory.states[agent], dtype=np.float32), device=device)
                 actions_ = torch.tensor(np.array(memory.actions[agent], dtype=np.int64), device=device)
                 old_log_probs = torch.tensor(np.array(memory.log_probs[agent], dtype=np.float32), device=device)
@@ -555,89 +552,62 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
                 advantages_ = torch.tensor(np.array(memory.advantages[agent], dtype=np.float32), device=device)
                 action_masks_ = torch.tensor(np.array(memory.action_masks[agent], dtype=np.float32), device=device)
                 
-                # Normalize advantages
                 adv_std = advantages_.std()
                 if adv_std < 1e-5:
                     normalized_advantages = advantages_
                 else:
                     normalized_advantages = (advantages_ - advantages_.mean()) / (adv_std + 1e-5)
                 
-                # Track metrics
                 kl_divs = []
                 policy_grad_norms = []
                 value_grad_norms = []
                 policy_losses = []
                 value_losses = []
                 entropies = []
-                classification_losses = []  # For auxiliary classification loss
-                classification_accuracies = []  # To track auxiliary classification accuracy
+                classification_losses = []
+                classification_accuracies = []
                 
-                # PPO epochs
+                # For training agents, retrieve stored expert inputs and compute expert index.
+                expert_inputs = torch.tensor(np.array(memory.expert_inputs[agent], dtype=np.float32), device=device)
+                with torch.no_grad():
+                    expert_logits = transformer_classification_head(expert_inputs)
+                    raw_expert_index = expert_logits.argmax(dim=-1)[0].item()
+                    expert_index = map_expert_index(raw_expert_index)
+                
                 for _ in range(config.K_EPOCHS):
-                    # Forward pass: now also retrieve gating_logits
-                    probs, _, gating_logits = policy_nets[agent](states, None)
+                    # Forward pass using the computed expert index
+                    probs, _ = policy_nets[agent](states, expert_index)
                     probs = torch.clamp(probs, 1e-8, 1.0)
                     masked_probs = probs * action_masks_
-                    
-                    # Normalize probabilities
                     row_sums = masked_probs.sum(dim=-1, keepdim=True)
                     masked_probs = torch.where(
                         row_sums > 0,
                         masked_probs / row_sums,
                         torch.ones_like(masked_probs) / masked_probs.shape[1]
                     )
-                    
                     m = Categorical(masked_probs)
                     new_log_probs = m.log_prob(actions_)
                     entropy = m.entropy().mean()
                     kl_div = torch.mean(old_log_probs - new_log_probs)
                     kl_divs.append(kl_div.item())
-                    
-                    # PPO policy loss
                     ratios = torch.exp(new_log_probs - old_log_probs)
                     surr1 = ratios * normalized_advantages
                     surr2 = torch.clamp(ratios, 1 - config.EPS_CLIP, 1 + config.EPS_CLIP) * normalized_advantages
                     policy_loss = -torch.min(surr1, surr2).mean() - static_entropy_coef * entropy
-                    
-                    # Value loss
                     state_values = value_nets[agent](states).squeeze()
                     value_loss = nn.MSELoss()(state_values, returns_)
                     
-                    # Auxiliary classification loss using gating_logits
-                    if gating_logits is not None:
-                        if current_opponent_type == "historical":
-                            target_label = historical_label_mapping.get(current_opponent_name, 0)
-                            if target_label == 0 and current_opponent_name != "GreedyCardSpammer":
-                                logger.warning(f"Could not find historical label for opponent {current_opponent_name}. Using 0 as default.")
-                        else:
-                            target_label = HARD_CODED_LABELS.get(current_opponent_name, 0)
-                            if target_label == 0 and current_opponent_name != "GreedyCardSpammer":
-                                logger.warning(f"Could not find hardcoded label for opponent {current_opponent_name}. Using 0 as default.")
-                        target_labels = torch.full((gating_logits.size(0),), target_label, dtype=torch.long, device=device)
-                        classification_loss = F.cross_entropy(gating_logits, target_labels)
-                        classification_losses.append(classification_loss.item())
-                        total_loss = policy_loss + 0.5 * value_loss + config.AUX_LOSS_WEIGHT * classification_loss
-                        
-                        with torch.no_grad():
-                            predicted_labels = gating_logits.argmax(dim=1)
-                            correct = (predicted_labels == target_labels).sum().item()
-                            total = target_labels.size(0)
-                            accuracy = correct / total
-                            classification_accuracies.append(accuracy)
-                    else:
-                        total_loss = policy_loss + 0.5 * value_loss
+                    total_loss = policy_loss + 0.5 * value_loss
                     
                     policy_losses.append(policy_loss.item())
                     value_losses.append(value_loss.item())
                     entropies.append(entropy.item())
                     
                     total_loss.backward()
-                    
                     p_grad_norm = sum(param.grad.data.norm(2).item() ** 2
                                       for param in policy_nets[agent].parameters()
                                       if param.grad is not None) ** 0.5
                     policy_grad_norms.append(p_grad_norm)
-                    
                     v_grad_norm = sum(param.grad.data.norm(2).item() ** 2
                                       for param in value_nets[agent].parameters()
                                       if param.grad is not None) ** 0.5
@@ -649,11 +619,9 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
                     optimizers_policy[agent].step()
                     optimizers_value[agent].step()
                     
-                    # Zero gradients for next epoch
                     optimizers_policy[agent].zero_grad()
                     optimizers_value[agent].zero_grad()
                 
-                # Log metrics
                 if writer is not None:
                     writer.add_scalar(f"Loss/Policy/{agent}", np.mean(policy_losses), episode)
                     writer.add_scalar(f"Loss/Value/{agent}", np.mean(value_losses), episode)
@@ -665,11 +633,9 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
                         writer.add_scalar(f"Loss/Classification/{agent}", np.mean(classification_losses), episode)
                         writer.add_scalar(f"Accuracy/Classification/{agent}", np.mean(classification_accuracies), episode)
             
-            # Reset memories after update
             for agent in training_agents:
                 memories[agent].reset()
         
-        # Train OBP model
         if len(obp_memory) > 100:
             avg_loss_obp, accuracy = train_obp(obp_model, obp_optimizer, obp_memory, device, logger)
             if avg_loss_obp is not None and accuracy is not None and writer is not None:
@@ -677,7 +643,6 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
                 writer.add_scalar("OBP/Accuracy", accuracy, episode)
             obp_memory = []
         
-        # Save checkpoint periodically
         if episode % config.CHECKPOINT_INTERVAL == 0 and load_checkpoint:
             save_checkpoint(
                 policy_nets,
@@ -691,18 +656,14 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
             )
             logger.info(f"Saved checkpoint at episode {episode}.")
         
-        # Log progress periodically
         steps_since_log += steps_in_episode
         episodes_since_log += 1
         
         if episode % config.LOG_INTERVAL == 0:
-            # Calculate current win rate (rolling average of last 100 games)
             current_progress = curriculum_progress[current_opponent_name]
             rolling_win_rate = sum(current_progress["win_history"]) / len(current_progress["win_history"]) if current_progress["win_history"] else 0
             games_played = len(current_progress["win_history"])
             games_remaining = max(0, min_games - games_played)
-            
-            # Log training progress
             avg_rewards_str = ", ".join([f"{agent}: {avg_rewards.get(agent, 0.0):.2f}" for agent in training_agents])
             avg_steps_per_episode = steps_since_log / episodes_since_log
             elapsed_time = time.time() - last_log_time
@@ -717,7 +678,6 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
                 f"Steps/s: {steps_per_second:.2f}"
             )
             
-            # Log metrics to tensorboard
             if writer is not None:
                 writer.add_scalar(f"Curriculum/Cycle", current_cycle, episode)
                 writer.add_scalar(f"Curriculum/Stage", current_curriculum_stage, episode)
@@ -726,11 +686,9 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
                 writer.add_scalar(f"Curriculum/ThresholdGap/{current_opponent_name}", rolling_win_rate - win_rate_threshold, episode)
                 writer.add_scalar(f"Curriculum/GamesPlayed/{current_opponent_name}", games_played, episode)
                 writer.add_scalar(f"Curriculum/GamesRemaining/{current_opponent_name}", games_remaining, episode)
-                
                 for agent, reward in avg_rewards.items():
                     if agent in training_agents:
                         writer.add_scalar(f"Average Reward/{agent}", reward, episode)
-                
                 for agent in training_agents:
                     for action in range(config.OUTPUT_DIM):
                         writer.add_scalar(
@@ -738,21 +696,16 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
                             action_counts_periodic[agent][action],
                             episode
                         )
-            
-            # Reset periodic counters
             for agent in training_agents:
                 for action in range(config.OUTPUT_DIM):
                     action_counts_periodic[agent][action] = 0
-            
             last_log_time = time.time()
             steps_since_log = 0
             episodes_since_log = 0
     
-    # Close tensorboard writer
     if writer is not None:
         writer.close()
     
-    # Return trained agent
     return {
         'policy_net': shared_policy_net,
         'value_net': shared_value_net,
@@ -765,19 +718,15 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
 def main():
     set_seed(config.SEED)
     device = torch.device(config.DEVICE)
-    
-    # Create environment
     if config.USE_WRAPPER:
         base_env = LiarsDeckEnv(num_players=config.NUM_PLAYERS, render_mode=config.RENDER_MODE)
         env = RewardRestrictionWrapper2(base_env)
     else:
         env = LiarsDeckEnv(num_players=config.NUM_PLAYERS, render_mode=config.RENDER_MODE)
     
-    # Configure logger
     logger = configure_logger()
     logger.info("Starting curriculum training process...")
     
-    # Run curriculum training
     training_results = train_curriculum(
         env=env,
         device=device,
@@ -790,7 +739,6 @@ def main():
         logger.error("Training results are None. Exiting.")
         return
     
-    # Extract trained components
     policy_net = training_results['policy_net']
     value_net = training_results['value_net']
     obp_model = training_results['obp_model']
@@ -798,13 +746,11 @@ def main():
     value_optimizer = training_results['value_optimizer']
     obp_optimizer = training_results['obp_optimizer']
     
-    # Create dictionaries for final checkpoint
     policy_nets = {'player_0': policy_net, 'player_1': policy_net}
     value_nets = {'player_0': value_net, 'player_1': value_net}
     optimizers_policy = {'player_0': policy_optimizer, 'player_1': policy_optimizer}
     optimizers_value = {'player_0': value_optimizer, 'player_1': value_optimizer}
     
-    # Save final checkpoint
     save_checkpoint(
         policy_nets,
         value_nets,
