@@ -698,9 +698,10 @@ def initialize_players(base_dir, device):
 # Unified Evaluation Function
 # ----------------------------
 
-def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournament=False, two_player=None):
+def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournament=False, two_player=None, track_experts=False):
     """
     Optimized evaluation function with minimized CPU/GPU transfers and vectorized operations.
+    Now with optional expert tracking capabilities.
     """
     logger = logging.getLogger("Evaluate")
     player_ids = list(players_in_this_game.keys())
@@ -729,6 +730,14 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
     total_steps = 0
     game_wins_list = []
     start_time = time.time()
+    
+    # Initialize expert tracking if enabled
+    expert_activations = {} if track_experts else None
+    if track_experts:
+        for agent_name in ['player_0', 'player_1']:
+            pid = agent_to_player.get(agent_name)
+            if pid:
+                expert_activations[agent_name] = {}
 
     with torch.no_grad():
         for game_idx in range(1, episodes + 1):
@@ -828,7 +837,24 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                     torch.zeros(num_layers, batch_size, hidden_size, device=device)
                 )
 
-                probs, _, _ = policy_net(final_obs_tensor, hidden_state)
+                # Modified to capture gating logits for expert tracking
+                probs, _, gating_logits = policy_net(final_obs_tensor, hidden_state)
+                
+                # Track which expert is activated if tracking is enabled
+                if track_experts and gating_logits is not None and agent in ['player_0', 'player_1']:
+                    # Get the top expert (assuming top_n=1 in the model)
+                    _, top_expert = torch.topk(gating_logits, 1, dim=1)
+                    expert_idx = top_expert.squeeze().item()
+                    expert_idx_str = str(expert_idx)
+                    
+                    # Initialize if not yet present
+                    if expert_idx_str not in expert_activations[agent]:
+                        expert_activations[agent][expert_idx_str] = 0
+                        
+                    # Count this activation
+                    expert_activations[agent][expert_idx_str] += 1
+                    logger.debug(f"Agent {agent} used expert {expert_idx}")
+                
                 probs = probs.clamp(1e-8, 1.0)
                 mask = info.get('action_mask', [1] * config.OUTPUT_DIM)
                 mask_tensor = torch.as_tensor(mask, dtype=torch.float32, device=device)
@@ -854,4 +880,9 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
     elapsed_time = time.time() - start_time
     steps_per_sec = total_steps / elapsed_time if elapsed_time > 0 else 0
     avg_steps = total_steps / episodes if episodes > 0 else 0
-    return cumulative_wins, action_counts, game_wins_list, avg_steps, steps_per_sec
+    
+    # Return expert activations if tracking was enabled
+    if track_experts:
+        return cumulative_wins, action_counts, game_wins_list, avg_steps, steps_per_sec, expert_activations
+    else:
+        return cumulative_wins, action_counts, game_wins_list, avg_steps, steps_per_sec
