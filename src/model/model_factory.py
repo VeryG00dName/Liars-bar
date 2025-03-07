@@ -1,9 +1,10 @@
+# src/model/model_factory.py
 import torch
 from src import config
 from src.model.common_model_api import BasePolicyNetwork, BaseValueNetwork, BaseOpponentBehaviorPredictor
 
 # Import new implementations for policy and value networks.
-from src.model.new_models import PolicyNetwork as PPONetwork, ValueNetwork as PPOValueNetwork
+from src.model.new_models import PolicyNetwork as NewPolicyNetwork, ValueNetwork as PPOValueNetwork
 
 class ModelFactory:
     """
@@ -12,18 +13,33 @@ class ModelFactory:
     
     @staticmethod
     def create_policy_network(use_aux_classifier: bool = False, num_opponent_classes: int = None,
-                              input_dim: int = 26, hidden_dim: int = 64, output_dim: int = config.OUTPUT_DIM,
-                              use_lstm: bool = True, use_dropout: bool = True, use_layer_norm: bool = True) -> BasePolicyNetwork:
-        model = PPONetwork(
-            input_dim=input_dim,
-            hidden_dim=hidden_dim,
-            output_dim=output_dim,
-            use_lstm=use_lstm,
-            use_dropout=use_dropout,
-            use_layer_norm=use_layer_norm,
-            use_aux_classifier=use_aux_classifier,
-            num_opponent_classes=num_opponent_classes
-        )
+                              input_dim: int = 26, hidden_dim: int = config.HIDDEN_DIM, output_dim: int = config.OUTPUT_DIM,
+                              use_lstm: bool = True, use_dropout: bool = True, use_layer_norm: bool = True,
+                              use_new_model: bool = True, strategy_dim: int = 5, num_opponents: int = 2) -> BasePolicyNetwork:
+        if use_new_model:
+            # Instantiate the new model version.
+            model = NewPolicyNetwork(
+                input_dim=input_dim,
+                hidden_dim=hidden_dim,
+                output_dim=output_dim,
+                use_lstm=use_lstm,
+                use_dropout=use_dropout,
+                use_layer_norm=use_layer_norm,
+                use_aux_classifier=use_aux_classifier,
+                num_opponent_classes=num_opponent_classes
+            )
+        else:
+            # Import and instantiate the older version from other_models.
+            from src.model.other_models import PolicyNetwork as OtherPolicyNetwork
+            model = OtherPolicyNetwork(
+                input_dim=input_dim,
+                hidden_dim=hidden_dim,
+                output_dim=output_dim,
+                strategy_dim=strategy_dim,
+                num_opponents=num_opponents,
+                use_lstm=use_lstm,
+                use_dropout=use_dropout
+            )
         return model
 
     @staticmethod
