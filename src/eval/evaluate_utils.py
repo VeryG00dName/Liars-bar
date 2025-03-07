@@ -24,7 +24,7 @@ from rich.progress import Progress, BarColumn, TextColumn
 # OpenSkill for rating updates
 from openskill.models import PlackettLuce
 
-from src.model.new_models import PolicyNetwork, ValueNetwork, StrategyTransformer ,OpponentBehaviorPredictor
+from src.model.other_models import PolicyNetwork, ValueNetwork, StrategyTransformer ,OpponentBehaviorPredictor
 
 # Model and config imports
 from src import config
@@ -59,15 +59,24 @@ def load_combined_checkpoint(checkpoint_path, device):
     return checkpoint
 
 def get_hidden_dim_from_state_dict(state_dict, layer_prefix='fc1'):
-    """Determine hidden dimension from a state dictionary based on layer prefix."""
-    weight_key = f"{layer_prefix}.weight"
-    if weight_key in state_dict:
-        return state_dict[weight_key].shape[0]
-    else:
-        for key in state_dict.keys():
-            if key.endswith('.weight') and ('fc' in key or 'layer' in key):
-                return state_dict[key].shape[0]
-    raise ValueError(f"Cannot determine hidden_dim from state_dict for layer prefix '{layer_prefix}'.")
+    # Try several candidate prefixes.
+    candidate_prefixes = [
+        layer_prefix,
+        "base_encoder.0",
+        "policy_net.fc1",
+        "model.fc1"
+    ]
+    for prefix in candidate_prefixes:
+        key = f"{prefix}.weight"
+        if key in state_dict:
+            return state_dict[key].shape[0]
+    # Fallback: return the first 2D tensor's first dimension.
+    for key, tensor in state_dict.items():
+        if isinstance(tensor, torch.Tensor) and tensor.ndim == 2:
+            return tensor.shape[0]
+    # If still not found, include available keys in the error message.
+    available_keys = list(state_dict.keys())
+    raise ValueError(f"Cannot determine hidden_dim from state_dict. Tried prefixes: {candidate_prefixes}. Available keys: {available_keys}")
 
 def assign_final_ranks(triple, cumulative_wins):
     """
