@@ -58,85 +58,38 @@ class SingleExpertPolicyNetwork(nn.Module):
 
 class PolicyNetwork(nn.Module):
     """
-    Mixture-of-Experts policy network with auxiliary gating loss.
+    Mixture-of-Experts policy network that uses an external expert selection.
     
-    It maintains a set of experts (one per opponent) using the simplified expert above.
-    The gating network uses only the last 10 elements of the observation (assumed to be memory embeddings)
-    to produce logits over experts. These logits are returned as an auxiliary output.
-    
-    Forward pass:
-      1. Extract the last 10 elements from the observation as the gating input.
-      2. Compute full gating logits via a small network.
-      3. Select the top n experts (hard selection) based on the gating logits.
-      4. Obtain each expert’s output (action probabilities) and average the top n outputs.
-    
-    Args:
-        input_dim (int): Dimensionality of the entire observation.
-        hidden_dim (int): Hidden layer size for both experts and gating network.
-        output_dim (int): Number of actions.
-        num_experts (int): Total number of experts.
-        top_n (int): Number of top experts to select.
-        use_lstm (bool): Whether experts use an LSTM.
-        use_dropout (bool): Whether to use dropout.
-        use_layer_norm (bool): Whether to use layer normalization.
+    Instead of computing gating internally, this network expects a second input,
+    'expert_index', which indicates which expert to use. The network then simply
+    passes the observation through the selected expert to produce the action probabilities.
     """
-    def __init__(self, input_dim, hidden_dim, output_dim, num_experts, top_n=1,
+    def __init__(self, input_dim, hidden_dim, output_dim, num_experts,
                  use_lstm=True, use_dropout=True, use_layer_norm=True):
         super(PolicyNetwork, self).__init__()
         self.num_experts = num_experts
-        self.top_n = top_n
         
         # Create a list of experts.
         self.experts = nn.ModuleList([
             SingleExpertPolicyNetwork(input_dim, hidden_dim, output_dim, use_lstm, use_dropout, use_layer_norm)
             for _ in range(num_experts)
         ])
-        
-        # Gating network: takes a 10-dim memory embedding and outputs logits over experts.
-        gating_input_dim = 10
-        self.gating_net = nn.Sequential(
-            nn.Linear(gating_input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, num_experts)
-        )
-        
-    def forward(self, x, hidden_state=None):
+    
+    def forward(self, x, expert_index, hidden_state=None):
         """
         Args:
-            x (Tensor): Observation of shape (batch_size, input_dim). The last 10 elements are used as memory embedding.
-            hidden_state (optional): LSTM hidden state for expert networks.
+            x (Tensor): Observation of shape (batch_size, input_dim).
+            expert_index (int): The index of the expert to use.
+            hidden_state (optional): LSTM hidden state for the selected expert.
             
         Returns:
-            combined_action_probs (Tensor): (batch_size, output_dim) final action probability distribution.
-            hidden_state: LSTM hidden state from the first expert.
-            gating_logits (Tensor): (batch_size, num_experts) full logits for auxiliary gating loss.
+            action_probs (Tensor): (batch_size, output_dim) action probability distribution.
+            hidden_state: LSTM hidden state from the selected expert.
         """
-        batch_size = x.size(0)
-        # Extract memory embedding (last 10 elements).
-        gating_input = x[:, -10:]  # shape: (batch_size, 10)
-        gating_logits = self.gating_net(gating_input)  # (batch_size, num_experts)
-        
-        # Select top n experts.
-        _, topk_indices = torch.topk(gating_logits, self.top_n, dim=-1)  # shape: (batch_size, top_n)
-        
-        # Get outputs from all experts.
-        expert_outputs = []
-        expert_hidden_state = None
-        for expert in self.experts:
-            action_probs, hs = expert(x, hidden_state)
-            expert_outputs.append(action_probs)  # each: (batch_size, output_dim)
-            if expert_hidden_state is None:
-                expert_hidden_state = hs
-        
-        # Stack expert outputs.
-        expert_action_probs = torch.stack(expert_outputs, dim=1)  # (batch_size, num_experts, output_dim)
-        # Gather outputs from the selected experts.
-        topk_indices_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, expert_action_probs.size(-1))
-        top_expert_outputs = torch.gather(expert_action_probs, dim=1, index=topk_indices_expanded)
-        # Average over top n experts.
-        combined_action_probs = top_expert_outputs.mean(dim=1)  # (batch_size, output_dim)
-        
-        return combined_action_probs, expert_hidden_state, gating_logits
+        if expert_index < 0 or expert_index >= self.num_experts:
+            raise ValueError(f"Expert index {expert_index} is out of range.")
+        expert = self.experts[expert_index]
+        return expert(x, hidden_state)
 
     
 class ValueNetwork(nn.Module):
