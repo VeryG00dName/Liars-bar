@@ -53,6 +53,30 @@ def convert_memory_to_features(memory, response_mapping, action_mapping):
         features.append([resp_val, act_val, penalties, card_count])
     return features
 
+def get_input_dim_from_state_dict(state_dict, candidate_prefix='fc1'):
+    """
+    Attempts to determine the input dimension from a policy state dictionary.
+    It searches for candidate keys (e.g. "fc1.weight", "base_encoder.0.weight", etc.)
+    and returns the second dimension of the first matching weight tensor.
+    """
+    candidate_prefixes = [
+        candidate_prefix,
+        "base_encoder.0",
+        "policy_net.fc1",
+        "model.fc1"
+    ]
+    for prefix in candidate_prefixes:
+        key = f"{prefix}.weight"
+        if key in state_dict:
+            return state_dict[key].shape[1]
+    # Fallback: iterate over all keys and return the input dimension from the first 2D tensor found.
+    for key, tensor in state_dict.items():
+        if hasattr(tensor, "ndim") and tensor.ndim == 2:
+            return tensor.shape[1]
+    available_keys = list(state_dict.keys())
+    raise ValueError(f"Cannot determine input_dim from state_dict. Tried prefixes: {candidate_prefixes}. "
+                     f"Available keys: {available_keys}")
+
 # --- Custom QListWidget for drag-and-drop ---
 class DropListWidget(QtWidgets.QListWidget):
     def __init__(self, main_window, parent=None):
@@ -80,6 +104,16 @@ class DropListWidget(QtWidgets.QListWidget):
             event.acceptProposedAction()
         else:
             event.ignore()
+
+# --- Helper: Detect if a policy state dict comes from new_models ---
+def is_new_policy(state_dict):
+    if "fc_classifier.weight" in state_dict:
+        return True
+    elif "strategy_query.weight" in state_dict:
+        return False
+    else:
+        # Default to new model if unclear.
+        return True
 
 # --- Worker thread to run the battleground matches ---
 class BattlegroundWorker(QThread):
@@ -133,21 +167,34 @@ class BattlegroundWorker(QThread):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         players_in_this_game = {}
 
-        # AI Agents (player_0 and player_1)
+        # --- AI Agents (player_0 and player_1) ---
         for key in ["player_0", "player_1"]:
             agent_data = self.ai_agents[key]
             hidden_dim = get_hidden_dim_from_state_dict(agent_data["policy_net"], "fc1")
             obs_dim = agent_data["input_dim"]
-            policy_net = ModelFactory.create_policy_network(
-                input_dim=obs_dim,
-                hidden_dim=hidden_dim,
-                output_dim=env.action_spaces[key].n,
-                use_aux_classifier=True,
-                num_opponent_classes=config.NUM_OPPONENT_CLASSES
-            )
+            new_model_flag = is_new_policy(agent_data["policy_net"])
+            if new_model_flag:
+                policy_net = ModelFactory.create_policy_network(
+                    input_dim=obs_dim,
+                    hidden_dim=hidden_dim,
+                    output_dim=env.action_spaces[key].n,
+                    use_aux_classifier=True,
+                    num_opponent_classes=config.NUM_OPPONENT_CLASSES,
+                    use_new_model=True
+                )
+            else:
+                policy_net = ModelFactory.create_policy_network(
+                    input_dim=obs_dim,
+                    hidden_dim=hidden_dim,
+                    output_dim=env.action_spaces[key].n,
+                    use_new_model=False,
+                    strategy_dim=config.STRATEGY_DIM,  # assumed defined in config
+                    num_opponents=env.num_players - 1
+                )
             policy_net.load_state_dict(agent_data["policy_net"], strict=False)
             policy_net.to(device).eval()
 
+            # OBP model loading remains the same.
             obp_state = agent_data["obp_model"]
             if obp_state is not None:
                 obp_hidden_dim = get_hidden_dim_from_state_dict(obp_state, "fc1")
@@ -172,7 +219,6 @@ class BattlegroundWorker(QThread):
                 obp_model.to(device).eval()
                 example_observation = torch.randn(1, config.OPPONENT_INPUT_DIM).to(device)
                 example_memory_embedding = torch.randn(1, config.STRATEGY_DIM).to(device)
-
                 obp_model = torch.jit.trace(obp_model, (example_observation, example_memory_embedding))
             else:
                 obp_model = None
@@ -185,7 +231,7 @@ class BattlegroundWorker(QThread):
                 "uses_memory": agent_data["uses_memory"]
             }
 
-        # Opponent as player_2.
+        # --- Opponent as player_2 ---
         if opponent_type == "hardcoded":
             opponent_instance = opponent_obj(opponent_name)
             players_in_this_game["player_2"] = {
@@ -199,13 +245,25 @@ class BattlegroundWorker(QThread):
             hist_state_dict = opponent_obj.state_dict()
             hidden_dim = get_hidden_dim_from_state_dict(hist_state_dict, "fc1")
             obs_dim = hist_state_dict["fc1.weight"].shape[1]
-            policy_net = ModelFactory.create_policy_network(
-                input_dim=obs_dim,
-                hidden_dim=hidden_dim,
-                output_dim=env.action_spaces["player_2"].n,
-                use_aux_classifier=True,
-                num_opponent_classes=config.NUM_OPPONENT_CLASSES
-            )
+            new_model_flag = is_new_policy(hist_state_dict)
+            if new_model_flag:
+                policy_net = ModelFactory.create_policy_network(
+                    input_dim=obs_dim,
+                    hidden_dim=hidden_dim,
+                    output_dim=env.action_spaces["player_2"].n,
+                    use_aux_classifier=True,
+                    num_opponent_classes=config.NUM_OPPONENT_CLASSES,
+                    use_new_model=True
+                )
+            else:
+                policy_net = ModelFactory.create_policy_network(
+                    input_dim=obs_dim,
+                    hidden_dim=hidden_dim,
+                    output_dim=env.action_spaces["player_2"].n,
+                    use_new_model=False,
+                    strategy_dim=config.STRATEGY_DIM,
+                    num_opponents=env.num_players - 1
+                )
             policy_net.load_state_dict(hist_state_dict, strict=False)
             policy_net.to(device).eval()
 
@@ -227,7 +285,7 @@ class BattlegroundWorker(QThread):
         else:
             raise ValueError(f"Unknown opponent type: {opponent_type}")
 
-        # Pass our two_player flag to evaluate_agents.
+        # Run evaluation for a single match.
         cumulative_wins, _, _, _, _ = evaluate_agents(env, device, players_in_this_game, episodes=1, two_player=self.two_player)
         winner = max(cumulative_wins, key=cumulative_wins.get)
         if winner in ["player_0", "player_1"]:
@@ -379,7 +437,23 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
             raise ValueError("Missing required keys in checkpoint")
         
         any_policy = next(iter(checkpoint["policy_nets"].values()))
-        input_dim = any_policy['fc1.weight'].shape[1]
+        
+        # If this checkpoint comes from an older (other_models) policy,
+        # its state dict will contain "base_encoder.0.weight". In that case,
+        # we extract the base dimension and compute the full input dimension.
+        if "base_encoder.0.weight" in any_policy:
+            base_dim = any_policy["base_encoder.0.weight"].shape[1]
+            # Default value for number of opponents (adjust if needed)
+            num_opponents = 2
+            # full input_dim = base_dim + (strategy_dim * num_opponents)
+            input_dim = base_dim + (config.STRATEGY_DIM * num_opponents)
+        else:
+            try:
+                input_dim = any_policy['fc1.weight'].shape[1]
+            except KeyError:
+                input_dim = get_input_dim_from_state_dict(any_policy, candidate_prefix='fc1')
+        
+        # Set observation version based on input_dim.
         if input_dim == 18:
             obs_version = 1
         elif input_dim in (16, 24, 26):
@@ -387,6 +461,7 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         else:
             raise ValueError(f"Unknown input_dim {input_dim} for model {file_path}")
         
+        # For simplicity, assume that the models use memory if loaded from these checkpoints.
         uses_memory = True
         
         self.loaded_models[file_path] = {
