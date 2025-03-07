@@ -3,81 +3,142 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-class PolicyNetwork(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, use_lstm=True, use_dropout=True, use_layer_norm=True,
-                 use_aux_classifier=False, num_opponent_classes=None):
-        super(PolicyNetwork, self).__init__()
+
+class SingleExpertPolicyNetwork(nn.Module):
+    """
+    A simplified expert network that uses a single hidden layer.
+    
+    It performs:
+      1. A linear transformation from input_dim to hidden_dim, with GELU activation.
+      2. Optional dropout and layer normalization.
+      3. Optionally, a one-layer LSTM (applied to a single time step).
+      4. A final linear layer to produce action logits.
+      5. Softmax over logits to produce action probabilities.
+    """
+    def __init__(self, input_dim, hidden_dim, output_dim, use_lstm=True, use_dropout=True, use_layer_norm=True):
+        super(SingleExpertPolicyNetwork, self).__init__()
         self.use_lstm = use_lstm
         self.use_dropout = use_dropout
         self.use_layer_norm = use_layer_norm
-        self.use_aux_classifier = use_aux_classifier
-
-        # Core network layers.
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, hidden_dim)
         
+        # A single hidden layer.
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        
+        # LSTM layer (if used) and final classification layer.
         if self.use_lstm:
-            self.lstm = nn.LSTM(hidden_dim, hidden_dim, num_layers=2, batch_first=True)
-            self.fc4 = nn.Linear(hidden_dim, output_dim)
+            # Using a one-layer LSTM for a single time-step.
+            self.lstm = nn.LSTM(hidden_dim, hidden_dim, num_layers=1, batch_first=True)
+            self.fc_out = nn.Linear(hidden_dim, output_dim)
         else:
-            self.fc4 = nn.Linear(hidden_dim, output_dim)
-
+            self.fc_out = nn.Linear(hidden_dim, output_dim)
+        
         if self.use_dropout:
             self.dropout = nn.Dropout(p=0.3)
         if self.use_layer_norm:
-            self.layer_norm1 = nn.LayerNorm(hidden_dim)
-            self.layer_norm2 = nn.LayerNorm(hidden_dim)
-            self.layer_norm3 = nn.LayerNorm(hidden_dim)
-
-        # Optional auxiliary classification head.
-        if self.use_aux_classifier:
-            if num_opponent_classes is None:
-                raise ValueError("num_opponent_classes must be provided when use_aux_classifier is True")
-            self.fc_classifier = nn.Linear(hidden_dim, num_opponent_classes)
-        else:
-            self.fc_classifier = None
+            self.layer_norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, x, hidden_state=None):
-        # First layer.
+        # x: (batch_size, input_dim)
         x = F.gelu(self.fc1(x))
         if self.use_layer_norm:
-            x = self.layer_norm1(x)
+            x = self.layer_norm(x)
         if self.use_dropout:
             x = self.dropout(x)
         
-        # Second layer.
-        x = F.gelu(self.fc2(x))
-        if self.use_layer_norm:
-            x = self.layer_norm2(x)
-        if self.use_dropout:
-            x = self.dropout(x)
-        
-        # Third layer.
-        x = F.gelu(self.fc3(x))
-        if self.use_layer_norm:
-            x = self.layer_norm3(x)
-        if self.use_dropout:
-            x = self.dropout(x)
-        
-        # Optionally, produce auxiliary classification logits using the hidden representation.
-        if self.use_aux_classifier:
-            opponent_logits = self.fc_classifier(x)
-        else:
-            opponent_logits = None
-        
-        # Continue with the original forward pass.
+        # Optionally use LSTM.
         if self.use_lstm:
-            x = x.unsqueeze(1)
+            # Add a time dimension (sequence length 1).
+            x = x.unsqueeze(1)  # (batch_size, 1, hidden_dim)
             x, hidden_state = self.lstm(x, hidden_state)
-            x = x.squeeze(1)
-            action_logits = self.fc4(x)
-        else:
-            action_logits = self.fc4(x)
+            x = x.squeeze(1)    # (batch_size, hidden_dim)
         
+        action_logits = self.fc_out(x)
         action_probs = F.softmax(action_logits, dim=-1)
-        return action_probs, hidden_state, opponent_logits
+        return action_probs, hidden_state
 
+class PolicyNetwork(nn.Module):
+    """
+    Mixture-of-Experts policy network with auxiliary gating loss.
+    
+    It maintains a set of experts (one per opponent) using the simplified expert above.
+    The gating network uses only the last 10 elements of the observation (assumed to be memory embeddings)
+    to produce logits over experts. These logits are returned as an auxiliary output.
+    
+    Forward pass:
+      1. Extract the last 10 elements from the observation as the gating input.
+      2. Compute full gating logits via a small network.
+      3. Select the top n experts (hard selection) based on the gating logits.
+      4. Obtain each expert’s output (action probabilities) and average the top n outputs.
+    
+    Args:
+        input_dim (int): Dimensionality of the entire observation.
+        hidden_dim (int): Hidden layer size for both experts and gating network.
+        output_dim (int): Number of actions.
+        num_experts (int): Total number of experts.
+        top_n (int): Number of top experts to select.
+        use_lstm (bool): Whether experts use an LSTM.
+        use_dropout (bool): Whether to use dropout.
+        use_layer_norm (bool): Whether to use layer normalization.
+    """
+    def __init__(self, input_dim, hidden_dim, output_dim, num_experts, top_n=1,
+                 use_lstm=True, use_dropout=True, use_layer_norm=True):
+        super(PolicyNetwork, self).__init__()
+        self.num_experts = num_experts
+        self.top_n = top_n
+        
+        # Create a list of experts.
+        self.experts = nn.ModuleList([
+            SingleExpertPolicyNetwork(input_dim, hidden_dim, output_dim, use_lstm, use_dropout, use_layer_norm)
+            for _ in range(num_experts)
+        ])
+        
+        # Gating network: takes a 10-dim memory embedding and outputs logits over experts.
+        gating_input_dim = 10
+        self.gating_net = nn.Sequential(
+            nn.Linear(gating_input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_experts)
+        )
+        
+    def forward(self, x, hidden_state=None):
+        """
+        Args:
+            x (Tensor): Observation of shape (batch_size, input_dim). The last 10 elements are used as memory embedding.
+            hidden_state (optional): LSTM hidden state for expert networks.
+            
+        Returns:
+            combined_action_probs (Tensor): (batch_size, output_dim) final action probability distribution.
+            hidden_state: LSTM hidden state from the first expert.
+            gating_logits (Tensor): (batch_size, num_experts) full logits for auxiliary gating loss.
+        """
+        batch_size = x.size(0)
+        # Extract memory embedding (last 10 elements).
+        gating_input = x[:, -10:]  # shape: (batch_size, 10)
+        gating_logits = self.gating_net(gating_input)  # (batch_size, num_experts)
+        
+        # Select top n experts.
+        _, topk_indices = torch.topk(gating_logits, self.top_n, dim=-1)  # shape: (batch_size, top_n)
+        
+        # Get outputs from all experts.
+        expert_outputs = []
+        expert_hidden_state = None
+        for expert in self.experts:
+            action_probs, hs = expert(x, hidden_state)
+            expert_outputs.append(action_probs)  # each: (batch_size, output_dim)
+            if expert_hidden_state is None:
+                expert_hidden_state = hs
+        
+        # Stack expert outputs.
+        expert_action_probs = torch.stack(expert_outputs, dim=1)  # (batch_size, num_experts, output_dim)
+        # Gather outputs from the selected experts.
+        topk_indices_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, expert_action_probs.size(-1))
+        top_expert_outputs = torch.gather(expert_action_probs, dim=1, index=topk_indices_expanded)
+        # Average over top n experts.
+        combined_action_probs = top_expert_outputs.mean(dim=1)  # (batch_size, output_dim)
+        
+        return combined_action_probs, expert_hidden_state, gating_logits
+
+    
 class ValueNetwork(nn.Module):
     def __init__(self, input_dim, hidden_dim, use_dropout=True, use_layer_norm=True):
         super(ValueNetwork, self).__init__()
