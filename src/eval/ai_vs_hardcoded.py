@@ -119,6 +119,7 @@ def is_new_policy(state_dict):
 class BattlegroundWorker(QThread):
     progress_signal = pyqtSignal(int)
     results_signal = pyqtSignal(dict)
+    expert_signal = pyqtSignal(dict)  # New signal for expert activations
     error_signal = pyqtSignal(str)
     
     # Now include an extra parameter "two_player"
@@ -129,6 +130,8 @@ class BattlegroundWorker(QThread):
         self.hardcoded_agents = hardcoded_agents
         self.rounds = rounds
         self.two_player = two_player  # if not None, pass the player id to eliminate
+        # New: Track expert activations
+        self.expert_activations = {}
 
     def run(self):
         try:
@@ -143,21 +146,37 @@ class BattlegroundWorker(QThread):
             total_matches = self.rounds * len(combined_opponents)
             progress_counter = 0
             results = {}
+            # Initialize expert activation tracking
+            self.expert_activations = {}
 
             for opp_name, (opp_type, opp_obj) in combined_opponents.items():
                 wins = [0, 0, 0]  # [AI1 Wins, AI2 Wins, Opponent Wins]
+                # Initialize expert activations for this opponent
+                self.expert_activations[opp_name] = {"player_0": {}, "player_1": {}}
+                
                 for _ in range(self.rounds):
-                    winner = self.run_match(opp_type, opp_obj, opp_name)
+                    winner, expert_data = self.run_match(opp_type, opp_obj, opp_name)
                     if winner == "player_0":
                         wins[0] += 1
                     elif winner == "player_1":
                         wins[1] += 1
                     elif winner == "opponent":
                         wins[2] += 1
+                    
+                    # Update expert activations
+                    if expert_data:
+                        for player, expert_counts in expert_data.items():
+                            for expert_idx, count in expert_counts.items():
+                                if expert_idx not in self.expert_activations[opp_name][player]:
+                                    self.expert_activations[opp_name][player][expert_idx] = 0
+                                self.expert_activations[opp_name][player][expert_idx] += count
+                    
                     progress_counter += 1
                     self.progress_signal.emit(progress_counter)
                 results[opp_name] = wins
 
+            # Emit the expert activations 
+            self.expert_signal.emit(self.expert_activations)
             self.results_signal.emit(results)
         except Exception as e:
             self.error_signal.emit(str(e))
@@ -228,7 +247,9 @@ class BattlegroundWorker(QThread):
                 "obp_model": obp_model,
                 "obs_version": agent_data["obs_version"],
                 "rating": None,
-                "uses_memory": agent_data["uses_memory"]
+                "uses_memory": agent_data["uses_memory"],
+                # Add flag to track expert activations
+                "track_experts": True
             }
 
         # --- Opponent as player_2 ---
@@ -285,15 +306,19 @@ class BattlegroundWorker(QThread):
         else:
             raise ValueError(f"Unknown opponent type: {opponent_type}")
 
-        # Run evaluation for a single match.
-        cumulative_wins, _, _, _, _ = evaluate_agents(env, device, players_in_this_game, episodes=1, two_player=self.two_player)
+        # Run evaluation for a single match, now capturing expert activations
+        cumulative_wins, _, _, _, _, expert_activations = evaluate_agents(
+            env, device, players_in_this_game, episodes=1, 
+            two_player=self.two_player, track_experts=True
+        )
+        
         winner = max(cumulative_wins, key=cumulative_wins.get)
         if winner in ["player_0", "player_1"]:
-            return winner
+            return winner, expert_activations
         elif winner == "player_2":
-            return "opponent"
+            return "opponent", expert_activations
         else:
-            return "unknown"
+            return "unknown", expert_activations
 
 # --- Main GUI class using PyQt with a Discord-like style ---
 class AgentBattlegroundGUI(QtWidgets.QMainWindow):
@@ -320,6 +345,8 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         # Store previous results for comparison.
         self.previous_results = None
         self.current_results = None
+        # Store expert activations
+        self.expert_activations = None
 
         self.initUI()
 
@@ -391,6 +418,11 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         self.compare_button = QtWidgets.QPushButton("Compare Results")
         self.compare_button.clicked.connect(self.compare_results)
         control_layout.addWidget(self.compare_button)
+        
+        # --- Show Expert Usage Button ---
+        self.expert_button = QtWidgets.QPushButton("Show Expert Usage")
+        self.expert_button.clicked.connect(self.show_expert_usage)
+        control_layout.addWidget(self.expert_button)
 
         main_layout.addLayout(control_layout)
 
@@ -542,11 +574,17 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         self.worker = BattlegroundWorker(ai_agents, self.historical_models, self.hardcoded_agents, rounds, two_player=two_player_param)
         self.worker.progress_signal.connect(self.update_progress)
         self.worker.results_signal.connect(self.display_results)
+        self.worker.expert_signal.connect(self.store_expert_activations)  # Connect to new signal
         self.worker.error_signal.connect(lambda msg: self.show_info(f"Error: {msg}"))
         self.worker.start()
 
     def update_progress(self, value):
         self.progress_bar.setValue(value)
+
+    def store_expert_activations(self, expert_activations):
+        """Store expert activations data"""
+        self.expert_activations = expert_activations
+        logger.info(f"Received expert activations for {len(expert_activations)} opponents")
 
     # --- Display results with optional combining ---
     def display_results(self, results):
@@ -700,6 +738,144 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
 
         # Update previous_results with current_results for future comparisons.
         self.previous_results = self.current_results
+
+    def show_expert_usage(self):
+        """Display expert activation information"""
+        if not self.expert_activations:
+            QtWidgets.QMessageBox.information(self, "Expert Usage", 
+                                            "No expert activation data available. Run a battle first.")
+            return
+        
+        # Create a dialog to show expert activation data
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Expert Activation Analysis")
+        dialog.setMinimumSize(800, 600)
+        
+        layout = QtWidgets.QVBoxLayout(dialog)
+        
+        # Create a tab widget to show AI1 and AI2 separately
+        tab_widget = QtWidgets.QTabWidget()
+        
+        # Create visualization for each AI agent
+        for player_idx, player in enumerate(["player_0", "player_1"]):
+            player_tab = QtWidgets.QWidget()
+            player_layout = QtWidgets.QVBoxLayout(player_tab)
+            
+            # Add text display of expert activations
+            text = QtWidgets.QTextEdit()
+            text.setReadOnly(True)
+            
+            html = f"""<h2>Expert Activations for AI Agent {player_idx+1}</h2>
+            <table style="border: 1px solid #7289da; border-collapse: collapse; width: 100%;">
+            <thead>
+                <tr style="background-color: #4f545c;">
+                <th style="border: 1px solid #7289da; padding: 8px;">Opponent</th>
+                <th style="border: 1px solid #7289da; padding: 8px;">Total Activations</th>
+                <th style="border: 1px solid #7289da; padding: 8px;">Most Used Expert</th>
+                <th style="border: 1px solid #7289da; padding: 8px;">Expert Distribution</th>
+                </tr>
+            </thead>
+            <tbody>
+            """
+            
+            # For plotting
+            opponent_names = []
+            expert_usages = []
+            
+            # Process each opponent
+            for opp_name, activations in self.expert_activations.items():
+                player_activations = activations.get(player, {})
+                if not player_activations:
+                    continue
+                
+                total = sum(player_activations.values())
+                
+                # Find the most used expert
+                most_used = max(player_activations.items(), key=lambda x: x[1], default=(None, 0))
+                if most_used[0] is not None:
+                    most_used_str = f"Expert {most_used[0]} ({most_used[1]/total:.1%})"
+                else:
+                    most_used_str = "None"
+                
+                # Create distribution string
+                dist_parts = []
+                for expert_idx, count in sorted(player_activations.items()):
+                    if count > 0:
+                        pct = count / total * 100
+                        dist_parts.append(f"E{expert_idx}: {pct:.1f}%")
+                
+                dist_str = " | ".join(dist_parts)
+                
+                # Add to table
+                html += f"""
+                <tr>
+                <td style="border: 1px solid #7289da; padding: 6px;">{opp_name}</td>
+                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{total}</td>
+                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{most_used_str}</td>
+                <td style="border: 1px solid #7289da; padding: 6px;">{dist_str}</td>
+                </tr>
+                """
+                
+                # Collect data for the plot
+                opponent_names.append(opp_name)
+                expert_data = {}
+                for expert_idx in range(10):  # Assume up to 10 experts
+                    expert_data[f"E{expert_idx}"] = player_activations.get(str(expert_idx), 0) / total if total else 0
+                
+                expert_usages.append(expert_data)
+            
+            html += """
+            </tbody>
+            </table>
+            """
+            
+            # Add explanation
+            html += """<p><b>Note:</b> This analysis shows which expert from the mixture-of-experts policy 
+            network was activated during battles against each opponent. If the agent is correctly 
+            specializing, you should see consistent expert selection for specific opponents.</p>"""
+            
+            text.setHtml(html)
+            player_layout.addWidget(text)
+            
+            # Add graphical visualization if we have data
+            if opponent_names and expert_usages:
+                # Create a figure with expert activation distributions
+                figure = plt.figure(figsize=(10, 6))
+                ax = figure.add_subplot(111)
+                
+                # Prepare data for a grouped bar chart
+                num_opponents = len(opponent_names)
+                expert_ids = sorted(set(key for usage in expert_usages for key in usage.keys()))
+                bar_width = 0.8 / len(expert_ids)
+                
+                # Plot bars for each expert
+                for i, expert_id in enumerate(expert_ids):
+                    values = [usage.get(expert_id, 0) for usage in expert_usages]
+                    x_pos = np.arange(num_opponents) + (i - len(expert_ids)/2 + 0.5) * bar_width
+                    ax.bar(x_pos, values, bar_width, label=expert_id)
+                
+                ax.set_xticks(np.arange(num_opponents))
+                ax.set_xticklabels(opponent_names, rotation=45, ha='right')
+                ax.set_ylabel('Activation Rate')
+                ax.set_title(f'Expert Activation Distribution for AI Agent {player_idx+1}')
+                ax.legend()
+                
+                # Create a canvas to display the plot
+                from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+                canvas = FigureCanvasQTAgg(figure)
+                player_layout.addWidget(canvas)
+            
+            tab_widget.addTab(player_tab, f"AI Agent {player_idx+1}")
+        
+        layout.addWidget(tab_widget)
+        
+        # Add a close button
+        button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        
+        dialog.setLayout(layout)
+        dialog.exec_()
 
 if __name__ == "__main__":
     import sys
