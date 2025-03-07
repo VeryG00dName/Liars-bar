@@ -26,7 +26,8 @@ from PIL import Image
 # Environment & model imports
 from src.env.reward_restriction_wrapper_2 import RewardRestrictionWrapper2
 from src.env.liars_deck_env_core import LiarsDeckEnv
-from src.model.new_models import PolicyNetwork, ValueNetwork, OpponentBehaviorPredictor, StrategyTransformer
+# Use the new model from other_models.
+from src.model.other_models import PolicyNetwork, ValueNetwork, OpponentBehaviorPredictor, StrategyTransformer
 from src.model.memory import RolloutMemory
 from src.env.reward_restriction_wrapper import RewardRestrictionWrapper
 from src import config
@@ -81,6 +82,7 @@ historical_label_mapping = {}
 
 device = torch.device(config.DEVICE)
 
+# Initialize the strategy transformer
 strategy_transformer = StrategyTransformer(
     num_tokens=config.STRATEGY_NUM_TOKENS,
     token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM,
@@ -117,6 +119,7 @@ if os.path.exists(transformer_checkpoint_path):
 else:
     raise FileNotFoundError(f"Transformer checkpoint not found at {transformer_checkpoint_path}")
 
+# Remove the transformer token embedding and classification head.
 strategy_transformer.token_embedding = nn.Identity()
 strategy_transformer.classification_head = None
 strategy_transformer.eval()
@@ -135,7 +138,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
     num_opponents = config.NUM_PLAYERS - 1
     config.set_derived_config(env.observation_spaces[agents[0]], env.action_spaces[agents[0]], num_opponents)
     
-    # Build list of possible injected bots
+    # Build list of possible injected bots.
     hardcoded_agent_classes = [
         GreedyCardSpammer,
         TableFirstConservativeChallenger,
@@ -150,11 +153,11 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
     for hist_model, identifier in historical_models:
         injected_bots.append(("historical", (hist_model, identifier)))
     
-    # Track wins and games played
+    # Track wins and games played.
     win_history = {agent: {} for agent in agents}
     games_played_counter = {agent: {} for agent in agents}
     
-    # Setup policy/value networks
+    # Setup policy/value networks using the new mixture-of-experts model.
     policy_nets = {}
     value_nets = {}
     optimizers_policy = {}
@@ -166,11 +169,11 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
             input_dim=config.INPUT_DIM,
             hidden_dim=config.HIDDEN_DIM,
             output_dim=config.OUTPUT_DIM,
+            num_experts=len(injected_bots),  # one expert per injected bot
+            top_n=1,                          # select only the top expert
             use_lstm=True,
             use_dropout=True,
             use_layer_norm=True,
-            use_aux_classifier=True,
-            num_opponent_classes=len(injected_bots)
         ).to(device)
         value_net = ValueNetwork(
             input_dim=config.INPUT_DIM,
@@ -248,7 +251,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
         agents = env.agents
         pending_rewards = {agent: 0.0 for agent in agents}
     
-        # Switch injected bot every 5 episodes
+        # Switch injected bot every 5 episodes.
         if (episode - start_episode) % 5 == 0:
             current_injected_agent_id = random.choice(agents)
             tracked_agent = current_injected_agent_id
@@ -284,13 +287,12 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
             observation = observation_dict[agent]
             action_mask = env.infos[agent]['action_mask']
     
-            # Generate OBP outputs according to type:
+            # --- OBP Memory Gathering ---
+            # (This block remains to update OBP memory every episode.)
             if agent == current_injected_agent_id:
                 if current_injected_bot_type == "hardcoded":
-                    # For hardcoded bots, skip OBP inference.
                     obp_probs = []
                 else:
-                    # For historical agents, generate memory embeddings normally.
                     embeddings_list = []
                     for opp in env.possible_agents:
                         if opp != agent:
@@ -371,18 +373,16 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 for i in range(num_opponents):
                     seg = normalized_arr[i * segment_size:(i + 1) * segment_size]
                     normalized_segments.append(torch.tensor(seg, dtype=torch.float32, device=device).unsqueeze(0))
-                obp_memory_embeddings = normalized_segments
                 obp_probs = run_obp_inference(obp_model, observation, device, env.num_players,
-                                              memory_embeddings=obp_memory_embeddings)
+                                              memory_embeddings=normalized_segments)
     
-            # Construct final observation
+            # Construct final observation.
             if agent == current_injected_agent_id:
                 if current_injected_bot_type == "hardcoded":
-                    final_obs = observation  # Use raw observation only.
+                    final_obs = observation
                 else:
                     base_obs = observation
                     obp_arr = np.array(obp_probs, dtype=np.float32)
-                    # For historical agents, expected input dim comes from their network.
                     expected_input_dim = current_injected_agent_instance.fc1.weight.shape[1]
                     current_dim = base_obs.shape[0] + obp_arr.shape[0]
                     missing_dim = expected_input_dim - current_dim
@@ -394,13 +394,14 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
             else:
                 final_obs = np.concatenate([observation, np.array(obp_probs, dtype=np.float32), normalized_arr], axis=0)
     
-            # Choose action
+            # Choose action using the (mixture-of-experts) policy network.
             if agent == current_injected_agent_id:
                 if current_injected_bot_type == "hardcoded":
                     action = current_injected_agent_instance.play_turn(observation, action_mask, table_card=None)
                     log_prob_value = 0.0
                 else:
                     observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
+                    # The new model returns (probs, hidden_state, gating_logits).
                     with torch.no_grad():
                         probs, _, _ = current_injected_agent_instance(observation_tensor, None)
                     probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
@@ -419,7 +420,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     log_prob_value = m.log_prob(torch.tensor(action, device=device)).item()
             else:
                 observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
-                probs, _, _ = policy_nets[agent](observation_tensor, None)
+                probs, _, gating_logits = policy_nets[agent](observation_tensor, None)
                 probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
                 mask_t = torch.tensor(action_mask, dtype=torch.float32, device=device)
                 masked_probs = probs * mask_t
@@ -454,10 +455,8 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                             log_prob=log_prob_value,
                             reward=reward,
                             is_terminal=env.terminations[agent] or env.truncations[agent],
-                            state_value=(
-                                value_nets[agent](torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)).item()
-                                if agent != current_injected_agent_id else 0.0
-                            ),
+                            state_value=(value_nets[agent](torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)).item()
+                                         if agent != current_injected_agent_id else 0.0),
                             action_mask=action_mask
                         )
                     episode_rewards[ag] += reward
@@ -487,50 +486,35 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 recent_rewards[agent].pop(0)
         avg_rewards = {agent: np.mean(recent_rewards[agent]) if recent_rewards[agent] else 0.0 for agent in agents}
     
-        for agent in agents:
-            if agent == current_injected_agent_id:
-                continue
-            memory = memories[agent]
-            rewards_agent = memory.rewards[agent]
-            dones_agent = memory.is_terminals[agent]
-            values_agent = memory.state_values[agent]
-            next_values_agent = values_agent[1:] + [0]
-            mean_reward = np.mean(rewards_agent)
-            std_reward = np.std(rewards_agent) + 1e-5
-            normalized_rewards = (np.array(rewards_agent) - mean_reward) / std_reward
-            advantages, returns_ = compute_gae(
-                rewards=normalized_rewards,
-                dones=dones_agent,
-                values=values_agent,
-                next_values=next_values_agent,
-                gamma=config.GAMMA,
-                lam=config.GAE_LAMBDA,
-            )
-            memory.advantages[agent] = advantages
-            memory.returns[agent] = returns_
-            
+        # --- OBP Memory Update ---
         episode_obp_data = extract_obp_training_data(env)
-        obp_memory.extend(episode_obp_data)
-        
+        if episode_obp_data:
+            obp_memory.extend(episode_obp_data)
+            logger.debug(f"Episode {episode}: Collected {len(episode_obp_data)} OBP samples. Total OBP memory size: {len(obp_memory)}")
+    
+        # --- PPO Update Loop: every UPDATE_STEPS episodes ---
         if episode % config.UPDATE_STEPS == 0:
             for agent in agents:
                 if agent == current_injected_agent_id:
                     continue
                 memory = memories[agent]
-                if not memory.states[agent]:
-                    continue
                 states = torch.tensor(np.array(memory.states[agent], dtype=np.float32), device=device)
                 actions_ = torch.tensor(np.array(memory.actions[agent], dtype=np.int64), device=device)
                 old_log_probs = torch.tensor(np.array(memory.log_probs[agent], dtype=np.float32), device=device)
                 returns_ = torch.tensor(np.array(memory.returns[agent], dtype=np.float32), device=device)
                 advantages_ = torch.tensor(np.array(memory.advantages[agent], dtype=np.float32), device=device)
                 action_masks_ = torch.tensor(np.array(memory.action_masks[agent], dtype=np.float32), device=device)
+                
+                if advantages_.numel() == 0:
+                    logger.debug(f"Skipping update for {agent} at episode {episode} because advantages are empty.")
+                    continue
+
                 adv_std = advantages_.std()
                 if adv_std < 1e-5:
                     normalized_advantages = advantages_
                 else:
                     normalized_advantages = (advantages_ - advantages_.mean()) / (adv_std + 1e-5)
-    
+                
                 kl_divs = []
                 policy_grad_norms = []
                 value_grad_norms = []
@@ -543,7 +527,8 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 per_label_total_counts = defaultdict(int)
     
                 for _ in range(config.K_EPOCHS):
-                    probs, _, opponent_logits = policy_nets[agent](states, None)
+                    # The new policy network returns (probs, hidden_state, gating_logits)
+                    probs, _, gating_logits = policy_nets[agent](states, None)
                     probs = torch.clamp(probs, 1e-8, 1.0)
                     masked_probs = probs * action_masks_
                     row_sums = masked_probs.sum(dim=-1, keepdim=True)
@@ -564,8 +549,8 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     state_values = value_nets[agent](states).squeeze()
                     value_loss = nn.MSELoss()(state_values, returns_)
         
-                    if opponent_logits is not None:
-                        # Determine human-readable opponent string
+                    if gating_logits is not None:
+                        # Train the gating network using an auxiliary loss.
                         if current_injected_bot_type == "historical":
                             target_opponent_str = current_injected_bot_identifier
                         else:
@@ -573,12 +558,12 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                         target_label = (historical_label_mapping[current_injected_bot_identifier]
                                         if current_injected_bot_type == "historical"
                                         else HARD_CODED_LABELS.get(current_injected_agent_instance.__class__.__name__, 0))
-                        target_labels = torch.full((opponent_logits.size(0),), target_label, dtype=torch.long, device=device)
-                        classification_loss = F.cross_entropy(opponent_logits, target_labels)
+                        target_labels = torch.full((gating_logits.size(0),), target_label, dtype=torch.long, device=device)
+                        classification_loss = F.cross_entropy(gating_logits, target_labels)
                         classification_losses.append(classification_loss.item())
     
                         with torch.no_grad():
-                            predicted_labels = opponent_logits.argmax(dim=1)
+                            predicted_labels = gating_logits.argmax(dim=1)
                             for i in range(predicted_labels.size(0)):
                                 actual = target_labels[i].item()
                                 pred = predicted_labels[i].item()
@@ -620,14 +605,13 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     writer.add_scalar(f"Gradient_Norms/Value/{agent}", np.mean(value_grad_norms), episode)
                     writer.add_scalar(f"Loss/Classification/{agent}", np.mean(classification_losses) if classification_losses else 0.0, episode)
     
-                    # Since all samples have the same target, we log one accuracy using the opponent string.
                     if per_label_total_counts:
-                        # There should be only one key
                         for lbl, total_ct in per_label_total_counts.items():
                             correct_ct = per_label_correct_counts[lbl]
                             acc = correct_ct / total_ct
                             writer.add_scalar(f"Accuracy/Classification/{agent}_vs_{target_opponent_str}", acc, episode)
     
+            # Reset memories after update.
             for agent in agents:
                 if agent != current_injected_agent_id:
                     memories[agent].reset()
@@ -704,7 +688,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
             games_played_counter = {agent: {} for agent in agents}
     
             if episode % 1000 == 0 and writer is not None and len(strategy_embeddings_by_agent_opponent) > 1:
-                all_agents = [a for a in agents if a != current_injected_agent_id]
+                all_agents = list(agents)
                 all_opponents = list(set([k[1] for k in strategy_embeddings_by_agent_opponent.keys()]))
                 reference_embeddings = np.array(list(strategy_embeddings_by_agent_opponent.values()))
                 logger.info(f"Generating strategy embedding visualizations for episode {episode}")
