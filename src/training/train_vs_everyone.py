@@ -288,7 +288,9 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
         pending_rewards = {agent: 0.0 for agent in agents}
     
         # Switch injected bot every 5 episodes.
-        if (episode - start_episode) % 5 == 0:
+        if (episode - start_episode) % 20 == 0:
+            from src.model.memory import PERSISTENT_OPPONENT_MEMORIES
+            PERSISTENT_OPPONENT_MEMORIES.clear()
             current_injected_agent_id = random.choice(agents)
             tracked_agent = current_injected_agent_id
             selected_bot = select_injected_bot(current_injected_agent_id, injected_bots, win_history, games_played_counter)
@@ -323,7 +325,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
             observation = observation_dict[agent]  # Assume 14 dims from env.
             action_mask = env.infos[agent]['action_mask']
     
-            # --- OBP Memory Gathering (unchanged) ---
+            # --- OBP Memory Gathering for injected agent ---
             if agent == current_injected_agent_id:
                 # Historical/injected agent: use original processing (14+2+memory).
                 if current_injected_bot_type == "hardcoded":
@@ -333,6 +335,10 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     for opp in env.possible_agents:
                         if opp != agent:
                             memory_full = query_opponent_memory_full(agent, opp)
+                            # Pad memory_full to length 200 if needed.
+                            if len(memory_full) < 200:
+                                pad_event = {"response": "", "triggering_action": "", "penalties": 0, "card_count": 0}
+                                memory_full = memory_full + [pad_event] * (200 - len(memory_full))
                             features_list = convert_memory_to_features(memory_full, response2idx, action2idx)
                             if features_list:
                                 feature_tensor = torch.tensor(features_list, dtype=torch.float32, device=device).unsqueeze(0)
@@ -381,6 +387,10 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 for opp in env.possible_agents:
                     if opp != agent:
                         memory_full = query_opponent_memory_full(agent, opp)
+                        # Pad memory_full to length 200 if needed.
+                        if len(memory_full) < 200:
+                            pad_event = {"response": "", "triggering_action": "", "penalties": 0, "card_count": 0}
+                            memory_full = memory_full + [pad_event] * (200 - len(memory_full))
                         features_list = convert_memory_to_features(memory_full, response2idx, action2idx)
                         if features_list:
                             feature_tensor = torch.tensor(features_list, dtype=torch.float32, device=device).unsqueeze(0)
@@ -428,6 +438,10 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                         previous_index = (agent_index - 2) % len(env.agents)
                     selected_opp = env.agents[previous_index]
                 memory_full = query_opponent_memory_full(agent, selected_opp)
+                # Pad memory_full if needed.
+                if len(memory_full) < 200:
+                    pad_event = {"response": "", "triggering_action": "", "penalties": 0, "card_count": 0}
+                    memory_full = memory_full + [pad_event] * (200 - len(memory_full))
                 features_list = convert_memory_to_features(memory_full, response2idx, action2idx)
                 if features_list:
                     feature_tensor = torch.tensor(features_list, dtype=torch.float32, device=device).unsqueeze(0)
@@ -435,7 +449,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                         projected = event_encoder(feature_tensor)
                         strategy_embedding, _ = strategy_transformer(projected)
                     # Each opponent’s memory embedding is 5 dims; take that 5-dim vector.
-                    learning_expert_input = strategy_embedding.cpu().detach().numpy().flatten()
+                    learning_expert_input = strategy_embedding.cpu().detach().numpy().flatten()[:5]
                 else:
                     learning_expert_input = np.zeros(5, dtype=np.float32)
                 
