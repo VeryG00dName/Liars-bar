@@ -78,13 +78,13 @@ def map_expert_index(raw_index):
 
 # Define hardcoded labels and historical mapping (for auxiliary classification)
 HARD_CODED_LABELS = {
-    "GreedyCardSpammer": 0,
-    "StrategicChallenger": 1,
-    "TableNonTableAgent": 2,
-    "Classic": 3,
-    "TableFirstConservativeChallenger": 4,
-    "SelectiveTableConservativeChallenger": 5,
-    "RandomAgent": 6
+    "GreedyCardSpammer": 2,
+    "StrategicChallenger": 4,
+    "TableNonTableAgent": 6,
+    "Classic": 0,
+    "TableFirstConservativeChallenger": 5,
+    "SelectiveTableConservativeChallenger": 1,
+    "RandomAgent": 3
 }
 historical_label_mapping = {}  # This can be populated if needed, e.g., when loading historical models
 
@@ -341,7 +341,6 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
                     current_opponent = current_stage["class"](agent_name=opponent_agent)
                 current_opponent_type = "hardcoded"
             logger.info(f"Switching to opponent: {current_opponent_name} (threshold: {win_rate_threshold:.2f}, min games: {min_games})")
-        
         episode_rewards = {agent: 0 for agent in agents}
         steps_in_episode = 0
         
@@ -427,6 +426,11 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
                 expert_logits = transformer_classification_head(learning_expert_tensor)
                 raw_expert_index = expert_logits.argmax(dim=-1).item()
                 expert_index = map_expert_index(raw_expert_index)
+            opponent_index = HARD_CODED_LABELS.get(current_opponent_name, historical_label_mapping.get(current_opponent_name, -1))
+            if opponent_index != expert_index:
+                logger.info(f"Agent {agent} selected expert {expert_index} for opponent {current_opponent_name} (index: {opponent_index})")
+
+
             # -------------------------------------------------------------------------------------
             
             # -------------------- Action Selection --------------------
