@@ -61,7 +61,7 @@ DEFAULT_SCORING_PARAMS = {
 # ----------------------------
 # Neural Network Configuration
 # ----------------------------
-HIDDEN_DIM = 500             # Number of hidden units in neural networks
+HIDDEN_DIM = 320            # Number of hidden units in neural networks
 
 # The INPUT_DIM will be set dynamically based on the environment.
 # It is computed as: base observation dimension + 2 (for OBP output) + (STRATEGY_DIM * num_opponents)
@@ -87,7 +87,7 @@ STRATEGY_TOKEN_EMBEDDING_DIM = 64       # Dimension of token embeddings.
 STRATEGY_NHEAD = 4                      # Number of attention heads.
 STRATEGY_NUM_LAYERS = 2                 # Number of transformer encoder layers.
 STRATEGY_DIM = 5                       # Final dimension of the strategy embedding.
-STRATEGY_NUM_CLASSES = 42                # Unused after removing the classification head.
+STRATEGY_NUM_CLASSES = 10                # Unused after removing the classification head.
 STRATEGY_DROPOUT = 0.1                  # Dropout rate in the transformer.
 
 # ----------------------------
@@ -98,7 +98,7 @@ GAMMA = 0.974                  # Discount factor
 GAE_LAMBDA = 0.98             # GAE lambda parameter
 EPS_CLIP = 0.3                # PPO clip parameter
 K_EPOCHS = 2                  # Number of PPO epochs per update
-NUM_EPISODES = 15000         # Total number of training episodes
+NUM_EPISODES = 10000         # Total number of training episodes
 UPDATE_STEPS = 3              # Number of episodes before PPO update
 MAX_NORM = 0.3                # Maximum norm for gradient clipping
 AUX_LOSS_WEIGHT = 0.3         # Weight for the auxiliary loss
@@ -106,11 +106,6 @@ AUX_LOSS_WEIGHT = 0.3         # Weight for the auxiliary loss
 # Entropy Regularization
 # ----------------------------
 INIT_ENTROPY_COEF = 0.005        # Initial entropy coefficient
-REWARD_ENTROPY_SCALE = 0.01     # Scale factor for reward-based entropy adjustments
-BASELINE_REWARD = -10           # Baseline reward for entropy coefficient updates
-ENTROPY_LR = 0.001              # Learning rate for entropy coefficient updates
-ENTROPY_CLIP_MIN = 0.05         # Minimum allowed value for entropy coefficient
-ENTROPY_CLIP_MAX = 0.3          # Maximum allowed value for entropy coefficient
 
 # ----------------------------
 # Logging and Checkpointing
