@@ -178,3 +178,5 @@ opponent_training_data.pkl
 *.pkl
 .qodo/history.sqlite
 /logs
+.qodo
+/checkpoints/rebel_vs_hardcoded
