@@ -236,14 +236,14 @@ def configure_logger():
 def load_specific_historical_models(players_dir, device):
     """
     Loads specific historical player models based on predefined versions.
-    - player_1 from Version_E
-    - player_0 from Version_C
-    - player_2 from Version_A
+    - player_1 from Version_E 9
+    - player_0 from Version_C 8
+    - player_2 from Version_A 7
     """
     required_models = {
-        "Version_E": "player_1",
+        "Version_A": "player_2",
         "Version_C": "player_0",
-        "Version_A": "player_2"
+        "Version_E": "player_1"
     }
 
     historical_models = []
