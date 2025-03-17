@@ -38,16 +38,27 @@ STRATEGY_DROPOUT = config.STRATEGY_DROPOUT                               # Dropo
 # -------------------------------
 def balance_training_data(training_data):
     """
-    Balance the dataset by undersampling each class to match the number of samples
-    in the smallest class.
+    Balance the dataset by undersampling each class to 1.5 times the number of samples
+    in the smallest class. The dataset is randomly shuffled beforehand to ensure a 
+    more uniform selection across the entire dataset.
     """
+    # Globally shuffle the training data for a more even distribution
+    random.shuffle(training_data)
+
+    # Calculate the count of samples per label and determine the smallest count
     label_counts = Counter(label for _, label in training_data)
     min_count = min(label_counts.values())
+    target_count = int(1.5 * min_count)
+    
     balanced_data = []
+    # For each label, select up to the target_count samples from the shuffled data
     for label in label_counts:
-        samples = [sample for sample in training_data if sample[1] == label]
-        random.shuffle(samples)
-        balanced_data.extend(samples[:min_count])
+        # Filter samples by label; since training_data is globally shuffled, this preserves randomness
+        label_samples = [sample for sample in training_data if sample[1] == label]
+        balanced_data.extend(label_samples[:target_count])
+    
+    # Optionally shuffle the final balanced dataset so the classes are intermingled
+    random.shuffle(balanced_data)
     return balanced_data
 
 def load_training_data(training_data_path):
