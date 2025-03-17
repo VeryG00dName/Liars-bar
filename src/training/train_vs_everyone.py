@@ -88,26 +88,14 @@ class ConsoleLogger:
             self.last_messages[agent] = message
             self.repeat_counts[agent] = 1
 
-def map_expert_index(raw_index):
-    if raw_index <= 6:
-        return raw_index
-    elif 7 <= raw_index <= 22:
-        return 7
-    elif 23 <= raw_index <= 38:
-        return 8
-    elif 39 <= raw_index <= 41:
-        return 9
-    else:
-        raise ValueError(f"Raw expert index {raw_index} out of expected range.")
-    
 HARD_CODED_LABELS = {
-    "GreedyCardSpammer": 2,
+    "GreedyCardSpammer": 1,
     "StrategicChallenger": 4,
     "TableNonTableAgent": 6,
     "Classic": 0,
     "TableFirstConservativeChallenger": 5,
-    "SelectiveTableConservativeChallenger": 1,
-    "RandomAgent": 3
+    "SelectiveTableConservativeChallenger": 3,
+    "RandomAgent": 2
 }
 historical_label_mapping = {}
 
@@ -162,7 +150,6 @@ print(f"Loaded {len(historical_models)} historical PPO models: {', '.join([id fo
 
 for idx, (_, identifier) in enumerate(historical_models):
     historical_label_mapping[identifier] = len(HARD_CODED_LABELS) + idx
-
 def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_directory=None, log_tensorboard=True):
     set_seed(config.SEED)
     obs, infos = env.reset(seed=config.SEED)
@@ -457,8 +444,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 learning_expert_tensor = torch.tensor(learning_expert_input, dtype=torch.float32, device=device).unsqueeze(0)
                 with torch.no_grad():
                     expert_logits = transformer_classification_head(learning_expert_tensor)
-                    raw_expert_index = expert_logits.argmax(dim=-1).item()
-                    expert_index = map_expert_index(raw_expert_index)
+                    expert_index = expert_logits.argmax(dim=-1).item()
                 # Log accuracy if the selected opponent is the injected opponent (which has a known label).
                 if current_injected_agent_id is not None and selected_opp == current_injected_agent_id:
                     if current_injected_bot_type == "hardcoded":
@@ -468,7 +454,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     transformer_accuracy_counts[current_injected_bot_identifier]["total"] += 1
                     if expert_index == expected_label:
                         transformer_accuracy_counts[current_injected_bot_identifier]["correct"] += 1
-                    console_logger.log(agent, f"Agent {agent} selected expert {raw_expert_index} for opponent {expected_label}")
+                    console_logger.log(agent, f"Agent {agent} selected expert {expert_index} for opponent {expected_label}")
                 # -------------------------------------------------------------------------------------
     
             # ---------- Action Selection ----------
@@ -625,16 +611,14 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     with torch.no_grad():
                         expert_logits = transformer_classification_head(expert_inputs)
                         predictions = expert_logits.argmax(dim=-1)
-                        raw_expert_index = predictions.mode()[0].item()
-                        expert_index = map_expert_index(raw_expert_index)
+                        expert_index = predictions.mode()[0].item()
                         
                 else:
                     extracted_embedding = states[:, -config.STRATEGY_DIM:]
                     with torch.no_grad():
                         expert_logits = transformer_classification_head(extracted_embedding)
                         predictions = expert_logits.argmax(dim=-1)
-                        raw_expert_index = predictions.mode()[0].item()
-                        expert_index = map_expert_index(raw_expert_index)
+                        expert_index = predictions.mode()[0].item()
     
                 for _ in range(config.K_EPOCHS):
                     probs, _ = policy_nets[agent](states, expert_index, None)
