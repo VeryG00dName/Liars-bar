@@ -3,15 +3,12 @@
 from collections import Counter
 import os
 import logging
-import sys
 import tkinter as tk
 from tkinter import ttk, messagebox
-import traceback
 from tkinterdnd2 import TkinterDnD, DND_FILES
 import torch
 import torch.nn.functional as F
 import numpy as np
-import random
 import pickle
 
 from src.env.liars_deck_env_core import LiarsDeckEnv
@@ -32,8 +29,7 @@ from src.eval.evaluate_utils import (
     adapt_observation_for_version,
     get_hidden_dim_from_state_dict,
     get_opponent_memory_embedding,
-    run_obp_inference,
-    run_obp_inference_tournament
+    run_obp_inference
 )
 
 # Import ModelFactory for OBP creation.
@@ -58,8 +54,6 @@ class AgentBattlegroundGUI:
         
         self.loaded_models = {}
         self.hardcoded_agents = {
-            # We still keep all definitions here in case you want them later,
-            # but we'll only use "Conservative" in the battleground loop.
             "GreedySpammer": GreedyCardSpammer,
             "TableFirst": TableFirstConservativeChallenger,
             "Strategic": lambda name: StrategicChallenger(name, 3, 2),
@@ -73,7 +67,7 @@ class AgentBattlegroundGUI:
         self.strategy_transformer = None
         self.current_env = None
         self.games_since_last_collection = {}
-        self.target_segments = 500  # Default value; also set via parameters box
+        self.target_segments = 50  # Default value; also set via parameters box
         
         # New: maintain a set of culled agents (by label)
         self.culled_agents = set()
@@ -195,6 +189,7 @@ class AgentBattlegroundGUI:
         ttk.Button(frame, text="Refresh Agents", command=self.refresh_all).pack(side=tk.LEFT, padx=5)
         ttk.Button(frame, text="Start Battleground", command=self.start_battleground_async).pack(side=tk.LEFT, padx=5)
         ttk.Button(frame, text="Save Training Data", command=self.save_training_data).pack(side=tk.LEFT, padx=5)
+        ttk.Button(frame, text="Generate Hardcoded Data", command=self.start_hardcoded_battleground_async).pack(side=tk.LEFT, padx=5)
 
     def refresh_all(self):
         self.update_agent_selectors()
@@ -364,14 +359,17 @@ class AgentBattlegroundGUI:
                 ai_agents_all = self.load_selected_agents()
                 if not ai_agents_all:
                     return
-                ai_agents = {}
-                for i, key in enumerate(ai_agents_all.keys()):
-                    # We'll just pick up to 2 PPO agents
-                    if i < 2:
-                        ai_agents[key] = ai_agents_all[key]
-                if len(ai_agents) < 2:
-                    self.show_info("Need at least two PPO agents for matches vs. hardcoded opponents.")
-                    return
+                # If only one PPO agent is selected, duplicate it for the two PPO slots.
+                selected_keys = list(ai_agents_all.keys())
+                if len(selected_keys) == 1:
+                    ai_agents = {
+                        "player_0": ai_agents_all[selected_keys[0]],
+                        "player_1": ai_agents_all[selected_keys[0]]
+                    }
+                else:
+                    ai_agents = {}
+                    for i, key in enumerate(selected_keys[:2]):
+                        ai_agents[f"player_{i}"] = ai_agents_all[key]
 
                 for hc_name, hc_class in self.hardcoded_agents.items():
                     # Filter out everything but "Conservative"
@@ -403,7 +401,7 @@ class AgentBattlegroundGUI:
                     hardcoded_results[hc_name] = wins
                 overall_results["hardcoded"] = hardcoded_results
 
-            # --- PPO-Only Matches: We can keep this or remove it, as desired.
+            # --- PPO-Only Matches ---
             if self.include_ppo.get():
                 all_agents = self.load_selected_agents()
                 if not all_agents:
@@ -417,18 +415,22 @@ class AgentBattlegroundGUI:
 
                 overall_match_count = 0
 
-                # We'll keep the logic to do PPO vs PPO matches if you still want them.
+                # Run PPO vs PPO matches. If fewer than 3 agents are available, duplicate the available ones.
                 while True:
                     available_agents = {
                         k: v for k, v in all_agents.items()
                         if v['label'] not in self.culled_agents and
                         sum(1 for seg, lbl in self.training_data if lbl == v['label']) < target_segments_val
                     }
-                    if len(available_agents) < 3:
-                        self.show_info("Not enough non-culled PPO agents remain for further matches.")
+                    if not available_agents:
+                        self.show_info("No non-culled PPO agents remain for further matches.")
                         break
-
-                    selected_keys = sorted(available_agents.keys(), key=lambda k: sample_count(available_agents[k]))[:3]
+                    selected_keys = list(available_agents.keys())
+                    # Replicate agents if there are fewer than 3.
+                    while len(selected_keys) < 3:
+                        selected_keys.append(selected_keys[0])
+                    # Optionally sort by sample count and take the first three.
+                    selected_keys = sorted(selected_keys, key=lambda k: sample_count(available_agents[k]))[:3]
 
                     new_subset = {}
                     mapping = {}
@@ -610,6 +612,57 @@ class AgentBattlegroundGUI:
             self.show_info(f"Error in run_match: {e}\nTraceback:\n{tb}")
             raise
 
+    def run_hardcoded_match(self, bot_agents):
+        try:
+            env = LiarsDeckEnv(num_players=3, render_mode=None)
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.current_env = env
+            env.reset()
+            while env.agent_selection is not None:
+                current_agent = env.agent_selection
+                obs, reward, termination, truncation, info = env.last()
+                if termination or truncation:
+                    env.step(None)
+                    continue
+                bot_data = bot_agents.get(current_agent)
+                if bot_data is None:
+                    raise ValueError(f"No bot data for agent {current_agent}")
+                bot_instance = bot_data["agent_instance"]
+                action = bot_instance.play_turn(
+                    obs[current_agent],
+                    info['action_mask'],
+                    env.table_card
+                )
+                env.step(action)
+
+            max_reward = max(env.rewards.values())
+            winners = [agent for agent, reward in env.rewards.items() if reward == max_reward]
+            winner = winners[0]
+
+            # Collect training data from each agent's memory.
+            for agent in env.agents:
+                memory_obj = get_opponent_memory(agent)
+                for opp, events in memory_obj.memory.items():
+                    events_list = list(events)
+                    if events_list and (len(events_list) >= 50):
+                        label = bot_agents[agent]["label"]
+                        self.training_data.append((events_list, label))
+                        events.clear()
+                        memory_obj.aggregates[opp] = {
+                            'early_total': 0,
+                            'late_total': 0,
+                            'early_challenge_count': 0,
+                            'late_challenge_count': 0,
+                            'early_three_card_trigger_count': 0,
+                            'late_three_card_trigger_count': 0
+                        }
+            return winner
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            self.show_info(f"Error in run_hardcoded_match: {e}\nTraceback:\n{tb}")
+            raise
+
     def choose_action(self, agent, policy_net, obp_model, observation, action_mask, device, num_players, obs_version, input_dim, uses_memory):
         base_obs = adapt_observation_for_version(observation, num_players, obs_version)
         
@@ -748,6 +801,57 @@ class AgentBattlegroundGUI:
         self.results_text.insert(tk.END, output)
         self.results_text.config(state=tk.DISABLED)
 
+    # New: asynchronous start for hardcoded battleground
+    def start_hardcoded_battleground_async(self):
+        import threading
+        thread = threading.Thread(target=self.start_hardcoded_battleground)
+        thread.start()
+
+    def start_hardcoded_battleground(self):
+        try:
+            try:
+                target_segments_val = int(self.target_segments_var.get())
+            except ValueError:
+                self.show_info("Invalid target segments value, using default of 500.")
+                target_segments_val = 500
+            self.target_segments = target_segments_val
+
+            # Get the list of all hardcoded bot names
+            all_bot_names = list(self.hardcoded_agents.keys())
+            overall_matches = 0
+
+            while True:
+                # Calculate training segments for each hardcoded bot
+                counts = {
+                    bot: sum(1 for seg, label in self.training_data if label == bot)
+                    for bot in all_bot_names
+                }
+                # If all bots have reached the target segments, finish.
+                if all(count >= self.target_segments for count in counts.values()):
+                    break
+
+                # Sort bots by current count (ascending)
+                sorted_bots = sorted(all_bot_names, key=lambda bot: counts[bot])
+                # Select three bots: if there are fewer than 3, duplicate the bot with the lowest count.
+                if len(sorted_bots) >= 3:
+                    selected = sorted_bots[:3]
+                else:
+                    selected = sorted_bots.copy()
+                    while len(selected) < 3:
+                        selected.append(sorted_bots[0])
+
+                # Create bot instances for the selected bots.
+                bot_agents = {}
+                for i, bot_name in enumerate(selected):
+                    instance = self.hardcoded_agents[bot_name](bot_name)
+                    bot_agents[f"player_{i}"] = {"agent_instance": instance, "label": bot_name}
+
+                winner = self.run_hardcoded_match(bot_agents)
+                overall_matches += 1
+                self.show_info(f"Hardcoded match {overall_matches} complete. Current counts: {counts}")
+            self.show_info(f"Hardcoded battleground complete after {overall_matches} matches. Total training examples: {len(self.training_data)}")
+        except Exception as e:
+            self.show_info(f"Error in hardcoded battleground: {str(e)}")
 
 if __name__ == "__main__":
     root = TkinterDnD.Tk()
