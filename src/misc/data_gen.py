@@ -7,7 +7,6 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from tkinterdnd2 import TkinterDnD, DND_FILES
 import torch
-import torch.nn.functional as F
 import numpy as np
 import pickle
 
@@ -121,7 +120,7 @@ class AgentBattlegroundGUI:
         frame.pack(fill=tk.X, padx=10, pady=5)
         target_label = ttk.Label(frame, text="Target Segments per Agent:")
         target_label.pack(side=tk.LEFT, padx=5)
-        self.target_segments_var = tk.StringVar(value="500")
+        self.target_segments_var = tk.StringVar(value="50")
         target_entry = ttk.Entry(frame, textvariable=self.target_segments_var, width=10)
         target_entry.pack(side=tk.LEFT)
         target_entry.bind("<FocusOut>", self.update_target_segments)
@@ -130,8 +129,8 @@ class AgentBattlegroundGUI:
         try:
             self.target_segments = int(self.target_segments_var.get())
         except ValueError:
-            self.show_info("Invalid target segments value, using default of 500.")
-            self.target_segments = 500
+            self.show_info("Invalid target segments value, using default of 50.")
+            self.target_segments = 50
 
     def create_progress_and_culling_controls(self):
         # New frame for progress bar, dropdown to select an agent, and a button to cull the agent.
@@ -347,8 +346,8 @@ class AgentBattlegroundGUI:
             try:
                 target_segments_val = int(self.target_segments_var.get())
             except ValueError:
-                self.show_info("Invalid target segments value, using default of 500.")
-                target_segments_val = 500
+                self.show_info("Invalid target segments value, using default of 50.")
+                target_segments_val = 50
             self.target_segments = target_segments_val
 
             overall_results = {}
@@ -398,6 +397,9 @@ class AgentBattlegroundGUI:
                             f"[Hardcoded:{hc_name}] After {match_count} matches, training segments: "
                             f"{sum(1 for seg, label in self.training_data if label == hc_name)}"
                         )
+                        # Update progress after each match
+                        self.update_agent_combobox()
+                        self.update_progress_bar()
                     hardcoded_results[hc_name] = wins
                 overall_results["hardcoded"] = hardcoded_results
 
@@ -426,10 +428,8 @@ class AgentBattlegroundGUI:
                         self.show_info("No non-culled PPO agents remain for further matches.")
                         break
                     selected_keys = list(available_agents.keys())
-                    # Replicate agents if there are fewer than 3.
                     while len(selected_keys) < 3:
                         selected_keys.append(selected_keys[0])
-                    # Optionally sort by sample count and take the first three.
                     selected_keys = sorted(selected_keys, key=lambda k: sample_count(available_agents[k]))[:3]
 
                     new_subset = {}
@@ -476,6 +476,9 @@ class AgentBattlegroundGUI:
                                 for new_key in new_subset
                             )
                         ))
+                        # Update UI after each match.
+                        self.update_agent_combobox()
+                        self.update_progress_bar()
                 overall_results["ppo"] = {"matches": overall_match_count}
             
             self.display_results(overall_results)
@@ -601,6 +604,10 @@ class AgentBattlegroundGUI:
                         }
                 self.games_since_last_collection[agent] = 0
 
+            # Update UI after match completes.
+            self.update_agent_combobox()
+            self.update_progress_bar()
+
             if winner in ai_agents:
                 return winner
             else:
@@ -656,6 +663,9 @@ class AgentBattlegroundGUI:
                             'early_three_card_trigger_count': 0,
                             'late_three_card_trigger_count': 0
                         }
+            # Update UI after match completes.
+            self.update_agent_combobox()
+            self.update_progress_bar()
             return winner
         except Exception as e:
             import traceback
@@ -801,6 +811,7 @@ class AgentBattlegroundGUI:
         self.results_text.insert(tk.END, output)
         self.results_text.config(state=tk.DISABLED)
 
+
     # New: asynchronous start for hardcoded battleground
     def start_hardcoded_battleground_async(self):
         import threading
@@ -812,8 +823,8 @@ class AgentBattlegroundGUI:
             try:
                 target_segments_val = int(self.target_segments_var.get())
             except ValueError:
-                self.show_info("Invalid target segments value, using default of 500.")
-                target_segments_val = 500
+                self.show_info("Invalid target segments value, using default of 50.")
+                target_segments_val = 50
             self.target_segments = target_segments_val
 
             # Get the list of all hardcoded bot names
@@ -849,6 +860,8 @@ class AgentBattlegroundGUI:
                 winner = self.run_hardcoded_match(bot_agents)
                 overall_matches += 1
                 self.show_info(f"Hardcoded match {overall_matches} complete. Current counts: {counts}")
+                self.update_agent_combobox()
+                self.update_progress_bar()
             self.show_info(f"Hardcoded battleground complete after {overall_matches} matches. Total training examples: {len(self.training_data)}")
         except Exception as e:
             self.show_info(f"Error in hardcoded battleground: {str(e)}")
