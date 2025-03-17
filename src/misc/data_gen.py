@@ -359,7 +359,6 @@ class AgentBattlegroundGUI:
             overall_results = {}
 
             # --- Hardcoded Agents Matches ---
-            # We'll ONLY generate data vs. "Conservative" (SelectiveTableConservativeChallenger).
             if self.include_hardcoded.get():
                 hardcoded_results = {}
                 ai_agents_all = self.load_selected_agents()
@@ -374,10 +373,10 @@ class AgentBattlegroundGUI:
                     self.show_info("Need at least two PPO agents for matches vs. hardcoded opponents.")
                     return
 
-                # Filter out everything but "Conservative"
                 for hc_name, hc_class in self.hardcoded_agents.items():
-                    if hc_name != "Strategic":
-                        continue  # Skip all other hardcoded bots
+                    # Filter out everything but "Conservative"
+                    #if hc_name != "Strategic":
+                    #      continue  # Skip all other hardcoded bots
 
                     wins = [0, 0, 0]
                     match_count = 0
