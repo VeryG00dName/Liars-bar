@@ -21,11 +21,11 @@ from src.model.hard_coded_agents import (
     TableNonTableAgent,
     Classic
 )
-from src.eval.evaluate_utils import (
+from src.misc.cheat.evaluate_utils_cheat import (
     get_hidden_dim_from_state_dict,
     evaluate_agents
 )
-from src.model.model_factory import ModelFactory
+from src.misc.cheat.model_factory_cheat import ModelFactory
 from src.training.train_vs_everyone import load_specific_historical_models
 
 torch.backends.cudnn.benchmark = True
