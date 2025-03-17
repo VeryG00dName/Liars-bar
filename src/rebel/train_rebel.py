@@ -15,10 +15,10 @@ from src.training.train_transformer import EventEncoder
 from src import config
 from src.env.liars_deck_env_core import LiarsDeckEnv
 from src.env.liars_deck_env_utils_2 import decode_action
-from src.model.rebel_models import ActionProbabilityModel, RebelPolicyNetwork,CFRValueNetwork
-from src.model.belief_models import BeliefStateModel
-from src.model.recursive_search_agent import RecursiveSearchAgent
-from src.model.blueprint_strategy import BlueprintStrategy
+from src.rebel.rebel_models import ActionProbabilityModel, RebelPolicyNetwork,CFRValueNetwork
+from src.rebel.belief_models import BeliefStateModel
+from src.rebel.recursive_search_agent import RecursiveSearchAgent
+from src.rebel.blueprint_strategy import BlueprintStrategy
 from src.training.train_utils import save_checkpoint, get_tensorboard_writer
 torch.backends.cudnn.benchmark = True
 
@@ -891,7 +891,7 @@ def train_rebel_agent(env, device, num_epochs=100, games_per_epoch=10,
     logger.info(f"Starting ReBeL training with DCFR and learned action probabilities on {device}")
     
     # Initialize action probability model and data collector
-    from src.model.rebel_models import ActionProbabilityModel, ActionProbabilityDataCollector
+    from rebel.rebel_models import ActionProbabilityModel, ActionProbabilityDataCollector
     action_prob_model = ActionProbabilityModel(input_dim=14, hidden_dim=128).to(device)
     data_collector = ActionProbabilityDataCollector()
     

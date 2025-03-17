@@ -7,10 +7,10 @@ import numpy as np
 from tqdm import tqdm
 
 from src.env.liars_deck_env_core import LiarsDeckEnv
-from src.model.rebel_models import RebelPolicyNetwork, CFRValueNetwork, ActionProbabilityModel
-from src.model.belief_models import BeliefStateModel
-from src.model.recursive_search_agent import RecursiveSearchAgent
-from src.model.blueprint_strategy import BlueprintStrategy
+from src.rebel.rebel_models import RebelPolicyNetwork, CFRValueNetwork, ActionProbabilityModel
+from src.rebel.belief_models import BeliefStateModel
+from src.rebel.recursive_search_agent import RecursiveSearchAgent
+from src.rebel.blueprint_strategy import BlueprintStrategy
 from src.env.liars_deck_env_utils_2 import decode_action  # Import the decode_action function
 from src.model.hard_coded_agents import (
     GreedyCardSpammer,
@@ -651,7 +651,7 @@ def main():
     if args.simulations:
         rebel_agent.num_simulations = args.simulations
     
-    from src.misc.recursivesearchprofiler import RecursiveSearchProfiler
+    from rebel.recursivesearchprofiler import RecursiveSearchProfiler
     sim_profiler = RecursiveSearchProfiler(rebel_agent)
     # Update DCFR parameters if specified
     rebel_agent.alpha = args.alpha

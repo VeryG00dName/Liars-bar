@@ -10,13 +10,13 @@ from collections import defaultdict
 
 # Import modules from src
 from src.env.liars_deck_env_core import LiarsDeckEnv
-from src.model.rebel_models import RebelPolicyNetwork, CFRValueNetwork, ActionProbabilityModel, ActionProbabilityDataCollector
-from src.model.belief_models import BeliefStateModel
-from src.model.recursive_search_agent import RecursiveSearchAgent
-from src.model.blueprint_strategy import BlueprintStrategy
+from src.rebel.rebel_models import RebelPolicyNetwork, CFRValueNetwork, ActionProbabilityModel, ActionProbabilityDataCollector
+from src.rebel.belief_models import BeliefStateModel
+from src.rebel.recursive_search_agent import RecursiveSearchAgent
+from src.rebel.blueprint_strategy import BlueprintStrategy
 from src.env.liars_deck_env_utils_2 import decode_action
 from src.training.train_utils import save_checkpoint, get_tensorboard_writer
-from src.training.train_rebel import (
+from src.rebel.train_rebel import (
     train_belief_model, train_value_network, train_policy_network,
     train_action_probability_model, create_env_copy, collect_experience
 )
