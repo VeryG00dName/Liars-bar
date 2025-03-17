@@ -180,3 +180,4 @@ opponent_training_data.pkl
 /logs
 .qodo
 /checkpoints/rebel_vs_hardcoded
+*.pt
