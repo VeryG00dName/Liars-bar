@@ -46,7 +46,8 @@ from src.training.train_utils import (
     save_checkpoint,
     load_checkpoint_if_available,
     get_tensorboard_writer,
-    train_obp
+    train_obp,
+    load_specific_historical_models as load_historical_models
 )
 from src.training.train_extras import (
     set_seed,
@@ -73,15 +74,14 @@ def convert_memory_to_features(memory, response_mapping, action_mapping):
     return features
 
 # ---------------------------
-# Configuration for which hardcoded bot to train against.
-# You can choose an index from 0 to 6:
-# 0: GreedyCardSpammer
-# 1: TableFirstConservativeChallenger
-# 2: StrategicChallenger
-# 3: SelectiveTableConservativeChallenger
-# 4: RandomAgent
-# 5: TableNonTableAgent
-# 6: Classic
+# Configuration for which bot to train against.
+# ---------------------------
+# Opponent Types:
+# 0: Hardcoded bot
+# 1: Historical agent
+OPPONENT_TYPE = 1  # <-- Change this to select opponent type
+
+# Hardcoded bot configuration (used if OPPONENT_TYPE = 0)
 HARD_CODED_BOT_INDEX = 6  # <-- Change this number to choose the bot.
 HARD_CODED_BOT_NAMES = {
     0: "GreedyCardSpammer",
@@ -101,8 +101,9 @@ HARD_CODED_BOT_CLASSES = {
     5: TableNonTableAgent,
     6: Classic
 }
-TRAINING_BOT_NAME = HARD_CODED_BOT_NAMES[HARD_CODED_BOT_INDEX]
-TRAINING_BOT_CLASS = HARD_CODED_BOT_CLASSES[HARD_CODED_BOT_INDEX]
+
+# Historical agent configuration (used if OPPONENT_TYPE = 1)
+HISTORICAL_AGENT_INDEX = 0  # <-- Change this to select which historical agent to use
 
 # Additional constant: number of consecutive log intervals with 0% win rate before culling.
 CULL_CONSECUTIVE_ZERO_WIN = 3  # You can adjust this threshold.
@@ -158,6 +159,14 @@ else:
 strategy_transformer.token_embedding = nn.Identity()
 strategy_transformer.classification_head = None
 strategy_transformer.eval()
+
+# ---------------------------
+# Load historical models
+# ---------------------------
+historical_models = load_historical_models(config.HISTORICAL_MODEL_DIR, device)
+print(f"Loaded {len(historical_models)} historical models:")
+for i, (_, identifier) in enumerate(historical_models):
+    print(f"  {i}: {identifier}")
 
 # ---------------------------
 # Helper functions for strategy embedding visualization.
@@ -285,8 +294,21 @@ def train_agent(env, device, target_win_rate=0.95, load_checkpoint_flag=False, l
     obp_memory = []
 
     logger = configure_logger()
-    writer = get_tensorboard_writer(log_dir=config.TENSORBOARD_RUNS_DIR) if log_tensorboard else None
+    writer = get_tensorboard_writer(log_dir=config.TENSORBOARD_RUNS_DIR) if log_tensorboard else True
     checkpoint_dir = config.CHECKPOINT_DIR
+
+    # Determine the opponent type and name for training
+    if OPPONENT_TYPE == 0:
+        # Hardcoded bot
+        opponent_class = HARD_CODED_BOT_CLASSES[HARD_CODED_BOT_INDEX]
+        opponent_name = HARD_CODED_BOT_NAMES[HARD_CODED_BOT_INDEX]
+        logger.info(f"Training against hardcoded bot: {opponent_name}")
+    elif OPPONENT_TYPE == 1 and HISTORICAL_AGENT_INDEX < len(historical_models):
+        # Historical agent
+        historical_model, opponent_name = historical_models[HISTORICAL_AGENT_INDEX]
+        logger.info(f"Training against historical agent: {opponent_name}")
+    else:
+        raise ValueError(f"Invalid opponent configuration: Type={OPPONENT_TYPE}, Index={HISTORICAL_AGENT_INDEX if OPPONENT_TYPE == 1 else HARD_CODED_BOT_INDEX}")
 
     start_episode = 1
     static_entropy_coef = config.INIT_ENTROPY_COEF
@@ -305,13 +327,21 @@ def train_agent(env, device, target_win_rate=0.95, load_checkpoint_flag=False, l
 
     while episode <= config.NUM_EPISODES:
         obs, infos = env.reset()
-        # Set opponents: both bot players are instances of the selected hardcoded bot.
-        if TRAINING_BOT_CLASS == StrategicChallenger:
-            bot1_instance = StrategicChallenger("player_1", num_players=config.NUM_PLAYERS, agent_index=1)
-            bot2_instance = StrategicChallenger("player_2", num_players=config.NUM_PLAYERS, agent_index=2)
+        
+        # Create opponent instances based on the selected type
+        if OPPONENT_TYPE == 0:
+            # Hardcoded bots
+            if opponent_class == StrategicChallenger:
+                bot1_instance = StrategicChallenger("player_1", num_players=config.NUM_PLAYERS, agent_index=1)
+                bot2_instance = StrategicChallenger("player_2", num_players=config.NUM_PLAYERS, agent_index=2)
+            else:
+                bot1_instance = opponent_class("player_1")
+                bot2_instance = opponent_class("player_2")
         else:
-            bot1_instance = TRAINING_BOT_CLASS("player_1")
-            bot2_instance = TRAINING_BOT_CLASS("player_2")
+            # Historical agents - we'll use the same model for both opponents
+            bot1_instance = historical_model
+            bot2_instance = historical_model
+        
         pending_rewards = {p: 0.0 for p in players}
         episode_rewards = {p: 0 for p in players}
         steps_in_episode = 0
@@ -329,41 +359,53 @@ def train_agent(env, device, target_win_rate=0.95, load_checkpoint_flag=False, l
             observation = observation_dict[current_agent]
             action_mask = env.infos[current_agent]['action_mask']
 
-            if current_agent == rl_agent:
-                # Process opponent memory and get transformer embeddings.
-                transformer_embeddings = []
-                obp_memory_embeddings = []
-                for opp in bot_agents:
-                    mem_summary = query_opponent_memory_full(rl_agent, opp)
+            # Process opponent memory and get transformer embeddings for ALL agents
+            # This ensures consistent observation formatting for both learning and historical agents
+            transformer_embeddings = []
+            obp_memory_embeddings = []
+            
+            # Get memory embeddings for the current agent (whether RL or opponent)
+            for opp in env.possible_agents:
+                if opp != current_agent:
+                    mem_summary = query_opponent_memory_full(current_agent, opp)
                     features_list = convert_memory_to_features(mem_summary, response2idx, action2idx)
                     if features_list:
                         feature_tensor = torch.tensor(features_list, dtype=torch.float32, device=device).unsqueeze(0)
                         with torch.no_grad():
                             projected = event_encoder(feature_tensor)
-                            # Note: using the same unpacking as in train_vs_everyone.
                             strategy_embedding, _ = strategy_transformer(projected)
                     else:
                         strategy_embedding = torch.zeros(1, config.STRATEGY_DIM, device=device)
                     obp_memory_embeddings.append(strategy_embedding)
-                    # Store flattened embedding for visualization.
-                    transformer_embeddings.append(strategy_embedding.cpu().detach().numpy().flatten())
-                    strategy_embeddings_by_agent_opponent[(rl_agent, TRAINING_BOT_NAME)] = strategy_embedding.cpu().detach().numpy().flatten()
+                    # Store flattened embedding for visualization if this is the RL agent
+                    if current_agent == rl_agent:
+                        transformer_embeddings.append(strategy_embedding.cpu().detach().numpy().flatten())
+                        strategy_embeddings_by_agent_opponent[(rl_agent, opponent_name)] = strategy_embedding.cpu().detach().numpy().flatten()
 
-                # Instead of using StandardScaler here, normalize via L2 norm.
-                if transformer_embeddings:
-                    embeddings_arr = np.concatenate(transformer_embeddings, axis=0)
-                    norm_val = np.linalg.norm(embeddings_arr, ord=2)
-                    normalized_transformer_features = embeddings_arr if norm_val == 0 else embeddings_arr / norm_val
-                else:
-                    normalized_transformer_features = np.zeros(config.STRATEGY_DIM * len(bot_agents), dtype=np.float32)
+            # Normalize transformer embeddings via L2 norm
+            if transformer_embeddings:
+                embeddings_arr = np.concatenate(transformer_embeddings, axis=0)
+                norm_val = np.linalg.norm(embeddings_arr, ord=2)
+                normalized_transformer_features = embeddings_arr if norm_val == 0 else embeddings_arr / norm_val
+            else:
+                normalized_transformer_features = np.zeros(config.STRATEGY_DIM * (len(env.possible_agents) - 1), dtype=np.float32)
 
-                obp_probs = run_obp_inference(
-                    obp_model, observation, device, num_players=3,
-                    memory_embeddings=obp_memory_embeddings
-                )
+            # Get OBP probabilities
+            obp_probs = run_obp_inference(
+                obp_model, observation, device, num_players=len(env.possible_agents),
+                memory_embeddings=obp_memory_embeddings
+            )
 
-                final_obs = np.concatenate([observation, np.array(obp_probs, dtype=np.float32), normalized_transformer_features], axis=0)
+            # Create the final observation with OBP probabilities
+            final_obs = np.concatenate([observation, np.array(obp_probs, dtype=np.float32)], axis=0)
+            
+            # For RL agent, also include transformer embeddings
+            if current_agent == rl_agent:
+                final_obs = np.concatenate([final_obs, normalized_transformer_features], axis=0)
 
+            # Action selection based on agent type
+            if current_agent == rl_agent:
+                # RL agent action selection
                 obs_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
                 probs, _, _ = policy_net(obs_tensor, None)
                 probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
@@ -381,12 +423,57 @@ def train_agent(env, device, target_win_rate=0.95, load_checkpoint_flag=False, l
                 action = m.sample().item()
                 log_prob_value = m.log_prob(torch.tensor(action, device=device)).item()
             else:
-                # Both opponents use the same selected hardcoded bot.
-                if current_agent in bot_agents:
-                    action = bot1_instance.play_turn(observation, action_mask, table_card=None)
+                # Opponent action selection
+                if OPPONENT_TYPE == 0:
+                    # Hardcoded bot logic
+                    bot_instance = bot1_instance if current_agent == "player_1" else bot2_instance
+                    action = bot_instance.play_turn(observation, action_mask, table_card=None)
                     log_prob_value = 0.0
+                else:
+                    # Historical agent logic
+                    bot_instance = bot1_instance if current_agent == "player_1" else bot2_instance
+                    
+                    try:
+                        # Format observation for historical model
+                        obs_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
+                        
+                        # Check if we need to pad the observation to match expected dimensions
+                        expected_input_dim = bot_instance.fc1.weight.shape[1]
+                        current_dim = obs_tensor.shape[1]
+                        
+                        if current_dim < expected_input_dim:
+                            # Pad with zeros to match expected dimension
+                            padding = torch.zeros(1, expected_input_dim - current_dim, device=device)
+                            obs_tensor = torch.cat([obs_tensor, padding], dim=1)
+                        elif current_dim > expected_input_dim:
+                            # Truncate to expected dimension
+                            obs_tensor = obs_tensor[:, :expected_input_dim]
+                        
+                        with torch.no_grad():
+                            probs, _, _ = bot_instance(obs_tensor, None)
+                            probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
+                            mask_t = torch.tensor(action_mask, dtype=torch.float32, device=device)
+                            masked_probs = probs * mask_t
+                            if masked_probs.sum() == 0:
+                                valid_indices = torch.nonzero(mask_t, as_tuple=True)[0]
+                                if len(valid_indices) > 0:
+                                    masked_probs[valid_indices] = 1.0 / valid_indices.numel()
+                                else:
+                                    masked_probs = torch.ones_like(probs) / probs.size(0)
+                            else:
+                                masked_probs /= masked_probs.sum()
+                            m = Categorical(masked_probs)
+                            action = m.sample().item()
+                            log_prob_value = 0.0  # Not needed for opponent
+                    except Exception as e:
+                        # Fallback to random action if model inference fails
+                        logger.warning(f"Error using historical model: {e}. Using random action.")
+                        valid_actions = [i for i, mask in enumerate(action_mask) if mask == 1]
+                        action = random.choice(valid_actions) if valid_actions else 0
+                        log_prob_value = 0.0
 
             env.step(action)
+            # Update rewards and store transitions
             if current_agent == rl_agent:
                 reward = env.rewards[rl_agent] + pending_rewards[rl_agent]
                 pending_rewards[rl_agent] = 0.0
@@ -399,7 +486,8 @@ def train_agent(env, device, target_win_rate=0.95, load_checkpoint_flag=False, l
                     reward=reward,
                     is_terminal=env.terminations[rl_agent] or env.truncations[rl_agent],
                     state_value=state_value,
-                    action_mask=action_mask
+                    action_mask=action_mask,
+                    expert_input=np.zeros(5)  # Placeholder for expert input - not used in this version
                 )
             else:
                 pending_rewards[rl_agent] += env.rewards[rl_agent]
@@ -440,6 +528,7 @@ def train_agent(env, device, target_win_rate=0.95, load_checkpoint_flag=False, l
                 writer.add_scalar("Reward/Average", avg_reward, episode)
                 writer.add_scalar("Stats/StepsPerEpisode", avg_steps, episode)
                 writer.add_scalar("Stats/StepsPerSecond", steps_per_sec, episode)
+                writer.add_scalar("WinRate", current_win_rate, episode)
             logger.info(f"Episode {episode} | Avg Reward: {avg_reward:.2f} | Avg Steps/Ep: {avg_steps:.2f} | Time: {elapsed:.2f}s | Steps/s: {steps_per_sec:.2f} | Win rate: {current_win_rate*100:.1f}% | Consecutive zero win intervals: {consecutive_zero_win_count}")
             interval_reward_sum = 0
             interval_steps_sum = 0
@@ -531,6 +620,11 @@ def train_agent(env, device, target_win_rate=0.95, load_checkpoint_flag=False, l
                 state_values = value_net(states).squeeze()
                 value_loss = nn.MSELoss()(state_values, returns_tensor)
                 total_loss = policy_loss + 0.5 * value_loss
+                
+                # Zero gradients before backward pass
+                optimizer_policy.zero_grad()
+                optimizer_value.zero_grad()
+                
                 total_loss.backward()
 
                 policy_losses.append(policy_loss.item())
@@ -554,7 +648,13 @@ def train_agent(env, device, target_win_rate=0.95, load_checkpoint_flag=False, l
     if writer is not None:
         writer.close()
 
-    checkpoint_filename = os.path.join(checkpoint_dir, f"{TRAINING_BOT_NAME}_checkpoint.pth")
+    # Determine the checkpoint filename based on the opponent type and name
+    if OPPONENT_TYPE == 0:
+        opponent_identifier = HARD_CODED_BOT_NAMES[HARD_CODED_BOT_INDEX]
+    else:
+        opponent_identifier = historical_models[HISTORICAL_AGENT_INDEX][1]
+    
+    checkpoint_filename = os.path.join(checkpoint_dir, f"{opponent_identifier}_checkpoint.pth")
     save_checkpoint(
         {rl_agent: policy_net},
         {rl_agent: value_net},
@@ -573,7 +673,22 @@ def main():
     device = torch.device(config.DEVICE)
     env = LiarsDeckEnv(num_players=config.NUM_PLAYERS, render_mode=config.RENDER_MODE)
     logger = configure_logger()
-    logger.info(f"Starting training process against {TRAINING_BOT_NAME}...")
+    
+    # Log information about the opponent selection
+    if OPPONENT_TYPE == 0:
+        opponent_name = HARD_CODED_BOT_NAMES[HARD_CODED_BOT_INDEX]
+        logger.info(f"Starting training process against hardcoded bot: {opponent_name}...")
+    elif OPPONENT_TYPE == 1 and len(historical_models) > 0:
+        if HISTORICAL_AGENT_INDEX < len(historical_models):
+            opponent_name = historical_models[HISTORICAL_AGENT_INDEX][1]
+            logger.info(f"Starting training process against historical agent: {opponent_name}...")
+        else:
+            logger.error(f"Historical agent index {HISTORICAL_AGENT_INDEX} is out of range. Only {len(historical_models)} historical models available.")
+            return
+    else:
+        logger.error("Invalid opponent configuration or no historical agents loaded.")
+        return
+    
     train_agent(env=env, device=device, load_checkpoint_flag=True, log_tensorboard=True)
 
 if __name__ == "__main__":
