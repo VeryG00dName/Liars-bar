@@ -1,6 +1,8 @@
 # src/training/train_vs_everyone.py
 
+from datetime import datetime
 import logging
+import pickle
 import time
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -181,6 +183,21 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
     # ------------------ NEW: Initialize Transformer Classification Accuracy Tracking ------------------
     transformer_accuracy_counts = defaultdict(lambda: {"correct": 0, "total": 0})
     # ------------------------------------------------------------------------------------------------------
+    
+    # ------------------ NEW: Add transformer training data collection ------------------
+    transformer_training_data = []
+    # Target number of samples per agent type before saving
+    target_samples_per_agent = 1000
+    # Track number of samples collected per agent
+    collected_samples_counter = defaultdict(int)
+    
+    last_collection_step = defaultdict(int)  # Track when we last collected for each agent
+    
+    collection_frequency = 10  # Collect samples every N steps
+    
+    min_sequence_length = 5  # Minimum sequence length to collect (much shorter)
+    # ------------------------------------------------------------------------------------------------------
+    
     console_logger = ConsoleLogger()
     # Setup policy/value networks using the new mixture-of-experts model.
     policy_nets = {}
@@ -267,6 +284,33 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
     tracked_agent = None
     
     strategy_embeddings_by_agent_opponent = {}
+    
+    # ------------------ NEW: Helper function to save transformer training data ------------------
+    def save_transformer_training_data():
+        if not transformer_training_data:
+            logger.info("No transformer training data to save.")
+            return
+            
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_path = os.path.join(config.CHECKPOINT_DIR, f"transformer_training_data_{timestamp}.pkl")
+        
+        try:
+            with open(file_path, "wb") as f:
+                pickle.dump(transformer_training_data, f)
+            logger.info(f"Saved {len(transformer_training_data)} transformer training samples to {file_path}")
+            
+            # Print distribution of labels
+            label_counts = defaultdict(int)
+            for _, label in transformer_training_data:
+                label_counts[label] += 1
+                
+            logger.info("Label distribution in saved data:")
+            for label, count in label_counts.items():
+                logger.info(f"  {label}: {count} samples")
+                
+        except Exception as e:
+            logger.error(f"Error saving transformer training data: {e}")
+    # ------------------------------------------------------------------------------------------------------
     
     for episode in range(start_episode, num_episodes + 1):
         env_seed = config.SEED + episode
@@ -378,6 +422,43 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                         if len(memory_full) < 200:
                             pad_event = {"response": "", "triggering_action": "", "penalties": 0, "card_count": 0}
                             memory_full = memory_full + [pad_event] * (200 - len(memory_full))
+                            
+                        # ------------------ NEW: Collect training data for transformer ------------------
+                        # If the opponent is the injected agent, collect its memory as training data
+                        for opp in env.possible_agents:
+                            if opp != agent:
+                                memory_full = query_opponent_memory_full(agent, opp)
+                                
+                                # ------------------ IMPROVED: Collect training data for transformer ------------------
+                                # If the opponent is the injected agent, collect its memory as training data
+                                if opp == current_injected_agent_id:
+                                    # Only collect every N steps to get varied sequence lengths
+                                    agent_opp_key = f"{agent}_{opp}"
+                                    current_step = global_step
+                                    
+                                    if (current_step - last_collection_step[agent_opp_key] >= collection_frequency and 
+                                        len(memory_full) >= min_sequence_length):
+                                        
+                                        # Determine the correct label based on the injected agent
+                                        if current_injected_bot_type == "hardcoded":
+                                            label = current_injected_bot_identifier
+                                        else:
+                                            label = current_injected_bot_identifier
+                                        
+                                        # Check we have room for more samples of this type
+                                        if collected_samples_counter[label] < target_samples_per_agent:
+                                            # Important: Store the ACTUAL sequence without padding to 200
+                                            transformer_training_data.append((list(memory_full), label))
+                                            collected_samples_counter[label] += 1
+                                            
+                                            # Log collection with sequence length
+                                            if collected_samples_counter[label] % 100 == 0:
+                                                logger.info(f"Collected {collected_samples_counter[label]} samples for {label} (length: {len(memory_full)})")
+                                            
+                                            # Update last collection time
+                                            last_collection_step[agent_opp_key] = current_step
+                                # ---------------------------------------------------------------------------------
+                                
                         features_list = convert_memory_to_features(memory_full, response2idx, action2idx)
                         if features_list:
                             feature_tensor = torch.tensor(features_list, dtype=torch.float32, device=device).unsqueeze(0)
@@ -435,7 +516,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     with torch.no_grad():
                         projected = event_encoder(feature_tensor)
                         strategy_embedding, _ = strategy_transformer(projected)
-                    # Each opponent’s memory embedding is 5 dims; take that 5-dim vector.
+                    # Each opponent's memory embedding is 5 dims; take that 5-dim vector.
                     learning_expert_input = strategy_embedding.cpu().detach().numpy().flatten()[:5]
                 else:
                     learning_expert_input = np.zeros(5, dtype=np.float32)
@@ -454,7 +535,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     transformer_accuracy_counts[current_injected_bot_identifier]["total"] += 1
                     if expert_index == expected_label:
                         transformer_accuracy_counts[current_injected_bot_identifier]["correct"] += 1
-                    console_logger.log(agent, f"Agent {agent} selected expert {expert_index} for opponent {expected_label}")
+                    #console_logger.log(agent, f"Agent {agent} selected expert {expert_index} for opponent {expected_label}")
                 # -------------------------------------------------------------------------------------
     
             # ---------- Action Selection ----------
@@ -684,6 +765,13 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 checkpoint_dir=checkpoint_dir
             )
             logger.info(f"Saved global checkpoint at episode {episode}.")
+            
+            # ------------------ NEW: Save transformer training data periodically ------------------
+            if len(transformer_training_data) > 500:  # Save when we have a decent amount of data
+                save_transformer_training_data()
+                transformer_training_data = []  # Clear after saving
+                collected_samples_counter = defaultdict(int)  # Reset counter
+            # -----------------------------------------------------------------------------------
     
         steps_since_log += steps_in_episode
         episodes_since_log += 1
@@ -730,7 +818,14 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     if counts["total"] > 0:
                         accuracy_percentage = counts["correct"] / counts["total"] * 100
                         writer.add_scalar(f"Transformer_Classification_Accuracy/{opp_identifier}", accuracy_percentage, episode)
+                        logger.info(f"Transformer accuracy for {opp_identifier}: {accuracy_percentage:.2f}% ({counts['correct']}/{counts['total']})")
             transformer_accuracy_counts.clear()
+            
+            # Log collected training data counts
+            if collected_samples_counter:
+                logger.info("Current transformer training data collection status:")
+                for label, count in collected_samples_counter.items():
+                    logger.info(f"  {label}: {count}/{target_samples_per_agent} samples collected")
             # -----------------------------------------------------------------------------------
     
             last_log_time = time.time()
@@ -750,6 +845,11 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 visualize_strategy_embeddings(writer, strategy_embeddings_by_agent_opponent, all_agents, all_opponents, episode, method='pca', reference_embeddings=reference_embeddings)
                 visualize_strategy_embeddings(writer, strategy_embeddings_by_agent_opponent, all_agents, all_opponents, episode, method='tsne', reference_embeddings=reference_embeddings)
                 strategy_embeddings_by_agent_opponent.clear()
+                
+    # ------------------ NEW: Save any remaining transformer training data ------------------
+    if transformer_training_data:
+        save_transformer_training_data()
+    # ---------------------------------------------------------------------------------------
     
     if writer is not None:
         writer.close()
