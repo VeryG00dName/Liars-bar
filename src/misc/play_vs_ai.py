@@ -1,3 +1,4 @@
+# src/misc/play_vs_ai.py
 import os
 import logging
 import tkinter as tk
@@ -53,6 +54,10 @@ class PlayVsAIGUI:
         self.create_ai_selection()
         self.create_control_buttons()
         
+        # Two Player Mode toggle
+        self.two_player_var = tk.BooleanVar(value=False)
+        self.create_two_player_checkbox()
+        
         # Create a persistent action window for human input (this window stays visible).
         self.create_action_window()
         
@@ -97,6 +102,7 @@ class PlayVsAIGUI:
         frame = ttk.LabelFrame(self.root, text="AI Agents Selection", padding=10)
         frame.pack(fill=tk.X, padx=10, pady=5)
         self.agent_selectors = {}
+        # We always create two selectors but later disable the second one if two player mode is active.
         for i in range(2):
             ttk.Label(frame, text=f"AI Agent {i+1}:").grid(row=i, column=0, sticky=tk.W, pady=2)
             self.agent_selectors[i] = ttk.Combobox(frame, state="readonly", width=50)
@@ -108,6 +114,27 @@ class PlayVsAIGUI:
         frame.pack(pady=10)
         ttk.Button(frame, text="Refresh Agents", command=self.update_agent_selectors).pack(side=tk.LEFT, padx=5)
         ttk.Button(frame, text="Start Game", command=self.start_game).pack(side=tk.LEFT, padx=5)
+
+    def create_two_player_checkbox(self):
+        """Creates a checkbox to toggle Two Player Mode."""
+        frame = ttk.Frame(self.root)
+        frame.pack(pady=5)
+        chk = ttk.Checkbutton(frame, text="Two Player Mode", variable=self.two_player_var,
+                              command=self.on_two_player_toggle)
+        chk.pack(side=tk.LEFT, padx=5)
+
+    def on_two_player_toggle(self):
+        """Callback when the two player checkbox is toggled.
+           If enabled, disable the second AI selector; otherwise, enable it."""
+        if self.two_player_var.get():
+            # Two player mode: only one AI opponent is needed.
+            self.agent_selectors[1].set('')
+            self.agent_selectors[1].config(state="disabled")
+        else:
+            # Enable both selectors
+            self.agent_selectors[1].config(state="readonly")
+        # Refresh the agent selection options in case you want to update the displayed values.
+        self.update_agent_selectors()
 
     def create_action_window(self):
         """Creates a persistent Toplevel window for human actions (this window stays visible)."""
@@ -184,17 +211,24 @@ class PlayVsAIGUI:
             for agent_name in data["policy_nets"].keys():
                 display_text = f"{folder_name} - {os.path.basename(file_path)} - {agent_name}"
                 agent_options.append(display_text)
-        for i in range(2):
-            self.agent_selectors[i]["values"] = agent_options
-            self.agent_selectors[i].state(["!disabled"])
+        # If two player mode is enabled, only populate the first selector.
+        if self.two_player_var.get():
+            self.agent_selectors[0]["values"] = agent_options
+            self.agent_selectors[0].state(["!disabled"])
+            self.agent_selectors[1].set('')
+        else:
+            for i in range(2):
+                self.agent_selectors[i]["values"] = agent_options
+                self.agent_selectors[i].state(["!disabled"])
 
     def start_game(self):
         try:
             agents = {}
-            for i in range(2):
-                selection = self.agent_selectors[i].get()
+            if self.two_player_var.get():
+                # Two player mode: Only one AI agent is needed.
+                selection = self.agent_selectors[0].get()
                 if not selection:
-                    raise ValueError(f"Select AI Agent {i+1}")
+                    raise ValueError("Select AI Agent 1")
                 parts = selection.split(" - ")
                 if len(parts) != 3:
                     raise ValueError("Invalid agent format")
@@ -204,10 +238,29 @@ class PlayVsAIGUI:
                 if not file_path_candidates:
                     raise ValueError(f"File for {file_name} not found among loaded models.")
                 file_path = file_path_candidates[0]
-                agents[f"player_{i}"] = {
+                agents["player_0"] = {
                     "policy_state": self.loaded_models[file_path]["policy_nets"][agent_name],
                     "obp_model_state": self.loaded_models[file_path]["obp_model"]
                 }
+            else:
+                # Normal mode: Two AI agents for a 3-player game (human + 2 AI).
+                for i in range(2):
+                    selection = self.agent_selectors[i].get()
+                    if not selection:
+                        raise ValueError(f"Select AI Agent {i+1}")
+                    parts = selection.split(" - ")
+                    if len(parts) != 3:
+                        raise ValueError("Invalid agent format")
+                    file_name = parts[1]
+                    agent_name = parts[2]
+                    file_path_candidates = [p for p in self.loaded_models.keys() if os.path.basename(p) == file_name]
+                    if not file_path_candidates:
+                        raise ValueError(f"File for {file_name} not found among loaded models.")
+                    file_path = file_path_candidates[0]
+                    agents[f"player_{i}"] = {
+                        "policy_state": self.loaded_models[file_path]["policy_nets"][agent_name],
+                        "obp_model_state": self.loaded_models[file_path]["obp_model"]
+                    }
             self.root.after(100, lambda: self.play_game(agents))
         except Exception as e:
             self.show_info(f"Error: {str(e)}")
@@ -535,7 +588,12 @@ class PlayVsAIGUI:
 
     def play_game(self, agents):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        num_players = 3  # Assuming human player + 2 AI agents
+        # Set number of players based on two player mode
+        if self.two_player_var.get():
+            num_players = 2  # Human vs. 1 AI
+        else:
+            num_players = 3  # Human vs. 2 AI
+        
         self.current_env = LiarsDeckEnv(num_players=num_players, render_mode="player")
         
         policy_nets = {}
