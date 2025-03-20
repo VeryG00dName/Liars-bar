@@ -95,8 +95,6 @@ class OpponentMemory:
                 'early_three_card_trigger_count': 0,
                 'late_three_card_trigger_count': 0
             }
-        
-        # (Optionally, if the deque is full, you might subtract the oldest event's contribution here.)
 
         self.memory[opponent].append(event)
         agg = self.aggregates[opponent]
