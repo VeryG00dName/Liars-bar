@@ -78,13 +78,13 @@ def map_expert_index(raw_index):
 
 # Define hardcoded labels and historical mapping (for auxiliary classification)
 HARD_CODED_LABELS = {
-    "GreedyCardSpammer": 2,
+    "GreedyCardSpammer": 1,
     "StrategicChallenger": 4,
     "TableNonTableAgent": 6,
     "Classic": 0,
     "TableFirstConservativeChallenger": 5,
-    "SelectiveTableConservativeChallenger": 1,
-    "RandomAgent": 3
+    "SelectiveTableConservativeChallenger": 3,
+    "RandomAgent": 2
 }
 historical_label_mapping = {}  # This can be populated if needed, e.g., when loading historical models
 
@@ -153,7 +153,7 @@ transformer_classification_head = strategy_transformer.classification_head
 transformer_classification_head.eval()
 strategy_transformer.eval()
 
-def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load_directory=None, log_tensorboard=True):
+def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, load_directory=None, log_tensorboard=True):
     set_seed(config.SEED)
     obs, infos = env.reset(seed=config.SEED)
     agents = env.agents
@@ -427,8 +427,8 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
                 raw_expert_index = expert_logits.argmax(dim=-1).item()
                 expert_index = map_expert_index(raw_expert_index)
             opponent_index = HARD_CODED_LABELS.get(current_opponent_name, historical_label_mapping.get(current_opponent_name, -1))
-            if opponent_index != expert_index:
-                logger.info(f"Agent {agent} selected expert {expert_index} for opponent {current_opponent_name} (index: {opponent_index})")
+            #if opponent_index != expert_index:
+                #logger.info(f"Agent {agent} selected expert {expert_index} for opponent {current_opponent_name} (index: {opponent_index})")
 
 
             # -------------------------------------------------------------------------------------
@@ -647,7 +647,7 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=True, load
                 writer.add_scalar("OBP/Accuracy", accuracy, episode)
             obp_memory = []
         
-        if episode % config.CHECKPOINT_INTERVAL == 0 and load_checkpoint:
+        if episode % config.CHECKPOINT_INTERVAL == 0:
             save_checkpoint(
                 policy_nets,
                 value_nets,
@@ -735,7 +735,7 @@ def main():
         env=env,
         device=device,
         num_episodes=config.NUM_EPISODES,
-        load_checkpoint=True,
+        load_checkpoint=False,
         log_tensorboard=True
     )
     
