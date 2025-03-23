@@ -134,7 +134,6 @@ class BattlegroundWorker(QThread):
         self.expert_activations = {}
 
     def run(self):
-        try:
             combined_opponents = {}
             # Add hardcoded agents.
             for name, cls in self.hardcoded_agents.items():
@@ -178,8 +177,6 @@ class BattlegroundWorker(QThread):
             # Emit the expert activations 
             self.expert_signal.emit(self.expert_activations)
             self.results_signal.emit(results)
-        except Exception as e:
-            self.error_signal.emit(str(e))
     
     def run_match(self, opponent_type, opponent_obj, opponent_name):
         env = LiarsDeckEnv(num_players=3, render_mode=None)
@@ -191,8 +188,23 @@ class BattlegroundWorker(QThread):
             agent_data = self.ai_agents[key]
             hidden_dim = get_hidden_dim_from_state_dict(agent_data["policy_net"], "fc1")
             obs_dim = agent_data["input_dim"]
+            
+            # Check if this is an MoE model
+            is_moe_model = ModelFactory.is_moe_policy(agent_data["policy_net"])
             new_model_flag = is_new_policy(agent_data["policy_net"])
-            if new_model_flag:
+            
+            if is_moe_model:
+                # Create MoE policy network
+                policy_net = ModelFactory.create_policy_network(
+                    input_dim=obs_dim,
+                    hidden_dim=hidden_dim,
+                    output_dim=env.action_spaces[key].n,
+                    use_aux_classifier=True,
+                    num_opponent_classes=config.NUM_OPPONENT_CLASSES,
+                    use_moe_model=True,
+                    num_experts=10
+                )
+            elif new_model_flag:
                 policy_net = ModelFactory.create_policy_network(
                     input_dim=obs_dim,
                     hidden_dim=hidden_dim,
@@ -210,6 +222,7 @@ class BattlegroundWorker(QThread):
                     strategy_dim=config.STRATEGY_DIM,  # assumed defined in config
                     num_opponents=env.num_players - 1
                 )
+                
             policy_net.load_state_dict(agent_data["policy_net"], strict=False)
             policy_net.to(device).eval()
 
@@ -266,8 +279,23 @@ class BattlegroundWorker(QThread):
             hist_state_dict = opponent_obj.state_dict()
             hidden_dim = get_hidden_dim_from_state_dict(hist_state_dict, "fc1")
             obs_dim = hist_state_dict["fc1.weight"].shape[1]
+            
+            # Check if this is an MoE model
+            is_moe_model = ModelFactory.is_moe_policy(hist_state_dict)
             new_model_flag = is_new_policy(hist_state_dict)
-            if new_model_flag:
+            
+            if is_moe_model:
+                # Create MoE policy network for historical model
+                policy_net = ModelFactory.create_policy_network(
+                    input_dim=obs_dim,
+                    hidden_dim=hidden_dim,
+                    output_dim=env.action_spaces["player_2"].n,
+                    use_aux_classifier=True,
+                    num_opponent_classes=config.NUM_OPPONENT_CLASSES,
+                    use_moe_model=True,
+                    num_experts=10
+                )
+            elif new_model_flag:
                 policy_net = ModelFactory.create_policy_network(
                     input_dim=obs_dim,
                     hidden_dim=hidden_dim,
@@ -285,6 +313,7 @@ class BattlegroundWorker(QThread):
                     strategy_dim=config.STRATEGY_DIM,
                     num_opponents=env.num_players - 1
                 )
+                
             policy_net.load_state_dict(hist_state_dict, strict=False)
             policy_net.to(device).eval()
 
@@ -931,3 +960,4 @@ if __name__ == "__main__":
     window = AgentBattlegroundGUI()
     window.show()
     sys.exit(app.exec_())
+
