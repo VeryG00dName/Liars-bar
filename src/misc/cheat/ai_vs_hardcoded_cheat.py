@@ -5,7 +5,7 @@ import logging
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-
+import traceback
 from PyQt5 import QtWidgets
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
@@ -21,11 +21,11 @@ from src.model.hard_coded_agents import (
     TableNonTableAgent,
     Classic
 )
-from src.eval.evaluate_utils import (
+from src.misc.cheat.evaluate_utils_cheat import (
     get_hidden_dim_from_state_dict,
     evaluate_agents
 )
-from src.model.model_factory import ModelFactory
+from src.misc.cheat.model_factory_cheat import ModelFactory
 from src.training.train_vs_everyone import load_specific_historical_models
 
 torch.backends.cudnn.benchmark = True
@@ -76,7 +76,19 @@ def get_input_dim_from_state_dict(state_dict, candidate_prefix='fc1'):
     available_keys = list(state_dict.keys())
     raise ValueError(f"Cannot determine input_dim from state_dict. Tried prefixes: {candidate_prefixes}. "
                      f"Available keys: {available_keys}")
-
+    
+HARD_CODED_LABELS = {
+    "GreedyCardSpammer": 2,
+    "StrategicChallenger": 4,
+    "TableNonTableAgent": 6,
+    "Classic": 0,
+    "TableFirstConservativeChallenger": 5,
+    "SelectiveTableConservativeChallenger": 1,
+    "RandomAgent": 3,
+    "Version_E_player_1": 7,
+    "Version_C_player_0": 8,
+    "Version_A_player_2": 9
+}
 # --- Custom QListWidget for drag-and-drop ---
 class DropListWidget(QtWidgets.QListWidget):
     def __init__(self, main_window, parent=None):
@@ -134,6 +146,7 @@ class BattlegroundWorker(QThread):
         self.expert_activations = {}
 
     def run(self):
+        try:
             combined_opponents = {}
             # Add hardcoded agents.
             for name, cls in self.hardcoded_agents.items():
@@ -177,6 +190,9 @@ class BattlegroundWorker(QThread):
             # Emit the expert activations 
             self.expert_signal.emit(self.expert_activations)
             self.results_signal.emit(results)
+        except Exception as e:
+            tb = traceback.format_exc()
+            self.error_signal.emit(tb)
     
     def run_match(self, opponent_type, opponent_obj, opponent_name):
         env = LiarsDeckEnv(num_players=3, render_mode=None)
@@ -188,41 +204,15 @@ class BattlegroundWorker(QThread):
             agent_data = self.ai_agents[key]
             hidden_dim = get_hidden_dim_from_state_dict(agent_data["policy_net"], "fc1")
             obs_dim = agent_data["input_dim"]
-            
-            # Check if this is an MoE model
-            is_moe_model = ModelFactory.is_moe_policy(agent_data["policy_net"])
-            new_model_flag = is_new_policy(agent_data["policy_net"])
-            
-            if is_moe_model:
-                # Create MoE policy network
-                policy_net = ModelFactory.create_policy_network(
-                    input_dim=obs_dim,
-                    hidden_dim=hidden_dim,
-                    output_dim=env.action_spaces[key].n,
-                    use_aux_classifier=True,
-                    num_opponent_classes=config.NUM_OPPONENT_CLASSES,
-                    use_moe_model=True,
-                    num_experts=10
-                )
-            elif new_model_flag:
-                policy_net = ModelFactory.create_policy_network(
-                    input_dim=obs_dim,
-                    hidden_dim=hidden_dim,
-                    output_dim=env.action_spaces[key].n,
-                    use_aux_classifier=True,
-                    num_opponent_classes=config.NUM_OPPONENT_CLASSES,
-                    use_new_model=True
-                )
-            else:
-                policy_net = ModelFactory.create_policy_network(
-                    input_dim=obs_dim,
-                    hidden_dim=hidden_dim,
-                    output_dim=env.action_spaces[key].n,
-                    use_new_model=False,
-                    strategy_dim=config.STRATEGY_DIM,  # assumed defined in config
-                    num_opponents=env.num_players - 1
-                )
-                
+            # Force loaded agents to use the older policy (other_models)
+            policy_net = ModelFactory.create_policy_network(
+                input_dim=obs_dim,
+                hidden_dim=hidden_dim,
+                output_dim=env.action_spaces[key].n,
+                use_new_model=False,  # Force using other_models
+                strategy_dim=config.STRATEGY_DIM,
+                num_opponents=env.num_players - 1
+            )
             policy_net.load_state_dict(agent_data["policy_net"], strict=False)
             policy_net.to(device).eval()
 
@@ -261,8 +251,8 @@ class BattlegroundWorker(QThread):
                 "obs_version": agent_data["obs_version"],
                 "rating": None,
                 "uses_memory": agent_data["uses_memory"],
-                # Add flag to track expert activations
-                "track_experts": True
+                # Mark these as loaded.
+                'loaded_model': True
             }
 
         # --- Opponent as player_2 ---
@@ -279,41 +269,15 @@ class BattlegroundWorker(QThread):
             hist_state_dict = opponent_obj.state_dict()
             hidden_dim = get_hidden_dim_from_state_dict(hist_state_dict, "fc1")
             obs_dim = hist_state_dict["fc1.weight"].shape[1]
-            
-            # Check if this is an MoE model
-            is_moe_model = ModelFactory.is_moe_policy(hist_state_dict)
-            new_model_flag = is_new_policy(hist_state_dict)
-            
-            if is_moe_model:
-                # Create MoE policy network for historical model
-                policy_net = ModelFactory.create_policy_network(
-                    input_dim=obs_dim,
-                    hidden_dim=hidden_dim,
-                    output_dim=env.action_spaces["player_2"].n,
-                    use_aux_classifier=True,
-                    num_opponent_classes=config.NUM_OPPONENT_CLASSES,
-                    use_moe_model=True,
-                    num_experts=10
-                )
-            elif new_model_flag:
-                policy_net = ModelFactory.create_policy_network(
-                    input_dim=obs_dim,
-                    hidden_dim=hidden_dim,
-                    output_dim=env.action_spaces["player_2"].n,
-                    use_aux_classifier=True,
-                    num_opponent_classes=config.NUM_OPPONENT_CLASSES,
-                    use_new_model=True
-                )
-            else:
-                policy_net = ModelFactory.create_policy_network(
-                    input_dim=obs_dim,
-                    hidden_dim=hidden_dim,
-                    output_dim=env.action_spaces["player_2"].n,
-                    use_new_model=False,
-                    strategy_dim=config.STRATEGY_DIM,
-                    num_opponents=env.num_players - 1
-                )
-                
+            # Force historical models to use the new implementation (new_models)
+            policy_net = ModelFactory.create_policy_network(
+                input_dim=obs_dim,
+                hidden_dim=hidden_dim,
+                output_dim=env.action_spaces["player_2"].n,
+                use_aux_classifier=True,
+                num_opponent_classes=config.NUM_OPPONENT_CLASSES,
+                use_new_model=True  # Use new_models for historical models
+            )
             policy_net.load_state_dict(hist_state_dict, strict=False)
             policy_net.to(device).eval()
 
@@ -330,15 +294,26 @@ class BattlegroundWorker(QThread):
                 "obp_model": obp_model,
                 "obs_version": 2,
                 "rating": None,
-                "uses_memory": True
+                "uses_memory": True,
+                'loaded_model': False
             }
         else:
             raise ValueError(f"Unknown opponent type: {opponent_type}")
 
-        # Run evaluation for a single match, now capturing expert activations
+        # Determine opponent's expert label.
+        opponent_data = players_in_this_game.get("player_2", None)
+        if opponent_data is not None:
+            if opponent_data.get('hardcoded_bot', False):
+                opp_label = HARD_CODED_LABELS.get(opponent_data['agent'].__class__.__name__, 0)
+            else:
+                opp_identifier = opponent_data.get('identifier', None)
+                opp_label = HARD_CODED_LABELS.get(opp_identifier, 0) if opp_identifier is not None else 0
+        else:
+            opp_label = 0
+
         cumulative_wins, _, _, _, _, expert_activations = evaluate_agents(
             env, device, players_in_this_game, episodes=1, 
-            two_player=self.two_player, track_experts=True
+            two_player=self.two_player, track_experts=True, expert_index=opp_label
         )
         
         winner = max(cumulative_wins, key=cumulative_wins.get)
@@ -960,4 +935,3 @@ if __name__ == "__main__":
     window = AgentBattlegroundGUI()
     window.show()
     sys.exit(app.exec_())
-

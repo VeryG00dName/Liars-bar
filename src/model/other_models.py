@@ -1,88 +1,117 @@
+# src/model/new_models.py
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ----------------------------
-# Policy Network: Specialized Agent (No Auxiliary Classifier)
-# ----------------------------
-class PolicyNetwork(nn.Module):
+class SingleExpertPolicyNetwork(nn.Module):
+    """
+    A simplified expert network that uses a single hidden layer.
+    
+    It performs:
+      1. A linear transformation from input_dim to hidden_dim, with GELU activation.
+      2. Optional dropout and layer normalization.
+      3. Optionally, a one-layer LSTM (applied to a single time step).
+      4. A final linear layer to produce action logits.
+      5. Softmax over logits to produce action probabilities.
+    """
     def __init__(self, input_dim, hidden_dim, output_dim, use_lstm=True, use_dropout=True, use_layer_norm=True):
-        super(PolicyNetwork, self).__init__()
+        super(SingleExpertPolicyNetwork, self).__init__()
         self.use_lstm = use_lstm
         self.use_dropout = use_dropout
         self.use_layer_norm = use_layer_norm
-
-        # Core layers
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, hidden_dim)
         
+        # A single hidden layer.
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        
+        # LSTM layer (if used) and final classification layer.
         if self.use_lstm:
-            self.lstm = nn.LSTM(hidden_dim, hidden_dim, num_layers=2, batch_first=True)
-            self.fc4 = nn.Linear(hidden_dim, output_dim)
+            # Using a one-layer LSTM for a single time-step.
+            self.lstm = nn.LSTM(hidden_dim, hidden_dim, num_layers=1, batch_first=True)
+            self.fc_out = nn.Linear(hidden_dim, output_dim)
         else:
-            self.fc4 = nn.Linear(hidden_dim, output_dim)
-
+            self.fc_out = nn.Linear(hidden_dim, output_dim)
+        
         if self.use_dropout:
             self.dropout = nn.Dropout(p=0.3)
         if self.use_layer_norm:
-            self.layer_norm1 = nn.LayerNorm(hidden_dim)
-            self.layer_norm2 = nn.LayerNorm(hidden_dim)
-            self.layer_norm3 = nn.LayerNorm(hidden_dim)
+            self.layer_norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, x, hidden_state=None):
+        # x: (batch_size, input_dim)
         x = F.gelu(self.fc1(x))
         if self.use_layer_norm:
-            x = self.layer_norm1(x)
+            x = self.layer_norm(x)
         if self.use_dropout:
             x = self.dropout(x)
         
-        x = F.gelu(self.fc2(x))
-        if self.use_layer_norm:
-            x = self.layer_norm2(x)
-        if self.use_dropout:
-            x = self.dropout(x)
-        
-        x = F.gelu(self.fc3(x))
-        if self.use_layer_norm:
-            x = self.layer_norm3(x)
-        if self.use_dropout:
-            x = self.dropout(x)
-        
+        # Optionally use LSTM.
         if self.use_lstm:
-            # Add sequence dimension if needed
-            x = x.unsqueeze(1)
+            # Add a time dimension (sequence length 1).
+            x = x.unsqueeze(1)  # (batch_size, 1, hidden_dim)
             x, hidden_state = self.lstm(x, hidden_state)
-            x = x.squeeze(1)
-            action_logits = self.fc4(x)
-        else:
-            action_logits = self.fc4(x)
+            x = x.squeeze(1)    # (batch_size, hidden_dim)
         
+        action_logits = self.fc_out(x)
         action_probs = F.softmax(action_logits, dim=-1)
         return action_probs, hidden_state
 
-# ----------------------------
-# Value Network
-# ----------------------------
+class PolicyNetwork(nn.Module):
+    """
+    Mixture-of-Experts policy network that uses an external expert selection.
+    
+    Instead of computing gating internally, this network expects a second input,
+    'expert_index', which indicates which expert to use. The network then simply
+    passes the observation through the selected expert to produce the action probabilities.
+    """
+    def __init__(self, input_dim, hidden_dim, output_dim, num_experts,
+                 use_lstm=True, use_dropout=True, use_layer_norm=True):
+        super(PolicyNetwork, self).__init__()
+        self.num_experts = num_experts
+        
+        # Create a list of experts.
+        self.experts = nn.ModuleList([
+            SingleExpertPolicyNetwork(input_dim, hidden_dim, output_dim, use_lstm, use_dropout, use_layer_norm)
+            for _ in range(num_experts)
+        ])
+    
+    def forward(self, x, expert_index, hidden_state=None):
+        """
+        Args:
+            x (Tensor): Observation of shape (batch_size, input_dim).
+            expert_index (int): The index of the expert to use.
+            hidden_state (optional): LSTM hidden state for the selected expert.
+            
+        Returns:
+            action_probs (Tensor): (batch_size, output_dim) action probability distribution.
+            hidden_state: LSTM hidden state from the selected expert.
+        """
+        if expert_index < 0 or expert_index >= self.num_experts:
+            raise ValueError(f"Expert index {expert_index} is out of range.")
+        expert = self.experts[expert_index]
+        return expert(x, hidden_state)
+
+    
 class ValueNetwork(nn.Module):
     def __init__(self, input_dim, hidden_dim, use_dropout=True, use_layer_norm=True):
         super(ValueNetwork, self).__init__()
         self.use_dropout = use_dropout
         self.use_layer_norm = use_layer_norm
-        
+
+        # Enhanced layers
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, hidden_dim)
         self.value_head = nn.Linear(hidden_dim, 1)
-        
+
+        # Regularization
         if self.use_dropout:
             self.dropout = nn.Dropout(p=0.3)
         if self.use_layer_norm:
             self.layer_norm1 = nn.LayerNorm(hidden_dim)
             self.layer_norm2 = nn.LayerNorm(hidden_dim)
             self.layer_norm3 = nn.LayerNorm(hidden_dim)
-    
+
     def forward(self, x):
         x = F.gelu(self.fc1(x))
         if self.use_layer_norm:
@@ -104,11 +133,7 @@ class ValueNetwork(nn.Module):
         
         state_value = self.value_head(x)
         return state_value
-    
-# ----------------------------
-# Opponent Behavior Predictor
-# ----------------------------
-    
+
 class OpponentBehaviorPredictor(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim=2, memory_dim=0):
         """
@@ -146,22 +171,29 @@ class OpponentBehaviorPredictor(nn.Module):
         logits = self.output_layer(x)
         return logits
     
-# ----------------------------
-# Strategy Transformer for Opponent Memory Embedding
-# ----------------------------
 class PositionalEncoding(nn.Module):
+    """
+    Implements the standard sinusoidal positional encoding.
+    """
     def __init__(self, d_model, dropout=0.1, max_len=5000):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
-        pe = torch.zeros(max_len, d_model)  
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)  
+        
+        pe = torch.zeros(max_len, d_model)  # shape: (max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)  # shape: (max_len, 1)
         div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float) * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)  
-        pe[:, 1::2] = torch.cos(position * div_term)  
-        pe = pe.unsqueeze(0)  
+        pe[:, 0::2] = torch.sin(position * div_term)  # even indices
+        pe[:, 1::2] = torch.cos(position * div_term)  # odd indices
+        pe = pe.unsqueeze(0)  # shape: (1, max_len, d_model)
         self.register_buffer('pe', pe)
 
     def forward(self, x):
+        """
+        Args:
+            x: Tensor of shape (batch_size, seq_len, d_model)
+        Returns:
+            Tensor with positional encodings added.
+        """
         x = x + self.pe[:, :x.size(1)]
         return self.dropout(x)
 

@@ -427,6 +427,222 @@ class LiarsDeckEnv(AECEnv):
             self.agent_selection = None
             self.logger.debug("No active agents remaining. Ending episode.")
 
+    def clone(self):
+        """
+        Creates a deep copy of the current environment state for simulation purposes.
+        
+        Returns:
+            LiarsDeckEnv: A new environment with the identical state.
+        """
+        cloned_env = LiarsDeckEnv(
+            num_players=self.num_players,
+            render_mode=None,  # Simulations don't need rendering
+            log_level=logging.WARNING,  # Quiet logging for simulations
+            scoring_params=self.scoring_params.copy()
+        )
+        
+        # Copy core game state
+        cloned_env.deck = self.deck.copy()
+        cloned_env.table_card = self.table_card
+        cloned_env.table_card_idx = self.table_card_idx
+        
+        # Deep copy players' hands
+        cloned_env.players_hands = {agent: hand.copy() for agent, hand in self.players_hands.items()}
+        
+        # Copy agent state
+        cloned_env.agents = self.agents.copy()
+        cloned_env.agent_selection = self.agent_selection
+        cloned_env._agent_selector = agent_selector(cloned_env.agents)  # Create fresh selector
+        
+        # Advance selector to match current agent
+        if self.agent_selection:
+            while cloned_env.agent_selection != self.agent_selection:
+                cloned_env.agent_selection = cloned_env._agent_selector.next()
+        
+        # Copy game tracking state
+        cloned_env.penalties = self.penalties.copy()
+        cloned_env.penalty_thresholds = self.penalty_thresholds.copy()
+        cloned_env.last_action = self.last_action
+        cloned_env.last_action_agent = self.last_action_agent
+        cloned_env.last_action_bluff = self.last_action_bluff
+        
+        # Copy last cards played
+        cloned_env.last_played_cards = {
+            agent: cards.copy() if cards else [] 
+            for agent, cards in self.last_played_cards.items()
+        }
+        
+        # Copy game status flags
+        cloned_env.terminations = self.terminations.copy()
+        cloned_env.truncations = self.truncations.copy()
+        cloned_env.round_eliminated = self.round_eliminated.copy()
+        cloned_env.winner = self.winner
+        
+        # Copy rewards and other info
+        cloned_env.rewards = self.rewards.copy()
+        cloned_env._cumulative_rewards = self._cumulative_rewards.copy()
+        cloned_env.infos = {agent: info.copy() for agent, info in self.infos.items()}
+        
+        # Copy bluff-related state
+        cloned_env.pending_bluff = self.pending_bluff.copy() if self.pending_bluff else None
+        
+        # Copy action tracking
+        cloned_env.last_agent_action = self.last_agent_action.copy()
+        cloned_env.consecutive_action_count = self.consecutive_action_count.copy()
+        
+        # Copy statistics
+        cloned_env.successful_bluffs = self.successful_bluffs.copy()
+        cloned_env.failed_bluffs = self.failed_bluffs.copy()
+        cloned_env.successful_challenges = self.successful_challenges.copy()
+        cloned_env.failed_challenges = self.failed_challenges.copy()
+        cloned_env.bluff_counts = self.bluff_counts.copy() 
+        cloned_env.total_plays = self.total_plays.copy()
+        
+        # Copy opponent histories
+        cloned_env.public_opponent_histories = {
+            agent: history.copy() for agent, history in self.public_opponent_histories.items()
+        }
+        cloned_env.private_opponent_histories = {
+            agent: history.copy() for agent, history in self.private_opponent_histories.items()
+        }
+        
+        # Set random number generator with same seed
+        cloned_env.np_random = np.random.default_rng(seed=self.np_random.bit_generator.state['state']['state'])
+        
+        return cloned_env
+
+    def set_state(self, state_dict):
+        """
+        Sets the environment state from a state dictionary.
+        
+        Args:
+            state_dict (dict): Dictionary containing the full environment state.
+        """
+        # Set core game state
+        self.deck = state_dict['deck']
+        self.table_card = state_dict['table_card']
+        self.table_card_idx = state_dict['table_card_idx']
+        
+        # Set players' hands
+        self.players_hands = state_dict['players_hands']
+        
+        # Set agent state
+        self.agents = state_dict['agents']
+        self.agent_selection = state_dict['agent_selection']
+        self._agent_selector = agent_selector(self.agents)  # Create fresh selector
+        
+        # Advance selector to match current agent
+        if self.agent_selection:
+            while self.agent_selection != state_dict['agent_selection']:
+                self.agent_selection = self._agent_selector.next()
+        
+        # Set game tracking state
+        self.penalties = state_dict['penalties']
+        self.penalty_thresholds = state_dict['penalty_thresholds']
+        self.last_action = state_dict['last_action']
+        self.last_action_agent = state_dict['last_action_agent']
+        self.last_action_bluff = state_dict['last_action_bluff']
+        self.last_played_cards = state_dict['last_played_cards']
+        
+        # Set game status flags
+        self.terminations = state_dict['terminations']
+        self.truncations = state_dict['truncations']
+        self.round_eliminated = state_dict['round_eliminated']
+        self.winner = state_dict['winner']
+        
+        # Set rewards and other info
+        self.rewards = state_dict['rewards']
+        self._cumulative_rewards = state_dict['_cumulative_rewards']
+        self.infos = state_dict['infos']
+        
+        # Set bluff-related state
+        self.pending_bluff = state_dict['pending_bluff']
+        
+        # Set action tracking
+        self.last_agent_action = state_dict['last_agent_action']
+        self.consecutive_action_count = state_dict['consecutive_action_count']
+        
+        # Set statistics
+        self.successful_bluffs = state_dict['successful_bluffs']
+        self.failed_bluffs = state_dict['failed_bluffs']
+        self.successful_challenges = state_dict['successful_challenges']
+        self.failed_challenges = state_dict['failed_challenges']
+        self.bluff_counts = state_dict['bluff_counts']
+        self.total_plays = state_dict['total_plays']
+        
+        # Set opponent histories
+        self.public_opponent_histories = state_dict['public_opponent_histories']
+        self.private_opponent_histories = state_dict['private_opponent_histories']
+        
+        # Set random number generator state
+        self.np_random = np.random.default_rng(seed=state_dict['random_seed'])
+
+    def get_state(self):
+        """
+        Returns a dictionary containing the full environment state.
+        
+        Returns:
+            dict: Dictionary containing the complete environment state.
+        """
+        return {
+            # Core game state
+            'deck': self.deck.copy(),
+            'table_card': self.table_card,
+            'table_card_idx': self.table_card_idx,
+            
+            # Players' hands
+            'players_hands': {agent: hand.copy() for agent, hand in self.players_hands.items()},
+            
+            # Agent state
+            'agents': self.agents.copy(),
+            'agent_selection': self.agent_selection,
+            
+            # Game tracking state
+            'penalties': self.penalties.copy(),
+            'penalty_thresholds': self.penalty_thresholds.copy(),
+            'last_action': self.last_action,
+            'last_action_agent': self.last_action_agent,
+            'last_action_bluff': self.last_action_bluff,
+            'last_played_cards': {a: c.copy() if c else [] for a, c in self.last_played_cards.items()},
+            
+            # Game status flags
+            'terminations': self.terminations.copy(),
+            'truncations': self.truncations.copy(),
+            'round_eliminated': self.round_eliminated.copy(),
+            'winner': self.winner,
+            
+            # Rewards and other info
+            'rewards': self.rewards.copy(),
+            '_cumulative_rewards': self._cumulative_rewards.copy(),
+            'infos': {agent: info.copy() for agent, info in self.infos.items()},
+            
+            # Bluff-related state
+            'pending_bluff': self.pending_bluff.copy() if self.pending_bluff else None,
+            
+            # Action tracking
+            'last_agent_action': self.last_agent_action.copy(),
+            'consecutive_action_count': self.consecutive_action_count.copy(),
+            
+            # Statistics
+            'successful_bluffs': self.successful_bluffs.copy(),
+            'failed_bluffs': self.failed_bluffs.copy(),
+            'successful_challenges': self.successful_challenges.copy(),
+            'failed_challenges': self.failed_challenges.copy(),
+            'bluff_counts': self.bluff_counts.copy(),
+            'total_plays': self.total_plays.copy(),
+            
+            # Opponent histories
+            'public_opponent_histories': {
+                agent: history.copy() for agent, history in self.public_opponent_histories.items()
+            },
+            'private_opponent_histories': {
+                agent: history.copy() for agent, history in self.private_opponent_histories.items()
+            },
+            
+            # Random seed
+            'random_seed': self.np_random.bit_generator.state['state']['state']
+        }
+
     def render(self, mode='human'):
         if mode not in ['human', 'player']:
             raise ValueError("Invalid render mode. Supported modes are 'human' and 'player'.")

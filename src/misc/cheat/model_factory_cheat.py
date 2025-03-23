@@ -5,7 +5,6 @@ from src.model.common_model_api import BasePolicyNetwork, BaseValueNetwork, Base
 
 # Import new implementations for policy and value networks.
 from src.model.new_models import PolicyNetwork as NewPolicyNetwork, ValueNetwork as PPOValueNetwork
-# Import MoE models when needed (dynamic import in create_policy_network)
 
 class ModelFactory:
     """
@@ -16,21 +15,8 @@ class ModelFactory:
     def create_policy_network(use_aux_classifier: bool = False, num_opponent_classes: int = None,
                               input_dim: int = 26, hidden_dim: int = config.HIDDEN_DIM, output_dim: int = config.OUTPUT_DIM,
                               use_lstm: bool = True, use_dropout: bool = True, use_layer_norm: bool = True,
-                              use_new_model: bool = True, strategy_dim: int = 5, num_opponents: int = 2,
-                              use_moe_model: bool = False, num_experts: int = 10) -> BasePolicyNetwork:
-        if use_moe_model:
-            # Import and instantiate the MoE model from other_models
-            from src.model.other_models import PolicyNetwork as MoEPolicyNetwork
-            model = MoEPolicyNetwork(
-                input_dim=input_dim,
-                hidden_dim=hidden_dim,
-                output_dim=output_dim,
-                use_lstm=use_lstm,
-                use_dropout=use_dropout,
-                use_layer_norm=use_layer_norm,
-                num_experts=num_experts
-            )
-        elif use_new_model:
+                              use_new_model: bool = True, strategy_dim: int = 5, num_opponents: int = 2) -> BasePolicyNetwork:
+        if use_new_model:
             # Instantiate the new model version.
             model = NewPolicyNetwork(
                 input_dim=input_dim,
@@ -49,26 +35,12 @@ class ModelFactory:
                 input_dim=input_dim,
                 hidden_dim=hidden_dim,
                 output_dim=output_dim,
-                strategy_dim=strategy_dim,
-                num_opponents=num_opponents,
+                num_experts=11,
                 use_lstm=use_lstm,
-                use_dropout=use_dropout
+                use_dropout=use_dropout,
+                use_layer_norm=use_layer_norm
             )
         return model
-    
-    @staticmethod
-    def is_moe_policy(state_dict):
-        """
-        Detects if a policy state dictionary comes from a Mixture of Experts model.
-        
-        Args:
-            state_dict: The state dictionary of a policy network.
-            
-        Returns:
-            bool: True if the state dictionary is from an MoE model, False otherwise.
-        """
-        # MoE models have expert-specific layers like 'experts.0.fc1.weight'
-        return any(k.startswith('experts.') for k in state_dict.keys())
 
     @staticmethod
     def create_value_network(input_dim: int = 26, hidden_dim: int = 64,

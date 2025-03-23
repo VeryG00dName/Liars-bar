@@ -6,7 +6,7 @@ import torch
 import pickle  # For saving/loading trial results
 
 from src.env.liars_deck_env_core import LiarsDeckEnv
-from src.tune.tune_train import train_agents as tune_train
+from src.tune.tune_train_single import train_agent as tune_train
 from src.training.train_extras import set_seed
 from src import config
 
@@ -48,23 +48,23 @@ def objective(trial: optuna.trial.Trial) -> float:
     """
     # --- 1) Sample scoring parameters using Optuna ---
     scoring_params = {
-        "play_reward_per_card": trial.suggest_int("play_reward_per_card", -2, 2),  # default -1: [-4, 2]
-        "play_reward": trial.suggest_int("play_reward", -2, 2),  # default 1: [-2, 4]
-        "challenge_success_challenger_reward": trial.suggest_int("challenge_success_challenger_reward", -1, 10),  # default 10: [7, 13]
-        "challenge_success_claimant_penalty": trial.suggest_int("challenge_success_claimant_penalty", -6, 1),  # default 0: [-3, 3]
-        "challenge_fail_challenger_penalty": trial.suggest_int("challenge_fail_challenger_penalty", -6, 1),  # default 0: [-3, 3]
-        "challenge_fail_claimant_reward": trial.suggest_int("challenge_fail_claimant_reward", -1, 8),  # default 5: [2, 8]
+        "play_reward_per_card": trial.suggest_int("play_reward_per_card", -3, 3),  # default 0: [-3, 3]
+        "play_reward": trial.suggest_int("play_reward", -3, 3),  # default 0: [-3, 3]
+        "challenge_success_challenger_reward": trial.suggest_int("challenge_success_challenger_reward", 2, 8),  # default 5: [2, 8]
+        "challenge_success_claimant_penalty": trial.suggest_int("challenge_success_claimant_penalty", -7, -1),  # default -4: [-7, -1]
+        "challenge_fail_challenger_penalty": trial.suggest_int("challenge_fail_challenger_penalty", -2, 4),  # default 1: [-2, 4]
+        "challenge_fail_claimant_reward": trial.suggest_int("challenge_fail_claimant_reward", 1, 7),  # default 4: [1, 7]
         "forced_challenge_success_challenger_reward": trial.suggest_int("forced_challenge_success_challenger_reward", -3, 3),  # default 0: [-3, 3]
-        "forced_challenge_success_claimant_penalty": trial.suggest_int("forced_challenge_success_claimant_penalty", -10, 1),  # default -10: [-13, -7]
-        "forced_challenge_fail_challenger_penalty": trial.suggest_int("forced_challenge_fail_challenger_penalty", -6, 1),  # default -3: [-6, 0]
-        "forced_challenge_fail_claimant_reward": trial.suggest_int("forced_challenge_fail_claimant_reward", -1, 3),  # default 0: [-3, 3]
-        "termination_penalty": trial.suggest_int("termination_penalty", -5, 1),  # default -1: [-4, 2]
-        "game_win_bonus": trial.suggest_int("game_win_bonus", 10, 20),  # default 16: [13, 19]
-        "game_lose_penalty": trial.suggest_int("game_lose_penalty", -20, -8),  # default -11: [-14, -8]
-        "hand_empty_bonus": trial.suggest_int("hand_empty_bonus", -1, 3),  # default 0: [-3, 3]
-        "consecutive_action_penalty": trial.suggest_int("consecutive_action_penalty", -2, 4),  # default 1: [-2, 4]
-        "successful_bluff_reward": trial.suggest_int("successful_bluff_reward", -3, 3),  # default 0: [-3, 3]
-        "unchallenged_bluff_penalty": trial.suggest_int("unchallenged_bluff_penalty", -5, 1)  # default -2: [-5, 1]
+        "forced_challenge_success_claimant_penalty": trial.suggest_int("forced_challenge_success_claimant_penalty", -8, -2),  # default -5: [-8, -2]
+        "forced_challenge_fail_challenger_penalty": trial.suggest_int("forced_challenge_fail_challenger_penalty", -7, -1),  # default -4: [-7, -1]
+        "forced_challenge_fail_claimant_reward": trial.suggest_int("forced_challenge_fail_claimant_reward", -2, 4),  # default 1: [-2, 4]
+        "termination_penalty": trial.suggest_int("termination_penalty", -3, 3),  # default 0: [-3, 3]
+        "game_win_bonus": trial.suggest_int("game_win_bonus", 14, 20),  # default 17: [14, 20]
+        "game_lose_penalty": trial.suggest_int("game_lose_penalty", -12, -6),  # default -9: [-12, -6]
+        "hand_empty_bonus": trial.suggest_int("hand_empty_bonus", -2, 4),  # default 1: [-2, 4]
+        "consecutive_action_penalty": trial.suggest_int("consecutive_action_penalty", -1, 5),  # default 2: [-1, 5]
+        "successful_bluff_reward": trial.suggest_int("successful_bluff_reward", -4, 2),  # default -1: [-4, 2]
+        "unchallenged_bluff_penalty": trial.suggest_int("unchallenged_bluff_penalty", -4, 2)  # default -1: [-4, 2]
     }
     logging.info(f"Trial {trial.number} scoring parameters: {scoring_params}")
 
@@ -89,7 +89,7 @@ def objective(trial: optuna.trial.Trial) -> float:
     else:
         device = torch.device('cpu')
     
-    TUNE_NUM_EPISODES = 15000
+    TUNE_NUM_EPISODES = 2000
 
     # --- 4) Run the new tune_train training routine, passing the trial object ---
     set_seed(config.SEED)  # Ensure reproducibility
@@ -132,8 +132,8 @@ def main():
 
     # Create a Hyperband pruner that will not allow culling until after 2500 episodes.
     pruner = optuna.pruners.HyperbandPruner(
-        min_resource=2500,  # No trial is pruned before 2500 episodes.
-        max_resource=15000,
+        min_resource=500,  # No trial is pruned before 2500 episodes.
+        max_resource=2000,
         reduction_factor=3
     )
     
@@ -153,7 +153,7 @@ def main():
         raise e
 
     study.enqueue_trial(config.DEFAULT_SCORING_PARAMS)
-    N_TRIALS = 50
+    N_TRIALS = 150
 
     # Determine number of GPUs and set n_jobs accordingly (at least 1)
     gpu_count = torch.cuda.device_count()

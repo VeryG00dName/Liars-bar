@@ -1,8 +1,5 @@
-# src/training/train_vs_everyone.py
-
-from datetime import datetime
+# src/training/train_cheat.py
 import logging
-import pickle
 import time
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -90,14 +87,26 @@ class ConsoleLogger:
             self.last_messages[agent] = message
             self.repeat_counts[agent] = 1
 
+def map_expert_inputs(raw_index):
+    if raw_index <= 6:
+        return raw_index
+    elif 7 <= raw_index <= 22:
+        return 7
+    elif 23 <= raw_index <= 38:
+        return 8
+    elif 39 <= raw_index <= 41:
+        return 9
+    else:
+        raise ValueError(f"Raw expert index {raw_index} out of expected range.")
+    
 HARD_CODED_LABELS = {
-    "GreedyCardSpammer": 1,
+    "GreedyCardSpammer": 2,
     "StrategicChallenger": 4,
     "TableNonTableAgent": 6,
     "Classic": 0,
     "TableFirstConservativeChallenger": 5,
-    "SelectiveTableConservativeChallenger": 3,
-    "RandomAgent": 2
+    "SelectiveTableConservativeChallenger": 1,
+    "RandomAgent": 3
 }
 historical_label_mapping = {}
 
@@ -142,7 +151,7 @@ else:
 
 # Replace the token embedding with identity.
 strategy_transformer.token_embedding = nn.Identity()
-# Instead of removing the classification head, we keep it for external expert selection.
+# We still keep the classification head in the model (for external expert selection), but it will no longer be used for expert selection.
 transformer_classification_head = strategy_transformer.classification_head
 transformer_classification_head.eval()
 strategy_transformer.eval()
@@ -152,6 +161,7 @@ print(f"Loaded {len(historical_models)} historical PPO models: {', '.join([id fo
 
 for idx, (_, identifier) in enumerate(historical_models):
     historical_label_mapping[identifier] = len(HARD_CODED_LABELS) + idx
+
 def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_directory=None, log_tensorboard=True):
     set_seed(config.SEED)
     obs, infos = env.reset(seed=config.SEED)
@@ -183,21 +193,6 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
     # ------------------ NEW: Initialize Transformer Classification Accuracy Tracking ------------------
     transformer_accuracy_counts = defaultdict(lambda: {"correct": 0, "total": 0})
     # ------------------------------------------------------------------------------------------------------
-    
-    # ------------------ NEW: Add transformer training data collection ------------------
-    transformer_training_data = []
-    # Target number of samples per agent type before saving
-    target_samples_per_agent = 1000
-    # Track number of samples collected per agent
-    collected_samples_counter = defaultdict(int)
-    
-    last_collection_step = defaultdict(int)  # Track when we last collected for each agent
-    
-    collection_frequency = 10  # Collect samples every N steps
-    
-    min_sequence_length = 5  # Minimum sequence length to collect (much shorter)
-    # ------------------------------------------------------------------------------------------------------
-    
     console_logger = ConsoleLogger()
     # Setup policy/value networks using the new mixture-of-experts model.
     policy_nets = {}
@@ -212,7 +207,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
             input_dim=16,  # learning agents we use only 16.
             hidden_dim=config.HIDDEN_DIM,
             output_dim=config.OUTPUT_DIM,
-            num_experts=len(injected_bots),  # one expert per injected bot
+            num_experts=len(injected_bots)+1,  # one expert per injected bot, plus one for default
             use_lstm=True,
             use_dropout=True,
             use_layer_norm=True,
@@ -227,6 +222,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
         value_nets[agent] = value_net
         optimizers_policy[agent] = optim.Adam(policy_net.parameters(), lr=config.LEARNING_RATE)
         optimizers_value[agent] = optim.Adam(value_net.parameters(), lr=config.LEARNING_RATE)
+        # IMPORTANT: We now assume that RolloutMemory stores a new key "expert_indices"
         memories[agent] = RolloutMemory([agent])
     
     obp_model = OpponentBehaviorPredictor(
@@ -285,33 +281,6 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
     
     strategy_embeddings_by_agent_opponent = {}
     
-    # ------------------ NEW: Helper function to save transformer training data ------------------
-    def save_transformer_training_data():
-        if not transformer_training_data:
-            logger.info("No transformer training data to save.")
-            return
-            
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        file_path = os.path.join(config.CHECKPOINT_DIR, f"transformer_training_data_{timestamp}.pkl")
-        
-        try:
-            with open(file_path, "wb") as f:
-                pickle.dump(transformer_training_data, f)
-            logger.info(f"Saved {len(transformer_training_data)} transformer training samples to {file_path}")
-            
-            # Print distribution of labels
-            label_counts = defaultdict(int)
-            for _, label in transformer_training_data:
-                label_counts[label] += 1
-                
-            logger.info("Label distribution in saved data:")
-            for label, count in label_counts.items():
-                logger.info(f"  {label}: {count} samples")
-                
-        except Exception as e:
-            logger.error(f"Error saving transformer training data: {e}")
-    # ------------------------------------------------------------------------------------------------------
-    
     for episode in range(start_episode, num_episodes + 1):
         env_seed = config.SEED + episode
         obs, infos = env.reset(seed=env_seed)
@@ -319,7 +288,7 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
         pending_rewards = {agent: 0.0 for agent in agents}
     
         # Switch injected bot every 5 episodes.
-        if (episode - start_episode) % 20 == 0:
+        if (episode - start_episode) % 5 == 0:
             from src.model.memory import PERSISTENT_OPPONENT_MEMORIES
             PERSISTENT_OPPONENT_MEMORIES.clear()
             current_injected_agent_id = random.choice(agents)
@@ -422,43 +391,6 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                         if len(memory_full) < 200:
                             pad_event = {"response": "", "triggering_action": "", "penalties": 0, "card_count": 0}
                             memory_full = memory_full + [pad_event] * (200 - len(memory_full))
-                            
-                        # ------------------ NEW: Collect training data for transformer ------------------
-                        # If the opponent is the injected agent, collect its memory as training data
-                        for opp in env.possible_agents:
-                            if opp != agent:
-                                memory_full = query_opponent_memory_full(agent, opp)
-                                
-                                # ------------------ IMPROVED: Collect training data for transformer ------------------
-                                # If the opponent is the injected agent, collect its memory as training data
-                                if opp == current_injected_agent_id:
-                                    # Only collect every N steps to get varied sequence lengths
-                                    agent_opp_key = f"{agent}_{opp}"
-                                    current_step = global_step
-                                    
-                                    if (current_step - last_collection_step[agent_opp_key] >= collection_frequency and 
-                                        len(memory_full) >= min_sequence_length):
-                                        
-                                        # Determine the correct label based on the injected agent
-                                        if current_injected_bot_type == "hardcoded":
-                                            label = current_injected_bot_identifier
-                                        else:
-                                            label = current_injected_bot_identifier
-                                        
-                                        # Check we have room for more samples of this type
-                                        if collected_samples_counter[label] < target_samples_per_agent:
-                                            # Important: Store the ACTUAL sequence without padding to 200
-                                            transformer_training_data.append((list(memory_full), label))
-                                            collected_samples_counter[label] += 1
-                                            
-                                            # Log collection with sequence length
-                                            #if collected_samples_counter[label] % 100 == 0:
-                                                #logger.info(f"Collected {collected_samples_counter[label]} samples for {label} (length: {len(memory_full)})")
-                                            
-                                            # Update last collection time
-                                            last_collection_step[agent_opp_key] = current_step
-                                # ---------------------------------------------------------------------------------
-                                
                         features_list = convert_memory_to_features(memory_full, response2idx, action2idx)
                         if features_list:
                             feature_tensor = torch.tensor(features_list, dtype=torch.float32, device=device).unsqueeze(0)
@@ -491,52 +423,16 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 obp_arr = np.array(obp_probs, dtype=np.float32)  # 2 dims
                 final_obs = np.concatenate([observation, obp_arr], axis=0)  # 14 + 2 = 16 dims
     
-                # Separately, select one opponent and compute its 5-dim expert input.
-                selected_opp = None
-                for opp in env.possible_agents:
-                    if opp == agent:
-                        continue
-                    if env.terminations.get(opp, False) or env.truncations.get(opp, False):
-                        selected_opp = opp
-                        break
-                if selected_opp is None:
-                    agent_index = env.agents.index(agent)
-                    previous_index = (agent_index - 1) % len(env.agents)
-                    if env.agents[previous_index] == agent:
-                        previous_index = (agent_index - 2) % len(env.agents)
-                    selected_opp = env.agents[previous_index]
-                memory_full = query_opponent_memory_full(agent, selected_opp)
-                # Pad memory_full if needed.
-                if len(memory_full) < 200:
-                    pad_event = {"response": "", "triggering_action": "", "penalties": 0, "card_count": 0}
-                    memory_full = memory_full + [pad_event] * (200 - len(memory_full))
-                features_list = convert_memory_to_features(memory_full, response2idx, action2idx)
-                if features_list:
-                    feature_tensor = torch.tensor(features_list, dtype=torch.float32, device=device).unsqueeze(0)
-                    with torch.no_grad():
-                        projected = event_encoder(feature_tensor)
-                        strategy_embedding, _ = strategy_transformer(projected)
-                    # Each opponent's memory embedding is 5 dims; take that 5-dim vector.
-                    learning_expert_input = strategy_embedding.cpu().detach().numpy().flatten()[:5]
-                else:
-                    learning_expert_input = np.zeros(5, dtype=np.float32)
-                
-                # ------------------ NEW: Transformer Classification Head Evaluation ------------------
-                learning_expert_tensor = torch.tensor(learning_expert_input, dtype=torch.float32, device=device).unsqueeze(0)
-                with torch.no_grad():
-                    expert_logits = transformer_classification_head(learning_expert_tensor)
-                    expert_index = expert_logits.argmax(dim=-1).item()
-                # Log accuracy if the selected opponent is the injected opponent (which has a known label).
-                if current_injected_agent_id is not None and selected_opp == current_injected_agent_id:
+                # Instead of computing an expert input and classifying it, we directly select the opponent.
+                # If an injected opponent exists, use its label.
+                if current_injected_agent_id is not None and current_injected_agent_id != agent:
+                    selected_opp = current_injected_agent_id
                     if current_injected_bot_type == "hardcoded":
-                        expected_label = HARD_CODED_LABELS[current_injected_agent_instance.__class__.__name__]
+                        expert_inputs = HARD_CODED_LABELS[current_injected_agent_instance.__class__.__name__]
                     else:
-                        expected_label = historical_label_mapping[current_injected_bot_identifier]
-                    transformer_accuracy_counts[current_injected_bot_identifier]["total"] += 1
-                    if expert_index == expected_label:
-                        transformer_accuracy_counts[current_injected_bot_identifier]["correct"] += 1
-                    #console_logger.log(agent, f"Agent {agent} selected expert {expert_index} for opponent {expected_label}")
-                # -------------------------------------------------------------------------------------
+                        expert_inputs = historical_label_mapping[current_injected_bot_identifier]
+                else:
+                    expert_inputs = 10  # default expert index if no injected opponent is available
     
             # ---------- Action Selection ----------
             if agent == current_injected_agent_id:
@@ -563,10 +459,9 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     action = m.sample().item()
                     log_prob_value = m.log_prob(torch.tensor(action, device=device)).item()
             else:
-                # Learning agent: use the separate 5-dim expert input.
-                # (The classification head evaluation was performed above.)
+                # Learning agent uses the injected opponent's label (saved as expert_inputs) for the transition.
                 observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
-                probs, _ = policy_nets[agent](observation_tensor, expert_index, None)
+                probs, _ = policy_nets[agent](observation_tensor, expert_inputs, None)
                 probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
                 mask_t = torch.tensor(action_mask, dtype=torch.float32, device=device)
                 masked_probs = probs * mask_t
@@ -594,11 +489,12 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 else:
                     reward = step_rewards[agent] + pending_rewards[agent]
                     pending_rewards[agent] = 0
+                    # --- Save the expert_inputs with the transition ---
                     if agent != current_injected_agent_id:
                         memories[agent].store_transition(
                             agent=agent,
                             state=final_obs,                # 16 dims: 14 (env) + 2 (OBP)
-                            expert_input=learning_expert_input,  # 5 dims
+                            expert_input=expert_inputs,      # Save the expert index used during rollout
                             action=action,
                             log_prob=log_prob_value,
                             reward=reward,
@@ -686,23 +582,14 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 value_losses = []
                 entropies = []
     
-                # For learning agents, retrieve stored expert input; for historical agents, use last config.STRATEGY_DIM from state.
-                if agent != current_injected_agent_id:
-                    expert_inputs = torch.tensor(np.array(memory.expert_inputs[agent], dtype=np.float32), device=device)
-                    with torch.no_grad():
-                        expert_logits = transformer_classification_head(expert_inputs)
-                        predictions = expert_logits.argmax(dim=-1)
-                        expert_index = predictions.mode()[0].item()
-                        
-                else:
-                    extracted_embedding = states[:, -config.STRATEGY_DIM:]
-                    with torch.no_grad():
-                        expert_logits = transformer_classification_head(extracted_embedding)
-                        predictions = expert_logits.argmax(dim=-1)
-                        expert_index = predictions.mode()[0].item()
+                # --- Use stored expert indices ---
+                # Retrieve the stored expert indices for this agent from memory.
+                # We use the mode (most common expert index) over the batch.
+                stored_expert_indices = np.array(memory.expert_inputs[agent], dtype=np.int64)
+                expert_inputs = int(np.bincount(stored_expert_indices).argmax())
     
                 for _ in range(config.K_EPOCHS):
-                    probs, _ = policy_nets[agent](states, expert_index, None)
+                    probs, _ = policy_nets[agent](states, expert_inputs, None)
                     probs = torch.clamp(probs, 1e-8, 1.0)
                     masked_probs = probs * action_masks_
                     row_sums = masked_probs.sum(dim=-1, keepdim=True)
@@ -765,13 +652,6 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 checkpoint_dir=checkpoint_dir
             )
             logger.info(f"Saved global checkpoint at episode {episode}.")
-            
-            # ------------------ NEW: Save transformer training data periodically ------------------
-            if len(transformer_training_data) > 500:  # Save when we have a decent amount of data
-                save_transformer_training_data()
-                transformer_training_data = []  # Clear after saving
-                collected_samples_counter = defaultdict(int)  # Reset counter
-            # -----------------------------------------------------------------------------------
     
         steps_since_log += steps_in_episode
         episodes_since_log += 1
@@ -811,21 +691,13 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                             action_counts_periodic[agent][action],
                             episode
                         )
-    
             # ------------------ NEW: Log Transformer Classification Accuracy ------------------
             if writer is not None:
                 for opp_identifier, counts in transformer_accuracy_counts.items():
                     if counts["total"] > 0:
                         accuracy_percentage = counts["correct"] / counts["total"] * 100
                         writer.add_scalar(f"Transformer_Classification_Accuracy/{opp_identifier}", accuracy_percentage, episode)
-                        logger.info(f"Transformer accuracy for {opp_identifier}: {accuracy_percentage:.2f}% ({counts['correct']}/{counts['total']})")
             transformer_accuracy_counts.clear()
-            
-            # Log collected training data counts
-            #if collected_samples_counter:
-                #logger.info("Current transformer training data collection status:")
-                #for label, count in collected_samples_counter.items():
-                    #logger.info(f"  {label}: {count}/{target_samples_per_agent} samples collected")
             # -----------------------------------------------------------------------------------
     
             last_log_time = time.time()
@@ -845,11 +717,6 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                 visualize_strategy_embeddings(writer, strategy_embeddings_by_agent_opponent, all_agents, all_opponents, episode, method='pca', reference_embeddings=reference_embeddings)
                 visualize_strategy_embeddings(writer, strategy_embeddings_by_agent_opponent, all_agents, all_opponents, episode, method='tsne', reference_embeddings=reference_embeddings)
                 strategy_embeddings_by_agent_opponent.clear()
-                
-    # ------------------ NEW: Save any remaining transformer training data ------------------
-    if transformer_training_data:
-        save_transformer_training_data()
-    # ---------------------------------------------------------------------------------------
     
     if writer is not None:
         writer.close()
