@@ -107,7 +107,7 @@ INIT_ENTROPY_COEF = 0.005
 # Logging and Checkpointing
 # ============================
 CULL_INTERVAL = 20001
-CHECKPOINT_INTERVAL = 2500
+CHECKPOINT_INTERVAL = 300000
 LOG_INTERVAL = 100
 
 # ============================
