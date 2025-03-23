@@ -24,6 +24,7 @@ from rich.progress import Progress, BarColumn, TextColumn
 # OpenSkill for rating updates
 from openskill.models import PlackettLuce
 
+from src.model.model_factory import ModelFactory
 from src.model.other_models import PolicyNetwork, ValueNetwork, StrategyTransformer ,OpponentBehaviorPredictor
 
 # Model and config imports
@@ -46,6 +47,30 @@ global_response2idx = None
 global_action2idx = None
 global_event_encoder = None
 global_strategy_transformer = None
+
+# ----------------------------
+# Expert Index Mapping for MoE Models
+# ----------------------------
+
+def map_expert_index(raw_index):
+    """
+    Maps raw expert indices to a fixed set (0-9).
+    This function should match the mapping used in training.
+    
+    Args:
+        raw_index: The raw expert index from the transformer classification
+        
+    Returns:
+        int: The mapped expert index to use with the MoE policy
+    """
+    if raw_index <= 6:
+        return raw_index
+    elif 7 <= raw_index <= 22:
+        return 7
+    elif 23 <= raw_index <= 28:
+        return 8
+    else:
+        return 9
 
 # ----------------------------
 # (Other utility functions remain unchanged)
@@ -291,7 +316,6 @@ def get_opponent_memory_embedding(current_agent, opponent, device):
         # Ensure global_strategy_transformer is loaded.
         if global_strategy_transformer is None:
             logger.debug("Global strategy transformer not set; initializing.")
-            from src.model.new_models import StrategyTransformer
             global_strategy_transformer = StrategyTransformer(
                 num_tokens=config.STRATEGY_NUM_TOKENS,
                 token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM,
@@ -311,7 +335,8 @@ def get_opponent_memory_embedding(current_agent, opponent, device):
                 logger.debug("Transformer checkpoint not found; strategy transformer initialized with random weights.")
             # Remove classification head and override token embedding.
             global_strategy_transformer.token_embedding = torch.nn.Identity()
-            global_strategy_transformer.classification_head = None
+            transformer_classification_head = global_strategy_transformer.classification_head
+            transformer_classification_head.eval()
         
         with torch.no_grad():
             logger.debug("Passing feature tensor through event encoder.")
@@ -700,8 +725,7 @@ def initialize_players(base_dir, device):
 
 def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournament=False, two_player=None, track_experts=False):
     """
-    Optimized evaluation function with minimized CPU/GPU transfers and vectorized operations.
-    Now with optional expert tracking capabilities.
+    Optimized evaluation function with support for MoE models.
     """
     logger = logging.getLogger("Evaluate")
     player_ids = list(players_in_this_game.keys())
@@ -721,7 +745,7 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
         if obp_model:
             fc1_weight = obp_model.state_dict().get("fc1.weight", None)
             player_tournament_mode[pid] = (fc1_weight is not None and 
-                                           fc1_weight.shape[1] == config.OPPONENT_INPUT_DIM + config.STRATEGY_DIM)
+                                          fc1_weight.shape[1] == config.OPPONENT_INPUT_DIM + config.STRATEGY_DIM)
         else:
             player_tournament_mode[pid] = is_tournament
 
@@ -738,6 +762,25 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
             pid = agent_to_player.get(agent_name)
             if pid:
                 expert_activations[agent_name] = {}
+
+    # Helper function to detect if a policy is MoE model
+    def is_moe_policy(policy_net):
+        state_dict = policy_net.state_dict()
+        return any('experts.' in k for k in state_dict.keys())
+
+    # Helper function to map expert index
+    def map_expert_index(raw_index):
+        if raw_index <= 6:
+            return raw_index
+        elif 7 <= raw_index <= 22:
+            return 7
+        elif 23 <= raw_index <= 38:
+            return 8
+        elif 39 <= raw_index <= 41:
+            return 9
+        else:
+            logger.warning(f"Raw expert index {raw_index} out of expected range. Using default 0.")
+            return 0
 
     with torch.no_grad():
         for game_idx in range(1, episodes + 1):
@@ -781,11 +824,16 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                     env.step(action)
                     continue
 
+                policy_net = player_data['policy_net']
                 obp_model = player_data.get('obp_model', None)
                 version = player_data['obs_version']
                 converted_obs = adapt_observation_for_version(observation, env.num_players, version)
                 use_tournament = player_tournament_mode[player_id]
                 mem_tensor = None  # To reuse in transformer features
+                expert_index = None  # For MoE models
+
+                # Check if this is an MoE model
+                is_moe = is_moe_policy(policy_net)
 
                 if obp_model is not None and use_tournament:
                     opponents = [opp for opp in env.possible_agents if opp != agent]
@@ -816,44 +864,84 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
 
                 converted_obs_tensor = torch.from_numpy(converted_obs).float().to(device)
                 obp_probs_tensor = torch.as_tensor(obp_probs, dtype=torch.float32, device=device)
+                
+                # Create basic observation (no memory embedding)
                 default_obs_tensor = torch.cat([converted_obs_tensor, obp_probs_tensor], dim=0)
-
-                # Build final observation tensor
-                if player_data.get('uses_memory', False) and version == 2 and mem_tensor is not None:
-                    transformer_features_tensor = mem_tensor.flatten()
-                    final_obs_tensor = torch.cat([default_obs_tensor, transformer_features_tensor], dim=0)
-                else:
+                
+                # For MoE models, we only need the basic 16-dim observation (14 from env + 2 from OBP)
+                # For traditional models, we may need to add memory embeddings based on model type
+                if is_moe:
+                    # MoE models use only the basic 16-dim observation
                     final_obs_tensor = default_obs_tensor
+                    
+                    # But we still need memory tensor for expert selection
+                    if mem_tensor is not None:
+                        # Get the first 5 elements of strategy embedding for classification
+                        learning_expert_input = mem_tensor[0, :5].cpu().detach().numpy()
+                        learning_expert_tensor = torch.tensor(learning_expert_input, dtype=torch.float32, device=device).unsqueeze(0)
+                        
+                        # Use global transformer classification head if available
+                        if global_strategy_transformer and hasattr(global_strategy_transformer, 'classification_head'):
+                            with torch.no_grad():
+                                classification_head = global_strategy_transformer.classification_head
+                                expert_logits = classification_head(learning_expert_tensor)
+                                raw_expert_index = expert_logits.argmax(dim=-1).item()
+                                expert_index = map_expert_index(raw_expert_index)
+                                logger.debug(f"Computed expert index {expert_index} (raw: {raw_expert_index}) for MoE model")
+                        else:
+                            # Default to expert 0 if classification not available
+                            expert_index = 0
+                            logger.debug("Using default expert index 0 (classifier not available)")
+                    else:
+                        expert_index = 0
+                else:
+                    # Traditional models might need memory embeddings added to observation
+                    if player_data.get('uses_memory', False) and version == 2 and mem_tensor is not None:
+                        transformer_features_tensor = mem_tensor.flatten()
+                        final_obs_tensor = torch.cat([default_obs_tensor, transformer_features_tensor], dim=0)
+                    else:
+                        final_obs_tensor = default_obs_tensor
 
                 final_obs_tensor = final_obs_tensor.unsqueeze(0)  # Add batch dimension
 
-                # Policy network inference
-                policy_net = player_data['policy_net']
-                num_layers = policy_net.lstm.num_layers
-                batch_size = final_obs_tensor.size(0)
-                hidden_size = policy_net.lstm.hidden_size
-                hidden_state = (
-                    torch.zeros(num_layers, batch_size, hidden_size, device=device),
-                    torch.zeros(num_layers, batch_size, hidden_size, device=device)
-                )
-
-                # Modified to capture gating logits for expert tracking
-                probs, _, gating_logits = policy_net(final_obs_tensor, hidden_state)
-                
-                # Track which expert is activated if tracking is enabled
-                if track_experts and gating_logits is not None and agent in ['player_0', 'player_1']:
-                    # Get the top expert (assuming top_n=1 in the model)
-                    _, top_expert = torch.topk(gating_logits, 1, dim=1)
-                    expert_idx = top_expert.squeeze().item()
-                    expert_idx_str = str(expert_idx)
+                # Policy network inference - different handling for MoE vs traditional models
+                if is_moe:
+                    # MoE models don't use hidden state, only need observation and expert index
+                    probs, _ = policy_net(final_obs_tensor, expert_index)
                     
-                    # Initialize if not yet present
-                    if expert_idx_str not in expert_activations[agent]:
-                        expert_activations[agent][expert_idx_str] = 0
+                    # Track expert usage
+                    if track_experts and agent in ['player_0', 'player_1']:
+                        expert_idx_str = str(expert_index)
+                        if expert_idx_str not in expert_activations[agent]:
+                            expert_activations[agent][expert_idx_str] = 0
+                        expert_activations[agent][expert_idx_str] += 1
+                        logger.debug(f"MoE model: Agent {agent} used expert {expert_idx_str}")
+                else:
+                    # Traditional models use hidden state
+                    num_layers = policy_net.lstm.num_layers if hasattr(policy_net, 'lstm') else 1
+                    batch_size = final_obs_tensor.size(0)
+                    hidden_size = policy_net.lstm.hidden_size if hasattr(policy_net, 'lstm') else 64
+                    hidden_state = (
+                        torch.zeros(num_layers, batch_size, hidden_size, device=device),
+                        torch.zeros(num_layers, batch_size, hidden_size, device=device)
+                    )
+                    
+                    # Different return signature based on model type
+                    if hasattr(policy_net, 'fc_classifier'):
+                        probs, _, gating_logits = policy_net(final_obs_tensor, hidden_state)
                         
-                    # Count this activation
-                    expert_activations[agent][expert_idx_str] += 1
-                    logger.debug(f"Agent {agent} used expert {expert_idx}")
+                        # Track expert usage for traditional mixture models
+                        if track_experts and gating_logits is not None and agent in ['player_0', 'player_1']:
+                            _, top_expert = torch.topk(gating_logits, 1, dim=1)
+                            expert_idx = top_expert.squeeze().item()
+                            expert_idx_str = str(expert_idx)
+                            
+                            if expert_idx_str not in expert_activations[agent]:
+                                expert_activations[agent][expert_idx_str] = 0
+                            expert_activations[agent][expert_idx_str] += 1
+                            logger.debug(f"Traditional model: Agent {agent} used expert {expert_idx}")
+                    else:
+                        probs, _ = policy_net(final_obs_tensor, hidden_state)
                 
                 probs = probs.clamp(1e-8, 1.0)
                 mask = info.get('action_mask', [1] * config.OUTPUT_DIM)
