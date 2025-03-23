@@ -6,7 +6,7 @@ import torch
 import pickle  # For saving/loading trial results
 
 from src.env.liars_deck_env_core import LiarsDeckEnv
-from src.tune.tune_train import train_agents as tune_train
+from src.tune.tune_train_single import train_agent as tune_train
 from src.training.train_extras import set_seed
 from src import config
 
@@ -89,7 +89,7 @@ def objective(trial: optuna.trial.Trial) -> float:
     else:
         device = torch.device('cpu')
     
-    TUNE_NUM_EPISODES = 15000
+    TUNE_NUM_EPISODES = 2000
 
     # --- 4) Run the new tune_train training routine, passing the trial object ---
     set_seed(config.SEED)  # Ensure reproducibility
@@ -132,8 +132,8 @@ def main():
 
     # Create a Hyperband pruner that will not allow culling until after 2500 episodes.
     pruner = optuna.pruners.HyperbandPruner(
-        min_resource=2500,  # No trial is pruned before 2500 episodes.
-        max_resource=15000,
+        min_resource=500,  # No trial is pruned before 2500 episodes.
+        max_resource=2000,
         reduction_factor=3
     )
     
@@ -153,7 +153,7 @@ def main():
         raise e
 
     study.enqueue_trial(config.DEFAULT_SCORING_PARAMS)
-    N_TRIALS = 50
+    N_TRIALS = 150
 
     # Determine number of GPUs and set n_jobs accordingly (at least 1)
     gpu_count = torch.cuda.device_count()
