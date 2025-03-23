@@ -29,7 +29,7 @@ class RolloutMemory:
         self.action_masks = {agent: [] for agent in self.agents}
         self.expert_inputs = {agent: [] for agent in self.agents}
 
-    def store_transition(self, agent, state, action, log_prob, reward, is_terminal, state_value, action_mask, expert_input):
+    def store_transition(self, agent, state, action, log_prob, reward, is_terminal, state_value, action_mask, expert_input=None):
         """
         Stores a single transition for a specific agent.
 
