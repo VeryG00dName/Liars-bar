@@ -452,8 +452,8 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                                             collected_samples_counter[label] += 1
                                             
                                             # Log collection with sequence length
-                                            if collected_samples_counter[label] % 100 == 0:
-                                                logger.info(f"Collected {collected_samples_counter[label]} samples for {label} (length: {len(memory_full)})")
+                                            #if collected_samples_counter[label] % 100 == 0:
+                                                #logger.info(f"Collected {collected_samples_counter[label]} samples for {label} (length: {len(memory_full)})")
                                             
                                             # Update last collection time
                                             last_collection_step[agent_opp_key] = current_step
@@ -822,10 +822,10 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
             transformer_accuracy_counts.clear()
             
             # Log collected training data counts
-            if collected_samples_counter:
-                logger.info("Current transformer training data collection status:")
-                for label, count in collected_samples_counter.items():
-                    logger.info(f"  {label}: {count}/{target_samples_per_agent} samples collected")
+            #if collected_samples_counter:
+                #logger.info("Current transformer training data collection status:")
+                #for label, count in collected_samples_counter.items():
+                    #logger.info(f"  {label}: {count}/{target_samples_per_agent} samples collected")
             # -----------------------------------------------------------------------------------
     
             last_log_time = time.time()
