@@ -37,9 +37,7 @@ ensure_dirs()
 NUM_PLAYERS = 3
 RENDER_MODE = None  # Set to 'human' to enable rendering
 USE_WRAPPER = False
-TWO_PLAYER_MODE = False
 USE_TRANSFORMER_MEMORY = True
-GAMES_TO_STORE = 2
 
 DEFAULT_SCORING_PARAMS = {
     "play_reward_per_card": 0,
@@ -92,7 +90,7 @@ STRATEGY_DROPOUT = 0.1
 # ============================
 # Training Hyperparameters
 # ============================
-NUM_EPISODES = 30000
+NUM_EPISODES = 40000
 LEARNING_RATE = 0.00019
 GAMMA = 0.974
 GAE_LAMBDA = 0.98
