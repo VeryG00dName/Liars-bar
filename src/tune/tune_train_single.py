@@ -355,44 +355,37 @@ def train_agent(env, device, num_episodes=10000, load_checkpoint=False, load_dir
                     # Historical agent logic
                     bot_instance = bot1_instance if current_agent == "player_1" else bot2_instance
                     
-                    try:
-                        # Format observation for historical model
-                        obs_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
-                        
-                        # Check if we need to pad the observation to match expected dimensions
-                        expected_input_dim = bot_instance.fc1.weight.shape[1]
-                        current_dim = obs_tensor.shape[1]
-                        
-                        if current_dim < expected_input_dim:
-                            # Pad with zeros to match expected dimension
-                            padding = torch.zeros(1, expected_input_dim - current_dim, device=device)
-                            obs_tensor = torch.cat([obs_tensor, padding], dim=1)
-                        elif current_dim > expected_input_dim:
-                            # Truncate to expected dimension
-                            obs_tensor = obs_tensor[:, :expected_input_dim]
-                        
-                        with torch.no_grad():
-                            probs, _, _ = bot_instance(obs_tensor, None)
-                            probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
-                            mask_t = torch.tensor(action_mask, dtype=torch.float32, device=device)
-                            masked_probs = probs * mask_t
-                            if masked_probs.sum() == 0:
-                                valid_indices = torch.nonzero(mask_t, as_tuple=True)[0]
-                                if len(valid_indices) > 0:
-                                    masked_probs[valid_indices] = 1.0 / valid_indices.numel()
-                                else:
-                                    masked_probs = torch.ones_like(probs) / probs.size(0)
+                    # Format observation for historical model
+                    obs_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
+                    
+                    # Check if we need to pad the observation to match expected dimensions
+                    expected_input_dim = bot_instance.fc1.weight.shape[1]
+                    current_dim = obs_tensor.shape[1]
+                    
+                    if current_dim < expected_input_dim:
+                        # Pad with zeros to match expected dimension
+                        padding = torch.zeros(1, expected_input_dim - current_dim, device=device)
+                        obs_tensor = torch.cat([obs_tensor, padding], dim=1)
+                    elif current_dim > expected_input_dim:
+                        # Truncate to expected dimension
+                        obs_tensor = obs_tensor[:, :expected_input_dim]
+                    
+                    with torch.no_grad():
+                        probs, _, _ = bot_instance(obs_tensor, None)
+                        probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
+                        mask_t = torch.tensor(action_mask, dtype=torch.float32, device=device)
+                        masked_probs = probs * mask_t
+                        if masked_probs.sum() == 0:
+                            valid_indices = torch.nonzero(mask_t, as_tuple=True)[0]
+                            if len(valid_indices) > 0:
+                                masked_probs[valid_indices] = 1.0 / valid_indices.numel()
                             else:
-                                masked_probs /= masked_probs.sum()
-                            m = Categorical(masked_probs)
-                            action = m.sample().item()
-                            log_prob_value = 0.0  # Not needed for opponent
-                    except Exception as e:
-                        # Fallback to random action if model inference fails
-                        logger.warning(f"Error using historical model: {e}. Using random action.")
-                        valid_actions = [i for i, mask in enumerate(action_mask) if mask == 1]
-                        action = random.choice(valid_actions) if valid_actions else 0
-                        log_prob_value = 0.0
+                                masked_probs = torch.ones_like(probs) / probs.size(0)
+                        else:
+                            masked_probs /= masked_probs.sum()
+                        m = Categorical(masked_probs)
+                        action = m.sample().item()
+                        log_prob_value = 0.0  # Not needed for opponent
 
             env.step(action)
             # Update rewards and store transitions (only for RL agent).
