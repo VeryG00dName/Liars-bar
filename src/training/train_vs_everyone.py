@@ -410,18 +410,6 @@ def train_agents(env, device, num_episodes=1000, load_checkpoint=True, load_dire
                     
                     # Now construct final_obs with actual memory embeddings instead of zeros
                     final_obs = np.concatenate([base_obs, obp_arr, memory_embeddings_arr], axis=0)
-                    
-                    # Check if dimensions need adjustment to match the model's expected input
-                    expected_input_dim = current_injected_agent_instance.fc1.weight.shape[1]
-                    if final_obs.shape[0] < expected_input_dim:
-                        # Still need some padding
-                        missing_dim = expected_input_dim - final_obs.shape[0]
-                        print(missing_dim)
-                        padding = np.zeros(missing_dim, dtype=np.float32)
-                        final_obs = np.concatenate([final_obs, padding], axis=0)
-                    elif final_obs.shape[0] > expected_input_dim:
-                        # Too many dimensions, need to truncate
-                        final_obs = final_obs[:expected_input_dim]
             else:
                 # ---------- Learning Agent Processing ----------
                 # Compute OBP with embeddings (same as historical branch)
