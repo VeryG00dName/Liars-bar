@@ -9,6 +9,7 @@ from src.env.liars_deck_env_core import LiarsDeckEnv
 from src.tune.tune_train_single import train_agent as tune_train
 from src.training.train_extras import set_seed
 from src import config
+from src.training.train_curriculum import tuned_scoring_params_for_9
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 torch.backends.cudnn.benchmark = True
@@ -153,6 +154,7 @@ def main():
         raise e
 
     study.enqueue_trial(config.DEFAULT_SCORING_PARAMS)
+    study.enqueue_trial(tuned_scoring_params_for_9)
     N_TRIALS = 150
 
     # Determine number of GPUs and set n_jobs accordingly (at least 1)
