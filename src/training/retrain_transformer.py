@@ -48,13 +48,13 @@ class MemoryDataset(Dataset):
         # Group samples by length for analysis
         length_groups = defaultdict(int)
         for length in self.lengths:
-            if length < 10:
+            if length < 25:
                 length_groups['very_short'] += 1
-            elif length < 25:
-                length_groups['short'] += 1
             elif length < 50:
-                length_groups['medium'] += 1
+                length_groups['short'] += 1
             elif length < 100:
+                length_groups['medium'] += 1
+            elif length < 150:
                 length_groups['long'] += 1
             else:
                 length_groups['very_long'] += 1
