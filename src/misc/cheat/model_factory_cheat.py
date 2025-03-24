@@ -35,7 +35,7 @@ class ModelFactory:
                 input_dim=input_dim,
                 hidden_dim=hidden_dim,
                 output_dim=output_dim,
-                num_experts=11,
+                num_experts=10,
                 use_lstm=use_lstm,
                 use_dropout=use_dropout,
                 use_layer_norm=use_layer_norm
