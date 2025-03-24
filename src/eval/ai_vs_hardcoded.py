@@ -28,6 +28,8 @@ from src.eval.evaluate_utils import (
 from src.model.model_factory import ModelFactory
 from src.training.train_vs_everyone import load_specific_historical_models
 
+from src.misc.cheat.ai_vs_hardcoded_cheat import LABELS
+
 torch.backends.cudnn.benchmark = True
 
 logging.basicConfig(level=logging.INFO,
@@ -123,62 +125,63 @@ class BattlegroundWorker(QThread):
     error_signal = pyqtSignal(str)
     
     # Now include an extra parameter "two_player"
-    def __init__(self, ai_agents, historical_models, hardcoded_agents, rounds, two_player=None, parent=None):
+    def __init__(self, ai_agents, historical_models, hardcoded_agents, rounds, two_player=None, parent=None, cheat=False):
         super().__init__(parent)
         self.ai_agents = ai_agents
         self.historical_models = historical_models
         self.hardcoded_agents = hardcoded_agents
         self.rounds = rounds
         self.two_player = two_player  # if not None, pass the player id to eliminate
-        # New: Track expert activations
+        self.cheat = cheat
         self.expert_activations = {}
 
     def run(self):
-            combined_opponents = {}
-            # Add hardcoded agents.
-            for name, cls in self.hardcoded_agents.items():
-                combined_opponents[name] = ("hardcoded", cls)
-            # Then add historical models.
-            for identifier, hist_model in self.historical_models.items():
-                combined_opponents[identifier] = ("historical", hist_model)
+        combined_opponents = {}
+        # Add hardcoded agents.
+        for name, cls in self.hardcoded_agents.items():
+            combined_opponents[name] = ("hardcoded", cls)
+        # Then add historical models.
+        for identifier, hist_model in self.historical_models.items():
+            combined_opponents[identifier] = ("historical", hist_model)
 
-            total_matches = self.rounds * len(combined_opponents)
-            progress_counter = 0
-            results = {}
-            # Initialize expert activation tracking
-            self.expert_activations = {}
+        progress_counter = 0
+        results = {}
+        # Initialize expert activation tracking
+        self.expert_activations = {}
 
-            for opp_name, (opp_type, opp_obj) in combined_opponents.items():
-                wins = [0, 0, 0]  # [AI1 Wins, AI2 Wins, Opponent Wins]
-                # Initialize expert activations for this opponent
-                self.expert_activations[opp_name] = {"player_0": {}, "player_1": {}}
-                
-                for _ in range(self.rounds):
-                    winner, expert_data = self.run_match(opp_type, opp_obj, opp_name)
-                    if winner == "player_0":
-                        wins[0] += 1
-                    elif winner == "player_1":
-                        wins[1] += 1
-                    elif winner == "opponent":
-                        wins[2] += 1
-                    
-                    # Update expert activations
-                    if expert_data:
-                        for player, expert_counts in expert_data.items():
-                            for expert_idx, count in expert_counts.items():
-                                if expert_idx not in self.expert_activations[opp_name][player]:
-                                    self.expert_activations[opp_name][player][expert_idx] = 0
-                                self.expert_activations[opp_name][player][expert_idx] += count
-                    
-                    progress_counter += 1
-                    self.progress_signal.emit(progress_counter)
-                results[opp_name] = wins
+        for opp_name, (opp_type, opp_obj) in combined_opponents.items():
+            # Initialize expert activations for this opponent
+            self.expert_activations[opp_name] = {"player_0": {}, "player_1": {}}
 
-            # Emit the expert activations 
-            self.expert_signal.emit(self.expert_activations)
-            self.results_signal.emit(results)
+            # Define a progress callback that emits progress updates
+            def progress_callback(episode):
+                # Here, you can combine progress_counter with episode for overall progress if needed.
+                self.progress_signal.emit(progress_counter + episode)
+
+            # Instead of running a loop, evaluate agents for self.rounds episodes at once, with progress callback.
+            cumulative_wins, expert_acts = self.run_match(opp_type, opp_obj, opp_name, episodes=self.rounds, progress_callback=progress_callback)
+
+            # Extract wins for player_0, player_1, and player_2 (where player_2 is the opponent)
+            wins = [
+                cumulative_wins.get("player_0", 0),
+                cumulative_wins.get("player_1", 0),
+                cumulative_wins.get("player_2", 0)
+            ]
+
+            # Update expert activations for the two AI agents
+            for agent in ["player_0", "player_1"]:
+                if agent in expert_acts:
+                    self.expert_activations[opp_name][agent] = expert_acts[agent]
+            
+            progress_counter += self.rounds
+            self.progress_signal.emit(progress_counter)
+            results[opp_name] = wins
+
+        # Emit the expert activations and the results
+        self.expert_signal.emit(self.expert_activations)
+        self.results_signal.emit(results)
     
-    def run_match(self, opponent_type, opponent_obj, opponent_name):
+    def run_match(self, opponent_type, opponent_obj, opponent_name, episodes, progress_callback=None):
         env = LiarsDeckEnv(num_players=3, render_mode=None)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         players_in_this_game = {}
@@ -219,7 +222,7 @@ class BattlegroundWorker(QThread):
                     hidden_dim=hidden_dim,
                     output_dim=env.action_spaces[key].n,
                     use_new_model=False,
-                    strategy_dim=config.STRATEGY_DIM,  # assumed defined in config
+                    strategy_dim=config.STRATEGY_DIM,
                     num_opponents=env.num_players - 1
                 )
                 
@@ -261,7 +264,6 @@ class BattlegroundWorker(QThread):
                 "obs_version": agent_data["obs_version"],
                 "rating": None,
                 "uses_memory": agent_data["uses_memory"],
-                # Add flag to track expert activations
                 "track_experts": True
             }
 
@@ -335,19 +337,24 @@ class BattlegroundWorker(QThread):
         else:
             raise ValueError(f"Unknown opponent type: {opponent_type}")
 
-        # Run evaluation for a single match, now capturing expert activations
-        cumulative_wins, _, _, _, _, expert_activations = evaluate_agents(
-            env, device, players_in_this_game, episodes=1, 
-            two_player=self.two_player, track_experts=True
-        )
-        
-        winner = max(cumulative_wins, key=cumulative_wins.get)
-        if winner in ["player_0", "player_1"]:
-            return winner, expert_activations
-        elif winner == "player_2":
-            return "opponent", expert_activations
+        # When calling evaluate_agents, determine the cheat expert index if cheat is enabled.
+        if self.cheat:
+            # Lookup the corresponding label for this opponent from the cheat dictionary.
+            cheat_expert_index = LABELS.get(opponent_name, None)
         else:
-            return "unknown", expert_activations
+            cheat_expert_index = None
+
+        # Run evaluation for the specified number of episodes, capturing expert activations and using the progress callback.
+        cumulative_wins, _, _, _, _, expert_activations = evaluate_agents(
+            env, device, players_in_this_game, episodes=episodes, 
+            two_player=self.two_player, track_experts=True,
+            progress_callback=progress_callback,
+            cheat_expert_index=cheat_expert_index # new parameter
+        )
+
+        # Return cumulative win counts and expert activations.
+        return cumulative_wins, expert_activations
+
 
 # --- Main GUI class using PyQt with a Discord-like style ---
 class AgentBattlegroundGUI(QtWidgets.QMainWindow):
@@ -357,13 +364,13 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         self.resize(1000, 700)
         self.loaded_models = {}
         self.hardcoded_agents = {
-            "GreedySpammer": GreedyCardSpammer,
-            "TableFirst": TableFirstConservativeChallenger,
-            "Strategic": lambda name: StrategicChallenger(name, 3, 2),
-            "Conservative": lambda name: SelectiveTableConservativeChallenger(name),
-            "TableNonTableAgent": TableNonTableAgent,
             "Classic": Classic,
-            "Random": RandomAgent
+            "GreedyCardSpammer": GreedyCardSpammer,
+            "RandomAgent": RandomAgent,
+            "SelectiveTableConservativeChallenger": lambda name: SelectiveTableConservativeChallenger(name),
+            "StrategicChallenger": lambda name: StrategicChallenger(name, 3, 2),
+            "TableFirstConservativeChallenger": TableFirstConservativeChallenger,
+            "TableNonTableAgent": TableNonTableAgent
         }
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.historical_models = {}
@@ -442,6 +449,8 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         self.two_player_checkbox.stateChanged.connect(
             lambda state: self.combine_ai_checkbox.setEnabled(state == Qt.Unchecked)
         )
+        self.cheat_checkbox = QtWidgets.QCheckBox("Cheat")  # <-- New cheat checkbox
+        control_layout.addWidget(self.cheat_checkbox)
 
         # --- Compare Results Button ---
         self.compare_button = QtWidgets.QPushButton("Compare Results")
@@ -601,6 +610,17 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         self.results_text.clear()
         # Pass two_player_param to the worker.
         self.worker = BattlegroundWorker(ai_agents, self.historical_models, self.hardcoded_agents, rounds, two_player=two_player_param)
+        self.worker.progress_signal.connect(self.update_progress)
+        self.worker.results_signal.connect(self.display_results)
+        self.worker.expert_signal.connect(self.store_expert_activations)  # Connect to new signal
+        # Read cheat checkbox state
+        cheat_flag = self.cheat_checkbox.isChecked()
+
+        self.worker = BattlegroundWorker(
+            ai_agents, self.historical_models, self.hardcoded_agents, rounds,
+            two_player=two_player_param,
+            cheat=cheat_flag  # new parameter
+        )
         self.worker.progress_signal.connect(self.update_progress)
         self.worker.results_signal.connect(self.display_results)
         self.worker.expert_signal.connect(self.store_expert_activations)  # Connect to new signal
@@ -960,4 +980,3 @@ if __name__ == "__main__":
     window = AgentBattlegroundGUI()
     window.show()
     sys.exit(app.exec_())
-

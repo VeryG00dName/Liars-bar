@@ -31,10 +31,9 @@ from src.model.other_models import PolicyNetwork, ValueNetwork, StrategyTransfor
 from src import config
 
 # Additional imports for memory and environment utilities
-from src.model.memory import get_opponent_memory
 from src.env.liars_deck_env_utils import query_opponent_memory_full
 from src.training.train_transformer import EventEncoder
-
+from src.training.train_extras import convert_memory_to_features
 # Constants for observation versions
 OBS_VERSION_1 = 1
 OBS_VERSION_2 = 2
@@ -47,30 +46,6 @@ global_response2idx = None
 global_action2idx = None
 global_event_encoder = None
 global_strategy_transformer = None
-
-# ----------------------------
-# Expert Index Mapping for MoE Models
-# ----------------------------
-
-def map_expert_index(raw_index):
-    """
-    Maps raw expert indices to a fixed set (0-9).
-    This function should match the mapping used in training.
-    
-    Args:
-        raw_index: The raw expert index from the transformer classification
-        
-    Returns:
-        int: The mapped expert index to use with the MoE policy
-    """
-    if raw_index <= 6:
-        return raw_index
-    elif 7 <= raw_index <= 22:
-        return 7
-    elif 23 <= raw_index <= 28:
-        return 8
-    else:
-        return 9
 
 # ----------------------------
 # (Other utility functions remain unchanged)
@@ -288,7 +263,9 @@ def get_opponent_memory_embedding(current_agent, opponent, device):
     logger.debug(f"Querying memory for current_agent: {current_agent}, opponent: {opponent}")
     mem_summary = query_opponent_memory_full(current_agent, opponent)
     logger.debug(f"Memory summary: {mem_summary}")
-    
+    if len(mem_summary) < 200:
+        pad_event = {"response": "", "triggering_action": "", "penalties": 0, "card_count": 0}
+        mem_summary = mem_summary + [pad_event] * (200 - len(mem_summary))
     # Convert memory events to features.
     features_list = convert_memory_to_features(mem_summary, global_response2idx, global_action2idx)
     logger.debug(f"Converted features list: {features_list}")
@@ -333,10 +310,8 @@ def get_opponent_memory_embedding(current_agent, opponent, device):
                 logger.debug("Loaded strategy transformer state_dict from checkpoint.")
             else:
                 logger.debug("Transformer checkpoint not found; strategy transformer initialized with random weights.")
-            # Remove classification head and override token embedding.
             global_strategy_transformer.token_embedding = torch.nn.Identity()
-            transformer_classification_head = global_strategy_transformer.classification_head
-            transformer_classification_head.eval()
+            global_strategy_transformer.classification_head.eval()
         
         with torch.no_grad():
             logger.debug("Passing feature tensor through event encoder.")
@@ -441,23 +416,6 @@ def run_obp_inference_tournament(obp_model, obs, device, num_players, obs_versio
             probs = torch.softmax(logits, dim=-1)
             obp_probs.append(probs[0, 1].item())
     return obp_probs
-
-def convert_memory_to_features(memory, response_mapping, action_mapping):
-    """
-    Convert the opponent memory (a list of events) to a list of 4-dimensional feature vectors.
-    """
-    features = []
-    for event in memory:
-        if not isinstance(event, dict):
-            raise ValueError(f"Memory event is not a dictionary: {event}.")
-        resp = event.get("response", "")
-        act = event.get("triggering_action", "")
-        penalties = float(event.get("penalties", 0))
-        card_count = float(event.get("card_count", 0))
-        resp_val = float(response_mapping.get(resp, 0))
-        act_val = float(action_mapping.get(act, 0))
-        features.append([resp_val, act_val, penalties, card_count])
-    return features
 
 # ----------------------------
 # New Unified Rich Progress and Scoreboard
@@ -723,19 +681,13 @@ def initialize_players(base_dir, device):
 # Unified Evaluation Function
 # ----------------------------
 
-def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournament=False, two_player=None, track_experts=False):
+def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournament=False, two_player=None, track_experts=False, progress_callback=None,cheat_expert_index=None):
     """
     Optimized evaluation function with support for MoE models.
     """
     logger = logging.getLogger("Evaluate")
     player_ids = list(players_in_this_game.keys())
     agent_to_player = {f'player_{i}': player_ids[i] for i in range(env.num_players)}
-    
-    # Clear memory for relevant agents
-    for env_agent, pid in agent_to_player.items():
-        player_data = players_in_this_game[pid]
-        if player_data.get('uses_memory', False) and player_data['obs_version'] == 2:
-            get_opponent_memory(env_agent).memory.clear()
     
     # Precompute tournament mode
     player_tournament_mode = {}
@@ -767,20 +719,6 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
     def is_moe_policy(policy_net):
         state_dict = policy_net.state_dict()
         return any('experts.' in k for k in state_dict.keys())
-
-    # Helper function to map expert index
-    def map_expert_index(raw_index):
-        if raw_index <= 6:
-            return raw_index
-        elif 7 <= raw_index <= 22:
-            return 7
-        elif 23 <= raw_index <= 38:
-            return 8
-        elif 39 <= raw_index <= 41:
-            return 9
-        else:
-            logger.warning(f"Raw expert index {raw_index} out of expected range. Using default 0.")
-            return 0
 
     with torch.no_grad():
         for game_idx in range(1, episodes + 1):
@@ -838,7 +776,12 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                 if obp_model is not None and use_tournament:
                     opponents = [opp for opp in env.possible_agents if opp != agent]
                     if opponents:
-                        mem_emb_list = [get_opponent_memory_embedding(agent, opp, device) for opp in opponents]
+                        mem_emb_list = []
+                        for opp in opponents:
+                            emb = get_opponent_memory_embedding(agent, opp, device)
+                            if opp == 'player_2':
+                                mem_tensor_unnorm = emb
+                            mem_emb_list.append(emb)
                         mem_tensor = torch.cat(mem_emb_list, dim=0)
                         if mem_tensor.numel() > 0:
                             # L2 normalization for transformer embedding instead of min-max normalization
@@ -875,25 +818,34 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                     final_obs_tensor = default_obs_tensor
                     
                     # But we still need memory tensor for expert selection
-                    if mem_tensor is not None:
+                    if mem_tensor_unnorm is not None:
                         # Get the first 5 elements of strategy embedding for classification
-                        learning_expert_input = mem_tensor[0, :5].cpu().detach().numpy()
+                        learning_expert_input = mem_tensor_unnorm.cpu().detach().numpy().flatten()[:5]
                         learning_expert_tensor = torch.tensor(learning_expert_input, dtype=torch.float32, device=device).unsqueeze(0)
                         
-                        # Use global transformer classification head if available
-                        if global_strategy_transformer and hasattr(global_strategy_transformer, 'classification_head'):
-                            with torch.no_grad():
-                                classification_head = global_strategy_transformer.classification_head
-                                expert_logits = classification_head(learning_expert_tensor)
-                                raw_expert_index = expert_logits.argmax(dim=-1).item()
-                                expert_index = map_expert_index(raw_expert_index)
-                                logger.debug(f"Computed expert index {expert_index} (raw: {raw_expert_index}) for MoE model")
-                        else:
-                            # Default to expert 0 if classification not available
-                            expert_index = 0
-                            logger.debug("Using default expert index 0 (classifier not available)")
+                        # Use global transformer classification head
+                        with torch.no_grad():
+                            classification_head = global_strategy_transformer.classification_head
+                            expert_logits = classification_head(learning_expert_tensor)
+                            expert_index = expert_logits.argmax(dim=-1).item()
+                            logger.debug(f"Computed expert index {expert_index} (raw: {expert_index}) for MoE model")
+                    # For MoE models, we use only the basic observation.
+                    final_obs_tensor = default_obs_tensor
+
+                    # If a cheat expert index is provided, use it instead of computing from the classification head.
+                    if cheat_expert_index is not None:
+                        expert_index = cheat_expert_index
+                        logger.debug(f"Using cheat expert index {expert_index} for MoE model")
                     else:
-                        expert_index = 0
+                        if mem_tensor_unnorm is not None:
+                            learning_expert_input = mem_tensor_unnorm.cpu().detach().numpy().flatten()[:5]
+                            learning_expert_tensor = torch.tensor(learning_expert_input, dtype=torch.float32, device=device).unsqueeze(0)
+                            classification_head = global_strategy_transformer.classification_head
+                            expert_logits = classification_head(learning_expert_tensor)
+                            expert_index = expert_logits.argmax(dim=-1).item()
+                            logger.debug(f"Computed expert index {expert_index} (raw: {expert_index}) for MoE model")
+                        else:
+                            expert_index = 0
                 else:
                     # Traditional models might need memory embeddings added to observation
                     if player_data.get('uses_memory', False) and version == 2 and mem_tensor is not None:
@@ -915,7 +867,6 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                         if expert_idx_str not in expert_activations[agent]:
                             expert_activations[agent][expert_idx_str] = 0
                         expert_activations[agent][expert_idx_str] += 1
-                        logger.debug(f"MoE model: Agent {agent} used expert {expert_idx_str}")
                 else:
                     # Traditional models use hidden state
                     num_layers = policy_net.lstm.num_layers if hasattr(policy_net, 'lstm') else 1
@@ -964,11 +915,13 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                 cumulative_wins[pid] += game_wins[pid]
             total_steps += steps_in_game
             game_wins_list.append(game_wins)
+            if progress_callback is not None:
+                progress_callback(game_idx)
 
     elapsed_time = time.time() - start_time
     steps_per_sec = total_steps / elapsed_time if elapsed_time > 0 else 0
     avg_steps = total_steps / episodes if episodes > 0 else 0
-    
+
     # Return expert activations if tracking was enabled
     if track_experts:
         return cumulative_wins, action_counts, game_wins_list, avg_steps, steps_per_sec, expert_activations
