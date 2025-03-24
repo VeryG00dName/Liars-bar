@@ -1,4 +1,4 @@
-# src/tests/see_transformer.py
+# src/eval/see_transformer.py
 import os
 import pickle
 import torch
@@ -8,36 +8,19 @@ from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
 from collections import defaultdict, Counter
 from random import shuffle
-
+import torch.nn as nn
 # Import the transformer model and configuration.
 from src.model.new_models import StrategyTransformer
 from src import config
 
 # Import helper functions and the EventEncoder from the training module.
-from src.training.train_transformer import build_field_vocab, EventEncoder
+from src.training.train_transformer import build_field_vocab, EventEncoder, convert_memory_to_features
 
 # Set device.
 device = torch.device(config.DEVICE)
 
 # Toggle extra debug prints.
 debug_mode = False
-
-# ---------------------------
-# Instantiate the Transformer Model.
-# ---------------------------
-strategy_transformer = StrategyTransformer(
-    num_tokens=config.STRATEGY_NUM_TOKENS,
-    token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM,
-    nhead=config.STRATEGY_NHEAD,
-    num_layers=config.STRATEGY_NUM_LAYERS,
-    strategy_dim=config.STRATEGY_DIM,
-    num_classes=config.STRATEGY_NUM_CLASSES,
-    dropout=config.STRATEGY_DROPOUT,
-    use_cls_token=True
-).to(device)
-
-# Override token_embedding so the transformer receives the projected embeddings.
-strategy_transformer.token_embedding = torch.nn.Identity()
 
 # ---------------------------
 # Load and balance training data.
@@ -54,6 +37,7 @@ with open(data_path, "rb") as f:
 def balance_training_data(data):
     label_counts = Counter(label for _, label in data)
     min_count = min(label_counts.values())
+    print(label_counts.values())
     balanced = []
     for label in label_counts:
         samples = [sample for sample in data if sample[1] == label]
@@ -73,11 +57,34 @@ for bot, count in bot_counts.items():
     print(f"{bot}: {count} samples")
 
 # ---------------------------
-# Build vocabularies for the categorical fields.
-# (These should match those used during training.)
+# Load the checkpoint for the transformer, event encoder, label mapping, and categorical mappings.
 # ---------------------------
-response2idx = build_field_vocab(training_data, "response")
-action2idx = build_field_vocab(training_data, "triggering_action")
+transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
+if not os.path.exists(transformer_checkpoint_path):
+    print(f"Error: Checkpoint file not found at {transformer_checkpoint_path}")
+    exit()
+
+# Load the checkpoint
+checkpoint = torch.load(transformer_checkpoint_path, map_location=device)
+
+# Extract vocabularies from checkpoint
+if "response2idx" not in checkpoint or "action2idx" not in checkpoint:
+    raise ValueError("Checkpoint missing vocabulary mappings")
+
+response2idx = checkpoint["response2idx"]
+action2idx = checkpoint["action2idx"]
+
+# Extract label mapping from checkpoint
+if "label_mapping" in checkpoint:
+    label_mapping = checkpoint["label_mapping"]
+    label2idx = label_mapping["label2idx"]
+    idx2label = label_mapping["idx2label"]
+else:
+    raise ValueError("Checkpoint missing label mapping")
+
+print("\nMapping from Bot Label to Class Index (Evaluation):")
+for label, idx in label2idx.items():
+    print(f"{label}: {idx}")
 
 if debug_mode:
     print("\nDEBUG: Response vocabulary:")
@@ -88,79 +95,31 @@ if debug_mode:
         print(f"  {key}: {val}")
 
 # ---------------------------
-# Instantiate the Event Encoder.
+# Create the transformer model and event encoder
 # ---------------------------
+transformer = StrategyTransformer(
+    num_tokens=config.STRATEGY_NUM_TOKENS,
+    token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM,
+    nhead=config.STRATEGY_NHEAD,
+    num_layers=config.STRATEGY_NUM_LAYERS,
+    strategy_dim=config.STRATEGY_DIM,
+    num_classes=len(label2idx),
+    dropout=config.STRATEGY_DROPOUT,
+    use_cls_token=True
+).to(device)
+
 event_encoder = EventEncoder(
     response_vocab_size=len(response2idx),
     action_vocab_size=len(action2idx),
     token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM
 ).to(device)
 
-# ---------------------------
-# Load the checkpoint for the transformer, event encoder, label mapping, and categorical mappings.
-# ---------------------------
-transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
-if os.path.exists(transformer_checkpoint_path):
-    checkpoint = torch.load(transformer_checkpoint_path, map_location=device, weights_only=False)
-    
-    # Load model states.
-    strategy_transformer.load_state_dict(checkpoint["transformer_state_dict"], strict=True)
-    event_encoder.load_state_dict(checkpoint["event_encoder_state_dict"])
-    print(f"Loaded transformer and event encoder from {transformer_checkpoint_path}")
-    
-    # Load label mapping; if not present, rebuild from training data.
-    if "label_mapping" in checkpoint:
-        label_mapping = checkpoint["label_mapping"]
-        label2idx = label_mapping["label2idx"]
-        idx2label = label_mapping["idx2label"]
-        print("Loaded label mapping from checkpoint.")
-    else:
-        unique_labels = sorted(list({bot_type for _, bot_type in training_data}))
-        label2idx = {label: idx for idx, label in enumerate(unique_labels)}
-        idx2label = {idx: label for label, idx in label2idx.items()}
-        print('failed to load label mapping from checkpoint')
-        print("Rebuilt label mapping from training data (sorted order).")
-    
-    # Load the categorical mappings; if not present, use the ones built earlier.
-    if "response2idx" in checkpoint and "action2idx" in checkpoint:
-        response2idx = checkpoint["response2idx"]
-        action2idx = checkpoint["action2idx"]
-        print("Loaded response and action mappings from checkpoint.")
-    else:
-        print('failed to load response and action mappings from checkpoint')
-        print("Using rebuilt response and action mappings from training data.")
-else:
-    print("No transformer checkpoint found. Using untrained model.")
-    unique_labels = sorted(list({bot_type for _, bot_type in training_data}))
-    label2idx = {label: idx for idx, label in enumerate(unique_labels)}
-    idx2label = {idx: label for label, idx in label2idx.items()}
+# Load state dicts with strict=False to handle the token_embedding.weight missing key
+transformer.load_state_dict(checkpoint["transformer_state_dict"], strict=False)
+event_encoder.load_state_dict(checkpoint["event_encoder_state_dict"])
 
-# Set models to evaluation mode.
-strategy_transformer.eval()
-event_encoder.eval()
-
-print("\nMapping from Bot Label to Class Index (Evaluation):")
-for label, idx in label2idx.items():
-    print(f"{label}: {idx}")
-
-# ---------------------------
-# Define a function to convert memory events to 4D feature vectors.
-# Each event should be a dictionary with keys: "response", "triggering_action", "penalties", and "card_count".
-# ---------------------------
-def convert_memory_to_features(memory, response_mapping, action_mapping):
-    features = []
-    for event in memory:
-        if not isinstance(event, dict):
-            raise ValueError(f"Memory event is not a dictionary: {event}. Please fix the data generation.")
-        resp = event.get("response", "")
-        act = event.get("triggering_action", "")
-        penalties = float(event.get("penalties", 0))
-        card_count = float(event.get("card_count", 0))
-        # Map the categorical features using the provided mappings.
-        resp_val = float(response_mapping.get(resp, 0))
-        act_val = float(action_mapping.get(act, 0))
-        features.append([resp_val, act_val, penalties, card_count])
-    return features
+# Replace token_embedding with Identity layer to match the training architecture
+transformer.token_embedding = nn.Identity()
 
 if debug_mode:
     print("\nDEBUG: First sample of raw training data:")
@@ -218,7 +177,7 @@ for i, (features, bot_type) in enumerate(training_data):
             sample_debug["projected_std"] = projected.std().item()
         
         with torch.no_grad():
-            embedding, logits = strategy_transformer(projected)
+            embedding, logits = transformer(projected)
         if debug_mode and i < 5:
             sample_debug["transformer_embedding"] = embedding.detach().cpu().numpy()
             sample_debug["logits"] = logits.detach().cpu().numpy()
