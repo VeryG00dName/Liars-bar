@@ -698,7 +698,7 @@ def initialize_players(base_dir, device):
 # Unified Evaluation Function
 # ----------------------------
 
-def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournament=False, two_player=None, track_experts=False, expert_index=0):
+def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournament=False, two_player=None, track_experts=True, expert_index=0):
     """
     Optimized evaluation function.
     For loaded agents (from other_models.py, i.e. those without an 'identifier'),
