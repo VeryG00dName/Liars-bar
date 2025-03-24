@@ -62,19 +62,25 @@ from src.training.train_transformer import EventEncoder
 # Set device
 device = torch.device(config.DEVICE)
 
-# -------------------- NEW: Helper function for mapping raw expert indices --------------------
-def map_expert_index(raw_index):
-    if raw_index <= 6:
-        return raw_index
-    elif 7 <= raw_index <= 22:
-        return 7
-    elif 23 <= raw_index <= 38:
-        return 8
-    elif 39 <= raw_index <= 41:
-        return 9
-    else:
-        raise ValueError(f"Raw expert index {raw_index} out of expected range.")
-# ---------------------------------------------------------------------------------------------
+tuned_scoring_params_for_9 = {
+    "play_reward_per_card": 0,
+    "play_reward": 1,
+    "challenge_success_challenger_reward": 6,
+    "challenge_success_claimant_penalty": -2,
+    "challenge_fail_challenger_penalty": -2,
+    "challenge_fail_claimant_reward": 1,
+    "forced_challenge_success_challenger_reward": 1,
+    "forced_challenge_success_claimant_penalty": -8,
+    "forced_challenge_fail_challenger_penalty": -6,
+    "forced_challenge_fail_claimant_reward": 1,
+    "termination_penalty": 1,
+    "game_win_bonus": 14,
+    "game_lose_penalty": -8,
+    "hand_empty_bonus": 4,
+    "consecutive_action_penalty": 0,
+    "successful_bluff_reward": 2,
+    "unchallenged_bluff_penalty": 1
+}
 
 # Define hardcoded labels and historical mapping (for auxiliary classification)
 HARD_CODED_LABELS = {
@@ -111,7 +117,7 @@ for idx, (model, identifier) in enumerate(historical_models):
     })
 for idx, (_, identifier) in enumerate(historical_models):
     historical_label_mapping[identifier] = len(HARD_CODED_LABELS) + idx
-
+CURRICULUM.reverse()
 # Load the strategy transformer and event encoder
 strategy_transformer = StrategyTransformer(
     num_tokens=config.STRATEGY_NUM_TOKENS,
@@ -424,9 +430,13 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, loa
             learning_expert_tensor = torch.tensor(learning_expert_input, dtype=torch.float32, device=device).unsqueeze(0)
             with torch.no_grad():
                 expert_logits = transformer_classification_head(learning_expert_tensor)
-                raw_expert_index = expert_logits.argmax(dim=-1).item()
-                expert_index = map_expert_index(raw_expert_index)
-            opponent_index = HARD_CODED_LABELS.get(current_opponent_name, historical_label_mapping.get(current_opponent_name, -1))
+                expert_index = expert_logits.argmax(dim=-1).item()
+                if expert_index == 9:
+                    env.update_scoring_params(tuned_scoring_params_for_9)
+                else:
+                    # Reset to default if not expert 9.
+                    env.update_scoring_params(config.DEFAULT_SCORING_PARAMS)
+            #opponent_index = HARD_CODED_LABELS.get(current_opponent_name, historical_label_mapping.get(current_opponent_name, -1))
             #if opponent_index != expert_index:
                 #logger.info(f"Agent {agent} selected expert {expert_index} for opponent {current_opponent_name} (index: {opponent_index})")
 
@@ -459,6 +469,36 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, loa
                     action = current_opponent.play_turn(observation, action_mask, table_card=None)
                     log_prob_value = 0.0
                 elif current_opponent_type == "historical":
+                    # For historical models: properly construct observation with memory embeddings
+                    embeddings_list = []
+                    for opp in env.possible_agents:
+                        if opp != agent:
+                            memory_full = query_opponent_memory_full(agent, opp)
+                            features_list = convert_memory_to_features(memory_full, response2idx, action2idx)
+                            if features_list:
+                                feature_tensor = torch.tensor(features_list, dtype=torch.float32, device=device).unsqueeze(0)
+                                with torch.no_grad():
+                                    projected = event_encoder(feature_tensor)
+                                    strategy_embedding, _ = strategy_transformer(projected)
+                            else:
+                                strategy_embedding = None
+                            if strategy_embedding is not None:
+                                embeddings_list.append(strategy_embedding.cpu().detach().numpy().flatten())
+                            else:
+                                embeddings_list.append(np.zeros(config.STRATEGY_DIM, dtype=np.float32))
+                    
+                    # Concatenate embeddings and normalize if needed
+                    if embeddings_list:
+                        embeddings_arr = np.concatenate(embeddings_list, axis=0)
+                        norm_val = np.linalg.norm(embeddings_arr, ord=2)
+                        normalized_arr = embeddings_arr if norm_val == 0 else embeddings_arr / norm_val
+                    else:
+                        normalized_arr = np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
+                    
+                    # Construct final_obs similar to train_vs_everyone.py
+                    obp_arr = np.array(obp_probs, dtype=np.float32)
+                    final_obs = np.concatenate([observation, obp_arr, normalized_arr], axis=0)
+                    
                     observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
                     with torch.no_grad():
                         probs, _, _ = current_opponent(observation_tensor, None)
@@ -575,8 +615,7 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, loa
                 expert_inputs = torch.tensor(np.array(memory.expert_inputs[agent], dtype=np.float32), device=device)
                 with torch.no_grad():
                     expert_logits = transformer_classification_head(expert_inputs)
-                    raw_expert_index = expert_logits.argmax(dim=-1)[0].item()
-                    expert_index = map_expert_index(raw_expert_index)
+                    expert_index = expert_logits.argmax(dim=-1)[0].item()
                 
                 for _ in range(config.K_EPOCHS):
                     # Forward pass using the computed expert index
@@ -729,7 +768,6 @@ def main():
         env = LiarsDeckEnv(num_players=config.NUM_PLAYERS, render_mode=config.RENDER_MODE)
     
     logger = configure_logger()
-    logger.info("Starting curriculum training process...")
     
     training_results = train_curriculum(
         env=env,

@@ -427,6 +427,17 @@ class LiarsDeckEnv(AECEnv):
             self.agent_selection = None
             self.logger.debug("No active agents remaining. Ending episode.")
 
+    def update_scoring_params(self, new_params):
+        """
+        Updates the environment's scoring parameters by merging in new values.
+        This method allows on-the-fly tuning of rewards/penalties without restarting the environment.
+        
+        Args:
+            new_params (dict): Dictionary of scoring parameter updates.
+                            Only keys provided in new_params will be updated.
+        """
+        self.scoring_params.update(new_params)
+
     def clone(self):
         """
         Creates a deep copy of the current environment state for simulation purposes.
