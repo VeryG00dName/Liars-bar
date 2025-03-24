@@ -77,17 +77,17 @@ def get_input_dim_from_state_dict(state_dict, candidate_prefix='fc1'):
     raise ValueError(f"Cannot determine input_dim from state_dict. Tried prefixes: {candidate_prefixes}. "
                      f"Available keys: {available_keys}")
     
-HARD_CODED_LABELS = {
-    "GreedyCardSpammer": 2,
+LABELS = {
+    "GreedyCardSpammer": 1,
     "StrategicChallenger": 4,
     "TableNonTableAgent": 6,
     "Classic": 0,
     "TableFirstConservativeChallenger": 5,
-    "SelectiveTableConservativeChallenger": 1,
-    "RandomAgent": 3,
-    "Version_E_player_1": 7,
+    "SelectiveTableConservativeChallenger": 3,
+    "RandomAgent": 2,
+    "Version_E_player_1": 9,
     "Version_C_player_0": 8,
-    "Version_A_player_2": 9
+    "Version_A_player_2": 7
 }
 # --- Custom QListWidget for drag-and-drop ---
 class DropListWidget(QtWidgets.QListWidget):
@@ -304,15 +304,15 @@ class BattlegroundWorker(QThread):
         opponent_data = players_in_this_game.get("player_2", None)
         if opponent_data is not None:
             if opponent_data.get('hardcoded_bot', False):
-                opp_label = HARD_CODED_LABELS.get(opponent_data['agent'].__class__.__name__, 0)
+                opp_label = LABELS.get(opponent_data['agent'].__class__.__name__, 0)
             else:
                 opp_identifier = opponent_data.get('identifier', None)
-                opp_label = HARD_CODED_LABELS.get(opp_identifier, 0) if opp_identifier is not None else 0
+                opp_label = LABELS.get(opp_identifier, 0) if opp_identifier is not None else 0
         else:
             opp_label = 0
 
         cumulative_wins, _, _, _, _, expert_activations = evaluate_agents(
-            env, device, players_in_this_game, episodes=1, 
+            env, device, players_in_this_game, episodes=20, 
             two_player=self.two_player, track_experts=True, expert_index=opp_label
         )
         
