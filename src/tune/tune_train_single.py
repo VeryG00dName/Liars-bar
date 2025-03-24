@@ -156,7 +156,7 @@ HARD_CODED_BOT_CLASSES = {
 }
 
 # Historical agent configuration (used if OPPONENT_TYPE = 1)
-HISTORICAL_AGENT_INDEX = 2  # <-- Change this to select which historical agent to use
+HISTORICAL_AGENT_INDEX = 1  # <-- Change this to select which historical agent to use
 
 # ---------------------------
 # Load historical models
