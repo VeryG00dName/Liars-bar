@@ -61,7 +61,25 @@ from src.training.train_transformer import EventEncoder
 
 # Set device
 device = torch.device(config.DEVICE)
-
+tuned_scoring_params_for_8 = {
+    "play_reward_per_card": 0,
+    "play_reward": 1,
+    "challenge_success_challenger_reward": 3,
+    "challenge_success_claimant_penalty": -2,
+    "challenge_fail_challenger_penalty": -1,
+    "challenge_fail_claimant_reward": 6,
+    "forced_challenge_success_challenger_reward": 2,
+    "forced_challenge_success_claimant_penalty": -4,
+    "forced_challenge_fail_challenger_penalty": -6,
+    "forced_challenge_fail_claimant_reward": -1,
+    "termination_penalty": -2,
+    "game_win_bonus": 19,
+    "game_lose_penalty": -8,
+    "hand_empty_bonus": 3,
+    "consecutive_action_penalty": 0,
+    "successful_bluff_reward": 2,
+    "unchallenged_bluff_penalty": -4
+}
 tuned_scoring_params_for_9 = {
     "play_reward_per_card": 0,
     "play_reward": 1,
@@ -166,7 +184,7 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, loa
     assert len(agents) == config.NUM_PLAYERS, f"Expected {config.NUM_PLAYERS} agents, but got {len(agents)} agents."
     num_opponents = config.NUM_PLAYERS - 1
     config.set_derived_config(env.observation_spaces[agents[0]], env.action_spaces[agents[0]], num_opponents)
-    
+    cheat_mode = True
     logger = configure_logger()
     logger.info("Starting curriculum training process...")
     
@@ -428,14 +446,21 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, loa
                 learning_expert_input = np.zeros(5, dtype=np.float32)
             
             learning_expert_tensor = torch.tensor(learning_expert_input, dtype=torch.float32, device=device).unsqueeze(0)
-            with torch.no_grad():
-                expert_logits = transformer_classification_head(learning_expert_tensor)
-                expert_index = expert_logits.argmax(dim=-1).item()
-                if expert_index == 9:
-                    env.update_scoring_params(tuned_scoring_params_for_9)
-                else:
-                    # Reset to default if not expert 9.
-                    env.update_scoring_params(config.DEFAULT_SCORING_PARAMS)
+            if cheat_mode:
+                # Use the label from HARD_CODED_LABELS or historical_label_mapping based on the current opponent name.
+                opponent_label = HARD_CODED_LABELS.get(current_opponent_name, historical_label_mapping.get(current_opponent_name, -1))
+                expert_index = opponent_label
+            else:
+                with torch.no_grad():
+                    expert_logits = transformer_classification_head(learning_expert_tensor)
+                    expert_index = expert_logits.argmax(dim=-1).item()
+            if expert_index == 9:
+                env.update_scoring_params(tuned_scoring_params_for_9)
+            elif   expert_index == 8:
+                env.update_scoring_params(tuned_scoring_params_for_8)
+            else:
+                # Reset to default if not expert 9.
+                env.update_scoring_params(config.DEFAULT_SCORING_PARAMS)
             #opponent_index = HARD_CODED_LABELS.get(current_opponent_name, historical_label_mapping.get(current_opponent_name, -1))
             #if opponent_index != expert_index:
                 #logger.info(f"Agent {agent} selected expert {expert_index} for opponent {current_opponent_name} (index: {opponent_index})")
