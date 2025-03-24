@@ -117,7 +117,7 @@ for idx, (model, identifier) in enumerate(historical_models):
     })
 for idx, (_, identifier) in enumerate(historical_models):
     historical_label_mapping[identifier] = len(HARD_CODED_LABELS) + idx
-CURRICULUM.reverse()
+    
 # Load the strategy transformer and event encoder
 strategy_transformer = StrategyTransformer(
     num_tokens=config.STRATEGY_NUM_TOKENS,

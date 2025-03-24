@@ -321,9 +321,9 @@ def train_agent(env, device, num_episodes=10000, load_checkpoint=False, load_dir
             # Create the final observation with OBP probabilities
             final_obs = np.concatenate([observation, np.array(obp_probs, dtype=np.float32)], axis=0)
             
-            # For RL agent, also include transformer embeddings
-            if current_agent == rl_agent:
-                final_obs = np.concatenate([final_obs, normalized_transformer_features], axis=0)
+            # also include transformer embeddings
+
+            final_obs = np.concatenate([final_obs, normalized_transformer_features], axis=0)
 
             # Action selection based on agent type
             if current_agent == rl_agent:
