@@ -15,7 +15,8 @@ from src.eval.evaluate_utils import (
     evaluate_agents,
     compare_scoreboards,
     load_scoreboard,
-    initialize_players
+    initialize_players,
+    rich_print_expert_activations
 )
 
 # Rich imports for final scoreboard rendering
@@ -191,8 +192,6 @@ def delete_bottom_half_checkpoints_by_score(players, checkpoints_dir):
         else:
             print(f"Checkpoint '{cp_filename}' not found in {checkpoints_dir}.")
 
-# Removed local compute_scoreboard_differences in favor of using compare_scoreboards from evaluate_utils.
-
 def run_group_swiss_tournament(env, device, players, num_games_per_match=11, NUM_ROUNDS=7):
     """
     Runs a Swiss tournament where each match consists of multiple games (num_games_per_match).
@@ -204,76 +203,94 @@ def run_group_swiss_tournament(env, device, players, num_games_per_match=11, NUM
     match_history = {pid: set() for pid in players}
     global_action_counts = {pid: {action: 0 for action in range(config.OUTPUT_DIM)} for pid in players}
     
-    # Calculate total number of matches for progress UI.
+    # Calculate total number of episodes (matches × episodes per match)
     total_matches = 0
+    groups = swiss_grouping(players, match_history, group_size)
     for _ in range(NUM_ROUNDS):
-        groups = swiss_grouping(players, match_history, group_size)
-        total_matches += len([group for group in groups if len(group) == group_size])
+        for group in groups:
+            if len(group) == group_size:
+                total_matches += num_games_per_match
     
-    # Choose the scoreboard file based on mode.
-    # When using the default flag, compare with the evaluation scoreboard ("scoreboard.json").
-    scoreboard_file = "scoreboard.json" if args.default else "tournament_scoreboard.json"
-    
-    old_scoreboard = load_scoreboard(scoreboard_file)
-    
+    old_scoreboard = load_scoreboard("tournament_scoreboard.json")
     progress_ui = RichProgressScoreboard(total_steps=total_matches, players=players)
     match_counter = 0
+    tournament_expert_activations = {}
     
     for round_num in range(1, NUM_ROUNDS + 1):
         groups = swiss_grouping(players, match_history, group_size)
         for group in groups:
             if len(group) != group_size:
                 continue
-            
+
             players_in_this_game = {pid: players[pid] for pid in group}
-            # Run the full match (e.g. num_games_per_match games)
-            cumulative_wins, action_counts, game_wins_list, avg_steps, steps_per_sec = evaluate_agents(
+            # Build agent map: maps "player_0", "player_1", ... to actual player IDs.
+            agent_map = {f'player_{i}': pid for i, pid in enumerate(players_in_this_game.keys())}
+            
+            # Define a simple progress callback that advances the progress bar.
+            progress_cb = lambda ep: progress_ui.update(increment=1)
+            
+            (cumulative_wins,
+             action_counts,
+             game_wins_list,
+             avg_steps,
+             steps_per_sec,
+             expert_activations) = evaluate_agents(
                 env=env,
                 device=device,
                 players_in_this_game=players_in_this_game,
                 episodes=num_games_per_match,
-                is_tournament=True
+                is_tournament=True,
+                progress_callback=progress_cb,
+                track_experts=True
             )
             
-            # Accumulate action counts across all episodes.
+            # Transform expert activations from env IDs to actual agent IDs.
+            transformed_expert_activations = {}
+            for env_agent, opp_data in expert_activations.items():
+                actual_agent = agent_map.get(env_agent, env_agent)
+                transformed_expert_activations.setdefault(actual_agent, {})
+                for env_opp, details in opp_data.items():
+                    actual_opp = agent_map.get(env_opp, env_opp)
+                    transformed_expert_activations[actual_agent][actual_opp] = details
+
+            # Aggregate expert activations over all matches.
+            for agent, opp_data in transformed_expert_activations.items():
+                if agent in tournament_expert_activations:
+                    tournament_expert_activations[agent].update(opp_data)
+                else:
+                    tournament_expert_activations[agent] = opp_data
+
+            # Update action counts.
             for pid in group:
                 for action in range(config.OUTPUT_DIM):
                     global_action_counts[pid][action] += action_counts[pid][action]
-            
-            # For match-level win rate, count one match played and update round wins.
+            # Update tournament tracking fields.
             for pid in group:
                 players[pid]['games_played'] += 1
                 players[pid]['total_round_wins'] += cumulative_wins[pid]
-            
-            # Determine the match winner: the player with the highest aggregate rounds won.
             group_ranking = sorted(group, key=lambda pid: cumulative_wins[pid], reverse=True)
-            winner = group_ranking[0]
-            players[winner]['wins_match'] += 1
-            
-            # Update win rates.
+            players[group_ranking[0]]['wins_match'] += 1
             for pid in group:
                 players[pid]['win_rate_match'] = players[pid]['wins_match'] / players[pid]['games_played']
                 players[pid]['win_rate_total'] = players[pid]['total_round_wins'] / (num_games_per_match * players[pid]['games_played'])
-            
-            # Update ratings using the aggregated match results.
             update_openskill_ratings(players, group, group_ranking, cumulative_wins)
-            
-            # Update match history.
             for pid in group:
                 for other in group:
                     if other != pid:
                         match_history[pid].add(other)
-            
             match_counter += 1
-            # Use the shared compare_scoreboards function from evaluate_utils.
+
+            # After each match update, recompute scoreboard differences and update progress UI.
             differences = compare_scoreboards(old_scoreboard, players)
-            progress_ui.update(
-                increment=1,
-                differences=differences,
-                description=f"Match {match_counter}",
-                steps_per_sec=steps_per_sec
-            )
+            progress_ui.update(differences=differences, description=f"Match {match_counter}", steps_per_sec=steps_per_sec)
     progress_ui.close()
+
+    # After all tournament matches, display aggregated expert activations.
+    if tournament_expert_activations:
+        # Here, the keys are actual agent IDs so we can pass an identity mapping.
+        identity_map = {agent: agent for agent in tournament_expert_activations.keys()}
+        rich_print_expert_activations(tournament_expert_activations, identity_map)
+
     return global_action_counts
 
 def rich_print_scoreboard_action_counts(players, action_counts):

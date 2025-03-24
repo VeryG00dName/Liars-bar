@@ -16,16 +16,14 @@ from src.eval.evaluate_utils import (
     plot_agent_heatmap,
     RichProgressScoreboard,
     evaluate_agents,
-    initialize_players
+    initialize_players,
+    rich_print_expert_activations
 )
 from src import config
 from openskill.models import PlackettLuce
 model = PlackettLuce(mu=25.0, sigma=25.0 / 3, beta=25.0 / 6)
 import warnings
 warnings.filterwarnings("ignore", message="enable_nested_tensor is True, but self.use_nested_tensor is False", category=UserWarning)
-
-# Import the new ModelFactory API.
-from src.model.model_factory import ModelFactory
 
 # Global variables for transformer-based memory integration (if needed elsewhere)
 global_strategy_transformer = None
@@ -39,72 +37,99 @@ def run_evaluation(env, device, players, num_games_per_triple=11):
     player_ids = list(players.keys())
     triples_list = list(itertools.combinations(player_ids, 3))
     random.shuffle(triples_list)
-
-    # Initialize the shared progress/scoreboard.
-    progress_ui = RichProgressScoreboard(total_steps=len(triples_list), players=players)
+    
+    total_episodes = len(triples_list) * num_games_per_triple
+    progress_ui = RichProgressScoreboard(total_steps=total_episodes, players=players)
     old_scoreboard = load_scoreboard()
     differences = compare_scoreboards(old_scoreboard, players)
 
-    # Initialize global tracking dictionaries.
+    # Aggregated expert activations using actual agent IDs.
+    aggregated_expert_activations = {}
     global_action_counts = {pid: {a: 0 for a in range(7)} for pid in players}
-    global_match_wins = {pid: 0 for pid in players}   # one win per match.
-    global_round_wins = {pid: 0 for pid in players}     # cumulative rounds won.
-    global_games = {pid: 0 for pid in players}          # number of matches played.
-    total_steps = 0
+    global_match_wins = {pid: 0 for pid in players}
+    global_round_wins = {pid: 0 for pid in players}
     agent_head_to_head = defaultdict(lambda: defaultdict(int))
 
-    try:
-        for idx, triple in enumerate(triples_list, 1):
-            players_in_this_game = {pid: players[pid] for pid in triple}
+    # Ensure each player has games_played initialized.
+    for pid in players:
+        players[pid].setdefault('games_played', 0)
 
-            cumulative_wins, action_counts, game_wins_list, avg_steps, steps_per_sec = evaluate_agents(
+    try:
+        for triple_index, triple in enumerate(triples_list, start=1):
+            players_in_this_game = {pid: players[pid] for pid in triple}
+            # Build mapping from env IDs to real agent IDs for this match.
+            agent_map = {f'player_{i}': pid for i, pid in enumerate(players_in_this_game.keys())}
+            
+            # Use a progress callback that only advances the progress bar.
+            progress_cb = lambda ep: progress_ui.advance_progress(increment=1)
+            
+            # Call evaluate_agents with track_experts=True.
+            (cumulative_wins,
+             action_counts,
+             game_wins_list,
+             avg_steps,
+             steps_per_sec,
+             expert_activations) = evaluate_agents(
                 env,
                 device,
                 players_in_this_game,
-                episodes=num_games_per_triple
+                episodes=num_games_per_triple,
+                progress_callback=progress_cb,
+                track_experts=True
             )
 
-            # For each match (triple), count one match played and update round wins.
+            # Transform expert_activations from env IDs to actual agent IDs.
+            transformed_expert_activations = {}
+            for env_key, opp_data in expert_activations.items():
+                actual_key = agent_map.get(env_key, env_key)
+                transformed_expert_activations.setdefault(actual_key, {})
+                for env_opp, details in opp_data.items():
+                    actual_opp = agent_map.get(env_opp, env_opp)
+                    transformed_expert_activations[actual_key][actual_opp] = details
+
+            # Aggregate expert activations across matches.
+            for actual_agent, opp_dict in transformed_expert_activations.items():
+                if actual_agent in aggregated_expert_activations:
+                    aggregated_expert_activations[actual_agent].update(opp_dict)
+                else:
+                    aggregated_expert_activations[actual_agent] = opp_dict
+
+            # Update round wins and increment games_played for players in this triple.
             for pid in triple:
                 global_round_wins[pid] += cumulative_wins[pid]
-                global_games[pid] += 1
+                players[pid]['games_played'] += 1
                 for a in range(7):
                     global_action_counts[pid][a] += action_counts[pid][a]
 
-            # Determine the match winner (the player with the highest rounds won).
+            # Determine the match winner.
             triple_ranking = sorted(triple, key=lambda pid: cumulative_wins[pid], reverse=True)
-            match_winner = triple_ranking[0]
-            global_match_wins[match_winner] += 1
+            winner = triple_ranking[0]
+            global_match_wins[winner] += 1
 
-            # Update win rates for each player in the triple.
+            # Recalculate win rates using games_played.
             for pid in triple:
-                players[pid]['win_rate_match'] = global_match_wins[pid] / global_games[pid]
-                players[pid]['win_rate_total'] = global_round_wins[pid] / (num_games_per_triple * global_games[pid])
-            
-            total_steps += avg_steps * num_games_per_triple
+                gp = players[pid]['games_played']
+                players[pid]['win_rate_match'] = global_match_wins[pid] / gp
+                players[pid]['win_rate_total'] = global_round_wins[pid] / (gp * num_games_per_triple)
 
-            # Update ratings using the aggregated match results.
+            # Update OpenSkill ratings and head-to-head counts.
             ranks = assign_final_ranks(triple, cumulative_wins)
             update_openskill_batch(players, triple, ranks)
-            
-            # Update head-to-head counts.
-            triple_ranked = list(zip(triple, ranks))
-            for i, (pid_i, rank_i) in enumerate(triple_ranked):
-                for j, (pid_j, rank_j) in enumerate(triple_ranked):
-                    if i == j:
-                        continue
-                    if rank_i < rank_j:
+            for i, (pid_i, rank_i) in enumerate(zip(triple, ranks)):
+                for j, (pid_j, rank_j) in enumerate(zip(triple, ranks)):
+                    if i != j and rank_i < rank_j:
                         agent_head_to_head[pid_i][pid_j] += 1
 
-            # Re-compute scoreboard differences and update the live board.
             differences = compare_scoreboards(old_scoreboard, players)
-            progress_ui.update(increment=1, differences=differences, steps_per_sec=steps_per_sec)
-                
-        # Final update after all matches.
-        differences = compare_scoreboards(old_scoreboard, players)
-        progress_ui.update(differences=differences)
+            progress_ui.update_scoreboard(differences=differences, steps_per_sec=steps_per_sec)
     finally:
         progress_ui.close()
+
+    # At the end, print the aggregated expert activations.
+    if aggregated_expert_activations:
+        # Since keys are already actual agent IDs, use an identity mapping.
+        identity_map = {agent: agent for agent in aggregated_expert_activations.keys()}
+        rich_print_expert_activations(aggregated_expert_activations, identity_map)
 
     return global_action_counts, agent_head_to_head
 

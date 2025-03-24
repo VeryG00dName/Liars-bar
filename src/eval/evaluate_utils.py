@@ -78,6 +78,41 @@ def get_hidden_dim_from_state_dict(state_dict, layer_prefix='fc1'):
     available_keys = list(state_dict.keys())
     raise ValueError(f"Cannot determine hidden_dim from state_dict. Tried prefixes: {candidate_prefixes}. Available keys: {available_keys}")
 
+def get_input_dim_from_state_dict(state_dict, candidate_prefix='fc1'):
+    """
+    Determines the input dimension of a policy network from its state dictionary.
+    
+    It checks several candidate prefixes (e.g. "fc1", "base_encoder.0", etc.) and returns
+    the second dimension (i.e. the input dimension) of the first matching weight tensor.
+    
+    Args:
+        state_dict (dict): The state dictionary of a policy network.
+        candidate_prefix (str): The first candidate prefix to try.
+    
+    Returns:
+        int: The input dimension for the policy network.
+    
+    Raises:
+        ValueError: If no appropriate tensor is found in the state_dict.
+    """
+    candidate_prefixes = [
+        candidate_prefix,
+        "base_encoder.0",
+        "policy_net.fc1",
+        "model.fc1"
+    ]
+    for prefix in candidate_prefixes:
+        key = f"{prefix}.weight"
+        if key in state_dict:
+            return state_dict[key].shape[1]
+    # Fallback: iterate over all keys and return the input dimension from the first 2D tensor found.
+    for key, tensor in state_dict.items():
+        if hasattr(tensor, "ndim") and tensor.ndim == 2:
+            return tensor.shape[1]
+    available_keys = list(state_dict.keys())
+    raise ValueError(f"Cannot determine input_dim from state_dict. Tried prefixes: {candidate_prefixes}. "
+                     f"Available keys: {available_keys}")
+
 def assign_final_ranks(triple, cumulative_wins):
     """
     Assign ranks to players based on cumulative wins.
@@ -530,9 +565,63 @@ class RichProgressScoreboard:
         # Refresh the live layout.
         self.live.update(self._generate_layout(differences))
 
+    def advance_progress(self, increment=1):
+        """Advance the progress bar without re-rendering scoreboard differences."""
+        self.progress.update(self.task_id, advance=increment)
+
+    def update_scoreboard(self, differences=None, steps_per_sec=None, description=None):
+        """Update the scoreboard (rank differences, steps/sec, etc.) on the live layout."""
+        if steps_per_sec is not None:
+            self.steps_per_sec = steps_per_sec
+        self.progress.update(
+            self.task_id,
+            description=description or "Evaluating...",
+            steps_per_sec=f"{self.steps_per_sec:.2f} steps/sec"
+        )
+        # Rebuild and refresh the layout including scoreboard differences.
+        self.live.update(self._generate_layout(differences))
+
     def close(self):
         self.live.__exit__(None, None, None)
 
+def rich_print_expert_activations(expert_activations, agent_map):
+    """
+    Displays MoE expert activations in a Rich table with the following columns:
+      - Agent ID
+      - Selected Expert
+      - Opponent ID
+      - Activation Details
+
+    :param expert_activations: A dict keyed by environment agent IDs with values
+           that are dicts mapping opponent env IDs to a details object.
+           The details can either be a dict (e.g. {"expert_index": 2, ...})
+           or a simple int representing the expert index.
+    :param agent_map: A dict mapping environment IDs (e.g., "player_0") to the actual agent IDs.
+    """
+    console = Console()
+    table = Table(title="MoE Expert Activations")
+    table.add_column("Agent ID", style="bold")
+    table.add_column("Selected Expert", style="cyan")
+    table.add_column("Opponent ID", style="magenta")
+    table.add_column("Activation Details", style="green")
+
+    for env_agent, opp_dict in expert_activations.items():
+        real_agent = agent_map.get(env_agent, env_agent)
+        if not opp_dict:
+            table.add_row(real_agent, "-", "-", "No activations")
+            continue
+
+        for env_opp, details in opp_dict.items():
+            real_opp = agent_map.get(env_opp, env_opp)
+            if isinstance(details, dict):
+                expert_index = details.get("expert_index", "-")
+                activation_str = str(details)
+            else:
+                # If details is not a dict, assume it's the expert index.
+                expert_index = details
+                activation_str = str(details)
+            table.add_row(real_agent, str(expert_index), real_opp, activation_str)
+    console.print(table)
 
 # ----------------------------
 # New Unified initialize players function
@@ -594,7 +683,10 @@ def initialize_players(base_dir, device):
                 obp_model.load_state_dict(obp_model_state)
             # Determine observation version using one of the policy networks.
             any_policy = next(iter(policy_nets.values()))
-            actual_input_dim = any_policy['fc1.weight'].shape[1]
+            try:
+                actual_input_dim = any_policy['fc1.weight'].shape[1]
+            except KeyError:
+                actual_input_dim = get_input_dim_from_state_dict(any_policy, candidate_prefix='fc1')
             if actual_input_dim == 18:
                 obs_version = 1
             elif actual_input_dim in (16, 24, 26):
@@ -605,24 +697,47 @@ def initialize_players(base_dir, device):
             # Process each agent in the checkpoint.
             for agent_name, policy_state_dict in policy_nets.items():
                 uses_memory = ("fc4.weight" in policy_state_dict)
+                # Determine if the checkpoint uses an auxiliary classifier.
                 use_aux_classifier = "fc_classifier.weight" in policy_state_dict
+                # For new models, infer the number of opponent classes.
                 if use_aux_classifier:
-                    # Infer the number of opponent classes from the first dimension of the classifier weight.
                     num_opponent_classes = policy_state_dict["fc_classifier.weight"].shape[0]
                 else:
                     num_opponent_classes = None
                 policy_hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, layer_prefix='fc1')
 
-                policy_net = PolicyNetwork(
-                    input_dim=actual_input_dim,
-                    hidden_dim=policy_hidden_dim,
-                    output_dim=config.OUTPUT_DIM,
-                    use_lstm=True,
-                    use_dropout=True,
-                    use_layer_norm=True,
-                    use_aux_classifier=use_aux_classifier,
-                    num_opponent_classes=num_opponent_classes
-                ).to(device)
+                # Check for MoE models first.
+                if ModelFactory.is_moe_policy(policy_state_dict):
+                    policy_net = ModelFactory.create_policy_network(
+                        input_dim=actual_input_dim,
+                        hidden_dim=policy_hidden_dim,
+                        output_dim=config.OUTPUT_DIM,
+                        use_aux_classifier=use_aux_classifier,
+                        num_opponent_classes=num_opponent_classes,
+                        use_moe_model=True,
+                        num_experts=10
+                    ).to(device)
+                else:
+                    # For non-MoE models, use new model parameters if the checkpoint uses an auxiliary classifier,
+                    # otherwise use the old model configuration.
+                    if use_aux_classifier:
+                        policy_net = ModelFactory.create_policy_network(
+                            input_dim=actual_input_dim,
+                            hidden_dim=policy_hidden_dim,
+                            output_dim=config.OUTPUT_DIM,
+                            use_aux_classifier=use_aux_classifier,
+                            num_opponent_classes=num_opponent_classes,
+                            use_new_model=True
+                        ).to(device)
+                    else:
+                        policy_net = ModelFactory.create_policy_network(
+                            input_dim=actual_input_dim,
+                            hidden_dim=policy_hidden_dim,
+                            output_dim=config.OUTPUT_DIM,
+                            use_new_model=False,
+                            strategy_dim=config.STRATEGY_DIM,
+                            num_opponents=2  # Adjust based on your environment if needed
+                        ).to(device)
                 policy_net.load_state_dict(policy_state_dict, strict=False)
                 policy_net.eval()
 
