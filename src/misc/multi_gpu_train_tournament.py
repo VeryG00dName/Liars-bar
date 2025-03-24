@@ -275,7 +275,7 @@ def load_best_checkpoint(device, checkpoint_dir):
     checkpoint_path = os.path.join(checkpoint_dir, 'best_checkpoint.pth')
     if not os.path.exists(checkpoint_path):
         return None, None, None, None
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     player_pool = {}
     for pid, agent_state in checkpoint['player_pool'].items():
         policy_net = PolicyNetwork(

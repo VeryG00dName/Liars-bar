@@ -465,7 +465,7 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
             self.show_info(f"Error: {str(e)}")
 
     def load_model(self, file_path):
-        checkpoint = torch.load(file_path, map_location="cpu")
+        checkpoint = torch.load(file_path, map_location="cpu", weights_only=False)
         if not isinstance(checkpoint, dict):
             raise ValueError("Invalid checkpoint format")
         required_keys = ["policy_nets", "obp_model"]

@@ -85,7 +85,7 @@ strategy_transformer.eval()
 # ---------------------------
 transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
 if os.path.exists(transformer_checkpoint_path):
-    checkpoint = torch.load(transformer_checkpoint_path, map_location=device)
+    checkpoint = torch.load(transformer_checkpoint_path, map_location=device, weights_only=False)
     
     # Load transformer and event encoder states.
     strategy_transformer.load_state_dict(checkpoint["transformer_state_dict"])

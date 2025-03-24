@@ -55,7 +55,7 @@ def load_combined_checkpoint(checkpoint_path, device):
     """Load a combined checkpoint from the given path."""
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     return checkpoint
 
 def get_hidden_dim_from_state_dict(state_dict, layer_prefix='fc1'):
@@ -250,7 +250,7 @@ def get_opponent_memory_embedding(current_agent, opponent, device):
     if global_response2idx is None or global_action2idx is None:
         logger.debug("Global response/action mappings not set; loading from checkpoint if available.")
         if os.path.exists(transformer_checkpoint_path):
-            ckpt = torch.load(transformer_checkpoint_path, map_location=device)
+            ckpt = torch.load(transformer_checkpoint_path, map_location=device, weights_only=False)
             global_response2idx = ckpt.get("response2idx", {})
             global_action2idx = ckpt.get("action2idx", {})
             logger.debug(f"Loaded response2idx with {len(global_response2idx)} entries and action2idx with {len(global_action2idx)} entries.")
@@ -281,7 +281,7 @@ def get_opponent_memory_embedding(current_agent, opponent, device):
                 token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM
             ).to(device)
             if os.path.exists(transformer_checkpoint_path):
-                ckpt = torch.load(transformer_checkpoint_path, map_location=device)
+                ckpt = torch.load(transformer_checkpoint_path, map_location=device, weights_only=False)
                 global_event_encoder.load_state_dict(ckpt["event_encoder_state_dict"])
                 global_event_encoder.eval()
                 logger.debug("Loaded event encoder state_dict from checkpoint.")
@@ -303,7 +303,7 @@ def get_opponent_memory_embedding(current_agent, opponent, device):
                 use_cls_token=True
             ).to(device)
             if os.path.exists(transformer_checkpoint_path):
-                ckpt = torch.load(transformer_checkpoint_path, map_location=device)
+                ckpt = torch.load(transformer_checkpoint_path, map_location=device, weights_only=False)
                 global_strategy_transformer.load_state_dict(ckpt["transformer_state_dict"], strict=False)
                 global_strategy_transformer.eval()
                 logger.debug("Loaded strategy transformer state_dict from checkpoint.")

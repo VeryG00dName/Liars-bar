@@ -57,7 +57,7 @@ class ModelInfoApp:
 
     def display_model_info(self, file_path):
         try:
-            data = torch.load(file_path, map_location="cpu")
+            data = torch.load(file_path, map_location="cpu", weights_only=False)
 
             self.text.configure(state="normal")
             self.text.delete(1.0, tk.END)

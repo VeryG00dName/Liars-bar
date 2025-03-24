@@ -147,7 +147,7 @@ class AgentManagerApp:
     def load_model(self, file_path):
         try:
             logging.debug(f"Attempting to load model: {file_path}")
-            checkpoint = torch.load(file_path, map_location="cpu")
+            checkpoint = torch.load(file_path, map_location="cpu", weights_only=False)
             if not isinstance(checkpoint, dict):
                 raise ValueError("Checkpoint is not a dictionary")
             required_keys = ["policy_nets", "obp_model"]

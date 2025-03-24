@@ -24,7 +24,6 @@ from rich.table import Table
 
 import warnings
 warnings.filterwarnings("ignore", message="enable_nested_tensor is True, but self.use_nested_tensor is False", category=UserWarning)
-warnings.filterwarnings("ignore", message="You are using `torch.load` with `weights_only=False`", category=FutureWarning)
 
 # Import hardcoded agents.
 from src.model.hard_coded_agents import (

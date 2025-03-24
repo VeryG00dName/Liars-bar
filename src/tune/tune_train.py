@@ -120,7 +120,7 @@ def load_strategy_transformer_and_event_encoder(device):
     if not os.path.exists(transformer_checkpoint_path):
         raise FileNotFoundError(f"Transformer checkpoint not found at {transformer_checkpoint_path}")
     
-    checkpoint = torch.load(transformer_checkpoint_path, map_location=device)
+    checkpoint = torch.load(transformer_checkpoint_path, map_location=device, weights_only=False)
     
     strategy_transformer = StrategyTransformer(
         num_tokens=config.STRATEGY_NUM_TOKENS,

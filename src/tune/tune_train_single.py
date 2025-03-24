@@ -98,7 +98,7 @@ strategy_transformer = StrategyTransformer(
 # ---------------------------
 transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
 if os.path.exists(transformer_checkpoint_path):
-    checkpoint = torch.load(transformer_checkpoint_path, map_location=device)
+    checkpoint = torch.load(transformer_checkpoint_path, map_location=device, weights_only=False)
     strategy_transformer.load_state_dict(checkpoint["transformer_state_dict"], strict=False)
     print(f"Loaded transformer from {transformer_checkpoint_path}")
     if "response2idx" in checkpoint and "action2idx" in checkpoint:
@@ -357,18 +357,6 @@ def train_agent(env, device, num_episodes=10000, load_checkpoint=False, load_dir
                     
                     # Format observation for historical model
                     obs_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
-                    
-                    # Check if we need to pad the observation to match expected dimensions
-                    expected_input_dim = bot_instance.fc1.weight.shape[1]
-                    current_dim = obs_tensor.shape[1]
-                    
-                    if current_dim < expected_input_dim:
-                        # Pad with zeros to match expected dimension
-                        padding = torch.zeros(1, expected_input_dim - current_dim, device=device)
-                        obs_tensor = torch.cat([obs_tensor, padding], dim=1)
-                    elif current_dim > expected_input_dim:
-                        # Truncate to expected dimension
-                        obs_tensor = obs_tensor[:, :expected_input_dim]
                     
                     with torch.no_grad():
                         probs, _, _ = bot_instance(obs_tensor, None)

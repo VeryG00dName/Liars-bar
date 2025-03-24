@@ -95,7 +95,7 @@ def train(
 
     transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
     if os.path.exists(transformer_checkpoint_path):
-        checkpoint = torch.load(transformer_checkpoint_path, map_location=device)
+        checkpoint = torch.load(transformer_checkpoint_path, map_location=device, weights_only=False)
         # Load transformer state dict in non-strict mode (to ignore missing keys).
         strategy_transformer.load_state_dict(checkpoint["transformer_state_dict"], strict=False)
         logger.info(f"Loaded transformer from {transformer_checkpoint_path}")

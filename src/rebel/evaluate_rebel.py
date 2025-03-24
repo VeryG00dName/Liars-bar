@@ -156,7 +156,7 @@ def load_rebel_agent(checkpoint_path, device, env):
         # Load transformer checkpoint
         transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
         if os.path.exists(transformer_checkpoint_path):
-            checkpoint = torch.load(transformer_checkpoint_path, map_location=device)
+            checkpoint = torch.load(transformer_checkpoint_path, map_location=device, weights_only=False)
             
             # Load mappings first
             response2idx = checkpoint["response2idx"]

@@ -128,7 +128,7 @@ class MixGUI:
         return os.path.normpath(file_path)
 
     def load_checkpoint(self, file_path):
-        checkpoint = torch.load(file_path, map_location="cpu")
+        checkpoint = torch.load(file_path, map_location="cpu", weights_only=False)
         if not isinstance(checkpoint, dict):
             raise ValueError("Invalid checkpoint format")
         required_keys = ["policy_nets", "value_nets", "optimizers_policy", "optimizers_value"]

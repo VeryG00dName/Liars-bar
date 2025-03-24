@@ -187,7 +187,7 @@ class PlayVsAIGUI:
             self.show_info(f"Error: {str(e)}")
 
     def load_model(self, file_path):
-        checkpoint = torch.load(file_path, map_location="cpu")
+        checkpoint = torch.load(file_path, map_location="cpu", weights_only=False)
         if not isinstance(checkpoint, dict):
             raise ValueError("Invalid checkpoint format")
         required_keys = ["policy_nets", "obp_model"]
@@ -441,7 +441,7 @@ class PlayVsAIGUI:
                                 ).to(device)
                                 transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
                                 if os.path.exists(transformer_checkpoint_path):
-                                    state_dict = torch.load(transformer_checkpoint_path, map_location=device)
+                                    state_dict = torch.load(transformer_checkpoint_path, map_location=device, weights_only=False)
                                     if "transformer_state_dict" in state_dict:
                                         state_dict = state_dict["transformer_state_dict"]
                                     global_strategy_transformer.load_state_dict(state_dict, strict=False)
@@ -520,7 +520,7 @@ class PlayVsAIGUI:
                             ).to(device)
                             transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
                             if os.path.exists(transformer_checkpoint_path):
-                                state_dict = torch.load(transformer_checkpoint_path, map_location=device)
+                                state_dict = torch.load(transformer_checkpoint_path, map_location=device, weights_only=False)
                                 if "transformer_state_dict" in state_dict:
                                     state_dict = state_dict["transformer_state_dict"]
                                 global_strategy_transformer.load_state_dict(state_dict, strict=False)

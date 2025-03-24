@@ -135,7 +135,7 @@ def measure_training_speed(hidden_dim, device, use_cudnn_benchmark=True, use_mix
     transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
     if os.path.exists(transformer_checkpoint_path):
         t_chk_start = time.perf_counter()
-        checkpoint = torch.load(transformer_checkpoint_path, map_location=device)
+        checkpoint = torch.load(transformer_checkpoint_path, map_location=device, weights_only=False)
         strategy_transformer.load_state_dict(checkpoint["transformer_state_dict"], strict=False)
         if "response2idx" in checkpoint and "action2idx" in checkpoint:
             response2idx = checkpoint["response2idx"]

@@ -104,7 +104,6 @@ HARD_CODED_BOT_CLASSES = {
 
 # Historical agent configuration (used if OPPONENT_TYPE = 1)
 HISTORICAL_AGENT_INDEX = 0  # <-- Change this to select which historical agent to use
-
 # Additional constant: number of consecutive log intervals with 0% win rate before culling.
 CULL_CONSECUTIVE_ZERO_WIN = 3  # You can adjust this threshold.
 
@@ -132,7 +131,7 @@ strategy_transformer = StrategyTransformer(
 # ---------------------------
 transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
 if os.path.exists(transformer_checkpoint_path):
-    checkpoint = torch.load(transformer_checkpoint_path, map_location=device)
+    checkpoint = torch.load(transformer_checkpoint_path, map_location=device, weights_only=False)
     strategy_transformer.load_state_dict(checkpoint["transformer_state_dict"], strict=False)
     print(f"Loaded transformer from {transformer_checkpoint_path}")
     if "response2idx" in checkpoint and "action2idx" in checkpoint:
@@ -400,8 +399,8 @@ def train_agent(env, device, target_win_rate=0.95, load_checkpoint_flag=False, l
             final_obs = np.concatenate([observation, np.array(obp_probs, dtype=np.float32)], axis=0)
             
             # For RL agent, also include transformer embeddings
-            if current_agent == rl_agent:
-                final_obs = np.concatenate([final_obs, normalized_transformer_features], axis=0)
+
+            final_obs = np.concatenate([final_obs, normalized_transformer_features], axis=0)
 
             # Action selection based on agent type
             if current_agent == rl_agent:
@@ -433,44 +432,25 @@ def train_agent(env, device, target_win_rate=0.95, load_checkpoint_flag=False, l
                     # Historical agent logic
                     bot_instance = bot1_instance if current_agent == "player_1" else bot2_instance
                     
-                    try:
-                        # Format observation for historical model
-                        obs_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
-                        
-                        # Check if we need to pad the observation to match expected dimensions
-                        expected_input_dim = bot_instance.fc1.weight.shape[1]
-                        current_dim = obs_tensor.shape[1]
-                        
-                        if current_dim < expected_input_dim:
-                            # Pad with zeros to match expected dimension
-                            padding = torch.zeros(1, expected_input_dim - current_dim, device=device)
-                            obs_tensor = torch.cat([obs_tensor, padding], dim=1)
-                        elif current_dim > expected_input_dim:
-                            # Truncate to expected dimension
-                            obs_tensor = obs_tensor[:, :expected_input_dim]
-                        
-                        with torch.no_grad():
-                            probs, _, _ = bot_instance(obs_tensor, None)
-                            probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
-                            mask_t = torch.tensor(action_mask, dtype=torch.float32, device=device)
-                            masked_probs = probs * mask_t
-                            if masked_probs.sum() == 0:
-                                valid_indices = torch.nonzero(mask_t, as_tuple=True)[0]
-                                if len(valid_indices) > 0:
-                                    masked_probs[valid_indices] = 1.0 / valid_indices.numel()
-                                else:
-                                    masked_probs = torch.ones_like(probs) / probs.size(0)
+                    # Format observation for historical model
+                    obs_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
+                    
+                    with torch.no_grad():
+                        probs, _, _ = bot_instance(obs_tensor, None)
+                        probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
+                        mask_t = torch.tensor(action_mask, dtype=torch.float32, device=device)
+                        masked_probs = probs * mask_t
+                        if masked_probs.sum() == 0:
+                            valid_indices = torch.nonzero(mask_t, as_tuple=True)[0]
+                            if len(valid_indices) > 0:
+                                masked_probs[valid_indices] = 1.0 / valid_indices.numel()
                             else:
-                                masked_probs /= masked_probs.sum()
-                            m = Categorical(masked_probs)
-                            action = m.sample().item()
-                            log_prob_value = 0.0  # Not needed for opponent
-                    except Exception as e:
-                        # Fallback to random action if model inference fails
-                        logger.warning(f"Error using historical model: {e}. Using random action.")
-                        valid_actions = [i for i, mask in enumerate(action_mask) if mask == 1]
-                        action = random.choice(valid_actions) if valid_actions else 0
-                        log_prob_value = 0.0
+                                masked_probs = torch.ones_like(probs) / probs.size(0)
+                        else:
+                            masked_probs /= masked_probs.sum()
+                        m = Categorical(masked_probs)
+                        action = m.sample().item()
+                        log_prob_value = 0.0  # Not needed for opponent
 
             env.step(action)
             # Update rewards and store transitions
@@ -487,7 +467,6 @@ def train_agent(env, device, target_win_rate=0.95, load_checkpoint_flag=False, l
                     is_terminal=env.terminations[rl_agent] or env.truncations[rl_agent],
                     state_value=state_value,
                     action_mask=action_mask,
-                    expert_input=np.zeros(5)  # Placeholder for expert input - not used in this version
                 )
             else:
                 pending_rewards[rl_agent] += env.rewards[rl_agent]

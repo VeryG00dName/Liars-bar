@@ -23,7 +23,6 @@ from openskill.models import PlackettLuce
 model = PlackettLuce(mu=25.0, sigma=25.0 / 3, beta=25.0 / 6)
 import warnings
 warnings.filterwarnings("ignore", message="enable_nested_tensor is True, but self.use_nested_tensor is False", category=UserWarning)
-warnings.filterwarnings("ignore", message="You are using `torch.load` with `weights_only=False`", category=FutureWarning)
 
 # Import the new ModelFactory API.
 from src.model.model_factory import ModelFactory
