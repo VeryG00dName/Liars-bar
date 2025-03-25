@@ -6,7 +6,7 @@ import torch.nn.functional as F
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.enabled = True
 import math
-
+from src import config
 
 class StackedObservationConvModel(nn.Module):
     """
@@ -17,7 +17,7 @@ class StackedObservationConvModel(nn.Module):
     - N: Number of historical observations to include
     - obs_dim: Dimension of each observation
     
-    Returns policy logits, state value, and opponent classification logits.
+    Returns policy logits, state value, and opponent classification logits for 2 opponents.
     """
     def __init__(self, obs_dim, num_actions, hidden_dim=256, num_obs_stack=10, num_opponent_classes=6):
         super(StackedObservationConvModel, self).__init__()
@@ -54,9 +54,10 @@ class StackedObservationConvModel(nn.Module):
         
         # Value head - outputs state value estimate
         self.value_head = nn.Linear(hidden_dim, 1)
-        
-        # Opponent classification head - outputs opponent type logits
-        self.opponent_class_head = nn.Linear(hidden_dim, num_opponent_classes)
+        if config.NUM_OPPONENT_CLASSES > 0:
+            # Opponent classification heads - outputs opponent type logits for 2 opponents
+            self.opponent1_class_head = nn.Linear(hidden_dim, num_opponent_classes)
+            self.opponent2_class_head = nn.Linear(hidden_dim, num_opponent_classes)
     
     def forward(self, x):
         """
@@ -66,7 +67,8 @@ class StackedObservationConvModel(nn.Module):
         Returns:
             policy_logits: Action logits of shape (batch_size, num_actions)
             state_value: State value of shape (batch_size, 1)
-            opponent_logits: Opponent classification logits of shape (batch_size, num_opponent_classes)
+            opponent_logits: Tuple containing two opponent classification logits, each of shape 
+                            (batch_size, num_opponent_classes)
         """
         # Input shape: (batch_size, N, obs_dim)
         # Conv1d expects: (batch_size, channels, length) where channels=N and length=obs_dim
@@ -82,9 +84,14 @@ class StackedObservationConvModel(nn.Module):
         # Get policy logits, state value, and opponent classification
         policy_logits = self.policy_head(features)
         state_value = self.value_head(features)
-        opponent_logits = self.opponent_class_head(features)
+        if config.NUM_OPPONENT_CLASSES > 0:
+            opponent1_logits = self.opponent1_class_head(features)
+            opponent2_logits = self.opponent2_class_head(features)
         
-        return policy_logits, state_value, opponent_logits
+            return policy_logits, state_value, (opponent1_logits, opponent2_logits)
+        else:
+            
+            return policy_logits, state_value
 
 class TransformerMemoryModel(nn.Module):
     """

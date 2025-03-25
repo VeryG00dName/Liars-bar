@@ -71,7 +71,7 @@ OUTPUT_DIM = 7  # Will be dynamically set
 # ============================
 # Opponent Model Configuration
 # ============================
-NUM_OPPONENT_CLASSES = 6
+NUM_OPPONENT_CLASSES = 0
 OPPONENT_INPUT_DIM = 4
 OPPONENT_HIDDEN_DIM = 128
 OPPONENT_LEARNING_RATE = 1e-4
@@ -105,7 +105,7 @@ INIT_ENTROPY_COEF = 0.005
 # Logging and Checkpointing
 # ============================
 CULL_INTERVAL = 20001
-CHECKPOINT_INTERVAL = 300000
+CHECKPOINT_INTERVAL = 3000
 LOG_INTERVAL = 100
 
 # ============================
