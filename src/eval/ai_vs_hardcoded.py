@@ -271,12 +271,12 @@ class BattlegroundWorker(QThread):
                     "uses_memory": False,
                     "track_experts": False,
                     "is_stacked_model": True,
-                    "observation_stacks": deque(maxlen=10)  # Initialize observation stack
+                    "observation_stacks": deque(maxlen=20)  # Initialize observation stack
                 }
                 
                 # Pre-fill the observation stack with zeros
                 sample_obs = env.observe(key, new=True)[key]
-                for _ in range(10):  # Assuming stack size of 10
+                for _ in range(20):  # Assuming stack size of 10
                     players_in_this_game[key]["observation_stacks"].append(np.zeros_like(sample_obs))
                 
             else:
