@@ -9,7 +9,6 @@ from sklearn.decomposition import PCA
 from collections import defaultdict, Counter
 from random import shuffle
 import torch.nn as nn
-from tqdm import tqdm
 # Import the transformer model and configuration.
 from src.model.new_models import StrategyTransformer
 from src import config
@@ -24,7 +23,8 @@ device = torch.device(config.DEVICE)
 debug_mode = False
 
 # ---------------------------
-# Load training data.
+# Load and balance training data.
+# (This is the same file used during training.)
 # ---------------------------
 data_path = "opponent_training_data.pkl"
 if not os.path.exists(data_path):
@@ -34,58 +34,17 @@ if not os.path.exists(data_path):
 with open(data_path, "rb") as f:
     training_data = pickle.load(f)
 
-# Randomly shuffle the data once after loading.
-shuffle(training_data)
-
-# ---------------------------
-# Two-Level Balancing Function:
-#   1. First balance the lengths so that each length group (based on raw event count) has the same number of samples.
-#   2. Then, balance by label so that each label is capped at a max of 4,000 samples.
-# ---------------------------
-def get_length_group(sample):
-    features, _ = sample
-    seq_length = len(features)
-    if seq_length < 25:
-        return 'very_short'
-    elif seq_length < 50:
-        return 'short'
-    elif seq_length < 100:
-        return 'medium'
-    elif seq_length < 150:
-        return 'long'
-    else:
-        return 'very_long'
-
 def balance_training_data(data, max_per_label=1000):
-    # First, group samples by length.
-    length_groups = defaultdict(list)
-    for sample in data:
-        group = get_length_group(sample)
-        length_groups[group].append(sample)
-    
-    # Determine the smallest group size across all length groups.
-    min_group_size = min(len(samples) for samples in length_groups.values())
-    
-    # For each length group, take exactly min_group_size samples.
-    balanced_by_length = []
-    for group, samples in length_groups.items():
-        balanced_by_length.extend(samples[:min_group_size])
-    
-    # Now, within the length-balanced data, group by label.
-    label_groups = defaultdict(list)
-    for sample in balanced_by_length:
-        label = sample[1]
-        label_groups[label].append(sample)
-    
-    # Cap each label group to max_per_label samples.
-    final_balanced = []
-    for label, samples in label_groups.items():
-        final_balanced.extend(samples[:min(len(samples), max_per_label)])
-    
-    return final_balanced
+    # Create a balanced dataset with up to max_per_label samples per label.
+    balanced = []
+    labels = set(label for _, label in data)
+    for label in labels:
+        samples = [sample for sample in data if sample[1] == label]
+        balanced.extend(samples[:min(len(samples), max_per_label)])
+    return balanced
 
 training_data = balance_training_data(training_data, max_per_label=1000)
-print(f"Total Samples Loaded (after two-level balancing): {len(training_data)}")
+print(f"Total Samples Loaded (after balancing): {len(training_data)}")
 
 # Print the distribution of bot labels.
 bot_counts = defaultdict(int)
@@ -103,13 +62,17 @@ if not os.path.exists(transformer_checkpoint_path):
     print(f"Error: Checkpoint file not found at {transformer_checkpoint_path}")
     exit()
 
-checkpoint = torch.load(transformer_checkpoint_path, map_location=device)
+# Load the checkpoint
+checkpoint = torch.load(transformer_checkpoint_path, map_location=device, weights_only=False)
 
+# Extract vocabularies from checkpoint
 if "response2idx" not in checkpoint or "action2idx" not in checkpoint:
     raise ValueError("Checkpoint missing vocabulary mappings")
+
 response2idx = checkpoint["response2idx"]
 action2idx = checkpoint["action2idx"]
 
+# Extract label mapping from checkpoint
 if "label_mapping" in checkpoint:
     label_mapping = checkpoint["label_mapping"]
     label2idx = label_mapping["label2idx"]
@@ -130,7 +93,7 @@ if debug_mode:
         print(f"  {key}: {val}")
 
 # ---------------------------
-# Create the transformer model and event encoder.
+# Create the transformer model and event encoder
 # ---------------------------
 transformer = StrategyTransformer(
     num_tokens=config.STRATEGY_NUM_TOKENS,
@@ -149,10 +112,11 @@ event_encoder = EventEncoder(
     token_embedding_dim=config.STRATEGY_TOKEN_EMBEDDING_DIM
 ).to(device)
 
+# Load state dicts with strict=False to handle the token_embedding.weight missing key
 transformer.load_state_dict(checkpoint["transformer_state_dict"], strict=False)
 event_encoder.load_state_dict(checkpoint["event_encoder_state_dict"])
 
-# Replace token_embedding with Identity layer.
+# Replace token_embedding with Identity layer to match the training architecture
 transformer.token_embedding = nn.Identity()
 
 if debug_mode:
@@ -183,14 +147,11 @@ label_colors = []        # For plot colors
 predicted_classes = []   # Numeric predictions from the model
 ground_truth_labels = [] # Actual bot type strings
 
+# For extra debugging, collect raw feature statistics and per-sample debug info.
 all_features = []
-sample_debug_info = []  # For debugging info
+sample_debug_info = []  # Store debug info for the first few samples
 
-# Prepare dictionaries for length-based evaluation.
-length_correct_counts = defaultdict(int)
-length_total_counts = defaultdict(int)
-
-for i, (features, bot_type) in tqdm(enumerate(training_data), total=len(training_data), desc="Processing samples"):
+for i, (features, bot_type) in enumerate(training_data):
     try:
         features_cont = convert_memory_to_features(features, response2idx, action2idx)
     except Exception as e:
@@ -200,20 +161,7 @@ for i, (features, bot_type) in tqdm(enumerate(training_data), total=len(training
         all_features.extend(features_cont)
         feature_tensor = torch.tensor(features_cont, dtype=torch.float, device=device).unsqueeze(0)
         
-        # Determine sequence length group.
-        seq_length = len(features)
-        if seq_length < 10:
-            length_group = 'very_short'
-        elif seq_length < 25:
-            length_group = 'short'
-        elif seq_length < 50:
-            length_group = 'medium'
-        elif seq_length < 100:
-            length_group = 'long'
-        else:
-            length_group = 'very_long'
-        length_total_counts[length_group] += 1
-
+        # Collect debugging info for the first few samples.
         if debug_mode and i < 5:
             sample_debug = {}
             sample_debug["original_features"] = features_cont
@@ -222,6 +170,7 @@ for i, (features, bot_type) in tqdm(enumerate(training_data), total=len(training
         projected = event_encoder(feature_tensor)
         if debug_mode and i < 5:
             sample_debug["projected_output"] = projected.detach().cpu().numpy()
+            # Also record summary stats of the projected outputs.
             sample_debug["projected_mean"] = projected.mean().item()
             sample_debug["projected_std"] = projected.std().item()
         
@@ -230,6 +179,7 @@ for i, (features, bot_type) in tqdm(enumerate(training_data), total=len(training
         if debug_mode and i < 5:
             sample_debug["transformer_embedding"] = embedding.detach().cpu().numpy()
             sample_debug["logits"] = logits.detach().cpu().numpy()
+            # Compute softmax probabilities.
             softmax_probs = torch.nn.functional.softmax(logits, dim=-1)
             sample_debug["softmax"] = softmax_probs.detach().cpu().numpy()
             sample_debug_info.append(sample_debug)
@@ -240,9 +190,6 @@ for i, (features, bot_type) in tqdm(enumerate(training_data), total=len(training
         pred_class = logits.argmax(dim=1).item()
         predicted_classes.append(pred_class)
         ground_truth_labels.append(bot_type)
-        
-        if bot_type in label2idx and pred_class == label2idx[bot_type]:
-            length_correct_counts[length_group] += 1
 
 if debug_mode:
     print("\nDEBUG: Detailed info for first 5 samples:")
@@ -274,6 +221,7 @@ skipped_labels = set()
 for gt_label, pred in zip(ground_truth_labels, predicted_classes):
     if gt_label not in label2idx:
         skipped_labels.add(gt_label)
+        #print(f"Warning: Ground truth label '{gt_label}' not found in label2idx mapping. Skipping sample for accuracy computation.")
         continue
     total_counts[gt_label] += 1
     if pred == label2idx[gt_label]:
@@ -290,17 +238,6 @@ overall_correct = sum(correct_counts.values())
 overall_total = sum(total_counts.values())
 overall_accuracy = (overall_correct / overall_total) * 100 if overall_total > 0 else 0.0
 print(f"\nOverall Accuracy: {overall_accuracy:.2f}% ({overall_correct}/{overall_total})")
-
-# ---------------------------
-# Print length-based evaluation metrics.
-# ---------------------------
-print("\nTransformer Classification Accuracy by Sequence Length:")
-order = {'very_short': 0, 'short': 1, 'medium': 2, 'long': 3, 'very_long': 4}
-for group in sorted(length_total_counts, key=lambda g: order.get(g, 999)):
-    total = length_total_counts[group]
-    correct = length_correct_counts[group]
-    accuracy = (correct / total) * 100 if total > 0 else 0.0
-    print(f"{group}: {accuracy:.2f}% ({correct}/{total})")
 
 # ---------------------------
 # Debug: Print raw input feature statistics.
@@ -323,15 +260,16 @@ pca_components = min(10, embeddings_array.shape[1])
 pca = PCA(n_components=pca_components)
 pca_embeddings = pca.fit_transform(embeddings_array)
 
-# t-SNE parameters: using the PCA output helps to speed up and stabilize t-SNE.
 perplexity = min(5, len(pca_embeddings) - 1)
 reducer = TSNE(n_components=2, perplexity=perplexity, random_state=42)
 embedded_2d = reducer.fit_transform(pca_embeddings)
 
 plt.figure(figsize=(10, 6))
+# Create a dictionary to collect one scatter handle per unique ground truth label.
 legend_handles = {}
-for i, gt_label in tqdm(enumerate(ground_truth_labels), total=len(ground_truth_labels), desc="Plotting embeddings"):
+for i, gt_label in enumerate(ground_truth_labels):
     x, y = embedded_2d[i, 0], embedded_2d[i, 1]
+    # If this label hasn't been added to the legend yet, store its scatter handle.
     if gt_label not in legend_handles:
         scatter_handle = plt.scatter(x, y, color=label_colors[i], label=gt_label)
         legend_handles[gt_label] = scatter_handle
@@ -343,9 +281,9 @@ plt.title("Transformer Strategy Embeddings (Colored by Bot Type)")
 plt.legend(
     handles=list(legend_handles.values()),
     loc='center left',
-    bbox_to_anchor=(1.0, 0.5),
+    bbox_to_anchor=(1.0, 0.5),  # Shift the legend outside the plot
     fontsize=8
 )
-plt.tight_layout()
+plt.tight_layout()  # Helps ensure nothing is clipped
 plt.grid()
 plt.show()
