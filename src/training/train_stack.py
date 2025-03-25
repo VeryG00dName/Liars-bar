@@ -430,7 +430,8 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, loa
                         normalized_arr = np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
                     
                     # Add memory embeddings to the old format observation
-                    final_obs = np.concatenate([old_observation, normalized_arr], axis=0)
+                    obp_placeholder = np.zeros(2, dtype=np.float32)
+                    final_obs = np.concatenate([old_observation, obp_placeholder, normalized_arr], axis=0)
                     observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
                     with torch.no_grad():
                         probs, _, _ = current_opponent(observation_tensor, None)
