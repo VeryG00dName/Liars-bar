@@ -126,6 +126,34 @@ def get_opponent_label(opponent_name, historical_label_mapping):
     else:
         return historical_label_mapping.get(opponent_name, 0)
 
+def apply_temporal_dropout(observation_stack, dropout_rate=0.3, recent_bias=True):
+    """
+    Apply temporal dropout to force the model to use full history.
+    Instead of using dropout_rate and recent_bias, this version finds the most recent
+    non-zero observation in each batch element and zeroes it out.
+
+    Args:
+        observation_stack: Tensor of shape [batch_size, seq_len, obs_dim]
+        dropout_rate: Unused, maintained for compatibility.
+        recent_bias: Unused, maintained for compatibility.
+
+    Returns:
+        Modified observation stack with the last non-zero observation zeroed out.
+    """
+    batch_size, seq_len, obs_dim = observation_stack.shape
+    mask = torch.ones_like(observation_stack)
+    
+    # Loop over each element in the batch
+    for b in range(batch_size):
+        # Iterate over time steps in reverse order to find the most recent valid observation
+        for i in range(seq_len - 1, -1, -1):
+            # Check if the observation is non-zero
+            if torch.sum(torch.abs(observation_stack[b, i, :])) > 0:
+                mask[b, i, :] = 0  # Zero out the most recent valid observation
+                break  # Stop after finding the most recent valid observation
+                
+    return observation_stack * mask
+
 def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint=False, load_directory=None, log_tensorboard=True, opponent_swap_interval=20):
     set_seed(config.SEED)
     obs, infos = env.reset(seed=config.SEED)
@@ -150,7 +178,7 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
     action_dim = env.action_spaces[env.agents[0]].n
     
     # Number of historical observations to stack
-    num_obs_stack = 10
+    num_obs_stack = config.NUM_OBS_STACK
     
     # Load historical models early, before we use them to calculate the number of classes
     historical_models_list = load_specific_historical_models(config.HISTORICAL_MODEL_DIR, device)
@@ -256,14 +284,6 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
         logger.info(f"  {opponent}: {label}")
     for opponent, label in historical_label_mapping.items():
         logger.info(f"  {opponent}: {label}")
-        for agent_name in opponent_agents:
-            opponent = {
-                "name": identifier,
-                "instance": model_instance,  # Already instantiated
-                "type": "historical",
-                "label": label
-            }
-            available_opponents.append(opponent)
     
     # Load the strategy transformer and event encoder
     strategy_transformer = StrategyTransformer(
@@ -348,6 +368,9 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
     wins = 0
     games = 0
     
+    opponent1_accuracies = deque(maxlen=100)
+    opponent2_accuracies = deque(maxlen=100)
+    
     # Main training loop
     for episode in range(start_episode, num_episodes + 1):
         env_seed = config.SEED + episode
@@ -355,23 +378,27 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
         agents = env.agents
         pending_rewards = {agent: 0.0 for agent in agents}
         
-        # Reset observation stack at the beginning of each episode
-        observation_stack = deque(maxlen=num_obs_stack)
-        for _ in range(num_obs_stack):
-            observation_stack.append(np.zeros(obs_dim, dtype=np.float32))
-        
         # Every opponent_swap_interval episodes, swap one random opponent
         if episode % opponent_swap_interval == 0:
             # Choose random opponent agent to replace
             agent_to_replace = np.random.choice(opponent_agents)
-            # Choose random opponent from available opponents
-            opponent_idx = np.random.randint(0, len(available_opponents))
-            opponent_config = available_opponents[opponent_idx]
+            # If player_2, restrict the available opponents
+            if agent_to_replace == "player_2":
+                allowed_names = {"Classic", "GreedyCardSpammer", "StrategicChallenger"}
+                filtered_opponents = [
+                    opp for opp in available_opponents 
+                    if opp["type"] == "hardcoded" and opp["name"] in allowed_names
+                ]
+                opponent_config = random.choice(filtered_opponents)
+            else:
+                opponent_idx = np.random.randint(0, len(available_opponents))
+                opponent_config = available_opponents[opponent_idx]
             
             if opponent_config["type"] == "hardcoded":
                 # Instantiate the opponent class with the appropriate parameters
                 opponent_class = opponent_config["class"]
-                agent_name = opponent_config["agent_name"]
+                # Override agent_name with the one being replaced
+                agent_name = agent_to_replace
                 agent_index = opponent_agents.index(agent_name) + 1  # +1 because player_0 is training agent
                 
                 if opponent_class == StrategicChallenger:
@@ -611,12 +638,14 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
             entropies = []
             opponent1_loss_values = []
             opponent2_loss_values = []
-            opponent1_accuracies = []
-            opponent2_accuracies = []
             
             for _ in range(config.K_EPOCHS):
                 # Forward pass through the model to get all outputs
-                policy_logits, state_values, opponent_logits = model(states)
+
+                modified_states = apply_temporal_dropout(states, dropout_rate=0.3)
+
+                
+                policy_logits, state_values, opponent_logits = model(modified_states)
                 opponent1_logits, opponent2_logits = opponent_logits
                 
                 # Check label validity
