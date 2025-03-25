@@ -18,7 +18,8 @@ from src.env.liars_deck_env_utils_2 import (
 )
 from src.env.liars_deck_env_utils import (
     apply_action,
-    get_observations
+    get_observations,
+    get_new_observations
 )
 
 
@@ -129,14 +130,16 @@ class LiarsDeckEnv(AECEnv):
     def observation_space(self, agent):
         return self.observation_spaces[agent]
 
-    def observe(self, agent):
+    def observe(self, agent, new=False):
         """
         Generates the observation for the agent.
-        In addition to the observation vector, it attaches an "action_mask"
-        in the infos for the agent.
+        If new=True, it uses the new observation construction.
+        In addition to the observation vector, it attaches an "action_mask" in the infos.
         """
-        obs_dict = get_observations(self, agent_specific=agent)
-        # Compute the action mask and add it into the infos dict.
+        if new:
+            obs_dict = get_new_observations(self, agent_specific=agent)
+        else:
+            obs_dict = get_observations(self, agent_specific=agent)
         mask = self._compute_action_mask(agent)
         self.infos[agent]["action_mask"] = mask
         return obs_dict

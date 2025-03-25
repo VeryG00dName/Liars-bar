@@ -389,6 +389,71 @@ def get_observations(env, agent_specific=None):
 
     return observations
 
+def get_new_observations(env, agent_specific=None):
+    """
+    Constructs a new observation vector for each agent.
+    Components:
+      - Hand vector (2-dim) via encode_hand.
+      - Last actions vector (length = num_players - 1): For each opponent (ordered by env.possible_agents),
+        if the opponent is eliminated or has not acted, use 0.
+        Otherwise, use 4 if they challenged, or the count (1, 2, or 3) if they played.
+      - Active players vector: normalized hand sizes for all players.
+      - Opponent cards left: raw counts of cards remaining for each opponent.
+    """
+    observations = {}
+    from src.env.liars_deck_env_utils_2 import encode_hand, decode_action
+    num_players = len(env.possible_agents)
+    agents_to_observe = [agent_specific] if agent_specific else env.agents
+
+    for agent in agents_to_observe:
+        # 1. Hand vector (same as before)
+        current_hand = env.players_hands.get(agent, [])
+        hand_vector = encode_hand(current_hand, env.table_card).astype(np.float32)
+
+        # 2. Last actions vector for each opponent (length = num_players - 1)
+        last_actions = []
+        for opp in env.possible_agents:
+            if opp == agent:
+                continue
+            # If the opponent is eliminated, code is 0.
+            if env.terminations.get(opp, False) or env.round_eliminated.get(opp, False):
+                code = 0.0
+            else:
+                last_act = env.last_agent_action.get(opp, None)
+                if last_act is None:
+                    code = 0.0
+                else:
+                    action_type, _, count = decode_action(last_act)
+                    if action_type == "Challenge":
+                        code = 4.0
+                    elif action_type == "Play":
+                        code = float(count) if count is not None else 0.0
+                    else:
+                        code = 0.0
+            last_actions.append(code)
+        last_actions = np.array(last_actions, dtype=np.float32)
+
+        # 3. Active players vector: normalized hand sizes (for all agents)
+        active_players = np.array([
+            len(env.players_hands.get(ag, [])) / 5.0
+            for ag in env.possible_agents
+        ], dtype=np.float32)
+
+        # 4. Opponent cards left: raw count for each opponent (exclude self)
+        opp_cards = []
+        for opp in env.possible_agents:
+            if opp == agent:
+                continue
+            opp_cards.append(float(len(env.players_hands.get(opp, []))))
+        opp_cards = np.array(opp_cards, dtype=np.float32)
+
+        # Concatenate in the following order:
+        # [hand_vector (2), last_actions (num_players-1), active_players (num_players), opp_cards (num_players-1)]
+        obs = np.concatenate([hand_vector, last_actions, active_players, opp_cards], axis=0)
+        observations[agent] = obs
+
+    return observations
+
 # New helper function to query persistent opponent memory.
 def query_opponent_memory(observer, opponent):
     """
