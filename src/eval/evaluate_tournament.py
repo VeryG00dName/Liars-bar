@@ -286,10 +286,10 @@ def run_group_swiss_tournament(env, device, players, num_games_per_match=11, NUM
     progress_ui.close()
 
     # After all tournament matches, display aggregated expert activations.
-    if tournament_expert_activations:
+    #if tournament_expert_activations:
         # Here, the keys are actual agent IDs so we can pass an identity mapping.
-        identity_map = {agent: agent for agent in tournament_expert_activations.keys()}
-        rich_print_expert_activations(tournament_expert_activations, identity_map)
+        #identity_map = {agent: agent for agent in tournament_expert_activations.keys()}
+        #rich_print_expert_activations(tournament_expert_activations, identity_map)
 
     return global_action_counts
 

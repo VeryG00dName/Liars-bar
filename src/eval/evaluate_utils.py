@@ -586,17 +586,18 @@ class RichProgressScoreboard:
 
 def rich_print_expert_activations(expert_activations, agent_map):
     """
-    Displays MoE expert activations in a Rich table with the following columns:
+    Displays MoE expert activations in a table with columns:
       - Agent ID
       - Selected Expert
       - Opponent ID
       - Activation Details
 
-    :param expert_activations: A dict keyed by environment agent IDs with values
-           that are dicts mapping opponent env IDs to a details object.
-           The details can either be a dict (e.g. {"expert_index": 2, ...})
-           or a simple int representing the expert index.
-    :param agent_map: A dict mapping environment IDs (e.g., "player_0") to the actual agent IDs.
+    :param expert_activations: A dict keyed by actual agent IDs (MoE agents) with values that are
+           dicts mapping opponent actual IDs to a details dict containing:
+             "selected_expert": (the selected expert index),
+             "activation_details": (a string or list with details).
+    :param agent_map: A dict mapping environment IDs to actual agent IDs (for display, if needed).
+                      (Here, keys are already actual agent IDs so an identity mapping is fine.)
     """
     console = Console()
     table = Table(title="MoE Expert Activations")
@@ -605,22 +606,21 @@ def rich_print_expert_activations(expert_activations, agent_map):
     table.add_column("Opponent ID", style="magenta")
     table.add_column("Activation Details", style="green")
 
-    for env_agent, opp_dict in expert_activations.items():
-        real_agent = agent_map.get(env_agent, env_agent)
+    for agent_id, opp_dict in expert_activations.items():
+        # Use the agent_map to get the display name (if desired).
+        display_agent = agent_map.get(agent_id, agent_id)
         if not opp_dict:
-            table.add_row(real_agent, "-", "-", "No activations")
+            table.add_row(display_agent, "-", "-", "No activations")
             continue
-
-        for env_opp, details in opp_dict.items():
-            real_opp = agent_map.get(env_opp, env_opp)
+        for opp_id, details in opp_dict.items():
+            display_opp = agent_map.get(opp_id, opp_id)
             if isinstance(details, dict):
-                expert_index = details.get("expert_index", "-")
-                activation_str = str(details)
+                selected_expert = details.get("selected_expert", "-")
+                activation_str = str(details.get("activation_details", ""))
             else:
-                # If details is not a dict, assume it's the expert index.
-                expert_index = details
+                selected_expert = details
                 activation_str = str(details)
-            table.add_row(real_agent, str(expert_index), real_opp, activation_str)
+            table.add_row(display_agent, str(selected_expert), display_opp, activation_str)
     console.print(table)
 
 # ----------------------------
