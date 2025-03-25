@@ -62,6 +62,25 @@ from src.training.train_transformer import EventEncoder
 # Set device
 device = torch.device(config.DEVICE)
 
+tuned_scoring_params_for_8 = {
+    "play_reward_per_card": 0,
+    "play_reward": 1,
+    "challenge_success_challenger_reward": 3,
+    "challenge_success_claimant_penalty": -2,
+    "challenge_fail_challenger_penalty": -1,
+    "challenge_fail_claimant_reward": 6,
+    "forced_challenge_success_challenger_reward": 2,
+    "forced_challenge_success_claimant_penalty": -4,
+    "forced_challenge_fail_challenger_penalty": -6,
+    "forced_challenge_fail_claimant_reward": -1,
+    "termination_penalty": -2,
+    "game_win_bonus": 19,
+    "game_lose_penalty": -8,
+    "hand_empty_bonus": 3,
+    "consecutive_action_penalty": 0,
+    "successful_bluff_reward": 2,
+    "unchallenged_bluff_penalty": -4
+}
 tuned_scoring_params_for_9 = {
     "play_reward_per_card": 0,
     "play_reward": 1,
@@ -180,7 +199,7 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, loa
     action_dim = env.action_spaces[env.agents[0]].n
     
     # Number of historical observations to stack
-    num_obs_stack = 10  # You can adjust this based on your needs
+    num_obs_stack = 20  # You can adjust this based on your needs
     
     # Create shared StackedObservationConvModel for training agents
     # This model handles both policy and value networks
