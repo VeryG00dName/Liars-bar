@@ -58,7 +58,7 @@ from src.training.train_extras import (
 
 # Strategy Transformer and event encoder
 from src.training.train_transformer import EventEncoder
-
+torch.backends.cudnn.benchmark = True
 # Set device
 device = torch.device(config.DEVICE)
 
@@ -116,12 +116,12 @@ historical_label_mapping = {}  # This can be populated if needed, e.g., when loa
 # Define curriculum stages with increasing difficulty
 CURRICULUM = [
     {"name": "RandomAgent", "class": RandomAgent, "win_rate_threshold": 0.80, "min_games": 100},
-    {"name": "GreedyCardSpammer", "class": GreedyCardSpammer, "win_rate_threshold": 0.80, "min_games": 100},
+    {"name": "GreedyCardSpammer", "class": GreedyCardSpammer, "win_rate_threshold": 0.70, "min_games": 100},
     {"name": "TableFirstConservativeChallenger", "class": TableFirstConservativeChallenger, "win_rate_threshold": 0.80, "min_games": 100},
     {"name": "SelectiveTableConservativeChallenger", "class": SelectiveTableConservativeChallenger, "win_rate_threshold": 0.80, "min_games": 100},
     {"name": "TableNonTableAgent", "class": TableNonTableAgent, "win_rate_threshold": 0.80, "min_games": 100},
     {"name": "StrategicChallenger", "class": StrategicChallenger, "win_rate_threshold": 0.80, "min_games": 100},
-    {"name": "Classic", "class": Classic, "win_rate_threshold": 0.80, "min_games": 100}
+    {"name": "Classic", "class": Classic, "win_rate_threshold": 0.70, "min_games": 100}
 ]
 
 # After completing the hardcoded agents, we'll move to historical models
@@ -131,7 +131,7 @@ for idx, (model, identifier) in enumerate(historical_models):
         "name": identifier, 
         "model": model, 
         "type": "historical",
-        "win_rate_threshold": 0.80,
+        "win_rate_threshold": 0.70,
         "min_games": 100
     })
 for idx, (_, identifier) in enumerate(historical_models):
@@ -175,6 +175,24 @@ else:
 strategy_transformer.token_embedding = nn.Identity()
 strategy_transformer.eval()
 
+# Function to update scoring parameters based on opponent name
+def update_scoring_params_for_opponent(env, opponent_name, logger):
+    if opponent_name == "Version_E_player_1":
+        env.update_scoring_params(tuned_scoring_params_for_9)
+        logger.info(f"Updated scoring parameters for {opponent_name} using tuned_scoring_params_for_9")
+    elif opponent_name == "Version_C_player_0":
+        env.update_scoring_params(tuned_scoring_params_for_8)
+        logger.info(f"Updated scoring parameters for {opponent_name} using tuned_scoring_params_for_8")
+    else:
+        env.update_scoring_params(config.DEFAULT_SCORING_PARAMS)
+        logger.info(f"Updated scoring parameters for {opponent_name} using DEFAULT_SCORING_PARAMS")
+
+def get_opponent_label(opponent_name):
+    if opponent_name in HARD_CODED_LABELS:
+        return HARD_CODED_LABELS[opponent_name]
+    else:
+        return historical_label_mapping[opponent_name]
+
 def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, load_directory=None, log_tensorboard=True):
     set_seed(config.SEED)
     obs, infos = env.reset(seed=config.SEED)
@@ -199,15 +217,16 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, loa
     action_dim = env.action_spaces[env.agents[0]].n
     
     # Number of historical observations to stack
-    num_obs_stack = 20  # You can adjust this based on your needs
+    num_obs_stack = 10  # You can adjust this based on your needs
     
     # Create shared StackedObservationConvModel for training agents
-    # This model handles both policy and value networks
+    # This model handles both policy, value, and opponent classification outputs
     shared_model = StackedObservationConvModel(
         obs_dim=obs_dim,
         num_actions=action_dim,
         hidden_dim=config.HIDDEN_DIM,
-        num_obs_stack=num_obs_stack
+        num_obs_stack=num_obs_stack,
+        num_opponent_classes=config.STRATEGY_NUM_CLASSES
     ).to(device)
     
     # Create dictionary mapping agents to the shared model
@@ -258,6 +277,9 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, loa
     win_rate_threshold = current_stage["win_rate_threshold"]
     min_games = current_stage["min_games"]
     
+    # Update scoring parameters based on current opponent
+    update_scoring_params_for_opponent(env, current_opponent_name, logger)
+    
     if "type" in current_stage and current_stage["type"] == "historical":
         current_opponent = current_stage["model"]
         current_opponent_type = "historical"
@@ -271,6 +293,9 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, loa
         else:
             current_opponent = current_stage["class"](agent_name=opponent_agent)
         current_opponent_type = "hardcoded"
+    
+    # Store the current opponent label
+    current_opponent_label = get_opponent_label(current_opponent_name)
     
     logger.info(f"Starting cycle {current_cycle+1}, opponent: {current_opponent_name} (threshold: {win_rate_threshold:.2f}, min games: {min_games})")
     
@@ -342,6 +367,10 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, loa
             current_opponent_name = current_stage["name"]
             win_rate_threshold = current_stage["win_rate_threshold"]
             min_games = current_stage["min_games"]
+            
+            # Update scoring parameters based on new opponent
+            update_scoring_params_for_opponent(env, current_opponent_name, logger)
+            
             if "type" in current_stage and current_stage["type"] == "historical":
                 current_opponent = current_stage["model"]
                 current_opponent_type = "historical"
@@ -355,6 +384,8 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, loa
                 else:
                     current_opponent = current_stage["class"](agent_name=opponent_agent)
                 current_opponent_type = "hardcoded"
+            # When switching opponents, update the opponent label
+            current_opponent_label = get_opponent_label(current_opponent_name)
             logger.info(f"Switching to opponent: {current_opponent_name} (threshold: {win_rate_threshold:.2f}, min games: {min_games})")
         episode_rewards = {agent: 0 for agent in agents}
         steps_in_episode = 0
@@ -408,8 +439,8 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, loa
                 stacked_obs = np.array(list(observation_stacks[agent]), dtype=np.float32)
                 stacked_obs_tensor = torch.tensor(stacked_obs, dtype=torch.float32, device=device).unsqueeze(0)
                 
-                # Get policy and value outputs
-                policy_logits, state_value = models[agent](stacked_obs_tensor)
+                # Get policy, value, and opponent classification outputs
+                policy_logits, state_value, opponent_logits = models[agent](stacked_obs_tensor)
                 
                 # Process action probabilities
                 probs = F.softmax(policy_logits, dim=-1).squeeze(0)
@@ -481,16 +512,17 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, loa
                     reward = step_rewards[agent] + pending_rewards[agent]
                     pending_rewards[agent] = 0
                     if ag in training_agents:
+                        # Store additional information for opponent classification
                         memories[ag].store_transition(
                             agent=ag,
-                            state=np.array(list(observation_stacks[ag])),  # Store the stacked observation
-                            expert_input=None,  # No expert input needed anymore
+                            state=np.array(list(observation_stacks[ag])),
                             action=action,
                             log_prob=log_prob_value,
                             reward=reward,
                             is_terminal=env.terminations[ag] or env.truncations[ag],
                             state_value=state_value_scalar,
-                            action_mask=action_mask
+                            action_mask=action_mask,
+                            expert_input=current_opponent_label  # New field added here
                         )
                     episode_rewards[ag] += reward
         
@@ -544,6 +576,8 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, loa
                 returns_ = torch.tensor(np.array(memory.returns[agent], dtype=np.float32), device=device)
                 advantages_ = torch.tensor(np.array(memory.advantages[agent], dtype=np.float32), device=device)
                 action_masks_ = torch.tensor(np.array(memory.action_masks[agent], dtype=np.float32), device=device)
+                # Get opponent labels from memory
+                opponent_labels = torch.tensor(np.array(memory.expert_inputs[agent], dtype=np.int64), device=device)
                 
                 adv_std = advantages_.std()
                 if adv_std < 1e-5:
@@ -556,10 +590,12 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, loa
                 policy_losses = []
                 value_losses = []
                 entropies = []
+                opponent_loss_values = []
+                opponent_accuracies = []
                 
                 for _ in range(config.K_EPOCHS):
-                    # Forward pass through the combined model
-                    policy_logits, state_values = models[agent](states)
+                    # Forward pass through the combined model to get all outputs
+                    policy_logits, state_values, opponent_logits = models[agent](states)
                     
                     probs = F.softmax(policy_logits, dim=-1)
                     probs = torch.clamp(probs, 1e-8, 1.0)
@@ -589,12 +625,21 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, loa
                     state_values = state_values.squeeze(-1)
                     value_loss = nn.MSELoss()(state_values, returns_)
                     
-                    # Combined loss
-                    total_loss = policy_loss + 0.5 * value_loss
+                    # Calculate opponent classification loss
+                    opponent_loss = F.cross_entropy(opponent_logits, opponent_labels)
+                    
+                    # Calculate accuracy metrics for logging
+                    opponent_preds = torch.argmax(opponent_logits, dim=1)
+                    opponent_accuracy = (opponent_preds == opponent_labels).float().mean()
+                    
+                    # Updated combined loss with auxiliary opponent classification loss
+                    total_loss = policy_loss + 0.5 * value_loss + config.AUX_LOSS_WEIGHT * opponent_loss
                     
                     policy_losses.append(policy_loss.item())
                     value_losses.append(value_loss.item())
                     entropies.append(entropy.item())
+                    opponent_loss_values.append(opponent_loss.item())
+                    opponent_accuracies.append(opponent_accuracy.item())
                     
                     # Backpropagation
                     optimizers[agent].zero_grad()
@@ -618,6 +663,8 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, loa
                     writer.add_scalar(f"Entropy/{agent}", np.mean(entropies), episode)
                     writer.add_scalar(f"KL_Divergence/{agent}", np.mean(kl_divs), episode)
                     writer.add_scalar(f"Gradient_Norms/{agent}", np.mean(grad_norms), episode)
+                    writer.add_scalar(f"Loss/Opponent/{agent}", np.mean(opponent_loss_values), episode)
+                    writer.add_scalar(f"Accuracy/Opponent/{agent}", np.mean(opponent_accuracies), episode)
             
             for agent in training_agents:
                 memories[agent].reset()

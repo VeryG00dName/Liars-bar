@@ -17,9 +17,9 @@ class StackedObservationConvModel(nn.Module):
     - N: Number of historical observations to include
     - obs_dim: Dimension of each observation
     
-    Returns policy logits and state value for PPO algorithm.
+    Returns policy logits, state value, and opponent classification logits.
     """
-    def __init__(self, obs_dim, num_actions, hidden_dim=256, num_obs_stack=10):
+    def __init__(self, obs_dim, num_actions, hidden_dim=256, num_obs_stack=10, num_opponent_classes=6):
         super(StackedObservationConvModel, self).__init__()
         
         # 1D Convolutional layers over the stacked observations
@@ -54,6 +54,9 @@ class StackedObservationConvModel(nn.Module):
         
         # Value head - outputs state value estimate
         self.value_head = nn.Linear(hidden_dim, 1)
+        
+        # Opponent classification head - outputs opponent type logits
+        self.opponent_class_head = nn.Linear(hidden_dim, num_opponent_classes)
     
     def forward(self, x):
         """
@@ -63,6 +66,7 @@ class StackedObservationConvModel(nn.Module):
         Returns:
             policy_logits: Action logits of shape (batch_size, num_actions)
             state_value: State value of shape (batch_size, 1)
+            opponent_logits: Opponent classification logits of shape (batch_size, num_opponent_classes)
         """
         # Input shape: (batch_size, N, obs_dim)
         # Conv1d expects: (batch_size, channels, length) where channels=N and length=obs_dim
@@ -75,12 +79,12 @@ class StackedObservationConvModel(nn.Module):
         # Process through fully connected layers
         features = self.fc_layers(x)
         
-        # Get policy logits and state value
+        # Get policy logits, state value, and opponent classification
         policy_logits = self.policy_head(features)
         state_value = self.value_head(features)
+        opponent_logits = self.opponent_class_head(features)
         
-        return policy_logits, state_value
-
+        return policy_logits, state_value, opponent_logits
 
 class TransformerMemoryModel(nn.Module):
     """
