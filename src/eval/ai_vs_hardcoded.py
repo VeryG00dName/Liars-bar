@@ -5,6 +5,7 @@ import logging
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+from collections import deque
 
 from PyQt5 import QtWidgets
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
@@ -78,6 +79,45 @@ def get_input_dim_from_state_dict(state_dict, candidate_prefix='fc1'):
     available_keys = list(state_dict.keys())
     raise ValueError(f"Cannot determine input_dim from state_dict. Tried prefixes: {candidate_prefixes}. "
                      f"Available keys: {available_keys}")
+
+# --- New helper: Detect if a state dict is from StackedObservationConvModel ---
+def is_stacked_observation_model(state_dict):
+    """
+    Detects if a state dictionary comes from a StackedObservationConvModel.
+    
+    Args:
+        state_dict: The state dictionary of a model.
+        
+    Returns:
+        bool: True if the state dictionary is from a StackedObservationConvModel, False otherwise.
+    """
+    # StackedObservationConvModel will have conv_layers and both policy_head and value_head
+    return (any(k.startswith('conv_layers.') for k in state_dict.keys()) and 
+            'policy_head.weight' in state_dict and 
+            'value_head.weight' in state_dict)
+
+# --- New helper: Get observation dimension from StackedObservationConvModel state dict ---
+def get_obs_dim_from_stacked_model(state_dict):
+    """
+    Extracts the observation dimension from a StackedObservationConvModel state dictionary.
+    
+    Args:
+        state_dict: The state dictionary of a StackedObservationConvModel.
+        
+    Returns:
+        int: The observation dimension.
+    """
+    # Try to find the first convolutional layer
+    for key in state_dict.keys():
+        if key.endswith('weight') and 'conv_layers' in key:
+            # Conv1d weight shape is (out_channels, in_channels, kernel_size)
+            # For the first conv layer, in_channels is the observation dimension
+            shape = state_dict[key].shape
+            if len(shape) == 3:  # Conv1d weight
+                return shape[2]  # kernel_size dimension gives the observation dimension
+    
+    # Fallback
+    return None
 
 # --- Custom QListWidget for drag-and-drop ---
 class DropListWidget(QtWidgets.QListWidget):
@@ -189,83 +229,136 @@ class BattlegroundWorker(QThread):
         # --- AI Agents (player_0 and player_1) ---
         for key in ["player_0", "player_1"]:
             agent_data = self.ai_agents[key]
-            hidden_dim = get_hidden_dim_from_state_dict(agent_data["policy_net"], "fc1")
-            obs_dim = agent_data["input_dim"]
+            policy_state_dict = agent_data["policy_net"]
             
-            # Check if this is an MoE model
-            is_moe_model = ModelFactory.is_moe_policy(agent_data["policy_net"])
-            new_model_flag = is_new_policy(agent_data["policy_net"])
+            # Check if this is a StackedObservationConvModel
+            is_stacked_model = is_stacked_observation_model(policy_state_dict)
             
-            if is_moe_model:
-                # Create MoE policy network
-                policy_net = ModelFactory.create_policy_network(
-                    input_dim=obs_dim,
+            if is_stacked_model:
+                # Create StackedObservationConvModel
+                obs_dim = agent_data.get("input_dim")
+                if obs_dim is None:
+                    # Try to determine obs_dim from the state dict
+                    obs_dim = get_obs_dim_from_stacked_model(policy_state_dict)
+                    if obs_dim is None:
+                        # Fallback: use sample observation from environment
+                        obs = env.observe(key, new=True)[key]
+                        obs_dim = obs.shape[0]
+                
+                hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, "fc_layers.0")
+                if hidden_dim is None:
+                    hidden_dim = config.HIDDEN_DIM
+                
+                # Create model using ModelFactory
+                policy_net = ModelFactory.create_stacked_observation_model(
+                    obs_dim=obs_dim,
+                    num_actions=env.action_spaces[key].n,
                     hidden_dim=hidden_dim,
-                    output_dim=env.action_spaces[key].n,
-                    use_aux_classifier=True,
-                    num_opponent_classes=config.NUM_OPPONENT_CLASSES,
-                    use_moe_model=True,
-                    num_experts=10
-                )
-            elif new_model_flag:
-                policy_net = ModelFactory.create_policy_network(
-                    input_dim=obs_dim,
-                    hidden_dim=hidden_dim,
-                    output_dim=env.action_spaces[key].n,
-                    use_aux_classifier=True,
-                    num_opponent_classes=config.NUM_OPPONENT_CLASSES,
-                    use_new_model=True
-                )
-            else:
-                policy_net = ModelFactory.create_policy_network(
-                    input_dim=obs_dim,
-                    hidden_dim=hidden_dim,
-                    output_dim=env.action_spaces[key].n,
-                    use_new_model=False,
-                    strategy_dim=config.STRATEGY_DIM,
-                    num_opponents=env.num_players - 1
+                    num_obs_stack=10  # Default value, can be adjusted
                 )
                 
-            policy_net.load_state_dict(agent_data["policy_net"], strict=False)
-            policy_net.to(device).eval()
-
-            # OBP model loading remains the same.
-            obp_state = agent_data["obp_model"]
-            if obp_state is not None:
-                obp_hidden_dim = get_hidden_dim_from_state_dict(obp_state, "fc1")
-                obp_input_dim = obp_state["fc1.weight"].shape[1]
-                if obp_input_dim == config.OPPONENT_INPUT_DIM + config.STRATEGY_DIM:
-                    obp_model = ModelFactory.create_obp(
-                        use_transformer_memory=True,
-                        input_dim=config.OPPONENT_INPUT_DIM,
-                        hidden_dim=obp_hidden_dim,
-                        output_dim=2
+                # Load state dict
+                policy_net.load_state_dict(policy_state_dict, strict=False)
+                policy_net.to(device).eval()
+                
+                # For StackedObservationConvModel, we don't need a separate value network
+                # or OBP model
+                players_in_this_game[key] = {
+                    "policy_net": policy_net,
+                    "obp_model": None,
+                    "obs_version": 3,  # Use a new version number for stacked models
+                    "rating": None,
+                    "uses_memory": False,
+                    "track_experts": False,
+                    "is_stacked_model": True,
+                    "observation_stacks": deque(maxlen=10)  # Initialize observation stack
+                }
+                
+                # Pre-fill the observation stack with zeros
+                sample_obs = env.observe(key, new=True)[key]
+                for _ in range(10):  # Assuming stack size of 10
+                    players_in_this_game[key]["observation_stacks"].append(np.zeros_like(sample_obs))
+                
+            else:
+                # Handle traditional single-observation models
+                hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, "fc1")
+                obs_dim = agent_data["input_dim"]
+                
+                # Check if this is an MoE model
+                is_moe_model = ModelFactory.is_moe_policy(policy_state_dict)
+                new_model_flag = is_new_policy(policy_state_dict)
+                
+                if is_moe_model:
+                    # Create MoE policy network
+                    policy_net = ModelFactory.create_policy_network(
+                        input_dim=obs_dim,
+                        hidden_dim=hidden_dim,
+                        output_dim=env.action_spaces[key].n,
+                        use_aux_classifier=True,
+                        num_opponent_classes=config.NUM_OPPONENT_CLASSES,
+                        use_moe_model=True,
+                        num_experts=10
                     )
-                elif obp_input_dim == config.OPPONENT_INPUT_DIM:
-                    obp_model = ModelFactory.create_obp(
-                        use_transformer_memory=False,
-                        input_dim=config.OPPONENT_INPUT_DIM,
-                        hidden_dim=obp_hidden_dim,
-                        output_dim=2
+                elif new_model_flag:
+                    policy_net = ModelFactory.create_policy_network(
+                        input_dim=obs_dim,
+                        hidden_dim=hidden_dim,
+                        output_dim=env.action_spaces[key].n,
+                        use_aux_classifier=True,
+                        num_opponent_classes=config.NUM_OPPONENT_CLASSES,
+                        use_new_model=True
                     )
                 else:
-                    raise ValueError(f"Unexpected OBP input dimension: {obp_input_dim}")
-                obp_model = ModelFactory.load_obp_state_dict(obp_model, obp_state)
-                obp_model.to(device).eval()
-                example_observation = torch.randn(1, config.OPPONENT_INPUT_DIM).to(device)
-                example_memory_embedding = torch.randn(1, config.STRATEGY_DIM).to(device)
-                obp_model = torch.jit.trace(obp_model, (example_observation, example_memory_embedding))
-            else:
-                obp_model = None
+                    policy_net = ModelFactory.create_policy_network(
+                        input_dim=obs_dim,
+                        hidden_dim=hidden_dim,
+                        output_dim=env.action_spaces[key].n,
+                        use_new_model=False,
+                        strategy_dim=config.STRATEGY_DIM,
+                        num_opponents=env.num_players - 1
+                    )
+                    
+                policy_net.load_state_dict(policy_state_dict, strict=False)
+                policy_net.to(device).eval()
 
-            players_in_this_game[key] = {
-                "policy_net": policy_net,
-                "obp_model": obp_model,
-                "obs_version": agent_data["obs_version"],
-                "rating": None,
-                "uses_memory": agent_data["uses_memory"],
-                "track_experts": True
-            }
+                # OBP model loading remains the same.
+                obp_state = agent_data["obp_model"]
+                if obp_state is not None:
+                    obp_hidden_dim = get_hidden_dim_from_state_dict(obp_state, "fc1")
+                    obp_input_dim = obp_state["fc1.weight"].shape[1]
+                    if obp_input_dim == config.OPPONENT_INPUT_DIM + config.STRATEGY_DIM:
+                        obp_model = ModelFactory.create_obp(
+                            use_transformer_memory=True,
+                            input_dim=config.OPPONENT_INPUT_DIM,
+                            hidden_dim=obp_hidden_dim,
+                            output_dim=2
+                        )
+                    elif obp_input_dim == config.OPPONENT_INPUT_DIM:
+                        obp_model = ModelFactory.create_obp(
+                            use_transformer_memory=False,
+                            input_dim=config.OPPONENT_INPUT_DIM,
+                            hidden_dim=obp_hidden_dim,
+                            output_dim=2
+                        )
+                    else:
+                        raise ValueError(f"Unexpected OBP input dimension: {obp_input_dim}")
+                    obp_model = ModelFactory.load_obp_state_dict(obp_model, obp_state)
+                    obp_model.to(device).eval()
+                    example_observation = torch.randn(1, config.OPPONENT_INPUT_DIM).to(device)
+                    example_memory_embedding = torch.randn(1, config.STRATEGY_DIM).to(device)
+                    obp_model = torch.jit.trace(obp_model, (example_observation, example_memory_embedding))
+                else:
+                    obp_model = None
+
+                players_in_this_game[key] = {
+                    "policy_net": policy_net,
+                    "obp_model": obp_model,
+                    "obs_version": agent_data["obs_version"],
+                    "rating": None,
+                    "uses_memory": agent_data["uses_memory"],
+                    "track_experts": True,
+                    "is_stacked_model": False
+                }
 
         # --- Opponent as player_2 ---
         if opponent_type == "hardcoded":
@@ -502,45 +595,99 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         checkpoint = torch.load(file_path, map_location="cpu", weights_only=False)
         if not isinstance(checkpoint, dict):
             raise ValueError("Invalid checkpoint format")
-        required_keys = ["policy_nets", "obp_model"]
-        if any(k not in checkpoint for k in required_keys):
-            raise ValueError("Missing required keys in checkpoint")
         
-        any_policy = next(iter(checkpoint["policy_nets"].values()))
-        
-        # If this checkpoint comes from an older (other_models) policy,
-        # its state dict will contain "base_encoder.0.weight". In that case,
-        # we extract the base dimension and compute the full input dimension.
-        if "base_encoder.0.weight" in any_policy:
-            base_dim = any_policy["base_encoder.0.weight"].shape[1]
-            # Default value for number of opponents (adjust if needed)
-            num_opponents = 2
-            # full input_dim = base_dim + (strategy_dim * num_opponents)
-            input_dim = base_dim + (config.STRATEGY_DIM * num_opponents)
+        # Check for different model formats
+        if "policy_nets" in checkpoint:
+            # Traditional format with separate policy_nets and value_nets
+            required_keys = ["policy_nets"]
+            if any(k not in checkpoint for k in required_keys):
+                raise ValueError("Missing required keys in checkpoint")
+            
+            any_policy = next(iter(checkpoint["policy_nets"].values()))
+            
+            # Check if the loaded model is a StackedObservationConvModel
+            is_stacked_model = is_stacked_observation_model(any_policy)
+            
+            if is_stacked_model:
+                # For StackedObservationConvModel, determine obs_dim from the model
+                obs_dim = get_obs_dim_from_stacked_model(any_policy)
+                if obs_dim is None:
+                    # Fallback: estimate from input tensors
+                    try:
+                        # Try an alternative approach to determine the dimension
+                        for key in any_policy.keys():
+                            if key.startswith('conv_layers') and key.endswith('weight'):
+                                if len(any_policy[key].shape) == 3:  # Conv1d weight tensor
+                                    obs_dim = any_policy[key].shape[2]
+                                    break
+                    except:
+                        # If all else fails, default to a reasonable value
+                        obs_dim = 14  # Default for new observation format
+                
+                # Set observation version to 3 for StackedObservationConvModel
+                obs_version = 3
+                uses_memory = False
+            else:
+                # For traditional models, determine input_dim as before
+                if "base_encoder.0.weight" in any_policy:
+                    base_dim = any_policy["base_encoder.0.weight"].shape[1]
+                    num_opponents = 2  # Default value
+                    input_dim = base_dim + (config.STRATEGY_DIM * num_opponents)
+                else:
+                    try:
+                        input_dim = any_policy['fc1.weight'].shape[1]
+                    except KeyError:
+                        input_dim = get_input_dim_from_state_dict(any_policy, candidate_prefix='fc1')
+                
+                obs_dim = input_dim
+                
+                # Set observation version based on input_dim
+                if input_dim == 18:
+                    obs_version = 1
+                elif input_dim in (16, 24, 26):
+                    obs_version = 2
+                else:
+                    obs_version = 2  # Default to newer format if unsure
+                
+                uses_memory = True
+            
+            self.loaded_models[file_path] = {
+                "policy_nets": checkpoint["policy_nets"],
+                "obp_model": checkpoint.get("obp_model", None),
+                "obs_version": obs_version,
+                "input_dim": obs_dim,
+                "uses_memory": uses_memory,
+                "is_stacked_model": is_stacked_model
+            }
+            
+        elif "model" in checkpoint:
+            # New format with a single model (StackedObservationConvModel)
+            any_policy = checkpoint["model"]
+            
+            # Verify it's actually a StackedObservationConvModel
+            if not is_stacked_observation_model(any_policy):
+                raise ValueError("Model in checkpoint is not a StackedObservationConvModel")
+            
+            # Determine observation dimension
+            obs_dim = get_obs_dim_from_stacked_model(any_policy)
+            if obs_dim is None:
+                # Fallback
+                obs_dim = 14  # Default for new observation format
+            
+            # Create two entries for player_0 and player_1 with the same model
+            self.loaded_models[file_path] = {
+                "policy_nets": {
+                    "player_0": checkpoint["model"],
+                    "player_1": checkpoint["model"]
+                },
+                "obp_model": None,  # StackedObservationConvModel doesn't use OBP
+                "obs_version": 3,   # Use version 3 for StackedObservationConvModel
+                "input_dim": obs_dim,
+                "uses_memory": False,
+                "is_stacked_model": True
+            }
         else:
-            try:
-                input_dim = any_policy['fc1.weight'].shape[1]
-            except KeyError:
-                input_dim = get_input_dim_from_state_dict(any_policy, candidate_prefix='fc1')
-        
-        # Set observation version based on input_dim.
-        if input_dim == 18:
-            obs_version = 1
-        elif input_dim in (16, 24, 26):
-            obs_version = 2
-        else:
-            raise ValueError(f"Unknown input_dim {input_dim} for model {file_path}")
-        
-        # For simplicity, assume that the models use memory if loaded from these checkpoints.
-        uses_memory = True
-        
-        self.loaded_models[file_path] = {
-            "policy_nets": checkpoint["policy_nets"],
-            "obp_model": checkpoint["obp_model"],
-            "obs_version": obs_version,
-            "input_dim": input_dim,
-            "uses_memory": uses_memory
-        }
+            raise ValueError("Unrecognized checkpoint format")
 
     def show_info(self, message):
         self.info_text.setPlainText(message)
@@ -549,8 +696,9 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         agent_options = []
         for file_path, data in self.loaded_models.items():
             folder_name = os.path.basename(os.path.dirname(file_path))
+            model_type = "StackedObs" if data.get("is_stacked_model", False) else "Standard"
             for agent_name in data["policy_nets"].keys():
-                display_text = f"{folder_name} - {os.path.basename(file_path)} - {agent_name}"
+                display_text = f"{folder_name} - {os.path.basename(file_path)} - {agent_name} ({model_type})"
                 agent_options.append(display_text)
         for i in range(2):
             self.agent_selectors[i].clear()
@@ -567,9 +715,14 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
                 if not selection:
                     raise ValueError(f"Select AI Agent {i+1}")
                 parts = selection.split(" - ")
-                if len(parts) != 3:
+                if len(parts) < 3:
                     raise ValueError("Invalid agent format")
-                folder_name, file_name, agent_name = parts
+                
+                # Handle the model type in parentheses
+                agent_part = parts[2]
+                agent_name = agent_part.split(" (")[0]
+                
+                folder_name, file_name = parts[0], parts[1]
                 file_path_candidates = [p for p in self.loaded_models.keys() if os.path.basename(p) == file_name]
                 if not file_path_candidates:
                     raise ValueError(f"File for {file_name} not found among loaded models.")
@@ -581,7 +734,8 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
                     "obp_model": model_data["obp_model"],
                     "obs_version": model_data["obs_version"],
                     "input_dim": model_data["input_dim"],
-                    "uses_memory": model_data["uses_memory"]
+                    "uses_memory": model_data["uses_memory"],
+                    "is_stacked_model": model_data.get("is_stacked_model", False)
                 }
             return ai_agents
         except Exception as e:
@@ -608,22 +762,18 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
             except Exception:
                 self.previous_results = None
         self.results_text.clear()
-        # Pass two_player_param to the worker.
-        self.worker = BattlegroundWorker(ai_agents, self.historical_models, self.hardcoded_agents, rounds, two_player=two_player_param)
-        self.worker.progress_signal.connect(self.update_progress)
-        self.worker.results_signal.connect(self.display_results)
-        self.worker.expert_signal.connect(self.store_expert_activations)  # Connect to new signal
+        
         # Read cheat checkbox state
         cheat_flag = self.cheat_checkbox.isChecked()
 
         self.worker = BattlegroundWorker(
             ai_agents, self.historical_models, self.hardcoded_agents, rounds,
             two_player=two_player_param,
-            cheat=cheat_flag  # new parameter
+            cheat=cheat_flag
         )
         self.worker.progress_signal.connect(self.update_progress)
         self.worker.results_signal.connect(self.display_results)
-        self.worker.expert_signal.connect(self.store_expert_activations)  # Connect to new signal
+        self.worker.expert_signal.connect(self.store_expert_activations)
         self.worker.error_signal.connect(lambda msg: self.show_info(f"Error: {msg}"))
         self.worker.start()
 

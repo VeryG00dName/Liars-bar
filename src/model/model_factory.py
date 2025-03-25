@@ -57,6 +57,34 @@ class ModelFactory:
         return model
     
     @staticmethod
+    def create_stacked_observation_model(
+        obs_dim: int,
+        num_actions: int, 
+        hidden_dim: int = config.HIDDEN_DIM,
+        num_obs_stack: int = 10
+    ) -> torch.nn.Module:
+        """
+        Creates a StackedObservationConvModel that handles both policy and value functions.
+        
+        Args:
+            obs_dim: Dimension of each observation
+            num_actions: Number of possible actions
+            hidden_dim: Dimension of hidden layers
+            num_obs_stack: Number of historical observations to include in the stack
+            
+        Returns:
+            A StackedObservationConvModel instance
+        """
+        from src.model.models import StackedObservationConvModel
+        model = StackedObservationConvModel(
+            obs_dim=obs_dim,
+            num_actions=num_actions,
+            hidden_dim=hidden_dim,
+            num_obs_stack=num_obs_stack
+        )
+        return model
+    
+    @staticmethod
     def is_moe_policy(state_dict):
         """
         Detects if a policy state dictionary comes from a Mixture of Experts model.

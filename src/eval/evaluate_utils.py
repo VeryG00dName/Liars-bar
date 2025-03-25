@@ -10,9 +10,9 @@ import torch
 import seaborn as sns
 import matplotlib.pyplot as plt
 import pandas as pd
-from collections import defaultdict
+from collections import defaultdict, deque
 from pettingzoo.utils import agent_selector
-
+import torch.nn.functional as F
 # Rich library imports for progress and scoreboard display
 from rich.console import Console
 from rich.table import Table
@@ -796,9 +796,9 @@ def initialize_players(base_dir, device):
 # Unified Evaluation Function
 # ----------------------------
 
-def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournament=False, two_player=None, track_experts=False, progress_callback=None,cheat_expert_index=None):
+def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournament=False, two_player=None, track_experts=False, progress_callback=None, cheat_expert_index=None):
     """
-    Optimized evaluation function with support for MoE models.
+    Optimized evaluation function with support for MoE models and StackedObservationConvModel.
     """
     logger = logging.getLogger("Evaluate")
     player_ids = list(players_in_this_game.keys())
@@ -858,18 +858,20 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                     env.step(None)
                     continue
 
-                observation = env.observe(agent)
-                if isinstance(observation, dict):
-                    observation = observation.get(agent, None)
-                if not isinstance(observation, np.ndarray):
-                    logger.error(f"Unexpected observation type: {type(observation)}")
-                    env.step(None)
-                    continue
-
                 player_id = agent_to_player[agent]
                 player_data = players_in_this_game[player_id]
 
+                # Handle hardcoded bots
                 if player_data.get('hardcoded_bot', False):
+                    # Use standard observation for hardcoded bots
+                    observation = env.observe(agent)
+                    if isinstance(observation, dict):
+                        observation = observation.get(agent, None)
+                    if not isinstance(observation, np.ndarray):
+                        logger.error(f"Unexpected observation type: {type(observation)}")
+                        env.step(None)
+                        continue
+                        
                     mask = info.get('action_mask', [1] * config.OUTPUT_DIM)
                     table_card = getattr(env, 'table_card', None)
                     action = player_data['agent'].play_turn(observation, mask, table_card)
@@ -877,9 +879,65 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                     env.step(action)
                     continue
 
+                # Check if this is a stacked observation model
+                is_stacked_model = player_data.get('is_stacked_model', False)
+                
+                if is_stacked_model:
+                    # For stacked observation models: get new observation format and update stack
+                    observation_dict = env.observe(agent, new=True)
+                    observation = observation_dict[agent]
+                    
+                    # Update observation stack
+                    observation_stack = player_data.get('observation_stacks', deque(maxlen=10))
+                    observation_stack.append(observation)
+                    
+                    # Create stacked observation tensor
+                    stacked_obs = np.array(list(observation_stack), dtype=np.float32)
+                    stacked_obs_tensor = torch.tensor(stacked_obs, dtype=torch.float32, device=device).unsqueeze(0)
+                    
+                    # Get policy and value from model
+                    policy_net = player_data['policy_net']
+                    policy_logits, _ = policy_net(stacked_obs_tensor)
+                    
+                    # Process action probabilities
+                    probs = F.softmax(policy_logits, dim=-1).squeeze(0)
+                    probs = probs.clamp(1e-8, 1.0)
+                    
+                    # Apply action mask
+                    mask = info.get('action_mask', [1] * config.OUTPUT_DIM)
+                    mask_tensor = torch.as_tensor(mask, dtype=torch.float32, device=device)
+                    masked_probs = probs * mask_tensor
+                    
+                    if masked_probs.sum() <= 0:
+                        masked_probs = mask_tensor + 1e-8
+                    masked_probs /= masked_probs.sum()
+                    
+                    # Sample action
+                    action = torch.distributions.Categorical(masked_probs).sample().item()
+                    action_counts[player_id][action] += 1
+                    env.step(action)
+                    continue
+                
+                # Standard model handling (existing code path)
+                # Get appropriate observation format based on version
                 policy_net = player_data['policy_net']
                 obp_model = player_data.get('obp_model', None)
                 version = player_data['obs_version']
+                
+                # Get observation with appropriate format (new=False is default)
+                if version == 3:  # Special case for new format
+                    observation_dict = env.observe(agent, new=True)
+                    observation = observation_dict[agent]
+                else:
+                    observation = env.observe(agent)
+                    if isinstance(observation, dict):
+                        observation = observation.get(agent, None)
+                
+                if not isinstance(observation, np.ndarray):
+                    logger.error(f"Unexpected observation type: {type(observation)}")
+                    env.step(None)
+                    continue
+                
                 converted_obs = adapt_observation_for_version(observation, env.num_players, version)
                 use_tournament = player_tournament_mode[player_id]
                 mem_tensor = None  # To reuse in transformer features
@@ -933,34 +991,25 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                     final_obs_tensor = default_obs_tensor
                     
                     # But we still need memory tensor for expert selection
-                    if mem_tensor_unnorm is not None:
+                    if 'mem_tensor_unnorm' in locals() and mem_tensor_unnorm is not None:
                         # Get the first 5 elements of strategy embedding for classification
                         learning_expert_input = mem_tensor_unnorm.cpu().detach().numpy().flatten()[:5]
                         learning_expert_tensor = torch.tensor(learning_expert_input, dtype=torch.float32, device=device).unsqueeze(0)
                         
                         # Use global transformer classification head
                         with torch.no_grad():
-                            classification_head = global_strategy_transformer.classification_head
-                            expert_logits = classification_head(learning_expert_tensor)
-                            expert_index = expert_logits.argmax(dim=-1).item()
-                            logger.debug(f"Computed expert index {expert_index} (raw: {expert_index}) for MoE model")
-                    # For MoE models, we use only the basic observation.
-                    final_obs_tensor = default_obs_tensor
+                            if 'global_strategy_transformer' in globals():
+                                classification_head = global_strategy_transformer.classification_head
+                                expert_logits = classification_head(learning_expert_tensor)
+                                expert_index = expert_logits.argmax(dim=-1).item()
+                                logger.debug(f"Computed expert index {expert_index} for MoE model")
 
                     # If a cheat expert index is provided, use it instead of computing from the classification head.
                     if cheat_expert_index is not None:
                         expert_index = cheat_expert_index
                         logger.debug(f"Using cheat expert index {expert_index} for MoE model")
-                    else:
-                        if mem_tensor_unnorm is not None:
-                            learning_expert_input = mem_tensor_unnorm.cpu().detach().numpy().flatten()[:5]
-                            learning_expert_tensor = torch.tensor(learning_expert_input, dtype=torch.float32, device=device).unsqueeze(0)
-                            classification_head = global_strategy_transformer.classification_head
-                            expert_logits = classification_head(learning_expert_tensor)
-                            expert_index = expert_logits.argmax(dim=-1).item()
-                            logger.debug(f"Computed expert index {expert_index} (raw: {expert_index}) for MoE model")
-                        else:
-                            expert_index = 0
+                    elif expert_index is None:
+                        expert_index = 0
                 else:
                     # Traditional models might need memory embeddings added to observation
                     if player_data.get('uses_memory', False) and version == 2 and mem_tensor is not None:
@@ -1042,3 +1091,4 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
         return cumulative_wins, action_counts, game_wins_list, avg_steps, steps_per_sec, expert_activations
     else:
         return cumulative_wins, action_counts, game_wins_list, avg_steps, steps_per_sec
+    
