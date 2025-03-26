@@ -19,7 +19,6 @@ from torch.distributions import Categorical
 from collections import defaultdict, deque
 
 # Environment imports
-from src.env.reward_restriction_wrapper_2 import RewardRestrictionWrapper2
 from src.env.liars_deck_env_core import LiarsDeckEnv
 
 # Import StackedObservationConvModel from models instead of separate networks
@@ -217,7 +216,7 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, loa
     action_dim = env.action_spaces[env.agents[0]].n
     
     # Number of historical observations to stack
-    num_obs_stack = 10  # You can adjust this based on your needs
+    num_obs_stack = 50  # You can adjust this based on your needs
     
     # Create shared StackedObservationConvModel for training agents
     # This model handles both policy, value, and opponent classification outputs
@@ -225,8 +224,7 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, loa
         obs_dim=obs_dim,
         num_actions=action_dim,
         hidden_dim=config.HIDDEN_DIM,
-        num_obs_stack=num_obs_stack,
-        num_opponent_classes=config.STRATEGY_NUM_CLASSES
+        num_obs_stack=num_obs_stack
     ).to(device)
     
     # Create dictionary mapping agents to the shared model
@@ -439,8 +437,8 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, loa
                 stacked_obs = np.array(list(observation_stacks[agent]), dtype=np.float32)
                 stacked_obs_tensor = torch.tensor(stacked_obs, dtype=torch.float32, device=device).unsqueeze(0)
                 
-                # Get policy, value, and opponent classification outputs
-                policy_logits, state_value, opponent_logits = models[agent](stacked_obs_tensor)
+                # Get policy, value
+                policy_logits, state_value = models[agent](stacked_obs_tensor)
                 
                 # Process action probabilities
                 probs = F.softmax(policy_logits, dim=-1).squeeze(0)
@@ -576,8 +574,6 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, loa
                 returns_ = torch.tensor(np.array(memory.returns[agent], dtype=np.float32), device=device)
                 advantages_ = torch.tensor(np.array(memory.advantages[agent], dtype=np.float32), device=device)
                 action_masks_ = torch.tensor(np.array(memory.action_masks[agent], dtype=np.float32), device=device)
-                # Get opponent labels from memory
-                opponent_labels = torch.tensor(np.array(memory.expert_inputs[agent], dtype=np.int64), device=device)
                 
                 adv_std = advantages_.std()
                 if adv_std < 1e-5:
@@ -591,11 +587,10 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, loa
                 value_losses = []
                 entropies = []
                 opponent_loss_values = []
-                opponent_accuracies = []
                 
                 for _ in range(config.K_EPOCHS):
                     # Forward pass through the combined model to get all outputs
-                    policy_logits, state_values, opponent_logits = models[agent](states)
+                    policy_logits, state_values = models[agent](states)
                     
                     probs = F.softmax(policy_logits, dim=-1)
                     probs = torch.clamp(probs, 1e-8, 1.0)
@@ -625,21 +620,12 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, loa
                     state_values = state_values.squeeze(-1)
                     value_loss = nn.MSELoss()(state_values, returns_)
                     
-                    # Calculate opponent classification loss
-                    opponent_loss = F.cross_entropy(opponent_logits, opponent_labels)
-                    
-                    # Calculate accuracy metrics for logging
-                    opponent_preds = torch.argmax(opponent_logits, dim=1)
-                    opponent_accuracy = (opponent_preds == opponent_labels).float().mean()
-                    
-                    # Updated combined loss with auxiliary opponent classification loss
-                    total_loss = policy_loss + 0.5 * value_loss + config.AUX_LOSS_WEIGHT * opponent_loss
+                    # Updated combined loss
+                    total_loss = policy_loss + 0.5 * value_loss
                     
                     policy_losses.append(policy_loss.item())
                     value_losses.append(value_loss.item())
                     entropies.append(entropy.item())
-                    opponent_loss_values.append(opponent_loss.item())
-                    opponent_accuracies.append(opponent_accuracy.item())
                     
                     # Backpropagation
                     optimizers[agent].zero_grad()
@@ -664,7 +650,6 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, loa
                     writer.add_scalar(f"KL_Divergence/{agent}", np.mean(kl_divs), episode)
                     writer.add_scalar(f"Gradient_Norms/{agent}", np.mean(grad_norms), episode)
                     writer.add_scalar(f"Loss/Opponent/{agent}", np.mean(opponent_loss_values), episode)
-                    writer.add_scalar(f"Accuracy/Opponent/{agent}", np.mean(opponent_accuracies), episode)
             
             for agent in training_agents:
                 memories[agent].reset()
@@ -740,11 +725,8 @@ def train_curriculum(env, device, num_episodes=10000, load_checkpoint=False, loa
 def main():
     set_seed(config.SEED)
     device = torch.device(config.DEVICE)
-    if config.USE_WRAPPER:
-        base_env = LiarsDeckEnv(num_players=config.NUM_PLAYERS, render_mode=config.RENDER_MODE)
-        env = RewardRestrictionWrapper2(base_env)
-    else:
-        env = LiarsDeckEnv(num_players=config.NUM_PLAYERS, render_mode=config.RENDER_MODE)
+
+    env = LiarsDeckEnv(num_players=config.NUM_PLAYERS, render_mode=config.RENDER_MODE)
     
     logger = configure_logger()
     
