@@ -19,7 +19,8 @@ from src.env.liars_deck_env_utils_2 import (
 from src.env.liars_deck_env_utils import (
     apply_action,
     get_observations,
-    get_new_observations
+    get_new_observations,
+    get_newer_observations
 )
 
 
@@ -117,6 +118,9 @@ class LiarsDeckEnv(AECEnv):
         self._agent_selector = None
         self.rewards = {}
 
+        # Initialize tracking for newer observations
+        self.last_challenge_success = None  # Track outcome of the last challenge
+        
         self.last_agent_action = {agent: None for agent in self.possible_agents}
         self.consecutive_action_count = {agent: 0 for agent in self.possible_agents}
 
@@ -130,13 +134,16 @@ class LiarsDeckEnv(AECEnv):
     def observation_space(self, agent):
         return self.observation_spaces[agent]
 
-    def observe(self, agent, new=False):
+    def observe(self, agent, new=False, newer=False):
         """
         Generates the observation for the agent.
         If new=True, it uses the new observation construction.
+        If newer=True, it uses the newer observation that focuses on action history.
         In addition to the observation vector, it attaches an "action_mask" in the infos.
         """
-        if new:
+        if newer:
+            obs_dict = get_newer_observations(self, agent_specific=agent)
+        elif new:
             obs_dict = get_new_observations(self, agent_specific=agent)
         else:
             obs_dict = get_observations(self, agent_specific=agent)
@@ -220,6 +227,9 @@ class LiarsDeckEnv(AECEnv):
         self.infos = {agent: {} for agent in self.possible_agents}
         self._cumulative_rewards = {agent: 0.0 for agent in self.agents}
 
+        # Reset tracking for newer observations
+        self.last_challenge_success = None
+        
         # Reset table_card at the start of each episode
         self.table_card = random.choice(["King", "Queen", "Ace"])
         self.logger.debug(f"Resetting environment. Initial table_card: {self.table_card}")
@@ -267,7 +277,6 @@ class LiarsDeckEnv(AECEnv):
         for agent in self.possible_agents:
             self.last_agent_action[agent] = None
             self.consecutive_action_count[agent] = 0
-
         random.shuffle(eligible_agents)
         self.agents = eligible_agents
         self._agent_selector = agent_selector(self.agents)
