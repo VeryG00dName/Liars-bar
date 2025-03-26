@@ -32,16 +32,17 @@ def test_observation_dependency(model, env, num_tests=50):
         "value_differences": [],
         "prob_distances": [],
         "actions_with_history": [],
-        "actions_without_history": []
+        "actions_without_history": [],
+        "real_gate_weights": [],
+        "fake_gate_weights": []
     }
     
-    # Run the test
     print(f"Running observation history dependency test ({num_tests} iterations)...")
     env.reset()
     
     observation_stack = deque(maxlen=50)  # Assume max stack size of 50
     
-    # Pre-fill with zeros
+    # Pre-fill with zeros based on the first observation
     sample_obs = env.observe('player_0', new=True)['player_0']
     for _ in range(50):
         observation_stack.append(np.zeros_like(sample_obs))
@@ -49,11 +50,17 @@ def test_observation_dependency(model, env, num_tests=50):
     tests_completed = 0
     
     while tests_completed < num_tests:
+        # Check if the game has ended (agent_selection is None) and reset if needed.
+        if env.agent_selection is None:
+            env.reset()
+            continue
+
+        agent = env.agent_selection
+        
         # Only test when it's player_0's turn
-        if env.agent_selection != 'player_0':
+        if agent != 'player_0':
             # Take random valid action for other agents
-            agent = env.agent_selection
-            mask = env.infos[agent].get('action_mask', [1, 1, 1, 1, 1, 1, 1])
+            mask = env.infos.get(agent, {}).get('action_mask', [1, 1, 1, 1, 1, 1, 1])
             valid_actions = [i for i, m in enumerate(mask) if m == 1]
             action = np.random.choice(valid_actions) if valid_actions else 0
             env.step(action)
@@ -65,37 +72,39 @@ def test_observation_dependency(model, env, num_tests=50):
         observation_stack.append(current_obs.copy())
         
         # Get action mask
-        mask = env.infos['player_0'].get('action_mask', [1, 1, 1, 1, 1, 1, 1])
+        mask = env.infos.get('player_0', {}).get('action_mask', [1, 1, 1, 1, 1, 1, 1])
         mask_tensor = torch.tensor(mask, dtype=torch.float32, device=device)
         
         # Create two different observation stacks:
         # 1. Real history
         real_history = list(observation_stack)
         real_tensor = torch.tensor(
-            np.array(real_history), 
-            dtype=torch.float32, 
+            np.array(real_history),
+            dtype=torch.float32,
             device=device
         ).unsqueeze(0)
         
         # 2. Current observation repeated
-        fake_history = [current_obs.copy() for _ in range(len(observation_stack))]
+        fake_history = [
+            current_obs.copy() if i == len(observation_stack) - 1 else np.zeros_like(current_obs)
+            for i in range(len(observation_stack))
+        ]
         fake_tensor = torch.tensor(
-            np.array(fake_history), 
-            dtype=torch.float32, 
+            np.array(fake_history),
+            dtype=torch.float32,
             device=device
         ).unsqueeze(0)
         
-        # Run both through the model
         with torch.no_grad():
             # With real history
-            real_policy, real_value, _ = model(real_tensor)
+            real_policy, real_value, _, real_gate = model(real_tensor)
             real_probs = F.softmax(real_policy, dim=-1).squeeze(0)
             real_masked_probs = real_probs * mask_tensor
             if real_masked_probs.sum() > 0:
                 real_masked_probs = real_masked_probs / real_masked_probs.sum()
             
             # With fake history
-            fake_policy, fake_value, _ = model(fake_tensor)
+            fake_policy, fake_value, _, fake_gate = model(fake_tensor)
             fake_probs = F.softmax(fake_policy, dim=-1).squeeze(0)
             fake_masked_probs = fake_probs * mask_tensor
             if fake_masked_probs.sum() > 0:
@@ -107,12 +116,15 @@ def test_observation_dependency(model, env, num_tests=50):
             
             # Calculate KL divergence between probability distributions
             kl_div = F.kl_div(
-                real_masked_probs.log(), 
+                real_masked_probs.log(),
                 fake_masked_probs,
                 reduction='sum'
             ).item()
             
-            # Track metrics
+            # Store the gate weights
+            results["real_gate_weights"].append(real_gate.squeeze(0).cpu().numpy())
+            results["fake_gate_weights"].append(fake_gate.squeeze(0).cpu().numpy())
+            
             results["action_match_rate"] += int(real_action == fake_action)
             results["value_differences"].append(abs(real_value.item() - fake_value.item()))
             results["prob_distances"].append(kl_div)
@@ -121,7 +133,6 @@ def test_observation_dependency(model, env, num_tests=50):
         
         # Take action in environment using real history
         env.step(real_action)
-        
         tests_completed += 1
         if tests_completed % 10 == 0:
             print(f"Completed {tests_completed}/{num_tests} tests")
@@ -131,29 +142,100 @@ def test_observation_dependency(model, env, num_tests=50):
     avg_value_diff = np.mean(results["value_differences"])
     avg_prob_distance = np.mean(results["prob_distances"])
     
+    # Calculate average gate weights
+    real_gate_weights = np.array(results["real_gate_weights"])
+    fake_gate_weights = np.array(results["fake_gate_weights"])
+    
+    avg_real_gate = np.mean(real_gate_weights, axis=0)
+    avg_fake_gate = np.mean(fake_gate_weights, axis=0)
+    
     print("\n=== Observation History Test Results ===")
     print(f"Action match rate: {match_rate:.2f}")
     print(f"Average value difference: {avg_value_diff:.4f}")
     print(f"Average probability distance: {avg_prob_distance:.4f}")
+    print(f"Average gate weights with history: Head 1 = {avg_real_gate[0]:.4f}, Head 2 = {avg_real_gate[1]:.4f}")
+    print(f"Average gate weights without history: Head 1 = {avg_fake_gate[0]:.4f}, Head 2 = {avg_fake_gate[1]:.4f}")
     
     # Plot action distributions
-    plt.figure(figsize=(10, 6))
-    plt.subplot(1, 2, 1)
+    plt.figure(figsize=(15, 10))
+    
+    plt.subplot(2, 2, 1)
     plt.hist(results["actions_with_history"], bins=7, alpha=0.7, label="With History")
     plt.title("Actions with History")
     plt.xlabel("Action")
     plt.ylabel("Frequency")
     
-    plt.subplot(1, 2, 2)
+    plt.subplot(2, 2, 2)
     plt.hist(results["actions_without_history"], bins=7, alpha=0.7, label="Without History")
     plt.title("Actions without History")
     plt.xlabel("Action")
     plt.ylabel("Frequency")
     
+    # Plot gate weights distribution
+    plt.subplot(2, 2, 3)
+    plt.hist(real_gate_weights[:, 0], bins=20, alpha=0.7, label="Head 1")
+    plt.hist(real_gate_weights[:, 1], bins=20, alpha=0.7, label="Head 2")
+    plt.title("Gate Weights Distribution with History")
+    plt.xlabel("Gate Weight")
+    plt.ylabel("Frequency")
+    plt.legend()
+    
+    plt.subplot(2, 2, 4)
+    plt.hist(fake_gate_weights[:, 0], bins=20, alpha=0.7, label="Head 1")
+    plt.hist(fake_gate_weights[:, 1], bins=20, alpha=0.7, label="Head 2")
+    plt.title("Gate Weights Distribution without History")
+    plt.xlabel("Gate Weight")
+    plt.ylabel("Frequency")
+    plt.legend()
+    
     plt.tight_layout()
     plt.show()
     
-    # Interpretation
+    # Plot gate weights over time
+    plt.figure(figsize=(12, 6))
+    x = range(len(real_gate_weights))
+    
+    plt.subplot(1, 2, 1)
+    plt.plot(x, real_gate_weights[:, 0], label="Head 1")
+    plt.plot(x, real_gate_weights[:, 1], label="Head 2")
+    plt.title("Gate Weights Over Time with History")
+    plt.xlabel("Test Number")
+    plt.ylabel("Gate Weight")
+    plt.legend()
+    plt.grid(True)
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(x, fake_gate_weights[:, 0], label="Head 1")
+    plt.plot(x, fake_gate_weights[:, 1], label="Head 2")
+    plt.title("Gate Weights Over Time without History")
+    plt.xlabel("Test Number")
+    plt.ylabel("Gate Weight")
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Create pie charts for average gate usage
+    plt.figure(figsize=(12, 5))
+    
+    plt.subplot(1, 2, 1)
+    plt.pie([avg_real_gate[0], avg_real_gate[1]], 
+            labels=["Head 1", "Head 2"],
+            autopct='%1.1f%%',
+            startangle=90)
+    plt.title("Average Gate Usage with History")
+    
+    plt.subplot(1, 2, 2)
+    plt.pie([avg_fake_gate[0], avg_fake_gate[1]], 
+            labels=["Head 1", "Head 2"],
+            autopct='%1.1f%%',
+            startangle=90)
+    plt.title("Average Gate Usage without History")
+    
+    plt.tight_layout()
+    plt.show()
+    
     if match_rate > 0.9:
         print("\nDIAGNOSIS: The model does not use observation history effectively.")
         print("It produces nearly identical actions with or without historical context.")
@@ -164,14 +246,20 @@ def test_observation_dependency(model, env, num_tests=50):
         print("\nDIAGNOSIS: The model effectively uses observation history.")
         print("Actions differ significantly with vs. without historical context.")
     
+    print("\nGATE ACTIVATION ANALYSIS:")
+    if np.abs(avg_real_gate[0] - avg_fake_gate[0]) < 0.1:
+        print("The model uses similar gate activation patterns with or without history.")
+    else:
+        print("Gate activation patterns differ significantly based on history presence.")
+        head_with_history = 1 if avg_real_gate[0] < 0.5 else 2
+        head_without_history = 1 if avg_fake_gate[0] < 0.5 else 2
+        print(f"The model prefers Head {head_with_history} with history and Head {head_without_history} without history.")
+    
     return results
 
 def main():
-    # Set device
     device = torch.device(config.DEVICE)
     
-    # Build the checkpoint path.
-    # Use the directory from config.DEFAULT_CHECKPOINT_PATH but with the filename "checkpoint_episode_3000.pth"
     checkpoint_dir = os.path.dirname(config.DEFAULT_CHECKPOINT_PATH)
     checkpoint_path = os.path.join(checkpoint_dir, "checkpoint_episode_3000.pth")
     print(f"Loading checkpoint from: {checkpoint_path}")
@@ -179,18 +267,16 @@ def main():
     # Load the checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
-    # Create an instance of OpponentConditionalModel
-    from src.model.models import OpponentConditionalModel
-    model = OpponentConditionalModel(
+    # Create an instance of the modified StackedObservationConvModel
+    from src.model.models import StackedObservationConvModel
+    model = StackedObservationConvModel(
         obs_dim=9,
         num_actions=config.OUTPUT_DIM,
         hidden_dim=config.HIDDEN_DIM,
         num_obs_stack=50,         # Assuming 50 observations in history
-        num_opponent_classes=10    # Default number of opponent classes
     )
     
-    # Load the state dict from the checkpoint.
-    # Check if the checkpoint contains "model_state_dict", otherwise check for "policy_nets".
+    # Load the model state from either "model_state_dict" or "policy_nets"
     if isinstance(checkpoint, dict):
         if "model_state_dict" in checkpoint:
             model.load_state_dict(checkpoint["model_state_dict"])
