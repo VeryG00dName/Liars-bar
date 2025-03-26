@@ -1,4 +1,5 @@
-# src/training/train_stack.py
+# src/training/train_stack_everyone.py
+# Modified to use prioritized replay buffer
 
 import logging
 import time
@@ -24,7 +25,8 @@ from src.env.liars_deck_env_core import LiarsDeckEnv
 # Import StackedObservationConvModel from models instead of separate networks
 from src.model.models import StackedObservationConvModel
 from src.model.other_models import StrategyTransformer
-from src.model.memory import RolloutMemory
+# Import our new PrioritizedReplayBuffer instead of RolloutMemory
+from src.model.memory import PrioritizedReplayBuffer
 from src import config
 
 # Import our hard-coded agent classes
@@ -61,6 +63,7 @@ torch.backends.cudnn.benchmark = True
 # Set device
 device = torch.device(config.DEVICE)
 
+# Scoring parameters (unchanged)
 tuned_scoring_params_for_8 = {
     "play_reward_per_card": 0,
     "play_reward": 1,
@@ -126,6 +129,25 @@ def get_opponent_label(opponent_name, historical_label_mapping):
     else:
         return historical_label_mapping.get(opponent_name, 0)
 
+# Calculate TD errors for prioritization
+def calculate_td_errors(states, actions, rewards, next_states, dones, gamma, model):
+    with torch.no_grad():
+        # Get current Q-values
+        _, state_values, _ = model(states)
+        state_values = state_values.squeeze(-1)
+        
+        # Get next state values
+        _, next_state_values, _ = model(next_states)
+        next_state_values = next_state_values.squeeze(-1)
+        
+        # Calculate target values
+        target_values = rewards + gamma * next_state_values * (1 - dones)
+        
+        # Calculate TD errors
+        td_errors = target_values - state_values
+        
+    return td_errors.abs().cpu().numpy()
+
 def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint=False, load_directory=None, log_tensorboard=True, opponent_swap_interval=20):
     set_seed(config.SEED)
     obs, infos = env.reset(seed=config.SEED)
@@ -180,8 +202,15 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
     # Create optimizer for the model
     optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
     
-    # Memory for the training agent
-    memory = RolloutMemory([training_agent])
+    # Replace RolloutMemory with PrioritizedReplayBuffer
+    # Configure the buffer with appropriate capacity and hyperparameters
+    memory = PrioritizedReplayBuffer(
+        agents=[training_agent],
+        capacity=50000,  # Larger capacity for off-policy learning
+        alpha=0.6,       # Priority exponent
+        beta=0.4,        # Initial importance sampling correction
+        beta_increment=0.0001  # Gradually increase beta to 1
+    )
     
     # Observation stack for the training agent (to maintain history)
     observation_stack = deque(maxlen=num_obs_stack)
@@ -340,8 +369,15 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
     wins = 0
     games = 0
     
+    # Track accuracies for opponent classification
     opponent1_accuracies = deque(maxlen=100)
     opponent2_accuracies = deque(maxlen=100)
+    
+    # Hyperparameters for prioritized replay
+    batch_size = 2560
+    min_buffer_size = 1000  # Minimum buffer size before starting training
+    update_freq = 400         # Update network every N steps
+    total_steps = 0         # Counter for total steps
     
     # Main training loop
     for episode in range(start_episode, num_episodes + 1):
@@ -413,10 +449,10 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
         
         episode_rewards = {agent: 0 for agent in agents}
         steps_in_episode = 0
-        
         # Run a single episode
         while env.agent_selection is not None:
             steps_in_episode += 1
+            total_steps += 1
             agent = env.agent_selection
             
             if env.terminations[agent] or env.truncations[agent]:
@@ -548,7 +584,7 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
                         opponent1_label = current_opponents["player_1"]["label"]
                         opponent2_label = current_opponents["player_2"]["label"]
                         
-                        # Store transition including both opponent labels
+                        # Store transition in prioritized replay buffer
                         memory.store_transition(
                             agent=ag,
                             state=np.array(list(observation_stack)),
@@ -561,69 +597,29 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
                             expert_input=(opponent1_label, opponent2_label)  # Store both opponent labels
                         )
                     episode_rewards[ag] += reward
-        
-        # Track rewards and wins for logging
-        recent_rewards.append(episode_rewards[training_agent])
-        if len(recent_rewards) > 100:
-            recent_rewards.pop(0)
-        
-        # Track win/loss statistics
-        games += 1
-        winner = env.winner
-        if winner == training_agent:
-            wins += 1
-        
-        # PPO Update
-        if episode % config.UPDATE_STEPS == 0:
-            if not memory.states[training_agent]:
-                logger.warning(f"Skipping PPO update because memory is empty.")
-                continue
+            
+            # Update the model using prioritized replay
+            if agent == training_agent and total_steps % update_freq == 0 and memory.is_ready(training_agent, min_buffer_size):
+                # Sample a batch of transitions
+                batch, indices, importance_weights = memory.sample(training_agent, batch_size)
                 
-            rewards_agent = memory.rewards[training_agent]
-            dones_agent = memory.is_terminals[training_agent]
-            values_agent = memory.state_values[training_agent]
-            next_values_agent = values_agent[1:] + [0]
-            mean_reward = np.mean(rewards_agent)
-            std_reward = np.std(rewards_agent) + 1e-5
-            normalized_rewards = (np.array(rewards_agent) - mean_reward) / std_reward
-            advantages, returns_ = compute_gae(
-                rewards=normalized_rewards,
-                dones=dones_agent,
-                values=values_agent,
-                next_values=next_values_agent,
-                gamma=config.GAMMA,
-                lam=config.GAE_LAMBDA,
-            )
-            memory.advantages[training_agent] = advantages
-            memory.returns[training_agent] = returns_
-            
-            states = torch.tensor(np.array(memory.states[training_agent], dtype=np.float32), device=device)
-            actions_ = torch.tensor(np.array(memory.actions[training_agent], dtype=np.int64), device=device)
-            old_log_probs = torch.tensor(np.array(memory.log_probs[training_agent], dtype=np.float32), device=device)
-            returns_ = torch.tensor(np.array(memory.returns[training_agent], dtype=np.float32), device=device)
-            advantages_ = torch.tensor(np.array(memory.advantages[training_agent], dtype=np.float32), device=device)
-            action_masks_ = torch.tensor(np.array(memory.action_masks[training_agent], dtype=np.float32), device=device)
-            
-            # Get opponent labels from memory and separate them
-            opponent_labels = memory.expert_inputs[training_agent]
-            opponent1_labels = torch.tensor([label[0] for label in opponent_labels], dtype=torch.int64, device=device)
-            opponent2_labels = torch.tensor([label[1] for label in opponent_labels], dtype=torch.int64, device=device)
-            
-            adv_std = advantages_.std()
-            if adv_std < 1e-5:
-                normalized_advantages = advantages_
-            else:
-                normalized_advantages = (advantages_ - advantages_.mean()) / (adv_std + 1e-5)
-            
-            kl_divs = []
-            grad_norms = []
-            policy_losses = []
-            value_losses = []
-            entropies = []
-            opponent1_loss_values = []
-            opponent2_loss_values = []
-            
-            for _ in range(config.K_EPOCHS):
+                if batch:
+                    # Prepare batch data
+                    states = torch.tensor(np.array([t.state for t in batch], dtype=np.float32), device=device)
+                    actions = torch.tensor(np.array([t.action for t in batch], dtype=np.int64), device=device)
+                    old_log_probs = torch.tensor(np.array([t.log_prob for t in batch], dtype=np.float32), device=device)
+                    rewards = torch.tensor(np.array([t.reward for t in batch], dtype=np.float32), device=device)
+                    dones = torch.tensor(np.array([t.is_terminal for t in batch], dtype=np.float32), device=device)
+                    action_masks = torch.tensor(np.array([t.action_mask for t in batch], dtype=np.float32), device=device)
+                    
+                    # Get opponent labels
+                    opponent_labels = [t.expert_input for t in batch]
+                    opponent1_labels = torch.tensor([label[0] for label in opponent_labels], dtype=torch.int64, device=device)
+                    opponent2_labels = torch.tensor([label[1] for label in opponent_labels], dtype=torch.int64, device=device)
+                    
+                    # Importance sampling weights
+                    importance_weights = torch.tensor(importance_weights, dtype=torch.float32, device=device)
+                    
                     # Forward pass through the model to get all outputs
                     policy_logits, state_values, opponent_logits = model(states)
                     opponent1_logits, opponent2_logits = opponent_logits
@@ -639,11 +635,12 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
                         # Clamp labels to valid range as a failsafe
                         opponent2_labels = torch.clamp(opponent2_labels, 0, opponent2_logits.size(1) - 1)
                     
+                    # Process action probabilities with masks
                     probs = F.softmax(policy_logits, dim=-1)
                     probs = torch.clamp(probs, 1e-8, 1.0)
                     
-                    # Adjust for action masks
-                    masked_probs = probs * action_masks_
+                    # Apply action masks
+                    masked_probs = probs * action_masks
                     row_sums = masked_probs.sum(dim=-1, keepdim=True)
                     masked_probs = torch.where(
                         row_sums > 0,
@@ -651,14 +648,29 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
                         torch.ones_like(masked_probs) / masked_probs.shape[1]
                     )
                     
-                    m = Categorical(masked_probs)
-                    new_log_probs = m.log_prob(actions_)
-                    entropy = m.entropy().mean()
+                    # Create categorical distributions and get log probs
+                    dists = [Categorical(p) for p in masked_probs]
+                    new_log_probs = torch.stack([dist.log_prob(act) for dist, act in zip(dists, actions)])
+                    
+                    # Calculate entropy
+                    entropy = torch.mean(torch.stack([dist.entropy() for dist in dists]))
+                    
+                    # Calculate KL divergence
                     kl_div = torch.mean(old_log_probs - new_log_probs)
-                    kl_divs.append(kl_div.item())
                     
                     # Calculate ratios for Trinal-Clip PPO
                     ratios = torch.exp(new_log_probs - old_log_probs)
+                    
+                    # Normalize rewards
+                    mean_reward = rewards.mean()
+                    std_reward = rewards.std() + 1e-5
+                    normalized_rewards = (rewards - mean_reward) / std_reward
+                    
+                    # Calculate advantages (simplified for off-policy)
+                    advantages = normalized_rewards - state_values.squeeze(-1)
+                    
+                    # Apply importance sampling weights to advantages
+                    weighted_advantages = advantages * importance_weights
                     
                     # First level clipping as in standard PPO
                     clipped_ratios = torch.clamp(ratios, 1 - config.EPS_CLIP, 1 + config.EPS_CLIP)
@@ -667,13 +679,13 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
                     # This applies when advantages are negative
                     delta1 = 3.0  # Upper bound for negative advantage clipping
                     trinal_clipped_ratios = torch.where(
-                        normalized_advantages < 0,
+                        weighted_advantages < 0,
                         torch.clamp(clipped_ratios, max=delta1),  # Apply upper bound delta1 for negative advantages
                         clipped_ratios
                     )
                     
                     # Compute policy loss with trinal clipping
-                    surrogate_loss = trinal_clipped_ratios * normalized_advantages
+                    surrogate_loss = trinal_clipped_ratios * weighted_advantages
                     policy_loss = -torch.mean(surrogate_loss) - static_entropy_coef * entropy
                     
                     # Get dynamic value bounds from environment scoring parameters
@@ -681,12 +693,12 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
                     delta2 = -20.0  # Lower bound for returns clipping
                     delta3 = 20.0   # Upper bound for returns clipping
                     
-                    # Value loss with clipped returns
+                    # Value loss with clipped rewards
                     state_values = state_values.squeeze(-1)
-                    clipped_returns = torch.clamp(returns_, delta2, delta3)
-                    value_loss = nn.MSELoss()(state_values, clipped_returns)
+                    clipped_rewards = torch.clamp(normalized_rewards, delta2, delta3)
+                    value_loss = F.mse_loss(state_values, clipped_rewards)
                     
-                    # Calculate opponent classification losses separately for each opponent
+                    # Calculate opponent classification losses
                     opponent1_loss = F.cross_entropy(opponent1_logits, opponent1_labels)
                     opponent2_loss = F.cross_entropy(opponent2_logits, opponent2_labels)
                     
@@ -699,42 +711,51 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
                     # Combined loss with auxiliary opponent classification losses
                     total_loss = policy_loss + 0.5 * value_loss + config.AUX_LOSS_WEIGHT * (opponent1_loss + opponent2_loss)
                     
-                    policy_losses.append(policy_loss.item())
-                    value_losses.append(value_loss.item())
-                    entropies.append(entropy.item())
-                    opponent1_loss_values.append(opponent1_loss.item())
-                    opponent2_loss_values.append(opponent2_loss.item())
-                    opponent1_accuracies.append(opponent1_accuracy.item())
-                    opponent2_accuracies.append(opponent2_accuracy.item())
-                    
                     # Backpropagation
                     optimizer.zero_grad()
                     total_loss.backward()
-                    
-                    # Calculate gradient norm
-                    grad_norm = sum(param.grad.data.norm(2).item() ** 2
-                                    for param in model.parameters()
-                                    if param.grad is not None) ** 0.5
-                    grad_norms.append(grad_norm)
                     
                     # Clip gradients
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.MAX_NORM)
                     
                     # Update parameters
                     optimizer.step()
-            
-            if writer is not None:
-                writer.add_scalar(f"Loss/Policy", np.mean(policy_losses), episode)
-                writer.add_scalar(f"Loss/Value", np.mean(value_losses), episode)
-                writer.add_scalar(f"Entropy", np.mean(entropies), episode)
-                writer.add_scalar(f"KL_Divergence", np.mean(kl_divs), episode)
-                writer.add_scalar(f"Gradient_Norms", np.mean(grad_norms), episode)
-                writer.add_scalar(f"Loss/Opponent1", np.mean(opponent1_loss_values), episode)
-                writer.add_scalar(f"Loss/Opponent2", np.mean(opponent2_loss_values), episode)
-                writer.add_scalar(f"Accuracy/Opponent1", np.mean(opponent1_accuracies), episode)
-                writer.add_scalar(f"Accuracy/Opponent2", np.mean(opponent2_accuracies), episode)
-            
-            memory.reset()
+                    
+                    # Calculate TD errors for priority updates
+                    with torch.no_grad():
+                        # For simplicity, we'll use the difference between expected values and actual rewards
+                        td_errors = (normalized_rewards - state_values).abs().cpu().numpy()
+                    
+                    # Update priorities in the replay buffer
+                    memory.update_priorities(training_agent, indices, td_errors)
+                    
+                    # Log opponent classification accuracies
+                    opponent1_accuracies.append(opponent1_accuracy.item())
+                    opponent2_accuracies.append(opponent2_accuracy.item())
+                    
+                    # Log to tensorboard if enabled
+                    if writer is not None and total_steps % 1000 == 0:
+                        writer.add_scalar(f"Loss/Policy", policy_loss.item(), total_steps)
+                        writer.add_scalar(f"Loss/Value", value_loss.item(), total_steps)
+                        writer.add_scalar(f"Entropy", entropy.item(), total_steps)
+                        writer.add_scalar(f"KL_Divergence", kl_div.item(), total_steps)
+                        writer.add_scalar(f"Loss/Opponent1", opponent1_loss.item(), total_steps) 
+                        writer.add_scalar(f"Loss/Opponent2", opponent2_loss.item(), total_steps)
+                        writer.add_scalar(f"Accuracy/Opponent1", opponent1_accuracy.item(), total_steps)
+                        writer.add_scalar(f"Accuracy/Opponent2", opponent2_accuracy.item(), total_steps)
+                        writer.add_scalar(f"Buffer/Size", memory.size(training_agent), total_steps)
+                        writer.add_scalar(f"Beta", memory.beta, total_steps)
+        
+        # Track rewards and wins for logging
+        recent_rewards.append(episode_rewards[training_agent])
+        if len(recent_rewards) > 100:
+            recent_rewards.pop(0)
+        
+        # Track win/loss statistics
+        games += 1
+        winner = env.winner
+        if winner == training_agent:
+            wins += 1
         
         if episode % config.CHECKPOINT_INTERVAL == 0:
             save_checkpoint(
@@ -765,6 +786,9 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
                 f"Opponents: player_1={current_opponents['player_1']['name']}, player_2={current_opponents['player_2']['name']} | "
                 f"Win Rate: {win_rate:.2f} ({wins}/{games}) | "
                 f"Avg Reward: {avg_reward:.2f} | "
+                f"Buffer Size: {memory.size(training_agent)} | "
+                f"Opp1 Accuracy: {np.mean(opponent1_accuracies):.2f} | "
+                f"Opp2 Accuracy: {np.mean(opponent2_accuracies):.2f} | "
                 f"Steps/s: {steps_per_second:.2f}"
             )
             
