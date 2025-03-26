@@ -126,34 +126,6 @@ def get_opponent_label(opponent_name, historical_label_mapping):
     else:
         return historical_label_mapping.get(opponent_name, 0)
 
-def apply_temporal_dropout(observation_stack, dropout_rate=0.3, recent_bias=True):
-    """
-    Apply temporal dropout to force the model to use full history.
-    Instead of using dropout_rate and recent_bias, this version finds the most recent
-    non-zero observation in each batch element and zeroes it out.
-
-    Args:
-        observation_stack: Tensor of shape [batch_size, seq_len, obs_dim]
-        dropout_rate: Unused, maintained for compatibility.
-        recent_bias: Unused, maintained for compatibility.
-
-    Returns:
-        Modified observation stack with the last non-zero observation zeroed out.
-    """
-    batch_size, seq_len, obs_dim = observation_stack.shape
-    mask = torch.ones_like(observation_stack)
-    
-    # Loop over each element in the batch
-    for b in range(batch_size):
-        # Iterate over time steps in reverse order to find the most recent valid observation
-        for i in range(seq_len - 1, -1, -1):
-            # Check if the observation is non-zero
-            if torch.sum(torch.abs(observation_stack[b, i, :])) > 0:
-                mask[b, i, :] = 0  # Zero out the most recent valid observation
-                break  # Stop after finding the most recent valid observation
-                
-    return observation_stack * mask
-
 def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint=False, load_directory=None, log_tensorboard=True, opponent_swap_interval=20):
     set_seed(config.SEED)
     obs, infos = env.reset(seed=config.SEED)
@@ -258,7 +230,7 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
         for agent_name in opponent_agents:
             opponent = {
                 "name": opponent_name,
-                "class": opponent_class,  # Store the class, not an instance
+                "class": opponent_class,
                 "agent_name": agent_name,
                 "type": "hardcoded",
                 "label": opponent_label
@@ -271,7 +243,7 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
         for agent_name in opponent_agents:
             opponent = {
                 "name": identifier,
-                "instance": model_instance,  # Already instantiated
+                "instance": model_instance,
                 "agent_name": agent_name,
                 "type": "historical",
                 "label": label
@@ -382,14 +354,26 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
         if episode % opponent_swap_interval == 0:
             # Choose random opponent agent to replace
             agent_to_replace = np.random.choice(opponent_agents)
-            # If player_2, restrict the available opponents
             if agent_to_replace == "player_2":
+                # For player_2, allowed hardcoded opponents
                 allowed_names = {"Classic", "GreedyCardSpammer", "StrategicChallenger"}
                 filtered_opponents = [
                     opp for opp in available_opponents 
                     if opp["type"] == "hardcoded" and opp["name"] in allowed_names
                 ]
                 opponent_config = random.choice(filtered_opponents)
+            elif agent_to_replace == "player_1":
+                # For player_1, allowed opponents can be both hardcoded and historical
+                allowed_names = {"TableFirstConservativeChallenger", "TableNonTableAgent", "Version_A_player_2", "Version_C_player_0", "Version_E_player_1"}
+                filtered_opponents = [
+                    opp for opp in available_opponents 
+                    if opp["name"] in allowed_names
+                ]
+                if not filtered_opponents:
+                    opponent_idx = np.random.randint(0, len(available_opponents))
+                    opponent_config = available_opponents[opponent_idx]
+                else:
+                    opponent_config = random.choice(filtered_opponents)
             else:
                 opponent_idx = np.random.randint(0, len(available_opponents))
                 opponent_config = available_opponents[opponent_idx]
@@ -640,89 +624,104 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
             opponent2_loss_values = []
             
             for _ in range(config.K_EPOCHS):
-                # Forward pass through the model to get all outputs
-
-                modified_states = apply_temporal_dropout(states, dropout_rate=0.3)
-
-                
-                policy_logits, state_values, opponent_logits = model(modified_states)
-                opponent1_logits, opponent2_logits = opponent_logits
-                
-                # Check label validity
-                if torch.any(opponent1_labels >= opponent1_logits.size(1)) or torch.any(opponent1_labels < 0):
-                    logger.error(f"Invalid opponent1 labels detected: min={opponent1_labels.min().item()}, max={opponent1_labels.max().item()}, n_classes={opponent1_logits.size(1)}")
-                    # Clamp labels to valid range as a failsafe
-                    opponent1_labels = torch.clamp(opponent1_labels, 0, opponent1_logits.size(1) - 1)
+                    # Forward pass through the model to get all outputs
+                    policy_logits, state_values, opponent_logits = model(states)
+                    opponent1_logits, opponent2_logits = opponent_logits
                     
-                if torch.any(opponent2_labels >= opponent2_logits.size(1)) or torch.any(opponent2_labels < 0):
-                    logger.error(f"Invalid opponent2 labels detected: min={opponent2_labels.min().item()}, max={opponent2_labels.max().item()}, n_classes={opponent2_logits.size(1)}")
-                    # Clamp labels to valid range as a failsafe
-                    opponent2_labels = torch.clamp(opponent2_labels, 0, opponent2_logits.size(1) - 1)
-                
-                probs = F.softmax(policy_logits, dim=-1)
-                probs = torch.clamp(probs, 1e-8, 1.0)
-                
-                # Adjust for action masks
-                masked_probs = probs * action_masks_
-                row_sums = masked_probs.sum(dim=-1, keepdim=True)
-                masked_probs = torch.where(
-                    row_sums > 0,
-                    masked_probs / row_sums,
-                    torch.ones_like(masked_probs) / masked_probs.shape[1]
-                )
-                
-                m = Categorical(masked_probs)
-                new_log_probs = m.log_prob(actions_)
-                entropy = m.entropy().mean()
-                kl_div = torch.mean(old_log_probs - new_log_probs)
-                kl_divs.append(kl_div.item())
-                
-                # Policy loss
-                ratios = torch.exp(new_log_probs - old_log_probs)
-                surr1 = ratios * normalized_advantages
-                surr2 = torch.clamp(ratios, 1 - config.EPS_CLIP, 1 + config.EPS_CLIP) * normalized_advantages
-                policy_loss = -torch.min(surr1, surr2).mean() - static_entropy_coef * entropy
-                
-                # Value loss
-                state_values = state_values.squeeze(-1)
-                value_loss = nn.MSELoss()(state_values, returns_)
-                
-                # Calculate opponent classification losses separately for each opponent
-                opponent1_loss = F.cross_entropy(opponent1_logits, opponent1_labels)
-                opponent2_loss = F.cross_entropy(opponent2_logits, opponent2_labels)
-                
-                # Calculate accuracy metrics for logging
-                opponent1_preds = torch.argmax(opponent1_logits, dim=1)
-                opponent2_preds = torch.argmax(opponent2_logits, dim=1)
-                opponent1_accuracy = (opponent1_preds == opponent1_labels).float().mean()
-                opponent2_accuracy = (opponent2_preds == opponent2_labels).float().mean()
-                
-                # Combined loss with auxiliary opponent classification losses
-                total_loss = policy_loss + 0.5 * value_loss + config.AUX_LOSS_WEIGHT * (opponent1_loss + opponent2_loss)
-                
-                policy_losses.append(policy_loss.item())
-                value_losses.append(value_loss.item())
-                entropies.append(entropy.item())
-                opponent1_loss_values.append(opponent1_loss.item())
-                opponent2_loss_values.append(opponent2_loss.item())
-                opponent1_accuracies.append(opponent1_accuracy.item())
-                opponent2_accuracies.append(opponent2_accuracy.item())
-                
-                # Backpropagation
-                optimizer.zero_grad()
-                total_loss.backward()
-                
-                # Calculate gradient norm
-                grad_norm = sum(param.grad.data.norm(2).item() ** 2
-                                for param in model.parameters()
-                                if param.grad is not None) ** 0.5
-                grad_norms.append(grad_norm)
-                
-                # Clip gradients
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.MAX_NORM)
-                
-                # Update parameters
-                optimizer.step()
+                    # Check label validity
+                    if torch.any(opponent1_labels >= opponent1_logits.size(1)) or torch.any(opponent1_labels < 0):
+                        logger.error(f"Invalid opponent1 labels detected: min={opponent1_labels.min().item()}, max={opponent1_labels.max().item()}, n_classes={opponent1_logits.size(1)}")
+                        # Clamp labels to valid range as a failsafe
+                        opponent1_labels = torch.clamp(opponent1_labels, 0, opponent1_logits.size(1) - 1)
+                        
+                    if torch.any(opponent2_labels >= opponent2_logits.size(1)) or torch.any(opponent2_labels < 0):
+                        logger.error(f"Invalid opponent2 labels detected: min={opponent2_labels.min().item()}, max={opponent2_labels.max().item()}, n_classes={opponent2_logits.size(1)}")
+                        # Clamp labels to valid range as a failsafe
+                        opponent2_labels = torch.clamp(opponent2_labels, 0, opponent2_logits.size(1) - 1)
+                    
+                    probs = F.softmax(policy_logits, dim=-1)
+                    probs = torch.clamp(probs, 1e-8, 1.0)
+                    
+                    # Adjust for action masks
+                    masked_probs = probs * action_masks_
+                    row_sums = masked_probs.sum(dim=-1, keepdim=True)
+                    masked_probs = torch.where(
+                        row_sums > 0,
+                        masked_probs / row_sums,
+                        torch.ones_like(masked_probs) / masked_probs.shape[1]
+                    )
+                    
+                    m = Categorical(masked_probs)
+                    new_log_probs = m.log_prob(actions_)
+                    entropy = m.entropy().mean()
+                    kl_div = torch.mean(old_log_probs - new_log_probs)
+                    kl_divs.append(kl_div.item())
+                    
+                    # Calculate ratios for Trinal-Clip PPO
+                    ratios = torch.exp(new_log_probs - old_log_probs)
+                    
+                    # First level clipping as in standard PPO
+                    clipped_ratios = torch.clamp(ratios, 1 - config.EPS_CLIP, 1 + config.EPS_CLIP)
+                    
+                    # The Trinal-Clip PPO policy loss: second-level clipping with delta1=3.0
+                    # This applies when advantages are negative
+                    delta1 = 3.0  # Upper bound for negative advantage clipping
+                    trinal_clipped_ratios = torch.where(
+                        normalized_advantages < 0,
+                        torch.clamp(clipped_ratios, max=delta1),  # Apply upper bound delta1 for negative advantages
+                        clipped_ratios
+                    )
+                    
+                    # Compute policy loss with trinal clipping
+                    surrogate_loss = trinal_clipped_ratios * normalized_advantages
+                    policy_loss = -torch.mean(surrogate_loss) - static_entropy_coef * entropy
+                    
+                    # Get dynamic value bounds from environment scoring parameters
+                    # These should reflect the range of rewards in your Liar's Deck environment
+                    delta2 = -20.0  # Lower bound for returns clipping
+                    delta3 = 20.0   # Upper bound for returns clipping
+                    
+                    # Value loss with clipped returns
+                    state_values = state_values.squeeze(-1)
+                    clipped_returns = torch.clamp(returns_, delta2, delta3)
+                    value_loss = nn.MSELoss()(state_values, clipped_returns)
+                    
+                    # Calculate opponent classification losses separately for each opponent
+                    opponent1_loss = F.cross_entropy(opponent1_logits, opponent1_labels)
+                    opponent2_loss = F.cross_entropy(opponent2_logits, opponent2_labels)
+                    
+                    # Calculate accuracy metrics for logging
+                    opponent1_preds = torch.argmax(opponent1_logits, dim=1)
+                    opponent2_preds = torch.argmax(opponent2_logits, dim=1)
+                    opponent1_accuracy = (opponent1_preds == opponent1_labels).float().mean()
+                    opponent2_accuracy = (opponent2_preds == opponent2_labels).float().mean()
+                    
+                    # Combined loss with auxiliary opponent classification losses
+                    total_loss = policy_loss + 0.5 * value_loss + config.AUX_LOSS_WEIGHT * (opponent1_loss + opponent2_loss)
+                    
+                    policy_losses.append(policy_loss.item())
+                    value_losses.append(value_loss.item())
+                    entropies.append(entropy.item())
+                    opponent1_loss_values.append(opponent1_loss.item())
+                    opponent2_loss_values.append(opponent2_loss.item())
+                    opponent1_accuracies.append(opponent1_accuracy.item())
+                    opponent2_accuracies.append(opponent2_accuracy.item())
+                    
+                    # Backpropagation
+                    optimizer.zero_grad()
+                    total_loss.backward()
+                    
+                    # Calculate gradient norm
+                    grad_norm = sum(param.grad.data.norm(2).item() ** 2
+                                    for param in model.parameters()
+                                    if param.grad is not None) ** 0.5
+                    grad_norms.append(grad_norm)
+                    
+                    # Clip gradients
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.MAX_NORM)
+                    
+                    # Update parameters
+                    optimizer.step()
             
             if writer is not None:
                 writer.add_scalar(f"Loss/Policy", np.mean(policy_losses), episode)
