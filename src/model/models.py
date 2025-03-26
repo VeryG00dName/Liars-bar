@@ -1,12 +1,10 @@
 # src/model/models.py
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.enabled = True
-import math
-from src import config
+
 
 class StackedObservationConvModel(nn.Module):
     """
@@ -17,9 +15,9 @@ class StackedObservationConvModel(nn.Module):
     - N: Number of historical observations to include
     - obs_dim: Dimension of each observation
     
-    Returns policy logits, state value, and opponent classification logits for 2 opponents.
+    Features dual policy and value heads with a gating network to decide which head to use.
     """
-    def __init__(self, obs_dim, num_actions, hidden_dim=256, num_obs_stack=10, num_opponent_classes=6):
+    def __init__(self, obs_dim, num_actions, hidden_dim=256, num_obs_stack=50):
         super(StackedObservationConvModel, self).__init__()
         
         # 1D Convolutional layers over the stacked observations
@@ -49,15 +47,26 @@ class StackedObservationConvModel(nn.Module):
             nn.Dropout(0.2),
         )
         
-        # Policy head - outputs action logits
-        self.policy_head = nn.Linear(hidden_dim, num_actions)
+        # Two policy heads - output action logits
+        self.policy_head1 = nn.Linear(hidden_dim, num_actions)
+        self.policy_head2 = nn.Linear(hidden_dim, num_actions)
         
-        # Value head - outputs state value estimate
-        self.value_head = nn.Linear(hidden_dim, 1)
-        if config.NUM_OPPONENT_CLASSES > 0:
-            # Opponent classification heads - outputs opponent type logits for 2 opponents
-            self.opponent1_class_head = nn.Linear(hidden_dim, num_opponent_classes)
-            self.opponent2_class_head = nn.Linear(hidden_dim, num_opponent_classes)
+        # Two value heads - output state value estimates
+        self.value_head1 = nn.Linear(hidden_dim, 1)
+        self.value_head2 = nn.Linear(hidden_dim, 1)
+        
+        # Gating network - determines which policy/value head to use
+        self.gating_network = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 4),
+            nn.LayerNorm(hidden_dim // 4),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim // 4, 2),  # Outputs 2 values, one for each head
+            nn.Softmax(dim=1)  # Normalize to probabilities that sum to 1
+        )
+        
+        # Next observation prediction head
+        self.next_obs_head = nn.Linear(hidden_dim, obs_dim)
     
     def forward(self, x):
         """
@@ -67,13 +76,9 @@ class StackedObservationConvModel(nn.Module):
         Returns:
             policy_logits: Action logits of shape (batch_size, num_actions)
             state_value: State value of shape (batch_size, 1)
-            opponent_logits: Tuple containing two opponent classification logits, each of shape 
-                            (batch_size, num_opponent_classes)
+            next_obs_pred: Predicted next observation of shape (batch_size, obs_dim)
+            gate_weights: Gate probabilities of shape (batch_size, 2)
         """
-        # Input shape: (batch_size, N, obs_dim)
-        # Conv1d expects: (batch_size, channels, length) where channels=N and length=obs_dim
-        # So no need to permute
-        
         # Process through conv layers
         x = self.conv_layers(x)  # Output: (batch_size, hidden_dim, 1)
         x = x.squeeze(-1)        # Remove last dimension: (batch_size, hidden_dim)
@@ -81,175 +86,22 @@ class StackedObservationConvModel(nn.Module):
         # Process through fully connected layers
         features = self.fc_layers(x)
         
-        # Get policy logits, state value, and opponent classification
-        policy_logits = self.policy_head(features)
-        state_value = self.value_head(features)
-        if config.NUM_OPPONENT_CLASSES > 0:
-            opponent1_logits = self.opponent1_class_head(features)
-            opponent2_logits = self.opponent2_class_head(features)
+        # Get gate probabilities
+        gate_weights = self.gating_network(features)  # shape: (batch_size, 2)
         
-            return policy_logits, state_value, (opponent1_logits, opponent2_logits)
-        else:
-            
-            return policy_logits, state_value
-
-class TransformerMemoryModel(nn.Module):
-    """
-    Neural network that combines current observation with a sequence of game history
-    using a Transformer encoder.
-    
-    Takes in:
-    - obs_input: Current observation tensor of shape (batch_size, obs_dim)
-    - memory_input: Game history tensor of shape (batch_size, seq_len, 2) where each
-      entry is a [player_id, action_code] pair
-    
-    Returns policy logits and state value for PPO algorithm.
-    """
-    def __init__(
-        self,
-        obs_dim,
-        num_actions,
-        hidden_dim=256,
-        embedding_dim=32,
-        num_players=5,
-        num_action_codes=5,
-        memory_seq_len=50,
-        num_heads=4,
-        num_transformer_layers=2,
-        dropout=0.2
-    ):
-        super(TransformerMemoryModel, self).__init__()
+        # Get policy logits from both heads
+        policy_logits1 = self.policy_head1(features)
+        policy_logits2 = self.policy_head2(features)
         
-        # Embedding layers for memory sequence
-        self.player_embedding = nn.Embedding(num_players + 1, embedding_dim, padding_idx=0)
-        self.action_embedding = nn.Embedding(num_action_codes + 1, embedding_dim, padding_idx=0)
+        # Get state values from both heads
+        state_value1 = self.value_head1(features)
+        state_value2 = self.value_head2(features)
         
-        # Positional encoding for transformer
-        self.pos_encoder = PositionalEncoding(embedding_dim * 2, dropout, max_len=memory_seq_len)
+        # Blend the policy logits and state values using the gate weights
+        policy_logits = gate_weights[:, 0:1] * policy_logits1 + gate_weights[:, 1:2] * policy_logits2
+        state_value = gate_weights[:, 0:1] * state_value1 + gate_weights[:, 1:2] * state_value2
         
-        # Transformer encoder for memory sequence
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embedding_dim * 2,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim,
-            dropout=dropout,
-            batch_first=True
-        )
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=num_transformer_layers
-        )
+        # Next observation prediction
+        next_obs_pred = self.next_obs_head(features)
         
-        # Learnable [CLS] token for sequence pooling
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embedding_dim * 2))
-        nn.init.normal_(self.cls_token, std=0.02)
-        
-        # Observation processing
-        self.obs_encoder = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
-        
-        # Combined processing
-        self.combined_encoder = nn.Sequential(
-            nn.Linear(hidden_dim + embedding_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
-        
-        # Policy head - outputs action logits
-        self.policy_head = nn.Linear(hidden_dim, num_actions)
-        
-        # Value head - outputs state value estimate
-        self.value_head = nn.Linear(hidden_dim, 1)
-    
-    def forward(self, obs_input, memory_input):
-        """
-        Args:
-            obs_input: Current observation tensor of shape (batch_size, obs_dim)
-            memory_input: Game history tensor of shape (batch_size, seq_len, 2)
-                          where each entry is [player_id, action_code]
-        
-        Returns:
-            policy_logits: Action logits of shape (batch_size, num_actions)
-            state_value: State value of shape (batch_size, 1)
-        """
-        batch_size = obs_input.size(0)
-        
-        # Process observation
-        obs_features = self.obs_encoder(obs_input)  # (batch_size, hidden_dim)
-        
-        # Process memory sequence - extract player IDs and action codes
-        player_ids = memory_input[:, :, 0].long()   # (batch_size, seq_len)
-        action_codes = memory_input[:, :, 1].long() # (batch_size, seq_len)
-        
-        # Get embeddings
-        player_embeds = self.player_embedding(player_ids)  # (batch_size, seq_len, embedding_dim)
-        action_embeds = self.action_embedding(action_codes)  # (batch_size, seq_len, embedding_dim)
-        
-        # Combine embeddings (concatenate)
-        memory_embeds = torch.cat([player_embeds, action_embeds], dim=2)  # (batch_size, seq_len, embedding_dim*2)
-        
-        # Add positional encoding
-        memory_embeds = self.pos_encoder(memory_embeds)
-        
-        # Add CLS token at the beginning
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-        memory_embeds = torch.cat([cls_tokens, memory_embeds], dim=1)
-        
-        # Process through transformer
-        memory_features = self.transformer_encoder(memory_embeds)
-        
-        # Extract CLS token output as sequence representation
-        memory_features = memory_features[:, 0]  # (batch_size, embedding_dim*2)
-        
-        # Combine observation and memory features
-        combined_features = torch.cat([obs_features, memory_features], dim=1)
-        features = self.combined_encoder(combined_features)
-        
-        # Get policy logits and state value
-        policy_logits = self.policy_head(features)
-        state_value = self.value_head(features)
-        
-        return policy_logits, state_value
-
-
-class PositionalEncoding(nn.Module):
-    """
-    Adds positional encoding to the token embeddings for transformer.
-    """
-    def __init__(self, d_model, dropout=0.1, max_len=5000):
-        super(PositionalEncoding, self).__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        
-        # Create positional encodings
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)
-        
-        # Register buffer (not a parameter, but part of the module)
-        self.register_buffer('pe', pe)
-        
-    def forward(self, x):
-        """
-        Args:
-            x: Tensor of shape (batch_size, seq_len, d_model)
-        """
-        x = x + self.pe[:, :x.size(1)]
-        return self.dropout(x)
+        return policy_logits, state_value, next_obs_pred, gate_weights
