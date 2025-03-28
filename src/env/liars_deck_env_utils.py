@@ -66,7 +66,7 @@ def apply_challenge(env, challenger_agent, claimant_agent, forced=False):
         if public_last_play:
             public_last_play['was_bluff'] = True
             env.logger.debug(f"Updated public history for {claimant_agent}: was_bluff=True")
-
+        challenge_success = not is_valid
         # Memory updates ...
         for observer in env.possible_agents:
             if observer != claimant_agent:
@@ -74,12 +74,14 @@ def apply_challenge(env, challenger_agent, claimant_agent, forced=False):
                     triggering_str = "Play_" + str(public_last_play['count'])
                 else:
                     triggering_str = "None"
+                
                 get_opponent_memory(observer).update(
                     opponent=claimant_agent,
                     response="Challenge",
                     triggering_action=triggering_str,
                     penalties=env.penalties.get(claimant_agent, 0),
-                    card_count=len(env.players_hands.get(claimant_agent, []))
+                    card_count=len(env.players_hands.get(claimant_agent, [])),
+                    challenge_success=challenge_success
                 )
 
         env.start_new_round()

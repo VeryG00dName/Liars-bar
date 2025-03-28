@@ -307,26 +307,28 @@ class OpponentMemory:
                              #                early_three_card_trigger_count, late_three_card_trigger_count}}
         self.max_events = max_events
 
-    def update(self, opponent, response, triggering_action, penalties, card_count):
+    def update(self, opponent, response, triggering_action, penalties, card_count, challenge_success=None):
         """
-        Record an event and update early/late aggregates based on the card count.
+        Record an event with challenge outcome information.
         
         Args:
             opponent (str): Opponent's identifier.
             response (str): E.g., "Challenge" or another response type.
             triggering_action (str): E.g., "Play_3" if it's a three-card play.
-            penalties (int): Current penalty count (not used in this summary, but you might log it).
+            penalties (int): Current penalty count.
             card_count (int): Current card count of the opponent.
-                             (If card_count < 3, consider the event as occurring in the late phase.)
+            challenge_success (bool, optional): Whether a challenge was successful.
+                                            (True means the play was a bluff)
         """
         event = {
             'response': response,
             'triggering_action': triggering_action,
             'penalties': penalties,
-            'card_count': card_count
+            'card_count': card_count,
+            'challenge_success': challenge_success
         }
         
-        # Initialize storage for opponent if necessary.
+        # Initialize storage for opponent if necessary
         if opponent not in self.memory:
             self.memory[opponent] = deque(maxlen=self.max_events)
             self.aggregates[opponent] = {
@@ -335,27 +337,28 @@ class OpponentMemory:
                 'early_challenge_count': 0,
                 'late_challenge_count': 0,
                 'early_three_card_trigger_count': 0,
-                'late_three_card_trigger_count': 0
+                'late_three_card_trigger_count': 0,
+                'early_successful_challenge_count': 0,
+                'late_successful_challenge_count': 0
             }
 
         self.memory[opponent].append(event)
         agg = self.aggregates[opponent]
         
-        # Use the opponent's card count to determine if the event is early or late.
-        if card_count < 3:
-            # Late event
-            agg['late_total'] += 1
-            if response == "Challenge":
-                agg['late_challenge_count'] += 1
-            if triggering_action == "Play_3":
-                agg['late_three_card_trigger_count'] += 1
-        else:
-            # Early event
-            agg['early_total'] += 1
-            if response == "Challenge":
-                agg['early_challenge_count'] += 1
-            if triggering_action == "Play_3":
-                agg['early_three_card_trigger_count'] += 1
+        # Use the opponent's card count to determine if the event is early or late
+        is_late = card_count < 3
+        phase_prefix = 'late_' if is_late else 'early_'
+        
+        # Update base counts
+        agg[f'{phase_prefix}total'] += 1
+        if response == "Challenge":
+            agg[f'{phase_prefix}challenge_count'] += 1
+        if triggering_action == "Play_3":
+            agg[f'{phase_prefix}three_card_trigger_count'] += 1
+        
+        # Track successful challenges (implies the play was a bluff)
+        if challenge_success is not None and challenge_success:
+            agg[f'{phase_prefix}successful_challenge_count'] += 1
 
     def get_summary(self, opponent):
         """
