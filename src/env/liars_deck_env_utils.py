@@ -1,7 +1,7 @@
 # src/env/liars_deck_env_utils.py
 
 import numpy as np
-from src.env.liars_deck_env_utils_2 import decode_action, select_cards_to_play, validate_claim
+from src.env.liars_deck_env_utils_2 import decode_action, select_cards_to_play, validate_claim, encode_hand
 from src.model.memory import get_opponent_memory
 # --- Existing functions ---
 
@@ -402,8 +402,6 @@ def get_new_observations(env, agent_specific=None):
       - Opponent cards left: raw counts of cards remaining for each opponent.
     """
     observations = {}
-    from src.env.liars_deck_env_utils_2 import encode_hand, decode_action
-    num_players = len(env.possible_agents)
     agents_to_observe = [agent_specific] if agent_specific else env.agents
 
     for agent in agents_to_observe:
@@ -540,6 +538,76 @@ def get_newer_observations(env, agent_specific=None):
         observations[agent] = obs
     
     return observations
+
+def get_derivable_game_state(env, agent_specific=None):
+    """
+    Returns game state information that is not directly available in the newer observations,
+    but can be derived from tracking the game history. Used as training targets for the
+    game state prediction head.
+    
+    Args:
+        env (LiarsDeckEnv): The environment instance.
+        agent_specific (str, optional): Specific agent whose perspective to use.
+    
+    Returns:
+        dict or np.ndarray: A dictionary or array of derivable game state information:
+            - own_hand_vector: The agent's own hand vector (table and non-table card counts)
+            - opponent_card_counts: Card counts for opponent players only
+            - active_players: Whether each player is active (not eliminated/terminated)
+            - penalties: Current penalty count for each player
+    """
+    from src.env.liars_deck_env_utils_2 import encode_hand
+    import numpy as np
+    
+    agents_to_process = [agent_specific] if agent_specific else env.agents
+    result = {}
+    
+    for agent in agents_to_process:
+        # Initialize data arrays
+        opponent_card_counts = []
+        active_players = []
+        penalties = []
+        
+        # First get the agent's own hand vector
+        own_hand = env.players_hands.get(agent, [])
+        own_hand_vector = encode_hand(own_hand, env.table_card)
+        
+        # Process state information for all players
+        for player in env.possible_agents:
+            # Skip adding card count for the agent itself (since we have hand vector)
+            if player != agent:
+                # Card count for opponents (normalize by max hand size)
+                player_hand = env.players_hands.get(player, [])
+                card_count = len(player_hand) / 5.0  # Normalize by max hand size
+                opponent_card_counts.append(card_count)
+            
+            # Player active status (1.0 = active, 0.0 = eliminated)
+            is_active = 0.0
+            if not env.terminations.get(player, False) and not env.round_eliminated.get(player, False):
+                is_active = 1.0
+            active_players.append(is_active)
+            
+            # Penalty count (normalize by typical max penalties)
+            penalty_count = env.penalties.get(player, 0) / 3.0  # Normalize by typical threshold
+            penalties.append(penalty_count)
+        
+        # Convert to numpy arrays
+        own_hand_vector = np.array(own_hand_vector, dtype=np.float32)
+        opponent_card_counts = np.array(opponent_card_counts, dtype=np.float32)
+        active_players = np.array(active_players, dtype=np.float32)
+        penalties = np.array(penalties, dtype=np.float32)
+        
+        # Combine all information into a single vector
+        derivable_state = np.concatenate([
+            own_hand_vector,
+            opponent_card_counts,
+            active_players,
+            penalties
+        ], dtype=np.float32)
+        
+        result[agent] = derivable_state
+    
+    return result if not agent_specific else result[agent_specific]
 
 # New helper function to query persistent opponent memory.
 def query_opponent_memory(observer, opponent):
