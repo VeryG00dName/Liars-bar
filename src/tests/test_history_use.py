@@ -43,7 +43,7 @@ def test_observation_dependency(model, env, num_tests=50):
     observation_stack = deque(maxlen=50)  # Assume max stack size of 50
     
     # Pre-fill with zeros based on the first observation
-    sample_obs = env.observe('player_0', new=True)['player_0']
+    sample_obs = env.observe('player_0', newer=True)['player_0']
     for _ in range(50):
         observation_stack.append(np.zeros_like(sample_obs))
     
@@ -67,17 +67,60 @@ def test_observation_dependency(model, env, num_tests=50):
             continue
         
         # Get current observation and add to history
-        observation_dict = env.observe('player_0', new=True)
+        observation_dict = env.observe('player_0', newer=True)
         current_obs = observation_dict['player_0']
+        
+        # Ensure observation shape consistency in the stack
+        if len(observation_stack) > 0:
+            # Check if the current observation has the same shape as those in the stack
+            if current_obs.shape != np.array(observation_stack[0]).shape:
+                print(f"Warning: Observation shape mismatch. Current: {current_obs.shape}, Stack: {np.array(observation_stack[0]).shape}")
+                # Resize older observations if needed
+                new_stack = deque(maxlen=50)
+                for old_obs in observation_stack:
+                    if np.array(old_obs).shape != current_obs.shape:
+                        # Pad or truncate to match the shape
+                        new_obs = np.zeros_like(current_obs)
+                        min_shape = min(len(old_obs), len(current_obs))
+                        new_obs[:min_shape] = old_obs[:min_shape]
+                        new_stack.append(new_obs)
+                    else:
+                        new_stack.append(old_obs)
+                observation_stack = new_stack
+                
+        # Add current observation to stack
         observation_stack.append(current_obs.copy())
         
         # Get action mask
         mask = env.infos.get('player_0', {}).get('action_mask', [1, 1, 1, 1, 1, 1, 1])
         mask_tensor = torch.tensor(mask, dtype=torch.float32, device=device)
         
+        # Ensure all observations in the stack have the same shape
+        if not all(np.array(obs).shape == np.array(current_obs).shape for obs in observation_stack):
+            print("Warning: Not all observations in stack have same shape. Fixing...")
+            uniform_stack = []
+            for obs in observation_stack:
+                if np.array(obs).shape != np.array(current_obs).shape:
+                    # Create a zero array of the right shape and copy what we can
+                    new_obs = np.zeros_like(current_obs)
+                    min_shape = min(len(obs), len(current_obs))
+                    new_obs[:min_shape] = obs[:min_shape]
+                    uniform_stack.append(new_obs)
+                else:
+                    uniform_stack.append(obs)
+            
+            # Verify all shapes are now the same
+            shapes = [np.array(obs).shape for obs in uniform_stack]
+            if len(set(shapes)) > 1:
+                print(f"Error: Still have inconsistent shapes in stack: {shapes}")
+                continue
+                
+            real_history = uniform_stack
+        else:
+            real_history = list(observation_stack)
+        
         # Create two different observation stacks:
         # 1. Real history
-        real_history = list(observation_stack)
         real_tensor = torch.tensor(
             np.array(real_history),
             dtype=torch.float32,
@@ -89,6 +132,7 @@ def test_observation_dependency(model, env, num_tests=50):
             current_obs.copy() if i == len(observation_stack) - 1 else np.zeros_like(current_obs)
             for i in range(len(observation_stack))
         ]
+        
         fake_tensor = torch.tensor(
             np.array(fake_history),
             dtype=torch.float32,
@@ -96,15 +140,27 @@ def test_observation_dependency(model, env, num_tests=50):
         ).unsqueeze(0)
         
         with torch.no_grad():
-            # With real history
-            real_policy, real_value, _, real_gate = model(real_tensor)
+            # With real history - adapt to newer model with game state prediction head
+            try:
+                # First try with the updated model architecture (policy, value, game_state_pred, gate)
+                real_policy, real_value, _, real_gate = model(real_tensor)
+            except ValueError:
+                # If that fails, try with the original architecture (policy, value, next_obs_pred, gate)
+                real_policy, real_value, _, real_gate = model(real_tensor)
+                
             real_probs = F.softmax(real_policy, dim=-1).squeeze(0)
             real_masked_probs = real_probs * mask_tensor
             if real_masked_probs.sum() > 0:
                 real_masked_probs = real_masked_probs / real_masked_probs.sum()
             
             # With fake history
-            fake_policy, fake_value, _, fake_gate = model(fake_tensor)
+            try:
+                # First try with the updated model architecture
+                fake_policy, fake_value, _, fake_gate = model(fake_tensor)
+            except ValueError:
+                # If that fails, try with the original architecture
+                fake_policy, fake_value, _, fake_gate = model(fake_tensor)
+                
             fake_probs = F.softmax(fake_policy, dim=-1).squeeze(0)
             fake_masked_probs = fake_probs * mask_tensor
             if fake_masked_probs.sum() > 0:
@@ -267,14 +323,44 @@ def main():
     # Load the checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
-    # Create an instance of the modified StackedObservationConvModel
+    # Determine if this is a newer observation model (with game state prediction)
+    is_newer_model = False
+    if isinstance(checkpoint, dict):
+        # Check if this is the newer model format
+        if "policy_nets" in checkpoint:
+            test_state_dict = next(iter(checkpoint["policy_nets"].values()))
+            is_newer_model = 'policy_head1.weight' in test_state_dict and 'game_state_head.weight' in test_state_dict
+        elif "model" in checkpoint:
+            test_state_dict = checkpoint["model"]
+            is_newer_model = 'policy_head1.weight' in test_state_dict and 'game_state_head.weight' in test_state_dict
+    
+    # Create the appropriate model instance based on the checkpoint
     from src.model.models import StackedObservationConvModel
-    model = StackedObservationConvModel(
-        obs_dim=9,
-        num_actions=config.OUTPUT_DIM,
-        hidden_dim=config.HIDDEN_DIM,
-        num_obs_stack=50,         # Assuming 50 observations in history
-    )
+    
+    if is_newer_model:
+        print("Detected newer model with game state prediction head")
+        
+        # Sample observation to determine dimension
+        env = LiarsDeckEnv(num_players=config.NUM_PLAYERS, render_mode=config.RENDER_MODE)
+        sample_obs = env.observe('player_0', newer=True)['player_0']
+        obs_dim = sample_obs.shape[0]
+        
+        # Create model with the appropriate parameters for newer observation format
+        model = StackedObservationConvModel(
+            obs_dim=obs_dim,
+            num_actions=config.OUTPUT_DIM,
+            hidden_dim=config.HIDDEN_DIM,
+            num_obs_stack=50,  # Assuming 50 observations in history
+            num_players=config.NUM_PLAYERS  # Pass number of players for game state dimension
+        )
+    else:
+        print("Using standard model with next observation prediction head")
+        model = StackedObservationConvModel(
+            obs_dim=9,  # Default for standard observation
+            num_actions=config.OUTPUT_DIM,
+            hidden_dim=config.HIDDEN_DIM,
+            num_obs_stack=50,  # Assuming 50 observations in history
+        )
     
     # Load the model state from either "model_state_dict" or "policy_nets"
     if isinstance(checkpoint, dict):
@@ -284,6 +370,8 @@ def main():
             # Assume we want the state for "player_0"
             state_dict = checkpoint["policy_nets"]["player_0"]
             model.load_state_dict(state_dict)
+        elif "model" in checkpoint:
+            model.load_state_dict(checkpoint["model"])
         else:
             raise ValueError("Checkpoint does not contain a recognized key for model state")
     else:
