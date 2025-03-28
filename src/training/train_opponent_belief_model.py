@@ -129,7 +129,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--max_seq_length", type=int, default=400, help="Max sequence length for belief model")
+    parser.add_argument("--max_seq_length", type=int, default=200, help="Max sequence length for belief model")
     parser.add_argument("--device", type=str, default=config.DEVICE, help="Device to use for training")
     parser.add_argument("--checkpoint_file", type=str, default="opponent_belief_model.pth", help="File to save the trained model")
     args = parser.parse_args()
