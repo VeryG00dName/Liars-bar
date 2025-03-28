@@ -1,5 +1,4 @@
 # src/training/train_with_belief.py
-# Modified to use belief space policy and opponent memory for belief updates
 
 import logging
 import time
@@ -339,7 +338,7 @@ def train_with_belief_space_policy(env, device, num_episodes=10000, load_checkpo
     # Create belief model that uses memory features instead of observations
     belief_model = OpponentBeliefModel(
         event_feature_dim=5,  # 5 features per event from convert_memory_to_features2
-        max_seq_length=200,   # Maximum events in memory
+        max_seq_length=400,   # Maximum events in memory
         hidden_dim=config.HIDDEN_DIM // 4,  # Smaller hidden dim for the sequence model
         num_opponent_types=num_opponent_classes
     ).to(device)
@@ -497,6 +496,11 @@ def train_with_belief_space_policy(env, device, num_episodes=10000, load_checkpo
     # Create list of all opponent models for belief update
     all_opponent_models = list(opponent_models_by_label.values())
     
+    beliefs = {}
+    for opponent in opponent_agents:
+        # Start with uniform belief over all opponent types
+        beliefs[opponent] = np.ones(num_opponent_classes) / num_opponent_classes
+    
     # Main training loop
     for episode in range(start_episode, num_episodes + 1):
         env_seed = config.SEED + episode
@@ -561,16 +565,11 @@ def train_with_belief_space_policy(env, device, num_episodes=10000, load_checkpo
             
             # Update scoring parameters if needed
             update_scoring_params_for_opponent(env, current_opponents[agent_to_replace]['name'], logger)
-        
+            for opponent in opponent_agents:
+                # Reset beliefs
+                beliefs[opponent] = np.ones(num_opponent_classes) / num_opponent_classes
         episode_rewards = {agent: 0 for agent in agents}
         steps_in_episode = 0
-        
-        # Initialize beliefs over opponent types
-        # One belief vector per opponent
-        beliefs = {}
-        for opponent in opponent_agents:
-            # Start with uniform belief over all opponent types
-            beliefs[opponent] = np.ones(num_opponent_classes) / num_opponent_classes
         
         # Track last observed actions for belief updates
         last_actions = {agent: None for agent in agents}
@@ -726,7 +725,6 @@ def train_with_belief_space_policy(env, device, num_episodes=10000, load_checkpo
                     with torch.no_grad():
                         updated_belief = belief_model(features_tensor, current_belief_tensor)
                         beliefs[agent] = updated_belief.squeeze(0).cpu().numpy()
-            
             # Take step in environment
             env.step(action)
             
@@ -974,7 +972,18 @@ def train_with_belief_space_policy(env, device, num_episodes=10000, load_checkpo
         # Update tracking metrics
         steps_since_log += steps_in_episode
         episodes_since_log += 1
-        
+        # Log the correct belief confidence for each opponent.
+                # For each opponent, get the belief probability corresponding to the true opponent type.
+        for opponent in opponent_agents:
+            correct_label = current_opponents[opponent]['label']
+            correct_confidence = beliefs[opponent][correct_label] * 100
+            writer.add_scalar(f"Performance/Belief_Correct_Confidence/{opponent}", correct_confidence, episode)
+            for label, prob in enumerate(beliefs[opponent]):
+                writer.add_scalar(
+                    f"Belief/{opponent}/Type_{label}",
+                    prob,
+                    episode
+                )
         # Log results periodically
         if episode % config.LOG_INTERVAL == 0:
             # Calculate stats
@@ -1002,15 +1011,6 @@ def train_with_belief_space_policy(env, device, num_episodes=10000, load_checkpo
                         action_counts_periodic[action],
                         episode
                     )
-                
-                # Also log belief distribution
-                for opponent in opponent_agents:
-                    for label, prob in enumerate(beliefs[opponent]):
-                        writer.add_scalar(
-                            f"Belief/{opponent}/Type_{label}",
-                            prob,
-                            episode
-                        )
             
             # Reset counters
             for action in range(action_dim):
@@ -1050,7 +1050,7 @@ def main():
         num_episodes=config.NUM_EPISODES,
         load_checkpoint=False,
         log_tensorboard=True,
-        opponent_swap_interval=20
+        opponent_swap_interval=100
     )
     
     if training_results is None:
