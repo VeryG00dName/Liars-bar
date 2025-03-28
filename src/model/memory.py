@@ -295,7 +295,7 @@ class PrioritizedReplayBuffer:
             }
 
 class OpponentMemory:
-    def __init__(self, max_events=200):
+    def __init__(self, max_events=400):
         """
         Initialize per-agent opponent memory with separate early/late aggregates.
         
@@ -360,6 +360,40 @@ class OpponentMemory:
         if challenge_success is not None and challenge_success:
             agg[f'{phase_prefix}successful_challenge_count'] += 1
 
+    def update_last_play(self, opponent, challenge_success):
+        """
+        Updates the most recent 'Play' action for the given opponent with challenge result.
+        
+        Args:
+            opponent (str): The opponent whose memory we're updating
+            challenge_success (bool): Whether the challenge against their play was successful
+                                    (True means the play was a bluff)
+        
+        Returns:
+            bool: Whether the update was successful
+        """
+        if opponent not in self.memory or not self.memory[opponent]:
+            return False
+            
+        # Iterate through memory in reverse to find the last Play action
+        for i in range(len(self.memory[opponent])-1, -1, -1):
+            event = self.memory[opponent][i]
+            if event['response'].startswith('Play_'):
+                # Update this event with the challenge result
+                self.memory[opponent][i]['challenge_success'] = challenge_success
+                
+                # Update aggregates if needed
+                agg = self.aggregates[opponent]
+                is_late = event['card_count'] < 3
+                phase_prefix = 'late_' if is_late else 'early_'
+                
+                if challenge_success:
+                    agg[f'{phase_prefix}successful_challenge_count'] += 1
+                    
+                return True
+        
+        return False
+
     def get_summary(self, opponent):
         """
         Produce a summary vector with early/late challenge rates and three-card challenge rates.
@@ -400,5 +434,5 @@ PERSISTENT_OPPONENT_MEMORIES = {}
 
 def get_opponent_memory(agent):
     if agent not in PERSISTENT_OPPONENT_MEMORIES:
-        PERSISTENT_OPPONENT_MEMORIES[agent] = OpponentMemory(max_events=200)
+        PERSISTENT_OPPONENT_MEMORIES[agent] = OpponentMemory(max_events=400)
     return PERSISTENT_OPPONENT_MEMORIES[agent]

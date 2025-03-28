@@ -83,7 +83,10 @@ def apply_challenge(env, challenger_agent, claimant_agent, forced=False):
                     card_count=len(env.players_hands.get(claimant_agent, [])),
                     challenge_success=challenge_success
                 )
-
+        for observer in env.possible_agents:
+            if observer != claimant_agent:
+                memory = get_opponent_memory(observer)
+                memory.update_last_play(claimant_agent, challenge_success)
         env.start_new_round()
         return
 
