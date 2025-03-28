@@ -9,7 +9,7 @@ from collections import deque
 
 from PyQt5 import QtWidgets
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
-
+from src.model.shen_models import BeliefSpacePolicy, OpponentBeliefModel
 # Import your environment, agents, evaluation helpers, and model factory.
 from src.env.liars_deck_env_core import LiarsDeckEnv
 from src import config
@@ -30,7 +30,6 @@ from src.model.model_factory import ModelFactory
 from src.training.train_vs_everyone import load_specific_historical_models
 
 from src.misc.cheat.ai_vs_hardcoded_cheat import LABELS
-
 torch.backends.cudnn.benchmark = True
 
 logging.basicConfig(level=logging.INFO,
@@ -95,6 +94,35 @@ def is_stacked_observation_model(state_dict):
     return (any(k.startswith('conv_layers.') for k in state_dict.keys()) and 
             'policy_head.weight' in state_dict and 
             'value_head.weight' in state_dict)
+
+def is_stacked_newer_observation_model(state_dict):
+    """
+    Detects if a state dictionary comes from a StackedObservationConvModel.
+    
+    Args:
+        state_dict: The state dictionary of a model.
+        
+    Returns:
+        bool: True if the state dictionary is from a StackedObservationConvModel, False otherwise.
+    """
+    # StackedObservationConvModel will have conv_layers and both policy_head and value_head
+    return (any(k.startswith('conv_layers.') for k in state_dict.keys()) and 
+            'policy_head1.weight' in state_dict and 
+            'value_head1.weight' in state_dict)
+
+def get_num_opponent_classes(state_dict):
+    """
+    Extracts the number of opponent classes from a model state dictionary.
+    
+    Args:
+        state_dict: The state dictionary of a model.
+        
+    Returns:
+        int: The number of opponent classes or None if not found.
+    """
+    if 'opponent1_class_head.weight' in state_dict:
+        return state_dict['opponent1_class_head.weight'].shape[0]
+    return None
 
 # --- New helper: Get observation dimension from StackedObservationConvModel state dict ---
 def get_obs_dim_from_stacked_model(state_dict):
@@ -225,17 +253,137 @@ class BattlegroundWorker(QThread):
         env = LiarsDeckEnv(num_players=3, render_mode=None)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         players_in_this_game = {}
+        logger = logging.getLogger("BattlegroundWorker")
 
         # --- AI Agents (player_0 and player_1) ---
         for key in ["player_0", "player_1"]:
             agent_data = self.ai_agents[key]
             policy_state_dict = agent_data["policy_net"]
             
-            # Check if this is a StackedObservationConvModel
-            is_stacked_model = is_stacked_observation_model(policy_state_dict)
-            
-            if is_stacked_model:
-                # Create StackedObservationConvModel
+            # Check if this is a BeliefSpacePolicy model
+            if agent_data.get("is_belief_space_policy", False):
+                # Get dimensions and create BeliefSpacePolicy
+                obs_dim = agent_data["input_dim"]
+                num_opponent_types = agent_data.get("num_opponent_types", 10)
+                
+                # For BeliefSpacePolicy, first extract the proper hidden dimension
+                # It should be the output dimension of the first network layer
+                if 'network.0.weight' in policy_state_dict:
+                    hidden_dim = policy_state_dict['network.0.weight'].shape[0]
+                else:
+                    hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, "network.0")
+                
+                # For BeliefSpacePolicy, belief_dim = num_opponent_types * number of opponents
+                belief_dim = num_opponent_types * (env.num_players - 1)
+                
+                # Log dimensions for debugging
+                logger.info(f"BeliefSpacePolicy dimensions - obs_dim: {obs_dim}, belief_dim: {belief_dim}, hidden_dim: {hidden_dim}")
+                
+                # Sanity check for dimensions
+                if belief_dim + obs_dim <= 0:
+                    # Fix the dimensions: Extract the total input dim from the state_dict
+                    total_input = policy_state_dict['network.0.weight'].shape[1]
+                    # Calculate a reasonable belief_dim based on observed network dimensions
+                    belief_dim = total_input - obs_dim
+                    logger.warning(f"Invalid dimensions detected. Adjusted belief_dim to {belief_dim}")
+                    
+                    # If still negative, set reasonable defaults
+                    if belief_dim <= 0:
+                        obs_dim = 16  # Standard observation dimension
+                        belief_dim = 20  # Reasonable belief dimension (10 types * 2 opponents)
+                        logger.warning(f"Using default dimensions: obs_dim={obs_dim}, belief_dim={belief_dim}")
+                
+                # Create BeliefSpacePolicy
+                policy_net = BeliefSpacePolicy(
+                    belief_dim=belief_dim,
+                    obs_dim=obs_dim,
+                    hidden_dim=hidden_dim,
+                    output_dim=env.action_spaces[key].n
+                )
+                
+                # Load state dict
+                policy_net.load_state_dict(policy_state_dict, strict=False)
+                policy_net.to(device).eval()
+                
+                # Load OpponentBeliefModel if available
+                belief_model_state = agent_data.get("belief_model", None)
+                belief_model = None
+                
+                if belief_model_state is not None:
+                    # Get belief model dimensions
+                    belief_hidden_dim = get_hidden_dim_from_state_dict(belief_model_state, "encoder.0")
+                    
+                    # Create and load belief model
+                    belief_model = OpponentBeliefModel(
+                        obs_dim=obs_dim,
+                        num_opponent_types=num_opponent_types,
+                        hidden_dim=belief_hidden_dim
+                    )
+                    belief_model.load_state_dict(belief_model_state, strict=False)
+                    belief_model.to(device).eval()
+                
+                players_in_this_game[key] = {
+                    "policy_net": policy_net,
+                    "belief_model": belief_model,
+                    "obs_version": 2,  # New observation format
+                    "rating": None,
+                    "uses_memory": False,
+                    "track_experts": False,
+                    "is_stacked_model": False,
+                    "is_newer_obs_model": False,
+                    "is_belief_space_policy": True,
+                    "num_opponent_types": num_opponent_types
+                }
+            # Check if this is a newer observation StackedObservationConvModel
+            elif agent_data.get("is_newer_obs_model", False):
+                # For StackedObservationConvModel for newer observation format
+                obs_dim = agent_data.get("input_dim")
+                if obs_dim is None:
+                    # Try to determine obs_dim from the state dict
+                    obs_dim = get_obs_dim_from_stacked_model(policy_state_dict)
+                    if obs_dim is None:
+                        # Fallback: use sample observation from environment
+                        obs = env.observe(key, newer=True)[key]
+                        obs_dim = obs.shape[0]
+                
+                hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, "fc_layers.0")
+                if hidden_dim is None:
+                    hidden_dim = config.HIDDEN_DIM
+                
+                # Create model using ModelFactory
+                policy_net = ModelFactory.create_stacked_observation_model(
+                    obs_dim=obs_dim,
+                    num_actions=env.action_spaces[key].n,
+                    hidden_dim=hidden_dim,
+                    num_obs_stack=config.NUM_OBS_STACK  # Default value, can be adjusted
+                )
+                
+                # Load state dict
+                policy_net.load_state_dict(policy_state_dict, strict=False)
+                policy_net.to(device).eval()
+                
+                # For StackedObservationConvModel, we don't need a separate value network
+                # or OBP model
+                players_in_this_game[key] = {
+                    "policy_net": policy_net,
+                    "obp_model": None,
+                    "obs_version": 5,  # Use version 5 for newer observation model
+                    "rating": None,
+                    "uses_memory": False,
+                    "track_experts": False,
+                    "is_stacked_model": True,
+                    "is_newer_obs_model": True,
+                    "is_conditional_model": False,
+                    "is_belief_space_policy": False,
+                    "observation_stacks": deque(maxlen=config.NUM_OBS_STACK)  # Initialize observation stack
+                }
+                
+                # Pre-fill the observation stack with zeros
+                sample_obs = env.observe(key, newer=True)[key]
+                for _ in range(config.NUM_OBS_STACK):  # Assuming stack size of config.NUM_OBS_STACK
+                    players_in_this_game[key]["observation_stacks"].append(np.zeros_like(sample_obs))
+            elif agent_data.get("is_stacked_model", False):
+                # Create StackedObservationConvModel for standard new observation format
                 obs_dim = agent_data.get("input_dim")
                 if obs_dim is None:
                     # Try to determine obs_dim from the state dict
@@ -254,7 +402,7 @@ class BattlegroundWorker(QThread):
                     obs_dim=obs_dim,
                     num_actions=env.action_spaces[key].n,
                     hidden_dim=hidden_dim,
-                    num_obs_stack=10  # Default value, can be adjusted
+                    num_obs_stack=config.NUM_OBS_STACK  # Default value, can be adjusted
                 )
                 
                 # Load state dict
@@ -266,21 +414,24 @@ class BattlegroundWorker(QThread):
                 players_in_this_game[key] = {
                     "policy_net": policy_net,
                     "obp_model": None,
-                    "obs_version": 3,  # Use a new version number for stacked models
+                    "obs_version": 3,  # Use version 3 for stacked models
                     "rating": None,
                     "uses_memory": False,
                     "track_experts": False,
                     "is_stacked_model": True,
-                    "observation_stacks": deque(maxlen=10)  # Initialize observation stack
+                    "is_newer_obs_model": False,
+                    "is_conditional_model": False,
+                    "is_belief_space_policy": False,
+                    "observation_stacks": deque(maxlen=config.NUM_OBS_STACK)  # Initialize observation stack
                 }
                 
                 # Pre-fill the observation stack with zeros
                 sample_obs = env.observe(key, new=True)[key]
-                for _ in range(10):  # Assuming stack size of 10
+                for _ in range(config.NUM_OBS_STACK):  # Assuming stack size of config.NUM_OBS_STACK
                     players_in_this_game[key]["observation_stacks"].append(np.zeros_like(sample_obs))
-                
+                    
             else:
-                # Handle traditional single-observation models
+                # Handle traditional single-observation models (existing code)
                 hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, "fc1")
                 obs_dim = agent_data["input_dim"]
                 
@@ -357,7 +508,10 @@ class BattlegroundWorker(QThread):
                     "rating": None,
                     "uses_memory": agent_data["uses_memory"],
                     "track_experts": True,
-                    "is_stacked_model": False
+                    "is_stacked_model": False,
+                    "is_newer_obs_model": False,
+                    "is_belief_space_policy": False,
+                    "is_conditional_model": False
                 }
 
         # --- Opponent as player_2 ---
@@ -442,12 +596,11 @@ class BattlegroundWorker(QThread):
             env, device, players_in_this_game, episodes=episodes, 
             two_player=self.two_player, track_experts=True,
             progress_callback=progress_callback,
-            cheat_expert_index=cheat_expert_index # new parameter
+            cheat_expert_index=cheat_expert_index
         )
 
         # Return cumulative win counts and expert activations.
         return cumulative_wins, expert_activations
-
 
 # --- Main GUI class using PyQt with a Discord-like style ---
 class AgentBattlegroundGUI(QtWidgets.QMainWindow):
@@ -605,10 +758,69 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
             
             any_policy = next(iter(checkpoint["policy_nets"].values()))
             
-            # Check if the loaded model is a StackedObservationConvModel
-            is_stacked_model = is_stacked_observation_model(any_policy)
-            
-            if is_stacked_model:
+            # Check if this is a BeliefSpacePolicy model
+            if ModelFactory.is_belief_space_policy(any_policy):
+                # For BeliefSpacePolicy, determine dimensions and opponent types
+                hidden_dim = get_hidden_dim_from_state_dict(any_policy, "network.0")
+                total_input_dim = any_policy['network.0.weight'].shape[1]
+                
+                # Observation dimension is total input minus belief dimension
+                obs_dim = ModelFactory.get_belief_input_dim(any_policy)
+                
+                # Get the belief model if available
+                belief_model = checkpoint.get("belief_model", None)
+                
+                # Determine number of opponent types from belief model
+                if belief_model:
+                    num_opponent_types = ModelFactory.get_num_opponent_types(belief_model)
+                else:
+                    num_opponent_types = 10  # Default value if we can't determine it
+                
+                self.loaded_models[file_path] = {
+                    "policy_nets": checkpoint["policy_nets"],
+                    "belief_model": belief_model,
+                    "obs_version": 2,  # Assume version 2 for BeliefSpacePolicy (new observation format)
+                    "input_dim": obs_dim,
+                    "uses_memory": False,
+                    "is_stacked_model": False,
+                    "is_newer_obs_model": False,
+                    "is_belief_space_policy": True,
+                    "num_opponent_types": num_opponent_types
+                }
+                return
+            # First check if the loaded model is a StackedObservationConvModel with newer obs format
+            if is_stacked_newer_observation_model(any_policy):
+                # For StackedNewerObservationModel, determine obs_dim from the model
+                obs_dim = get_obs_dim_from_stacked_model(any_policy)  # Reuse this function as it works the same way
+                if obs_dim is None:
+                    # Fallback: estimate from input tensors
+                    try:
+                        # Try an alternative approach
+                        for key in any_policy.keys():
+                            if key.startswith('conv_layers') and key.endswith('weight'):
+                                if len(any_policy[key].shape) == 3:  # Conv1d weight tensor
+                                    obs_dim = any_policy[key].shape[2]
+                                    break
+                    except:
+                        # Fallback to default
+                        obs_dim = 8  # Default for newer observation format
+                
+                # Set observation version to 5 for StackedNewerObservationModel
+                obs_version = 5
+                uses_memory = False
+                
+                self.loaded_models[file_path] = {
+                    "policy_nets": checkpoint["policy_nets"],
+                    "obp_model": checkpoint.get("obp_model", None),
+                    "obs_version": obs_version,
+                    "input_dim": obs_dim,
+                    "uses_memory": uses_memory,
+                    "is_stacked_model": True,
+                    "is_newer_obs_model": True,
+                    "is_conditional_model": False
+                }
+            # Then check if the loaded model is a standard StackedObservationConvModel
+            elif is_stacked_observation_model(any_policy):
                 # For StackedObservationConvModel, determine obs_dim from the model
                 obs_dim = get_obs_dim_from_stacked_model(any_policy)
                 if obs_dim is None:
@@ -627,6 +839,17 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
                 # Set observation version to 3 for StackedObservationConvModel
                 obs_version = 3
                 uses_memory = False
+                
+                self.loaded_models[file_path] = {
+                    "policy_nets": checkpoint["policy_nets"],
+                    "obp_model": checkpoint.get("obp_model", None),
+                    "obs_version": obs_version,
+                    "input_dim": obs_dim,
+                    "uses_memory": uses_memory,
+                    "is_stacked_model": True,
+                    "is_newer_obs_model": False,
+                    "is_conditional_model": False
+                }
             else:
                 # For traditional models, determine input_dim as before
                 if "base_encoder.0.weight" in any_policy:
@@ -650,42 +873,66 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
                     obs_version = 2  # Default to newer format if unsure
                 
                 uses_memory = True
-            
-            self.loaded_models[file_path] = {
-                "policy_nets": checkpoint["policy_nets"],
-                "obp_model": checkpoint.get("obp_model", None),
-                "obs_version": obs_version,
-                "input_dim": obs_dim,
-                "uses_memory": uses_memory,
-                "is_stacked_model": is_stacked_model
-            }
+                
+                self.loaded_models[file_path] = {
+                    "policy_nets": checkpoint["policy_nets"],
+                    "obp_model": checkpoint.get("obp_model", None),
+                    "obs_version": obs_version,
+                    "input_dim": obs_dim,
+                    "uses_memory": uses_memory,
+                    "is_stacked_model": False,
+                    "is_newer_obs_model": False,
+                    "is_conditional_model": False
+                }
             
         elif "model" in checkpoint:
-            # New format with a single model (StackedObservationConvModel)
+            # New format with a single model
             any_policy = checkpoint["model"]
             
-            # Verify it's actually a StackedObservationConvModel
-            if not is_stacked_observation_model(any_policy):
-                raise ValueError("Model in checkpoint is not a StackedObservationConvModel")
-            
-            # Determine observation dimension
-            obs_dim = get_obs_dim_from_stacked_model(any_policy)
-            if obs_dim is None:
-                # Fallback
-                obs_dim = 14  # Default for new observation format
-            
-            # Create two entries for player_0 and player_1 with the same model
-            self.loaded_models[file_path] = {
-                "policy_nets": {
-                    "player_0": checkpoint["model"],
-                    "player_1": checkpoint["model"]
-                },
-                "obp_model": None,  # StackedObservationConvModel doesn't use OBP
-                "obs_version": 3,   # Use version 3 for StackedObservationConvModel
-                "input_dim": obs_dim,
-                "uses_memory": False,
-                "is_stacked_model": True
-            }
+            # First check for stacked newer observation model
+            if is_stacked_newer_observation_model(any_policy):
+                # For StackedNewerObservationModel
+                obs_dim = get_obs_dim_from_stacked_model(any_policy)
+                if obs_dim is None:
+                    obs_dim = 8  # Default for newer observation format
+                
+                # Create two entries for player_0 and player_1 with the same model
+                self.loaded_models[file_path] = {
+                    "policy_nets": {
+                        "player_0": checkpoint["model"],
+                        "player_1": checkpoint["model"]
+                    },
+                    "obp_model": None,
+                    "obs_version": 5,  # Use version 5 for StackedNewerObservationModel
+                    "input_dim": obs_dim,
+                    "uses_memory": False,
+                    "is_stacked_model": True,
+                    "is_newer_obs_model": True,
+                    "is_conditional_model": False
+                }
+            # Then check for standard stacked observation model
+            elif is_stacked_observation_model(any_policy):
+                # For StackedObservationConvModel
+                obs_dim = get_obs_dim_from_stacked_model(any_policy)
+                if obs_dim is None:
+                    obs_dim = 14  # Default for new observation format
+                
+                # Create two entries for player_0 and player_1 with the same model
+                self.loaded_models[file_path] = {
+                    "policy_nets": {
+                        "player_0": checkpoint["model"],
+                        "player_1": checkpoint["model"]
+                    },
+                    "obp_model": None,
+                    "obs_version": 3,  # Use version 3 for StackedObservationConvModel
+                    "input_dim": obs_dim,
+                    "uses_memory": False,
+                    "is_stacked_model": True,
+                    "is_newer_obs_model": False,
+                    "is_conditional_model": False
+                }
+            else:
+                raise ValueError("Unrecognized model format in checkpoint")
         else:
             raise ValueError("Unrecognized checkpoint format")
 
@@ -729,14 +976,30 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
                 file_path = file_path_candidates[0]
                 model_data = self.loaded_models[file_path]
                 key = f"player_{i}"
-                ai_agents[key] = {
-                    "policy_net": model_data["policy_nets"][agent_name],
-                    "obp_model": model_data["obp_model"],
-                    "obs_version": model_data["obs_version"],
-                    "input_dim": model_data["input_dim"],
-                    "uses_memory": model_data["uses_memory"],
-                    "is_stacked_model": model_data.get("is_stacked_model", False)
-                }
+                
+                # Check if this is a BeliefSpacePolicy model (has belief_model instead of obp_model)
+                if model_data.get("is_belief_space_policy", False):
+                    ai_agents[key] = {
+                        "policy_net": model_data["policy_nets"][agent_name],
+                        "belief_model": model_data.get("belief_model"),
+                        "obs_version": model_data["obs_version"],
+                        "input_dim": model_data["input_dim"],
+                        "uses_memory": model_data["uses_memory"],
+                        "is_stacked_model": model_data.get("is_stacked_model", False),
+                        "is_belief_space_policy": True,
+                        "num_opponent_types": model_data.get("num_opponent_types", 10)
+                    }
+                else:
+                    # Handle standard models
+                    ai_agents[key] = {
+                        "policy_net": model_data["policy_nets"][agent_name],
+                        "obp_model": model_data.get("obp_model"),
+                        "obs_version": model_data["obs_version"],
+                        "input_dim": model_data["input_dim"],
+                        "uses_memory": model_data["uses_memory"],
+                        "is_stacked_model": model_data.get("is_stacked_model", False),
+                        "is_newer_obs_model": model_data.get("is_newer_obs_model", False)
+                    }
             return ai_agents
         except Exception as e:
             self.show_info(f"Error loading selected agents: {str(e)}")
