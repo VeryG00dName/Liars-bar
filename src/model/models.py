@@ -15,10 +15,22 @@ class StackedObservationConvModel(nn.Module):
     - N: Number of historical observations to include
     - obs_dim: Dimension of each observation
     
-    Features dual policy and value heads with a gating network to decide which head to use.
+    Features dual policy and value heads with a gating network to decide which head to use,
+    and a game state prediction head for inferring the hidden state from observation history.
     """
-    def __init__(self, obs_dim, num_actions, hidden_dim=256, num_obs_stack=50):
+    def __init__(self, obs_dim, num_actions, hidden_dim=256, num_obs_stack=50, num_players=3):
         super(StackedObservationConvModel, self).__init__()
+        
+        # Save parameters for reference
+        self.obs_dim = obs_dim
+        self.num_players = num_players
+        
+        # Calculate dimension of derivable game state:
+        # - own_hand_vector: 2 values (table cards, non-table cards)
+        # - opponent_card_counts: num_players - 1 values
+        # - active_players: num_players values
+        # - penalties: num_players values
+        self.game_state_dim = 2 + (num_players - 1) + num_players + num_players
         
         # 1D Convolutional layers over the stacked observations
         self.conv_layers = nn.Sequential(
@@ -65,8 +77,8 @@ class StackedObservationConvModel(nn.Module):
             nn.Softmax(dim=1)  # Normalize to probabilities that sum to 1
         )
         
-        # Next observation prediction head
-        self.next_obs_head = nn.Linear(hidden_dim, obs_dim)
+        # Game state prediction head - predicts the derivable game state
+        self.game_state_head = nn.Linear(hidden_dim, self.game_state_dim)
     
     def forward(self, x):
         """
@@ -76,7 +88,7 @@ class StackedObservationConvModel(nn.Module):
         Returns:
             policy_logits: Action logits of shape (batch_size, num_actions)
             state_value: State value of shape (batch_size, 1)
-            next_obs_pred: Predicted next observation of shape (batch_size, obs_dim)
+            game_state_pred: Predicted derivable game state of shape (batch_size, game_state_dim)
             gate_weights: Gate probabilities of shape (batch_size, 2)
         """
         # Process through conv layers
@@ -101,7 +113,7 @@ class StackedObservationConvModel(nn.Module):
         policy_logits = gate_weights[:, 0:1] * policy_logits1 + gate_weights[:, 1:2] * policy_logits2
         state_value = gate_weights[:, 0:1] * state_value1 + gate_weights[:, 1:2] * state_value2
         
-        # Next observation prediction
-        next_obs_pred = self.next_obs_head(features)
+        # Game state prediction - predicts the derivable state
+        game_state_pred = self.game_state_head(features)
         
-        return policy_logits, state_value, next_obs_pred, gate_weights
+        return policy_logits, state_value, game_state_pred, gate_weights
