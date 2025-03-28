@@ -1,6 +1,8 @@
 # src/training/train_with_belief.py
 
+from datetime import datetime
 import logging
+import pickle
 import time
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -24,7 +26,7 @@ from src.env.liars_deck_env_core import LiarsDeckEnv
 from src.model.shen_models import BeliefSpacePolicy, OpponentBeliefModel
 from src.model.other_models import StrategyTransformer
 # Import our PrioritizedReplayBuffer
-from src.model.memory import PrioritizedReplayBuffer
+from src.model.memory import PrioritizedReplayBuffer, clear_opponent_memory
 from src import config
 
 # Import hard-coded agent classes
@@ -313,6 +315,35 @@ def train_with_belief_space_policy(env, device, num_episodes=10000, load_checkpo
     obs_dim = sample_obs.shape[0]
     action_dim = env.action_spaces[env.agents[0]].n
     
+    transformer_training_data = []  # List to hold (memory_sequence, label) tuples
+    target_samples_per_opponent = 1000  # Target number of samples per opponent type
+    collected_samples_counter = defaultdict(int)
+    last_collection_step = defaultdict(int)  # Last collection step per training_agent-opponent pair
+    collection_frequency = 150  # Collect samples every 10 steps
+    min_sequence_length = 10    # Only collect if sequence length >= 5
+    def save_transformer_training_data():
+        """Save the collected transformer training data to a pickle file."""
+        if not transformer_training_data:
+            logging.getLogger('Train').info("No transformer training data to save.")
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_path = os.path.join(config.CHECKPOINT_DIR, f"transformer_training_data_{timestamp}.pkl")
+        
+        try:
+            with open(file_path, "wb") as f:
+                pickle.dump(transformer_training_data, f)
+            logging.getLogger('Train').info(f"Saved {len(transformer_training_data)} transformer training samples to {file_path}")
+            
+            label_counts = defaultdict(int)
+            for _, label in transformer_training_data:
+                label_counts[label] += 1
+            
+            logging.getLogger('Train').info("Label distribution in saved data:")
+            for label, count in label_counts.items():
+                logging.getLogger('Train').info(f"  {label}: {count} samples")
+        except Exception as e:
+            logging.getLogger('Train').error(f"Error saving transformer training data: {e}")
     # Load historical models
     historical_models_list = load_specific_historical_models(config.HISTORICAL_MODEL_DIR, device)
     historical_label_mapping = {}
@@ -342,6 +373,13 @@ def train_with_belief_space_policy(env, device, num_episodes=10000, load_checkpo
         hidden_dim=config.HIDDEN_DIM // 4,  # Smaller hidden dim for the sequence model
         num_opponent_types=num_opponent_classes
     ).to(device)
+    
+    checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "opponent_belief_model.pth")
+    if not os.path.exists(checkpoint_path):
+        logger.error(f"Belief model checkpoint not found at {checkpoint_path}. Exiting.")
+        return
+    belief_model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    logger.info(f"Loaded belief_model from checkpoint: {checkpoint_path}")
     
     # Create optimizers
     policy_optimizer = optim.Adam(belief_policy.parameters(), lr=config.LEARNING_RATE)
@@ -512,27 +550,9 @@ def train_with_belief_space_policy(env, device, num_episodes=10000, load_checkpo
         if episode % opponent_swap_interval == 0:
             # Same opponent swapping logic as original implementation
             agent_to_replace = np.random.choice(opponent_agents)
-            if agent_to_replace == "player_2":
-                allowed_names = {"Classic", "GreedyCardSpammer", "StrategicChallenger"}
-                filtered_opponents = [
-                    opp for opp in available_opponents 
-                    if opp["type"] == "hardcoded" and opp["name"] in allowed_names
-                ]
-                opponent_config = random.choice(filtered_opponents)
-            elif agent_to_replace == "player_1":
-                allowed_names = {"TableFirstConservativeChallenger", "TableNonTableAgent", "Version_A_player_2", "Version_C_player_0", "Version_E_player_1"}
-                filtered_opponents = [
-                    opp for opp in available_opponents 
-                    if opp["name"] in allowed_names
-                ]
-                if not filtered_opponents:
-                    opponent_idx = np.random.randint(0, len(available_opponents))
-                    opponent_config = available_opponents[opponent_idx]
-                else:
-                    opponent_config = random.choice(filtered_opponents)
-            else:
-                opponent_idx = np.random.randint(0, len(available_opponents))
-                opponent_config = available_opponents[opponent_idx]
+            
+            opponent_idx = np.random.randint(0, len(available_opponents))
+            opponent_config = available_opponents[opponent_idx]
                 
             # Instantiate opponent
             if opponent_config["type"] == "hardcoded":
@@ -705,11 +725,29 @@ def train_with_belief_space_policy(env, device, num_episodes=10000, load_checkpo
             last_observations_old[agent] = observation_old
             last_action_masks[agent] = action_mask
             
+            # ------------------ NEW: Collect Transformer Training Data ------------------
+            # For the training agent, we collect raw opponent memory sequences (without padding)
+            # using the new conversion function.
+            if agent == training_agent:
+                for opp in opponent_agents:
+                    memory_full = query_opponent_memory_full(training_agent, opp)
+                    if len(memory_full) >= min_sequence_length:
+                        agent_opp_key = f"{training_agent}_{opp}"
+                        current_step = total_steps
+                        if current_step - last_collection_step[agent_opp_key] >= collection_frequency:
+                            # Use the opponent name as the label (or you can use any mapping as needed)
+                            label = current_opponents[opp]['name']
+                            if collected_samples_counter[label] < target_samples_per_opponent:
+                                transformer_training_data.append((list(memory_full), label))
+                                collected_samples_counter[label] += 1
+                                last_collection_step[agent_opp_key] = current_step
+                                clear_opponent_memory(training_agent, opp)
+                            
+            # -----------------------------------------------------------------------------
             # Update beliefs based on opponent memory
             if agent in opponent_agents:
                 # Get memory data for this opponent
                 memory_full = query_opponent_memory_full(training_agent, agent)
-                
                 # Convert memory to features using the new function
                 features_list = convert_memory_to_features2(memory_full, response2idx, action2idx)
                 
@@ -955,8 +993,17 @@ def train_with_belief_space_policy(env, device, num_episodes=10000, load_checkpo
         if winner == training_agent:
             wins += 1
         
+        # ------------------ NEW: Periodically Save Transformer Training Data ------------------
         # Save checkpoint periodically
         if episode % config.CHECKPOINT_INTERVAL == 0:
+            if len(transformer_training_data) > 500:
+                # Print distribution of samples per opponent before saving
+                logger.info("Transformer training data sample distribution:")
+                for opponent, count in collected_samples_counter.items():
+                    logger.info(f"  {opponent}: {count} samples")
+                save_transformer_training_data()
+                transformer_training_data.clear()
+                collected_samples_counter = defaultdict(int)
             save_checkpoint(
                 {training_agent: belief_policy},
                 None,
@@ -968,7 +1015,6 @@ def train_with_belief_space_policy(env, device, num_episodes=10000, load_checkpo
                 checkpoint_dir=checkpoint_dir
             )
             logger.info(f"Saved checkpoint at episode {episode}.")
-        
         # Update tracking metrics
         steps_since_log += steps_in_episode
         episodes_since_log += 1
@@ -1050,7 +1096,7 @@ def main():
         num_episodes=config.NUM_EPISODES,
         load_checkpoint=False,
         log_tensorboard=True,
-        opponent_swap_interval=100
+        opponent_swap_interval=50
     )
     
     if training_results is None:
