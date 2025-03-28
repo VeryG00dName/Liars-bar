@@ -150,6 +150,26 @@ def main():
             all_samples.extend(samples)
     logging.info(f"Loaded {len(all_samples)} samples from {len(data_files)} files.")
     
+    # Load transformer mappings (needed for conversion) before computing sequence statistics
+    transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
+    response2idx, action2idx = load_transformer_mappings(transformer_checkpoint_path, device)
+    
+    # Compute sequence length statistics for the samples
+    seq_lengths = []
+    for memory_sequence, _ in all_samples:
+        features_list = convert_memory_to_features2(memory_sequence, response2idx, action2idx)
+        if features_list is None:
+            seq_lengths.append(0)
+        else:
+            seq_lengths.append(len(features_list))
+    if seq_lengths:
+        min_len = min(seq_lengths)
+        mean_len = np.mean(seq_lengths)
+        max_len = max(seq_lengths)
+        logging.info(f"Sequence Lengths -- min: {min_len}, mean: {mean_len:.2f}, max: {max_len}")
+    else:
+        logging.info("No sequence lengths computed.")
+    
     # Balance the training data
     all_samples = balance_training_data(all_samples)
     logging.info(f"Balanced dataset to {len(all_samples)} samples.")
@@ -159,10 +179,6 @@ def main():
     label2idx = {label: idx for idx, label in enumerate(unique_labels)}
     num_opponent_types = len(label2idx)
     logging.info(f"Detected {num_opponent_types} opponent types: {label2idx}")
-
-    # Load response2idx and action2idx from the transformer checkpoint
-    transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
-    response2idx, action2idx = load_transformer_mappings(transformer_checkpoint_path, device)
 
     # Create dataset and dataloader
     dataset = BeliefTrainingDataset(all_samples, response2idx, action2idx, args.max_seq_length, label2idx)
@@ -190,8 +206,13 @@ def main():
             seq_lens = seq_lens.to(device)            # (B,)
             targets = targets.to(device)              # (B, num_opponent_types)
 
-            # For this training, we treat the one-hot target as the current belief.
-            current_belief = targets.clone()
+            batch_size, num_opponent_types = targets.size()
+            current_belief = torch.full(
+                size=(batch_size, num_opponent_types),
+                fill_value=1.0 / num_opponent_types,
+                device=device,
+                dtype=torch.float32
+            )
 
             optimizer.zero_grad()
             # Forward pass: note that model.forward expects sequence_lengths (optional)
