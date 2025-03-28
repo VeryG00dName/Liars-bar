@@ -130,11 +130,11 @@ def get_opponent_label(opponent_name, historical_label_mapping):
 def calculate_td_errors(states, actions, rewards, next_states, dones, gamma, model):
     with torch.no_grad():
         # Get current Q-values
-        _, state_values, _ = model(states)
+        _, state_values = model(states)
         state_values = state_values.squeeze(-1)
         
         # Get next state values
-        _, next_state_values, _ = model(next_states)
+        _, next_state_values = model(next_states)
         next_state_values = next_state_values.squeeze(-1)
         
         # Calculate target values
@@ -160,24 +160,27 @@ def compute_action_likelihood(opponent_model, observation_new, observation_old, 
                 predicted_action = opponent_model.play_turn(observation_new, action_mask, table_card=None)
                 return 1.0 if predicted_action == action else 0.1  # Small probability for unmatched actions
             else:  # Neural network model (historical)
-                # For historical models - use OLD observation format
+                # For historical models - use OLD observation format with padding
                 # Add memory embeddings to old format observation
                 obp_placeholder = np.zeros(2, dtype=np.float32)
                 
-                # Create embeddings similar to what's in the episode loop
-                embeddings_list = []
-                
-                # This is a simplified version since we don't know the opponent memory here
-                strategy_dim = config.STRATEGY_DIM
-                num_players = config.NUM_PLAYERS
-                normalized_arr = np.zeros(strategy_dim * (num_players - 1), dtype=np.float32)
+                # Add 10 zeros to simulate OBP output and transformer output
+                padding = np.zeros(10, dtype=np.float32)
                 
                 # Construct the final observation format for historical models
-                final_obs = np.concatenate([observation_old, obp_placeholder, normalized_arr], axis=0)
+                final_obs = np.concatenate([observation_old, obp_placeholder, padding], axis=0)
                 obs_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
                 
                 # Get action probabilities from the model
-                probs, _, _ = opponent_model(obs_tensor, None)
+                try:
+                    probs, _, _ = opponent_model(obs_tensor, None)
+                except ValueError:
+                    try:
+                        probs, _ = opponent_model(obs_tensor, None)
+                    except:
+                        # Fall back to a simple probability for problematic models
+                        return 0.2  # Default probability
+                
                 probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
                 mask_tensor = torch.tensor(action_mask, dtype=torch.float32, device=device)
                 masked_probs = probs * mask_tensor
@@ -304,18 +307,18 @@ def train_with_belief_space_policy(env, device, num_episodes=10000, load_checkpo
     num_opponent_classes = max(config.NUM_OPPONENT_CLASSES, total_opponent_types)
     logger.info(f"Using {num_opponent_classes} opponent types")
     
-    # Create belief space policy and opponent belief model
+    # Create belief space policy (belief_dim = num_opponent_classes * number of opponents)
     belief_policy = BeliefSpacePolicy(
-        belief_dim=num_opponent_classes,
+        belief_dim=num_opponent_classes * len(opponent_agents),
         obs_dim=obs_dim,
         hidden_dim=config.HIDDEN_DIM,
         output_dim=action_dim
     ).to(device)
     
     belief_model = OpponentBeliefModel(
-        obs_dim=obs_dim,
-        num_opponent_types=num_opponent_classes,
-        hidden_dim=config.HIDDEN_DIM // 2  # Smaller network for belief updates
+        obs_dim=obs_dim, 
+        num_opponent_types=num_opponent_classes,  # This should be per opponent
+        hidden_dim=config.HIDDEN_DIM // 2
     ).to(device)
     
     # Create optimizers
@@ -562,12 +565,14 @@ def train_with_belief_space_policy(env, device, num_episodes=10000, load_checkpo
                 env.step(None)
                 continue
             
-            # Use the NEW observation format (not newer)
-            observation_dict = env.observe(agent, new=True)
-            observation = observation_dict[agent]
+            # Get BOTH observation formats
+            observation_dict_new = env.observe(agent, new=True)
+            observation_new = observation_dict_new[agent]
+            observation_dict_old = env.observe(agent, new=False)
+            observation_old = observation_dict_old[agent]
             action_mask = env.infos[agent]['action_mask']
             
-            # Get derivable game state for prediction head
+            # Get derivable game state (reused for transition storage)
             current_game_state = get_derivable_game_state(env, agent)
             
             # Action Selection
@@ -580,7 +585,7 @@ def train_with_belief_space_policy(env, device, num_episodes=10000, load_checkpo
                 # Convert to tensor
                 combined_belief = np.concatenate(opponent_beliefs)
                 belief_tensor = torch.tensor(combined_belief, dtype=torch.float32, device=device).unsqueeze(0)
-                obs_tensor = torch.tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
+                obs_tensor = torch.tensor(observation_new, dtype=torch.float32, device=device).unsqueeze(0)
                 
                 # Get policy output using belief space policy
                 with torch.no_grad():
@@ -608,18 +613,17 @@ def train_with_belief_space_policy(env, device, num_episodes=10000, load_checkpo
                 
                 # Store state value
                 state_value_scalar = state_value.item()
-                observation_new = observation
+                
             else:
                 # Opponent agent: use its policy (hardcoded or historical)
                 opponent = current_opponents[agent]
                 if opponent["type"] == "hardcoded":
-                    action = opponent["instance"].play_turn(observation, action_mask, table_card=None)
+                    action = opponent["instance"].play_turn(observation_new, action_mask, table_card=None)
                     log_prob_value = 0.0
                     state_value_scalar = 0.0
                 elif opponent["type"] == "historical":
                     # For historical models: use appropriate observation format
-                    old_obs_dict = env.observe(agent, new=False)
-                    old_observation = old_obs_dict[agent]
+                    old_observation = observation_old
                     
                     # Get opponent memory embedding if needed
                     # This part is similar to original implementation
@@ -648,9 +652,12 @@ def train_with_belief_space_policy(env, device, num_episodes=10000, load_checkpo
                     obp_placeholder = np.zeros(2, dtype=np.float32)
                     final_obs = np.concatenate([old_observation, obp_placeholder, normalized_arr], axis=0)
                     observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
-                    observation_old = final_obs
+                    
                     with torch.no_grad():
-                        probs, _, _ = opponent["instance"](observation_tensor, None)
+                        try:
+                            probs, _, _ = opponent["instance"](observation_tensor, None)
+                        except ValueError:
+                            probs, _ = opponent["instance"](observation_tensor, None)
                     
                     probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
                     mask_t = torch.tensor(action_mask, dtype=torch.float32, device=device)
@@ -672,6 +679,8 @@ def train_with_belief_space_policy(env, device, num_episodes=10000, load_checkpo
             
             # Store last observed action for belief update
             last_actions[agent] = action
+            last_observations_new[agent] = observation_new
+            last_observations_old[agent] = observation_old
             last_action_masks[agent] = action_mask
             
             # Update beliefs based on observed actions
@@ -680,17 +689,20 @@ def train_with_belief_space_policy(env, device, num_episodes=10000, load_checkpo
                 # Update belief only when we have seen this agent act before
                 if last_actions[agent] is not None:
                     # Get observation and action
+                    obs_new = last_observations_new[agent]
+                    obs_old = last_observations_old[agent]
                     act = last_actions[agent] 
                     act_mask = last_action_masks[agent]
                     
                     # Update belief using Bayesian update
                     beliefs[agent] = bayesian_belief_update(
                         beliefs[agent],
-                        obs,
+                        obs_new,
+                        obs_old,
                         act,
                         act_mask,
                         all_opponent_models,
-                        device
+                        device=device
                     )
             
             # Take step in environment
@@ -715,7 +727,7 @@ def train_with_belief_space_policy(env, device, num_episodes=10000, load_checkpo
                         # Store transition with belief
                         memory.store_transition(
                             agent=ag,
-                            state=observation,  # Just the observation, not stacked
+                            state=observation_new,  # Just the observation, not stacked
                             action=action,
                             log_prob=log_prob_value,
                             reward=reward,
@@ -743,15 +755,14 @@ def train_with_belief_space_policy(env, device, num_episodes=10000, load_checkpo
                     dones = torch.tensor(np.array([t.is_terminal for t in batch], dtype=np.float32), device=device)
                     action_masks = torch.tensor(np.array([t.action_mask for t in batch], dtype=np.float32), device=device)
                     
-                    # Get beliefs and game states from expert_input
-                    beliefs = torch.tensor(np.array([t.expert_input['belief'] for t in batch], dtype=np.float32), device=device)
-                    game_states = torch.tensor(np.array([t.expert_input['game_state'] for t in batch], dtype=np.float32), device=device)
+                    # Get beliefs from expert_input
+                    batch_beliefs = torch.tensor(np.array([t.expert_input['belief'] for t in batch], dtype=np.float32), device=device)
                     
                     # Importance sampling weights
                     importance_weights = torch.tensor(importance_weights, dtype=torch.float32, device=device)
                     
                     # Forward pass through belief policy
-                    action_logits, state_values = belief_policy(states, beliefs)
+                    action_logits, state_values = belief_policy(states, batch_beliefs)
                     
                     # Process probabilities with masks
                     probs = F.softmax(action_logits, dim=-1)
@@ -834,28 +845,35 @@ def train_with_belief_space_policy(env, device, num_episodes=10000, load_checkpo
                         
                         # Prepare data
                         belief_states = torch.tensor(np.array([t.state for t in belief_batch], dtype=np.float32), device=device)
-                        belief_beliefs = torch.tensor(np.array([t.expert_input['belief'] for t in belief_batch], dtype=np.float32), device=device)
                         
-                        # Forward pass through belief model
-                        updated_beliefs = belief_model(belief_states, belief_beliefs)
+                        # Get all beliefs but reshape to get individual opponent beliefs
+                        all_beliefs = np.array([t.expert_input['belief'] for t in belief_batch])
                         
-                        # Loss is KL divergence between adjacent beliefs in episode
-                        # This is a simple way to enforce smooth belief updates
-                        belief_loss = F.kl_div(
-                            F.log_softmax(updated_beliefs, dim=1),
-                            F.softmax(belief_beliefs, dim=1),
-                            reduction='batchmean'
-                        )
-                        
-                        # Backpropagation
-                        belief_optimizer.zero_grad()
-                        belief_loss.backward()
-                        torch.nn.utils.clip_grad_norm_(belief_model.parameters(), max_norm=config.MAX_NORM)
-                        belief_optimizer.step()
-                        
-                        # Log belief model training
-                        if writer is not None:
-                            writer.add_scalar("Loss/Belief", belief_loss.item(), total_steps)
+                        # Process each opponent separately
+                        for opponent_idx, opponent in enumerate(opponent_agents):
+                            # Extract just this opponent's belief
+                            opponent_beliefs = all_beliefs[:, opponent_idx*num_opponent_classes:(opponent_idx+1)*num_opponent_classes]
+                            opponent_beliefs_tensor = torch.tensor(opponent_beliefs, dtype=torch.float32, device=device)
+                            
+                            # Forward pass through belief model for this opponent's beliefs
+                            updated_beliefs = belief_model(belief_states, opponent_beliefs_tensor)
+                            
+                            # Loss is KL divergence between model predictions and stored beliefs
+                            belief_loss = F.kl_div(
+                                F.log_softmax(updated_beliefs, dim=1),
+                                F.softmax(opponent_beliefs_tensor, dim=1),
+                                reduction='batchmean'
+                            )
+                            
+                            # Backpropagation
+                            belief_optimizer.zero_grad()
+                            belief_loss.backward()
+                            torch.nn.utils.clip_grad_norm_(belief_model.parameters(), max_norm=config.MAX_NORM)
+                            belief_optimizer.step()
+                            
+                            # Log belief model training
+                            if writer is not None:
+                                writer.add_scalar(f"Loss/Belief/Opponent_{opponent}", belief_loss.item(), total_steps)
                     
                     # Calculate TD errors for priority updates
                     with torch.no_grad():
