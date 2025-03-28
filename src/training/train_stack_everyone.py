@@ -1,5 +1,5 @@
 # src/training/train_stack_everyone.py
-# Modified to use prioritized replay buffer
+# Modified to use prioritized replay buffer and newer observation format
 
 import logging
 import time
@@ -41,7 +41,7 @@ from src.model.hard_coded_agents import (
 )
 
 # For querying memory
-from src.env.liars_deck_env_utils import query_opponent_memory_full
+from src.env.liars_deck_env_utils import query_opponent_memory_full, get_derivable_game_state
 
 # PPO and logging utilities
 from src.training.train_utils import (
@@ -166,8 +166,8 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
     opponent_agents = ['player_1', 'player_2']
     
     # Get observation dimension from environment
-    # Use the new observation format
-    sample_obs = env.observe(env.agents[0], new=True)[env.agents[0]]
+    # Use the newer observation format
+    sample_obs = env.observe(env.agents[0], newer=True)[env.agents[0]]
     obs_dim = sample_obs.shape[0]
     action_dim = env.action_spaces[env.agents[0]].n
     
@@ -190,12 +190,13 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
     num_opponent_classes = max(config.NUM_OPPONENT_CLASSES, total_opponent_types)
     logger.info(f"Using {num_opponent_classes} opponent classes to cover {len(HARD_CODED_LABELS)} hardcoded and {len(historical_models_list)} historical opponents")
     
-    # Create model for training agent with 2 opponent classification heads
+    # Create model for training agent with game state prediction head
     model = StackedObservationConvModel(
         obs_dim=obs_dim,
         num_actions=action_dim,
         hidden_dim=config.HIDDEN_DIM,
-        num_obs_stack=num_obs_stack
+        num_obs_stack=num_obs_stack,
+        num_players=config.NUM_PLAYERS
     ).to(device)
         
     # Create optimizer for the model
@@ -368,11 +369,10 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
     wins = 0
     games = 0
     
-    
     # Hyperparameters for prioritized replay
     batch_size = 2560
     min_buffer_size = 1000  # Minimum buffer size before starting training
-    update_freq = 400         # Update network every N steps
+    update_freq = 400       # Update network every N steps
     total_steps = 0         # Counter for total steps
     
     # Main training loop
@@ -445,6 +445,7 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
         
         episode_rewards = {agent: 0 for agent in agents}
         steps_in_episode = 0
+        
         # Run a single episode
         while env.agent_selection is not None:
             steps_in_episode += 1
@@ -455,10 +456,13 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
                 env.step(None)
                 continue
             
-            # Use the new observation format
-            observation_dict = env.observe(agent, new=True)
+            # Use the newer observation format (minimal)
+            observation_dict = env.observe(agent, newer=True)
             observation = observation_dict[agent]
             action_mask = env.infos[agent]['action_mask']
+            
+            # Get the derivable game state (for training the prediction head)
+            current_game_state = get_derivable_game_state(env, agent)
             
             # Generate strategy embeddings for any agent that needs them
             normalized_arr = None
@@ -490,15 +494,14 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
             if agent == training_agent:
                 # Add current observation to the stack
                 observation_stack.append(observation)
-                current_obs = observation.copy()
+                
                 # Create a stacked observation tensor
                 stacked_obs = np.array(list(observation_stack), dtype=np.float32)
                 stacked_obs_tensor = torch.tensor(stacked_obs, dtype=torch.float32, device=device).unsqueeze(0)
                 
-                # Get policy, value, and opponent classification outputs
-                policy_logits, state_value, next_obs_pred = model(stacked_obs_tensor)
+                # Get policy, value, and game state prediction outputs
+                policy_logits, state_value, game_state_pred = model(stacked_obs_tensor)
 
-                
                 # Process action probabilities
                 probs = F.softmax(policy_logits, dim=-1).squeeze(0)
                 probs = torch.clamp(probs, 1e-8, 1.0)
@@ -563,6 +566,7 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
                     action = m.sample().item()
                     log_prob_value = m.log_prob(torch.tensor(action, device=device)).item()
                     state_value_scalar = 0.0
+            
             env.step(action)
             
             step_rewards = env.rewards.copy()
@@ -573,10 +577,8 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
                 else:
                     reward = step_rewards[agent] + pending_rewards[agent]
                     pending_rewards[agent] = 0
-                    if ag == training_agent:
-                        # Get the opponent labels
-                        
-                        # Store transition in prioritized replay buffer
+                    if ag == training_agent:                        
+                        # Store transition in prioritized replay buffer with game state ground truth
                         memory.store_transition(
                             agent=ag,
                             state=np.array(list(observation_stack)),
@@ -586,7 +588,8 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
                             is_terminal=env.terminations[ag] or env.truncations[ag],
                             state_value=state_value_scalar,
                             action_mask=action_mask,
-                            expert_input=current_obs
+                            # Store game state as expert_input for the prediction task
+                            expert_input=current_game_state
                         )
                     episode_rewards[ag] += reward
             
@@ -604,14 +607,14 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
                     dones = torch.tensor(np.array([t.is_terminal for t in batch], dtype=np.float32), device=device)
                     action_masks = torch.tensor(np.array([t.action_mask for t in batch], dtype=np.float32), device=device)
                     
-                    # Get next observation targets (using the expert_input field, which now contains the observation)
-                    next_obs_targets = torch.tensor(np.array([t.expert_input for t in batch], dtype=np.float32), device=device)
+                    # Get game state targets
+                    game_state_targets = torch.tensor(np.array([t.expert_input for t in batch], dtype=np.float32), device=device)
                     
                     # Importance sampling weights
                     importance_weights = torch.tensor(importance_weights, dtype=torch.float32, device=device)
                     
                     # Forward pass through the model to get all outputs
-                    policy_logits, state_values, next_obs_preds = model(states)
+                    policy_logits, state_values, game_state_preds = model(states)
                     
                     # Process action probabilities with masks
                     probs = F.softmax(policy_logits, dim=-1)
@@ -676,11 +679,11 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
                     clipped_rewards = torch.clamp(normalized_rewards, delta2, delta3)
                     value_loss = F.mse_loss(state_values, clipped_rewards)
                     
-                    # Calculate next observation prediction loss
-                    next_obs_loss = F.mse_loss(next_obs_preds, next_obs_targets)
+                    # Calculate game state prediction loss (MSE between predicted and actual game state)
+                    game_state_loss = F.mse_loss(game_state_preds, game_state_targets)
                     
-                    # Combined loss with auxiliary opponent classification losses
-                    total_loss = policy_loss + 0.5 * value_loss + config.AUX_LOSS_WEIGHT * next_obs_loss
+                    # Combined loss with auxiliary game state prediction loss
+                    total_loss = policy_loss + 0.5 * value_loss + config.AUX_LOSS_WEIGHT * game_state_loss
                     
                     # Backpropagation
                     optimizer.zero_grad()
@@ -700,12 +703,11 @@ def train_with_random_opponents(env, device, num_episodes=10000, load_checkpoint
                     # Update priorities in the replay buffer
                     memory.update_priorities(training_agent, indices, td_errors)
                 
-                    
                     # Log to tensorboard if enabled
                     if writer is not None:
                         writer.add_scalar(f"Loss/Policy", policy_loss.item(), total_steps)
                         writer.add_scalar(f"Loss/Value", value_loss.item(), total_steps)
-                        writer.add_scalar(f"Loss/NextObsPred", next_obs_loss.item(), total_steps)
+                        writer.add_scalar(f"Loss/DerivableStatePred", game_state_loss.item(), total_steps)
                         writer.add_scalar(f"Entropy", entropy.item(), total_steps)
                         writer.add_scalar(f"KL_Divergence", kl_div.item(), total_steps)
                         writer.add_scalar(f"Buffer/Size", memory.size(training_agent), total_steps)
