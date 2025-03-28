@@ -96,65 +96,72 @@ class BeliefSpacePolicy(nn.Module):
 
 class OpponentBeliefModel(nn.Module):
     """
-    Model for updating beliefs about opponent types based on observations.
-    Uses Bayesian-inspired updates to maintain a belief distribution.
+    Model for updating beliefs about opponent types based on sequences of opponent memory events.
+    Uses a sequence model to process memory events and updates belief distribution.
     
     Enhanced with numerical stability safeguards to prevent NaN/Inf values.
     """
-    def __init__(self, obs_dim, num_opponent_types, hidden_dim):
+    def __init__(self, event_feature_dim=5, max_seq_length=200, hidden_dim=128, num_opponent_types=10):
         super().__init__()
         # Store dimensions for validation
-        self.obs_dim = obs_dim
+        self.event_feature_dim = event_feature_dim  # 5 features per event
+        self.max_seq_length = max_seq_length  # Up to 200 events
         self.num_opponent_types = num_opponent_types
+        self.hidden_dim = hidden_dim
         
-        self.encoder = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU()
+        # Event embedding layer
+        self.event_embedding = nn.Linear(event_feature_dim, hidden_dim)
+        
+        # LSTM for sequence processing
+        self.lstm = nn.LSTM(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            num_layers=2,
+            batch_first=True,
+            dropout=0.1,
+            bidirectional=True
         )
         
-        # Network to update belief based on observation and current belief
+        # Attention mechanism
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_dim * 2, 1),  # Bidirectional LSTM gives 2*hidden_dim
+            nn.Tanh()
+        )
+        
+        # Network to update belief based on sequence representation and current belief
         self.belief_update = nn.Sequential(
-            nn.Linear(hidden_dim + num_opponent_types, hidden_dim),
+            nn.Linear(hidden_dim * 2 + num_opponent_types, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
+            nn.Dropout(0.2),
             nn.Linear(hidden_dim, num_opponent_types)
         )
     
-    def forward(self, obs, current_belief):
+    def forward(self, event_sequences, current_belief, sequence_lengths=None):
         """
-        Forward pass to update belief based on new observation.
+        Forward pass to update belief based on sequences of opponent memory events.
         
         Args:
-            obs: Observation tensor of shape (batch_size, obs_dim)
+            event_sequences: Tensor of shape (batch_size, seq_length, event_feature_dim)
+                containing sequences of event features
             current_belief: Current belief tensor of shape (batch_size, num_opponent_types)
+            sequence_lengths: Optional tensor of shape (batch_size) containing actual
+                length of each sequence, used for packing/padding
             
         Returns:
             updated_belief: Updated belief of shape (batch_size, num_opponent_types)
         """
-        # Validate and handle input dimensions
-        if obs.size(1) != self.obs_dim:
-            if obs.size(1) > self.obs_dim:
-                # Truncate observation
-                obs = obs[:, :self.obs_dim]
-            else:
-                # Pad observation
-                padding = torch.zeros((obs.size(0), self.obs_dim - obs.size(1)), device=obs.device)
-                obs = torch.cat([obs, padding], dim=1)
+        batch_size = event_sequences.size(0)
+        seq_length = event_sequences.size(1)
         
-        if current_belief.size(1) != self.num_opponent_types:
-            if current_belief.size(1) > self.num_opponent_types:
-                # Truncate belief
-                current_belief = current_belief[:, :self.num_opponent_types]
-            else:
-                # Pad belief
-                padding = torch.zeros((current_belief.size(0), 
-                                      self.num_opponent_types - current_belief.size(1)), 
-                                      device=current_belief.device)
-                current_belief = torch.cat([current_belief, padding], dim=1)
+        # Handle empty sequences gracefully
+        if seq_length == 0:
+            # Just return the current belief with some noise to encourage exploration
+            noise = torch.randn_like(current_belief) * 0.01
+            return current_belief + noise
         
         # Apply numeric safeguards
-        obs = torch.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=-1.0)
+        event_sequences = torch.nan_to_num(event_sequences, nan=0.0, posinf=1.0, neginf=-1.0)
         
         # Normalize belief to ensure it sums to 1
         belief_sum = current_belief.sum(dim=1, keepdim=True)
@@ -164,12 +171,42 @@ class OpponentBeliefModel(nn.Module):
             torch.ones_like(current_belief) / current_belief.size(1)
         )
         
-        # Encode observation
-        obs_features = self.encoder(obs)
-        obs_features = torch.nan_to_num(obs_features, nan=0.0, posinf=1.0, neginf=-1.0)
+        # Embed each event in the sequence
+        # (batch_size, seq_length, event_feature_dim) -> (batch_size, seq_length, hidden_dim)
+        embedded_events = self.event_embedding(event_sequences)
+        embedded_events = F.gelu(embedded_events)
+        
+        # Handle variable-length sequences
+        if sequence_lengths is not None:
+            # Pack the sequences for efficient processing
+            packed_events = nn.utils.rnn.pack_padded_sequence(
+                embedded_events, 
+                sequence_lengths.cpu(), 
+                batch_first=True, 
+                enforce_sorted=False
+            )
+            
+            # Process through LSTM
+            packed_outputs, (hidden, _) = self.lstm(packed_events)
+            
+            # Unpack the sequences
+            lstm_outputs, _ = nn.utils.rnn.pad_packed_sequence(packed_outputs, batch_first=True)
+        else:
+            # If no sequence lengths provided, just process through LSTM
+            lstm_outputs, (hidden, _) = self.lstm(embedded_events)
+        
+        # Apply attention mechanism to focus on relevant events
+        attention_weights = self.attention(lstm_outputs)
+        
+        # Normalize attention weights
+        attention_weights = F.softmax(attention_weights, dim=1)
+        
+        # Apply attention to get a weighted sum of the LSTM outputs
+        # (batch_size, seq_length, hidden_dim*2) * (batch_size, seq_length, 1) -> (batch_size, hidden_dim*2)
+        context_vector = torch.sum(lstm_outputs * attention_weights, dim=1)
         
         # Combine with current belief
-        combined = torch.cat([obs_features, current_belief], dim=1)
+        combined = torch.cat([context_vector, current_belief], dim=1)
         
         # Output logits for belief update
         belief_logits = self.belief_update(combined)

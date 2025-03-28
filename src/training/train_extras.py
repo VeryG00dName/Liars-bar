@@ -45,6 +45,40 @@ def convert_memory_to_features(memory, response_mapping, action_mapping):
         features.append([resp_val, act_val, penalties, card_count])
     return features
 
+def convert_memory_to_features2(memory, response_mapping, action_mapping):
+    """
+    Convert the opponent memory (a list of events) to a list of 5-dimensional feature vectors.
+    Each event is expected to be a dictionary with keys: "response", "triggering_action", 
+    "penalties", "card_count", and optionally "challenge_success".
+    
+    challenge_success will be:
+    - 1.0 if the challenge was successful (play was a bluff)
+    - 0.0 if the challenge was unsuccessful (play was honest)
+    - -1.0 if not applicable (e.g., for Play actions where no challenge occurred)
+    """
+    features = []
+    for event in memory:
+        if not isinstance(event, dict):
+            raise ValueError(f"Memory event is not a dictionary: {event}. Please fix the data generation.")
+            
+        resp = event.get("response", "")
+        act = event.get("triggering_action", "")
+        penalties = float(event.get("penalties", 0))
+        card_count = float(event.get("card_count", 0))
+        
+        # Get challenge_success value, use -1.0 as placeholder when None
+        challenge_success_val = -1.0
+        if event.get("challenge_success") is not None:
+            challenge_success_val = 1.0 if event["challenge_success"] else 0.0
+        
+        # Map the categorical features using the provided mappings
+        resp_val = float(response_mapping.get(resp, 0))
+        act_val = float(action_mapping.get(act, 0))
+        
+        features.append([resp_val, act_val, penalties, card_count, challenge_success_val])
+        
+    return features
+
 def extract_obp_features_from_action(action_entry):
     """
     Extracts features from a single opponent action entry suitable for OBP input.

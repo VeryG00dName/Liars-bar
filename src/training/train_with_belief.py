@@ -1,4 +1,5 @@
 # src/training/train_with_belief.py
+# Modified to use belief space policy and opponent memory for belief updates
 
 import logging
 import time
@@ -52,7 +53,8 @@ from src.training.train_utils import (
 )
 from src.training.train_extras import (
     set_seed,
-    convert_memory_to_features
+    convert_memory_to_features,
+    convert_memory_to_features2
 )
 
 from src.training.train_transformer import EventEncoder
@@ -193,8 +195,7 @@ def compute_action_likelihood(opponent_model, observation_new, observation_old, 
 
 def bayesian_belief_update(current_belief, observation_new, observation_old, action, action_mask, opponent_models, device):
     """
-    Update belief over opponent types using Bayesian inference with enhanced error handling and
-    numerical stability safeguards.
+    Update belief over opponent types using Bayesian inference with robust error handling.
     
     Args:
         current_belief: Current belief distribution over opponent types
@@ -208,12 +209,6 @@ def bayesian_belief_update(current_belief, observation_new, observation_old, act
     Returns:
         updated_belief: Updated belief distribution
     """
-    import logging
-    import numpy as np
-    import torch
-    
-    logger = logging.getLogger("Evaluate")
-    
     # Convert current belief to numpy for easier manipulation
     if isinstance(current_belief, torch.Tensor):
         belief_np = current_belief.cpu().numpy()
@@ -221,76 +216,41 @@ def bayesian_belief_update(current_belief, observation_new, observation_old, act
         belief_np = current_belief
     
     # Ensure current belief is valid
-    if np.isnan(belief_np).any() or np.isinf(belief_np).any() or belief_np.sum() < 1e-10:
-        logger.debug("Invalid belief distribution detected, resetting to uniform")
+    if np.isnan(belief_np).any() or np.isinf(belief_np).any() or belief_np.sum() == 0:
+        # Reset to uniform distribution
         belief_np = np.ones_like(belief_np) / len(belief_np)
-    
-    # Add small epsilon to avoid exactly zero beliefs
-    belief_np = belief_np + 1e-6
-    belief_np = belief_np / belief_np.sum()
-    
-    # Compute likelihoods with enhanced error handling
+        
+    # Compute likelihoods for each opponent type
     likelihoods = []
-    valid_models = 0
-    
-    for model_idx, model in enumerate(opponent_models):
+    for model in opponent_models:
         try:
             likelihood = compute_action_likelihood(model, observation_new, observation_old, action, action_mask, device)
-            
-            # Validate likelihood value
-            if likelihood is None or np.isnan(likelihood) or np.isinf(likelihood):
-                logger.debug(f"Invalid likelihood from model {model_idx}, using default")
-                likelihood = 0.1
-            else:
-                # Ensure likelihood is positive but not too small
-                likelihood = max(likelihood, 1e-5)
-                valid_models += 1
-            
-            likelihoods.append(likelihood)
+            likelihoods.append(max(likelihood, 1e-6))  # Avoid zero probabilities
         except Exception as e:
-            logger.debug(f"Error computing likelihood for model {model_idx}: {str(e)}")
-            likelihoods.append(0.1)  # Default likelihood 
+            # On error, assign a small default likelihood
+            likelihoods.append(0.1)  # Non-zero default likelihood
     
-    # If all models failed, maintain current belief 
-    if valid_models == 0:
-        logger.debug("No valid likelihood computations, maintaining current belief")
-        return belief_np
-    
-    # Ensure we have likelihoods for all models with proper length handling
+    # Ensure we have likelihoods for all models
     if len(likelihoods) < len(belief_np):
-        logger.debug(f"Not enough likelihoods ({len(likelihoods)}) for belief size ({len(belief_np)}), padding")
         likelihoods.extend([0.1] * (len(belief_np) - len(likelihoods)))
-    elif len(likelihoods) > len(belief_np):
-        logger.debug(f"Too many likelihoods ({len(likelihoods)}) for belief size ({len(belief_np)}), truncating")
-        likelihoods = likelihoods[:len(belief_np)]
     
     # Convert to numpy array
-    likelihoods = np.array(likelihoods, dtype=np.float32)
-    
-    # Apply smoothing to likelihoods to avoid extremes
-    smoothed_likelihoods = 0.95 * likelihoods + 0.05 * np.ones_like(likelihoods) / len(likelihoods)
+    likelihoods = np.array(likelihoods[:len(belief_np)])  # Truncate if we have too many
     
     # Bayesian update: posterior ∝ prior * likelihood
-    posterior = belief_np * smoothed_likelihoods
+    posterior = belief_np * likelihoods
     
-    # Normalize with safety checks
-    posterior_sum = posterior.sum()
-    if posterior_sum > 1e-10:
-        posterior = posterior / posterior_sum
+    # Normalize
+    if posterior.sum() > 0:
+        posterior = posterior / posterior.sum()
     else:
-        logger.debug("Posterior sum too small, using smoothed prior instead")
-        # If posterior sum is too small, use a smoothed version of the prior
-        posterior = 0.9 * belief_np + 0.1 * np.ones_like(belief_np) / len(belief_np)
+        # If all likelihoods are zero, keep the prior
+        posterior = belief_np
     
     # Final safety check for NaN/Inf values
     if np.isnan(posterior).any() or np.isinf(posterior).any():
-        logger.debug("NaN/Inf in posterior after update, using uniform distribution")
+        # Return uniform distribution
         return np.ones_like(belief_np) / len(belief_np)
-    
-    # Ensure posterior is a proper distribution (sums to 1)
-    posterior_sum = posterior.sum()
-    if abs(posterior_sum - 1.0) > 1e-5:
-        posterior = posterior / posterior_sum
         
     return posterior
 
@@ -376,10 +336,12 @@ def train_with_belief_space_policy(env, device, num_episodes=10000, load_checkpo
         output_dim=action_dim
     ).to(device)
     
+    # Create belief model that uses memory features instead of observations
     belief_model = OpponentBeliefModel(
-        obs_dim=obs_dim, 
-        num_opponent_types=num_opponent_classes,  # This should be per opponent
-        hidden_dim=config.HIDDEN_DIM // 2
+        event_feature_dim=5,  # 5 features per event from convert_memory_to_features2
+        max_seq_length=200,   # Maximum events in memory
+        hidden_dim=config.HIDDEN_DIM // 4,  # Smaller hidden dim for the sequence model
+        num_opponent_types=num_opponent_classes
     ).to(device)
     
     # Create optimizers
@@ -744,27 +706,26 @@ def train_with_belief_space_policy(env, device, num_episodes=10000, load_checkpo
             last_observations_old[agent] = observation_old
             last_action_masks[agent] = action_mask
             
-            # Update beliefs based on observed actions
-            # We update belief about the current agent based on its action
+            # Update beliefs based on opponent memory
             if agent in opponent_agents:
-                # Update belief only when we have seen this agent act before
-                if last_actions[agent] is not None:
-                    # Get observation and action
-                    obs_new = last_observations_new[agent]
-                    obs_old = last_observations_old[agent]
-                    act = last_actions[agent] 
-                    act_mask = last_action_masks[agent]
+                # Get memory data for this opponent
+                memory_full = query_opponent_memory_full(training_agent, agent)
+                
+                # Convert memory to features using the new function
+                features_list = convert_memory_to_features2(memory_full, response2idx, action2idx)
+                
+                if features_list:
+                    # Convert features to tensor [seq_len, feature_dim]
+                    features_tensor = torch.tensor(features_list, dtype=torch.float32, device=device)
                     
-                    # Update belief using Bayesian update
-                    beliefs[agent] = bayesian_belief_update(
-                        beliefs[agent],
-                        obs_new,
-                        obs_old,
-                        act,
-                        act_mask,
-                        all_opponent_models,
-                        device=device
-                    )
+                    # Add batch dimension [1, seq_len, feature_dim]
+                    features_tensor = features_tensor.unsqueeze(0)
+                    
+                    # Update belief using the belief model
+                    current_belief_tensor = torch.tensor(beliefs[agent], dtype=torch.float32, device=device).unsqueeze(0)
+                    with torch.no_grad():
+                        updated_belief = belief_model(features_tensor, current_belief_tensor)
+                        beliefs[agent] = updated_belief.squeeze(0).cpu().numpy()
             
             # Take step in environment
             env.step(action)
@@ -898,43 +859,77 @@ def train_with_belief_space_policy(env, device, num_episodes=10000, load_checkpo
                     policy_optimizer.step()
                     
                     # Update belief model separately (train on a smaller batch)
-                    # This is independent of the policy training
-                    if len(batch) >= 256:
+                    # Using memory features instead of observations
+                    if len(batch) >= 128:  # Reduced batch size due to sequence processing
                         # Sample a subset for belief model training
-                        belief_batch_indices = np.random.choice(len(batch), 256, replace=False)
+                        belief_batch_indices = np.random.choice(len(batch), 128, replace=False)
                         belief_batch = [batch[i] for i in belief_batch_indices]
-                        
-                        # Prepare data
-                        belief_states = torch.tensor(np.array([t.state for t in belief_batch], dtype=np.float32), device=device)
-                        
-                        # Get all beliefs but reshape to get individual opponent beliefs
-                        all_beliefs = np.array([t.expert_input['belief'] for t in belief_batch])
-                        
                         # Process each opponent separately
                         for opponent_idx, opponent in enumerate(opponent_agents):
-                            # Extract just this opponent's belief
-                            opponent_beliefs = all_beliefs[:, opponent_idx*num_opponent_classes:(opponent_idx+1)*num_opponent_classes]
-                            opponent_beliefs_tensor = torch.tensor(opponent_beliefs, dtype=torch.float32, device=device)
+                            memory_features_list = []
+                            belief_tensors_list = []
+                            sequence_lengths = []
                             
-                            # Forward pass through belief model for this opponent's beliefs
-                            updated_beliefs = belief_model(belief_states, opponent_beliefs_tensor)
+                            # Process each sample in the batch
+                            for sample in belief_batch:
+                                # Get memory data for this opponent
+                                memory_full = query_opponent_memory_full(training_agent, opponent)
+                                
+                                # Convert memory to features using the new function
+                                features_list = convert_memory_to_features2(memory_full, response2idx, action2idx)
+                                
+                                if features_list:
+                                    # Store the features and sequence length
+                                    seq_length = len(features_list)
+                                    sequence_lengths.append(seq_length)
+                                    
+                                    # Convert to tensor
+                                    features_tensor = torch.tensor(features_list, dtype=torch.float32, device=device)
+                                    memory_features_list.append(features_tensor)
+                                    
+                                    # Extract belief for this opponent
+                                    all_beliefs = sample.expert_input['belief']
+                                    opponent_belief = all_beliefs[opponent_idx*num_opponent_classes:(opponent_idx+1)*num_opponent_classes]
+                                    belief_tensors_list.append(torch.tensor(opponent_belief, dtype=torch.float32, device=device))
                             
-                            # Loss is KL divergence between model predictions and stored beliefs
-                            belief_loss = F.kl_div(
-                                F.log_softmax(updated_beliefs, dim=1),
-                                F.softmax(opponent_beliefs_tensor, dim=1),
-                                reduction='batchmean'
-                            )
-                            
-                            # Backpropagation
-                            belief_optimizer.zero_grad()
-                            belief_loss.backward()
-                            torch.nn.utils.clip_grad_norm_(belief_model.parameters(), max_norm=config.MAX_NORM)
-                            belief_optimizer.step()
-                            
-                            # Log belief model training
-                            if writer is not None:
-                                writer.add_scalar(f"Loss/Belief/Opponent_{opponent}", belief_loss.item(), total_steps)
+                            if memory_features_list and belief_tensors_list:
+                                # Pad sequences to same length
+                                max_seq_len = max(sequence_lengths)
+                                padded_features = []
+                                
+                                for features, length in zip(memory_features_list, sequence_lengths):
+                                    # If sequence is shorter than max_seq_len, pad with zeros
+                                    if length < max_seq_len:
+                                        padding = torch.zeros((max_seq_len - length, 5), device=device)
+                                        padded = torch.cat([features, padding], dim=0)
+                                    else:
+                                        padded = features
+                                    padded_features.append(padded)
+                                
+                                # Stack all padded features and beliefs
+                                memory_features_tensor = torch.stack(padded_features)  # [batch_size, max_seq_len, 5]
+                                opponent_beliefs_tensor = torch.stack(belief_tensors_list)  # [batch_size, num_opponent_types]
+                                sequence_lengths_tensor = torch.tensor(sequence_lengths, device=device)
+                                
+                                # Forward pass through belief model with sequence lengths
+                                updated_beliefs = belief_model(memory_features_tensor, opponent_beliefs_tensor, sequence_lengths_tensor)
+                                
+                                # Loss is KL divergence between model predictions and stored beliefs
+                                belief_loss = F.kl_div(
+                                    F.log_softmax(updated_beliefs, dim=1),
+                                    F.softmax(opponent_beliefs_tensor, dim=1),
+                                    reduction='batchmean'
+                                )
+                                
+                                # Backpropagation
+                                belief_optimizer.zero_grad()
+                                belief_loss.backward()
+                                torch.nn.utils.clip_grad_norm_(belief_model.parameters(), max_norm=config.MAX_NORM)
+                                belief_optimizer.step()
+                                
+                                # Log belief model training
+                                if writer is not None:
+                                    writer.add_scalar(f"Loss/Belief/Opponent_{opponent}", belief_loss.item(), total_steps)
                     
                     # Calculate TD errors for priority updates
                     with torch.no_grad():
