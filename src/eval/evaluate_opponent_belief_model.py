@@ -5,7 +5,8 @@ evaluate_opponent_belief_model.py
 This script loads a trained OpponentBeliefModel checkpoint, loads the saved
 transformer training data, balances the dataset, and evaluates the model on
 this data. It outputs the overall accuracy as well as the count of predictions
-per label.
+per label. In this version, we feed a uniform distribution as the 'current_belief'
+instead of the ground-truth one-hot label.
 """
 
 import os
@@ -37,22 +38,6 @@ def load_transformer_mappings(checkpoint_path, device):
     else:
         raise ValueError("Checkpoint is missing response2idx and/or action2idx.")
     return response2idx, action2idx
-
-def balance_training_data(training_data):
-    """
-    Balance the dataset by undersampling each class to 1.2 times the number of samples 
-    in the smallest class. The dataset is randomly shuffled beforehand.
-    """
-    random.shuffle(training_data)
-    label_counts = Counter(label for _, label in training_data)
-    min_count = min(label_counts.values())
-    target_count = int(1.2 * min_count)
-    balanced_data = []
-    for label in label_counts:
-        label_samples = [sample for sample in training_data if sample[1] == label]
-        balanced_data.extend(label_samples[:target_count])
-    random.shuffle(balanced_data)
-    return balanced_data
 
 class BeliefTrainingDataset(Dataset):
     def __init__(self, samples, response2idx, action2idx, max_seq_length, label2idx):
@@ -92,27 +77,47 @@ def collate_fn(batch):
     features, seq_lens, targets = zip(*batch)
     features = torch.stack(features)         # (batch, max_seq_length, event_feature_dim)
     seq_lens = torch.tensor(seq_lens, dtype=torch.long)
-    targets = torch.stack(targets)             # (batch, num_classes)
+    targets = torch.stack(targets)           # (batch, num_classes)
     return features, seq_lens, targets
 
 def evaluate(model, dataloader, device):
+    """
+    Evaluate the OpponentBeliefModel by feeding in a UNIFORM distribution
+    as 'current_belief' (rather than the one-hot label). This way, the model
+    must infer the label from the memory features alone.
+    """
     model.eval()
     correct = 0
     total = 0
     predictions_counter = Counter()
+
     with torch.no_grad():
         for features, seq_lens, targets in tqdm(dataloader, desc="Evaluating", leave=False):
             features = features.to(device)
             seq_lens = seq_lens.to(device)
             targets = targets.to(device)
-            # Here we treat the one-hot target as the current belief
-            current_belief = targets.clone()
+
+            # Create a uniform distribution for current_belief
+            batch_size, num_opponent_types = targets.size()
+            current_belief = torch.full(
+                size=(batch_size, num_opponent_types),
+                fill_value=1.0 / num_opponent_types,
+                device=device,
+                dtype=torch.float32
+            )
+
+            # Forward pass
             updated_belief = model(features, current_belief, sequence_lengths=seq_lens)
+
+            # Compare predictions to ground truth
             preds = torch.argmax(updated_belief, dim=1)
             true_labels = torch.argmax(targets, dim=1)
             total += targets.size(0)
             correct += (preds == true_labels).sum().item()
+
+            # Track how many times each label is predicted
             predictions_counter.update(pred.item() for pred in preds.cpu().numpy())
+
     accuracy = correct / total if total > 0 else 0
     return accuracy, predictions_counter
 
@@ -145,21 +150,21 @@ def main():
             all_samples.extend(samples)
     logging.info(f"Loaded {len(all_samples)} samples from {len(data_files)} files.")
     
-    # Balance the training data
-    all_samples = balance_training_data(all_samples)
-    logging.info(f"Balanced dataset to {len(all_samples)} samples.")
-
+    # Build label mapping
     unique_labels = sorted(list({label for _, label in all_samples}))
     label2idx = {label: idx for idx, label in enumerate(unique_labels)}
     num_opponent_types = len(label2idx)
     logging.info(f"Detected {num_opponent_types} opponent types: {label2idx}")
 
+    # Load response2idx and action2idx
     transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
     response2idx, action2idx = load_transformer_mappings(transformer_checkpoint_path, device)
 
+    # Create dataset and dataloader
     dataset = BeliefTrainingDataset(all_samples, response2idx, action2idx, args.max_seq_length, label2idx)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
 
+    # Initialize and load model
     model = OpponentBeliefModel(
         event_feature_dim=5,
         max_seq_length=args.max_seq_length,
@@ -173,6 +178,7 @@ def main():
     model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=False))
     logging.info(f"Loaded OpponentBeliefModel checkpoint from {checkpoint_path}")
 
+    # Evaluate with a uniform "current_belief"
     accuracy, predictions_counter = evaluate(model, dataloader, device)
     logging.info(f"Evaluation Accuracy: {accuracy * 100:.2f}%")
     logging.info("Predictions per label:")
