@@ -428,7 +428,6 @@ class OpponentMemory:
             return list(self.memory[opponent])
         else:
             return []
-        
 # Global dictionary to hold persistent opponent memories per agent.
 PERSISTENT_OPPONENT_MEMORIES = {}
 
@@ -436,3 +435,15 @@ def get_opponent_memory(agent):
     if agent not in PERSISTENT_OPPONENT_MEMORIES:
         PERSISTENT_OPPONENT_MEMORIES[agent] = OpponentMemory(max_events=400)
     return PERSISTENT_OPPONENT_MEMORIES[agent]
+
+def clear_opponent_memory(agent, opponent):
+    """
+    Clear the memory of a specific opponent for a given agent.
+    
+    Args:
+        agent (str): The agent identifier.
+        opponent (str): The opponent identifier.
+    """
+    if agent in PERSISTENT_OPPONENT_MEMORIES and opponent in PERSISTENT_OPPONENT_MEMORIES[agent].memory:
+        del PERSISTENT_OPPONENT_MEMORIES[agent].memory[opponent]
+        del PERSISTENT_OPPONENT_MEMORIES[agent].aggregates[opponent]
