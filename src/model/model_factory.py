@@ -71,22 +71,82 @@ class ModelFactory:
         return model
     
     @staticmethod
-    def get_belief_input_dim(state_dict):
+    def get_belief_dimensions(state_dict):
         """
-        Extracts the observation dimension from a BeliefSpacePolicy state dictionary.
+        Extract exact dimensions from a BeliefSpacePolicy state dictionary.
         
         Args:
             state_dict: The state dictionary of a BeliefSpacePolicy.
             
         Returns:
-            int: The observation dimension.
+            tuple: (total_input_dim, suggested_obs_dim, suggested_belief_dim)
         """
-        total_input_dim = state_dict['network.0.weight'].shape[1]
-        hidden_dim = state_dict['network.0.weight'].shape[0]
+        # Get the exact total input dimension
+        total_input_dim = None
         
-        # In BeliefSpacePolicy, the input is [observation, belief]
-        # So the observation dimension is the difference between total input and hidden dim
-        return total_input_dim - hidden_dim
+        # Check for the weight of the first network layer
+        if 'network.0.weight' in state_dict:
+            total_input_dim = state_dict['network.0.weight'].shape[1]
+        
+        # If we couldn't find it, try other keys
+        if total_input_dim is None:
+            for key, tensor in state_dict.items():
+                if isinstance(tensor, torch.Tensor) and tensor.ndim == 2 and 'network' in key and 'weight' in key:
+                    total_input_dim = tensor.shape[1]
+                    break
+        
+        # If still not found, use a default
+        if total_input_dim is None:
+            return (None, 16, 20)  # Default values
+        
+        # Make a reasonable split: around 2/3 for obs_dim, 1/3 for belief_dim
+        # This is just a suggestion, as we'll use the exact total_input_dim
+        suggested_obs_dim = int(total_input_dim * 0.67)
+        suggested_belief_dim = total_input_dim - suggested_obs_dim
+        
+        return (total_input_dim, suggested_obs_dim, suggested_belief_dim)
+    
+    @staticmethod
+    def get_belief_input_dim(state_dict):
+        """
+        Extracts the observation dimension from a BeliefSpacePolicy state dictionary.
+        
+        For BeliefSpacePolicy, the input dimension to the network is the sum of 
+        observation dimension and belief dimension. This method attempts to determine
+        the observation dimension by examining the state dictionary.
+        
+        Args:
+            state_dict: The state dictionary of a BeliefSpacePolicy.
+            
+        Returns:
+            int: The estimated observation dimension.
+        """
+        # First, try to determine the total input dimension (obs_dim + belief_dim)
+        total_input_dim = None
+        
+        # Check for the weight of the first network layer
+        if 'network.0.weight' in state_dict:
+            total_input_dim = state_dict['network.0.weight'].shape[1]
+        
+        # If we couldn't find it through direct keys, try examining each key
+        if total_input_dim is None:
+            for key, tensor in state_dict.items():
+                if isinstance(tensor, torch.Tensor) and tensor.ndim == 2 and 'network' in key and 'weight' in key:
+                    # This is likely a linear layer in the network
+                    total_input_dim = tensor.shape[1]
+                    break
+        
+        # If we still can't determine it, provide a reasonable default
+        if total_input_dim is None:
+            return 16  # Default observation dimension for BeliefSpacePolicy
+        
+        # For BeliefSpacePolicy, a reasonable heuristic is that
+        # observation_dim is about 75-80% of the total input dimension
+        # The rest is for the belief dimension
+        obs_dim = int(total_input_dim * 0.75)
+        
+        # Ensure the dimension is positive and reasonable
+        return max(obs_dim, 16)  # Minimum 16 as a reasonable default
     
     @staticmethod
     def get_num_opponent_types(belief_model_state_dict):

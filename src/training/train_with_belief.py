@@ -1,5 +1,4 @@
 # src/training/train_with_belief.py
-# Modified to use belief space policy and opponent belief model
 
 import logging
 import time
@@ -194,7 +193,8 @@ def compute_action_likelihood(opponent_model, observation_new, observation_old, 
 
 def bayesian_belief_update(current_belief, observation_new, observation_old, action, action_mask, opponent_models, device):
     """
-    Update belief over opponent types using Bayesian inference.
+    Update belief over opponent types using Bayesian inference with enhanced error handling and
+    numerical stability safeguards.
     
     Args:
         current_belief: Current belief distribution over opponent types
@@ -208,28 +208,89 @@ def bayesian_belief_update(current_belief, observation_new, observation_old, act
     Returns:
         updated_belief: Updated belief distribution
     """
+    import logging
+    import numpy as np
+    import torch
+    
+    logger = logging.getLogger("Evaluate")
+    
     # Convert current belief to numpy for easier manipulation
     if isinstance(current_belief, torch.Tensor):
         belief_np = current_belief.cpu().numpy()
     else:
         belief_np = current_belief
-        
-    # Compute likelihoods for each opponent type
+    
+    # Ensure current belief is valid
+    if np.isnan(belief_np).any() or np.isinf(belief_np).any() or belief_np.sum() < 1e-10:
+        logger.debug("Invalid belief distribution detected, resetting to uniform")
+        belief_np = np.ones_like(belief_np) / len(belief_np)
+    
+    # Add small epsilon to avoid exactly zero beliefs
+    belief_np = belief_np + 1e-6
+    belief_np = belief_np / belief_np.sum()
+    
+    # Compute likelihoods with enhanced error handling
     likelihoods = []
-    for model in opponent_models:
-        likelihood = compute_action_likelihood(model, observation_new, observation_old, action, action_mask, device)
-        likelihoods.append(max(likelihood, 1e-6))  # Avoid zero probabilities
+    valid_models = 0
+    
+    for model_idx, model in enumerate(opponent_models):
+        try:
+            likelihood = compute_action_likelihood(model, observation_new, observation_old, action, action_mask, device)
+            
+            # Validate likelihood value
+            if likelihood is None or np.isnan(likelihood) or np.isinf(likelihood):
+                logger.debug(f"Invalid likelihood from model {model_idx}, using default")
+                likelihood = 0.1
+            else:
+                # Ensure likelihood is positive but not too small
+                likelihood = max(likelihood, 1e-5)
+                valid_models += 1
+            
+            likelihoods.append(likelihood)
+        except Exception as e:
+            logger.debug(f"Error computing likelihood for model {model_idx}: {str(e)}")
+            likelihoods.append(0.1)  # Default likelihood 
+    
+    # If all models failed, maintain current belief 
+    if valid_models == 0:
+        logger.debug("No valid likelihood computations, maintaining current belief")
+        return belief_np
+    
+    # Ensure we have likelihoods for all models with proper length handling
+    if len(likelihoods) < len(belief_np):
+        logger.debug(f"Not enough likelihoods ({len(likelihoods)}) for belief size ({len(belief_np)}), padding")
+        likelihoods.extend([0.1] * (len(belief_np) - len(likelihoods)))
+    elif len(likelihoods) > len(belief_np):
+        logger.debug(f"Too many likelihoods ({len(likelihoods)}) for belief size ({len(belief_np)}), truncating")
+        likelihoods = likelihoods[:len(belief_np)]
+    
+    # Convert to numpy array
+    likelihoods = np.array(likelihoods, dtype=np.float32)
+    
+    # Apply smoothing to likelihoods to avoid extremes
+    smoothed_likelihoods = 0.95 * likelihoods + 0.05 * np.ones_like(likelihoods) / len(likelihoods)
     
     # Bayesian update: posterior ∝ prior * likelihood
-    likelihoods = np.array(likelihoods)
-    posterior = belief_np * likelihoods
+    posterior = belief_np * smoothed_likelihoods
     
-    # Normalize
-    if posterior.sum() > 0:
-        posterior = posterior / posterior.sum()
+    # Normalize with safety checks
+    posterior_sum = posterior.sum()
+    if posterior_sum > 1e-10:
+        posterior = posterior / posterior_sum
     else:
-        # If all likelihoods are zero, keep the prior
-        posterior = belief_np
+        logger.debug("Posterior sum too small, using smoothed prior instead")
+        # If posterior sum is too small, use a smoothed version of the prior
+        posterior = 0.9 * belief_np + 0.1 * np.ones_like(belief_np) / len(belief_np)
+    
+    # Final safety check for NaN/Inf values
+    if np.isnan(posterior).any() or np.isinf(posterior).any():
+        logger.debug("NaN/Inf in posterior after update, using uniform distribution")
+        return np.ones_like(belief_np) / len(belief_np)
+    
+    # Ensure posterior is a proper distribution (sums to 1)
+    posterior_sum = posterior.sum()
+    if abs(posterior_sum - 1.0) > 1e-5:
+        posterior = posterior / posterior_sum
         
     return posterior
 

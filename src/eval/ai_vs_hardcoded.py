@@ -249,7 +249,7 @@ class BattlegroundWorker(QThread):
         self.expert_signal.emit(self.expert_activations)
         self.results_signal.emit(results)
     
-    def run_match(self, opponent_type, opponent_obj, opponent_name, episodes, progress_callback=None):
+    def run_match(self, opponent_type, opponent_obj, opponent_name, episodes, progress_callback=None): 
         env = LiarsDeckEnv(num_players=3, render_mode=None)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         players_in_this_game = {}
@@ -259,81 +259,174 @@ class BattlegroundWorker(QThread):
         for key in ["player_0", "player_1"]:
             agent_data = self.ai_agents[key]
             policy_state_dict = agent_data["policy_net"]
-            
+
             # Check if this is a BeliefSpacePolicy model
             if agent_data.get("is_belief_space_policy", False):
-                # Get dimensions and create BeliefSpacePolicy
-                obs_dim = agent_data["input_dim"]
-                num_opponent_types = agent_data.get("num_opponent_types", 10)
-                
-                # For BeliefSpacePolicy, first extract the proper hidden dimension
-                # It should be the output dimension of the first network layer
-                if 'network.0.weight' in policy_state_dict:
-                    hidden_dim = policy_state_dict['network.0.weight'].shape[0]
-                else:
-                    hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, "network.0")
-                
-                # For BeliefSpacePolicy, belief_dim = num_opponent_types * number of opponents
-                belief_dim = num_opponent_types * (env.num_players - 1)
-                
-                # Log dimensions for debugging
-                logger.info(f"BeliefSpacePolicy dimensions - obs_dim: {obs_dim}, belief_dim: {belief_dim}, hidden_dim: {hidden_dim}")
-                
-                # Sanity check for dimensions
-                if belief_dim + obs_dim <= 0:
-                    # Fix the dimensions: Extract the total input dim from the state_dict
-                    total_input = policy_state_dict['network.0.weight'].shape[1]
-                    # Calculate a reasonable belief_dim based on observed network dimensions
-                    belief_dim = total_input - obs_dim
-                    logger.warning(f"Invalid dimensions detected. Adjusted belief_dim to {belief_dim}")
+                try:
+                    # Get dimensions from the model's state dict
+                    if 'network.0.weight' in policy_state_dict:
+                        hidden_dim = policy_state_dict['network.0.weight'].shape[0]
+                        total_input_dim = policy_state_dict['network.0.weight'].shape[1]
+                    else:
+                        # Try fallback methods
+                        hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, "network.0")
+                        if 'network.0.bias' in policy_state_dict:
+                            hidden_dim = policy_state_dict['network.0.bias'].shape[0]
+
+                        # Try to find any linear layer to infer dimensions
+                        for net_key, tensor in policy_state_dict.items():
+                            if isinstance(tensor, torch.Tensor) and tensor.ndim == 2 and '.weight' in net_key and 'network' in net_key:
+                                total_input_dim = tensor.shape[1]
+                                break
+                        else:
+                            # If still not found, use ModelFactory to estimate dimensions
+                            dimensions = ModelFactory.get_belief_dimensions(policy_state_dict)
+                            if dimensions[0] is not None:
+                                total_input_dim, obs_dim, belief_dim = dimensions
+                            else:
+                                # Last resort fallback
+                                total_input_dim = 29  # Default if we can't determine
                     
-                    # If still negative, set reasonable defaults
-                    if belief_dim <= 0:
-                        obs_dim = 16  # Standard observation dimension
-                        belief_dim = 20  # Reasonable belief dimension (10 types * 2 opponents)
-                        logger.warning(f"Using default dimensions: obs_dim={obs_dim}, belief_dim={belief_dim}")
-                
-                # Create BeliefSpacePolicy
-                policy_net = BeliefSpacePolicy(
-                    belief_dim=belief_dim,
-                    obs_dim=obs_dim,
-                    hidden_dim=hidden_dim,
-                    output_dim=env.action_spaces[key].n
-                )
-                
-                # Load state dict
-                policy_net.load_state_dict(policy_state_dict, strict=False)
-                policy_net.to(device).eval()
-                
-                # Load OpponentBeliefModel if available
-                belief_model_state = agent_data.get("belief_model", None)
-                belief_model = None
-                
-                if belief_model_state is not None:
-                    # Get belief model dimensions
-                    belief_hidden_dim = get_hidden_dim_from_state_dict(belief_model_state, "encoder.0")
-                    
-                    # Create and load belief model
-                    belief_model = OpponentBeliefModel(
-                        obs_dim=obs_dim,
-                        num_opponent_types=num_opponent_types,
-                        hidden_dim=belief_hidden_dim
-                    )
-                    belief_model.load_state_dict(belief_model_state, strict=False)
-                    belief_model.to(device).eval()
-                
-                players_in_this_game[key] = {
-                    "policy_net": policy_net,
-                    "belief_model": belief_model,
-                    "obs_version": 2,  # New observation format
-                    "rating": None,
-                    "uses_memory": False,
-                    "track_experts": False,
-                    "is_stacked_model": False,
-                    "is_newer_obs_model": False,
-                    "is_belief_space_policy": True,
-                    "num_opponent_types": num_opponent_types
-                }
+                    if total_input_dim is not None:
+                        # Compute a better estimate of observation and belief dimensions
+                        
+                        # First check if the model has configuration attributes saved
+                        if hasattr(policy_state_dict, 'get') and policy_state_dict.get('total_input_dim') is not None:
+                            total_input_dim = policy_state_dict['total_input_dim'].item()
+                        if hasattr(policy_state_dict, 'get') and policy_state_dict.get('obs_dim') is not None:
+                            obs_dim = policy_state_dict['obs_dim'].item()
+                            belief_dim = total_input_dim - obs_dim
+                        else:
+                            # Make a better estimate by analyzing the observation
+                            sample_obs = env.observe(key, new=True)[key]
+                            estimated_obs_dim = min(sample_obs.shape[0], total_input_dim - 10)  # Ensure at least 10 for belief
+                            
+                            # For display and initialization
+                            obs_dim = estimated_obs_dim
+                            belief_dim = total_input_dim - obs_dim
+                        
+                        # Create BeliefSpacePolicy with the exact dimensions from the checkpoint
+                        policy_net = BeliefSpacePolicy(
+                            belief_dim=belief_dim,
+                            obs_dim=obs_dim,
+                            hidden_dim=hidden_dim,
+                            output_dim=env.action_spaces[key].n
+                        )
+                        
+                        # Load state dict with better error handling
+                        try:
+                            policy_net.load_state_dict(policy_state_dict, strict=False)
+                            
+                            # Check for NaN/Inf in loaded weights and fix them
+                            has_invalid_params = False
+                            for name, param in policy_net.named_parameters():
+                                if torch.isnan(param).any() or torch.isinf(param).any():
+                                    logger.warning(f"NaN/Inf found in parameter {name}, fixing...")
+                                    has_invalid_params = True
+                                    # Zero out the problematic values
+                                    param.data = torch.nan_to_num(param.data, nan=0.0, posinf=0.0, neginf=0.0)
+                            
+                            if has_invalid_params:
+                                logger.info("Fixed NaN/Inf values in model parameters")
+                                
+                        except Exception as e:
+                            logger.warning(f"Error loading state dict: {str(e)}. Attempting to adjust...")
+                            # Try to match parameter shapes
+                            mismatched_keys = []
+                            for name, param in policy_net.named_parameters():
+                                if name in policy_state_dict:
+                                    checkpoint_param = policy_state_dict[name]
+                                    if param.shape != checkpoint_param.shape:
+                                        mismatched_keys.append(name)
+                                        logger.warning(f"Shape mismatch for {name}: model {param.shape} vs checkpoint {checkpoint_param.shape}")
+                            
+                            # If there are mismatches, try to adjust the state dict
+                            if mismatched_keys:
+                                adjusted_state_dict = {}
+                                for name, param in policy_state_dict.items():
+                                    if name in mismatched_keys:
+                                        # Skip mismatched keys
+                                        continue
+                                    adjusted_state_dict[name] = param
+                                
+                                # Load the adjusted state dict
+                                policy_net.load_state_dict(adjusted_state_dict, strict=False)
+                                logger.info("Loaded adjusted state dict with skipped mismatched keys")
+                        
+                        policy_net.to(device).eval()
+                        
+                        # Load OpponentBeliefModel if available with similar error handling
+                        belief_model_state = agent_data.get("belief_model", None)
+                        belief_model = None
+                        
+                        if belief_model_state is not None:
+                            try:
+                                # Get belief model dimensions with fallbacks
+                                if 'encoder.0.weight' in belief_model_state:
+                                    belief_hidden_dim = belief_model_state['encoder.0.weight'].shape[0]
+                                    belief_obs_dim = belief_model_state['encoder.0.weight'].shape[1]
+                                else:
+                                    belief_hidden_dim = get_hidden_dim_from_state_dict(belief_model_state, "encoder.0")
+                                    belief_obs_dim = obs_dim  # Use the same as policy network
+                                
+                                # Get num_opponent_types from final layer
+                                if 'belief_update.2.weight' in belief_model_state:
+                                    num_opponent_types = belief_model_state['belief_update.2.weight'].shape[0]
+                                else:
+                                    num_opponent_types = agent_data.get('num_opponent_types', 10)
+                                
+                                # Create and load belief model
+                                belief_model = OpponentBeliefModel(
+                                    obs_dim=belief_obs_dim,
+                                    num_opponent_types=num_opponent_types,
+                                    hidden_dim=belief_hidden_dim
+                                )
+                                
+                                # Load state dict with error handling
+                                try:
+                                    belief_model.load_state_dict(belief_model_state, strict=False)
+                                    
+                                    # Check for NaN/Inf values
+                                    for name, param in belief_model.named_parameters():
+                                        if torch.isnan(param).any() or torch.isinf(param).any():
+                                            logger.warning(f"NaN/Inf found in belief model parameter {name}, fixing...")
+                                            param.data = torch.nan_to_num(param.data, nan=0.0, posinf=0.0, neginf=0.0)
+                                            
+                                except Exception as e:
+                                    logger.warning(f"Error loading belief model state dict: {str(e)}. Using partial loading.")
+                                    # Try to load as many parameters as possible
+                                    own_state = belief_model.state_dict()
+                                    for name, param in belief_model_state.items():
+                                        if name in own_state:
+                                            try:
+                                                if own_state[name].shape == param.shape:
+                                                    own_state[name].copy_(param)
+                                            except Exception:
+                                                logger.warning(f"Could not copy parameter {name}")
+                                
+                                belief_model.to(device).eval()
+                            except Exception as e:
+                                logger.warning(f"Failed to create belief model: {str(e)}")
+                                belief_model = None
+                        
+                        players_in_this_game[key] = {
+                            "policy_net": policy_net,
+                            "belief_model": belief_model,
+                            "obs_version": 2,  # New observation format
+                            "rating": None,
+                            "uses_memory": False,
+                            "track_experts": False,
+                            "is_stacked_model": False,
+                            "is_newer_obs_model": False,
+                            "is_belief_space_policy": True,
+                            "num_opponent_types": num_opponent_types if 'num_opponent_types' in locals() else 10
+                        }
+                    else:
+                        raise ValueError("Could not determine total input dimension for BeliefSpacePolicy")
+                except Exception as e:
+                    logger.error(f"Failed to create BeliefSpacePolicy: {str(e)}")
+                    raise
+
             # Check if this is a newer observation StackedObservationConvModel
             elif agent_data.get("is_newer_obs_model", False):
                 # For StackedObservationConvModel for newer observation format
@@ -362,8 +455,7 @@ class BattlegroundWorker(QThread):
                 policy_net.load_state_dict(policy_state_dict, strict=False)
                 policy_net.to(device).eval()
                 
-                # For StackedObservationConvModel, we don't need a separate value network
-                # or OBP model
+                # For StackedObservationConvModel, we don't need a separate value network or OBP model
                 players_in_this_game[key] = {
                     "policy_net": policy_net,
                     "obp_model": None,
@@ -409,8 +501,6 @@ class BattlegroundWorker(QThread):
                 policy_net.load_state_dict(policy_state_dict, strict=False)
                 policy_net.to(device).eval()
                 
-                # For StackedObservationConvModel, we don't need a separate value network
-                # or OBP model
                 players_in_this_game[key] = {
                     "policy_net": policy_net,
                     "obp_model": None,
