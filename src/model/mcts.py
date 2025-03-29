@@ -55,7 +55,7 @@ class PerfectMCTS:
         }
         
         # Debug flag for verbose logging
-        self.debug = False
+        self.debug = True
     
     def _log(self, message):
         """Log a message if debug is enabled."""
@@ -274,316 +274,194 @@ class PerfectMCTS:
     
     def _simulate_single_opponent_action(self, sim_env, action_sequence):
         """
-        Simple helper function to simulate a single opponent action and add it to the sequence.
-        Uses robust error handling.
+        Simulate a single opponent action and add it to the action sequence.
+        This version does not silently recover from errors.
         
         Args:
-            sim_env: Simulation environment
-            action_sequence: Current action sequence
+            sim_env: Simulation environment.
+            action_sequence: Current action sequence (list of (agent, action) tuples).
             
         Returns:
-            bool: True if successful, False otherwise
+            True if the action was simulated; otherwise, an exception is raised.
         """
-        try:
-            current_agent = sim_env.agent_selection
-            if current_agent is None or current_agent == self.training_agent:
-                return False
-                
-            # Get action for this opponent
-            opponent_action = self._select_opponent_action(sim_env, current_agent)
-            action_sequence.append((current_agent, opponent_action))
-            
-            # Take step
-            sim_env.step(opponent_action)
-            return True
-        except Exception as e:
-            self._log(f"Error simulating opponent action: {e}")
-            return False
+        current_agent = sim_env.agent_selection
+        if current_agent is None or current_agent == self.training_agent:
+            raise RuntimeError("Simulation error: Expected an opponent agent but got None or the training agent.")
+        
+        opponent_action = self._select_opponent_action(sim_env, current_agent)
+        action_sequence.append((current_agent, opponent_action))
+        sim_env.step(opponent_action)
+        return True
 
-    
+
     def simulate_game(self, env_state, action):
         """
-        Simulate a game starting from the given state and action.
-        Simplified with robust error handling.
+        Recursively simulate the game starting from the given state and action until the round ends.
+        
+        After executing the given action, we simulate opponent moves until our training agent's turn is reached.
+        If the training agent's hand size is neither 0 nor 5 (i.e. round has not ended), then we recursively
+        simulate all valid moves from that state and choose the best outcome.
         
         Args:
-            env_state: The current environment state
-            action: The action to simulate
+            env_state: The current environment state.
+            action: The action to simulate.
             
         Returns:
-            tuple: (reward, action_sequence, is_terminal)
-                reward: Value reflecting outcome
-                action_sequence: List of (agent, action) pairs for replay
-                is_terminal: Whether the game reached a terminal state
+            tuple: (total_reward, full_action_sequence, is_terminal)
+                total_reward: Outcome value at round end.
+                full_action_sequence: List of (agent, action) tuples for replay.
+                is_terminal: Boolean indicating whether the game terminated.
         """
-        # Clone the environment for simulation
+        # Clone environment and set state.
         sim_env = self.base_env.clone()
         sim_env.set_state(env_state)
         
-        # Check if it's our turn
         if sim_env.agent_selection != self.training_agent:
-            raise RuntimeError(f"Cannot simulate game when it's not our turn. Current agent: {sim_env.agent_selection}")
+            raise RuntimeError(f"simulate_game() expected training agent's turn but got {sim_env.agent_selection}.")
         
-        # Take our action
+        # Start the action sequence with the provided action.
         action_sequence = [(self.training_agent, action)]
-        
-        # Check if our action would be a bluff
         action_type, card_category, count = decode_action(action)
         is_bluffing = False
         if action_type == "Play":
             if card_category == "non-table":
                 is_bluffing = True
             elif card_category == "table":
-                # Check if we have enough actual table cards
                 table_card = sim_env.table_card
                 hand = sim_env.players_hands.get(self.training_agent, [])
                 table_cards = sum(1 for card in hand if card == table_card or card == "Joker")
-                is_bluffing = count > table_cards
+                is_bluffing = (count > table_cards)
         
-        # Take our action and see what happens
         sim_env.step(action)
+        self._log(f"After action {action}: training agent hand size = {len(sim_env.players_hands.get(self.training_agent, []))}")
         
-        # If game is over, return
-        if sim_env.agent_selection is None:
-            return 0.0, action_sequence, True
-        
-        # If it's our turn again immediately, return
-        if sim_env.agent_selection == self.training_agent:
-            return 0.0, action_sequence, False
-        
-        # Simulate the next opponent's action
-        if self._simulate_single_opponent_action(sim_env, action_sequence):
-            # If the opponent challenged our bluff, return negative
-            last_opponent, last_action = action_sequence[-1]
-            last_action_type, _, _ = decode_action(last_action)
-            if last_action_type == "Challenge" and is_bluffing:
-                return -2.0, action_sequence, False
-        
-        # Basic value calculation
-        if is_bluffing:
-            # Bluffing is always slightly risky
-            return -0.2, action_sequence, False
-        else:
-            # Safe play is good
-            return 0.2, action_sequence, False
-    
-    def _continue_simulation_after_round_transition(self, sim_env, action_sequence):
-        """
-        Continue simulation after a round transition is detected.
-        This ensures we capture ALL opponents' actions at the start of a new round.
-        
-        Args:
-            sim_env: The simulation environment
-            action_sequence: Current action sequence
-            
-        Returns:
-            tuple: (reward, action_sequence, is_terminal)
-                Same as simulate_game return values
-        """
-        self._log("Continuing simulation after round transition")
-        
-        # Simulate ALL opponent actions until it's our turn again
+        # Continue simulation until either:
+        # 1. The game terminates (no active agent), or
+        # 2. It's our turn AND our hand size is either 0 or 5 (i.e. round ended).
+        max_steps = 100  # safeguard against infinite loops
+        step = 0
         while sim_env.agent_selection is not None and sim_env.agent_selection != self.training_agent:
+            step += 1
+            if step > max_steps:
+                raise RuntimeError("simulate_game() exceeded maximum simulation steps without round ending.")
+            
             current_agent = sim_env.agent_selection
-            
-            # Get action for opponent
-            opponent_action = self._select_opponent_action(sim_env, current_agent)
-            action_sequence.append((current_agent, opponent_action))
-            
-            # Record penalties before step
-            pre_step_penalties = {agent: sim_env.penalties.get(agent, 0) for agent in sim_env.possible_agents}
-            
-            # Take step
-            sim_env.step(opponent_action)
-            
-            # Check if any penalties occurred
-            for agent in sim_env.possible_agents:
-                if sim_env.penalties.get(agent, 0) > pre_step_penalties.get(agent, 0):
-                    # Our agent got a penalty - bad outcome
-                    if agent == self.training_agent:
-                        return -1.0, action_sequence, sim_env.terminations.get(agent, False)
-                    # Opponent got a penalty - good outcome
-                    else:
-                        return 1.0, action_sequence, sim_env.terminations.get(agent, False)
+            self._log(f"Simulating opponent action for agent {current_agent}; "
+                    f"training agent hand size = {len(sim_env.players_hands.get(self.training_agent, []))}, "
+                    f"{current_agent} hand size = {len(sim_env.players_hands.get(current_agent, []))}")
+            self._simulate_single_opponent_action(sim_env, action_sequence)
         
-        return 0.0, action_sequence, False
+        # Now, either the game is over or it's our turn.
+        training_hand_size = len(sim_env.players_hands.get(self.training_agent, []))
+        if sim_env.agent_selection == self.training_agent and training_hand_size not in {0, 5}:
+            self._log(f"Returned to training agent with hand size {training_hand_size} (round not ended): Recursing for next move.")
+            sim_env.observe(self.training_agent, new=True)
+            if self.training_agent not in sim_env.infos or "action_mask" not in sim_env.infos[self.training_agent]:
+                raise RuntimeError(f"No valid action mask available for {self.training_agent}")
+            action_mask = sim_env.infos[self.training_agent]['action_mask']
+            valid_moves = [i for i, mask in enumerate(action_mask) if mask == 1]
+            if not valid_moves:
+                raise RuntimeError("No valid moves available on training agent's turn during recursion.")
+            
+            best_future_value = -float('inf')
+            best_future_sequence = []
+            # Recursively simulate each valid move from the current state.
+            for move in valid_moves:
+                future_value, future_sequence, is_terminal = self.simulate_game(sim_env.get_state(), move)
+                self._log(f"Recursive move {move} yields value {future_value} with sequence length {len(future_sequence)}")
+                if future_value > best_future_value:
+                    best_future_value = future_value
+                    best_future_sequence = future_sequence
+            full_sequence = action_sequence + best_future_sequence
+            total_value = best_future_value
+            return total_value, full_sequence, (sim_env.agent_selection is None)
+        else:
+            # Simulation ends because either the game terminated or the round ended.
+            if sim_env.agent_selection is None:
+                self._log("Simulation ended because no active agent remains (terminal state).")
+            elif training_hand_size in {0, 5}:
+                self._log(f"Simulation completed: training agent hand size = {training_hand_size} (round ended).")
+            reward = self.evaluate_terminal_state(sim_env.get_state())
+            return reward, action_sequence, (sim_env.agent_selection is None)
     
     def search(self, env_state):
         """
-        Enhanced search that properly evaluates action sequences and ensures we have 
-        plans for ALL opponents who will act before our next turn.
+        Enhanced search that evaluates each valid action from the current state by recursively simulating until the round ends.
+        
+        Raises an error if no valid action is found.
         
         Args:
-            env_state: Environment state to start search from
+            env_state: The environment state to start search from.
             
         Returns:
             tuple: (action_probs, best_action, best_value)
         """
-        # Create a sim env to examine the current state
         sim_env = self.base_env.clone()
         sim_env.set_state(env_state)
         
-        # Make sure it's our turn
         if sim_env.agent_selection != self.training_agent:
             raise RuntimeError(f"Cannot simulate game when it's not our turn. Current agent: {sim_env.agent_selection}")
-            
-        # Get valid actions
+        
         sim_env.observe(self.training_agent, new=True)
         if self.training_agent not in sim_env.infos or "action_mask" not in sim_env.infos[self.training_agent]:
             raise RuntimeError(f"No valid action mask available for {self.training_agent}")
-            
+        
         action_mask = sim_env.infos[self.training_agent]['action_mask']
         valid_actions = [i for i, mask in enumerate(action_mask) if mask == 1]
         
         if not valid_actions:
             raise RuntimeError(f"No valid actions available for {self.training_agent}")
         
-        # Pre-filter: Remove challenge action (action 6) if opponent is not bluffing
-        challenge_action = 6  # Challenge action index
+        challenge_action = 6  # Challenge action index.
         if challenge_action in valid_actions and not self._should_challenge(sim_env):
             valid_actions.remove(challenge_action)
             self._log("Removed challenge action as opponent is not bluffing")
         
-        # If no valid actions remain after filtering, use default actions
         if not valid_actions:
-            self._log("No valid actions after filtering, using default actions")
-            # Choose a safe default - play 1 table card if possible
-            if action_mask[0] == 1:  # Action 0 = play 1 table card
-                valid_actions = [0]
-            else:
-                # Just use any valid action from the original mask
-                valid_actions = [i for i, mask in enumerate(action_mask) if mask == 1]
+            raise RuntimeError("No valid actions available after filtering for the training agent.")
         
-        # Find safe actions (playing table cards we actually have)
         safe_actions = []
         for action in valid_actions:
             action_type, card_category, count = decode_action(action)
             if action_type == "Play" and card_category == "table":
-                # Check if we actually have enough table cards
                 table_card = sim_env.table_card
                 hand = sim_env.players_hands.get(self.training_agent, [])
                 table_cards = sum(1 for card in hand if card == table_card or card == "Joker")
                 if count <= table_cards:
                     safe_actions.append(action)
         
-        # Evaluate each valid action
         best_action = None
         best_value = -float('inf')
         best_sequence = []
         
         for action in valid_actions:
-            try:
-                # Get value of this action through simulation
-                value, action_sequence, is_terminal = self.simulate_game(env_state, action)
-                
-                # Debug output
-                action_type, card_category, count = decode_action(action)
-                self._log(f"Action {action} ({action_type}, {card_category}, {count}): value={value}, seq_len={len(action_sequence)}")
-                
-                # Reject any action with very negative value
-                if value < -1.5:
-                    self._log(f"Rejecting action {action} with very negative value {value}")
-                    continue
-                
-                # Prefer safe actions slightly
-                if action in safe_actions:
-                    value += 0.1  # Small boost for safe actions
-                
-                if value > best_value:
-                    best_action = action
-                    best_value = value
-                    best_sequence = action_sequence
-                    self._log(f"New best action: {action} with value {value}")
-            except Exception as e:
-                self._log(f"Error evaluating action {action}: {e}")
+            value, action_sequence, is_terminal = self.simulate_game(env_state, action)
+            action_type, card_category, count = decode_action(action)
+            self._log(f"Action {action} ({action_type}, {card_category}, {count}): value={value}, seq_len={len(action_sequence)}")
+            if value < -1.5:
+                self._log(f"Rejecting action {action} with very negative value {value}")
                 continue
+            if action in safe_actions:
+                value += 0.1  # Boost for safe actions.
+            if value > best_value:
+                best_action = action
+                best_value = value
+                best_sequence = action_sequence
+                self._log(f"New best action: {action} with value {value}")
         
-        # If no good action was found, fall back to safe actions
         if best_action is None:
-            self._log("No good actions found, falling back to safe actions")
-            
-            if safe_actions:
-                # Use the safest action (lowest card count)
-                best_action = min(safe_actions, key=lambda a: decode_action(a)[2])
-                try:
-                    value, best_sequence, _ = self.simulate_game(env_state, best_action)
-                    best_value = value
-                except Exception as e:
-                    self._log(f"Error simulating fallback action: {e}")
-                    best_value = 0.0
-                    best_sequence = [(self.training_agent, best_action)]
-                self._log(f"Using safe fallback action: {best_action}")
-            else:
-                # If even safe actions are bad, just pick a challenge if available
-                if challenge_action in valid_actions:
-                    best_action = challenge_action
-                    try:
-                        value, best_sequence, _ = self.simulate_game(env_state, best_action)
-                        best_value = value
-                    except Exception as e:
-                        self._log(f"Error simulating challenge fallback: {e}")
-                        best_value = 0.0
-                        best_sequence = [(self.training_agent, best_action)]
-                    self._log(f"Using challenge as fallback: {best_action}")
-                else:
-                    # Last resort - just pick first valid action
-                    best_action = valid_actions[0]
-                    try:
-                        value, best_sequence, _ = self.simulate_game(env_state, best_action)
-                        best_value = value
-                    except Exception as e:
-                        self._log(f"Error simulating last resort action: {e}")
-                        best_value = 0.0
-                        best_sequence = [(self.training_agent, best_action)]
-                    self._log(f"Using first valid action as fallback: {best_action}")
+            raise RuntimeError("No valid action found after evaluating all valid actions in MCTS search.")
         
-        # **** CRITICAL VALIDATION: Ensure we have at least one opponent action ****
-        # If we don't have any opponent actions, try to add at least one
-        if len(best_sequence) <= 1:
-            self._log("WARNING: Action sequence has no opponent actions!")
-            
-            try:
-                # Create a test environment to find the next opponent
-                test_env = sim_env.clone()
-                test_env.step(best_action)
-                
-                next_agent = test_env.agent_selection
-                if next_agent is not None and next_agent != self.training_agent:
-                    # Try to get a valid action for this opponent
-                    test_env.observe(next_agent, new=True)
-                    if next_agent in test_env.infos and "action_mask" in test_env.infos[next_agent]:
-                        action_mask = test_env.infos[next_agent]['action_mask']
-                        valid_indices = [i for i, mask in enumerate(action_mask) if mask == 1]
-                        if valid_indices:
-                            opponent_action = self._select_opponent_action(test_env, next_agent)
-                            best_sequence.append((next_agent, opponent_action))
-                            self._log(f"Added missing action for {next_agent}: {opponent_action}")
-            except Exception as e:
-                self._log(f"Error adding opponent action: {e}")
+        self.action_sequence = best_sequence
+        self._log(f"Final selected action: {best_action} with value {best_value}")
+        self._log(f"Action sequence ({len(best_sequence)} steps):")
+        for i, (agent, seq_action) in enumerate(best_sequence):
+            action_type, card_category, count = decode_action(seq_action)
+            self._log(f"  {i+1}. {agent}: {action_type}, {card_category}, {count}")
         
-        # Create probability distribution (one-hot for the selected action)
         action_dim = sim_env.action_spaces[self.training_agent].n
         action_probs = np.zeros(action_dim)
-        
-        if best_action is not None:
-            action_probs[best_action] = 1.0
-            # Save the action sequence for future moves
-            self.action_sequence = best_sequence
-            
-            # Final debugging log
-            self._log(f"Final selected action: {best_action} with value {best_value}")
-            self._log(f"Action sequence ({len(best_sequence)} steps):")
-            for i, (agent, seq_action) in enumerate(best_sequence):
-                action_type, card_category, count = decode_action(seq_action)
-                self._log(f"  {i+1}. {agent}: {action_type}, {card_category}, {count}")
-        else:
-            # This should never happen, but just in case, pick a safe default
-            for i, mask in enumerate(action_mask):
-                if mask == 1:
-                    action_probs[i] = 1.0
-                    best_action = i
-                    self.action_sequence = [(self.training_agent, best_action)]
-                    break
+        action_probs[best_action] = 1.0
         
         return action_probs, best_action, best_value
     
