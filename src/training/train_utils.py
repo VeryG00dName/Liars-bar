@@ -31,10 +31,10 @@ def compute_gae(rewards, dones, values, next_values, gamma=0.99, lam=0.95):
     returns = [adv + val for adv, val in zip(advantages, values)]
     return advantages, returns
 
-def save_checkpoint(policy_nets, value_nets, optimizers_policy, optimizers_value, obp_model, obp_optimizer, episode, checkpoint_dir=config.CHECKPOINT_DIR, checkpoint_filename=None):
+def save_checkpoint(policy_nets, value_nets, optimizers_policy, optimizers_value, belief_model, belief_optimizer, episode, checkpoint_dir=config.CHECKPOINT_DIR, checkpoint_filename=None):
     """
     Saves the current state of the training process, including models and optimizers.
-    Modified to handle cases where value_nets, value optimizers, OBP model, and OBP optimizer are None.
+    Modified to handle cases where value_nets, value optimizers, belief_model, and belief_optimizer may be None.
     """
     os.makedirs(checkpoint_dir, exist_ok=True)
     if checkpoint_filename is None:
@@ -43,28 +43,28 @@ def save_checkpoint(policy_nets, value_nets, optimizers_policy, optimizers_value
 
     checkpoint = {'episode': episode}
     
-    # Save policy networks (for the new StackedObservationConvModel, this includes both policy and value components)
+    # Save policy networks.
     checkpoint['policy_nets'] = {agent: net.state_dict() for agent, net in policy_nets.items()}
     
-    # Save value networks if provided
+    # Save value networks if provided.
     if value_nets is not None:
         checkpoint['value_nets'] = {agent: net.state_dict() for agent, net in value_nets.items()}
     
-    # Save policy optimizers if provided
+    # Save policy optimizers if provided.
     if optimizers_policy is not None:
         checkpoint['optimizers_policy'] = {agent: opt.state_dict() for agent, opt in optimizers_policy.items()}
     
-    # Save value optimizers if provided
+    # Save value optimizers if provided.
     if optimizers_value is not None:
         checkpoint['optimizers_value'] = {agent: opt.state_dict() for agent, opt in optimizers_value.items()}
     
-    # Save OBP model if provided
-    if obp_model is not None:
-        checkpoint['obp_model'] = obp_model.state_dict()
+    # Save belief model if provided.
+    if belief_model is not None:
+        checkpoint['belief_model'] = belief_model.state_dict()
     
-    # Save OBP optimizer if provided
-    if obp_optimizer is not None:
-        checkpoint['obp_optimizer'] = obp_optimizer.state_dict()
+    # Save belief optimizer if provided.
+    if belief_optimizer is not None:
+        checkpoint['belief_optimizer'] = belief_optimizer.state_dict()
     
     torch.save(checkpoint, checkpoint_path)
     print(f"Checkpoint saved to {checkpoint_path}")
