@@ -66,12 +66,21 @@ class ModelInfoApp:
             self.text.insert(tk.END, f"File: {file_path}\n")
             self.text.insert(tk.END, f"Total File Size: {total_file_size:.2f} MB\n\n")
 
-            if "policy_nets" in data and isinstance(data["policy_nets"], dict) and "player_1" in data["policy_nets"]:
-                policy_net = data["policy_nets"]["player_1"]
-                self.text.insert(tk.END, "\nVisualizing policy network for player_1\n")
+            # Always display model composition
+            self.text.insert(tk.END, "Model Composition:\n")
+            self.display_model_composition(data)
+            self.text.insert(tk.END, "\n")
+
+            # Attempt to visualize a specific network if available.
+            if "policy_nets" in data and isinstance(data["policy_nets"], dict):
+                # Try to pick a policy net from any available player key
+                available_keys = list(data["policy_nets"].keys())
+                selected_key = available_keys[0]
+                policy_net = data["policy_nets"][selected_key]
+                self.text.insert(tk.END, f"\nVisualizing policy network for {selected_key}\n")
                 self.draw_policy_network_visualization(policy_net)
             else:
-                self.text.insert(tk.END, "\nNo policy network found for player_1.\n")
+                self.text.insert(tk.END, "\nNo policy network found in the checkpoint.\n")
                 self.canvas.delete("all")
 
             self.text.insert(tk.END, "\nModel loaded successfully.")
@@ -80,8 +89,29 @@ class ModelInfoApp:
 
         self.text.configure(state="disabled")
 
+    def display_model_composition(self, data):
+        """
+        Displays the composition of the loaded model by listing its top-level keys.
+        If a key contains a state dictionary (i.e. dict of tensors), list each parameter and its shape.
+        """
+        for key, value in data.items():
+            self.text.insert(tk.END, f"Key: {key}\n")
+            # If the value is a dict and likely a state dict, list its contents.
+            if isinstance(value, dict):
+                for subkey, subval in value.items():
+                    if isinstance(subval, torch.Tensor):
+                        self.text.insert(tk.END, f"  {subkey}: {tuple(subval.shape)}\n")
+                    else:
+                        self.text.insert(tk.END, f"  {subkey}: {type(subval)}\n")
+            else:
+                self.text.insert(tk.END, f"  Type: {type(value)}\n")
+            self.text.insert(tk.END, "\n")
+
     def draw_policy_network_visualization(self, policy_net):
-        """Visualizes the policy network with increased spacing and only the strongest/weakest 3 connections per neuron."""
+        """
+        Visualizes the policy network with increased spacing and only the strongest/weakest 3 connections per neuron.
+        Aggregates weight matrices if necessary.
+        """
         self.canvas.delete("all")
         
         layers = []
@@ -116,7 +146,9 @@ class ModelInfoApp:
         self._draw_network(sizes, weight_matrices)
 
     def _draw_network(self, sizes, weight_matrices):
-        """Draws the network while only visualizing the 3 strongest and 3 weakest connections per neuron."""
+        """
+        Draws the network while only visualizing the 3 strongest and 3 weakest connections per neuron.
+        """
         canvas_width = self.canvas.winfo_width()
         canvas_height = self.canvas.winfo_height()
         if canvas_width <= 1:
@@ -145,6 +177,9 @@ class ModelInfoApp:
         for layer_idx in range(num_layers - 1):
             weight_matrix = weight_matrices[layer_idx]
             max_abs = abs(weight_matrix).max() if weight_matrix.size > 0 else 1
+            # Avoid division by zero in case max_abs is zero
+            if max_abs == 0:
+                max_abs = 1
 
             for out_idx, out_node in enumerate(nodes[layer_idx + 1]):
                 for in_idx, in_node in enumerate(nodes[layer_idx]):
