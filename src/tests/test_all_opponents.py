@@ -2,6 +2,7 @@
 # test_all_opponents.py - Tests the MCTS agent against all opponent combinations until a loss
 
 import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import sys
 import logging
 import random
@@ -319,13 +320,28 @@ def play_game(opponent1_config, opponent2_config, seed=42, render_mode=None, ver
     # Count challenging errors (failed challenges or missed bluffs)
     challenging_errors = 0
     
+    # Track rounds to know when a new round has started
+    hand_sizes = {agent: len(env.players_hands.get(agent, [])) for agent in env.possible_agents}
+    first_move_of_round = {agent: True for agent in env.possible_agents}
+    
     while not done:
         if env.agent_selection is None:
             if verbose:
                 logger.info("Game ended - no more agents to select")
             break
             
-        if env.agent_selection == training_agent:
+        current_agent = env.agent_selection
+        
+        # Check if this is the first move of a new round for this agent
+        new_hand_size = len(env.players_hands.get(current_agent, []))
+        if new_hand_size == 5 and new_hand_size > hand_sizes.get(current_agent, 0):
+            first_move_of_round[current_agent] = True
+            if verbose:
+                logger.info(f"Detected start of new round for {current_agent} (hand size: {new_hand_size})")
+        # Update hand size tracking
+        hand_sizes[current_agent] = new_hand_size
+            
+        if current_agent == training_agent:
             # Our agent's turn
             if verbose:
                 logger.info(f"Round {round_num}, Move {move_num}: {training_agent}'s turn (MCTS)")
@@ -393,10 +409,15 @@ def play_game(opponent1_config, opponent2_config, seed=42, render_mode=None, ver
             if verbose:
                 print_game_state(env, training_agent, opponent_agents, current_opponents)
             
+            # Reset first move flag after our move
+            first_move_of_round[current_agent] = False
+            
             # Check if hand reset to 5 cards (new round)
             if len(env.players_hands.get(training_agent, [])) == 5 and move_num > 1:
                 round_num += 1
                 move_num = 0
+                # Reset first move flags for all agents
+                first_move_of_round = {agent: True for agent in env.possible_agents}
                 if verbose:
                     logger.info(f"Starting round {round_num}")
             
@@ -404,11 +425,11 @@ def play_game(opponent1_config, opponent2_config, seed=42, render_mode=None, ver
                 
         else:
             # Opponent's turn
-            agent = env.agent_selection
+            agent = current_agent
             if verbose:
                 logger.info(f"Round {round_num}, Move {move_num}: {agent}'s turn ({current_opponents[agent]['name']})")
             
-            # Check if we have a pre-planned action for this opponent
+            # Only use model-selected action if this is the first move of a round or no pre-planned action exists
             planned_action = mcts.get_next_opponent_action(agent)
             
             if planned_action is not None:
@@ -417,12 +438,28 @@ def play_game(opponent1_config, opponent2_config, seed=42, render_mode=None, ver
                 if verbose:
                     action_type, card_category, count = decode_action(action)
                     logger.info(f"{agent} using pre-planned action: {action_type}, {card_category}, {count}")
-            else:
-                # Fall back to opponent model
+            elif first_move_of_round[agent]:
+                # Only use model-selected action for the first move of a round
                 action = mcts._select_opponent_action(env, agent)
                 if verbose:
                     action_type, card_category, count = decode_action(action)
-                    logger.info(f"{agent} using model-selected action: {action_type}, {card_category}, {count}")
+                    logger.info(f"{agent} using model-selected action (first move of round): {action_type}, {card_category}, {count}")
+            else:
+                # This should never happen - but if it does, we need to know about it
+                logger.error(f"CRITICAL ERROR: No pre-planned action for {agent} and not first move of round!")
+                logger.error(f"Current round: {round_num}, move: {move_num}")
+                logger.error(f"Action sequence: {mcts.action_sequence}")
+                logger.error(f"First move flags: {first_move_of_round}")
+                logger.error(f"Hand sizes: {hand_sizes}")
+                
+                # As a last resort, use model-selected action but log clearly
+                action = mcts._select_opponent_action(env, agent)
+                if verbose:
+                    action_type, card_category, count = decode_action(action)
+                    logger.error(f"{agent} using EMERGENCY model-selected action: {action_type}, {card_category}, {count}")
+            
+            # Reset first move flag after the agent's move
+            first_move_of_round[agent] = False
             
             # Execute action
             initial_rewards = {a: env.rewards[a] for a in env.possible_agents}
@@ -444,6 +481,10 @@ def play_game(opponent1_config, opponent2_config, seed=42, render_mode=None, ver
             if len(env.players_hands.get(agent, [])) == 5 and move_num > 1:
                 round_num += 1
                 move_num = 0
+                # Reset first move flags for all agents
+                first_move_of_round = {agent: True for agent in env.possible_agents}
+                if verbose:
+                    logger.info(f"Starting round {round_num}")
             
             move_num += 1
         
