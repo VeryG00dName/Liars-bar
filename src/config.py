@@ -64,18 +64,18 @@ DEFAULT_SCORING_PARAMS = {
 # ============================
 # Neural Network Configuration
 # ============================
-HIDDEN_DIM = 320
+HIDDEN_DIM = 256
 INPUT_DIM = 26  # Will be dynamically set
 OUTPUT_DIM = 7  # Will be dynamically set
-
+NUM_OBS_STACK = 50
 # ============================
 # Opponent Model Configuration
 # ============================
-NUM_OPPONENT_CLASSES = 0
+NUM_OPPONENT_CLASSES = 10
 OPPONENT_INPUT_DIM = 4
 OPPONENT_HIDDEN_DIM = 128
 OPPONENT_LEARNING_RATE = 1e-4
-
+MAX_SQUENCE_LENGTH = 400
 # ============================
 # Transformer Configuration (Strategy Embedding)
 # ============================
@@ -98,14 +98,14 @@ EPS_CLIP = 0.3
 K_EPOCHS = 2
 UPDATE_STEPS = 3
 MAX_NORM = 0.3
-AUX_LOSS_WEIGHT = 0.3
+AUX_LOSS_WEIGHT = 0.5
 INIT_ENTROPY_COEF = 0.005
 
 # ============================
 # Logging and Checkpointing
 # ============================
 CULL_INTERVAL = 20001
-CHECKPOINT_INTERVAL = 3000
+CHECKPOINT_INTERVAL = 2000
 LOG_INTERVAL = 100
 
 # ============================
