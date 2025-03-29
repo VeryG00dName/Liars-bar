@@ -33,7 +33,7 @@ from src import config
 # Additional imports for memory and environment utilities
 from src.env.liars_deck_env_utils import query_opponent_memory_full
 from src.training.train_transformer import EventEncoder
-from src.training.train_extras import convert_memory_to_features
+from src.training.train_extras import convert_memory_to_features, convert_memory_to_features2
 # Constants for observation versions
 OBS_VERSION_1 = 1
 OBS_VERSION_2 = 2
@@ -46,7 +46,10 @@ global_response2idx = None
 global_action2idx = None
 global_event_encoder = None
 global_strategy_transformer = None
-
+global_response2idx2 = None
+global_action2idx2 = None
+global_event_encoder2 = None
+global_strategy_transformer2 = None
 # ----------------------------
 # (Other utility functions remain unchanged)
 # ----------------------------
@@ -839,109 +842,6 @@ def compute_action_likelihood(opponent_model, observation_new, observation_old, 
                 # Return probability of the observed action
                 return masked_probs[action].item()
 
-def bayesian_belief_update(current_belief, observation_new, observation_old, action, action_mask, opponent_models, device):
-    """
-    Update belief over opponent types using Bayesian inference with enhanced error handling and
-    numerical stability safeguards.
-    
-    Args:
-        current_belief: Current belief distribution over opponent types
-        observation_new: Current observation in new format
-        observation_old: Current observation in old format
-        action: Observed action taken by opponent
-        action_mask: Valid action mask
-        opponent_models: List of opponent models (one per type)
-        device: Torch device
-        
-    Returns:
-        updated_belief: Updated belief distribution
-    """
-    import logging
-    import numpy as np
-    import torch
-    
-    logger = logging.getLogger("Evaluate")
-    
-    # Convert current belief to numpy for easier manipulation
-    if isinstance(current_belief, torch.Tensor):
-        belief_np = current_belief.cpu().numpy()
-    else:
-        belief_np = current_belief
-    
-    # Ensure current belief is valid
-    if np.isnan(belief_np).any() or np.isinf(belief_np).any() or belief_np.sum() < 1e-10:
-        logger.debug("Invalid belief distribution detected, resetting to uniform")
-        belief_np = np.ones_like(belief_np) / len(belief_np)
-    
-    # Add small epsilon to avoid exactly zero beliefs
-    belief_np = belief_np + 1e-6
-    belief_np = belief_np / belief_np.sum()
-    
-    # Compute likelihoods with enhanced error handling
-    likelihoods = []
-    valid_models = 0
-    
-    for model_idx, model in enumerate(opponent_models):
-        try:
-            likelihood = compute_action_likelihood(model, observation_new, observation_old, action, action_mask, device)
-            
-            # Validate likelihood value
-            if likelihood is None or np.isnan(likelihood) or np.isinf(likelihood):
-                logger.debug(f"Invalid likelihood from model {model_idx}, using default")
-                likelihood = 0.1
-            else:
-                # Ensure likelihood is positive but not too small
-                likelihood = max(likelihood, 1e-5)
-                valid_models += 1
-            
-            likelihoods.append(likelihood)
-        except Exception as e:
-            logger.debug(f"Error computing likelihood for model {model_idx}: {str(e)}")
-            likelihoods.append(0.1)  # Default likelihood 
-    
-    # If all models failed, maintain current belief 
-    if valid_models == 0:
-        logger.debug("No valid likelihood computations, maintaining current belief")
-        return belief_np
-    
-    # Ensure we have likelihoods for all models with proper length handling
-    if len(likelihoods) < len(belief_np):
-        logger.debug(f"Not enough likelihoods ({len(likelihoods)}) for belief size ({len(belief_np)}), padding")
-        likelihoods.extend([0.1] * (len(belief_np) - len(likelihoods)))
-    elif len(likelihoods) > len(belief_np):
-        logger.debug(f"Too many likelihoods ({len(likelihoods)}) for belief size ({len(belief_np)}), truncating")
-        likelihoods = likelihoods[:len(belief_np)]
-    
-    # Convert to numpy array
-    likelihoods = np.array(likelihoods, dtype=np.float32)
-    
-    # Apply smoothing to likelihoods to avoid extremes
-    smoothed_likelihoods = 0.95 * likelihoods + 0.05 * np.ones_like(likelihoods) / len(likelihoods)
-    
-    # Bayesian update: posterior ∝ prior * likelihood
-    posterior = belief_np * smoothed_likelihoods
-    
-    # Normalize with safety checks
-    posterior_sum = posterior.sum()
-    if posterior_sum > 1e-10:
-        posterior = posterior / posterior_sum
-    else:
-        logger.debug("Posterior sum too small, using smoothed prior instead")
-        # If posterior sum is too small, use a smoothed version of the prior
-        posterior = 0.9 * belief_np + 0.1 * np.ones_like(belief_np) / len(belief_np)
-    
-    # Final safety check for NaN/Inf values
-    if np.isnan(posterior).any() or np.isinf(posterior).any():
-        logger.debug("NaN/Inf in posterior after update, using uniform distribution")
-        return np.ones_like(belief_np) / len(belief_np)
-    
-    # Ensure posterior is a proper distribution (sums to 1)
-    posterior_sum = posterior.sum()
-    if abs(posterior_sum - 1.0) > 1e-5:
-        posterior = posterior / posterior_sum
-        
-    return posterior
-
 # ----------------------------
 # Unified Evaluation Function
 # ----------------------------
@@ -952,6 +852,22 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
     Combines functionalities from two versions and includes robust belief-based action selection and updates.
     """
     logger = logging.getLogger("Evaluate")
+    
+    global global_response2idx2, global_action2idx2, global_event_encoder2, global_strategy_transformer2
+    transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "opponent_belief_model.pth")
+    # Load categorical mappings if not already loaded.
+    if global_response2idx2 is None or global_action2idx2 is None:
+        logger.debug("Global response/action mappings not set; loading from checkpoint if available.")
+        if os.path.exists(transformer_checkpoint_path):
+            ckpt = torch.load(transformer_checkpoint_path, map_location=device, weights_only=False)
+            global_response2idx2 = ckpt.get("response2idx", {})
+            global_action2idx2 = ckpt.get("action2idx", {})
+            logger.debug(f"Loaded response2idx with {len(global_response2idx2)} entries and action2idx with {len(global_action2idx2)} entries.")
+        else:
+            global_response2idx2 = {}
+            global_action2idx2 = {}
+            logger.debug("Transformer checkpoint not found; using empty mappings.")
+            
     player_ids = list(players_in_this_game.keys())
     agent_to_player = {f'player_{i}': player_ids[i] for i in range(env.num_players)}
     
@@ -1060,6 +976,15 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                     # Combine beliefs into a single vector
                     combined_belief = np.concatenate(opponent_beliefs)
                     
+                    # *** New: Record the belief model's output as expert activation ***
+                    if track_experts and agent in expert_activations:
+                        # Use the argmax of the combined belief as a proxy expert index.
+                        belief_expert_index = int(np.argmax(combined_belief))
+                        expert_idx_str = str(belief_expert_index)
+                        if expert_idx_str not in expert_activations[agent]:
+                            expert_activations[agent][expert_idx_str] = 0
+                        expert_activations[agent][expert_idx_str] += 1
+                    
                     # Convert to tensors
                     obs_tensor = torch.tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
                     belief_tensor = torch.tensor(combined_belief, dtype=torch.float32, device=device).unsqueeze(0)
@@ -1109,40 +1034,28 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                     # --- Update beliefs about opponents if using BeliefSpacePolicy ---
                     if agent in belief_spaces:
                         for opp_agent in env.possible_agents:
-                            if opp_agent != agent and opp_agent in last_actions and last_actions[opp_agent] is not None:
-                                try:
-                                    # Get observation and action for the opponent
-                                    obs_new = last_observations_new[opp_agent]
-                                    obs_old = last_observations_old[opp_agent]
-                                    opp_action = last_actions[opp_agent]
-                                    action_mask = last_action_masks[opp_agent]
-                                    
-                                    if belief_models.get(agent) is not None:
-                                        # Use neural belief model for update
-                                        belief_model = belief_models[agent]
-                                        current_belief = belief_spaces[agent][opp_agent]
-                                        
-                                        obs_tensor = torch.tensor(obs_new, dtype=torch.float32, device=device).unsqueeze(0)
-                                        belief_tensor = torch.tensor(current_belief, dtype=torch.float32, device=device).unsqueeze(0)
+                            if opp_agent != agent:
+                                # Update belief using the neural belief model if available.
+                                if belief_models.get(agent) is not None:
+                                    belief_model = belief_models[agent]
+                                    current_belief = belief_spaces[agent][opp_agent]
+                                    # Instead of using a single observation, query the full opponent memory.
+                                    memory_full = query_opponent_memory_full(agent, opp_agent)
+                                    features_list = None
+                                    if memory_full is None:
+                                        print(f"No memory available for {agent} vs {opp_agent}, skipping belief update")
+                                    else:
+                                        features_list = convert_memory_to_features2(memory_full, global_response2idx2, global_action2idx2)
+                                    if features_list:
+                                        features_tensor = torch.tensor(features_list, dtype=torch.float32, device=device).unsqueeze(0)
+                                        belief_tensor = torch.tensor(current_belief, dtype=torch.float32, device=device).unsqueeze(0) 
                                         
                                         with torch.no_grad():
-                                            updated_belief = belief_model(obs_tensor, belief_tensor)
+                                            updated_belief = belief_model(features_tensor, belief_tensor)
                                             updated_belief_np = updated_belief.squeeze().cpu().numpy()
                                             if np.isnan(updated_belief_np).any() or np.isinf(updated_belief_np).any():
                                                 updated_belief_np = current_belief
                                             belief_spaces[agent][opp_agent] = updated_belief_np
-                                    else:
-                                        # Use Bayesian update
-                                        updated_belief = bayesian_belief_update(
-                                            belief_spaces[agent][opp_agent],
-                                            obs_new, obs_old, opp_action, action_mask, 
-                                            all_opponent_models, device
-                                        )
-                                        if np.isnan(updated_belief).any() or np.isinf(updated_belief).any():
-                                            updated_belief = belief_spaces[agent][opp_agent]
-                                        belief_spaces[agent][opp_agent] = updated_belief
-                                except Exception as e:
-                                    logger.error(f"Error updating belief for {agent} about {opp_agent}: {e}")
                     env.step(action)
                     # Continue to next step.
                     continue
@@ -1161,6 +1074,8 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                     action = player_data['agent'].play_turn(observation, mask, table_card)
                     action_counts[player_id][action] += 1
                     # Update belief tracking if applicable.
+                    if agent in belief_spaces:
+                        print("test")
                     if agent in belief_spaces:
                         new_obs = env.observe(agent, new=True)[agent]
                         old_obs = env.observe(agent, new=False)[agent]
@@ -1197,6 +1112,8 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                     
                     action = torch.distributions.Categorical(masked_probs).sample().item()
                     action_counts[player_id][action] += 1
+                    if agent in belief_spaces:
+                        print("test")
                     if agent in belief_spaces:
                         new_obs = env.observe(agent, new=True)[agent]
                         old_obs = env.observe(agent, new=False)[agent]
@@ -1282,6 +1199,11 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                         logger.debug(f"Using cheat expert index {expert_index} for MoE model")
                     elif expert_index is None:
                         expert_index = 0
+                    if track_experts and agent in ['player_0', 'player_1']:
+                        expert_idx_str = str(expert_index)
+                        if expert_idx_str not in expert_activations[agent]:
+                            expert_activations[agent][expert_idx_str] = 0
+                        expert_activations[agent][expert_idx_str] += 1
                 else:
                     if player_data.get('uses_memory', False) and version == 2 and mem_tensor is not None:
                         transformer_features_tensor = mem_tensor.flatten()
@@ -1291,14 +1213,7 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                 
                 final_obs_tensor = final_obs_tensor.unsqueeze(0)
                 
-                if is_moe:
-                    probs, _ = policy_net(final_obs_tensor, expert_index)
-                    if track_experts and agent in ['player_0', 'player_1']:
-                        expert_idx_str = str(expert_index)
-                        if expert_idx_str not in expert_activations[agent]:
-                            expert_activations[agent][expert_idx_str] = 0
-                        expert_activations[agent][expert_idx_str] += 1
-                else:
+                if not is_moe:
                     num_layers = policy_net.lstm.num_layers if hasattr(policy_net, 'lstm') else 1
                     batch_size = final_obs_tensor.size(0)
                     hidden_size = policy_net.lstm.hidden_size if hasattr(policy_net, 'lstm') else 64
@@ -1318,6 +1233,8 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                             logger.debug(f"Traditional model: Agent {agent} used expert {expert_idx}")
                     else:
                         probs, _ = policy_net(final_obs_tensor, hidden_state)
+                else:
+                    probs, _ = policy_net(final_obs_tensor, expert_index)
                 
                 probs = probs.clamp(1e-8, 1.0)
                 mask = info.get('action_mask', [1] * config.OUTPUT_DIM)
@@ -1328,6 +1245,8 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                 masked_probs /= masked_probs.sum()
                 action = torch.distributions.Categorical(masked_probs).sample().item()
                 action_counts[player_id][action] += 1
+                if agent in belief_spaces:
+                        print("test")
                 if agent in belief_spaces:
                     new_obs = env.observe(agent, new=True)[agent]
                     old_obs = env.observe(agent, new=False)[agent]
@@ -1358,4 +1277,3 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
         return cumulative_wins, action_counts, game_wins_list, avg_steps, steps_per_sec, expert_activations
     else:
         return cumulative_wins, action_counts, game_wins_list, avg_steps, steps_per_sec
-    
