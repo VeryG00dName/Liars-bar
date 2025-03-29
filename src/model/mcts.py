@@ -272,10 +272,39 @@ class PerfectMCTS:
             self._log(f"Detected bluff by {last_agent}, recommending challenge")
         return True
     
+    def _simulate_single_opponent_action(self, sim_env, action_sequence):
+        """
+        Simple helper function to simulate a single opponent action and add it to the sequence.
+        Uses robust error handling.
+        
+        Args:
+            sim_env: Simulation environment
+            action_sequence: Current action sequence
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            current_agent = sim_env.agent_selection
+            if current_agent is None or current_agent == self.training_agent:
+                return False
+                
+            # Get action for this opponent
+            opponent_action = self._select_opponent_action(sim_env, current_agent)
+            action_sequence.append((current_agent, opponent_action))
+            
+            # Take step
+            sim_env.step(opponent_action)
+            return True
+        except Exception as e:
+            self._log(f"Error simulating opponent action: {e}")
+            return False
+
+    
     def simulate_game(self, env_state, action):
         """
-        Simulate a game starting from the given state and action until a terminal state or end of round.
-        Fixed to properly track opponent actions and include them in the planned sequence.
+        Simulate a game starting from the given state and action.
+        Simplified with robust error handling.
         
         Args:
             env_state: The current environment state
@@ -295,11 +324,8 @@ class PerfectMCTS:
         if sim_env.agent_selection != self.training_agent:
             raise RuntimeError(f"Cannot simulate game when it's not our turn. Current agent: {sim_env.agent_selection}")
         
-        # For challenge actions, verify if challenge is valid before proceeding
-        if action == 6:  # Challenge action
-            # If the opponent is not bluffing, don't even consider this action
-            if not self._should_challenge(sim_env, is_simulation=True):
-                return -1.0, [], False  # Negative reward to discourage this action
+        # Take our action
+        action_sequence = [(self.training_agent, action)]
         
         # Check if our action would be a bluff
         action_type, card_category, count = decode_action(action)
@@ -314,124 +340,37 @@ class PerfectMCTS:
                 table_cards = sum(1 for card in hand if card == table_card or card == "Joker")
                 is_bluffing = count > table_cards
         
-        # If we're bluffing, we need to ensure we simulate at least one opponent action
-        # to see if they challenge us
-        must_simulate_opponent = is_bluffing
-        
-        # Take our action
-        action_sequence = [(self.training_agent, action)]
-        initial_penalties = {agent: sim_env.penalties.get(agent, 0) for agent in sim_env.possible_agents}
-        
-        # Store the initial hand size to detect round transitions
-        initial_hand_sizes = {agent: len(sim_env.players_hands.get(agent, [])) for agent in sim_env.possible_agents}
-        
+        # Take our action and see what happens
         sim_env.step(action)
         
-        # Check if we got a penalty immediately (rare but possible)
-        if sim_env.penalties.get(self.training_agent, 0) > initial_penalties.get(self.training_agent, 0):
-            return -1.0, action_sequence, False  # Negative reward - we got penalized
-        
-        # Check if our action resulted in an opponent getting a penalty
-        for opponent in self.opponent_agents:
-            if sim_env.penalties.get(opponent, 0) > initial_penalties.get(opponent, 0):
-                return 1.0, action_sequence, sim_env.terminations.get(opponent, False)
-                
-        # If the round ended or game ended, return current action sequence
+        # If game is over, return
         if sim_env.agent_selection is None:
-            # If we're bluffing but didn't simulate any opponent actions,
-            # we need to force at least one opponent simulation
-            if must_simulate_opponent and len(action_sequence) == 1:
-                # This should never happen in normal gameplay, but ensure we have a response
-                # We'll use a default "challenge" action to be safe
-                for opponent in self.opponent_agents:
-                    if opponent in sim_env.agents:
-                        action_sequence.append((opponent, 6))  # 6 = Challenge
-                        return -2.0, action_sequence, True  # Negative value - would get challenged
             return 0.0, action_sequence, True
-            
-        # If it's our turn again immediately, the round might have ended
+        
+        # If it's our turn again immediately, return
         if sim_env.agent_selection == self.training_agent:
-            # Check if our hand has been reset to a full hand (5 cards), which indicates a new round
-            current_hand_size = len(sim_env.players_hands.get(self.training_agent, []))
-            if current_hand_size == 5 and initial_hand_sizes[self.training_agent] < 5:
-                # New round started, continue simulation with opponents first
-                next_round_result = self._continue_simulation_after_round_transition(sim_env, action_sequence)
-                return next_round_result
-                
-            # If we're bluffing but didn't simulate any opponent actions,
-            # we need to force at least one opponent simulation
-            if must_simulate_opponent and len(action_sequence) == 1:
-                # For safety, assume an opponent would challenge our bluff
-                for opponent in self.opponent_agents:
-                    if opponent in sim_env.agents:
-                        action_sequence.append((opponent, 6))  # 6 = Challenge
-                        return -2.0, action_sequence, False  # Negative value - would get challenged
-                
             return 0.0, action_sequence, False
         
-        # Simulate next opponent action
-        next_agent = sim_env.agent_selection
-        next_action = self._select_opponent_action(sim_env, next_agent)
-        action_sequence.append((next_agent, next_action))
+        # Simulate the next opponent's action
+        if self._simulate_single_opponent_action(sim_env, action_sequence):
+            # If the opponent challenged our bluff, return negative
+            last_opponent, last_action = action_sequence[-1]
+            last_action_type, _, _ = decode_action(last_action)
+            if last_action_type == "Challenge" and is_bluffing:
+                return -2.0, action_sequence, False
         
-        # Check if the opponent is challenging us
-        next_action_type, _, _ = decode_action(next_action)
-        if next_action_type == "Challenge" and is_bluffing:
-            # If we bluffed and they're challenging, we will get a penalty
-            return -2.0, action_sequence, False  # Strongly negative - we'll get challenged
-        
-        # Take the opponent's step
-        pre_step_penalties = {agent: sim_env.penalties.get(agent, 0) for agent in sim_env.possible_agents}
-        sim_env.step(next_action)
-        
-        # Check if any penalties occurred
-        for agent in sim_env.possible_agents:
-            if sim_env.penalties.get(agent, 0) > pre_step_penalties.get(agent, 0):
-                # Our agent got a penalty - bad outcome
-                if agent == self.training_agent:
-                    return -1.0, action_sequence, sim_env.terminations.get(agent, False)
-                # Opponent got a penalty - good outcome
-                else:
-                    return 1.0, action_sequence, sim_env.terminations.get(agent, False)
-        
-        # For longer simulations, continue with more steps
-        if action_type == "Play" and not is_bluffing:
-            # For non-bluff plays, we can optionally simulate more steps
-            max_additional_steps = 2
-            for step in range(max_additional_steps):
-                # Stop if it's our turn again or game ended
-                if sim_env.agent_selection is None or sim_env.agent_selection == self.training_agent:
-                    break
-                    
-                # Get the next opponent action
-                next_agent = sim_env.agent_selection
-                next_action = self._select_opponent_action(sim_env, next_agent)
-                action_sequence.append((next_agent, next_action))
-                
-                # Apply the action
-                pre_step_penalties = {agent: sim_env.penalties.get(agent, 0) for agent in sim_env.possible_agents}
-                sim_env.step(next_action)
-                
-                # Check for penalties
-                for agent in sim_env.possible_agents:
-                    if sim_env.penalties.get(agent, 0) > pre_step_penalties.get(agent, 0):
-                        # Our agent got a penalty - bad outcome
-                        if agent == self.training_agent:
-                            return -1.0, action_sequence, sim_env.terminations.get(agent, False)
-                        # Opponent got a penalty - good outcome
-                        else:
-                            return 1.0, action_sequence, sim_env.terminations.get(agent, False)
-        
-        # Not explicitly good or bad, but successful non-bluff is slightly positive
-        if action_type == "Play" and not is_bluffing:
-            return 0.2, action_sequence, False
+        # Basic value calculation
+        if is_bluffing:
+            # Bluffing is always slightly risky
+            return -0.2, action_sequence, False
         else:
-            return 0.0, action_sequence, False
+            # Safe play is good
+            return 0.2, action_sequence, False
     
     def _continue_simulation_after_round_transition(self, sim_env, action_sequence):
         """
         Continue simulation after a round transition is detected.
-        This ensures we capture all opponents' actions at the start of a new round.
+        This ensures we capture ALL opponents' actions at the start of a new round.
         
         Args:
             sim_env: The simulation environment
@@ -443,31 +382,23 @@ class PerfectMCTS:
         """
         self._log("Continuing simulation after round transition")
         
-        # Continue simulating until it's our turn
-        max_additional_steps = 50  # Limit for additional steps to prevent loops
-        step_count = 0
-        
-        # Record initial penalties to track changes
-        initial_penalties = {agent: sim_env.penalties.get(agent, 0) 
-                            for agent in sim_env.possible_agents}
-        
-        while (sim_env.agent_selection != self.training_agent and 
-            sim_env.agent_selection is not None and 
-            step_count < max_additional_steps):
-            
-            step_count += 1
+        # Simulate ALL opponent actions until it's our turn again
+        while sim_env.agent_selection is not None and sim_env.agent_selection != self.training_agent:
             current_agent = sim_env.agent_selection
             
             # Get action for opponent
             opponent_action = self._select_opponent_action(sim_env, current_agent)
             action_sequence.append((current_agent, opponent_action))
             
+            # Record penalties before step
+            pre_step_penalties = {agent: sim_env.penalties.get(agent, 0) for agent in sim_env.possible_agents}
+            
             # Take step
             sim_env.step(opponent_action)
             
             # Check if any penalties occurred
             for agent in sim_env.possible_agents:
-                if sim_env.penalties.get(agent, 0) > initial_penalties.get(agent, 0):
+                if sim_env.penalties.get(agent, 0) > pre_step_penalties.get(agent, 0):
                     # Our agent got a penalty - bad outcome
                     if agent == self.training_agent:
                         return -1.0, action_sequence, sim_env.terminations.get(agent, False)
@@ -475,14 +406,12 @@ class PerfectMCTS:
                     else:
                         return 1.0, action_sequence, sim_env.terminations.get(agent, False)
         
-        if step_count >= max_additional_steps:
-            self._log(f"Warning: Post-round simulation reached max steps ({max_additional_steps})")
-        
         return 0.0, action_sequence, False
     
     def search(self, env_state):
         """
-        Enhanced search that properly evaluates action sequences.
+        Enhanced search that properly evaluates action sequences and ensures we have 
+        plans for ALL opponents who will act before our next turn.
         
         Args:
             env_state: Environment state to start search from
@@ -496,7 +425,7 @@ class PerfectMCTS:
         
         # Make sure it's our turn
         if sim_env.agent_selection != self.training_agent:
-            raise RuntimeError(f"Search called when it's not our turn. Current agent: {sim_env.agent_selection}")
+            raise RuntimeError(f"Cannot simulate game when it's not our turn. Current agent: {sim_env.agent_selection}")
             
         # Get valid actions
         sim_env.observe(self.training_agent, new=True)
@@ -543,33 +472,31 @@ class PerfectMCTS:
         best_sequence = []
         
         for action in valid_actions:
-            # Get value of this action through simulation
-            value, action_sequence, is_terminal = self.simulate_game(env_state, action)
-            
-            # Debug output
-            action_type, card_category, count = decode_action(action)
-            self._log(f"Action {action} ({action_type}, {card_category}, {count}): value={value}, seq_len={len(action_sequence)}")
-            
-            # CRITICAL: Check if action sequence has at least one opponent action
-            # for non-terminal states (this ensures we simulate opponent responses)
-            if not is_terminal and len(action_sequence) < 2:
-                self._log(f"Rejecting action {action} - no opponent actions in sequence")
+            try:
+                # Get value of this action through simulation
+                value, action_sequence, is_terminal = self.simulate_game(env_state, action)
+                
+                # Debug output
+                action_type, card_category, count = decode_action(action)
+                self._log(f"Action {action} ({action_type}, {card_category}, {count}): value={value}, seq_len={len(action_sequence)}")
+                
+                # Reject any action with very negative value
+                if value < -1.5:
+                    self._log(f"Rejecting action {action} with very negative value {value}")
+                    continue
+                
+                # Prefer safe actions slightly
+                if action in safe_actions:
+                    value += 0.1  # Small boost for safe actions
+                
+                if value > best_value:
+                    best_action = action
+                    best_value = value
+                    best_sequence = action_sequence
+                    self._log(f"New best action: {action} with value {value}")
+            except Exception as e:
+                self._log(f"Error evaluating action {action}: {e}")
                 continue
-            
-            # Reject any action with negative value (would result in penalty)
-            if value < 0:
-                self._log(f"Rejecting action {action} with negative value {value}")
-                continue
-            
-            # Prefer safe actions slightly
-            if action in safe_actions:
-                value += 0.1  # Small boost for safe actions
-            
-            if value > best_value:
-                best_action = action
-                best_value = value
-                best_sequence = action_sequence
-                self._log(f"New best action: {action} with value {value}")
         
         # If no good action was found, fall back to safe actions
         if best_action is None:
@@ -578,44 +505,61 @@ class PerfectMCTS:
             if safe_actions:
                 # Use the safest action (lowest card count)
                 best_action = min(safe_actions, key=lambda a: decode_action(a)[2])
-                value, best_sequence, _ = self.simulate_game(env_state, best_action)
-                best_value = value
+                try:
+                    value, best_sequence, _ = self.simulate_game(env_state, best_action)
+                    best_value = value
+                except Exception as e:
+                    self._log(f"Error simulating fallback action: {e}")
+                    best_value = 0.0
+                    best_sequence = [(self.training_agent, best_action)]
                 self._log(f"Using safe fallback action: {best_action}")
             else:
                 # If even safe actions are bad, just pick a challenge if available
                 if challenge_action in valid_actions:
                     best_action = challenge_action
-                    value, best_sequence, _ = self.simulate_game(env_state, best_action)
-                    best_value = value
+                    try:
+                        value, best_sequence, _ = self.simulate_game(env_state, best_action)
+                        best_value = value
+                    except Exception as e:
+                        self._log(f"Error simulating challenge fallback: {e}")
+                        best_value = 0.0
+                        best_sequence = [(self.training_agent, best_action)]
                     self._log(f"Using challenge as fallback: {best_action}")
                 else:
                     # Last resort - just pick first valid action
                     best_action = valid_actions[0]
-                    value, best_sequence, _ = self.simulate_game(env_state, best_action)
-                    best_value = value
+                    try:
+                        value, best_sequence, _ = self.simulate_game(env_state, best_action)
+                        best_value = value
+                    except Exception as e:
+                        self._log(f"Error simulating last resort action: {e}")
+                        best_value = 0.0
+                        best_sequence = [(self.training_agent, best_action)]
                     self._log(f"Using first valid action as fallback: {best_action}")
         
-        # FINAL VALIDATION: Ensure we have at least one opponent action in the sequence
-        # This is critical to prevent the "model-selected action" problem
-        if len(best_sequence) < 2:
-            self._log("WARNING: Final action sequence has no opponent actions!")
+        # **** CRITICAL VALIDATION: Ensure we have at least one opponent action ****
+        # If we don't have any opponent actions, try to add at least one
+        if len(best_sequence) <= 1:
+            self._log("WARNING: Action sequence has no opponent actions!")
             
-            # Force adding an opponent action if possible
-            next_agent = None
-            for agent in sim_env.agents:
-                if agent != self.training_agent:
-                    next_agent = agent
-                    break
-                    
-            if next_agent:
-                # Create a temporary env to simulate the opponent's response
-                temp_env = sim_env.clone()
-                temp_env.step(best_action)
+            try:
+                # Create a test environment to find the next opponent
+                test_env = sim_env.clone()
+                test_env.step(best_action)
                 
-                if temp_env.agent_selection == next_agent:
-                    opponent_action = self._select_opponent_action(temp_env, next_agent)
-                    best_sequence.append((next_agent, opponent_action))
-                    self._log(f"Forcibly added opponent action: {opponent_action} for {next_agent}")
+                next_agent = test_env.agent_selection
+                if next_agent is not None and next_agent != self.training_agent:
+                    # Try to get a valid action for this opponent
+                    test_env.observe(next_agent, new=True)
+                    if next_agent in test_env.infos and "action_mask" in test_env.infos[next_agent]:
+                        action_mask = test_env.infos[next_agent]['action_mask']
+                        valid_indices = [i for i, mask in enumerate(action_mask) if mask == 1]
+                        if valid_indices:
+                            opponent_action = self._select_opponent_action(test_env, next_agent)
+                            best_sequence.append((next_agent, opponent_action))
+                            self._log(f"Added missing action for {next_agent}: {opponent_action}")
+            except Exception as e:
+                self._log(f"Error adding opponent action: {e}")
         
         # Create probability distribution (one-hot for the selected action)
         action_dim = sim_env.action_spaces[self.training_agent].n
@@ -632,6 +576,14 @@ class PerfectMCTS:
             for i, (agent, seq_action) in enumerate(best_sequence):
                 action_type, card_category, count = decode_action(seq_action)
                 self._log(f"  {i+1}. {agent}: {action_type}, {card_category}, {count}")
+        else:
+            # This should never happen, but just in case, pick a safe default
+            for i, mask in enumerate(action_mask):
+                if mask == 1:
+                    action_probs[i] = 1.0
+                    best_action = i
+                    self.action_sequence = [(self.training_agent, best_action)]
+                    break
         
         return action_probs, best_action, best_value
     
