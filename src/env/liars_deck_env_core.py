@@ -117,7 +117,8 @@ class LiarsDeckEnv(AECEnv):
         self.winner = None
         self._agent_selector = None
         self.rewards = {}
-
+        self.round = 0
+        
         # Initialize tracking for newer observations
         self.last_challenge_success = None  # Track outcome of the last challenge
         
@@ -215,7 +216,8 @@ class LiarsDeckEnv(AECEnv):
         self.last_action_agent = None
         self.last_action_bluff = None
         self.winner = None
-
+        self.round = 0
+        
         self.opponent_histories = {agent: [] for agent in self.possible_agents}
         self.bluff_counts = {agent: 0 for agent in self.possible_agents}
         self.total_plays = {agent: 0 for agent in self.possible_agents}
@@ -286,7 +288,7 @@ class LiarsDeckEnv(AECEnv):
         self.last_played_cards = {agent: [] for agent in self.possible_agents}
         self.last_action_agent = None
         self.last_action_bluff = None
-
+        self.round += 1
         self.table_card = self.np_random.choice(["King", "Queen", "Ace"])
         self.table_card_idx = TABLE_CARD_MAP[self.table_card]
 
@@ -488,6 +490,7 @@ class LiarsDeckEnv(AECEnv):
         cloned_env.last_action = self.last_action
         cloned_env.last_action_agent = self.last_action_agent
         cloned_env.last_action_bluff = self.last_action_bluff
+        cloned_env.round = self.round
         
         # Copy last cards played
         cloned_env.last_played_cards = {
@@ -572,7 +575,7 @@ class LiarsDeckEnv(AECEnv):
         self.truncations = state_dict['truncations']
         self.round_eliminated = state_dict['round_eliminated']
         self.winner = state_dict['winner']
-        
+        self.round = state_dict['round']
         # Set rewards and other info
         self.rewards = state_dict['rewards']
         self._cumulative_rewards = state_dict['_cumulative_rewards']
@@ -633,7 +636,7 @@ class LiarsDeckEnv(AECEnv):
             'truncations': self.truncations.copy(),
             'round_eliminated': self.round_eliminated.copy(),
             'winner': self.winner,
-            
+            'round': self.round,
             # Rewards and other info
             'rewards': self.rewards.copy(),
             '_cumulative_rewards': self._cumulative_rewards.copy(),
@@ -672,6 +675,7 @@ class LiarsDeckEnv(AECEnv):
 
         if mode == 'human':
             print("\n=== Current Game State ===")
+            print(f"Round: {self.round}")
             print(f"Table Card: {self.table_card}")
             print("Players' Hands:")
             for agent in self.possible_agents:
