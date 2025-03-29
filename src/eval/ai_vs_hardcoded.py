@@ -35,7 +35,7 @@ torch.backends.cudnn.benchmark = True
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(name)s %(levelname)s: %(message)s")
 logger = logging.getLogger("AgentBattleground")
-
+logger.propagate = True
 # --- Helper function (unchanged) ---
 def convert_memory_to_features(memory, response_mapping, action_mapping):
     """
@@ -254,7 +254,6 @@ class BattlegroundWorker(QThread):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         players_in_this_game = {}
         logger = logging.getLogger("BattlegroundWorker")
-
         # --- AI Agents (player_0 and player_1) ---
         for key in ["player_0", "player_1"]:
             agent_data = self.ai_agents[key]
@@ -356,7 +355,7 @@ class BattlegroundWorker(QThread):
                         policy_net.to(device).eval()
                         
                         # Load OpponentBeliefModel if available with similar error handling
-                        belief_model_state = agent_data.get("belief_model", None)
+                        belief_model_state = agent_data["belief_model"]
                         belief_model = None
                         
                         if belief_model_state is not None:
@@ -377,11 +376,11 @@ class BattlegroundWorker(QThread):
                                 
                                 # Create and load belief model
                                 belief_model = OpponentBeliefModel(
-                                    obs_dim=belief_obs_dim,
-                                    num_opponent_types=num_opponent_types,
-                                    hidden_dim=belief_hidden_dim
-                                )
-                                
+                                    event_feature_dim=5,
+                                    max_seq_length=config.MAX_SQUENCE_LENGTH,
+                                    hidden_dim=config.HIDDEN_DIM // 4,
+                                    num_opponent_types=10
+                                ).to(device)
                                 # Load state dict with error handling
                                 try:
                                     belief_model.load_state_dict(belief_model_state, strict=False)
