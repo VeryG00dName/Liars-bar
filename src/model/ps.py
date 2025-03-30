@@ -131,10 +131,11 @@ class PerfectSearch:
         self._log(f"[Sim] Caching action {opponent_action} for opponent {agent}")
         return opponent_action
 
-    def simulate_round(self, env_state, action, opponent_action_cache=None, depth=0, max_depth=40):  # Increased max_depth
+    def simulate_round(self, env_state, action, opponent_action_cache=None, depth=0, max_depth=40):
         """
         Recursively simulates possible action sequences from the initial action.
-        Incorporates a bait-and-switch heuristic for a one-card bluff scenario and revises outcome checks.
+        Explores all valid actions on our turns up to max_depth.
+        Uses opponent_action_cache to ensure consistent opponent behavior.
         
         Args:
             env_state: The current environment state.
@@ -147,269 +148,309 @@ class PerfectSearch:
             tuple: (outcome_value, action_sequence, is_terminal, is_new_round)
         """
         if opponent_action_cache is None:
-            opponent_action_cache = {}  # Cache specific to this simulation branch
-
+            opponent_action_cache = {}
+            
         self.simulations_performed += 1
+        
+        # Clone environment and set state.
         sim_env = self.base_env.clone()
         sim_env.set_state(env_state)
-
+        
+        # Record our starting state information.
         starting_penalty = sim_env.penalties.get(self.training_agent, 0)
         starting_round = sim_env.round
-        starting_hand = sim_env.players_hands.get(self.training_agent, [])[:]  # Copy hand state
-        has_table_card_at_start = any(c == sim_env.table_card or c == "Joker" for c in starting_hand)
-
+        starting_hand_size = len(sim_env.players_hands.get(self.training_agent, []))
+        
+        # Decode the action for better logging.
         action_type, card_category, count = decode_action(action)
-        self._log(f"[Depth {depth}] Simulating action {action} ({action_type}, {card_category}, {count}) for {self.training_agent}")
-
-        # --- Heuristic Check: Are we simulating the specific bluff scenario? ---
-        is_simulating_one_card_bluff = (action_type == "Play" and card_category == "non-table" and count == 1)
-        # ---------------------------------------------------------------------------
-
+        self._log(f"[Depth {depth}] Simulating action {action} ({action_type}, {card_category}, {count})")
+        
+        # Start with our action.
         action_sequence = [(self.training_agent, action)]
-
-        # --- Take Action and Check Immediate Outcome ---
+        
+        # Get info before taking action.
         pre_step_termination = sim_env.terminations.get(self.training_agent, False)
+        pre_step_hand = sim_env.players_hands.get(self.training_agent, [])[:]
+        
+        # Take the action.
         sim_env.step(action)
+        
+        # Get info after the action.
         post_step_termination = sim_env.terminations.get(self.training_agent, False)
         post_step_penalty = sim_env.penalties.get(self.training_agent, 0)
-
-        # --- Order of Checks (Revised) ---
-        # 1. Check if game ended immediately.
+        post_step_hand = sim_env.players_hands.get(self.training_agent, [])[:]
+        cards_played = [c for c in pre_step_hand if c not in post_step_hand]
+        
+        self._log(f"[Depth {depth}] After action: Penalty={post_step_penalty}, Hand size={len(post_step_hand)}, Cards played={cards_played}")
+        
+         # Check if game over after our action.
         if sim_env.agent_selection is None:
             winner = sim_env.winner
             if winner == self.training_agent:
-                self._log(f"[Depth {depth}] Game ended after our action {action} - WE WIN!")
+                self._log(f"[Depth {depth}] Game ended after our action - WE WIN!")
                 return 5000.0, action_sequence, True, False
             else:
-                if not pre_step_termination and post_step_termination:
-                    self._log(f"[Depth {depth}] Game ended, WE LOST (terminated by action {action})")
-                    return -10000.0, action_sequence, True, False
-                else:
-                    self._log(f"[Depth {depth}] Game ended after our action {action} - WE LOSE (opponent won)")
-                    return -5000.0, action_sequence, True, False
-
-        # 2. Check if our action caused our elimination.
+                self._log(f"[Depth {depth}] Game ended after our action - WE LOSE")
+                return -5000.0, action_sequence, True, False
+        
+        # Check if we got eliminated by our action.
         if not pre_step_termination and post_step_termination:
-            self._log(f"[Depth {depth}] Got eliminated by our action {action}! Very bad.")
+            self._log(f"[Depth {depth}] Got eliminated by our own action! Very bad.")
             return -10000.0, action_sequence, True, False
-
-        # 3. Check if we incurred a penalty.
+        
+        # Check if we got an immediate penalty.
         if post_step_penalty > starting_penalty:
-            self._log(f"[Depth {depth}] Got penalty right after our action {action}.")
-            penalty_value = -5000.0 if starting_penalty >= 2 else -1000.0
-            return penalty_value, action_sequence, False, False
-
-        # 4. Check for an immediate round change.
+            self._log(f"[Depth {depth}] Got penalty right after our action.")
+            if starting_penalty >= 2:
+                return -5000.0, action_sequence, False, False
+            else:
+                return -1000.0, action_sequence, False, False
+        
+        # Check if round changed.
         if sim_env.round > starting_round:
             final_penalty = sim_env.penalties.get(self.training_agent, 0)
+            final_hand_size = len(sim_env.players_hands.get(self.training_agent, []))
             is_terminated = sim_env.terminations.get(self.training_agent, False)
             if is_terminated:
-                self._log(f"[Depth {depth}] ELIMINATED during immediate round change after action {action}!")
+                self._log(f"[Depth {depth}] We got ELIMINATED during round change! Very negative value")
                 return -10000.0, action_sequence, True, True
             if final_penalty > starting_penalty:
-                self._log(f"[Depth {depth}] Got penalty during immediate round change after action {action}")
+                self._log(f"[Depth {depth}] Got penalty during round change, returning very negative value")
                 return -5000.0, action_sequence, False, True
-            self._log(f"[Depth {depth}] Round changed immediately after action {action}, no penalty.")
-            return 10.0, action_sequence, False, True
-
-        # --- Main Simulation Loop ---
-        max_steps = 20  # Maximum simulation steps
-        step_count = 0
+            if final_hand_size < starting_hand_size - 1:
+                if final_penalty > starting_penalty:
+                    self._log(f"[Depth {depth}] Lost cards AND penalty during round change - very bad")
+                    return -5000.0, action_sequence, False, True
+        
+        # Track opponent penalties.
         found_opponent_penalty = False
-
+        
+        # Maximum steps to prevent infinite loops.
+        max_steps = 20
+        step_count = 0
+        
+        # Continue simulation until game ends or round changes.
         while step_count < max_steps:
             step_count += 1
-            current_sim_agent = sim_env.agent_selection
-            if current_sim_agent is None:
+            
+            if sim_env.agent_selection is None:
                 winner = sim_env.winner
-                win_value = 5000.0 if winner == self.training_agent else -5000.0
-                self._log(f"[Depth {depth}] Game ended in loop step {step_count}. Winner: {winner}. Value: {win_value}")
-                return win_value, action_sequence, True, False
-
-            # Check for round change during simulation loop.
+                if winner == self.training_agent:
+                    self._log(f"[Depth {depth}] Game ended after {step_count} steps - WE WIN!")
+                    return 5000.0, action_sequence, True, False
+                else:
+                    self._log(f"[Depth {depth}] Game ended after {step_count} steps - WE LOSE")
+                    return -5000.0, action_sequence, True, False
+            
             if sim_env.round > starting_round:
                 final_penalty = sim_env.penalties.get(self.training_agent, 0)
+                final_hand_size = len(sim_env.players_hands.get(self.training_agent, []))
                 is_terminated = sim_env.terminations.get(self.training_agent, False)
                 if is_terminated:
-                    self._log(f"[Depth {depth}] ELIMINATED during round change in loop!")
+                    self._log(f"[Depth {depth}] We got ELIMINATED during round change! Very negative value")
                     return -10000.0, action_sequence, True, True
                 if final_penalty > starting_penalty:
-                    self._log(f"[Depth {depth}] Got penalty during round change in loop.")
+                    self._log(f"[Depth {depth}] Got penalty during round change, returning very negative value")
                     return -5000.0, action_sequence, False, True
                 if found_opponent_penalty:
-                    self._log(f"[Depth {depth}] Round changed after finding opponent penalty. Good outcome.")
+                    self._log(f"[Depth {depth}] Round changed and found opponent penalty, returning positive value")
                     return 2000.0, action_sequence, False, True
-                self._log(f"[Depth {depth}] Round changed in loop, no specific outcome.")
-                return 10.0, action_sequence, False, True
-
-            # --- If it's our turn ---
-            if current_sim_agent == self.training_agent:
-                if depth < max_depth:
-                    # Recursive Exploration: Get valid actions and prioritize them.
-                    sim_env.observe(self.training_agent, new=True)
-                    action_mask = sim_env.infos[self.training_agent].get('action_mask', [0] * 7)
-                    valid_actions = [i for i, mask in enumerate(action_mask) if mask == 1]
-                    if not valid_actions:
-                        self._log(f"[Depth {depth}] No valid actions available")
-                        return -50.0, action_sequence, False, False
-
-                    # Prioritize actions based on penalties and hand state.
-                    current_penalty = sim_env.penalties.get(self.training_agent, 0)
-                    hand = sim_env.players_hands.get(self.training_agent, [])
-                    table_card = sim_env.table_card
-                    table_cards = [c for c in hand if c == table_card or c == "Joker"]
-                    prioritized_actions = []
-                    if current_penalty >= 2:
-                        for a in [0, 1, 2]:
-                            if a in valid_actions and (a % 3) + 1 <= len(table_cards):
-                                prioritized_actions.append(a)
-                        for a in valid_actions:
-                            if a not in prioritized_actions:
-                                prioritized_actions.append(a)
-                    else:
-                        for a in [0, 1, 2]:
-                            if a in valid_actions and (a % 3) + 1 <= len(table_cards):
-                                prioritized_actions.append(a)
-                        for a in [3]:
-                            if a in valid_actions:
-                                prioritized_actions.append(a)
-                        for a in valid_actions:
-                            if a not in prioritized_actions:
-                                prioritized_actions.append(a)
-
-                    best_recursive_value = float('-inf')
-                    best_recursive_sequence_suffix = []  # Part after current action
-                    best_recursive_is_terminal = False
-                    best_recursive_is_new_round = False
-
-                    for next_action in prioritized_actions:
-                        self._log(f"[Depth {depth}] Exploring recursive action {next_action}")
-                        next_state = sim_env.get_state()
-                        value, next_seq, is_terminal, is_new_round = self.simulate_round(
-                            next_state, next_action, opponent_action_cache, depth+1, max_depth
-                        )
-                        self._log(f"[Depth {depth}] Recursive action {next_action} produced value {value}, seq_len={len(next_seq)}")
-                        if value > best_recursive_value:
-                            best_recursive_value = value
-                            best_recursive_sequence_suffix = next_seq
-                            best_recursive_is_terminal = is_terminal
-                            best_recursive_is_new_round = is_new_round
-                            self._log(f"[Depth {depth}] New best recursive path via action {next_action} with value {value}")
-
-                    if best_recursive_sequence_suffix:
-                        combined_sequence = action_sequence + best_recursive_sequence_suffix
-                        self._log(f"[Depth {depth}] Returning best recursive result. Value: {best_recursive_value}")
-                        return best_recursive_value, combined_sequence, best_recursive_is_terminal, best_recursive_is_new_round
-                    else:
-                        self._log(f"[Depth {depth}] No valid outcomes from recursive exploration.")
-                        return -100.0, action_sequence, False, False
+            
+            # If it's our turn.
+            if sim_env.agent_selection == self.training_agent and depth < max_depth:
+                sim_env.observe(self.training_agent, new=True)
+                action_mask = sim_env.infos[self.training_agent].get('action_mask', [0] * 7)
+                valid_actions = [i for i, mask in enumerate(action_mask) if mask == 1]
+                if not valid_actions:
+                    self._log(f"[Depth {depth}] No valid actions available")
+                    return -50.0, action_sequence, False, False
+                
+                # Always check for challenge opportunities first.
+                if 6 in valid_actions:
+                    last_agent = sim_env.last_action_agent
+                    if last_agent:
+                        played_cards = sim_env.last_played_cards.get(last_agent, [])
+                        table_card = sim_env.table_card
+                        is_bluff = any(card != table_card and card != "Joker" for card in played_cards)
+                        if is_bluff:
+                            self._log(f"[Depth {depth}] Found opponent bluff during simulation, trying challenge")
+                            next_state = sim_env.get_state()
+                            value, next_seq, is_terminal, is_new_round = self.simulate_round(
+                                next_state, 6, opponent_action_cache, depth+1, max_depth
+                            )
+                            if value > 0:
+                                self._log(f"[Depth {depth}] Found successful challenge with value {value}")
+                                return value, action_sequence + next_seq[1:], is_terminal, is_new_round
+                # Get current penalties and hand state.
+                current_penalty = sim_env.penalties.get(self.training_agent, 0)
+                hand = sim_env.players_hands.get(self.training_agent, [])
+                table_card = sim_env.table_card
+                table_cards = [c for c in hand if c == table_card or c == "Joker"]
+                
+                # Prioritize actions.
+                prioritized_actions = []
+                if current_penalty >= 2:
+                    for a in [0, 1, 2]:
+                        if a in valid_actions and (a % 3) + 1 <= len(table_cards):
+                            prioritized_actions.append(a)
+                    for a in valid_actions:
+                        if a not in prioritized_actions:
+                            prioritized_actions.append(a)
                 else:
-                    # Max Depth Reached: Use a simple heuristic action.
-                    self._log(f"[Depth {depth}] Max depth reached. Selecting heuristic action.")
-                    sim_env.observe(self.training_agent, new=True)
-                    action_mask = sim_env.infos[self.training_agent].get('action_mask', [0] * 7)
-                    valid_actions = [i for i, mask in enumerate(action_mask) if mask == 1]
-                    if not valid_actions:
-                        self._log(f"[Depth {depth}] No valid actions available at max depth")
-                        return -50.0, action_sequence, False, False
-
-                    hand = sim_env.players_hands.get(self.training_agent, [])
-                    table_card = sim_env.table_card
-                    table_cards = [c for c in hand if c == table_card or c == "Joker"]
-                    current_penalty = sim_env.penalties.get(self.training_agent, 0)
-                    if 6 in valid_actions:
-                        last_agent = sim_env.last_action_agent
-                        if last_agent:
-                            played_cards = sim_env.last_played_cards.get(self.training_agent, [])
-                            is_bluff = any(card != table_card and card != "Joker" for card in played_cards)
-                            if is_bluff:
-                                next_action = 6
-                                self._log(f"[Depth {depth}] At max depth - found bluff, challenging")
-                    elif current_penalty >= 2 and 0 in valid_actions and table_cards:
-                        next_action = 0
-                        self._log(f"[Depth {depth}] At max depth - high penalties, playing 1 table card")
-                    elif 0 in valid_actions and table_cards:
-                        next_action = 0
-                        self._log(f"[Depth {depth}] At max depth - playing 1 table card")
-                    elif current_penalty < 2 and 3 in valid_actions and len(hand) > len(table_cards):
-                        next_action = 3
-                        self._log(f"[Depth {depth}] At max depth - playing 1 non-table card")
-                    else:
-                        next_action = valid_actions[0]
-                        self._log(f"[Depth {depth}] At max depth - using first valid action: {next_action}")
-
-                    old_penalty = sim_env.penalties.get(self.training_agent, 0)
-                    sim_env.step(next_action)
-                    action_sequence.append((self.training_agent, next_action))
-                    if not pre_step_termination and sim_env.terminations.get(self.training_agent, False):
-                        self._log(f"[Depth {depth}] Got eliminated at max depth! Very bad.")
-                        return -10000.0, action_sequence, True, False
+                    for a in [0, 1, 2]:
+                        if a in valid_actions and (a % 3) + 1 <= len(table_cards):
+                            prioritized_actions.append(a)
+                    for a in [3]:
+                        if a in valid_actions:
+                            prioritized_actions.append(a)
+                    for a in valid_actions:
+                        if a not in prioritized_actions:
+                            prioritized_actions.append(a)
+                
+                best_value = float('-inf')
+                best_sequence = None
+                best_is_terminal = False
+                best_is_new_round = False
+                
+                for next_action in prioritized_actions:
+                    if next_action == 6 and best_sequence is not None:
+                        continue
+                    self._log(f"[Depth {depth}] Exploring next action {next_action}")
+                    next_state = sim_env.get_state()
+                    value, next_seq, is_terminal, is_new_round = self.simulate_round(
+                        next_state, next_action, opponent_action_cache, depth+1, max_depth
+                    )
+                    self._log(f"[Depth {depth}] Action {next_action} produced value {value}")
+                    
+                    if value > 1000:
+                        self._log(f"[Depth {depth}] Found path where opponent gets penalty, using immediately")
+                        return value, action_sequence + next_seq[1:], is_terminal, is_new_round
+                    if value > best_value:
+                        best_value = value
+                        best_sequence = next_seq
+                        best_is_terminal = is_terminal
+                        best_is_new_round = is_new_round
+                        self._log(f"[Depth {depth}] New best action: {next_action} with value {value}")
+                
+                if best_sequence:
+                    return best_value, action_sequence + best_sequence[1:], best_is_terminal, best_is_new_round
+                else:
+                    self._log(f"[Depth {depth}] No valid actions produced positive outcomes")
+                    return -100.0, action_sequence, False, False
+            
+            # If it's our turn but max depth is reached.
+            elif sim_env.agent_selection == self.training_agent:
+                sim_env.observe(self.training_agent, new=True)
+                action_mask = sim_env.infos[self.training_agent].get('action_mask', [0] * 7)
+                valid_actions = [i for i, mask in enumerate(action_mask) if mask == 1]
+                if not valid_actions:
+                    self._log(f"[Depth {depth}] No valid actions available at max depth")
+                    return -50.0, action_sequence, False, False
+                
+                hand = sim_env.players_hands.get(self.training_agent, [])
+                table_card = sim_env.table_card
+                table_cards = [c for c in hand if c == table_card or c == "Joker"]
+                current_penalty = sim_env.penalties.get(self.training_agent, 0)
+                
+                if 6 in valid_actions:
+                    last_agent = sim_env.last_action_agent
+                    if last_agent:
+                        played_cards = sim_env.last_played_cards.get(self.training_agent, [])
+                        is_bluff = any(card != table_card and card != "Joker" for card in played_cards)
+                        if is_bluff:
+                            next_action = 6
+                            self._log(f"[Depth {depth}] At max depth - found bluff, challenging")
+                elif current_penalty >= 2 and 0 in valid_actions and len(table_cards) > 0:
+                    next_action = 0
+                    self._log(f"[Depth {depth}] At max depth - high penalties, playing 1 table card")
+                elif 0 in valid_actions and len(table_cards) > 0:
+                    next_action = 0
+                    self._log(f"[Depth {depth}] At max depth - playing 1 table card")
+                elif current_penalty < 2 and 3 in valid_actions and len(hand) > len(table_cards):
+                    next_action = 3
+                    self._log(f"[Depth {depth}] At max depth - playing 1 non-table card")
+                else:
+                    next_action = valid_actions[0]
+                    self._log(f"[Depth {depth}] At max depth - using first valid action: {next_action}")
+                
+                pre_step_termination = sim_env.terminations.get(self.training_agent, False)
+                old_penalty = sim_env.penalties.get(self.training_agent, 0)
+                sim_env.step(next_action)
+                action_sequence.append((self.training_agent, next_action))
+                post_step_termination = sim_env.terminations.get(self.training_agent, False)
+                if not pre_step_termination and post_step_termination:
+                    self._log(f"[Depth {depth}] Got eliminated at max depth! Very bad.")
+                    return -10000.0, action_sequence, True, False
+                if sim_env.round > starting_round:
+                    final_penalty = sim_env.penalties.get(self.training_agent, 0)
+                    is_terminated = sim_env.terminations.get(self.training_agent, False)
+                    if final_penalty > old_penalty or is_terminated:
+                        self._log(f"[Depth {depth}] Got penalty or eliminated at round change at max depth")
+                        return -5000.0, action_sequence, is_terminated, True
+                new_penalty = sim_env.penalties.get(self.training_agent, 0)
+                if new_penalty > old_penalty:
+                    self._log(f"[Depth {depth}] Got penalty at max depth, bad")
+                    return -1000.0, action_sequence, False, False
+            
+            # If it's an opponent's turn.
+            else:
+                current_agent = sim_env.agent_selection
+                self._log(f"[Depth {depth}] Opponent {current_agent}'s turn")
+                try:
+                    opponent_action = self._select_opponent_action(sim_env, current_agent, opponent_action_cache)
+                    opp_action_type, opp_card_cat, opp_count = decode_action(opponent_action)
+                    self._log(f"[Depth {depth}] Opponent action: {opponent_action} ({opp_action_type}, {opp_card_cat}, {opp_count})")
+                    old_penalty = sim_env.penalties.get(current_agent, 0)
+                    is_challenging_us = (opponent_action == 6 and sim_env.last_action_agent == self.training_agent)
+                    if is_challenging_us:
+                        played_cards = sim_env.last_played_cards.get(self.training_agent, [])
+                        table_card = sim_env.table_card
+                        is_our_bluff = any(card != table_card and card != "Joker" for card in played_cards)
+                        if is_our_bluff:
+                            self._log(f"[Depth {depth}] Opponent is challenging our bluff! Very bad.")
+                            sim_env.step(opponent_action)
+                            action_sequence.append((current_agent, opponent_action))
+                            if starting_penalty >= 2:
+                                return -10000.0, action_sequence, False, False
+                            return -5000.0, action_sequence, False, False
+                    sim_env.step(opponent_action)
+                    action_sequence.append((current_agent, opponent_action))
+                    if sim_env.agent_selection is None:
+                        winner = sim_env.winner
+                        if winner == self.training_agent:
+                            self._log(f"[Depth {depth}] Game ended - WE WIN!")
+                            return 5000.0, action_sequence, True, False
+                        else:
+                            self._log(f"[Depth {depth}] Game ended - WE LOSE")
+                            return -5000.0, action_sequence, True, False
+                    new_penalty = sim_env.penalties.get(current_agent, 0)
+                    if new_penalty > old_penalty:
+                        found_opponent_penalty = True
+                        self._log(f"[Depth {depth}] Opponent got penalty from action {opponent_action}, very good")
+                        return 2000.0, action_sequence, False, False
                     if sim_env.round > starting_round:
                         final_penalty = sim_env.penalties.get(self.training_agent, 0)
                         is_terminated = sim_env.terminations.get(self.training_agent, False)
-                        if final_penalty > old_penalty or is_terminated:
-                            self._log(f"[Depth {depth}] Got penalty or eliminated at round change at max depth")
-                            return -5000.0, action_sequence, is_terminated, True
-                    new_penalty = sim_env.penalties.get(self.training_agent, 0)
-                    if new_penalty > old_penalty:
-                        self._log(f"[Depth {depth}] Got penalty at max depth, bad")
-                        return -1000.0, action_sequence, False, False
-                    final_val_at_max_depth = 0.0
-                    if sim_env.winner == self.training_agent:
-                        final_val_at_max_depth = 5000.0
-                    elif sim_env.terminations.get(self.training_agent):
-                        final_val_at_max_depth = -10000.0
-                    elif sim_env.agent_selection is None:
-                        final_val_at_max_depth = -5000.0
-                    elif sim_env.penalties.get(self.training_agent, 0) > starting_penalty:
-                        final_val_at_max_depth = -1000.0
-                    elif sim_env.round > starting_round:
-                        final_val_at_max_depth = 10.0
-                    return final_val_at_max_depth, action_sequence, (final_val_at_max_depth in [5000.0, -10000.0]), (sim_env.round > starting_round)
-
-            # --- If it's an opponent's turn ---
-            else:
-                self._log(f"[Depth {depth}] Opponent {current_sim_agent}'s turn")
-                try:
-                    opponent_action = self._select_opponent_action(sim_env, current_sim_agent, opponent_action_cache)
-                    opp_action_type, _, _ = decode_action(opponent_action)
-                    self._log(f"[Depth {depth}] Opponent action selected: {opponent_action} ({opp_action_type})")
-
-                    # --- Bait-and-Switch Heuristic ---
-                    if is_simulating_one_card_bluff and opponent_action == 6 and has_table_card_at_start:
-                        self._log(f"[Depth {depth}] HEURISTIC TRIGGERED: Opponent challenging 1-card bluff, we have table card.")
-                        action_sequence[0] = (self.training_agent, 0)  # Replace bluff with table card play
-                        action_sequence.append((current_sim_agent, 6))
-                        heuristic_win_value = 3000.0
-                        self._log(f"[Depth {depth}] Heuristic outcome: Assuming opponent penalty. Value: {heuristic_win_value}")
-                        return heuristic_win_value, action_sequence, False, True
-
-                    # --- Normal Opponent Action Simulation ---
-                    old_penalty = sim_env.penalties.get(current_sim_agent, 0)
-                    if opponent_action == 6 and sim_env.last_action_agent == self.training_agent:
-                        if getattr(sim_env, "last_action_bluff", False):
-                            self._log(f"[Depth {depth}] Opponent is challenging our actual bluff! Very bad.")
-                            sim_env.step(opponent_action)
-                            action_sequence.append((current_sim_agent, opponent_action))
-                            new_round_occurred = sim_env.round > starting_round
-                            if sim_env.terminations.get(self.training_agent):
-                                return -10000.0, action_sequence, True, new_round_occurred
-                            return -5000.0, action_sequence, False, new_round_occurred
-
-                    sim_env.step(opponent_action)
-                    action_sequence.append((current_sim_agent, opponent_action))
-                    new_penalty = sim_env.penalties.get(current_sim_agent, 0)
-                    if new_penalty > old_penalty:
-                        found_opponent_penalty = True
-                        self._log(f"[Depth {depth}] Opponent got penalty from {opponent_action}. Good.")
+                        if is_terminated:
+                            self._log(f"[Depth {depth}] Got ELIMINATED during round change! Very negative")
+                            return -10000.0, action_sequence, True, True
+                        
+                        if final_penalty > starting_penalty:
+                            self._log(f"[Depth {depth}] Our penalty increased during round change, returning negative value")
+                            return -5000.0, action_sequence, False, True
+                        
+                        if found_opponent_penalty:
+                            self._log(f"[Depth {depth}] Round changed and found opponent penalty, returning positive value")
+                            return 2000.0, action_sequence, False, True
                 except Exception as e:
-                    self._log(f"[Depth {depth}] Error simulating opponent {current_sim_agent}: {e}", exc_info=True)
+                    self._log(f"[Depth {depth}] Error with opponent action: {e}")
                     return -50.0, action_sequence, False, False
 
-        # End of loop: Hit step limit.
-        self._log(f"[Depth {depth}] Hit step limit ({max_steps})")
-        final_val_at_limit = 2000.0 if found_opponent_penalty else 10.0
-        return final_val_at_limit, action_sequence, False, False
+        self._log(f"[Depth {depth}] Hit step limit ({max_steps}) - sequence length: {len(action_sequence)}")
+        if found_opponent_penalty:
+            return 1000.0, action_sequence, False, False
+        else:
+            return 10.0, action_sequence, False, False
 
     def get_next_agent_action(self, agent_whose_turn_it_is):
         self._log(f"get_next_agent_action called for {agent_whose_turn_it_is}. Pos: {self.sequence_position}, SeqLen: {len(self.action_sequence)}")
