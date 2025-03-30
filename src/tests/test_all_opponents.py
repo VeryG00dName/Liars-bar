@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# test_all_opponents.py - Tests the MCTS agent against all opponent combinations until a loss
+# test_all_opponents.py - Tests the PerfectSearch agent against all opponent combinations
 
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -18,8 +18,8 @@ from src.env.liars_deck_env_core import LiarsDeckEnv
 from src.env.liars_deck_env_utils_2 import decode_action
 from src import config
 
-# Import MCTS and opponent models
-from src.model.mcts import PerfectMCTS
+# Import PS and opponent models
+from src.model.ps import PerfectSearch
 
 # Import opponent models
 from src.model.hard_coded_agents import (
@@ -47,11 +47,12 @@ OPPONENT_TYPES = [
 ]
 
 def setup_logging(verbosity=logging.INFO):
-    """Set up logging with specified verbosity"""
     logger = logging.getLogger()
+    # Clear any existing handlers to avoid duplicate logs
+    if logger.hasHandlers():
+        logger.handlers.clear()
     logger.setLevel(verbosity)
     
-    # Create console handler with formatting
     handler = logging.StreamHandler()
     formatter = logging.Formatter('[%(levelname)s] %(message)s')
     handler.setFormatter(formatter)
@@ -59,41 +60,21 @@ def setup_logging(verbosity=logging.INFO):
     
     return logger
 
-def print_mcts_stats(mcts, action_probs, best_action, best_value):
-    """Print detailed stats about the MCTS decision"""
-    print("\n===== MCTS DECISION STATS =====")
-    if best_action is not None:
-        action_type, card_category, count = decode_action(best_action)
-        print(f"Best action: {best_action} ({action_type}, {card_category}, {count if count else 'None'})")
-        print(f"Expected value: {best_value:.3f}")
-    else:
-        print("No best action found")
-    
-    print("\nAction probabilities:")
-    
-    # Print all action probabilities with their decoded meaning
-    for action, prob in enumerate(action_probs):
-        if prob > 0.01:  # Only print significant probabilities
-            action_type, card_category, count = decode_action(action)
-            print(f"  Action {action} ({action_type}, {card_category}, {count}): {prob:.3f}")
-    
-    # Print cache stats
-    print(f"\nCache size: {len(mcts.cache)} states")
-    
-    # Print action sequence information
-    if hasattr(mcts, 'action_sequence') and mcts.action_sequence:
-        print("\nPlanned action sequence:")
-        for i, (agent, action) in enumerate(mcts.action_sequence):
-            action_type, card_category, count = decode_action(action)
-            print(f"  {i+1}. {agent}: {action_type}, {card_category}, {count}")
-    else:
-        print("\nNo planned action sequence")
-    
-    print("=================================\n")
+def print_PS_stats(ps, action_probs, best_action, best_value):
+    """Print detailed stats about the PS decision"""
+    print("\n===== PS DECISION STATS =====")
+    print(f"Best action selected: {best_action}")
+    action_type, card_category, count = decode_action(best_action)
+    print(f"Action type: {action_type}, Category: {card_category}, Count: {count}")
+    print(f"Evaluated value: {best_value}")
+    print(f"Planned sequence length: {len(ps.action_sequence)}")
+    print(f"Current sequence position: {ps.sequence_position}")
+    print("=============================")
 
 def print_game_state(env, training_agent, opponent_agents, current_opponents):
     """Print detailed game state information"""
     print("\n========== GAME STATE ==========")
+    print(f"Round number:{env.round}")
     print(f"Table Card: {env.table_card}")
     print(f"Current agent selection: {env.agent_selection}")
     
@@ -297,231 +278,306 @@ def play_game(opponent1_config, opponent2_config, seed=42, render_mode=None, ver
     # Reset environment
     obs, infos = env.reset(seed=seed)
     
-    # Create MCTS instance
-    mcts = PerfectMCTS(
+    # Create PS instance
+    ps = PerfectSearch(
         env=env,
         training_agent=training_agent,
-        opponent_models=opponent_models,
-        exploration_weight=1.0
+        opponent_models=opponent_models
     )
     
     # Print initial game state if verbose
     if verbose:
         logger.info("Game started!")
+        print_game_state(env, training_agent, opponent_agents, current_opponents)
     
-    # Run the game
-    done = False
-    round_num = 1
-    move_num = 1
+    # Track search time for performance analysis
+    search_time = 0
+    search_count = 0
     
-    # Track rewards
-    total_rewards = {agent: 0 for agent in env.possible_agents}
+    # Game loop
+    max_steps = 1000  # Safety against infinite loops
+    steps = 0
     
-    # Count challenging errors (failed challenges or missed bluffs)
-    challenging_errors = 0
-    
-    # Track rounds to know when a new round has started
-    hand_sizes = {agent: len(env.players_hands.get(agent, [])) for agent in env.possible_agents}
-    first_move_of_round = {agent: True for agent in env.possible_agents}
-    
-    while not done:
-        if env.agent_selection is None:
-            if verbose:
-                logger.info("Game ended - no more agents to select")
-            break
-            
+    while not all(env.terminations.values()) and steps < max_steps:
+        steps += 1
+        
+        # Check which player's turn it is
         current_agent = env.agent_selection
         
-        # Check if this is the first move of a new round for this agent
-        new_hand_size = len(env.players_hands.get(current_agent, []))
-        if new_hand_size == 5 and new_hand_size > hand_sizes.get(current_agent, 0):
-            first_move_of_round[current_agent] = True
-            if verbose:
-                logger.info(f"Detected start of new round for {current_agent} (hand size: {new_hand_size})")
-        # Update hand size tracking
-        hand_sizes[current_agent] = new_hand_size
+        if current_agent is None:
+            logger.warning("No agent selected, game might have ended")
+            break
             
+        if verbose:
+            logger.info(f"Step {steps}: {current_agent}'s turn")
+        
+        # If it's our turn (training agent)
         if current_agent == training_agent:
-            # Our agent's turn
-            if verbose:
-                logger.info(f"Round {round_num}, Move {move_num}: {training_agent}'s turn (MCTS)")
+            # CRITICAL FIX: Make sure we observe the environment to get the latest state
+            env.observe(current_agent, new=True)
             
-            # Get observation and action mask
-            observation = env.observe(training_agent, new=True)[training_agent]
-            action_mask = env.infos[training_agent]['action_mask']
+            # Get the action mask to validate actions
+            action_mask = env.infos[current_agent].get('action_mask', [0] * 7)
             
-            # Run MCTS to get action
-            env_state = env.get_state()
+            # First check if we have a cached action from our winning sequence
+            cached_action = ps.get_next_agent_action(training_agent)
             
-            try:
-                start_time = time.time()
-                mcts_probs, best_action, best_value = mcts.search(env_state)
-                elapsed_time = time.time() - start_time
-                
-                if verbose:
-                    logger.info(f"MCTS completed in {elapsed_time:.2f} seconds")
-                    print_mcts_stats(mcts, mcts_probs, best_action, best_value)
-                
-                if best_action is not None:
-                    action_type, card_category, count = decode_action(best_action)
+            if cached_action is not None:
+                # CRITICAL FIX: Validate the cached action against the current mask
+                if action_mask[cached_action] == 1:
+                    # Use the cached action from our winning sequence
+                    best_action = cached_action
                     if verbose:
-                        logger.info(f"MCTS selected action: {action_type}, {card_category}, {count}")
-                    
-                    # Check if we're challenging
-                    if action_type == "Challenge":
-                        # Get last action agent and check if they were actually bluffing
-                        last_agent = env.last_action_agent
-                        if last_agent and not mcts._is_bluffing(env, last_agent):
-                            challenging_errors += 1
-                            if verbose:
-                                logger.warning("WARNING: Challenging when opponent is not bluffing!")
-                    
-                    # Execute action
-                    initial_rewards = {a: env.rewards[a] for a in env.possible_agents}
-                    env.step(best_action)
-                    
-                    # Update reward tracking
-                    for agent in env.possible_agents:
-                        reward = env.rewards.get(agent, 0) - initial_rewards.get(agent, 0)
-                        total_rewards[agent] += reward
-                    
-                    # Reset rewards in environment
-                    env.rewards = {agent: 0 for agent in env.possible_agents}
+                        logger.info(f"Using cached action: {best_action}")
                 else:
-                    # Fallback to random valid action
-                    valid_actions = [i for i, mask in enumerate(action_mask) if mask == 1]
-                    if valid_actions:
-                        fallback_action = np.random.choice(valid_actions)
-                        env.step(fallback_action)
-                    else:
-                        env.step(0)  # Dummy action
-            except Exception as e:
-                logger.error(f"Error in MCTS search: {e}")
-                # Take random valid action as fallback
-                valid_actions = [i for i, mask in enumerate(action_mask) if mask == 1]
-                if valid_actions:
-                    random_action = np.random.choice(valid_actions)
-                    env.step(random_action)
-                else:
-                    env.step(0)
-            
-            # Print game state if verbose
-            if verbose:
-                print_game_state(env, training_agent, opponent_agents, current_opponents)
-            
-            # Reset first move flag after our move
-            first_move_of_round[current_agent] = False
-            
-            # Check if hand reset to 5 cards (new round)
-            if len(env.players_hands.get(training_agent, [])) == 5 and move_num > 1:
-                round_num += 1
-                move_num = 0
-                # Reset first move flags for all agents
-                first_move_of_round = {agent: True for agent in env.possible_agents}
-                if verbose:
-                    logger.info(f"Starting round {round_num}")
-            
-            move_num += 1
-                
-        else:
-            # Opponent's turn
-            agent = current_agent
-            if verbose:
-                logger.info(f"Round {round_num}, Move {move_num}: {agent}'s turn ({current_opponents[agent]['name']})")
-            
-            # Only use model-selected action if this is the first move of a round or no pre-planned action exists
-            planned_action = mcts.get_next_opponent_action(agent)
-            
-            if planned_action is not None:
-                # Use the pre-planned action
-                action = planned_action
-                if verbose:
-                    action_type, card_category, count = decode_action(action)
-                    logger.info(f"{agent} using pre-planned action: {action_type}, {card_category}, {count}")
-            elif first_move_of_round[agent]:
-                # Only use model-selected action for the first move of a round
-                action = mcts._select_opponent_action(env, agent)
-                if verbose:
-                    action_type, card_category, count = decode_action(action)
-                    logger.info(f"{agent} using model-selected action (first move of round): {action_type}, {card_category}, {count}")
+                    # Cached action is no longer valid, need to search
+                    logger.warning(f"Cached action {cached_action} is invalid, running search instead")
+                    start_time = time.time()
+                    action_probs, best_action, best_value = ps.search(env.get_state())
+                    end_time = time.time()
+                    search_time += (end_time - start_time)
+                    search_count += 1
+                    
+                    if verbose:
+                        logger.info(f"Search completed in {end_time - start_time:.3f} seconds")
+                        print_PS_stats(ps, action_probs, best_action, best_value)
             else:
-                # This should never happen - but if it does, we need to know about it
-                logger.error(f"CRITICAL ERROR: No pre-planned action for {agent} and not first move of round!")
-                logger.error(f"Current round: {round_num}, move: {move_num}")
-                logger.error(f"Action sequence: {mcts.action_sequence}")
-                logger.error(f"First move flags: {first_move_of_round}")
-                logger.error(f"Hand sizes: {hand_sizes}")
-                
-                # As a last resort, use model-selected action but log clearly
-                action = mcts._select_opponent_action(env, agent)
-                if verbose:
-                    action_type, card_category, count = decode_action(action)
-                    logger.error(f"{agent} using EMERGENCY model-selected action: {action_type}, {card_category}, {count}")
+                # No cached action, need to search
+                try:
+                    start_time = time.time()
+                    action_probs, best_action, best_value = ps.search(env.get_state())
+                    end_time = time.time()
+                    search_time += (end_time - start_time)
+                    search_count += 1
+                    
+                    if verbose:
+                        logger.info(f"Search completed in {end_time - start_time:.3f} seconds")
+                        print_PS_stats(ps, action_probs, best_action, best_value)
+                except Exception as e:
+                    logger.error(f"Error in PerfectSearch: {e}")
+                    logger.info("Game aborted due to search error")
+                    return False, {
+                        "winner": None,
+                        "steps": steps,
+                        "error": str(e),
+                        "final_penalties": {agent: env.penalties.get(agent, 0) for agent in env.possible_agents},
+                        "search_time": search_time,
+                        "search_count": search_count,
+                        "avg_search_time": search_time/max(1, search_count)
+                    }
             
-            # Reset first move flag after the agent's move
-            first_move_of_round[agent] = False
+            # Apply the action
+            env.step(best_action)
             
-            # Execute action
-            initial_rewards = {a: env.rewards[a] for a in env.possible_agents}
-            env.step(action)
-            
-            # Update reward tracking
-            for a in env.possible_agents:
-                reward = env.rewards.get(a, 0) - initial_rewards.get(a, 0)
-                total_rewards[a] += reward
-            
-            # Reset rewards in environment
-            env.rewards = {agent: 0 for agent in env.possible_agents}
-            
-            # Print game state if verbose
             if verbose:
+                logger.info(f"{training_agent} took action {best_action}")
+                action_type, card_category, count = decode_action(best_action)
+                logger.info(f"Action: {action_type}, {card_category}, {count}")
                 print_game_state(env, training_agent, opponent_agents, current_opponents)
-            
-            # Check if hand reset to 5 cards (new round)
-            if len(env.players_hands.get(agent, [])) == 5 and move_num > 1:
-                round_num += 1
-                move_num = 0
-                # Reset first move flags for all agents
-                first_move_of_round = {agent: True for agent in env.possible_agents}
-                if verbose:
-                    logger.info(f"Starting round {round_num}")
-            
-            move_num += 1
-        
-        # Check if game is done
-        if env.agent_selection is None:
-            done = True
-    
-    # Print final results if verbose
-    if verbose:
-        print("\n========== GAME RESULTS ==========")
-        if env.winner:
-            print(f"Winner: {env.winner}" + (" (YOU!)" if env.winner == training_agent else ""))
+                
+        # If it's an opponent's turn
         else:
-            print("No winner declared")
-        
-        print("\nFinal rewards:")
-        for agent in env.possible_agents:
-            print(f"  {agent}: {total_rewards[agent]:.2f}" + (" (YOU)" if agent == training_agent else ""))
-        
-        print("\nFinal penalties:")
-        for agent in env.possible_agents:
-            print(f"  {agent}: {env.penalties.get(agent, 0)}/{env.penalty_thresholds.get(agent, 3)}")
-        
-        print("==================================\n")
+            # CRITICAL FIX: Make sure we observe the environment to get the latest state
+            env.observe(current_agent, new=True)
+            action_mask = env.infos[current_agent].get('action_mask', [0] * 7)
+            
+            # First check if we have a saved action from our search planning
+            cached_action = ps.get_next_agent_action(current_agent)
+            
+            if cached_action is not None:
+                # CRITICAL FIX: Validate the cached action against the current mask
+                if action_mask[cached_action] == 1:
+                    # Use the pre-planned action
+                    if verbose:
+                        logger.info(f"Using cached action for {current_agent}: {cached_action}")
+                    
+                    env.step(cached_action)
+                    
+                    if verbose:
+                        logger.info(f"{current_agent} took cached action {cached_action}")
+                        action_type, card_category, count = decode_action(cached_action)
+                        logger.info(f"Action: {action_type}, {card_category}, {count}")
+                        print_game_state(env, training_agent, opponent_agents, current_opponents)
+                else:
+                    logger.warning(f"Cached action {cached_action} for opponent {current_agent} is invalid, using model instead")
+                    # If cached action is invalid, fall back to opponent model
+                    try:
+                        opponent_model = opponent_models[current_agent]
+                        observation = env.observe(current_agent, new=True)[current_agent]
+                        
+                        # Different handling based on opponent type
+                        if hasattr(opponent_model, 'play_turn'):  # Hardcoded agent
+                            action = opponent_model.play_turn(observation, action_mask, table_card=env.table_card)
+                        else:  # Historical model
+                            # Format observation for historical model
+                            old_observation = env.observe(current_agent, new=False)[current_agent]
+                            obp_placeholder = np.zeros(2, dtype=np.float32)
+                            memory_placeholder = np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
+                            final_obs = np.concatenate([old_observation, obp_placeholder, memory_placeholder], axis=0)
+                            
+                            # Get probabilities
+                            observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device='cpu').unsqueeze(0)
+                            with torch.no_grad():
+                                try:
+                                    probs, _, _ = opponent_model(observation_tensor, None)
+                                except ValueError:
+                                    probs, _ = opponent_model(observation_tensor, None)
+                            
+                            # Apply mask and select action
+                            probs = probs.squeeze().cpu().numpy()
+                            masked_probs = probs * action_mask
+                            masked_probs_sum = masked_probs.sum()
+                            
+                            if masked_probs_sum > 0:
+                                masked_probs /= masked_probs_sum
+                                action = np.argmax(masked_probs)
+                            else:
+                                # If no valid actions after masking, choose first valid action
+                                valid_actions = [i for i, m in enumerate(action_mask) if m == 1]
+                                if valid_actions:
+                                    action = valid_actions[0]
+                                else:
+                                    logger.error(f"No valid actions for {current_agent}")
+                                    return False, {
+                                        "winner": None,
+                                        "steps": steps,
+                                        "error": "No valid actions for opponent",
+                                        "final_penalties": {agent: env.penalties.get(agent, 0) for agent in env.possible_agents},
+                                        "search_time": search_time,
+                                        "search_count": search_count,
+                                        "avg_search_time": search_time/max(1, search_count)
+                                    }
+                        
+                        # Take the action
+                        env.step(action)
+                        
+                        if verbose:
+                            logger.info(f"{current_agent} took model-generated action {action}")
+                            action_type, card_category, count = decode_action(action)
+                            logger.info(f"Action: {action_type}, {card_category}, {count}")
+                            print_game_state(env, training_agent, opponent_agents, current_opponents)
+                            
+                    except Exception as e:
+                        logger.error(f"Error generating opponent action: {e}")
+                        return False, {
+                            "winner": None,
+                            "steps": steps,
+                            "error": str(e),
+                            "final_penalties": {agent: env.penalties.get(agent, 0) for agent in env.possible_agents},
+                            "search_time": search_time,
+                            "search_count": search_count,
+                            "avg_search_time": search_time/max(1, search_count)
+                        }
+            else:
+                # If no cached action, use the opponent model directly
+                try:
+                    opponent_model = opponent_models[current_agent]
+                    observation = env.observe(current_agent, new=True)[current_agent]
+                    action_mask = env.infos[current_agent].get('action_mask', [0] * 7)
+                    
+                    # Different handling based on opponent type
+                    if hasattr(opponent_model, 'play_turn'):  # Hardcoded agent
+                        action = opponent_model.play_turn(observation, action_mask, table_card=env.table_card)
+                    else:  # Historical model
+                        # Format observation for historical model
+                        old_observation = env.observe(current_agent, new=False)[current_agent]
+                        obp_placeholder = np.zeros(2, dtype=np.float32)
+                        memory_placeholder = np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
+                        final_obs = np.concatenate([old_observation, obp_placeholder, memory_placeholder], axis=0)
+                        
+                        # Get probabilities
+                        observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device='cpu').unsqueeze(0)
+                        with torch.no_grad():
+                            try:
+                                probs, _, _ = opponent_model(observation_tensor, None)
+                            except ValueError:
+                                probs, _ = opponent_model(observation_tensor, None)
+                        
+                        # Apply mask and select action
+                        probs = probs.squeeze().cpu().numpy()
+                        masked_probs = probs * action_mask
+                        masked_probs_sum = masked_probs.sum()
+                        
+                        if masked_probs_sum > 0:
+                            masked_probs /= masked_probs_sum
+                            action = np.argmax(masked_probs)
+                        else:
+                            # If no valid actions after masking, choose first valid action
+                            valid_actions = [i for i, m in enumerate(action_mask) if m == 1]
+                            if valid_actions:
+                                action = valid_actions[0]
+                            else:
+                                logger.error(f"No valid actions for {current_agent}")
+                                return False, {
+                                    "winner": None,
+                                    "steps": steps,
+                                    "error": "No valid actions for opponent",
+                                    "final_penalties": {agent: env.penalties.get(agent, 0) for agent in env.possible_agents},
+                                    "search_time": search_time,
+                                    "search_count": search_count,
+                                    "avg_search_time": search_time/max(1, search_count)
+                                }
+                    
+                    # Take the action
+                    env.step(action)
+                    
+                    if verbose:
+                        logger.info(f"{current_agent} took model-generated action {action}")
+                        action_type, card_category, count = decode_action(action)
+                        logger.info(f"Action: {action_type}, {card_category}, {count}")
+                        print_game_state(env, training_agent, opponent_agents, current_opponents)
+                        
+                except Exception as e:
+                    logger.error(f"Error generating opponent action: {e}")
+                    return False, {
+                        "winner": None,
+                        "steps": steps,
+                        "error": str(e),
+                        "final_penalties": {agent: env.penalties.get(agent, 0) for agent in env.possible_agents},
+                        "search_time": search_time,
+                        "search_count": search_count,
+                        "avg_search_time": search_time/max(1, search_count)
+                    }
+            
+        # Check if game is over
+        if all(env.terminations.values()) or env.winner is not None:
+            break
     
-    # Collect stats
-    stats = {
-        "win": env.winner == training_agent,
-        "winner": env.winner,
-        "final_rewards": total_rewards,
-        "final_penalties": {a: env.penalties.get(a, 0) for a in env.possible_agents},
-        "rounds_played": round_num,
-        "total_moves": move_num,
-        "challenging_errors": challenging_errors
+    # Check for step limit reached
+    if steps >= max_steps:
+        logger.warning(f"Game reached maximum steps ({max_steps})")
+        return False, {
+            "winner": None,
+            "steps": steps,
+            "error": "Maximum steps reached",
+            "final_penalties": {agent: env.penalties.get(agent, 0) for agent in env.possible_agents},
+            "search_time": search_time,
+            "search_count": search_count,
+            "avg_search_time": search_time/max(1, search_count)
+        }
+    
+    # Determine winner and final stats
+    winner = env.winner
+    final_penalties = {agent: env.penalties.get(agent, 0) for agent in env.possible_agents}
+    
+    if verbose:
+        logger.info(f"Game ended after {steps} steps")
+        logger.info(f"Winner: {winner}")
+        logger.info(f"Final penalties: {final_penalties}")
+        if search_count > 0:
+            logger.info(f"Total search time: {search_time:.3f} seconds")
+            logger.info(f"Search count: {search_count}")
+            logger.info(f"Average search time: {search_time/search_count:.3f} seconds")
+    
+    # Return outcome
+    return (winner == training_agent), {
+        "winner": winner,
+        "steps": steps,
+        "final_penalties": final_penalties,
+        "search_time": search_time,
+        "search_count": search_count,
+        "avg_search_time": search_time/max(1, search_count) if search_count > 0 else 0
     }
-    
-    return stats["win"], stats
 
 def generate_opponent_combinations(all_opponents, include_hardcoded=True, include_historical=True, include_mixed=True):
     """
@@ -607,7 +663,7 @@ def test_opponent_combinations(render_mode=None, verbose=False, stop_on_loss=Tru
     Returns:
         results: Dictionary with results for each opponent combination
     """
-    print("Testing MCTS agent against opponent combinations...")
+    print("Testing PerfectSearch agent against opponent combinations...")
     
     # Load all available opponent models
     all_opponents = load_opponent_models(include_historical=include_historical)
@@ -632,7 +688,10 @@ def test_opponent_combinations(render_mode=None, verbose=False, stop_on_loss=Tru
         "hardcoded_results": {"wins": 0, "losses": 0, "win_rate": 0.0},
         "historical_results": {"wins": 0, "losses": 0, "win_rate": 0.0},
         "mixed_results": {"wins": 0, "losses": 0, "win_rate": 0.0},
-        "first_loss": None
+        "first_loss": None,
+        "total_search_time": 0,
+        "total_search_count": 0,
+        "avg_search_time": 0
     }
     
     # Test each combination
@@ -659,6 +718,12 @@ def test_opponent_combinations(render_mode=None, verbose=False, stop_on_loss=Tru
                 render_mode=render_mode,
                 verbose=verbose
             )
+            
+            # Update search stats
+            results["total_search_time"] += stats.get("search_time", 0)
+            results["total_search_count"] += stats.get("search_count", 0)
+            if results["total_search_count"] > 0:
+                results["avg_search_time"] = results["total_search_time"] / results["total_search_count"]
             
             # Update results
             results["games_played"] += 1
@@ -713,8 +778,10 @@ def test_opponent_combinations(render_mode=None, verbose=False, stop_on_loss=Tru
                 "type": combo_type
             }
             
-            # Print result
+            # Print result with search stats
             print(f"Result: {result_str} - Current win rate: {results['win_rate']:.2f}")
+            print(f"Search stats: {stats.get('search_count', 0)} searches, " 
+                  f"avg time: {stats.get('avg_search_time', 0):.3f}s")
             
             # If we lost and stop_on_loss is True, break the loop
             if not win and stop_on_loss:
@@ -731,6 +798,12 @@ def test_opponent_combinations(render_mode=None, verbose=False, stop_on_loss=Tru
     print("\n===== Test Results Summary =====")
     print(f"Combinations tested: {results['combinations_tested']}/{results['total_combinations']}")
     print(f"Overall win rate: {results['win_rate']:.4f} ({results['wins']}/{results['games_played']})")
+    
+    # Print search performance stats
+    if results["total_search_count"] > 0:
+        print(f"Search performance: {results['total_search_count']} searches, "
+              f"total time: {results['total_search_time']:.2f}s, "
+              f"avg time: {results['avg_search_time']:.3f}s")
     
     # Print category-specific results
     for category in ["hardcoded", "historical", "mixed"]:
@@ -757,7 +830,7 @@ def test_opponent_combinations(render_mode=None, verbose=False, stop_on_loss=Tru
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description="Test MCTS agent against all opponent combinations")
+    parser = argparse.ArgumentParser(description="Test PerfectSearch agent against all opponent combinations")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument("--render", action="store_true", help="Enable visual rendering")
     parser.add_argument("--no-stop", action="store_true", help="Don't stop on first loss")
@@ -766,11 +839,20 @@ def main():
     parser.add_argument("--only-hardcoded", action="store_true", help="Only test hardcoded agents")
     parser.add_argument("--only-historical", action="store_true", help="Only test historical agents")
     parser.add_argument("--only-mixed", action="store_true", help="Only test mixed combinations")
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode in PerfectSearch")
     
     args = parser.parse_args()
     
     render_mode = 'human' if args.render else None
     stop_on_loss = not args.no_stop
+    
+    # Enable debug mode in PerfectSearch if requested
+    if args.debug:
+        # This is a hack to set the debug flag in the PerfectSearch class
+        # before any instances are created
+        from src.model.ps import PerfectSearch
+        PerfectSearch.debug = True
+        print("Debug mode enabled for PerfectSearch")
     
     # Determine which combinations to test
     include_hardcoded = True
@@ -797,11 +879,20 @@ def main():
     if args.output:
         with open(args.output, 'w') as f:
             # Convert results to a serializable format
-            serializable_results = {
-                k: (v if not isinstance(v, dict) or "stats" not in v else 
-                   {kk: (vv if kk != "stats" else str(vv)) for kk, vv in v.items()})
-                for k, v in results.items()
-            }
+            serializable_results = {}
+            for k, v in results.items():
+                if isinstance(v, dict) and "stats" in v:
+                    serializable_results[k] = {kk: (vv if kk != "stats" else str(vv)) for kk, vv in v.items()}
+                elif k == "results_by_combination":
+                    serializable_results[k] = {}
+                    for combo_name, combo_result in v.items():
+                        serializable_results[k][combo_name] = {
+                            kk: (vv if kk != "stats" else str(vv)) 
+                            for kk, vv in combo_result.items()
+                        }
+                else:
+                    serializable_results[k] = v
+                    
             json.dump(serializable_results, f, indent=2)
         print(f"\nResults saved to {args.output}")
 
