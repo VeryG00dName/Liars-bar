@@ -414,7 +414,7 @@ def test_opponent_combinations(render_mode=None, verbose=False, stop_on_loss=Tru
         "avg_search_time": 0
     }
     
-    for i, (opponent1, opponent2) in enumerate(combinations):
+    for i, (opponent1, opponent2) in enumerate(tqdm(combinations, desc="Simulating battles")):
         combination_name = f"{opponent1['name']} ({opponent1['type']}) vs {opponent2['name']} ({opponent2['type']})"
         seed = start_seed + i
         print(f"\nTesting combination {i+1}/{len(combinations)}: {combination_name}")
