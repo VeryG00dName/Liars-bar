@@ -30,7 +30,7 @@ class PerfectSearch:
         self.sequence_position = 0
 
         self.simulations_performed = 0
-        self.debug = True  # Set default debug state
+        self.debug = False # Set default debug state
 
     def _log(self, message):
         """Log a message if debug is enabled."""
