@@ -1035,11 +1035,20 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                     if agent in belief_spaces:
                         for opp_agent in env.possible_agents:
                             if opp_agent != agent:
-                                # Update belief using the neural belief model if available.
-                                if belief_models.get(agent) is not None:
+                                # If cheat_expert_index is provided, override belief update.
+                                if cheat_expert_index is not None:
+                                    num_opponent_types = player_data.get('num_opponent_types', 10)
+                                    artificial_belief = np.zeros(num_opponent_types)
+                                    if cheat_expert_index < num_opponent_types:
+                                        artificial_belief[cheat_expert_index] = 1.0
+                                    else:
+                                        logger.warning(f"cheat_expert_index {cheat_expert_index} out of range; defaulting to index 0")
+                                        artificial_belief[0] = 1.0
+                                    belief_spaces[agent][opp_agent] = artificial_belief
+                                # Otherwise, use the original neural belief update.
+                                elif belief_models.get(agent) is not None:
                                     belief_model = belief_models[agent]
                                     current_belief = belief_spaces[agent][opp_agent]
-                                    # Instead of using a single observation, query the full opponent memory.
                                     memory_full = query_opponent_memory_full(agent, opp_agent)
                                     features_list = None
                                     if memory_full is None:
@@ -1048,8 +1057,7 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                                         features_list = convert_memory_to_features2(memory_full, global_response2idx2, global_action2idx2)
                                     if features_list:
                                         features_tensor = torch.tensor(features_list, dtype=torch.float32, device=device).unsqueeze(0)
-                                        belief_tensor = torch.tensor(current_belief, dtype=torch.float32, device=device).unsqueeze(0) 
-                                        
+                                        belief_tensor = torch.tensor(current_belief, dtype=torch.float32, device=device).unsqueeze(0)
                                         with torch.no_grad():
                                             updated_belief = belief_model(features_tensor, belief_tensor)
                                             updated_belief_np = updated_belief.squeeze().cpu().numpy()
