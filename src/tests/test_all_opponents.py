@@ -284,12 +284,57 @@ def play_game(opponent1_config, opponent2_config, seed=42, render_mode=None, ver
         training_agent=training_agent,
         opponent_models=opponent_models
     )
-    
+    original_select_opponent_action = ps._select_opponent_action
     # Print initial game state if verbose
     if verbose:
         logger.info("Game started!")
         print_game_state(env, training_agent, opponent_agents, current_opponents)
     
+    def cached_select_opponent_action(env, agent):
+        # Generate a hash key for the opponent's observation
+        env.observe(agent, new=True)
+        
+        # Key components:
+        # 1. Opponent's hand (sorted)
+        hand = sorted(env.players_hands.get(agent, []))
+        # 2. Table card
+        table_card = env.table_card
+        # 3. Last action & agent
+        last_action = env.last_action
+        last_agent = env.last_action_agent
+        # 4. Cards played by last agent
+        cards_played = []
+        if last_agent:
+            cards_played = sorted(env.last_played_cards.get(last_agent, []))
+        
+        # Create a consistent key for this observation
+        obs_key = (
+            agent,
+            tuple(hand),
+            table_card,
+            last_action,
+            last_agent,
+            tuple(cards_played)
+        )
+        
+        # Check if we've already determined an action for this observation
+        if hasattr(ps, 'current_opponent_action_cache') and obs_key in ps.current_opponent_action_cache:
+            cached_action = ps.current_opponent_action_cache[obs_key]
+            if verbose:
+                logger.info(f"Using cached action {cached_action} for {agent} from PS cache")
+            return cached_action
+            
+        # Otherwise get action normally
+        action = original_select_opponent_action(env, agent)
+        
+        # Cache it for future use
+        if hasattr(ps, 'current_opponent_action_cache'):
+            ps.current_opponent_action_cache[obs_key] = action
+            if verbose:
+                logger.info(f"Caching action {action} for {agent} in PS cache")
+        
+        return action
+    ps._select_opponent_action = cached_select_opponent_action
     # Track search time for performance analysis
     search_time = 0
     search_count = 0
