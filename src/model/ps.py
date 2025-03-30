@@ -1,6 +1,7 @@
 import numpy as np
 from src.env.liars_deck_env_utils_2 import decode_action
-
+import torch
+from src import config
 class PerfectSearch:
     """
     Simplified Perfect Search algorithm for Liar's Deck.
@@ -42,6 +43,15 @@ class PerfectSearch:
         """Log a message if debug is enabled."""
         if self.debug:
             print(f"PS DEBUG: {message}")
+    
+    def invalidate_plan(self):
+        """Resets the cached action sequence because the game state has deviated."""
+        if self.action_sequence: # Only log if there was a plan
+            self._log("Plan invalidated due to deviation or new round.")
+        self.action_sequence = []
+        self.sequence_position = 0
+        # Clear the opponent action cache tied to the old plan
+        self.current_opponent_action_cache = {}
     
     def _select_opponent_action(self, env, agent):
         """
@@ -85,14 +95,11 @@ class PerfectSearch:
             old_observation = env.observe(agent, new=False)[agent]
             
             # Historical models expect padded observation
-            import numpy as np
-            from src import config
             obp_placeholder = np.zeros(2, dtype=np.float32)
             memory_placeholder = np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
             final_obs = np.concatenate([old_observation, obp_placeholder, memory_placeholder], axis=0)
             
             # Convert to tensor
-            import torch
             observation_tensor = torch.tensor(final_obs, dtype=torch.float32, device='cpu').unsqueeze(0)
             
             # Get action probabilities
@@ -120,16 +127,18 @@ class PerfectSearch:
             action = np.argmax(masked_probs)
             return action
     
-    def simulate_round(self, env_state, action, opponent_action_cache=None):
+    def simulate_round(self, env_state, action, opponent_action_cache=None, depth=0, max_depth=20):
         """
-        Simulates until the end of the current round or until someone gets a penalty.
-        Always continues until round change to ensure complete action sequences.
+        Recursively simulates possible action sequences from the initial action.
+        Explores all valid actions on our turns up to max_depth.
         Uses opponent_action_cache to ensure consistent opponent behavior.
         
         Args:
             env_state: The current environment state
             action: The action to simulate
             opponent_action_cache: Dictionary to cache opponent actions based on observations
+            depth: Current recursion depth
+            max_depth: Maximum recursion depth for exploration
             
         Returns:
             tuple: (outcome_value, action_sequence, is_terminal, is_new_round)
@@ -147,57 +156,88 @@ class PerfectSearch:
         # Record our starting state information
         starting_penalty = sim_env.penalties.get(self.training_agent, 0)
         starting_round = sim_env.round
+        starting_hand_size = len(sim_env.players_hands.get(self.training_agent, []))
         
-        self._log(f"Starting simulation in round {starting_round} with action {action}")
-        
-        # Check for opportunity to challenge an opponent bluff
-        should_challenge = False
-        if action == 6:  # Challenge action
-            last_agent = sim_env.last_action_agent
-            if last_agent:
-                played_cards = sim_env.last_played_cards.get(last_agent, [])
-                table_card = sim_env.table_card
-                is_bluff = any(card != table_card and card != "Joker" for card in played_cards)
-                if is_bluff:
-                    should_challenge = True
-                    self._log(f"Found real bluff to challenge from {last_agent}")
+        # Decode the action for better logging
+        action_type, card_category, count = decode_action(action)
+        self._log(f"[Depth {depth}] Simulating action {action} ({action_type}, {card_category}, {count})")
         
         # Start with our action
         action_sequence = [(self.training_agent, action)]
+
+        # Get info before taking action
+        pre_step_termination = sim_env.terminations.get(self.training_agent, False)
+        pre_step_hand = sim_env.players_hands.get(self.training_agent, [])[:]  # Copy hand before action
         
         # Take the action
         sim_env.step(action)
         
-        # Track if we found any opponent penalties
-        found_opponent_penalty = False
-        found_our_penalty = False
+        # Get info after the action for better debugging
+        post_step_termination = sim_env.terminations.get(self.training_agent, False)
+        post_step_penalty = sim_env.penalties.get(self.training_agent, 0)
+        post_step_hand = sim_env.players_hands.get(self.training_agent, [])[:]  # Copy hand after action
         
-        # Get information after our action
-        new_penalty = sim_env.penalties.get(self.training_agent, 0)
-        penalty_increase = new_penalty - starting_penalty
+        # Cards played in this action
+        cards_played = [c for c in pre_step_hand if c not in post_step_hand]
         
-        # If we got a penalty and it wasn't from a successful challenge, this is a very bad path
-        if penalty_increase > 0 and not should_challenge:
-            self._log(f"We got a penalty, but continuing simulation")
-            penalty_value = -1000.0 * penalty_increase
-            # If this was from a failed challenge, it's extra bad with high penalties
-            if action == 6 and starting_penalty >= 2:
-                penalty_value = -5000.0
-            # Continue simulation but track that our penalty increased
-            found_our_penalty = True
+        # Debug info about what happened
+        self._log(f"[Depth {depth}] After action: Penalty={post_step_penalty}, Hand size={len(post_step_hand)}, Cards played={cards_played}")
+        
+        # Check if we got eliminated by our action
+        if not pre_step_termination and post_step_termination:
+            self._log(f"[Depth {depth}] Got eliminated by our own action! Very bad.")
+            return -10000.0, action_sequence, True, False
+        
+        # Check if we got an immediate penalty
+        if post_step_penalty > starting_penalty:
+            self._log(f"[Depth {depth}] Got penalty right after our action.")
+            if starting_penalty >= 2:
+                # At risk of elimination
+                return -5000.0, action_sequence, False, False
+            else:
+                return -1000.0, action_sequence, False, False
+        
+        # Check if game over after our action
+        if sim_env.agent_selection is None:
+            winner = sim_env.winner
+            if winner == self.training_agent:
+                self._log(f"[Depth {depth}] Game ended after our action - WE WIN!")
+                return 5000.0, action_sequence, True, False
+            else:
+                self._log(f"[Depth {depth}] Game ended after our action - WE LOSE")
+                return -5000.0, action_sequence, True, False
         
         # Check if we can stop here because the round changed already
         if sim_env.round > starting_round:
-            success_value = 100.0 if not found_our_penalty else -1000.0
-            self._log(f"Round changed after our action, returning {'positive' if not found_our_penalty else 'negative'} value")
-            return success_value, action_sequence, False, True
+            # Even if round changed, we need to check final penalties
+            final_penalty = sim_env.penalties.get(self.training_agent, 0)
+            final_hand_size = len(sim_env.players_hands.get(self.training_agent, []))
+            is_terminated = sim_env.terminations.get(self.training_agent, False)
+            
+            # Detect if we got eliminated during round change
+            if is_terminated:
+                self._log(f"[Depth {depth}] We got ELIMINATED during round change! Very negative value")
+                return -10000.0, action_sequence, True, True
+            
+            # Detect penalty increases during round change
+            if final_penalty > starting_penalty:
+                self._log(f"[Depth {depth}] We got a penalty during round change, returning very negative value")
+                return -5000.0, action_sequence, False, True
+            
+            # If our hand size changed significantly during round change (challenge), check our status
+            if final_hand_size < starting_hand_size - 1:  # More than 1 card difference
+                if final_penalty > starting_penalty:
+                    self._log(f"[Depth {depth}] Lost cards AND penalty during round change - very bad")
+                    return -5000.0, action_sequence, False, True
         
-        # Maximum steps to prevent infinite loops
-        max_steps = 100
+        # Track opponent penalties
+        found_opponent_penalty = False
+        
+        # Maximum steps to prevent infinite loops - INCREASED for more thorough simulation
+        max_steps = 20  # Increased from 10
         step_count = 0
         
         # Continue simulation until game ends or round changes
-        # IMPORTANT: We always continue until the round changes to ensure complete sequences
         while step_count < max_steps:
             step_count += 1
             
@@ -205,36 +245,52 @@ class PerfectSearch:
             if sim_env.agent_selection is None:
                 winner = sim_env.winner
                 if winner == self.training_agent:
-                    self._log(f"Game ended after {step_count} steps - WE WIN!")
+                    self._log(f"[Depth {depth}] Game ended after {step_count} steps - WE WIN!")
                     return 5000.0, action_sequence, True, False
                 else:
-                    self._log(f"Game ended after {step_count} steps - WE LOSE")
+                    self._log(f"[Depth {depth}] Game ended after {step_count} steps - WE LOSE")
                     return -5000.0, action_sequence, True, False
             
             # Check if round changed
             if sim_env.round > starting_round:
-                if found_our_penalty:
-                    self._log(f"Round changed but we got a penalty earlier, returning negative value")
-                    return -1000.0, action_sequence, False, True
-                elif found_opponent_penalty:
-                    self._log(f"Round changed and found opponent penalty, returning positive value")
+                # Check our final status
+                final_penalty = sim_env.penalties.get(self.training_agent, 0)
+                final_hand_size = len(sim_env.players_hands.get(self.training_agent, []))
+                is_terminated = sim_env.terminations.get(self.training_agent, False)
+                
+                # Detect if we got eliminated
+                if is_terminated:
+                    self._log(f"[Depth {depth}] We got ELIMINATED during round change! Very negative value")
+                    return -10000.0, action_sequence, True, True
+                
+                # Detect penalty increases during round change
+                if final_penalty > starting_penalty:
+                    self._log(f"[Depth {depth}] We got a penalty during round change, returning very negative value")
+                    return -5000.0, action_sequence, False, True
+                
+                # If found opponent penalty, this is excellent
+                if found_opponent_penalty:
+                    self._log(f"[Depth {depth}] Round changed and found opponent penalty, returning positive value")
                     return 2000.0, action_sequence, False, True
-                else:
-                    self._log(f"Round changed normally, returning neutral value")
-                    return 100.0, action_sequence, False, True
             
-            # If it's our turn
-            if sim_env.agent_selection == self.training_agent:
+            # If it's our turn and we haven't exceeded max depth, EXPLORE ALL VALID ACTIONS RECURSIVELY
+            if sim_env.agent_selection == self.training_agent and depth < max_depth:
                 # Get valid actions
                 sim_env.observe(self.training_agent, new=True)
                 action_mask = sim_env.infos[self.training_agent].get('action_mask', [0] * 7)
                 valid_actions = [i for i, mask in enumerate(action_mask) if mask == 1]
                 
                 if not valid_actions:
-                    self._log("No valid actions available")
+                    self._log(f"[Depth {depth}] No valid actions available")
                     return -50.0, action_sequence, False, False
                 
-                # First check if we can challenge a bluff
+                # RECURSIVE EXPLORATION - Try all valid actions and pick the best outcome
+                best_value = float('-inf')
+                best_sequence = None
+                best_is_terminal = False
+                best_is_new_round = False
+                
+                # Always check for challenge opportunities first
                 if 6 in valid_actions:
                     last_agent = sim_env.last_action_agent
                     if last_agent:
@@ -242,130 +298,158 @@ class PerfectSearch:
                         table_card = sim_env.table_card
                         is_bluff = any(card != table_card and card != "Joker" for card in played_cards)
                         if is_bluff:
-                            self._log(f"Found opponent bluff during simulation, challenging")
-                            next_action = 6
-                            # Take our action and add to sequence
-                            old_penalty = sim_env.penalties.get(self.training_agent, 0)
-                            sim_env.step(next_action)
-                            action_sequence.append((self.training_agent, next_action))
-                            
-                            # Check opponent's penalty after challenge
-                            new_opp_penalty = sim_env.penalties.get(last_agent, 0)
-                            old_opp_penalty = sim_env.penalties.get(last_agent, 0) - 1  # Approx
-                            if new_opp_penalty > old_opp_penalty:
-                                found_opponent_penalty = True
-                                self._log(f"Successful challenge - opponent penalty increased")
-                            
-                            # Check if round changed after challenge
-                            if sim_env.round > starting_round:
-                                if found_opponent_penalty:
-                                    self._log(f"Round changed after successful challenge, returning very positive value")
-                                    return 2000.0, action_sequence, False, True
-                                else:
-                                    self._log(f"Round changed after challenge, returning positive value")
-                                    return 500.0, action_sequence, False, True
-                            
-                            # Also check if we got a penalty (failed challenge)
-                            new_our_penalty = sim_env.penalties.get(self.training_agent, 0)
-                            if new_our_penalty > old_penalty:
-                                found_our_penalty = True
-                                self._log(f"Failed challenge - our penalty increased")
-                            
-                            continue
+                            self._log(f"[Depth {depth}] Found opponent bluff during simulation, trying challenge")
+                            # Clone state for exploration
+                            next_state = sim_env.get_state()
+                            value, next_seq, is_terminal, is_new_round = self.simulate_round(
+                                next_state, 6, opponent_action_cache, depth+1, max_depth
+                            )
+                            # If this outcome is good, use it immediately
+                            if value > 0:
+                                self._log(f"[Depth {depth}] Found successful challenge with value {value}")
+                                return value, action_sequence + next_seq[1:], is_terminal, is_new_round
+                            # Otherwise, still consider it with other actions
+                            if value > best_value:
+                                best_value = value
+                                best_sequence = next_seq
+                                best_is_terminal = is_terminal
+                                best_is_new_round = is_new_round
                 
-                # If we have table cards and high penalties, play those
+                # Get current penalties and hand state
+                current_penalty = sim_env.penalties.get(self.training_agent, 0)
+                hand = sim_env.players_hands.get(self.training_agent, [])
+                table_card = sim_env.table_card
+                table_cards = [c for c in hand if c == table_card or c == "Joker"]
+                
+                # Prioritize actions - always try table cards first at high penalties
+                prioritized_actions = []
+                if current_penalty >= 2:
+                    # First try table cards
+                    for a in [0, 1, 2]:  # Table card plays (1, 2, 3 cards)
+                        if a in valid_actions and (a % 3) + 1 <= len(table_cards):
+                            prioritized_actions.append(a)
+                    # Then other actions
+                    for a in valid_actions:
+                        if a not in prioritized_actions:
+                            prioritized_actions.append(a)
+                else:
+                    # Prefer table cards, then low counts of non-table cards
+                    for a in [0, 1, 2]:  # Table card plays
+                        if a in valid_actions and (a % 3) + 1 <= len(table_cards):
+                            prioritized_actions.append(a)
+                    for a in [3]:  # Try 1 non-table card
+                        if a in valid_actions:
+                            prioritized_actions.append(a)
+                    # Then other actions
+                    for a in valid_actions:
+                        if a not in prioritized_actions:
+                            prioritized_actions.append(a)
+                
+                # Explore all actions and find the best outcome
+                for next_action in prioritized_actions:
+                    # Skip challenge if we already checked it
+                    if next_action == 6 and best_sequence is not None:
+                        continue
+                        
+                    self._log(f"[Depth {depth}] Exploring next action {next_action}")
+                    # Clone state for exploration
+                    next_state = sim_env.get_state()
+                    value, next_seq, is_terminal, is_new_round = self.simulate_round(
+                        next_state, next_action, opponent_action_cache, depth+1, max_depth
+                    )
+                    self._log(f"[Depth {depth}] Action {next_action} produced value {value}")
+                    
+                    # Early stopping: If we found an opponent getting a penalty, use it immediately
+                    if value > 1000:
+                        self._log(f"[Depth {depth}] Found path where opponent gets penalty, using immediately")
+                        return value, action_sequence + next_seq[1:], is_terminal, is_new_round
+                    
+                    # Otherwise track best outcome
+                    if value > best_value:
+                        best_value = value
+                        best_sequence = next_seq
+                        best_is_terminal = is_terminal
+                        best_is_new_round = is_new_round
+                        self._log(f"[Depth {depth}] New best action: {next_action} with value {value}")
+                
+                # Return the best outcome found
+                if best_sequence:
+                    return best_value, action_sequence + best_sequence[1:], best_is_terminal, best_is_new_round
+                else:
+                    # No valid actions found - very unlikely but handle it
+                    self._log(f"[Depth {depth}] No valid actions produced positive outcomes")
+                    return -100.0, action_sequence, False, False
+                    
+            # If it's our turn but we've hit max depth, use a simple strategy
+            elif sim_env.agent_selection == self.training_agent:
+                # Get valid actions
+                sim_env.observe(self.training_agent, new=True)
+                action_mask = sim_env.infos[self.training_agent].get('action_mask', [0] * 7)
+                valid_actions = [i for i, mask in enumerate(action_mask) if mask == 1]
+                
+                if not valid_actions:
+                    self._log(f"[Depth {depth}] No valid actions available at max depth")
+                    return -50.0, action_sequence, False, False
+                
+                # Simple strategy - use table cards at high penalties, otherwise 1 non-table to bait challenge
                 hand = sim_env.players_hands.get(self.training_agent, [])
                 table_card = sim_env.table_card
                 table_cards = [c for c in hand if c == table_card or c == "Joker"]
                 current_penalty = sim_env.penalties.get(self.training_agent, 0)
                 
-                # Smart decision logic - when at high penalties, prioritize table cards
-                if current_penalty >= 2 and table_cards:
-                    # Play 1 table card (action 0)
-                    if 0 in valid_actions:
-                        next_action = 0
-                    elif 1 in valid_actions:
-                        next_action = 1  # Play 2 table cards
-                    elif 2 in valid_actions:
-                        next_action = 2  # Play 3 table cards
-                    else:
-                        # Play the action with the lowest count
-                        next_action = min(valid_actions, key=lambda a: (a % 3) + 1)
-                    self._log(f"High penalties, playing table card: action {next_action}")
-                
-                # If we have few cards left, see if we should play table cards before challenging
-                elif len(hand) <= 3 and found_opponent_penalty == False:
-                    # Hold our table cards until right before challenging 
-                    if 0 in valid_actions and len(table_cards) > 0:
-                        next_action = 0  # Play 1 table card
-                        self._log(f"Playing 1 table card before challenging")
-                    # Play 1 non-table card
-                    elif 3 in valid_actions and len(hand) > len(table_cards):
-                        next_action = 3  # Play 1 non-table card
-                        self._log(f"Playing 1 non-table card")
-                    else:
-                        # Play the action with the lowest count
-                        play_actions = [a for a in valid_actions if a < 6]
-                        if play_actions:
-                            next_action = min(play_actions, key=lambda a: (a % 3) + 1)
-                        else:
-                            next_action = valid_actions[0]
-                        self._log(f"Default play: action {next_action}")
-                
-                # Otherwise, try to play cards strategically
+                # Select a reasonable action without recursion
+                if 6 in valid_actions:  # Always consider challenging first
+                    last_agent = sim_env.last_action_agent
+                    if last_agent:
+                        played_cards = sim_env.last_played_cards.get(last_agent, [])
+                        is_bluff = any(card != table_card and card != "Joker" for card in played_cards)
+                        if is_bluff:
+                            next_action = 6  # Challenge
+                            self._log(f"[Depth {depth}] At max depth - found bluff, challenging")
+                elif current_penalty >= 2 and 0 in valid_actions and len(table_cards) > 0:
+                    next_action = 0  # Play 1 table card
+                    self._log(f"[Depth {depth}] At max depth - high penalties, playing 1 table card")
+                elif 0 in valid_actions and len(table_cards) > 0:
+                    next_action = 0  # Play 1 table card
+                    self._log(f"[Depth {depth}] At max depth - playing 1 table card")
+                elif current_penalty < 2 and 3 in valid_actions and len(hand) > len(table_cards):
+                    next_action = 3  # Play 1 non-table card
+                    self._log(f"[Depth {depth}] At max depth - playing 1 non-table card")
                 else:
-                    # If we have both table and non-table cards, alternate
-                    if len(table_cards) > 0 and len(hand) > len(table_cards):
-                        # Look at last action to decide
-                        if action_sequence[-1][1] < 3:  # If last action was table card play
-                            if 3 in valid_actions:
-                                next_action = 3  # Play 1 non-table card
-                                self._log(f"Alternating to non-table card")
-                            else:
-                                next_action = min(valid_actions, key=lambda a: (a % 3) + 1)
-                        else:  # If last action was non-table card play
-                            if 0 in valid_actions:
-                                next_action = 0  # Play 1 table card
-                                self._log(f"Alternating to table card")
-                            else:
-                                next_action = min(valid_actions, key=lambda a: (a % 3) + 1)
-                    else:
-                        # Play the action with the lowest count
-                        play_actions = [a for a in valid_actions if a < 6]
-                        if play_actions:
-                            next_action = min(play_actions, key=lambda a: (a % 3) + 1)
-                        else:
-                            next_action = valid_actions[0]
-                        self._log(f"Default play: action {next_action}")
-                
-                self._log(f"Our turn - selected action {next_action}")
-                
-                # Get the penalty before taking action
-                old_penalty = sim_env.penalties.get(self.training_agent, 0)
+                    next_action = valid_actions[0]
+                    self._log(f"[Depth {depth}] At max depth - using first valid action: {next_action}")
                 
                 # Take our action and add to sequence
+                pre_step_termination = sim_env.terminations.get(self.training_agent, False)
+                old_penalty = sim_env.penalties.get(self.training_agent, 0)
                 sim_env.step(next_action)
                 action_sequence.append((self.training_agent, next_action))
                 
+                # Check if we got eliminated
+                post_step_termination = sim_env.terminations.get(self.training_agent, False)
+                if not pre_step_termination and post_step_termination:
+                    self._log(f"[Depth {depth}] Got eliminated at max depth! Very bad.")
+                    return -10000.0, action_sequence, True, False
+                
                 # Check if round changed
                 if sim_env.round > starting_round:
-                    if found_our_penalty:
-                        self._log(f"Round changed but we got a penalty earlier, returning negative value")
-                        return -1000.0, action_sequence, False, True
-                    elif found_opponent_penalty:
-                        self._log(f"Round changed and found opponent penalty, returning positive value")
-                        return 2000.0, action_sequence, False, True
+                    final_penalty = sim_env.penalties.get(self.training_agent, 0)
+                    is_terminated = sim_env.terminations.get(self.training_agent, False)
+                    
+                    if final_penalty > old_penalty or is_terminated:
+                        self._log(f"[Depth {depth}] Got penalty or eliminated at round change at max depth")
+                        return -5000.0, action_sequence, is_terminated, True
                 
                 # Check if we got a penalty
                 new_penalty = sim_env.penalties.get(self.training_agent, 0)
                 if new_penalty > old_penalty:
-                    found_our_penalty = True
-                    self._log(f"We got a penalty, but continuing simulation to end of round")
+                    self._log(f"[Depth {depth}] Got penalty at max depth, bad")
+                    return -1000.0, action_sequence, False, False
             
             # If it's an opponent's turn
             else:
                 current_agent = sim_env.agent_selection
-                self._log(f"Opponent {current_agent}'s turn")
+                self._log(f"[Depth {depth}] Opponent {current_agent}'s turn")
                 
                 try:
                     # Generate a hash key for the opponent's observation
@@ -398,100 +482,88 @@ class PerfectSearch:
                     # Check if we've already determined an action for this observation
                     if obs_key in opponent_action_cache:
                         opponent_action = opponent_action_cache[obs_key]
-                        self._log(f"Using cached action {opponent_action} for opponent {current_agent}")
+                        self._log(f"[Depth {depth}] Using cached action {opponent_action} for opponent {current_agent}")
                     else:
-                        # Get the opponent's action
+                        # Get the opponent's action OR force challenge if likely
                         opponent_action = self._select_opponent_action(sim_env, current_agent)
+                        
                         # Cache it for future use
                         opponent_action_cache[obs_key] = opponent_action
-                        self._log(f"Caching action {opponent_action} for opponent {current_agent}")
+                        self._log(f"[Depth {depth}] Caching action {opponent_action} for opponent {current_agent}")
+                    
+                    # Decode for better logging
+                    opp_action_type, opp_card_cat, opp_count = decode_action(opponent_action)
+                    self._log(f"[Depth {depth}] Opponent action: {opponent_action} ({opp_action_type}, {opp_card_cat}, {opp_count})")
                     
                     # Get the opponent's penalty before action
                     old_penalty = sim_env.penalties.get(current_agent, 0)
+                    
+                    # Check if this is a challenge to our action
+                    is_challenging_us = (opponent_action == 6 and last_agent == self.training_agent)
+                    if is_challenging_us:
+                        # Check if we were bluffing
+                        played_cards = sim_env.last_played_cards.get(self.training_agent, [])
+                        is_our_bluff = any(card != table_card and card != "Joker" for card in played_cards)
+                        if is_our_bluff:
+                            self._log(f"[Depth {depth}] Opponent is challenging our bluff! Very bad.")
+                            # Take action anyway to record, but will return negative
+                            sim_env.step(opponent_action)
+                            action_sequence.append((current_agent, opponent_action))
+                            # Extra negative if we're at high penalties
+                            if starting_penalty >= 2:
+                                return -10000.0, action_sequence, False, False  # Fatal at high penalties
+                            return -5000.0, action_sequence, False, False
                     
                     # Take the action and record it
                     sim_env.step(opponent_action)
                     action_sequence.append((current_agent, opponent_action))
                     
+                    # Check if game is over
+                    if sim_env.agent_selection is None:
+                        winner = sim_env.winner
+                        if winner == self.training_agent:
+                            self._log(f"[Depth {depth}] Game ended - WE WIN!")
+                            return 5000.0, action_sequence, True, False
+                        else:
+                            self._log(f"[Depth {depth}] Game ended - WE LOSE")
+                            return -5000.0, action_sequence, True, False
+                    
                     # Check if opponent got a penalty - this is good for us
                     new_penalty = sim_env.penalties.get(current_agent, 0)
                     if new_penalty > old_penalty:
                         found_opponent_penalty = True
-                        self._log(f"Opponent got a penalty, but continuing to end of round")
+                        self._log(f"[Depth {depth}] Opponent got a penalty from action {opponent_action}, very good")
+                        # Early return for good outcome
+                        return 2000.0, action_sequence, False, False
                     
                     # Check if round changed
                     if sim_env.round > starting_round:
-                        if found_our_penalty:
-                            self._log(f"Round changed but we got a penalty earlier, returning negative value")
-                            return -1000.0, action_sequence, False, True
-                        elif found_opponent_penalty:
-                            self._log(f"Round changed and found opponent penalty, returning positive value")
+                        # Check our final status
+                        final_penalty = sim_env.penalties.get(self.training_agent, 0)
+                        is_terminated = sim_env.terminations.get(self.training_agent, False)
+                        
+                        if is_terminated:
+                            self._log(f"[Depth {depth}] Got ELIMINATED during round change! Very negative")
+                            return -10000.0, action_sequence, True, True
+                        
+                        if final_penalty > starting_penalty:
+                            self._log(f"[Depth {depth}] Our penalty increased during round change, returning negative value")
+                            return -5000.0, action_sequence, False, True
+                        
+                        if found_opponent_penalty:
+                            self._log(f"[Depth {depth}] Round changed and found opponent penalty, returning positive value")
                             return 2000.0, action_sequence, False, True
                     
                 except Exception as e:
-                    self._log(f"Error with opponent action: {e}")
+                    self._log(f"[Depth {depth}] Error with opponent action: {e}")
                     return -50.0, action_sequence, False, False
         
         # If we reach here, we hit the step limit
-        self._log(f"Hit step limit ({max_steps}) - sequence length: {len(action_sequence)}")
-        if found_our_penalty:
-            return -1000.0, action_sequence, False, False
-        elif found_opponent_penalty:
+        self._log(f"[Depth {depth}] Hit step limit ({max_steps}) - sequence length: {len(action_sequence)}")
+        if found_opponent_penalty:
             return 1000.0, action_sequence, False, False
         else:
             return 10.0, action_sequence, False, False
-    
-    def _evaluate_state(self, env):
-        """
-        Evaluates a non-terminal game state, focusing on penalties.
-        
-        Args:
-            env: The environment to evaluate.
-            
-        Returns:
-            float: Value of the state.
-        """
-        # If the game is over, use terminal state evaluation
-        if env.agent_selection is None:
-            return self._evaluate_terminal_state(env)
-        
-        # Main evaluation is based on penalties
-        our_penalty = env.penalties.get(self.training_agent, 0)
-        opponent_penalties = [env.penalties.get(opp, 0) for opp in self.opponent_agents]
-        max_opponent_penalty = max(opponent_penalties) if opponent_penalties else 0
-        
-        # Critical check: if we're eliminated, extremely bad
-        if our_penalty >= 3:
-            return -2000.0
-        
-        # Basic penalty-based score: positive if opponents have more penalties
-        penalty_diff = max_opponent_penalty - our_penalty
-        
-        # Scale based on how close we are to elimination
-        if our_penalty == 0:
-            score = penalty_diff * 100
-        elif our_penalty == 1:
-            score = penalty_diff * 200
-        else:  # our_penalty == 2
-            score = penalty_diff * 500  # Much higher weight when at risk
-        
-        return score
-    
-    def _evaluate_terminal_state(self, env):
-        """
-        Evaluate a terminal state to determine its value.
-        
-        Args:
-            env: Environment in the terminal state
-            
-        Returns:
-            float: Value of the state (positive if we win, negative if we lose)
-        """
-        # Check if we won
-        if env.winner == self.training_agent:
-            return 2000.0  # We won - very high value
-        else:
-            return -2000.0  # We lost - very negative value
     
     def get_next_agent_action(self, agent):
         """
