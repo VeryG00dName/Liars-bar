@@ -796,52 +796,6 @@ def initialize_players(base_dir, device):
                 players.update(process_checkpoint(checkpoint_path, identifier_prefix=file))
     return players
 
-def compute_action_likelihood(opponent_model, observation_new, observation_old, action, action_mask, device):
-    """Compute likelihood of an action given observation for a specific opponent model"""
-    if hasattr(opponent_model, 'get_action_prob'):
-        # If model has a direct probability function, use it
-        return opponent_model.get_action_prob(observation_new, action, action_mask)
-    else:
-        # Otherwise use forward pass for neural network models
-        with torch.no_grad():
-            if hasattr(opponent_model, 'play_turn'):  # Hardcoded agent
-                # We don't have exact probabilities for hardcoded agents
-                # So we check if the agent would take this action
-                predicted_action = opponent_model.play_turn(observation_new, action_mask, table_card=None)
-                return 1.0 if predicted_action == action else 0.1  # Small probability for unmatched actions
-            else:  # Neural network model (historical)
-                # For historical models - use OLD observation format with padding
-                # Add memory embeddings to old format observation
-                obp_placeholder = np.zeros(2, dtype=np.float32)
-                
-                # Add 10 zeros to simulate OBP output and transformer output
-                padding = np.zeros(10, dtype=np.float32)
-                
-                # Construct the final observation format for historical models
-                final_obs = np.concatenate([observation_old, obp_placeholder, padding], axis=0)
-                obs_tensor = torch.tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
-                
-                # Get action probabilities from the model
-                try:
-                    probs, _, _ = opponent_model(obs_tensor, None)
-                except ValueError:
-                    try:
-                        probs, _ = opponent_model(obs_tensor, None)
-                    except:
-                        # Fall back to a simple probability for problematic models
-                        return 0.2  # Default probability
-                
-                probs = torch.clamp(probs, 1e-8, 1.0).squeeze(0)
-                mask_tensor = torch.tensor(action_mask, dtype=torch.float32, device=device)
-                masked_probs = probs * mask_tensor
-                
-                # Normalize if needed
-                if masked_probs.sum() > 0:
-                    masked_probs = masked_probs / masked_probs.sum()
-                    
-                # Return probability of the observed action
-                return masked_probs[action].item()
-
 # ----------------------------
 # Unified Evaluation Function
 # ----------------------------
@@ -943,12 +897,6 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
             
             steps_in_game = 0
             game_wins = {pid: 0 for pid in player_ids}
-            
-            # Initialize tracking for belief updates.
-            last_actions = {agent: None for agent in env.possible_agents}
-            last_observations_new = {agent: None for agent in env.possible_agents}
-            last_observations_old = {agent: None for agent in env.possible_agents}
-            last_action_masks = {agent: None for agent in env.possible_agents}
             
             while env.agent_selection is not None:
                 steps_in_game += 1
@@ -1081,16 +1029,7 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                     table_card = getattr(env, 'table_card', None)
                     action = player_data['agent'].play_turn(observation, mask, table_card)
                     action_counts[player_id][action] += 1
-                    # Update belief tracking if applicable.
-                    if agent in belief_spaces:
-                        print("test")
-                    if agent in belief_spaces:
-                        new_obs = env.observe(agent, new=True)[agent]
-                        old_obs = env.observe(agent, new=False)[agent]
-                        last_observations_new[agent] = new_obs
-                        last_observations_old[agent] = old_obs
-                        last_action_masks[agent] = info.get('action_mask', [1] * config.OUTPUT_DIM)
-                        last_actions[agent] = action
+                    
                     env.step(action)
                     continue
                 
@@ -1120,15 +1059,6 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                     
                     action = torch.distributions.Categorical(masked_probs).sample().item()
                     action_counts[player_id][action] += 1
-                    if agent in belief_spaces:
-                        print("test")
-                    if agent in belief_spaces:
-                        new_obs = env.observe(agent, new=True)[agent]
-                        old_obs = env.observe(agent, new=False)[agent]
-                        last_observations_new[agent] = new_obs
-                        last_observations_old[agent] = old_obs
-                        last_action_masks[agent] = info.get('action_mask', [1] * config.OUTPUT_DIM)
-                        last_actions[agent] = action
                     env.step(action)
                     continue
                 
@@ -1253,15 +1183,6 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                 masked_probs /= masked_probs.sum()
                 action = torch.distributions.Categorical(masked_probs).sample().item()
                 action_counts[player_id][action] += 1
-                if agent in belief_spaces:
-                        print("test")
-                if agent in belief_spaces:
-                    new_obs = env.observe(agent, new=True)[agent]
-                    old_obs = env.observe(agent, new=False)[agent]
-                    last_observations_new[agent] = new_obs
-                    last_observations_old[agent] = old_obs
-                    last_action_masks[agent] = info.get('action_mask', [1] * config.OUTPUT_DIM)
-                    last_actions[agent] = action
                 env.step(action)
             
             # --- End of game loop: record results ---
