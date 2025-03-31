@@ -223,7 +223,9 @@ class BattlegroundWorker(QThread):
             for opp_name, (opp_type, opp_obj) in combined_opponents.items():
                 if self.onev2:
                     if self.cheat:
-                        cheat_expert_index = LABELS.get(opp_name, None)
+                        cheat_index1 = LABELS.get(opp_name1, None)
+                        cheat_index2 = LABELS.get(opp_name2, None)
+                        cheat_expert_index = (cheat_index1, cheat_index2)
                     else:
                         cheat_expert_index = None
                     cumulative_wins, expert_acts = self.run_match(opp_type, opp_obj, opp_name, episodes=self.rounds, progress_callback=lambda ep: self.progress_signal.emit(progress_counter + ep), cheat_expert_index=cheat_expert_index)
@@ -1546,24 +1548,40 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
             self.previous_results = self.current_results
             return
 
+        # Determine mode: if either onev2 or duo is checked.
+        is_special_mode = self.onev2_checkbox.isChecked() or self.duo_checkbox.isChecked()
+
         opp_names = list(self.current_results.keys())
         ai_prev_rates = []
         opp_prev_rates = []
         ai_curr_rates = []
         opp_curr_rates = []
-        
+
         for opp in opp_names:
             prev = self.previous_results.get(opp, [0, 0, 0])
             curr = self.current_results.get(opp, [0, 0, 0])
-            # Combined AI wins (sum of AI1 and AI2) and Opponent wins.
-            prev_ai_wins = prev[0] + prev[1]
-            curr_ai_wins = curr[0] + curr[1]
-            prev_total = prev_ai_wins + prev[2]
-            curr_total = curr_ai_wins + curr[2]
+            if is_special_mode:
+                # In 1v2/duo mode, AI wins are only from column 0;
+                # opponent wins are the sum of columns 1 and 2.
+                prev_ai_wins = prev[0]
+                curr_ai_wins = curr[0]
+                prev_opp_wins = prev[1] + prev[2]
+                curr_opp_wins = curr[1] + curr[2]
+            else:
+                # Normal mode: combine AI wins from columns 0 and 1.
+                prev_ai_wins = prev[0] + prev[1]
+                curr_ai_wins = curr[0] + curr[1]
+                prev_opp_wins = prev[2]
+                curr_opp_wins = curr[2]
+            
+            prev_total = prev_ai_wins + prev_opp_wins
+            curr_total = curr_ai_wins + curr_opp_wins
+
             ai_prev = prev_ai_wins / prev_total if prev_total > 0 else 0
-            opp_prev = prev[2] / prev_total if prev_total > 0 else 0
+            opp_prev = prev_opp_wins / prev_total if prev_total > 0 else 0
             ai_curr = curr_ai_wins / curr_total if curr_total > 0 else 0
-            opp_curr = curr[2] / curr_total if curr_total > 0 else 0
+            opp_curr = curr_opp_wins / curr_total if curr_total > 0 else 0
+
             ai_prev_rates.append(ai_prev)
             opp_prev_rates.append(opp_prev)
             ai_curr_rates.append(ai_curr)
@@ -1575,13 +1593,13 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         # Create two subplots: one for AI win rates, one for Opponent win rates.
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
 
-        # Graph for Combined AI win rates.
+        # Graph for AI win rates.
         ax1.bar(x - width/2, ai_prev_rates, width, label='Previous AI Win Rate')
         ax1.bar(x + width/2, ai_curr_rates, width, label='Current AI Win Rate')
         ax1.set_xticks(x)
         ax1.set_xticklabels(opp_names, rotation=45)
         ax1.set_ylabel("Win Rate")
-        ax1.set_title("Combined AI Win Rate Comparison")
+        ax1.set_title("AI Win Rate Comparison")
         ax1.legend()
 
         # Graph for Opponent win rates.
