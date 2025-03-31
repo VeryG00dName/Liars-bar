@@ -23,7 +23,7 @@ def main():
     parser.add_argument(
         "--bsp_subdir",
         type=str,
-        default="bsp_20250330_192915",
+        default="bsp_20250330_210719",
         help="Subdirectory inside checkpoint_dir where belief_space_policy_best.pth is located"
     )
     parser.add_argument(
