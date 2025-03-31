@@ -72,6 +72,7 @@ def save_checkpoint(policy_nets, value_nets, optimizers_policy, optimizers_value
 def load_checkpoint_if_available(policy_nets, value_nets, optimizers_policy, optimizers_value, obp_model, obp_optimizer, checkpoint_dir=config.CHECKPOINT_DIR):
     """
     Loads the latest checkpoint if available and restores the state of models and optimizers.
+    Now supports loading BeliefSpacePolicy and OpponentBeliefModel, and handles missing optimizer data.
     """
     if not os.path.isdir(checkpoint_dir):
         logging.info("Checkpoint directory does not exist. Starting training from scratch.")
@@ -99,9 +100,10 @@ def load_checkpoint_if_available(policy_nets, value_nets, optimizers_policy, opt
     latest_checkpoint = os.path.join(checkpoint_dir, f"checkpoint_episode_{latest_episode}.pth")
     checkpoint = torch.load(latest_checkpoint, map_location='cpu')
 
+    # Load policy networks.
     for agent, net in policy_nets.items():
         mapped_agent = AGENT_NAME_MAPPING.get(agent, agent)
-        if mapped_agent in checkpoint['policy_nets']:
+        if mapped_agent in checkpoint.get('policy_nets', {}):
             try:
                 missing_keys, unexpected_keys = net.load_state_dict(checkpoint['policy_nets'][mapped_agent], strict=False)
                 if missing_keys:
@@ -116,26 +118,31 @@ def load_checkpoint_if_available(policy_nets, value_nets, optimizers_policy, opt
         else:
             logging.warning(f"Policy Network for {agent} not found in checkpoint. Skipping.")
 
-    for agent, net in value_nets.items():
-        mapped_agent = AGENT_NAME_MAPPING.get(agent, agent)
-        if mapped_agent in checkpoint['value_nets']:
-            try:
-                missing_keys, unexpected_keys = net.load_state_dict(checkpoint['value_nets'][mapped_agent], strict=False)
-                if missing_keys:
-                    logging.warning(f"Value Network for {agent} is missing keys: {missing_keys}")
-                if unexpected_keys:
-                    logging.warning(f"Value Network for {agent} has unexpected keys: {unexpected_keys}")
-                net.to(next(net.parameters()).device)
-                logging.info(f"Loaded Value Network for {agent} from episode {latest_episode} with strict=False.")
-            except RuntimeError as e:
-                logging.error(f"Error loading Value Network for {agent}: {e}")
-                logging.info(f"Skipping loading Value Network for {agent}. Initializing randomly.")
-        else:
-            logging.warning(f"Value Network for {agent} not found in checkpoint. Skipping.")
+    # Load value networks if provided.
+    if value_nets is not None:
+        for agent, net in value_nets.items():
+            mapped_agent = AGENT_NAME_MAPPING.get(agent, agent)
+            if mapped_agent in checkpoint.get('value_nets', {}):
+                try:
+                    missing_keys, unexpected_keys = net.load_state_dict(checkpoint['value_nets'][mapped_agent], strict=False)
+                    if missing_keys:
+                        logging.warning(f"Value Network for {agent} is missing keys: {missing_keys}")
+                    if unexpected_keys:
+                        logging.warning(f"Value Network for {agent} has unexpected keys: {unexpected_keys}")
+                    net.to(next(net.parameters()).device)
+                    logging.info(f"Loaded Value Network for {agent} from episode {latest_episode} with strict=False.")
+                except RuntimeError as e:
+                    logging.error(f"Error loading Value Network for {agent}: {e}")
+                    logging.info(f"Skipping loading Value Network for {agent}. Initializing randomly.")
+            else:
+                logging.warning(f"Value Network for {agent} not found in checkpoint. Skipping.")
+    else:
+        logging.info("No value networks provided; skipping value network loading.")
 
+    # Load policy optimizers.
     for agent, opt in optimizers_policy.items():
         mapped_agent = AGENT_NAME_MAPPING.get(agent, agent)
-        if mapped_agent in checkpoint['optimizers_policy']:
+        if mapped_agent in checkpoint.get('optimizers_policy', {}):
             try:
                 opt.load_state_dict(checkpoint['optimizers_policy'][mapped_agent])
                 logging.info(f"Loaded Policy Optimizer for {agent} from episode {latest_episode}.")
@@ -145,29 +152,45 @@ def load_checkpoint_if_available(policy_nets, value_nets, optimizers_policy, opt
         else:
             logging.warning(f"Policy Optimizer for {agent} not found in checkpoint. Skipping.")
 
-    for agent, opt in optimizers_value.items():
-        mapped_agent = AGENT_NAME_MAPPING.get(agent, agent)
-        if mapped_agent in checkpoint['optimizers_value']:
-            try:
-                opt.load_state_dict(checkpoint['optimizers_value'][mapped_agent])
-                logging.info(f"Loaded Value Optimizer for {agent} from episode {latest_episode}.")
-            except RuntimeError as e:
-                logging.error(f"Error loading Value Optimizer for {agent}: {e}")
-                logging.info(f"Skipping loading Value Optimizer for {agent}.")
-        else:
-            logging.warning(f"Value Optimizer for {agent} not found in checkpoint. Skipping.")
-
-    if 'obp_model' in checkpoint and 'obp_optimizer' in checkpoint:
-        try:
-            obp_model.load_state_dict(checkpoint['obp_model'])
-            obp_model.to(next(obp_model.parameters()).device)
-            obp_optimizer.load_state_dict(checkpoint['obp_optimizer'])
-            logging.info(f"Loaded Opponent Behavior Predictor model and optimizer from episode {latest_episode}.")
-        except RuntimeError as e:
-            logging.error(f"Error loading Opponent Behavior Predictor: {e}")
-            logging.info("Skipping loading Opponent Behavior Predictor. Initializing randomly.")
+    # Load value optimizers if provided.
+    if optimizers_value is not None:
+        for agent, opt in optimizers_value.items():
+            mapped_agent = AGENT_NAME_MAPPING.get(agent, agent)
+            if mapped_agent in checkpoint.get('optimizers_value', {}):
+                try:
+                    opt.load_state_dict(checkpoint['optimizers_value'][mapped_agent])
+                    logging.info(f"Loaded Value Optimizer for {agent} from episode {latest_episode}.")
+                except RuntimeError as e:
+                    logging.error(f"Error loading Value Optimizer for {agent}: {e}")
+                    logging.info(f"Skipping loading Value Optimizer for {agent}.")
+            else:
+                logging.warning(f"Value Optimizer for {agent} not found in checkpoint. Skipping.")
     else:
-        logging.warning("Opponent Behavior Predictor model and/or optimizer not found in checkpoint. Skipping.")
+        logging.info("No value optimizers provided; skipping value optimizer loading.")
+
+    # Load Belief/Opponent model and its optimizer.
+    if 'obp_model' in checkpoint or 'belief_model' in checkpoint:
+        try:
+            # Load the belief model using either key.
+            if 'obp_model' in checkpoint:
+                obp_model.load_state_dict(checkpoint['obp_model'])
+            elif 'belief_model' in checkpoint:
+                obp_model.load_state_dict(checkpoint['belief_model'])
+            obp_model.to(next(obp_model.parameters()).device)
+            # Attempt to load the optimizer state if available.
+            if obp_optimizer is not None:
+                if 'obp_optimizer' in checkpoint and checkpoint['obp_optimizer'] is not None:
+                    obp_optimizer.load_state_dict(checkpoint['obp_optimizer'])
+                elif 'belief_optimizer' in checkpoint and checkpoint['belief_optimizer'] is not None:
+                    obp_optimizer.load_state_dict(checkpoint['belief_optimizer'])
+                else:
+                    logging.warning("Belief optimizer state not found in checkpoint; skipping optimizer load.")
+            logging.info(f"Loaded Opponent Belief model and optimizer from episode {latest_episode}.")
+        except RuntimeError as e:
+            logging.error(f"Error loading Opponent Belief model: {e}")
+            logging.info("Skipping loading Opponent Belief model. Initializing randomly.")
+    else:
+        logging.warning("Opponent Belief model and/or optimizer not found in checkpoint. Skipping.")
 
     if 'entropy_coefs' in checkpoint:
         logging.info("Ignoring entropy coefficients found in checkpoint.")
