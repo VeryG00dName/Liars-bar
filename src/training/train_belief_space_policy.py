@@ -54,20 +54,6 @@ def setup_logging(log_file=None, level=logging.INFO):
     
     return logger
 
-def _safe_to_tensor(data, dtype=None, device=None):
-    """Convert data to tensor safely without warnings."""
-    if isinstance(data, torch.Tensor):
-        result = data
-        if dtype is not None:
-            result = result.to(dtype)
-    else:
-        result = torch.tensor(data, dtype=dtype)
-    
-    if device is not None:
-        result = result.to(device)
-    
-    return result
-
 def create_opponent_mapping(data_dir, use_cache=True, cache_file="opponent_mapping_cache.pkl"):
     """Create mapping of opponent names to indices.
     
@@ -158,7 +144,7 @@ def create_opponent_mapping(data_dir, use_cache=True, cache_file="opponent_mappi
 
 class PSDataset(Dataset):
     """Dataset for PerfectSearch generated data, with fixed-size belief tensors."""
-    def __init__(self, data, opponent_mapping, num_opponent_types, device, max_opponent_count=4):
+    def __init__(self, data, opponent_mapping, num_opponent_types, device, max_opponent_count=2):
         self.data = []
         self.opponent_mapping = opponent_mapping
         self.num_opponent_types = num_opponent_types
@@ -866,7 +852,7 @@ def main():
     parser.add_argument("--log-dir", type=str, default=None, help="Log directory for TensorBoard")
     parser.add_argument("--device", type=str, default='cuda', help="Device to use (cuda/cpu)")
     parser.add_argument("--max-files", type=int, default=10, help="Maximum number of data files to load")
-    parser.add_argument("--max-samples", type=int, default=500000, help="Maximum number of samples to load (default: 500k)")
+    parser.add_argument("--max-samples", type=int, default=900000, help="Maximum number of samples to load (default: 500k)")
     
     args = parser.parse_args()
     
