@@ -804,6 +804,8 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
     """
     Optimized evaluation function with support for BeliefSpacePolicy, MoE models, and StackedObservationConvModel.
     Combines functionalities from two versions and includes robust belief-based action selection and updates.
+    Now updates beliefs for each opponent with cheat_expert_index (scalar or 2-element list) and tracks expert activations
+    for every player, including two activations per belief model.
     """
     logger = logging.getLogger("Evaluate")
     
@@ -843,14 +845,12 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
     game_wins_list = []
     start_time = time.time()
     
-    # Initialize expert tracking if enabled.
+    # Initialize expert tracking for all agents if enabled.
     expert_activations = {} if track_experts else None
     if track_experts:
-        for agent_name in ['player_0', 'player_1']:
-            pid = agent_to_player.get(agent_name)
-            if pid:
-                expert_activations[agent_name] = {}
-    
+        for agent in agent_to_player.keys():
+            expert_activations[agent] = {}
+
     # --- BeliefSpacePolicy setup ---
     belief_models = {}  # maps agent name -> belief model (if any)
     belief_spaces = {}  # maps agent name -> dict(opponent -> belief distribution)
@@ -924,14 +924,12 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                     # Combine beliefs into a single vector
                     combined_belief = np.concatenate(opponent_beliefs)
                     
-                    # *** New: Record the belief model's output as expert activation ***
-                    if track_experts and agent in expert_activations:
-                        # Use the argmax of the combined belief as a proxy expert index.
-                        belief_expert_index = int(np.argmax(combined_belief))
-                        expert_idx_str = str(belief_expert_index)
-                        if expert_idx_str not in expert_activations[agent]:
-                            expert_activations[agent][expert_idx_str] = 0
-                        expert_activations[agent][expert_idx_str] += 1
+                    # *** Updated: Track top-2 expert activations for belief models ***
+                    if track_experts:
+                        top2_experts = np.argsort(combined_belief)[-2:]
+                        for expert_idx in top2_experts:
+                            expert_idx_str = str(int(expert_idx))
+                            expert_activations[agent][expert_idx_str] = expert_activations[agent].get(expert_idx_str, 0) + 1
                     
                     # Convert to tensors
                     obs_tensor = torch.tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
@@ -981,39 +979,48 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                     
                     # --- Update beliefs about opponents if using BeliefSpacePolicy ---
                     if agent in belief_spaces:
+                        # Prepare cheat indexes if provided.
+                        # If cheat_expert_index is a list/tuple, assume order matches opponents encountered.
+                        cheat_indexes = None
+                        if cheat_expert_index is not None:
+                            if isinstance(cheat_expert_index, (list, tuple)):
+                                cheat_indexes = list(cheat_expert_index)
+                            else:
+                                cheat_indexes = [cheat_expert_index] * (len(env.possible_agents) - 1)
+                        opp_counter = 0
                         for opp_agent in env.possible_agents:
-                            if opp_agent != agent:
-                                # If cheat_expert_index is provided, override belief update.
-                                if cheat_expert_index is not None:
-                                    num_opponent_types = player_data.get('num_opponent_types', 10)
-                                    artificial_belief = np.zeros(num_opponent_types)
-                                    if cheat_expert_index < num_opponent_types:
-                                        artificial_belief[cheat_expert_index] = 1.0
-                                    else:
-                                        logger.warning(f"cheat_expert_index {cheat_expert_index} out of range; defaulting to index 0")
-                                        artificial_belief[0] = 1.0
-                                    belief_spaces[agent][opp_agent] = artificial_belief
-                                # Otherwise, use the original neural belief update.
-                                elif belief_models.get(agent) is not None:
-                                    belief_model = belief_models[agent]
-                                    current_belief = belief_spaces[agent][opp_agent]
-                                    memory_full = query_opponent_memory_full(agent, opp_agent)
-                                    features_list = None
-                                    if memory_full is None:
-                                        print(f"No memory available for {agent} vs {opp_agent}, skipping belief update")
-                                    else:
-                                        features_list = convert_memory_to_features2(memory_full, global_response2idx2, global_action2idx2)
-                                    if features_list:
-                                        features_tensor = torch.tensor(features_list, dtype=torch.float32, device=device).unsqueeze(0)
-                                        belief_tensor = torch.tensor(current_belief, dtype=torch.float32, device=device).unsqueeze(0)
-                                        with torch.no_grad():
-                                            updated_belief = belief_model(features_tensor, belief_tensor)
-                                            updated_belief_np = updated_belief.squeeze().cpu().numpy()
-                                            if np.isnan(updated_belief_np).any() or np.isinf(updated_belief_np).any():
-                                                updated_belief_np = current_belief
-                                            belief_spaces[agent][opp_agent] = updated_belief_np
+                            if opp_agent == agent:
+                                continue
+                            num_opponent_types = player_data.get('num_opponent_types', 10)
+                            if cheat_indexes is not None:
+                                cheat_idx = cheat_indexes[opp_counter] if opp_counter < len(cheat_indexes) else cheat_indexes[-1]
+                                artificial_belief = np.zeros(num_opponent_types)
+                                if cheat_idx < num_opponent_types:
+                                    artificial_belief[cheat_idx] = 1.0
+                                else:
+                                    logger.warning(f"cheat_expert_index {cheat_idx} out of range; defaulting to index 0")
+                                    artificial_belief[0] = 1.0
+                                belief_spaces[agent][opp_agent] = artificial_belief
+                            elif belief_models.get(agent) is not None:
+                                belief_model = belief_models[agent]
+                                current_belief = belief_spaces[agent][opp_agent]
+                                memory_full = query_opponent_memory_full(agent, opp_agent)
+                                features_list = None
+                                if memory_full is None:
+                                    print(f"No memory available for {agent} vs {opp_agent}, skipping belief update")
+                                else:
+                                    features_list = convert_memory_to_features2(memory_full, global_response2idx2, global_action2idx2)
+                                if features_list:
+                                    features_tensor = torch.tensor(features_list, dtype=torch.float32, device=device).unsqueeze(0)
+                                    belief_tensor = torch.tensor(current_belief, dtype=torch.float32, device=device).unsqueeze(0)
+                                    with torch.no_grad():
+                                        updated_belief = belief_model(features_tensor, belief_tensor)
+                                        updated_belief_np = updated_belief.squeeze().cpu().numpy()
+                                        if np.isnan(updated_belief_np).any() or np.isinf(updated_belief_np).any():
+                                            updated_belief_np = current_belief
+                                        belief_spaces[agent][opp_agent] = updated_belief_np
+                            opp_counter += 1
                     env.step(action)
-                    # Continue to next step.
                     continue
                 
                 # --- Hardcoded bot handling ---
@@ -1137,11 +1144,10 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                         logger.debug(f"Using cheat expert index {expert_index} for MoE model")
                     elif expert_index is None:
                         expert_index = 0
-                    if track_experts and agent in ['player_0', 'player_1']:
+                    if track_experts:
+                        # Track expert activation regardless of agent role.
                         expert_idx_str = str(expert_index)
-                        if expert_idx_str not in expert_activations[agent]:
-                            expert_activations[agent][expert_idx_str] = 0
-                        expert_activations[agent][expert_idx_str] += 1
+                        expert_activations[agent][expert_idx_str] = expert_activations[agent].get(expert_idx_str, 0) + 1
                 else:
                     if player_data.get('uses_memory', False) and version == 2 and mem_tensor is not None:
                         transformer_features_tensor = mem_tensor.flatten()
@@ -1161,13 +1167,12 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                     )
                     if hasattr(policy_net, 'fc_classifier'):
                         probs, _, gating_logits = policy_net(final_obs_tensor, hidden_state)
-                        if track_experts and gating_logits is not None and agent in ['player_0', 'player_1']:
+                        if track_experts and gating_logits is not None:
+                            # For traditional models, still track expert activations even if not a belief model.
                             _, top_expert = torch.topk(gating_logits, 1, dim=1)
                             expert_idx = top_expert.squeeze().item()
                             expert_idx_str = str(expert_idx)
-                            if expert_idx_str not in expert_activations[agent]:
-                                expert_activations[agent][expert_idx_str] = 0
-                            expert_activations[agent][expert_idx_str] += 1
+                            expert_activations[agent][expert_idx_str] = expert_activations[agent].get(expert_idx_str, 0) + 1
                             logger.debug(f"Traditional model: Agent {agent} used expert {expert_idx}")
                     else:
                         probs, _ = policy_net(final_obs_tensor, hidden_state)
