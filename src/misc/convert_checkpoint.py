@@ -23,7 +23,7 @@ def main():
     parser.add_argument(
         "--bsp_subdir",
         type=str,
-        default="bsp_20250330_130020",
+        default="bsp_20250330_192915",
         help="Subdirectory inside checkpoint_dir where belief_space_policy_best.pth is located"
     )
     parser.add_argument(
@@ -36,7 +36,7 @@ def main():
 
     checkpoint_dir = args.checkpoint_dir
     bsp_dir = os.path.join(checkpoint_dir, args.bsp_subdir)
-    bsp_path = os.path.join(bsp_dir, "belief_space_policy_final.pth")
+    bsp_path = os.path.join(bsp_dir, "belief_space_policy_best.pth")
     opponent_belief_path = os.path.join(checkpoint_dir, "opponent_belief_model.pth")
 
     if not os.path.exists(bsp_path):
