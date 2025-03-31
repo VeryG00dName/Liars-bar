@@ -1,4 +1,5 @@
 # src/evaluation/ai_vs_hardcoded.py
+import itertools
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import logging
@@ -37,23 +38,6 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger("AgentBattleground")
 logger.propagate = True
 # --- Helper function (unchanged) ---
-def convert_memory_to_features(memory, response_mapping, action_mapping):
-    """
-    Convert the opponent memory (a list of events) to a list of 4-dimensional feature vectors.
-    Each event must be a dictionary with keys: "response", "triggering_action", "penalties", and "card_count".
-    """
-    features = []
-    for event in memory:
-        if not isinstance(event, dict):
-            raise ValueError(f"Memory event is not a dictionary: {event}.")
-        resp = event.get("response", "")
-        act = event.get("triggering_action", "")
-        penalties = float(event.get("penalties", 0))
-        card_count = float(event.get("card_count", 0))
-        resp_val = float(response_mapping.get(resp, 0))
-        act_val = float(action_mapping.get(act, 0))
-        features.append([resp_val, act_val, penalties, card_count])
-    return features
 
 def get_input_dim_from_state_dict(state_dict, candidate_prefix='fc1'):
     """
@@ -109,20 +93,6 @@ def is_stacked_newer_observation_model(state_dict):
     return (any(k.startswith('conv_layers.') for k in state_dict.keys()) and 
             'policy_head1.weight' in state_dict and 
             'value_head1.weight' in state_dict)
-
-def get_num_opponent_classes(state_dict):
-    """
-    Extracts the number of opponent classes from a model state dictionary.
-    
-    Args:
-        state_dict: The state dictionary of a model.
-        
-    Returns:
-        int: The number of opponent classes or None if not found.
-    """
-    if 'opponent1_class_head.weight' in state_dict:
-        return state_dict['opponent1_class_head.weight'].shape[0]
-    return None
 
 # --- New helper: Get observation dimension from StackedObservationConvModel state dict ---
 def get_obs_dim_from_stacked_model(state_dict):
@@ -192,8 +162,8 @@ class BattlegroundWorker(QThread):
     expert_signal = pyqtSignal(dict)  # New signal for expert activations
     error_signal = pyqtSignal(str)
     
-    # Now include an extra parameter "two_player"
-    def __init__(self, ai_agents, historical_models, hardcoded_agents, rounds, two_player=None, parent=None, cheat=False):
+    # Now include extra parameters "onev2" and "duo"
+    def __init__(self, ai_agents, historical_models, hardcoded_agents, rounds, two_player=None, parent=None, cheat=False, onev2=False, duo=False):
         super().__init__(parent)
         self.ai_agents = ai_agents
         self.historical_models = historical_models
@@ -201,8 +171,10 @@ class BattlegroundWorker(QThread):
         self.rounds = rounds
         self.two_player = two_player  # if not None, pass the player id to eliminate
         self.cheat = cheat
+        self.onev2 = onev2      # if True, run 1v2 mode (one AI against the same opponent in both slots)
+        self.duo = duo          # if True, run duo mode (one AI against a pair of different opponents)
         self.expert_activations = {}
-
+    
     def run(self):
         combined_opponents = {}
         # Add hardcoded agents.
@@ -211,55 +183,82 @@ class BattlegroundWorker(QThread):
         # Then add historical models.
         for identifier, hist_model in self.historical_models.items():
             combined_opponents[identifier] = ("historical", hist_model)
-
+        
         progress_counter = 0
         results = {}
         # Initialize expert activation tracking
         self.expert_activations = {}
-
-        for opp_name, (opp_type, opp_obj) in combined_opponents.items():
-            # Initialize expert activations for this opponent
-            self.expert_activations[opp_name] = {"player_0": {}, "player_1": {}}
-
-            # Define a progress callback that emits progress updates
-            def progress_callback(episode):
-                # Here, you can combine progress_counter with episode for overall progress if needed.
-                self.progress_signal.emit(progress_counter + episode)
-
-            # Instead of running a loop, evaluate agents for self.rounds episodes at once, with progress callback.
-            cumulative_wins, expert_acts = self.run_match(opp_type, opp_obj, opp_name, episodes=self.rounds, progress_callback=progress_callback)
-
-            # Extract wins for player_0, player_1, and player_2 (where player_2 is the opponent)
-            wins = [
-                cumulative_wins.get("player_0", 0),
-                cumulative_wins.get("player_1", 0),
-                cumulative_wins.get("player_2", 0)
-            ]
-
-            # Update expert activations for the two AI agents
-            for agent in ["player_0", "player_1"]:
-                if agent in expert_acts:
-                    self.expert_activations[opp_name][agent] = expert_acts[agent]
-            
-            progress_counter += self.rounds
-            self.progress_signal.emit(progress_counter)
-            results[opp_name] = wins
-
+        
+        # Duo mode: iterate over every pair of opponents.
+        if self.duo:
+            duo_pairs = list(itertools.combinations(combined_opponents.items(), 2))
+            for ((opp_name1, (opp_type1, opp_obj1)), (opp_name2, (opp_type2, opp_obj2))) in duo_pairs:
+                opponent_name = f"{opp_name1}+{opp_name2}"
+                if self.cheat:
+                    cheat_index1 = LABELS.get(opp_name1, None)
+                    cheat_index2 = LABELS.get(opp_name2, None)
+                    cheat_expert_index = (cheat_index1, cheat_index2)
+                else:
+                    cheat_expert_index = None
+                # Pass a tuple of opponent types and a tuple of opponent objects.
+                cumulative_wins, expert_acts = self.run_match(
+                    (opp_type1, opp_type2), 
+                    (opp_obj1, opp_obj2), 
+                    opponent_name, 
+                    episodes=self.rounds, 
+                    progress_callback=lambda ep: self.progress_signal.emit(progress_counter + ep), 
+                    cheat_expert_index=cheat_expert_index
+                )
+                wins = [
+                    cumulative_wins.get("player_0", 0),
+                    cumulative_wins.get("player_1", 0),
+                    cumulative_wins.get("player_2", 0)
+                ]
+                self.expert_activations[opponent_name] = expert_acts
+                progress_counter += self.rounds
+                self.progress_signal.emit(progress_counter)
+                results[opponent_name] = wins
+        else:
+            # Normal and onev2 modes.
+            for opp_name, (opp_type, opp_obj) in combined_opponents.items():
+                if self.onev2:
+                    if self.cheat:
+                        cheat_expert_index = LABELS.get(opp_name, None)
+                    else:
+                        cheat_expert_index = None
+                    cumulative_wins, expert_acts = self.run_match(opp_type, opp_obj, opp_name, episodes=self.rounds, progress_callback=lambda ep: self.progress_signal.emit(progress_counter + ep), cheat_expert_index=cheat_expert_index)
+                else:
+                    if self.cheat:
+                        cheat_expert_index = LABELS.get(opp_name, None)
+                    else:
+                        cheat_expert_index = None
+                    cumulative_wins, expert_acts = self.run_match(opp_type, opp_obj, opp_name, episodes=self.rounds, progress_callback=lambda ep: self.progress_signal.emit(progress_counter + ep), cheat_expert_index=cheat_expert_index)
+                wins = [
+                    cumulative_wins.get("player_0", 0),
+                    cumulative_wins.get("player_1", 0),
+                    cumulative_wins.get("player_2", 0)
+                ]
+                self.expert_activations[opp_name] = expert_acts
+                progress_counter += self.rounds
+                self.progress_signal.emit(progress_counter)
+                results[opp_name] = wins
+        
         # Emit the expert activations and the results
         self.expert_signal.emit(self.expert_activations)
         self.results_signal.emit(results)
     
-    def run_match(self, opponent_type, opponent_obj, opponent_name, episodes, progress_callback=None): 
+    def run_match(self, opponent_type, opponent_obj, opponent_name, episodes, progress_callback=None, cheat_expert_index=None): 
         env = LiarsDeckEnv(num_players=3, render_mode=None)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         players_in_this_game = {}
         logger = logging.getLogger("BattlegroundWorker")
-        # --- AI Agents (player_0 and player_1) ---
-        for key in ["player_0", "player_1"]:
-            agent_data = self.ai_agents[key]
+        
+        # --- Set up AI agent(s) and opponent(s) based on mode ---
+        if isinstance(opponent_type, (tuple, list)):
+            # Duo mode: Use a single AI agent in player_0, and two different opponents for player_1 and player_2.
+            # Load AI agent from self.ai_agents["player_0"]
+            agent_data = self.ai_agents["player_0"]
             policy_state_dict = agent_data["policy_net"]
-
-            # Check if this is a BeliefSpacePolicy model
             if agent_data.get("is_belief_space_policy", False):
                 try:
                     # Get dimensions from the model's state dict
@@ -296,6 +295,7 @@ class BattlegroundWorker(QThread):
                             obs_dim = policy_state_dict['obs_dim'].item()
                             belief_dim = total_input_dim - obs_dim
                         else:
+                            key = "player_0"
                             # Make a better estimate by analyzing the observation
                             sample_obs = env.observe(key, new=True)[key]
                             estimated_obs_dim = min(sample_obs.shape[0], total_input_dim - 10)  # Ensure at least 10 for belief
@@ -425,115 +425,432 @@ class BattlegroundWorker(QThread):
                 except Exception as e:
                     logger.error(f"Failed to create BeliefSpacePolicy: {str(e)}")
                     raise
-
-            # Check if this is a newer observation StackedObservationConvModel
-            elif agent_data.get("is_newer_obs_model", False):
-                # For StackedObservationConvModel for newer observation format
-                obs_dim = agent_data.get("input_dim")
-                if obs_dim is None:
-                    # Try to determine obs_dim from the state dict
-                    obs_dim = get_obs_dim_from_stacked_model(policy_state_dict)
-                    if obs_dim is None:
-                        # Fallback: use sample observation from environment
-                        obs = env.observe(key, newer=True)[key]
-                        obs_dim = obs.shape[0]
-                
-                hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, "fc_layers.0")
-                if hidden_dim is None:
-                    hidden_dim = config.HIDDEN_DIM
-                
-                # Create model using ModelFactory
-                policy_net = ModelFactory.create_stacked_observation_model(
-                    obs_dim=obs_dim,
-                    num_actions=env.action_spaces[key].n,
-                    hidden_dim=hidden_dim,
-                    num_obs_stack=config.NUM_OBS_STACK  # Default value, can be adjusted
-                )
-                
-                # Load state dict
-                policy_net.load_state_dict(policy_state_dict, strict=False)
-                policy_net.to(device).eval()
-                
-                # For StackedObservationConvModel, we don't need a separate value network or OBP model
-                players_in_this_game[key] = {
-                    "policy_net": policy_net,
-                    "obp_model": None,
-                    "obs_version": 5,  # Use version 5 for newer observation model
-                    "rating": None,
-                    "uses_memory": False,
-                    "track_experts": False,
-                    "is_stacked_model": True,
-                    "is_newer_obs_model": True,
-                    "is_conditional_model": False,
-                    "is_belief_space_policy": False,
-                    "observation_stacks": deque(maxlen=config.NUM_OBS_STACK)  # Initialize observation stack
-                }
-                
-                # Pre-fill the observation stack with zeros
-                sample_obs = env.observe(key, newer=True)[key]
-                for _ in range(config.NUM_OBS_STACK):  # Assuming stack size of config.NUM_OBS_STACK
-                    players_in_this_game[key]["observation_stacks"].append(np.zeros_like(sample_obs))
-            elif agent_data.get("is_stacked_model", False):
-                # Create StackedObservationConvModel for standard new observation format
-                obs_dim = agent_data.get("input_dim")
-                if obs_dim is None:
-                    # Try to determine obs_dim from the state dict
-                    obs_dim = get_obs_dim_from_stacked_model(policy_state_dict)
-                    if obs_dim is None:
-                        # Fallback: use sample observation from environment
-                        obs = env.observe(key, new=True)[key]
-                        obs_dim = obs.shape[0]
-                
-                hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, "fc_layers.0")
-                if hidden_dim is None:
-                    hidden_dim = config.HIDDEN_DIM
-                
-                # Create model using ModelFactory
-                policy_net = ModelFactory.create_stacked_observation_model(
-                    obs_dim=obs_dim,
-                    num_actions=env.action_spaces[key].n,
-                    hidden_dim=hidden_dim,
-                    num_obs_stack=config.NUM_OBS_STACK  # Default value, can be adjusted
-                )
-                
-                # Load state dict
-                policy_net.load_state_dict(policy_state_dict, strict=False)
-                policy_net.to(device).eval()
-                
-                players_in_this_game[key] = {
-                    "policy_net": policy_net,
-                    "obp_model": None,
-                    "obs_version": 3,  # Use version 3 for stacked models
-                    "rating": None,
-                    "uses_memory": False,
-                    "track_experts": False,
-                    "is_stacked_model": True,
-                    "is_newer_obs_model": False,
-                    "is_conditional_model": False,
-                    "is_belief_space_policy": False,
-                    "observation_stacks": deque(maxlen=config.NUM_OBS_STACK)  # Initialize observation stack
-                }
-                
-                # Pre-fill the observation stack with zeros
-                sample_obs = env.observe(key, new=True)[key]
-                for _ in range(config.NUM_OBS_STACK):  # Assuming stack size of config.NUM_OBS_STACK
-                    players_in_this_game[key]["observation_stacks"].append(np.zeros_like(sample_obs))
-                    
             else:
-                # Handle traditional single-observation models (existing code)
+                # Otherwise, use the traditional model initialization.
                 hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, "fc1")
                 obs_dim = agent_data["input_dim"]
-                
-                # Check if this is an MoE model
-                is_moe_model = ModelFactory.is_moe_policy(policy_state_dict)
-                new_model_flag = is_new_policy(policy_state_dict)
-                
-                if is_moe_model:
-                    # Create MoE policy network
+                policy_net = ModelFactory.create_policy_network(
+                    input_dim=obs_dim,
+                    hidden_dim=hidden_dim,
+                    output_dim=env.action_spaces["player_0"].n,
+                    use_new_model=True
+                )
+                policy_net.load_state_dict(policy_state_dict, strict=False)
+                policy_net.to(device).eval()
+                belief_model = None
+            players_in_this_game["player_0"] = {
+                "policy_net": policy_net,
+                "belief_model": belief_model,
+                "obs_version": 2,
+                "rating": None,
+                "uses_memory": False,
+                "track_experts": False,
+                "is_belief_space_policy": agent_data.get("is_belief_space_policy", False)
+            }
+            # Now create opponent players for player_1 and player_2 from the duo pair.
+            for idx, (opp_type, opp_obj) in enumerate(zip(opponent_type, opponent_obj), start=1):
+                key = f"player_{idx}"
+                if opp_type == "hardcoded":
+                    opponent_instance = opp_obj(opponent_name)
+                    players_in_this_game[key] = {
+                        "hardcoded_bot": True,
+                        "agent": opponent_instance,
+                        "obs_version": 2,
+                        "rating": None,
+                        "uses_memory": False
+                    }
+                elif opp_type == "historical":
+                    hist_state_dict = opp_obj.state_dict()
+                    hidden_dim = get_hidden_dim_from_state_dict(hist_state_dict, "fc1")
+                    obs_dim = hist_state_dict["fc1.weight"].shape[1]
                     policy_net = ModelFactory.create_policy_network(
                         input_dim=obs_dim,
                         hidden_dim=hidden_dim,
                         output_dim=env.action_spaces[key].n,
+                        use_new_model=True
+                    )
+                    policy_net.load_state_dict(hist_state_dict, strict=False)
+                    policy_net.to(device).eval()
+                    obp_model = ModelFactory.create_obp(
+                        use_transformer_memory=True,
+                        input_dim=config.OPPONENT_INPUT_DIM,
+                        hidden_dim=config.OPPONENT_HIDDEN_DIM,
+                        output_dim=2
+                    )
+                    obp_model.to(device).eval()
+                    players_in_this_game[key] = {
+                        "policy_net": policy_net,
+                        "obp_model": obp_model,
+                        "obs_version": 2,
+                        "rating": None,
+                        "uses_memory": True
+                    }
+                else:
+                    raise ValueError(f"Unsupported opponent type in duo mode: {opp_type}")
+        elif self.onev2:
+            # onev2 mode: Use a single AI agent for player_0 and assign the same opponent to both player_1 and player_2.
+            agent_data = self.ai_agents["player_0"]
+            policy_state_dict = agent_data["policy_net"]
+            if agent_data.get("is_belief_space_policy", False):
+                hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, "network.0")
+                total_input_dim = policy_state_dict['network.0.weight'].shape[1]
+                sample_obs = env.observe("player_0", new=True)["player_0"]
+                obs_dim = min(sample_obs.shape[0], total_input_dim - 10)
+                belief_dim = total_input_dim - obs_dim
+                policy_net = BeliefSpacePolicy(
+                    belief_dim=belief_dim,
+                    obs_dim=obs_dim,
+                    hidden_dim=hidden_dim,
+                    output_dim=env.action_spaces["player_0"].n
+                )
+                policy_net.load_state_dict(policy_state_dict, strict=False)
+                policy_net.to(device).eval()
+                belief_model_state = agent_data["belief_model"]
+                if belief_model_state is not None:
+                    # Determine dimensions (example values; adjust based on your requirements)
+                    belief_hidden_dim = get_hidden_dim_from_state_dict(belief_model_state, "encoder.0")
+                    belief_obs_dim = belief_model_state["encoder.0.weight"].shape[1] if "encoder.0.weight" in belief_model_state else obs_dim
+                    num_opponent_types = 10  # or retrieve from agent_data if available
+
+                    # Instantiate the belief model.
+                    belief_model = OpponentBeliefModel(
+                        event_feature_dim=5,
+                        max_seq_length=config.MAX_SQUENCE_LENGTH,
+                        hidden_dim=belief_hidden_dim,
+                        num_opponent_types=num_opponent_types
+                    ).to(device)
+                    # Load the parameters.
+                    belief_model.load_state_dict(belief_model_state, strict=False)
+                else:
+                    belief_model = None
+            else:
+                hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, "fc1")
+                obs_dim = agent_data["input_dim"]
+                policy_net = ModelFactory.create_policy_network(
+                    input_dim=obs_dim,
+                    hidden_dim=hidden_dim,
+                    output_dim=env.action_spaces["player_0"].n,
+                    use_new_model=True
+                )
+                policy_net.load_state_dict(policy_state_dict, strict=False)
+                policy_net.to(device).eval()
+                belief_model = None
+            players_in_this_game["player_0"] = {
+                "policy_net": policy_net,
+                "belief_model": belief_model,
+                "obs_version": 2,
+                "rating": None,
+                "uses_memory": False,
+                "track_experts": False,
+                "is_belief_space_policy": agent_data.get("is_belief_space_policy", False)
+            }
+            # For onev2, assign the same opponent to both player_1 and player_2.
+            if opponent_type == "hardcoded":
+                opponent_instance = opponent_obj(opponent_name)
+                for key in ["player_1", "player_2"]:
+                    players_in_this_game[key] = {
+                        "hardcoded_bot": True,
+                        "agent": opponent_instance,
+                        "obs_version": 2,
+                        "rating": None,
+                        "uses_memory": False
+                    }
+            elif opponent_type == "historical":
+                hist_state_dict = opponent_obj.state_dict()
+                hidden_dim = get_hidden_dim_from_state_dict(hist_state_dict, "fc1")
+                obs_dim = hist_state_dict["fc1.weight"].shape[1]
+                policy_net = ModelFactory.create_policy_network(
+                    input_dim=obs_dim,
+                    hidden_dim=hidden_dim,
+                    output_dim=env.action_spaces["player_2"].n,
+                    use_new_model=True
+                )
+                policy_net.load_state_dict(hist_state_dict, strict=False)
+                policy_net.to(device).eval()
+                obp_model = ModelFactory.create_obp(
+                    use_transformer_memory=True,
+                    input_dim=config.OPPONENT_INPUT_DIM,
+                    hidden_dim=config.OPPONENT_HIDDEN_DIM,
+                    output_dim=2
+                )
+                obp_model.to(device).eval()
+                for key in ["player_1", "player_2"]:
+                    players_in_this_game[key] = {
+                        "policy_net": policy_net,
+                        "obp_model": obp_model,
+                        "obs_version": 2,
+                        "rating": None,
+                        "uses_memory": True
+                    }
+            else:
+                raise ValueError(f"Unknown opponent type in onev2 mode: {opponent_type}")
+        else:
+            # Normal mode: Load AI agents for player_0 and player_1, and assign opponent to player_2.
+            for key in ["player_0", "player_1"]:
+                agent_data = self.ai_agents[key]
+                policy_state_dict = agent_data["policy_net"]
+                if agent_data.get("is_belief_space_policy", False):
+                    try:
+                        if 'network.0.weight' in policy_state_dict:
+                            hidden_dim = policy_state_dict['network.0.weight'].shape[0]
+                            total_input_dim = policy_state_dict['network.0.weight'].shape[1]
+                        else:
+                            hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, "network.0")
+                            if 'network.0.bias' in policy_state_dict:
+                                hidden_dim = policy_state_dict['network.0.bias'].shape[0]
+                            for net_key, tensor in policy_state_dict.items():
+                                if isinstance(tensor, torch.Tensor) and tensor.ndim == 2 and '.weight' in net_key and 'network' in net_key:
+                                    total_input_dim = tensor.shape[1]
+                                    break
+                            else:
+                                dimensions = ModelFactory.get_belief_dimensions(policy_state_dict)
+                                if dimensions[0] is not None:
+                                    total_input_dim, obs_dim, belief_dim = dimensions
+                                else:
+                                    total_input_dim = 29
+                        if total_input_dim is not None:
+                            if hasattr(policy_state_dict, 'get') and policy_state_dict.get('total_input_dim') is not None:
+                                total_input_dim = policy_state_dict['total_input_dim'].item()
+                            if hasattr(policy_state_dict, 'get') and policy_state_dict.get('obs_dim') is not None:
+                                obs_dim = policy_state_dict['obs_dim'].item()
+                                belief_dim = total_input_dim - obs_dim
+                            else:
+                                sample_obs = env.observe(key, new=True)[key]
+                                estimated_obs_dim = min(sample_obs.shape[0], total_input_dim - 10)
+                                obs_dim = estimated_obs_dim
+                                belief_dim = total_input_dim - obs_dim
+                            policy_net = BeliefSpacePolicy(
+                                belief_dim=belief_dim,
+                                obs_dim=obs_dim,
+                                hidden_dim=hidden_dim,
+                                output_dim=env.action_spaces[key].n
+                            )
+                            try:
+                                policy_net.load_state_dict(policy_state_dict, strict=False)
+                                has_invalid_params = False
+                                for name, param in policy_net.named_parameters():
+                                    if torch.isnan(param).any() or torch.isinf(param).any():
+                                        logger.warning(f"NaN/Inf found in parameter {name}, fixing...")
+                                        has_invalid_params = True
+                                        param.data = torch.nan_to_num(param.data, nan=0.0, posinf=0.0, neginf=0.0)
+                                if has_invalid_params:
+                                    logger.info("Fixed NaN/Inf values in model parameters")
+                            except Exception as e:
+                                logger.warning(f"Error loading state dict: {str(e)}. Attempting to adjust...")
+                                mismatched_keys = []
+                                for name, param in policy_net.named_parameters():
+                                    if name in policy_state_dict:
+                                        checkpoint_param = policy_state_dict[name]
+                                        if param.shape != checkpoint_param.shape:
+                                            mismatched_keys.append(name)
+                                            logger.warning(f"Shape mismatch for {name}: model {param.shape} vs checkpoint {checkpoint_param.shape}")
+                                if mismatched_keys:
+                                    adjusted_state_dict = {}
+                                    for name, param in policy_state_dict.items():
+                                        if name in mismatched_keys:
+                                            continue
+                                        adjusted_state_dict[name] = param
+                                    policy_net.load_state_dict(adjusted_state_dict, strict=False)
+                                    logger.info("Loaded adjusted state dict with skipped mismatched keys")
+                            policy_net.to(device).eval()
+                            belief_model_state = agent_data["belief_model"]
+                            if belief_model_state is not None:
+                                # Determine dimensions (example values; adjust based on your requirements)
+                                belief_hidden_dim = get_hidden_dim_from_state_dict(belief_model_state, "encoder.0")
+                                belief_obs_dim = belief_model_state["encoder.0.weight"].shape[1] if "encoder.0.weight" in belief_model_state else obs_dim
+                                num_opponent_types = 10  # or retrieve from agent_data if available
+
+                                # Instantiate the belief model.
+                                belief_model = OpponentBeliefModel(
+                                    event_feature_dim=5,
+                                    max_seq_length=config.MAX_SQUENCE_LENGTH,
+                                    hidden_dim=belief_hidden_dim,
+                                    num_opponent_types=num_opponent_types
+                                ).to(device)
+                                # Load the parameters.
+                                belief_model.load_state_dict(belief_model_state, strict=False)
+                            else:
+                                belief_model = None
+                        else:
+                            raise ValueError("Could not determine total input dimension for BeliefSpacePolicy")
+                    except Exception as e:
+                        logger.error(f"Failed to create BeliefSpacePolicy: {str(e)}")
+                        raise
+                    players_in_this_game[key] = {
+                        "policy_net": policy_net,
+                        "belief_model": belief_model,
+                        "obs_version": 2,
+                        "rating": None,
+                        "uses_memory": False,
+                        "track_experts": False,
+                        "is_stacked_model": False,
+                        "is_newer_obs_model": False,
+                        "is_belief_space_policy": True,
+                        "num_opponent_types": agent_data.get('num_opponent_types', 10)
+                    }
+                elif agent_data.get("is_newer_obs_model", False):
+                    obs_dim = agent_data.get("input_dim")
+                    if obs_dim is None:
+                        obs_dim = get_obs_dim_from_stacked_model(policy_state_dict)
+                        if obs_dim is None:
+                            obs = env.observe(key, newer=True)[key]
+                            obs_dim = obs.shape[0]
+                    hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, "fc_layers.0")
+                    if hidden_dim is None:
+                        hidden_dim = config.HIDDEN_DIM
+                    policy_net = ModelFactory.create_stacked_observation_model(
+                        obs_dim=obs_dim,
+                        num_actions=env.action_spaces[key].n,
+                        hidden_dim=hidden_dim,
+                        num_obs_stack=config.NUM_OBS_STACK
+                    )
+                    policy_net.load_state_dict(policy_state_dict, strict=False)
+                    policy_net.to(device).eval()
+                    players_in_this_game[key] = {
+                        "policy_net": policy_net,
+                        "obp_model": obp_model,
+                        "obs_version": 5,
+                        "rating": None,
+                        "uses_memory": False,
+                        "track_experts": False,
+                        "is_stacked_model": True,
+                        "is_newer_obs_model": True,
+                        "is_conditional_model": False,
+                        "is_belief_space_policy": False,
+                        "observation_stacks": deque(maxlen=config.NUM_OBS_STACK)
+                    }
+                    sample_obs = env.observe(key, newer=True)[key]
+                    for _ in range(config.NUM_OBS_STACK):
+                        players_in_this_game[key]["observation_stacks"].append(np.zeros_like(sample_obs))
+                elif agent_data.get("is_stacked_model", False):
+                    obs_dim = agent_data.get("input_dim")
+                    if obs_dim is None:
+                        obs_dim = get_obs_dim_from_stacked_model(policy_state_dict)
+                        if obs_dim is None:
+                            obs = env.observe(key, new=True)[key]
+                            obs_dim = obs.shape[0]
+                    hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, "fc_layers.0")
+                    if hidden_dim is None:
+                        hidden_dim = config.HIDDEN_DIM
+                    policy_net = ModelFactory.create_stacked_observation_model(
+                        obs_dim=obs_dim,
+                        num_actions=env.action_spaces[key].n,
+                        hidden_dim=hidden_dim,
+                        num_obs_stack=config.NUM_OBS_STACK
+                    )
+                    policy_net.load_state_dict(policy_state_dict, strict=False)
+                    policy_net.to(device).eval()
+                    players_in_this_game[key] = {
+                        "policy_net": policy_net,
+                        "obp_model": None,
+                        "obs_version": 3,
+                        "rating": None,
+                        "uses_memory": False,
+                        "track_experts": False,
+                        "is_stacked_model": True,
+                        "is_newer_obs_model": False,
+                        "is_conditional_model": False,
+                        "is_belief_space_policy": False,
+                        "observation_stacks": deque(maxlen=config.NUM_OBS_STACK)
+                    }
+                    sample_obs = env.observe(key, new=True)[key]
+                    for _ in range(config.NUM_OBS_STACK):
+                        players_in_this_game[key]["observation_stacks"].append(np.zeros_like(sample_obs))
+                else:
+                    hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, "fc1")
+                    obs_dim = agent_data["input_dim"]
+                    is_moe_model = ModelFactory.is_moe_policy(policy_state_dict)
+                    new_model_flag = is_new_policy(policy_state_dict)
+                    if is_moe_model:
+                        policy_net = ModelFactory.create_policy_network(
+                            input_dim=obs_dim,
+                            hidden_dim=hidden_dim,
+                            output_dim=env.action_spaces[key].n,
+                            use_aux_classifier=True,
+                            num_opponent_classes=config.NUM_OPPONENT_CLASSES,
+                            use_moe_model=True,
+                            num_experts=10
+                        )
+                    elif new_model_flag:
+                        policy_net = ModelFactory.create_policy_network(
+                            input_dim=obs_dim,
+                            hidden_dim=hidden_dim,
+                            output_dim=env.action_spaces[key].n,
+                            use_aux_classifier=True,
+                            num_opponent_classes=config.NUM_OPPONENT_CLASSES,
+                            use_new_model=True
+                        )
+                    else:
+                        policy_net = ModelFactory.create_policy_network(
+                            input_dim=obs_dim,
+                            hidden_dim=hidden_dim,
+                            output_dim=env.action_spaces[key].n,
+                            use_new_model=False,
+                            strategy_dim=config.STRATEGY_DIM,
+                            num_opponents=env.num_players - 1
+                        )
+                    policy_net.load_state_dict(policy_state_dict, strict=False)
+                    policy_net.to(device).eval()
+                    obp_state = agent_data["obp_model"]
+                    if obp_state is not None:
+                        obp_hidden_dim = get_hidden_dim_from_state_dict(obp_state, "fc1")
+                        obp_input_dim = obp_state["fc1.weight"].shape[1]
+                        if obp_input_dim == config.OPPONENT_INPUT_DIM + config.STRATEGY_DIM:
+                            obp_model = ModelFactory.create_obp(
+                                use_transformer_memory=True,
+                                input_dim=config.OPPONENT_INPUT_DIM,
+                                hidden_dim=obp_hidden_dim,
+                                output_dim=2
+                            )
+                        elif obp_input_dim == config.OPPONENT_INPUT_DIM:
+                            obp_model = ModelFactory.create_obp(
+                                use_transformer_memory=False,
+                                input_dim=config.OPPONENT_INPUT_DIM,
+                                hidden_dim=obp_hidden_dim,
+                                output_dim=2
+                            )
+                        else:
+                            raise ValueError(f"Unexpected OBP input dimension: {obp_input_dim}")
+                        obp_model = ModelFactory.load_obp_state_dict(obp_model, obp_state)
+                        obp_model.to(device).eval()
+                        example_observation = torch.randn(1, config.OPPONENT_INPUT_DIM).to(device)
+                        example_memory_embedding = torch.randn(1, config.STRATEGY_DIM).to(device)
+                        obp_model = torch.jit.trace(obp_model, (example_observation, example_memory_embedding))
+                    else:
+                        obp_model = None
+                    players_in_this_game[key] = {
+                        "policy_net": policy_net,
+                        "obp_model": obp_model,
+                        "obs_version": agent_data["obs_version"],
+                        "rating": None,
+                        "uses_memory": agent_data["uses_memory"],
+                        "track_experts": True,
+                        "is_stacked_model": False,
+                        "is_newer_obs_model": False,
+                        "is_belief_space_policy": False,
+                        "is_conditional_model": False
+                    }
+            # --- Opponent as player_2 ---
+            if opponent_type == "hardcoded":
+                opponent_instance = opponent_obj(opponent_name)
+                players_in_this_game["player_2"] = {
+                    "hardcoded_bot": True,
+                    "agent": opponent_instance,
+                    "obs_version": 2,
+                    "rating": None,
+                    "uses_memory": False
+                }
+            elif opponent_type == "historical":
+                hist_state_dict = opponent_obj.state_dict()
+                hidden_dim = get_hidden_dim_from_state_dict(hist_state_dict, "fc1")
+                obs_dim = hist_state_dict["fc1.weight"].shape[1]
+                is_moe_model = ModelFactory.is_moe_policy(hist_state_dict)
+                new_model_flag = is_new_policy(hist_state_dict)
+                if is_moe_model:
+                    policy_net = ModelFactory.create_policy_network(
+                        input_dim=obs_dim,
+                        hidden_dim=hidden_dim,
+                        output_dim=env.action_spaces["player_2"].n,
                         use_aux_classifier=True,
                         num_opponent_classes=config.NUM_OPPONENT_CLASSES,
                         use_moe_model=True,
@@ -543,7 +860,7 @@ class BattlegroundWorker(QThread):
                     policy_net = ModelFactory.create_policy_network(
                         input_dim=obs_dim,
                         hidden_dim=hidden_dim,
-                        output_dim=env.action_spaces[key].n,
+                        output_dim=env.action_spaces["player_2"].n,
                         use_aux_classifier=True,
                         num_opponent_classes=config.NUM_OPPONENT_CLASSES,
                         use_new_model=True
@@ -552,143 +869,37 @@ class BattlegroundWorker(QThread):
                     policy_net = ModelFactory.create_policy_network(
                         input_dim=obs_dim,
                         hidden_dim=hidden_dim,
-                        output_dim=env.action_spaces[key].n,
+                        output_dim=env.action_spaces["player_2"].n,
                         use_new_model=False,
                         strategy_dim=config.STRATEGY_DIM,
                         num_opponents=env.num_players - 1
                     )
-                    
-                policy_net.load_state_dict(policy_state_dict, strict=False)
+                policy_net.load_state_dict(hist_state_dict, strict=False)
                 policy_net.to(device).eval()
-
-                # OBP model loading remains the same.
-                obp_state = agent_data["obp_model"]
-                if obp_state is not None:
-                    obp_hidden_dim = get_hidden_dim_from_state_dict(obp_state, "fc1")
-                    obp_input_dim = obp_state["fc1.weight"].shape[1]
-                    if obp_input_dim == config.OPPONENT_INPUT_DIM + config.STRATEGY_DIM:
-                        obp_model = ModelFactory.create_obp(
-                            use_transformer_memory=True,
-                            input_dim=config.OPPONENT_INPUT_DIM,
-                            hidden_dim=obp_hidden_dim,
-                            output_dim=2
-                        )
-                    elif obp_input_dim == config.OPPONENT_INPUT_DIM:
-                        obp_model = ModelFactory.create_obp(
-                            use_transformer_memory=False,
-                            input_dim=config.OPPONENT_INPUT_DIM,
-                            hidden_dim=obp_hidden_dim,
-                            output_dim=2
-                        )
-                    else:
-                        raise ValueError(f"Unexpected OBP input dimension: {obp_input_dim}")
-                    obp_model = ModelFactory.load_obp_state_dict(obp_model, obp_state)
-                    obp_model.to(device).eval()
-                    example_observation = torch.randn(1, config.OPPONENT_INPUT_DIM).to(device)
-                    example_memory_embedding = torch.randn(1, config.STRATEGY_DIM).to(device)
-                    obp_model = torch.jit.trace(obp_model, (example_observation, example_memory_embedding))
-                else:
-                    obp_model = None
-
-                players_in_this_game[key] = {
+                obp_model = ModelFactory.create_obp(
+                    use_transformer_memory=True,
+                    input_dim=config.OPPONENT_INPUT_DIM,
+                    hidden_dim=config.OPPONENT_HIDDEN_DIM,
+                    output_dim=2
+                )
+                obp_model.to(device).eval()
+                players_in_this_game["player_2"] = {
                     "policy_net": policy_net,
                     "obp_model": obp_model,
-                    "obs_version": agent_data["obs_version"],
+                    "obs_version": 2,
                     "rating": None,
-                    "uses_memory": agent_data["uses_memory"],
-                    "track_experts": True,
-                    "is_stacked_model": False,
-                    "is_newer_obs_model": False,
-                    "is_belief_space_policy": False,
-                    "is_conditional_model": False
+                    "uses_memory": True
                 }
-
-        # --- Opponent as player_2 ---
-        if opponent_type == "hardcoded":
-            opponent_instance = opponent_obj(opponent_name)
-            players_in_this_game["player_2"] = {
-                "hardcoded_bot": True,
-                "agent": opponent_instance,
-                "obs_version": 2,
-                "rating": None,
-                "uses_memory": False
-            }
-        elif opponent_type == "historical":
-            hist_state_dict = opponent_obj.state_dict()
-            hidden_dim = get_hidden_dim_from_state_dict(hist_state_dict, "fc1")
-            obs_dim = hist_state_dict["fc1.weight"].shape[1]
-            
-            # Check if this is an MoE model
-            is_moe_model = ModelFactory.is_moe_policy(hist_state_dict)
-            new_model_flag = is_new_policy(hist_state_dict)
-            
-            if is_moe_model:
-                # Create MoE policy network for historical model
-                policy_net = ModelFactory.create_policy_network(
-                    input_dim=obs_dim,
-                    hidden_dim=hidden_dim,
-                    output_dim=env.action_spaces["player_2"].n,
-                    use_aux_classifier=True,
-                    num_opponent_classes=config.NUM_OPPONENT_CLASSES,
-                    use_moe_model=True,
-                    num_experts=10
-                )
-            elif new_model_flag:
-                policy_net = ModelFactory.create_policy_network(
-                    input_dim=obs_dim,
-                    hidden_dim=hidden_dim,
-                    output_dim=env.action_spaces["player_2"].n,
-                    use_aux_classifier=True,
-                    num_opponent_classes=config.NUM_OPPONENT_CLASSES,
-                    use_new_model=True
-                )
             else:
-                policy_net = ModelFactory.create_policy_network(
-                    input_dim=obs_dim,
-                    hidden_dim=hidden_dim,
-                    output_dim=env.action_spaces["player_2"].n,
-                    use_new_model=False,
-                    strategy_dim=config.STRATEGY_DIM,
-                    num_opponents=env.num_players - 1
-                )
-                
-            policy_net.load_state_dict(hist_state_dict, strict=False)
-            policy_net.to(device).eval()
-
-            obp_model = ModelFactory.create_obp(
-                use_transformer_memory=True,
-                input_dim=config.OPPONENT_INPUT_DIM,
-                hidden_dim=config.OPPONENT_HIDDEN_DIM,
-                output_dim=2
-            )
-            obp_model.to(device).eval()
-
-            players_in_this_game["player_2"] = {
-                "policy_net": policy_net,
-                "obp_model": obp_model,
-                "obs_version": 2,
-                "rating": None,
-                "uses_memory": True
-            }
-        else:
-            raise ValueError(f"Unknown opponent type: {opponent_type}")
-
-        # When calling evaluate_agents, determine the cheat expert index if cheat is enabled.
-        if self.cheat:
-            # Lookup the corresponding label for this opponent from the cheat dictionary.
-            cheat_expert_index = LABELS.get(opponent_name, None)
-        else:
-            cheat_expert_index = None
-
-        # Run evaluation for the specified number of episodes, capturing expert activations and using the progress callback.
+                raise ValueError(f"Unknown opponent type: {opponent_type}")
+        
+        # When calling evaluate_agents, pass the cheat_expert_index (which may be scalar or a tuple).
         cumulative_wins, _, _, _, _, expert_activations = evaluate_agents(
             env, device, players_in_this_game, episodes=episodes, 
             two_player=self.two_player, track_experts=True,
             progress_callback=progress_callback,
             cheat_expert_index=cheat_expert_index
         )
-
-        # Return cumulative win counts and expert activations.
         return cumulative_wins, expert_activations
 
 # --- Main GUI class using PyQt with a Discord-like style ---
@@ -730,11 +941,11 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         model_files_group = QtWidgets.QGroupBox("Model Files")
         model_files_layout = QtWidgets.QVBoxLayout(model_files_group)
         self.file_list = DropListWidget(self)
-        self.file_list.setMinimumHeight(60)
+        self.file_list.setMaximumHeight(60)
         model_files_layout.addWidget(self.file_list)
         drop_label = QtWidgets.QLabel("Drag and drop .pth files here")
         model_files_layout.addWidget(drop_label)
-        main_layout.addWidget(model_files_group)
+        main_layout.addWidget(model_files_group, 0)
 
         # --- Model Info Group ---
         model_info_group = QtWidgets.QGroupBox("Model Info")
@@ -777,7 +988,7 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         # --- New Checkboxes ---
         self.two_player_checkbox = QtWidgets.QCheckBox("2 Player Mode")
         control_layout.addWidget(self.two_player_checkbox)
-        self.combine_ai_checkbox = QtWidgets.QCheckBox("Combine AI Columns")
+        self.combine_ai_checkbox = QtWidgets.QCheckBox("Combine Columns")
         control_layout.addWidget(self.combine_ai_checkbox)
         self.combine_ai_checkbox.stateChanged.connect(self.update_results_display)
         # Disable combine checkbox when 2 Player is active.
@@ -786,6 +997,13 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         )
         self.cheat_checkbox = QtWidgets.QCheckBox("Cheat")  # <-- New cheat checkbox
         control_layout.addWidget(self.cheat_checkbox)
+
+        # --- New Checkboxes for 1v2 and Duo Modes ---
+        self.onev2_checkbox = QtWidgets.QCheckBox("1v2 Mode")
+        control_layout.addWidget(self.onev2_checkbox)
+
+        self.duo_checkbox = QtWidgets.QCheckBox("Duo Mode")
+        control_layout.addWidget(self.duo_checkbox)
 
         # --- Compare Results Button ---
         self.compare_button = QtWidgets.QPushButton("Compare Results")
@@ -812,10 +1030,10 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         results_layout = QtWidgets.QVBoxLayout(results_group)
         self.results_text = QtWidgets.QTextEdit()
         self.results_text.setReadOnly(True)
-        self.results_text.setFixedHeight(320)
+        self.results_text.setMinimumHeight(320)
         self.results_text.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         results_layout.addWidget(self.results_text)
-        main_layout.addWidget(results_group)
+        main_layout.addWidget(results_group, 1)
 
     def on_file_drop(self, file_path):
         file_path = file_path.strip()
@@ -852,7 +1070,6 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
                 # For BeliefSpacePolicy, determine dimensions and opponent types
                 hidden_dim = get_hidden_dim_from_state_dict(any_policy, "network.0")
                 total_input_dim = any_policy['network.0.weight'].shape[1]
-                
                 # Observation dimension is total input minus belief dimension
                 obs_dim = ModelFactory.get_belief_input_dim(any_policy)
                 
@@ -1101,9 +1318,14 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
 
         # Determine two_player parameter from checkbox:
         two_player_param = "player_1" if self.two_player_checkbox.isChecked() else None
-
+        onev2_enabled = self.onev2_checkbox.isChecked()
+        duo_enabled = self.duo_checkbox.isChecked()
         rounds = self.rounds_spinbox.value()
-        total_matches = rounds * (len(self.hardcoded_agents) + len(self.historical_models))
+        if duo_enabled:
+            total_opponents = len(self.hardcoded_agents) + len(self.historical_models)
+            total_matches = rounds * (total_opponents * (total_opponents - 1) // 2)
+        else:
+            total_matches = rounds * (len(self.hardcoded_agents) + len(self.historical_models))
         self.progress_bar.setMaximum(total_matches)
         self.progress_bar.setValue(0)
         # If there are already results, store them for later comparison.
@@ -1121,7 +1343,9 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         self.worker = BattlegroundWorker(
             ai_agents, self.historical_models, self.hardcoded_agents, rounds,
             two_player=two_player_param,
-            cheat=cheat_flag
+            cheat=cheat_flag,
+            onev2=onev2_enabled,
+            duo=duo_enabled
         )
         self.worker.progress_signal.connect(self.update_progress)
         self.worker.results_signal.connect(self.display_results)
@@ -1140,89 +1364,174 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
     # --- Display results with optional combining ---
     def display_results(self, results):
         self.current_results = results  # Save the current results
-        # Determine whether to combine AI columns.
         combine = (not self.two_player_checkbox.isChecked()) and self.combine_ai_checkbox.isChecked()
+        is_onev2 = self.onev2_checkbox.isChecked()
+        is_duo = self.duo_checkbox.isChecked()
         
         if combine:
-            html = """
-            <table style="border: 1px solid #7289da; border-collapse: collapse; width: 100%;">
-            <thead>
-                <tr style="background-color: #4f545c;">
-                <th style="border: 1px solid #7289da; padding: 8px;">Opponent Name</th>
-                <th style="border: 1px solid #7289da; padding: 8px;">Combined AI Wins</th>
-                <th style="border: 1px solid #7289da; padding: 8px;">Opponent Wins</th>
-                <th style="border: 1px solid #7289da; padding: 8px;">Combined AI Win Rate</th>
-                <th style="border: 1px solid #7289da; padding: 8px;">Opponent Win Rate</th>
-                <th style="border: 1px solid #7289da; padding: 8px;">Result</th>
-                </tr>
-            </thead>
-            <tbody>
-            """
-            for opp_name, wins in results.items():
-                combined_ai_wins = wins[0] + wins[1]
-                opp_wins = wins[2]
-                total = combined_ai_wins + opp_wins
-                combined_rate = combined_ai_wins / total if total > 0 else 0.0
-                opp_rate = opp_wins / total if total > 0 else 0.0
-                result_str = "Win" if combined_rate > 0.5 else "Loss"
-                row = f"""
-                <tr>
-                <td style="border: 1px solid #7289da; padding: 6px;">{opp_name}</td>
-                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{combined_ai_wins}</td>
-                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp_wins}</td>
-                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{combined_rate:.2%}</td>
-                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp_rate:.2%}</td>
-                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{result_str}</td>
-                </tr>
+            if is_onev2 or is_duo:
+                # In 1v2 mode, combine opponent columns.
+                html = """
+                <table style="border: 1px solid #7289da; border-collapse: collapse; width: 100%;">
+                <thead>
+                    <tr style="background-color: #4f545c;">
+                        <th style="border: 1px solid #7289da; padding: 8px;">Opponent Name</th>
+                        <th style="border: 1px solid #7289da; padding: 8px;">AI Wins</th>
+                        <th style="border: 1px solid #7289da; padding: 8px;">Combined Opponent Wins</th>
+                        <th style="border: 1px solid #7289da; padding: 8px;">AI Win Rate</th>
+                        <th style="border: 1px solid #7289da; padding: 8px;">Opponent Win Rate</th>
+                        <th style="border: 1px solid #7289da; padding: 8px;">Result</th>
+                    </tr>
+                </thead>
+                <tbody>
                 """
-                html += row
-            html += """
-            </tbody>
-            </table>
-            """
+                for opp_name, wins in results.items():
+                    # wins[0] is AI wins; wins[1] and wins[2] are opponent wins
+                    combined_opp_wins = wins[1] + wins[2]
+                    total = wins[0] + combined_opp_wins
+                    ai_rate = wins[0] / total if total > 0 else 0.0
+                    opp_rate = combined_opp_wins / total if total > 0 else 0.0
+                    result_str = "Win" if ai_rate > 0.5 else "Loss"
+                    row = f"""
+                    <tr>
+                        <td style="border: 1px solid #7289da; padding: 6px;">{opp_name}</td>
+                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{wins[0]}</td>
+                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{combined_opp_wins}</td>
+                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{ai_rate:.2%}</td>
+                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp_rate:.2%}</td>
+                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{result_str}</td>
+                    </tr>
+                    """
+                    html += row
+                html += """
+                </tbody>
+                </table>
+                """
+            else:
+                # Normal mode: combine AI columns.
+                html = """
+                <table style="border: 1px solid #7289da; border-collapse: collapse; width: 100%;">
+                <thead>
+                    <tr style="background-color: #4f545c;">
+                        <th style="border: 1px solid #7289da; padding: 8px;">Opponent Name</th>
+                        <th style="border: 1px solid #7289da; padding: 8px;">Combined AI Wins</th>
+                        <th style="border: 1px solid #7289da; padding: 8px;">Opponent Wins</th>
+                        <th style="border: 1px solid #7289da; padding: 8px;">Combined AI Win Rate</th>
+                        <th style="border: 1px solid #7289da; padding: 8px;">Opponent Win Rate</th>
+                        <th style="border: 1px solid #7289da; padding: 8px;">Result</th>
+                    </tr>
+                </thead>
+                <tbody>
+                """
+                for opp_name, wins in results.items():
+                    combined_ai_wins = wins[0] + wins[1]
+                    opp_wins = wins[2]
+                    total = combined_ai_wins + opp_wins
+                    ai_rate = combined_ai_wins / total if total > 0 else 0.0
+                    opp_rate = opp_wins / total if total > 0 else 0.0
+                    result_str = "Win" if ai_rate > 0.5 else "Loss"
+                    row = f"""
+                    <tr>
+                        <td style="border: 1px solid #7289da; padding: 6px;">{opp_name}</td>
+                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{combined_ai_wins}</td>
+                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp_wins}</td>
+                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{ai_rate:.2%}</td>
+                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp_rate:.2%}</td>
+                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{result_str}</td>
+                    </tr>
+                    """
+                    html += row
+                html += """
+                </tbody>
+                </table>
+                """
         else:
-            html = """
-            <table style="border: 1px solid #7289da; border-collapse: collapse; width: 100%;">
-            <thead>
-                <tr style="background-color: #4f545c;">
-                <th style="border: 1px solid #7289da; padding: 8px;">Opponent Name</th>
-                <th style="border: 1px solid #7289da; padding: 8px;">AI1 Wins</th>
-                <th style="border: 1px solid #7289da; padding: 8px;">AI2 Wins</th>
-                <th style="border: 1px solid #7289da; padding: 8px;">Opponent Wins</th>
-                <th style="border: 1px solid #7289da; padding: 8px;">AI1 Win Rate</th>
-                <th style="border: 1px solid #7289da; padding: 8px;">AI2 Win Rate</th>
-                <th style="border: 1px solid #7289da; padding: 8px;">Opponent Win Rate</th>
-                <th style="border: 1px solid #7289da; padding: 8px;">Result</th>
-                </tr>
-            </thead>
-            <tbody>
-            """
-            for opp_name, wins in results.items():
-                ai1_wins, ai2_wins, opp_wins = wins
-                total = ai1_wins + ai2_wins + opp_wins
-                rate1 = ai1_wins / total if total > 0 else 0.0
-                rate2 = ai2_wins / total if total > 0 else 0.0
-                rate_opp = opp_wins / total if total > 0 else 0.0
-                # Calculate combined AI win rate regardless of display mode.
-                combined_rate = (ai1_wins + ai2_wins) / total if total > 0 else 0.0
-                result_str = "Win" if combined_rate > 0.5 else "Loss"
-                row = f"""
-                <tr>
-                <td style="border: 1px solid #7289da; padding: 6px;">{opp_name}</td>
-                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{ai1_wins}</td>
-                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{ai2_wins}</td>
-                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp_wins}</td>
-                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{rate1:.2%}</td>
-                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{rate2:.2%}</td>
-                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{rate_opp:.2%}</td>
-                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{result_str}</td>
-                </tr>
+            if is_onev2 or is_duo:
+                # In 1v2 mode without combining, show separate opponent win columns.
+                html = """
+                <table style="border: 1px solid #7289da; border-collapse: collapse; width: 100%;">
+                <thead>
+                    <tr style="background-color: #4f545c;">
+                        <th style="border: 1px solid #7289da; padding: 8px;">Opponent Name</th>
+                        <th style="border: 1px solid #7289da; padding: 8px;">AI Wins</th>
+                        <th style="border: 1px solid #7289da; padding: 8px;">Opponent1 Wins</th>
+                        <th style="border: 1px solid #7289da; padding: 8px;">Opponent2 Wins</th>
+                        <th style="border: 1px solid #7289da; padding: 8px;">AI Win Rate</th>
+                        <th style="border: 1px solid #7289da; padding: 8px;">Opponent1 Win Rate</th>
+                        <th style="border: 1px solid #7289da; padding: 8px;">Opponent2 Win Rate</th>
+                        <th style="border: 1px solid #7289da; padding: 8px;">Result</th>
+                    </tr>
+                </thead>
+                <tbody>
                 """
-                html += row
-            html += """
-            </tbody>
-            </table>
-            """
+                for opp_name, wins in results.items():
+                    ai_wins, opp1_wins, opp2_wins = wins
+                    total = ai_wins + opp1_wins + opp2_wins
+                    ai_rate = ai_wins / total if total > 0 else 0.0
+                    opp1_rate = opp1_wins / total if total > 0 else 0.0
+                    opp2_rate = opp2_wins / total if total > 0 else 0.0
+                    combined_opp_rate = (opp1_wins + opp2_wins) / total if total > 0 else 0.0
+                    result_str = "Win" if ai_rate > 0.5 else "Loss"
+                    row = f"""
+                    <tr>
+                        <td style="border: 1px solid #7289da; padding: 6px;">{opp_name}</td>
+                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{ai_wins}</td>
+                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp1_wins}</td>
+                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp2_wins}</td>
+                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{ai_rate:.2%}</td>
+                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp1_rate:.2%}</td>
+                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp2_rate:.2%}</td>
+                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{result_str}</td>
+                    </tr>
+                    """
+                    html += row
+                html += """
+                </tbody>
+                </table>
+                """
+            else:
+                # Normal mode without combining: show separate AI win columns.
+                html = """
+                <table style="border: 1px solid #7289da; border-collapse: collapse; width: 100%;">
+                <thead>
+                    <tr style="background-color: #4f545c;">
+                        <th style="border: 1px solid #7289da; padding: 8px;">Opponent Name</th>
+                        <th style="border: 1px solid #7289da; padding: 8px;">AI1 Wins</th>
+                        <th style="border: 1px solid #7289da; padding: 8px;">AI2 Wins</th>
+                        <th style="border: 1px solid #7289da; padding: 8px;">Opponent Wins</th>
+                        <th style="border: 1px solid #7289da; padding: 8px;">AI1 Win Rate</th>
+                        <th style="border: 1px solid #7289da; padding: 8px;">AI2 Win Rate</th>
+                        <th style="border: 1px solid #7289da; padding: 8px;">Opponent Win Rate</th>
+                        <th style="border: 1px solid #7289da; padding: 8px;">Result</th>
+                    </tr>
+                </thead>
+                <tbody>
+                """
+                for opp_name, wins in results.items():
+                    ai1_wins, ai2_wins, opp_wins = wins
+                    total = ai1_wins + ai2_wins + opp_wins
+                    rate1 = ai1_wins / total if total > 0 else 0.0
+                    rate2 = ai2_wins / total if total > 0 else 0.0
+                    opp_rate = opp_wins / total if total > 0 else 0.0
+                    combined_rate = (ai1_wins + ai2_wins) / total if total > 0 else 0.0
+                    result_str = "Win" if combined_rate > 0.5 else "Loss"
+                    row = f"""
+                    <tr>
+                        <td style="border: 1px solid #7289da; padding: 6px;">{opp_name}</td>
+                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{ai1_wins}</td>
+                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{ai2_wins}</td>
+                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp_wins}</td>
+                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{rate1:.2%}</td>
+                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{rate2:.2%}</td>
+                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp_rate:.2%}</td>
+                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{result_str}</td>
+                    </tr>
+                    """
+                    html += row
+                html += """
+                </tbody>
+                </table>
+                """
         self.results_text.setHtml(html)
         
     def update_results_display(self):
