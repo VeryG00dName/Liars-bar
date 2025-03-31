@@ -197,7 +197,7 @@ def main():
 
     # Here we pass device to our dataset so all tensors are pre-converted to GPU.
     # Optionally, you can set max_opponent_count if you want a fixed-size belief.
-    eval_dataset = EvalPSDataset(data, opponent_mapping, num_opponent_types, device, max_opponent_count=4)
+    eval_dataset = EvalPSDataset(data, opponent_mapping, num_opponent_types, device, max_opponent_count=2)
     eval_loader = DataLoader(eval_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     overall_acc_correct, gt_dist_correct, pred_dist_correct, combo_stats_correct = evaluate(
