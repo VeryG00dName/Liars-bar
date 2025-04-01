@@ -30,7 +30,7 @@ class PerfectSearch:
         self.sequence_position = 0
 
         self.simulations_performed = 0
-        self.debug = False # Set default debug state
+        self.debug = True # Set default debug state
 
     def _log(self, message):
         """Log a message if debug is enabled."""
@@ -157,7 +157,7 @@ class PerfectSearch:
         sim_env.set_state(env_state)
         
         # Record our starting state information.
-        starting_penalty = sim_env.penalties.get(self.training_agent, 0)
+        starting_penalty = sim_env.penalties[self.training_agent]
         starting_round = sim_env.round
         starting_hand_size = len(sim_env.players_hands.get(self.training_agent, []))
         
@@ -287,32 +287,12 @@ class PerfectSearch:
                 table_card = sim_env.table_card
                 table_cards = [c for c in hand if c == table_card or c == "Joker"]
                 
-                # Prioritize actions.
-                prioritized_actions = []
-                if current_penalty >= 2:
-                    for a in [0, 1, 2]:
-                        if a in valid_actions and (a % 3) + 1 <= len(table_cards):
-                            prioritized_actions.append(a)
-                    for a in valid_actions:
-                        if a not in prioritized_actions:
-                            prioritized_actions.append(a)
-                else:
-                    for a in [0, 1, 2]:
-                        if a in valid_actions and (a % 3) + 1 <= len(table_cards):
-                            prioritized_actions.append(a)
-                    for a in [3]:
-                        if a in valid_actions:
-                            prioritized_actions.append(a)
-                    for a in valid_actions:
-                        if a not in prioritized_actions:
-                            prioritized_actions.append(a)
-                
                 best_value = float('-inf')
                 best_sequence = None
                 best_is_terminal = False
                 best_is_new_round = False
                 
-                for next_action in prioritized_actions:
+                for next_action in valid_actions:
                     if next_action == 6 and best_sequence is not None:
                         continue
                     self._log(f"[Depth {depth}] Exploring next action {next_action}")
