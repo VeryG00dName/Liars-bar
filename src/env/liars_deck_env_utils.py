@@ -460,41 +460,23 @@ def get_new_observations(env, agent_specific=None):
 
 def get_newer_observations(env, agent_specific=None):
     """
-    Constructs minimal observation that forces agents to use memory:
-    - Hand vector only on first turn of each round
-    - Last actions of other players
-    - Challenge outcomes
-    - Player elimination status
-    
-    Args:
-        env (LiarsDeckEnv): The environment instance.
-        agent_specific (str, optional): Specific agent to generate observation for.
-    
-    Returns:
-        dict: A dictionary of observations keyed by agent names.
+    Constructs a new observation vector for each agent.
+    Components:
+      - Hand vector (2-dim) via encode_hand.
+      - Last actions vector (length = num_players - 1): For each opponent (ordered by env.possible_agents),
+        if the opponent is eliminated or has not acted, use 0.
+        Otherwise, use 4 if they challenged, or the count (1, 2, or 3) if they played.
+      - Active players vector: normalized hand sizes for all players.
     """
     observations = {}
-    from src.env.liars_deck_env_utils_2 import encode_hand, decode_action
-    
     agents_to_observe = [agent_specific] if agent_specific else env.agents
-    
+
     for agent in agents_to_observe:
-        if env.terminations.get(agent, False):
-            observations[agent] = np.zeros(env.observation_spaces[agent].shape, dtype=np.float32)
-            continue
-            
-        # Determine if this is the first turn in a round by checking hand size
-        # In Liar's Deck, a full hand is 5 cards at the start of a round
-        current_hand = env.players_hands[agent]
-        is_first_turn = len(current_hand) == 5
-        
-        # 1. Hand information (only on first turn)
-        if is_first_turn:
-            hand_vector = encode_hand(current_hand, env.table_card).astype(np.float32)
-        else:
-            hand_vector = np.zeros_like(encode_hand([], env.table_card), dtype=np.float32)
-        
-        # 2. Last actions of each opponent (same as in get_new_observations)
+        # 1. Hand vector (same as before)
+        current_hand = env.players_hands.get(agent, [])
+        hand_vector = encode_hand(current_hand, env.table_card).astype(np.float32)
+
+        # 2. Last actions vector for each opponent (length = num_players - 1)
         last_actions = []
         for opp in env.possible_agents:
             if opp == agent:
@@ -516,32 +498,17 @@ def get_newer_observations(env, agent_specific=None):
                         code = 0.0
             last_actions.append(code)
         last_actions = np.array(last_actions, dtype=np.float32)
-        
-        # 3. Challenge outcome
-        # 1.0 if last challenge succeeded, -1.0 if failed, 0.0 if no challenge has occurred
-        challenge_outcome = 0.0
-        if env.last_challenge_success is not None:
-            challenge_outcome = 1.0 if env.last_challenge_success else -1.0
-        challenge_outcome_flag = np.array([challenge_outcome], dtype=np.float32)
-        
-        # 4. Player elimination status
-        # 1.0 if player has been eliminated (hit penalty threshold), 0.0 otherwise
-        elimination_status = []
-        for p in env.possible_agents:
-            status = 1.0 if env.terminations.get(p, False) else 0.0
-            elimination_status.append(status)
-        elimination_status = np.array(elimination_status, dtype=np.float32)
-        
-        # Concatenate everything
-        obs = np.concatenate([
-            hand_vector,
-            last_actions,
-            challenge_outcome_flag,
-            elimination_status
+
+        # 3. Active players vector: normalized hand sizes (for all agents)
+        active_players = np.array([
+            len(env.players_hands.get(ag, [])) / 5.0
+            for ag in env.possible_agents
         ], dtype=np.float32)
-        
+
+        # Concatenate in the following order:
+        # [hand_vector (2), last_actions (num_players-1), active_players (num_players)]
+        obs = np.concatenate([hand_vector, last_actions, active_players], axis=0)
         observations[agent] = obs
-    
     return observations
 
 def get_derivable_game_state(env, agent_specific=None):
