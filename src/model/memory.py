@@ -447,3 +447,10 @@ def clear_opponent_memory(agent, opponent):
     if agent in PERSISTENT_OPPONENT_MEMORIES and opponent in PERSISTENT_OPPONENT_MEMORIES[agent].memory:
         del PERSISTENT_OPPONENT_MEMORIES[agent].memory[opponent]
         del PERSISTENT_OPPONENT_MEMORIES[agent].aggregates[opponent]
+        
+def delete_opponent_memory():
+    """
+    Delete all persistent opponent memories.
+    """
+    global PERSISTENT_OPPONENT_MEMORIES
+    PERSISTENT_OPPONENT_MEMORIES = {}
