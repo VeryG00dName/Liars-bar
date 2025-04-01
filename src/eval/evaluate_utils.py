@@ -1006,8 +1006,9 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                                     features_tensor = torch.tensor(features_list, dtype=torch.float32, device=device).unsqueeze(0)
                                     current_belief = belief_spaces[agent][opp_agent]
                                     belief_tensor = torch.tensor(current_belief, dtype=torch.float32, device=device).unsqueeze(0)
+                                    seq_len = torch.tensor([len(features_list)], dtype=torch.long, device=device)
                                     with torch.no_grad():
-                                        updated_belief = belief_models[agent](features_tensor, belief_tensor)
+                                        updated_belief = belief_models[agent](features_tensor, belief_tensor, sequence_lengths=seq_len)
                                         updated_belief_np = updated_belief.squeeze().cpu().numpy()
                                         if np.isnan(updated_belief_np).any() or np.isinf(updated_belief_np).any():
                                             updated_belief_np = current_belief
