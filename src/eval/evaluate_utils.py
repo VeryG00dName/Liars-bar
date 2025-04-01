@@ -26,7 +26,7 @@ from openskill.models import PlackettLuce
 
 from src.model.model_factory import ModelFactory
 from src.model.other_models import PolicyNetwork, ValueNetwork, StrategyTransformer ,OpponentBehaviorPredictor
-
+from src.model.memory import delete_opponent_memory
 # Model and config imports
 from src import config
 
@@ -808,7 +808,6 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
     for every player, including two activations per belief model.
     """
     logger = logging.getLogger("Evaluate")
-    
     global global_response2idx2, global_action2idx2, global_event_encoder2, global_strategy_transformer2
     transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "opponent_belief_model.pth")
     # Load categorical mappings if not already loaded.
@@ -826,7 +825,7 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
             
     player_ids = list(players_in_this_game.keys())
     agent_to_player = {f'player_{i}': player_ids[i] for i in range(env.num_players)}
-    
+    delete_opponent_memory()
     # Precompute tournament mode per player.
     player_tournament_mode = {}
     for pid in player_ids:
@@ -977,48 +976,45 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                     
                     action_counts[player_id][action] += 1
                     
-                    # --- Update beliefs about opponents if using BeliefSpacePolicy ---
                     if agent in belief_spaces:
-                        # Prepare cheat indexes if provided.
-                        # If cheat_expert_index is a list/tuple, assume order matches opponents encountered.
-                        cheat_indexes = None
-                        if cheat_expert_index is not None:
-                            if isinstance(cheat_expert_index, (list, tuple)):
-                                cheat_indexes = list(cheat_expert_index)
-                            else:
-                                cheat_indexes = [cheat_expert_index] * (len(env.possible_agents) - 1)
                         opp_counter = 0
                         for opp_agent in env.possible_agents:
                             if opp_agent == agent:
                                 continue
                             num_opponent_types = player_data.get('num_opponent_types', 10)
-                            if cheat_indexes is not None:
-                                cheat_idx = cheat_indexes[opp_counter] if opp_counter < len(cheat_indexes) else cheat_indexes[-1]
-                                artificial_belief = np.zeros(num_opponent_types)
+                            
+                            # If a cheat override is provided, bypass compute and assign artificial belief.
+                            if cheat_expert_index is not None:
+                                if isinstance(cheat_expert_index, (list, tuple)):
+                                    cheat_idx = cheat_expert_index[opp_counter] if opp_counter < len(cheat_expert_index) else cheat_expert_index[-1]
+                                else:
+                                    cheat_idx = cheat_expert_index
+                                artificial_belief = np.zeros(num_opponent_types, dtype=np.float32)
                                 if cheat_idx < num_opponent_types:
                                     artificial_belief[cheat_idx] = 1.0
                                 else:
                                     logger.warning(f"cheat_expert_index {cheat_idx} out of range; defaulting to index 0")
                                     artificial_belief[0] = 1.0
                                 belief_spaces[agent][opp_agent] = artificial_belief
-                            elif belief_models.get(agent) is not None:
-                                belief_model = belief_models[agent]
-                                current_belief = belief_spaces[agent][opp_agent]
+                            else:
+                                # Unconditionally update belief using memory.
                                 memory_full = query_opponent_memory_full(agent, opp_agent)
                                 features_list = None
-                                if memory_full is None:
-                                    print(f"No memory available for {agent} vs {opp_agent}, skipping belief update")
-                                else:
+                                if memory_full is not None:
                                     features_list = convert_memory_to_features2(memory_full, global_response2idx2, global_action2idx2)
                                 if features_list:
                                     features_tensor = torch.tensor(features_list, dtype=torch.float32, device=device).unsqueeze(0)
+                                    current_belief = belief_spaces[agent][opp_agent]
                                     belief_tensor = torch.tensor(current_belief, dtype=torch.float32, device=device).unsqueeze(0)
                                     with torch.no_grad():
-                                        updated_belief = belief_model(features_tensor, belief_tensor)
+                                        updated_belief = belief_models[agent](features_tensor, belief_tensor)
                                         updated_belief_np = updated_belief.squeeze().cpu().numpy()
                                         if np.isnan(updated_belief_np).any() or np.isinf(updated_belief_np).any():
                                             updated_belief_np = current_belief
-                                        belief_spaces[agent][opp_agent] = updated_belief_np
+                                else:
+                                    # If no memory features are available, reset to a uniform distribution.
+                                    updated_belief_np = np.ones(num_opponent_types, dtype=np.float32) / num_opponent_types
+                                belief_spaces[agent][opp_agent] = updated_belief_np
                             opp_counter += 1
                     env.step(action)
                     continue
