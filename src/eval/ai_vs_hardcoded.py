@@ -7,7 +7,8 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from collections import deque
-
+import re
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 from PyQt5 import QtWidgets
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from src.model.shen_models import BeliefSpacePolicy, OpponentBeliefModel
@@ -223,9 +224,8 @@ class BattlegroundWorker(QThread):
             for opp_name, (opp_type, opp_obj) in combined_opponents.items():
                 if self.onev2:
                     if self.cheat:
-                        cheat_index1 = LABELS.get(opp_name1, None)
-                        cheat_index2 = LABELS.get(opp_name2, None)
-                        cheat_expert_index = (cheat_index1, cheat_index2)
+                        cheat_index1 = LABELS.get(opp_name, None)
+                        cheat_expert_index = (cheat_index1, cheat_index1)
                     else:
                         cheat_expert_index = None
                     cumulative_wins, expert_acts = self.run_match(opp_type, opp_obj, opp_name, episodes=self.rounds, progress_callback=lambda ep: self.progress_signal.emit(progress_counter + ep), cheat_expert_index=cheat_expert_index)
@@ -395,6 +395,7 @@ class BattlegroundWorker(QThread):
                                             
                                 except Exception as e:
                                     logger.warning(f"Error loading belief model state dict: {str(e)}. Using partial loading.")
+                                    print('test')
                                     # Try to load as many parameters as possible
                                     own_state = belief_model.state_dict()
                                     for name, param in belief_model_state.items():
@@ -1251,7 +1252,14 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         agent_options = []
         for file_path, data in self.loaded_models.items():
             folder_name = os.path.basename(os.path.dirname(file_path))
-            model_type = "StackedObs" if data.get("is_stacked_model", False) else "Standard"
+            if data.get("is_belief_space_policy", False):
+                model_type = "Belief"
+            elif data.get("is_stacked_model", False):
+                model_type = "StackedObs"
+            elif ModelFactory.is_moe_policy(next(iter(data["policy_nets"].values()))):
+                model_type = "MoE"
+            else:
+                model_type = "Standard"
             for agent_name in data["policy_nets"].keys():
                 display_text = f"{folder_name} - {os.path.basename(file_path)} - {agent_name} ({model_type})"
                 agent_options.append(display_text)
@@ -1387,6 +1395,7 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
                 </thead>
                 <tbody>
                 """
+                total_ai = total_opp = 0
                 for opp_name, wins in results.items():
                     # wins[0] is AI wins; wins[1] and wins[2] are opponent wins
                     combined_opp_wins = wins[1] + wins[2]
@@ -1394,6 +1403,8 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
                     ai_rate = wins[0] / total if total > 0 else 0.0
                     opp_rate = combined_opp_wins / total if total > 0 else 0.0
                     result_str = "Win" if ai_rate > 0.5 else "Loss"
+                    total_ai += wins[0]
+                    total_opp += combined_opp_wins
                     row = f"""
                     <tr>
                         <td style="border: 1px solid #7289da; padding: 6px;">{opp_name}</td>
@@ -1405,6 +1416,22 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
                     </tr>
                     """
                     html += row
+                # Add overall row
+                overall_total = total_ai + total_opp
+                overall_ai_rate = total_ai / overall_total if overall_total > 0 else 0.0
+                overall_opp_rate = total_opp / overall_total if overall_total > 0 else 0.0
+                overall_result = "Win" if overall_ai_rate > 0.5 else "Loss"
+                overall_row = f"""
+                <tr>
+                    <td style="border: 1px solid #7289da; padding: 6px;">Overall</td>
+                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{total_ai}</td>
+                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{total_opp}</td>
+                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_ai_rate:.2%}</td>
+                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_opp_rate:.2%}</td>
+                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_result}</td>
+                </tr>
+                """
+                html += overall_row
                 html += """
                 </tbody>
                 </table>
@@ -1425,6 +1452,7 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
                 </thead>
                 <tbody>
                 """
+                total_ai = total_opp = 0
                 for opp_name, wins in results.items():
                     combined_ai_wins = wins[0] + wins[1]
                     opp_wins = wins[2]
@@ -1432,6 +1460,8 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
                     ai_rate = combined_ai_wins / total if total > 0 else 0.0
                     opp_rate = opp_wins / total if total > 0 else 0.0
                     result_str = "Win" if ai_rate > 0.5 else "Loss"
+                    total_ai += combined_ai_wins
+                    total_opp += opp_wins
                     row = f"""
                     <tr>
                         <td style="border: 1px solid #7289da; padding: 6px;">{opp_name}</td>
@@ -1443,6 +1473,22 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
                     </tr>
                     """
                     html += row
+                # Add overall row
+                overall_total = total_ai + total_opp
+                overall_ai_rate = total_ai / overall_total if overall_total > 0 else 0.0
+                overall_opp_rate = total_opp / overall_total if overall_total > 0 else 0.0
+                overall_result = "Win" if overall_ai_rate > 0.5 else "Loss"
+                overall_row = f"""
+                <tr>
+                    <td style="border: 1px solid #7289da; padding: 6px;">Overall</td>
+                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{total_ai}</td>
+                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{total_opp}</td>
+                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_ai_rate:.2%}</td>
+                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_opp_rate:.2%}</td>
+                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_result}</td>
+                </tr>
+                """
+                html += overall_row
                 html += """
                 </tbody>
                 </table>
@@ -1466,14 +1512,16 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
                 </thead>
                 <tbody>
                 """
+                total_ai = total_opp1 = total_opp2 = 0
                 for opp_name, wins in results.items():
                     ai_wins, opp1_wins, opp2_wins = wins
                     total = ai_wins + opp1_wins + opp2_wins
                     ai_rate = ai_wins / total if total > 0 else 0.0
                     opp1_rate = opp1_wins / total if total > 0 else 0.0
                     opp2_rate = opp2_wins / total if total > 0 else 0.0
-                    combined_opp_rate = (opp1_wins + opp2_wins) / total if total > 0 else 0.0
-                    result_str = "Win" if ai_rate > 0.5 else "Loss"
+                    total_ai += ai_wins
+                    total_opp1 += opp1_wins
+                    total_opp2 += opp2_wins
                     row = f"""
                     <tr>
                         <td style="border: 1px solid #7289da; padding: 6px;">{opp_name}</td>
@@ -1483,10 +1531,29 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
                         <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{ai_rate:.2%}</td>
                         <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp1_rate:.2%}</td>
                         <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp2_rate:.2%}</td>
-                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{result_str}</td>
+                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{"Win" if ai_rate > 0.5 else "Loss"}</td>
                     </tr>
                     """
                     html += row
+                # Add overall row
+                overall_total = total_ai + total_opp1 + total_opp2
+                overall_ai_rate = total_ai / overall_total if overall_total > 0 else 0.0
+                overall_opp1_rate = total_opp1 / overall_total if overall_total > 0 else 0.0
+                overall_opp2_rate = total_opp2 / overall_total if overall_total > 0 else 0.0
+                overall_result = "Win" if overall_ai_rate > 0.5 else "Loss"
+                overall_row = f"""
+                <tr>
+                    <td style="border: 1px solid #7289da; padding: 6px;">Overall</td>
+                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{total_ai}</td>
+                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{total_opp1}</td>
+                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{total_opp2}</td>
+                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_ai_rate:.2%}</td>
+                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_opp1_rate:.2%}</td>
+                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_opp2_rate:.2%}</td>
+                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_result}</td>
+                </tr>
+                """
+                html += overall_row
                 html += """
                 </tbody>
                 </table>
@@ -1509,14 +1576,17 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
                 </thead>
                 <tbody>
                 """
+                total_ai1 = total_ai2 = total_opp = 0
                 for opp_name, wins in results.items():
                     ai1_wins, ai2_wins, opp_wins = wins
                     total = ai1_wins + ai2_wins + opp_wins
                     rate1 = ai1_wins / total if total > 0 else 0.0
                     rate2 = ai2_wins / total if total > 0 else 0.0
                     opp_rate = opp_wins / total if total > 0 else 0.0
+                    total_ai1 += ai1_wins
+                    total_ai2 += ai2_wins
+                    total_opp += opp_wins
                     combined_rate = (ai1_wins + ai2_wins) / total if total > 0 else 0.0
-                    result_str = "Win" if combined_rate > 0.5 else "Loss"
                     row = f"""
                     <tr>
                         <td style="border: 1px solid #7289da; padding: 6px;">{opp_name}</td>
@@ -1526,10 +1596,30 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
                         <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{rate1:.2%}</td>
                         <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{rate2:.2%}</td>
                         <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp_rate:.2%}</td>
-                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{result_str}</td>
+                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{"Win" if combined_rate > 0.5 else "Loss"}</td>
                     </tr>
                     """
                     html += row
+                # Add overall row
+                overall_total = total_ai1 + total_ai2 + total_opp
+                overall_rate1 = total_ai1 / overall_total if overall_total > 0 else 0.0
+                overall_rate2 = total_ai2 / overall_total if overall_total > 0 else 0.0
+                overall_opp_rate = total_opp / overall_total if overall_total > 0 else 0.0
+                overall_combined_rate = (total_ai1 + total_ai2) / overall_total if overall_total > 0 else 0.0
+                overall_result = "Win" if overall_combined_rate > 0.5 else "Loss"
+                overall_row = f"""
+                <tr>
+                    <td style="border: 1px solid #7289da; padding: 6px;">Overall</td>
+                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{total_ai1}</td>
+                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{total_ai2}</td>
+                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{total_opp}</td>
+                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_rate1:.2%}</td>
+                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_rate2:.2%}</td>
+                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_opp_rate:.2%}</td>
+                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_result}</td>
+                </tr>
+                """
+                html += overall_row
                 html += """
                 </tbody>
                 </table>
@@ -1548,14 +1638,40 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
             self.previous_results = self.current_results
             return
 
-        # Determine mode: if either onev2 or duo is checked.
-        is_special_mode = self.onev2_checkbox.isChecked() or self.duo_checkbox.isChecked()
+        def make_acronym(name):
+            # If the name length is 7 or less, return as is.
+            if len(name) <= 7:
+                return name
+
+            # Attempt to split on common delimiters.
+            parts = re.split(r'[+\_]', name)
+            if len(parts) > 1:
+                # Filter out any empty parts and take first letters.
+                acronym = ''.join(part[0].upper() for part in parts if part)
+                if len(acronym) > 0:
+                    return acronym
+
+            # If no delimiter was found or it didn't work, try to split by camel case.
+            camel_parts = re.findall(r'[A-Z][^A-Z]*', name)
+            if len(camel_parts) > 1:
+                acronym = ''.join(part[0].upper() for part in camel_parts)
+                if len(acronym) > 0:
+                    return acronym
+
+            # Fallback: simply return the first 7 characters.
+            return name[:7]
 
         opp_names = list(self.current_results.keys())
+        # Create shortened labels for plotting.
+        display_names = [make_acronym(name) for name in opp_names]
+
         ai_prev_rates = []
         opp_prev_rates = []
         ai_curr_rates = []
         opp_curr_rates = []
+
+        # Determine mode: if either onev2 or duo is checked.
+        is_special_mode = self.onev2_checkbox.isChecked() or self.duo_checkbox.isChecked()
 
         for opp in opp_names:
             prev = self.previous_results.get(opp, [0, 0, 0])
@@ -1590,27 +1706,29 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         x = np.arange(len(opp_names))
         width = 0.35
 
-        # Create two subplots: one for AI win rates, one for Opponent win rates.
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
-
-        # Graph for AI win rates.
+        # Create the figure for AI win rates.
+        fig1, ax1 = plt.subplots(figsize=(8, 6))
         ax1.bar(x - width/2, ai_prev_rates, width, label='Previous AI Win Rate')
         ax1.bar(x + width/2, ai_curr_rates, width, label='Current AI Win Rate')
         ax1.set_xticks(x)
-        ax1.set_xticklabels(opp_names, rotation=45)
+        ax1.set_xticklabels(display_names, rotation=45)
         ax1.set_ylabel("Win Rate")
         ax1.set_title("AI Win Rate Comparison")
-        ax1.legend()
+        # Place legend outside the plot area
+        ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
+        plt.tight_layout()
+        plt.show()
 
-        # Graph for Opponent win rates.
+        # Create the figure for Opponent win rates.
+        fig2, ax2 = plt.subplots(figsize=(8, 6))
         ax2.bar(x - width/2, opp_prev_rates, width, label='Previous Opponent Win Rate')
         ax2.bar(x + width/2, opp_curr_rates, width, label='Current Opponent Win Rate')
         ax2.set_xticks(x)
-        ax2.set_xticklabels(opp_names, rotation=45)
+        ax2.set_xticklabels(display_names, rotation=45)
         ax2.set_ylabel("Win Rate")
         ax2.set_title("Opponent Win Rate Comparison")
-        ax2.legend()
-
+        # Place legend outside the plot area
+        ax2.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
         plt.tight_layout()
         plt.show()
 
@@ -1623,135 +1741,139 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "Expert Usage", 
                                             "No expert activation data available. Run a battle first.")
             return
-        
-        # Create a dialog to show expert activation data
+
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle("Expert Activation Analysis")
         dialog.setMinimumSize(800, 600)
-        
         layout = QtWidgets.QVBoxLayout(dialog)
-        
-        # Create a tab widget to show AI1 and AI2 separately
+
+        # Create a tab widget to show data for each AI agent separately.
         tab_widget = QtWidgets.QTabWidget()
-        
-        # Create visualization for each AI agent
+
         for player_idx, player in enumerate(["player_0", "player_1"]):
             player_tab = QtWidgets.QWidget()
             player_layout = QtWidgets.QVBoxLayout(player_tab)
-            
-            # Add text display of expert activations
-            text = QtWidgets.QTextEdit()
-            text.setReadOnly(True)
-            
+
+            # Build an HTML table showing per-opponent most used expert info.
             html = f"""<h2>Expert Activations for AI Agent {player_idx+1}</h2>
             <table style="border: 1px solid #7289da; border-collapse: collapse; width: 100%;">
             <thead>
                 <tr style="background-color: #4f545c;">
                 <th style="border: 1px solid #7289da; padding: 8px;">Opponent</th>
-                <th style="border: 1px solid #7289da; padding: 8px;">Total Activations</th>
-                <th style="border: 1px solid #7289da; padding: 8px;">Most Used Expert</th>
-                <th style="border: 1px solid #7289da; padding: 8px;">Expert Distribution</th>
+                <th style="border: 1px solid #7289da; padding: 8px;">Set 1 - Most Used Expert</th>
+                <th style="border: 1px solid #7289da; padding: 8px;">Set 2 - Most Used Expert</th>
                 </tr>
             </thead>
             <tbody>
             """
-            
-            # For plotting
+
+            # Lists for plotting
             opponent_names = []
-            expert_usages = []
-            
-            # Process each opponent
+            set1_rates = []
+            set1_experts = []
+            set2_rates = []
+            set2_experts = []
+
             for opp_name, activations in self.expert_activations.items():
                 player_activations = activations.get(player, {})
                 if not player_activations:
                     continue
-                
-                total = sum(player_activations.values())
-                
-                # Find the most used expert
-                most_used = max(player_activations.items(), key=lambda x: x[1], default=(None, 0))
-                if most_used[0] is not None:
-                    most_used_str = f"Expert {most_used[0]} ({most_used[1]/total:.1%})"
+
+                # Partition activations based on key value.
+                set1 = {}
+                set2 = {}
+                for k, v in player_activations.items():
+                    try:
+                        key_int = int(k)
+                    except ValueError:
+                        continue
+                    if key_int < 10:
+                        set1[k] = v
+                    else:
+                        # Reindex second set so that keys become 0-9.
+                        set2[str(key_int - 10)] = v
+
+                # Process Set 1.
+                total1 = sum(set1.values())
+                if total1 > 0:
+                    expert1, count1 = max(set1.items(), key=lambda x: x[1])
+                    rate1 = count1 / total1
                 else:
-                    most_used_str = "None"
-                
-                # Create distribution string
-                dist_parts = []
-                for expert_idx, count in sorted(player_activations.items()):
-                    if count > 0:
-                        pct = count / total * 100
-                        dist_parts.append(f"E{expert_idx}: {pct:.1f}%")
-                
-                dist_str = " | ".join(dist_parts)
-                
-                # Add to table
+                    expert1, rate1 = "N/A", 0
+
+                # Process Set 2.
+                if set2:
+                    total2 = sum(set2.values())
+                    if total2 > 0:
+                        expert2, count2 = max(set2.items(), key=lambda x: x[1])
+                        rate2 = count2 / total2
+                    else:
+                        expert2, rate2 = "N/A", 0
+                else:
+                    expert2, rate2 = "N/A", 0
+
+                # Add row to HTML table.
                 html += f"""
                 <tr>
                 <td style="border: 1px solid #7289da; padding: 6px;">{opp_name}</td>
-                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{total}</td>
-                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{most_used_str}</td>
-                <td style="border: 1px solid #7289da; padding: 6px;">{dist_str}</td>
+                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">Expert {expert1} ({rate1:.1%})</td>
+                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">Expert {expert2} ({rate2:.1%})</td>
                 </tr>
                 """
-                
-                # Collect data for the plot
+
                 opponent_names.append(opp_name)
-                expert_data = {}
-                for expert_idx in range(10):  # Assume up to 10 experts
-                    expert_data[f"E{expert_idx}"] = player_activations.get(str(expert_idx), 0) / total if total else 0
-                
-                expert_usages.append(expert_data)
-            
+                set1_rates.append(rate1)
+                set1_experts.append(expert1)
+                set2_rates.append(rate2)
+                set2_experts.append(expert2)
+
             html += """
             </tbody>
             </table>
+            <p><b>Note:</b> For each opponent the graph shows two bars (if available) representing the activation rate of the most used expert for each of the two activation sets.</p>
             """
-            
-            # Add explanation
-            html += """<p><b>Note:</b> This analysis shows which expert from the mixture-of-experts policy 
-            network was activated during battles against each opponent. If the agent is correctly 
-            specializing, you should see consistent expert selection for specific opponents.</p>"""
-            
+
+            text = QtWidgets.QTextEdit()
+            text.setReadOnly(True)
             text.setHtml(html)
             player_layout.addWidget(text)
-            
-            # Add graphical visualization if we have data
-            if opponent_names and expert_usages:
-                # Create a figure with expert activation distributions
+
+            if opponent_names:
+                num_opponents = len(opponent_names)
+                x = np.arange(num_opponents)
+                bar_width = 0.35
+
                 figure = plt.figure(figsize=(10, 6))
                 ax = figure.add_subplot(111)
-                
-                # Prepare data for a grouped bar chart
-                num_opponents = len(opponent_names)
-                expert_ids = sorted(set(key for usage in expert_usages for key in usage.keys()))
-                bar_width = 0.8 / len(expert_ids)
-                
-                # Plot bars for each expert
-                for i, expert_id in enumerate(expert_ids):
-                    values = [usage.get(expert_id, 0) for usage in expert_usages]
-                    x_pos = np.arange(num_opponents) + (i - len(expert_ids)/2 + 0.5) * bar_width
-                    ax.bar(x_pos, values, bar_width, label=expert_id)
-                
-                ax.set_xticks(np.arange(num_opponents))
+
+                bars1 = ax.bar(x - bar_width/2, set1_rates, bar_width, label='Set 1')
+                bars2 = ax.bar(x + bar_width/2, set2_rates, bar_width, label='Set 2')
+
+                ax.set_xticks(x)
                 ax.set_xticklabels(opponent_names, rotation=45, ha='right')
                 ax.set_ylabel('Activation Rate')
-                ax.set_title(f'Expert Activation Distribution for AI Agent {player_idx+1}')
-                ax.legend()
-                
-                # Create a canvas to display the plot
-                from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+                ax.set_title(f'Most Used Expert Activation for AI Agent {player_idx+1}')
+                ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0)
+
+                # Annotate bars with expert id.
+                for bar, expert in zip(bars1, set1_experts):
+                    height = bar.get_height()
+                    ax.text(bar.get_x() + bar.get_width()/2, height, f"E{expert}", ha='center', va='bottom', fontsize=9)
+                for bar, expert in zip(bars2, set2_experts):
+                    height = bar.get_height()
+                    ax.text(bar.get_x() + bar.get_width()/2, height, f"E{expert}", ha='center', va='bottom', fontsize=9)
+
                 canvas = FigureCanvasQTAgg(figure)
                 player_layout.addWidget(canvas)
-            
+
             tab_widget.addTab(player_tab, f"AI Agent {player_idx+1}")
-        
+
         layout.addWidget(tab_widget)
-        
-        # Add a close button
+
         button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
         button_box.rejected.connect(dialog.reject)
         layout.addWidget(button_box)
-        
+
         dialog.setLayout(layout)
         dialog.exec_()
 
