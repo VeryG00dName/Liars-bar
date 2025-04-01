@@ -61,14 +61,14 @@ def convert_memory_to_features2(memory, response_mapping, action_mapping):
         if not isinstance(event, dict):
             raise ValueError(f"Memory event is not a dictionary: {event}. Please fix the data generation.")
             
-        resp = event.get("response", "")
-        act = event.get("triggering_action", "")
-        penalties = float(event.get("penalties", 0))
-        card_count = float(event.get("card_count", 0))
+        resp = event["response"]
+        act = event["triggering_action"]
+        penalties = float(event["penalties"])
+        card_count = float(event["card_count"])
         
         # Get challenge_success value, use -1.0 as placeholder when None
         challenge_success_val = -1.0
-        if event.get("challenge_success") is not None:
+        if event["challenge_success"] is not None:
             challenge_success_val = 1.0 if event["challenge_success"] else 0.0
         
         # Map the categorical features using the provided mappings
