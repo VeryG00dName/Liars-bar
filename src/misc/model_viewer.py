@@ -66,10 +66,31 @@ class ModelInfoApp:
             self.text.insert(tk.END, f"File: {file_path}\n")
             self.text.insert(tk.END, f"Total File Size: {total_file_size:.2f} MB\n\n")
 
-            # Always display model composition
+            # Display overall composition of the file
             self.text.insert(tk.END, "Model Composition:\n")
             self.display_model_composition(data)
             self.text.insert(tk.END, "\n")
+            
+            # If a state dictionary exists, show a grouped architecture view
+            state_dict = None
+            if "state_dict" in data:
+                state_dict = data["state_dict"]
+            else:
+                # Try to find a state dict in one of the top-level keys
+                for key, value in data.items():
+                    if isinstance(value, dict):
+                        for subkey, subval in value.items():
+                            if isinstance(subval, torch.Tensor) and subkey.endswith('.weight'):
+                                state_dict = value
+                                break
+                    if state_dict is not None:
+                        break
+            if state_dict is not None:
+                self.text.insert(tk.END, "Model Architecture:\n")
+                self.display_architecture_info(state_dict)
+                self.text.insert(tk.END, "\n")
+            else:
+                self.text.insert(tk.END, "No state_dict found for architecture details.\n\n")
 
             # Attempt to visualize a specific network if available.
             if "policy_nets" in data and isinstance(data["policy_nets"], dict):
@@ -106,6 +127,32 @@ class ModelInfoApp:
             else:
                 self.text.insert(tk.END, f"  Type: {type(value)}\n")
             self.text.insert(tk.END, "\n")
+
+    def display_architecture_info(self, state_dict):
+        """
+        Groups parameters by layer (using common name prefixes) and displays the weight and bias shapes.
+        """
+        architecture = {}
+        for param_name, tensor in state_dict.items():
+            if isinstance(tensor, torch.Tensor):
+                if param_name.endswith('.weight'):
+                    layer_name = param_name.rsplit('.', 1)[0]
+                    architecture.setdefault(layer_name, {})['weight'] = tuple(tensor.shape)
+                elif param_name.endswith('.bias'):
+                    layer_name = param_name.rsplit('.', 1)[0]
+                    architecture.setdefault(layer_name, {})['bias'] = tuple(tensor.shape)
+
+        if not architecture:
+            self.text.insert(tk.END, "No layers found with weight or bias parameters.\n")
+            return
+
+        for layer, params in architecture.items():
+            line = f"Layer: {layer} - "
+            if 'weight' in params:
+                line += f"Weight shape: {params['weight']}  "
+            if 'bias' in params:
+                line += f"Bias shape: {params['bias']}"
+            self.text.insert(tk.END, line + "\n")
 
     def draw_policy_network_visualization(self, policy_net):
         """
