@@ -809,7 +809,7 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
     """
     logger = logging.getLogger("Evaluate")
     global global_response2idx2, global_action2idx2, global_event_encoder2, global_strategy_transformer2
-    transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "opponent_belief_model.pth")
+    transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
     # Load categorical mappings if not already loaded.
     if global_response2idx2 is None or global_action2idx2 is None:
         logger.debug("Global response/action mappings not set; loading from checkpoint if available.")
