@@ -384,28 +384,14 @@ class BattlegroundWorker(QThread):
                                     num_opponent_types=10
                                 ).to(device)
                                 # Load state dict with error handling
-                                try:
-                                    belief_model.load_state_dict(belief_model_state, strict=False)
-                                    
-                                    # Check for NaN/Inf values
-                                    for name, param in belief_model.named_parameters():
-                                        if torch.isnan(param).any() or torch.isinf(param).any():
-                                            logger.warning(f"NaN/Inf found in belief model parameter {name}, fixing...")
-                                            param.data = torch.nan_to_num(param.data, nan=0.0, posinf=0.0, neginf=0.0)
-                                            
-                                except Exception as e:
-                                    logger.warning(f"Error loading belief model state dict: {str(e)}. Using partial loading.")
-                                    print('test')
-                                    # Try to load as many parameters as possible
-                                    own_state = belief_model.state_dict()
-                                    for name, param in belief_model_state.items():
-                                        if name in own_state:
-                                            try:
-                                                if own_state[name].shape == param.shape:
-                                                    own_state[name].copy_(param)
-                                            except Exception:
-                                                logger.warning(f"Could not copy parameter {name}")
+                                belief_model.load_state_dict(belief_model_state, strict=True)
                                 
+                                # Check for NaN/Inf values
+                                for name, param in belief_model.named_parameters():
+                                    if torch.isnan(param).any() or torch.isinf(param).any():
+                                        logger.warning(f"NaN/Inf found in belief model parameter {name}, fixing...")
+                                        param.data = torch.nan_to_num(param.data, nan=0.0, posinf=0.0, neginf=0.0)
+                                    
                                 belief_model.to(device).eval()
                             except Exception as e:
                                 logger.warning(f"Failed to create belief model: {str(e)}")
@@ -523,7 +509,7 @@ class BattlegroundWorker(QThread):
                         num_opponent_types=num_opponent_types
                     ).to(device)
                     # Load the parameters.
-                    belief_model.load_state_dict(belief_model_state, strict=False)
+                    belief_model.load_state_dict(belief_model_state, strict=True)
                 else:
                     belief_model = None
             else:
@@ -671,7 +657,7 @@ class BattlegroundWorker(QThread):
                                     num_opponent_types=num_opponent_types
                                 ).to(device)
                                 # Load the parameters.
-                                belief_model.load_state_dict(belief_model_state, strict=False)
+                                belief_model.load_state_dict(belief_model_state, strict=True)
                             else:
                                 belief_model = None
                         else:
