@@ -520,7 +520,6 @@ def test_opponent_combinations(render_mode=None, verbose=False, stop_on_loss=Tru
         print(f"Type: {first_loss['type']}")
         print(f"Seed: {first_loss['seed']}")
         print(f"Winner: {first_loss['stats']['winner']}")
-        print(f"Final penalties: {first_loss['stats']['final_penalties']}")
     else:
         print("\nNo losses encountered!")
     
