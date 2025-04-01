@@ -266,41 +266,31 @@ def generate_data(
                 logger.warning(f"Episode {episode+1}: No agent selected, game might have ended")
                 break
             
-            # Get current observation and state
-            env.observe(current_agent, new=True)
+            # Use the newer observation for richer state info
+            obs_current = env.observe(current_agent, newer=True)
+            observation_current = obs_current[current_agent]
             action_mask = env.infos[current_agent].get('action_mask', [0] * 7)
             
             # Handle PS agent's turn
             if current_agent == training_agent:
-                # First try to get action from existing plan
                 planned_action = ps.get_next_agent_action(current_agent)
                 
                 if planned_action is not None:
                     best_action = planned_action
-                    # We need a "dummy" distribution for the transition
                     action_probs = np.zeros(7)
                     action_probs[best_action] = 1.0
-                    best_value = 0.0  # We don't have a value from the plan
                     action_source = "PS Plan Sequence"
                 else:
-                    # Perform a full PS search
                     try:
                         start_time = time.time()
-                        # Get the current state for search
                         current_state = env.get_state()
-                        
-                        # Execute search
-                        action_probs, best_action, best_value = ps.search(current_state)
-                        
-                        # Track search statistics
+                        action_probs, best_action, _ = ps.search(current_state)
                         search_time = time.time() - start_time
                         stats["avg_search_time"] = (stats["avg_search_time"] * stats["simulation_count"] + search_time) / (stats["simulation_count"] + 1)
                         stats["simulation_count"] += 1
-                        stats["avg_value"] = (stats["avg_value"] * (stats["episodes"] * 100 + episode_step - 1) + best_value) / (stats["episodes"] * 100 + episode_step)
-                        
                         action_source = "PS Search"
                         if verbose:
-                            logger.info(f"PS Search completed in {search_time:.3f}s, value: {best_value:.2f}")
+                            logger.info(f"PS Search completed in {search_time:.3f}s")
                     except Exception as e:
                         logger.error(f"Error during PS search: {e}")
                         stats["failed_searches"] += 1
@@ -311,7 +301,6 @@ def generate_data(
                             best_action = valid_actions[0]
                             action_probs = np.zeros(7)
                             action_probs[best_action] = 1.0
-                            best_value = -100.0  # Negative value for fallback actions
                         else:
                             logger.error(f"No valid actions available for {current_agent}. Skipping turn.")
                             continue
@@ -325,13 +314,20 @@ def generate_data(
                 action_key = f"{action_type}_{card_category}_{count}"
                 stats["action_distribution"][action_key] += 1
                 
-                # Store the transition data
+                # Execute the action and then capture the environment reward
+                env.step(best_action)
+                env_reward = env.rewards.get(training_agent, 0)
+                
+                # Get the newer observation post-action
+                obs_post = env.observe(current_agent, newer=True)
+                observation_post = obs_post[current_agent]
+                
                 transition = {
-                    "observation": env.observe(current_agent, new=True)[current_agent].tolist(),
+                    "observation": observation_post.tolist(),
                     "action_mask": action_mask,
                     "action": best_action,
                     "action_probs": action_probs.tolist(),
-                    "value": best_value,
+                    "value": env_reward,
                     "table_card": env.table_card,
                     "hand": env.players_hands.get(current_agent, []),
                     "agent": current_agent,
@@ -345,10 +341,7 @@ def generate_data(
                 episode_data.append(transition)
                 
                 if verbose:
-                    logger.info(f"Step {episode_step}: {current_agent} takes action {best_action} ({action_type}, {card_category}, {count}) from {action_source}")
-                
-                # Apply the action in the environment
-                env.step(best_action)
+                    logger.info(f"Step {episode_step}: {current_agent} takes action {best_action} ({action_type}, {card_category}, {count}) from {action_source} with reward {env_reward}")
             else:
                 # Opponent's turn
                 # First try to get action from PS plan
@@ -360,15 +353,15 @@ def generate_data(
                 else:
                     # Use opponent's own policy
                     opponent_model = opponent_models[current_agent]
-                    observation = env.observe(current_agent, new=True)[current_agent]
+                    observation_opponent = env.observe(current_agent, newer=True)[current_agent]
                     
-                    if hasattr(opponent_model, 'play_turn'):  # Hardcoded agent
+                    if hasattr(opponent_model, 'play_turn'):
                         best_action = opponent_model.play_turn(
-                            observation, 
+                            observation_opponent, 
                             action_mask, 
                             table_card=env.table_card
                         )
-                    else:  # Historical model (neural network)
+                    else:
                         old_observation = env.observe(current_agent, new=False)[current_agent]
                         obp_placeholder = np.zeros(2, dtype=np.float32)
                         memory_placeholder = np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
@@ -383,10 +376,8 @@ def generate_data(
                         
                         probs = probs.squeeze().cpu().numpy()
                         masked_probs = probs * action_mask
-                        masked_probs_sum = masked_probs.sum()
-                        
-                        if masked_probs_sum > 0:
-                            masked_probs /= masked_probs_sum
+                        if masked_probs.sum() > 0:
+                            masked_probs /= masked_probs.sum()
                             best_action = np.argmax(masked_probs)
                         else:
                             # Fallback
@@ -394,16 +385,8 @@ def generate_data(
                             best_action = valid_actions[0]
                     
                     action_source = f"Opponent Model ({current_opponents[current_agent]['name']})"
-                
-                if verbose:
-                    action_type, card_category, count = decode_action(best_action)
-                    logger.info(f"Step {episode_step}: {current_agent} takes action {best_action} ({action_type}, {card_category}, {count}) from {action_source}")
-                
-                # Apply the action in the environment
-                env.step(best_action)
-        
-        # Episode completed
-        # Update episode result (win/loss)
+                    env.step(best_action)
+            
         episode_result = 1.0 if env.winner == training_agent else -1.0
         
         if env.winner == training_agent:
