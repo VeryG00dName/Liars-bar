@@ -1094,7 +1094,7 @@ def main():
         env=env,
         device=device,
         num_episodes=config.NUM_EPISODES,
-        load_checkpoint=False,
+        load_checkpoint=True,
         log_tensorboard=True,
         opponent_swap_interval=50
     )
