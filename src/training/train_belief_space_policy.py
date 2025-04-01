@@ -594,7 +594,7 @@ def train_belief_space_policy(
         logger.info(f"Setting num_opponent_types to {num_opponent_types}")
     
     logger.info(f"Loading data from {data_dir}")
-    all_data = load_ps_data(data_dir, max_files, max_samples)
+    all_data = load_ps_data(data_dir, max_files, max_samples, use_sample_cache=False)
     
     filtered_data = [sample for sample in all_data if sample['value'] > -5000]
     logger.info(f"Filtered data from {len(all_data)} to {len(filtered_data)} samples")
@@ -843,7 +843,7 @@ def main():
     parser.add_argument("--data-dir", type=str, default="./ps_data", help="Directory containing PS data files")
     parser.add_argument("--data-file", type=str, default=None, help="Specific data file to load (instead of directory)")
     parser.add_argument("--num-opponent-types", type=int, default=None, help="Number of opponent types (auto-detected if None)")
-    parser.add_argument("--hidden-dim", type=int, default=256, help="Hidden dimension of the policy network")
+    parser.add_argument("--hidden-dim", type=int, default=config.HIDDEN_DIM, help="Hidden dimension of the policy network")
     parser.add_argument("--learning-rate", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--batch-size", type=int, default=2048, help="Batch size")
     parser.add_argument("--num-epochs", type=int, default=100, help="Number of epochs")
