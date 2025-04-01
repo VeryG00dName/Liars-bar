@@ -101,7 +101,7 @@ class OpponentBeliefModel(nn.Module):
     
     Enhanced with numerical stability safeguards to prevent NaN/Inf values.
     """
-    def __init__(self, event_feature_dim=5, max_seq_length=200, hidden_dim=128, num_opponent_types=10):
+    def __init__(self, event_feature_dim=5, max_seq_length=400, hidden_dim=128, num_opponent_types=10):
         super().__init__()
         # Store dimensions for validation
         self.event_feature_dim = event_feature_dim  # 5 features per event
