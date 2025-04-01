@@ -159,7 +159,7 @@ def main():
     # Load response2idx and action2idx
     transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
     response2idx, action2idx = load_transformer_mappings(transformer_checkpoint_path, device)
-
+    all_samples = [sample for sample in all_samples if len(convert_memory_to_features2(sample[0], response2idx, action2idx) or []) > 0]
     # Create dataset and dataloader
     dataset = BeliefTrainingDataset(all_samples, response2idx, action2idx, args.max_seq_length, label2idx)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
