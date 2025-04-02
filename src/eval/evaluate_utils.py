@@ -910,10 +910,12 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                 
                 # --- BeliefSpacePolicy handling ---
                 if player_data.get('is_belief_space_policy', False):
-                    # Get observation in the appropriate format (new=True by default for Belief models)
-                    observation_dict = env.observe(agent, new=True)
+                    # Get observation in the appropriate format
+                    if player_data['policy_net'].total_input_dim == 29:
+                        observation_dict = env.observe(agent, new=True)
+                    else:
+                        observation_dict = env.observe(agent, newer=True)
                     observation = observation_dict[agent]
-                    
                     # Get beliefs about all opponents
                     opponent_beliefs = []
                     for opp_agent in env.possible_agents:
@@ -967,6 +969,7 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
                         # Sample action
                         action = torch.distributions.Categorical(masked_probs).sample().item()
                     except Exception as e:
+                        print('test')
                         logger.error(f"Error in belief-based action selection for {agent}: {e}")
                         valid_actions = [i for i, m in enumerate(mask) if m == 1]
                         if valid_actions:
