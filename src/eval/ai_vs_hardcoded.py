@@ -299,7 +299,7 @@ class BattlegroundWorker(QThread):
                         else:
                             key = "player_0"
                             # Make a better estimate by analyzing the observation
-                            sample_obs = env.observe(key, new=True)[key]
+                            sample_obs = env.observe(key, newer=True)[key]
                             estimated_obs_dim = min(sample_obs.shape[0], total_input_dim - 10)  # Ensure at least 10 for belief
                             
                             # For display and initialization
@@ -315,44 +315,19 @@ class BattlegroundWorker(QThread):
                         )
                         
                         # Load state dict with better error handling
-                        try:
-                            policy_net.load_state_dict(policy_state_dict, strict=False)
-                            
-                            # Check for NaN/Inf in loaded weights and fix them
-                            has_invalid_params = False
-                            for name, param in policy_net.named_parameters():
-                                if torch.isnan(param).any() or torch.isinf(param).any():
-                                    logger.warning(f"NaN/Inf found in parameter {name}, fixing...")
-                                    has_invalid_params = True
-                                    # Zero out the problematic values
-                                    param.data = torch.nan_to_num(param.data, nan=0.0, posinf=0.0, neginf=0.0)
-                            
-                            if has_invalid_params:
-                                logger.info("Fixed NaN/Inf values in model parameters")
-                                
-                        except Exception as e:
-                            logger.warning(f"Error loading state dict: {str(e)}. Attempting to adjust...")
-                            # Try to match parameter shapes
-                            mismatched_keys = []
-                            for name, param in policy_net.named_parameters():
-                                if name in policy_state_dict:
-                                    checkpoint_param = policy_state_dict[name]
-                                    if param.shape != checkpoint_param.shape:
-                                        mismatched_keys.append(name)
-                                        logger.warning(f"Shape mismatch for {name}: model {param.shape} vs checkpoint {checkpoint_param.shape}")
-                            
-                            # If there are mismatches, try to adjust the state dict
-                            if mismatched_keys:
-                                adjusted_state_dict = {}
-                                for name, param in policy_state_dict.items():
-                                    if name in mismatched_keys:
-                                        # Skip mismatched keys
-                                        continue
-                                    adjusted_state_dict[name] = param
-                                
-                                # Load the adjusted state dict
-                                policy_net.load_state_dict(adjusted_state_dict, strict=False)
-                                logger.info("Loaded adjusted state dict with skipped mismatched keys")
+                        policy_net.load_state_dict(policy_state_dict, strict=True)
+                        
+                        # Check for NaN/Inf in loaded weights and fix them
+                        has_invalid_params = False
+                        for name, param in policy_net.named_parameters():
+                            if torch.isnan(param).any() or torch.isinf(param).any():
+                                logger.warning(f"NaN/Inf found in parameter {name}, fixing...")
+                                has_invalid_params = True
+                                # Zero out the problematic values
+                                param.data = torch.nan_to_num(param.data, nan=0.0, posinf=0.0, neginf=0.0)
+                        
+                        if has_invalid_params:
+                            logger.info("Fixed NaN/Inf values in model parameters")
                         
                         policy_net.to(device).eval()
                         
@@ -483,7 +458,7 @@ class BattlegroundWorker(QThread):
             if agent_data.get("is_belief_space_policy", False):
                 hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, "network.0")
                 total_input_dim = policy_state_dict['network.0.weight'].shape[1]
-                sample_obs = env.observe("player_0", new=True)["player_0"]
+                sample_obs = env.observe("player_0", newer=True)["player_0"]
                 obs_dim = min(sample_obs.shape[0], total_input_dim - 10)
                 belief_dim = total_input_dim - obs_dim
                 policy_net = BeliefSpacePolicy(
@@ -604,7 +579,7 @@ class BattlegroundWorker(QThread):
                                 obs_dim = policy_state_dict['obs_dim'].item()
                                 belief_dim = total_input_dim - obs_dim
                             else:
-                                sample_obs = env.observe(key, new=True)[key]
+                                sample_obs = env.observe(key, newer=True)[key]
                                 estimated_obs_dim = min(sample_obs.shape[0], total_input_dim - 10)
                                 obs_dim = estimated_obs_dim
                                 belief_dim = total_input_dim - obs_dim
@@ -1624,28 +1599,24 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
             self.previous_results = self.current_results
             return
 
+        LABEL_SHORT_NAMES = {
+            "GreedyCardSpammer": "GCS",
+            "StrategicChallenger": "SC",
+            "TableNonTableAgent": "TNTA",
+            "Classic": "CL",
+            "TableFirstConservativeChallenger": "TFCC",
+            "SelectiveTableConservativeChallenger": "STCC",
+            "RandomAgent": "RA",
+            "Version_E_player_1": "VE",
+            "Version_C_player_0": "VC",
+            "Version_A_player_2": "VA",
+        }
+
         def make_acronym(name):
-            # If the name length is 7 or less, return as is.
-            if len(name) <= 7:
-                return name
-
-            # Attempt to split on common delimiters.
-            parts = re.split(r'[+\_]', name)
-            if len(parts) > 1:
-                # Filter out any empty parts and take first letters.
-                acronym = ''.join(part[0].upper() for part in parts if part)
-                if len(acronym) > 0:
-                    return acronym
-
-            # If no delimiter was found or it didn't work, try to split by camel case.
-            camel_parts = re.findall(r'[A-Z][^A-Z]*', name)
-            if len(camel_parts) > 1:
-                acronym = ''.join(part[0].upper() for part in camel_parts)
-                if len(acronym) > 0:
-                    return acronym
-
-            # Fallback: simply return the first 7 characters.
-            return name[:7]
+            # For pair names joined by +, like "Classic+GreedyCardSpammer"
+            parts = name.split("+")
+            short_parts = [LABEL_SHORT_NAMES.get(part, part[:4].upper()) for part in parts]
+            return "+".join(short_parts)
 
         opp_names = list(self.current_results.keys())
         # Create shortened labels for plotting.
@@ -1717,9 +1688,6 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         ax2.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
         plt.tight_layout()
         plt.show()
-
-        # Update previous_results with current_results for future comparisons.
-        self.previous_results = self.current_results
 
     def show_expert_usage(self):
         """Display expert activation information"""
