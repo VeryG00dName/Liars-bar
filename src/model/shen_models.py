@@ -50,22 +50,6 @@ class BeliefSpacePolicy(nn.Module):
             action_logits: Policy logits of shape (batch_size, output_dim)
             state_value: Value prediction of shape (batch_size, 1)
         """
-        # Validate input dimensions
-        if obs.size(1) + belief.size(1) != self.total_input_dim:
-            # Handle dimension mismatch - try to adapt
-            total_size = obs.size(1) + belief.size(1)
-            if total_size > self.total_input_dim:
-                # Truncate to match expected dimensions
-                if obs.size(1) > self.obs_dim:
-                    obs = obs[:, :self.obs_dim]
-                if belief.size(1) > self.belief_dim:
-                    belief = belief[:, :self.belief_dim]
-            elif total_size < self.total_input_dim:
-                # Pad with zeros to match expected dimensions
-                missing = self.total_input_dim - total_size
-                padding = torch.zeros((obs.size(0), missing), device=obs.device)
-                # Append padding to belief (safer than observation)
-                belief = torch.cat([belief, padding], dim=1)
         
         # Ensure both tensors have proper values (no NaN/Inf)
         obs = torch.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=-1.0)
