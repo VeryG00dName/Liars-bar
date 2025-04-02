@@ -143,46 +143,67 @@ def create_opponent_mapping(data_dir, use_cache=True, cache_file="opponent_mappi
     return opponent_mapping
 
 class PSDataset(Dataset):
-    """Dataset for PerfectSearch generated data, with fixed-size belief tensors."""
+    """
+    Dataset for PerfectSearch generated data, with fixed-size belief tensors.
+    Includes logic to trim observations from 9 dimensions to 7.
+    """
     def __init__(self, data, opponent_mapping, num_opponent_types, device, max_opponent_count=2):
         self.data = []
         self.opponent_mapping = opponent_mapping
         self.num_opponent_types = num_opponent_types
         self.device = device
         self.max_opponent_count = max_opponent_count  # New parameter
-        
-        for sample in data:
-            observation = torch.tensor(np.array(sample['observation'], dtype=np.float32), device=device)
+        self.trimmed_first_sample = False # Flag to print only once
+
+        for i, sample in enumerate(tqdm(data, desc="Processing samples")):
+            # Load observation as NumPy array first for shape check and trimming
+            observation_np = np.array(sample['observation'], dtype=np.float32)
+
+            # Check if observation has 9 dimensions and trim if necessary
+            if observation_np.shape[0] == 9:
+                observation_np = observation_np[:-2] # Trim the last two elements
+                # Optional: Print a message for the first trimmed sample
+                if not self.trimmed_first_sample:
+                    print(f"INFO: Trimming observation shape from (9,) to {observation_np.shape} for training dataset.")
+                    self.trimmed_first_sample = True
+            elif observation_np.shape[0] != 7:
+                # Optional: Add a warning if observations have unexpected dimensions
+                 print(f"WARNING: Sample {i} has unexpected observation shape {observation_np.shape}. Expected 7 or 9.")
+
+
+            # Convert the (potentially trimmed) observation to a tensor
+            observation = torch.tensor(observation_np, device=device)
+
+            # --- Keep the rest of the original logic ---
             action = torch.tensor(sample['action'], dtype=torch.long, device=device)
             action_probs = torch.tensor(np.array(sample['action_probs'], dtype=np.float32), device=device)
             value = torch.tensor(sample['value'], dtype=torch.float32, device=device)
             action_mask = torch.tensor(np.array(sample['action_mask'], dtype=np.float32), device=device)
-            
+
             opponent_types = sample['opponent_types']
             # Create a belief vector of fixed length: num_opponent_types * max_opponent_count
             belief_array = np.zeros(self.num_opponent_types * self.max_opponent_count, dtype=np.float32)
-            
+
             # Process available opponents, up to max_opponent_count
-            for i in range(self.max_opponent_count):
-                if i < len(opponent_types):
-                    opp_name = opponent_types[i]
+            for j in range(self.max_opponent_count):
+                if j < len(opponent_types):
+                    opp_name = opponent_types[j]
                     if opp_name in self.opponent_mapping:
                         opp_idx = self.opponent_mapping[opp_name]
-                        belief_array[i * self.num_opponent_types + opp_idx] = 1.0
+                        belief_array[j * self.num_opponent_types + opp_idx] = 1.0
                     else:
                         # For unknown opponents, fill with a uniform distribution
-                        start_idx = i * self.num_opponent_types
-                        end_idx = (i + 1) * self.num_opponent_types
+                        start_idx = j * self.num_opponent_types
+                        end_idx = (j + 1) * self.num_opponent_types
                         belief_array[start_idx:end_idx] = 1.0 / self.num_opponent_types
                 else:
-                    # For missing opponent slots, you might want to fill with zeros or a uniform belief.
-                    # Here, we choose uniform.
-                    start_idx = i * self.num_opponent_types
-                    end_idx = (i + 1) * self.num_opponent_types
+                    # For missing opponent slots, fill with uniform distribution.
+                    start_idx = j * self.num_opponent_types
+                    end_idx = (j + 1) * self.num_opponent_types
                     belief_array[start_idx:end_idx] = 1.0 / self.num_opponent_types
 
             belief = torch.tensor(belief_array, dtype=torch.float32, device=device)
-            
+
             self.data.append({
                 'observation': observation,
                 'action': action,
@@ -194,7 +215,7 @@ class PSDataset(Dataset):
 
     def __len__(self):
         return len(self.data)
-    
+
     def __getitem__(self, idx):
         return self.data[idx]
 
@@ -840,7 +861,7 @@ def evaluate_model(model, data_loader, opponent_mapping, device):
 
 def main():
     parser = argparse.ArgumentParser(description="Train BeliefSpacePolicy using PS-generated data")
-    parser.add_argument("--data-dir", type=str, default="./ps_data", help="Directory containing PS data files")
+    parser.add_argument("--data-dir", type=str, default="./ps_data/old", help="Directory containing PS data files")
     parser.add_argument("--data-file", type=str, default=None, help="Specific data file to load (instead of directory)")
     parser.add_argument("--num-opponent-types", type=int, default=None, help="Number of opponent types (auto-detected if None)")
     parser.add_argument("--hidden-dim", type=int, default=config.HIDDEN_DIM, help="Hidden dimension of the policy network")
@@ -852,7 +873,7 @@ def main():
     parser.add_argument("--log-dir", type=str, default=None, help="Log directory for TensorBoard")
     parser.add_argument("--device", type=str, default='cuda', help="Device to use (cuda/cpu)")
     parser.add_argument("--max-files", type=int, default=10, help="Maximum number of data files to load")
-    parser.add_argument("--max-samples", type=int, default=900000, help="Maximum number of samples to load (default: 500k)")
+    parser.add_argument("--max-samples", type=int, default=2000000, help="Maximum number of samples to load (default: 500k)")
     
     args = parser.parse_args()
     
