@@ -861,7 +861,7 @@ def evaluate_model(model, data_loader, opponent_mapping, device):
 
 def main():
     parser = argparse.ArgumentParser(description="Train BeliefSpacePolicy using PS-generated data")
-    parser.add_argument("--data-dir", type=str, default="./ps_data/old", help="Directory containing PS data files")
+    parser.add_argument("--data-dir", type=str, default="./ps_data", help="Directory containing PS data files")
     parser.add_argument("--data-file", type=str, default=None, help="Specific data file to load (instead of directory)")
     parser.add_argument("--num-opponent-types", type=int, default=None, help="Number of opponent types (auto-detected if None)")
     parser.add_argument("--hidden-dim", type=int, default=config.HIDDEN_DIM, help="Hidden dimension of the policy network")
