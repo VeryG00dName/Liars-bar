@@ -17,26 +17,26 @@ def main():
     parser.add_argument(
         "--checkpoint_dir",
         type=str,
-        required=True,
+        default=config.CHECKPOINT_DIR,
         help="Directory containing the checkpoints (opponent_belief_model.pth and bsp_* subfolder)"
     )
     parser.add_argument(
         "--bsp_subdir",
         type=str,
-        default="bsp_20250330_210719",
+        default="bsp_20250402_174927",
         help="Subdirectory inside checkpoint_dir where belief_space_policy_best.pth is located"
     )
     parser.add_argument(
         "--episode",
         type=int,
-        default=0,
+        default=100,
         help="Episode number to record in the new checkpoint"
     )
     args = parser.parse_args()
 
     checkpoint_dir = args.checkpoint_dir
     bsp_dir = os.path.join(checkpoint_dir, args.bsp_subdir)
-    bsp_path = os.path.join(bsp_dir, "belief_space_policy_best.pth")
+    bsp_path = os.path.join(bsp_dir, "belief_space_policy_final.pth")
     opponent_belief_path = os.path.join(checkpoint_dir, "opponent_belief_model.pth")
 
     if not os.path.exists(bsp_path):
@@ -64,7 +64,7 @@ def main():
     belief_policy = BeliefSpacePolicy(
         belief_dim=belief_dim,
         obs_dim=obs_dim,
-        hidden_dim=hidden_dim,
+        hidden_dim=config.HIDDEN_DIM,
         output_dim=output_dim
     )
     belief_policy.load_state_dict(bsp_checkpoint["model_state_dict"])
@@ -79,7 +79,7 @@ def main():
     belief_model = OpponentBeliefModel(
         event_feature_dim=5,
         max_seq_length=config.MAX_SQUENCE_LENGTH,
-        hidden_dim=config.HIDDEN_DIM // 4,
+        hidden_dim=256 // 4,
         num_opponent_types=10
     )
     belief_model.load_state_dict(obm_state)
