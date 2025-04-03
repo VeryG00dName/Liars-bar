@@ -3,13 +3,11 @@
 
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-import sys
 import logging
 import random
 import numpy as np
 import torch
 import time
-import itertools
 import json
 from tqdm import tqdm
 
@@ -20,8 +18,6 @@ from src import config
 
 # Import PS and opponent models
 from src.model.ps import PerfectSearch
-# Remove the following line if it's still present:
-# from src.model.ps import calculate_opponent_obs_key  # NO LONGER NEEDED
 
 # Import opponent models
 from src.model.hard_coded_agents import (
@@ -195,22 +191,24 @@ def play_game(opponent1_config, opponent2_config, seed=42, render_mode=None, ver
         training_agent=training_agent,
         opponent_models=opponent_models
     )
-
+    ps.debug = True
     search_time = 0
     search_count = 0
     max_steps = 1000
     steps = 0
     last_round = env.round
-
+    plan_invalidation_count = 0
     while not all(env.terminations.values()) and steps < max_steps:
         steps += 1
         current_agent = env.agent_selection
         if current_agent is None:
             logger.warning("No agent selected, game might have ended")
             break
+
+        # Invalidate the PS plan on round change without incrementing the counter.
         if env.round > last_round:
             if verbose:
-                logger.info(f"New round ({env.round}) started. Invalidating PS plan sequence.")
+                logger.info(f"New round ({env.round}) started. Invalidating PS plan sequence (round change).")
             ps.invalidate_plan()
             last_round = env.round
         if verbose:
@@ -254,6 +252,13 @@ def play_game(opponent1_config, opponent2_config, seed=42, render_mode=None, ver
                 if verbose:
                     logger.info(f"Using model for opponent {current_agent} ({action_source})")
                 try:
+                    # Check opponent's hand length; if not 5, increment the plan_invalidation_count.
+                    opp_hand = env.players_hands.get(current_agent, [])
+                    if len(opp_hand) != 5:
+                        plan_invalidation_count += 1
+                        if verbose:
+                            logger.info(f"Plan invalidated because {current_agent}'s hand length is not 5 (len={len(opp_hand)}).")
+                    
                     opponent_model = opponent_models[current_agent]
                     observation = env.observe(current_agent, new=True)[current_agent]
                     if hasattr(opponent_model, 'play_turn'):  # Hardcoded agent
@@ -304,6 +309,7 @@ def play_game(opponent1_config, opponent2_config, seed=42, render_mode=None, ver
         "search_time": search_time,
         "search_count": search_count,
         "avg_search_time": avg_search_time,
+        "ps_plan_invalidations": plan_invalidation_count,
         "error": None
     }
     if steps >= max_steps:
@@ -411,7 +417,8 @@ def test_opponent_combinations(render_mode=None, verbose=False, stop_on_loss=Tru
         "first_loss": None,
         "total_search_time": 0,
         "total_search_count": 0,
-        "avg_search_time": 0
+        "avg_search_time": 0,
+        "total_ps_plan_invalidations": 0,
     }
     
     for i, (opponent1, opponent2) in enumerate(tqdm(combinations, desc="Simulating battles")):
@@ -442,6 +449,7 @@ def test_opponent_combinations(render_mode=None, verbose=False, stop_on_loss=Tru
             
             results["games_played"] += 1
             results["combinations_tested"] += 1
+            results["total_ps_plan_invalidations"] += stats.get("ps_plan_invalidations", 0)
             
             if win:
                 results["wins"] += 1
@@ -522,7 +530,7 @@ def test_opponent_combinations(render_mode=None, verbose=False, stop_on_loss=Tru
         print(f"Winner: {first_loss['stats']['winner']}")
     else:
         print("\nNo losses encountered!")
-    
+    print(f"Total PS plan invalidations: {results['total_ps_plan_invalidations']}")
     return results
 
 def main():
@@ -543,11 +551,6 @@ def main():
     
     render_mode = 'human' if args.render else None
     stop_on_loss = not args.no_stop
-    
-    if args.debug:
-        from src.model.ps import PerfectSearch
-        PerfectSearch.debug = True
-        print("Debug mode enabled for PerfectSearch")
     
     include_hardcoded = True
     include_historical = True
