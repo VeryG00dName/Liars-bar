@@ -323,7 +323,7 @@ def generate_data(
                 observation_post = obs_post[current_agent]
                 
                 transition = {
-                    "observation": observation_post.tolist(),
+                    "observation": observation_current.tolist(),
                     "action_mask": action_mask,
                     "action": best_action,
                     "action_probs": action_probs.tolist(),
