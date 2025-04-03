@@ -10,13 +10,13 @@ import torch
 import argparse
 import pickle
 import json
-from collections import defaultdict, deque
+from collections import defaultdict
 from tqdm import tqdm
 from datetime import datetime
 
 # Environment imports
 from src.env.liars_deck_env_core import LiarsDeckEnv
-from src.env.liars_deck_env_utils_2 import decode_action, encode_hand
+from src.env.liars_deck_env_utils_2 import decode_action
 from src import config
 
 # Import opponent models
