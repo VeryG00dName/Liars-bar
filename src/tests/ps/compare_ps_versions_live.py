@@ -278,6 +278,7 @@ def run_comparison_game(opponent1_config, opponent2_config, seed=42, render_mode
     search_count_fixed = 0
     disagreements = 0
     disagreement_details = []  # Store detailed info about disagreements
+    pending_disagreement = None  # To hold a disagreement record until an opponent moves
 
     max_steps = 1000  # Safety limit
     steps = 0
@@ -362,7 +363,8 @@ def run_comparison_game(opponent1_config, opponent2_config, seed=42, render_mode
                 logger.warning(f"  Fixed PS   : Action={action_fixed}, Value={value_fixed:.1f}")
                 logger.warning(f"  Executed   : Action={best_action} (from PS {chosen_ps})")
 
-                disagreement_details.append({
+                # Save disagreement details but wait for opponent response before finalizing
+                pending_disagreement = {
                     "step": steps,
                     "state": current_state,
                     "action_mask": action_mask if isinstance(action_mask, list) else action_mask.tolist(),
@@ -373,8 +375,10 @@ def run_comparison_game(opponent1_config, opponent2_config, seed=42, render_mode
                     "value_fixed": value_fixed,
                     "log_fixed": log_output_fixed if verbose else "Not logged",
                     "chosen_action": best_action,
-                    "chosen_ps": chosen_ps
-                })
+                    "chosen_ps": chosen_ps,
+                    "opponent_response": None,
+                    "opponent": None
+                }
 
         # --- Opponent's Turn Logic ---
         else:
@@ -402,6 +406,13 @@ def run_comparison_game(opponent1_config, opponent2_config, seed=42, render_mode
                     valid_actions = [i for i, m in enumerate(action_mask) if m == 1]
                     best_action = valid_actions[0] if valid_actions else 0
             action_source = f"Opponent Model ({current_opponents[current_agent]['name']})"
+
+            # If a disagreement is pending from the previous training agent turn, update it with the opponent's response.
+            if pending_disagreement is not None:
+                pending_disagreement["opponent_response"] = best_action
+                pending_disagreement["opponent"] = current_agent
+                disagreement_details.append(pending_disagreement)
+                pending_disagreement = None
 
         if best_action is None:
             logger.error(f"CRITICAL: Failed to determine an action for {current_agent}. Source Trail: {action_source}")
@@ -442,6 +453,11 @@ def run_comparison_game(opponent1_config, opponent2_config, seed=42, render_mode
         "disagreement_details": disagreement_details,
         "error": None
     }
+
+    # In case the game ended before an opponent move could update a pending disagreement, record it as is.
+    if pending_disagreement is not None:
+        disagreement_details.append(pending_disagreement)
+        pending_disagreement = None
 
     if steps >= max_steps:
         stats["error"] = "Maximum steps reached"
