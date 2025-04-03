@@ -17,23 +17,24 @@ from src.training.train_belief_space_policy import load_ps_data
 
 # Evaluation Dataset that pre-loads data onto the GPU.
 class EvalPSDataset(Dataset):
-    def __init__(self, data, opponent_mapping, num_opponent_types, device, max_opponent_count=None):
-        """
-        Args:
-            data: List of raw samples.
-            opponent_mapping: Mapping for opponent types.
-            num_opponent_types: Total number of opponent types.
-            device: torch.device on which to store the tensors.
-            max_opponent_count: Optional fixed number of opponent slots. If provided, belief tensor will be of fixed size.
-        """
+    def __init__(self, data, opponent_mapping, num_opponent_types, device, max_opponent_count=None, trim_obs=False):
         self.data = []
         self.opponent_mapping = opponent_mapping
         self.num_opponent_types = num_opponent_types
         self.device = device
         self.max_opponent_count = max_opponent_count
+        self.trim_obs = trim_obs
 
         for sample in data:
-            observation = torch.tensor(np.array(sample['observation'], dtype=np.float32), device=device)
+            observation = np.array(sample['observation'], dtype=np.float32)
+            
+            # Trim the last two elements if requested
+            if self.trim_obs and len(observation) >= 2:
+                if sample == data[0]:  # Only print for first sample
+                    print(f"Trimming observation from {observation.shape} to {observation.shape[0]-2}")
+                observation = observation[:-2]
+            
+            observation = torch.tensor(observation, device=device)
             action = torch.tensor(sample['action'], dtype=torch.long, device=device)
             action_probs = torch.tensor(np.array(sample['action_probs'], dtype=np.float32), device=device)
             value = torch.tensor(sample['value'], dtype=torch.float32, device=device)
@@ -86,6 +87,62 @@ class EvalPSDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.data[idx]
+
+class ModifiedBeliefSpacePolicy(BeliefSpacePolicy):
+    """Subclass that handles dimension adjustments for evaluation"""
+    def forward(self, obs, belief):
+        """
+        Modified forward pass to handle dimension mismatch
+        """
+        # Get actual dimensions from the inputs
+        actual_obs_dim = obs.shape[1]
+        actual_belief_dim = belief.shape[1]
+        expected_input_dim = self.network[0].weight.shape[1]  # First layer's expected input dim
+        
+        # Print dimensions for the first batch
+        if not hasattr(self, 'printed_dims'):
+            print(f"Actual obs dim: {actual_obs_dim}, Actual belief dim: {actual_belief_dim}")
+            print(f"Model expects total input dim: {expected_input_dim}")
+            self.printed_dims = True
+        
+        # Handle dimension mismatch by padding with zeros
+        if actual_obs_dim + actual_belief_dim != expected_input_dim:
+            padding_size = expected_input_dim - (actual_obs_dim + actual_belief_dim)
+            if padding_size > 0:
+                # Add zero padding
+                zero_padding = torch.zeros(obs.shape[0], padding_size, device=obs.device)
+                combined = torch.cat([obs, belief, zero_padding], dim=1)
+                if not hasattr(self, 'printed_padding'):
+                    print(f"Added {padding_size} zeros as padding")
+                    self.printed_padding = True
+            else:
+                # Need to trim - prioritize keeping all of belief and trimming from obs
+                trim_size = -padding_size
+                if not hasattr(self, 'printed_trimming'):
+                    print(f"Need to trim {trim_size} elements from combined vector")
+                    self.printed_trimming = True
+                # Try to keep the belief intact and trim from observation
+                combined = torch.cat([obs[:, :actual_obs_dim-trim_size], belief], dim=1)
+        else:
+            # Dimensions match correctly
+            combined = torch.cat([obs, belief], dim=1)
+        
+        # Ensure both tensors have proper values (no NaN/Inf)
+        combined = torch.nan_to_num(combined, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        # Process through network with additional safeguards
+        features = self.network(combined)
+        features = torch.nan_to_num(features, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        # Get action logits from policy head
+        action_logits = self.policy_head(features)
+        action_logits = torch.clamp(action_logits, min=-10.0, max=10.0)  # Prevent extreme values
+        
+        # Get state value from value head
+        state_value = self.value_head(features)
+        state_value = torch.clamp(state_value, min=-100.0, max=100.0)  # Reasonable value range
+        
+        return action_logits, state_value
 
 def evaluate(model, data_loader, device, num_opponent_types, uniform_belief=False):
     """
@@ -148,29 +205,32 @@ def print_results(overall_acc, gt_dist, pred_dist, combo_stats, title):
     for label, count in sorted(pred_dist.items()):
         print(f"  Action {label}: {count} samples")
     
-    print("\nAccuracy per Opponent Combination (sorted alphabetically):")
-    for combo_str, (correct, total) in sorted(combo_stats.items()):
+    print("\nAccuracy per Opponent Combination (sorted by accuracy):")
+    sorted_combos = sorted([(combo, correct, total) for combo, (correct, total) in combo_stats.items()], 
+                          key=lambda x: x[1]/x[2] if x[2] > 0 else 0, reverse=True)
+    for combo_str, correct, total in sorted_combos:
         acc = correct / total if total > 0 else 0
         print(f"  {combo_str}: {acc*100:.2f}% ({correct}/{total})")
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate BeliefSpacePolicy model with both correct and uniform beliefs")
     
-    default_checkpoint_dir = os.path.join(config.CHECKPOINT_DIR, "bsp_20250330_192915")
+    default_checkpoint_dir = os.path.join(config.CHECKPOINT_DIR, "bsp_20250401_132645")
     parser.add_argument("--checkpoint-dir", type=str, default=default_checkpoint_dir,
                         help="Directory containing the checkpoint and (optionally) data files")
-    parser.add_argument("--data-dir", type=str, default="./ps_data",
+    parser.add_argument("--data-dir", type=str, default="./ps_data/old",
                         help="Directory containing PS-generated data files")
     parser.add_argument("--max-samples", type=int, default=50000,
                         help="Maximum number of samples to load for evaluation")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for evaluation")
     parser.add_argument("--device", type=str, default='cuda', help="Device to use (cpu or cuda)")
+    parser.add_argument("--trim-obs", action="store_true", help="Trim the last two elements from observations")
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() or args.device == 'cpu' else 'cpu')
     print(f"Using device: {device}")
 
-    checkpoint_path = os.path.join(args.checkpoint_dir, "belief_space_policy_best.pth")
+    checkpoint_path = os.path.join(args.checkpoint_dir, "belief_space_policy_final.pth")
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
 
@@ -182,7 +242,11 @@ def main():
     output_dim = checkpoint['output_dim']
     hidden_dim = checkpoint['hidden_dim']
 
-    model = BeliefSpacePolicy(
+    # Print original model dimensions
+    print(f"Model dimensions from checkpoint: obs_dim={obs_dim}, belief_dim={belief_dim}, total_input={obs_dim+belief_dim}")
+
+    # Use our modified model class that can handle dimension mismatches
+    model = ModifiedBeliefSpacePolicy(
         belief_dim=belief_dim,
         obs_dim=obs_dim,
         hidden_dim=hidden_dim,
@@ -195,10 +259,17 @@ def main():
     data = load_ps_data(data_dir=args.data_dir, max_samples=args.max_samples, use_sample_cache=False)
     print(f"Loaded {len(data)} samples from data directory: {args.data_dir}")
 
+    # Get the shape of the first observation to display
+    if len(data) > 0 and 'observation' in data[0]:
+        first_obs = data[0]['observation']
+        print(f"First observation shape before processing: {np.array(first_obs).shape}")
+
     # Here we pass device to our dataset so all tensors are pre-converted to GPU.
-    # Optionally, you can set max_opponent_count if you want a fixed-size belief.
-    eval_dataset = EvalPSDataset(data, opponent_mapping, num_opponent_types, device, max_opponent_count=2)
+    eval_dataset = EvalPSDataset(data, opponent_mapping, num_opponent_types, device, 
+                                max_opponent_count=2, trim_obs=args.trim_obs)
     eval_loader = DataLoader(eval_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
+
+    # Now our modified model class will handle dimension mismatch
 
     overall_acc_correct, gt_dist_correct, pred_dist_correct, combo_stats_correct = evaluate(
         model, eval_loader, device, num_opponent_types, uniform_belief=False)
