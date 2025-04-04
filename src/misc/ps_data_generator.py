@@ -318,10 +318,6 @@ def generate_data(
                 env.step(best_action)
                 env_reward = env.rewards.get(training_agent, 0)
                 
-                # Get the newer observation post-action
-                obs_post = env.observe(current_agent, newer=True)
-                observation_post = obs_post[current_agent]
-                
                 transition = {
                     "observation": observation_current.tolist(),
                     "action_mask": action_mask,
