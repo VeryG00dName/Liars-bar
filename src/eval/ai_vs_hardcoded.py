@@ -856,7 +856,7 @@ class BattlegroundWorker(QThread):
                 }
             else:
                 raise ValueError(f"Unknown opponent type: {opponent_type}")
-        
+        env.reset(seed=42)
         # When calling evaluate_agents, pass the cheat_expert_index (which may be scalar or a tuple).
         cumulative_wins, _, _, _, _, expert_activations = evaluate_agents(
             env, device, players_in_this_game, episodes=episodes, 
