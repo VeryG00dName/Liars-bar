@@ -33,7 +33,7 @@ from src import config
 # Additional imports for memory and environment utilities
 from src.env.liars_deck_env_utils import query_opponent_memory_full
 from src.training.train_transformer import EventEncoder
-from src.training.train_extras import convert_memory_to_features, convert_memory_to_features2
+from src.training.train_extras import convert_memory_to_features, convert_memory_to_features2, set_seed
 # Constants for observation versions
 OBS_VERSION_1 = 1
 OBS_VERSION_2 = 2
@@ -843,7 +843,7 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
     total_steps = 0
     game_wins_list = []
     start_time = time.time()
-    
+    set_seed(config.SEED)
     # Initialize expert tracking for all agents if enabled.
     expert_activations = {} if track_experts else None
     if track_experts:
@@ -884,7 +884,7 @@ def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournamen
     
     with torch.no_grad():
         for game_idx in range(1, episodes + 1):
-            env.reset()
+            env.reset(seed=game_idx)
             if two_player is not None and two_player in env.penalties:
                 env.penalties[two_player] = env.penalty_thresholds[two_player]
                 env.terminations[two_player] = True
