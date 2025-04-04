@@ -16,7 +16,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
-
+from src.training.train_extras import set_seed
 from src.model.shen_models import BeliefSpacePolicy
 from src import config
 
@@ -876,7 +876,7 @@ def main():
     parser.add_argument("--max-samples", type=int, default=2000000, help="Maximum number of samples to load (default: 500k)")
     
     args = parser.parse_args()
-    
+    set_seed(config.SEED)
     device = args.device
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
