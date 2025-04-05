@@ -253,8 +253,9 @@ class PerfectSearch:
                 best_sequence_continuation = None
                 best_is_terminal_recursive = False
                 best_is_new_round_recursive = False
-
-                for next_action in valid_actions:
+                simulation_order = [3, 5, 4, 0, 2, 1]
+                actions_to_simulate = [act for act in simulation_order if act in valid_actions]
+                for next_action in actions_to_simulate:
                     self._log(f"[Depth {depth}, SimStep {step_count}] Exploring recursive action {next_action} for {self.training_agent} (Depth {depth + 1})")
                     next_state = sim_env.get_state()
                     value, next_seq_cont, is_term, is_new_rnd = self.simulate_round(
@@ -303,34 +304,54 @@ class PerfectSearch:
                             initial_action_type, _, initial_count = decode_action(action) # Decode the *first* action of this sim
 
                             if initial_action_type == 'Play' and action >= 3: # Was it a Play Non-Table action?
+                                # Check initial hand state passed into this simulation call
                                 initial_hand = env_state['players_hands'].get(self.training_agent, [])
                                 table_cards_in_initial_hand = [c for c in initial_hand if c == table_card or c == "Joker"]
                                 num_table_cards_available = len(table_cards_in_initial_hand)
 
+                                # Check if the required count for the *initial* action could have been met with table cards
                                 if num_table_cards_available >= initial_count:
                                     # HEURISTIC APPLIES: Pretend we played table cards
-                                    self._log(f"[Depth {depth}] HEURISTIC: Opponent challenges bluff, but swapping to table cards (had {num_table_cards_available} for count {initial_count}).")
+                                    self._log(f"[Depth {depth}] HEURISTIC: Opponent challenges bluff, but swapping last play to table cards (had {num_table_cards_available} available for initial count {initial_count}).")
+                                    # Calculate the equivalent table action based on the count of the *initial* action
                                     equivalent_table_action = action - 3
-                                    action_sequence[0] = (self.training_agent, equivalent_table_action) # Modify first step
-                                    action_sequence.append((current_agent, opponent_action)) # Opponent's challenge
-                                    # Return POSITIVE value (opponent penalized)
+
+                                    # --- CORRECTED LOGIC ---
+                                    # Modify the *last* action in the sequence, which was our bluff that is now being challenged.
+                                    # Ensure the last action was indeed ours (should be guaranteed by is_challenging_us check)
+                                    if action_sequence and action_sequence[-1][0] == self.training_agent:
+                                        original_action_being_swapped = action_sequence[-1][1]
+                                        action_sequence[-1] = (self.training_agent, equivalent_table_action)
+                                        self._log(f"[Depth {depth}] HEURISTIC: Swapped our last action {original_action_being_swapped} to equivalent table action {equivalent_table_action}.")
+                                    else:
+                                        # Log a warning if something unexpected happened
+                                        self._log(f"[Depth {depth}] HEURISTIC WARNING: Could not find our last action in sequence to swap. Sequence: {action_sequence}")
+                                        # Fallback: Treat as a failed bluff (might be safer than proceeding with potentially incorrect sequence)
+                                        penalty_value = -10000.0 if starting_penalty_us >= 2 else -5000.0
+                                        action_sequence.append((current_agent, opponent_action)) # Add challenge before returning
+                                        return penalty_value, action_sequence, False, True
+                                    # --- END CORRECTED LOGIC ---
+
+                                    # Append the opponent's challenge action *after* the swap
+                                    action_sequence.append((current_agent, opponent_action))
+                                    # Return POSITIVE value (opponent penalized because our swapped play is now valid)
                                     return self.OPPONENT_PENALTY_THRESHOLD, action_sequence, False, True
                                 else:
-                                    # HEURISTIC DOES NOT APPLY: Standard bad outcome
-                                    self._log(f"[Depth {depth}] Outcome: Opponent challenges bluff! Bad. (Only had {num_table_cards_available} table cards for count {initial_count})")
-                                    # Don't step here, return directly
-                                    penalty_value = -10000.0 if starting_penalty_us >= 2 else -5000.0
-                                    action_sequence.append((current_agent, opponent_action)) # Add challenge before returning
-                                    return penalty_value, action_sequence, False, True
+                                     # HEURISTIC DOES NOT APPLY: Standard bad outcome
+                                     self._log(f"[Depth {depth}] Outcome: Opponent challenges bluff! Bad. (Only had {num_table_cards_available} table cards for initial count {initial_count})")
+                                     penalty_value = -10000.0 if starting_penalty_us >= 2 else -5000.0
+                                     action_sequence.append((current_agent, opponent_action)) # Add challenge before returning
+                                     return penalty_value, action_sequence, False, True # Returns penalty, indicates round potentially ends
                             else:
-                                # Safety check: Bluff detected but initial action wasn't Play Non-Table
-                                self._log(f"[Depth {depth}] Outcome: Opponent challenges bluff, initial action mismatch? Applying standard penalty.")
+                                # Safety check: Bluff detected but initial action wasn't Play Non-Table or count mismatch
+                                self._log(f"[Depth {depth}] Outcome: Opponent challenges bluff, initial action mismatch or invalid count? Applying standard penalty.")
                                 penalty_value = -10000.0 if starting_penalty_us >= 2 else -5000.0
                                 action_sequence.append((current_agent, opponent_action))
-                                return penalty_value, action_sequence, False, True
+                                return penalty_value, action_sequence, False, True # Returns penalty, indicates round potentially ends
                         # else: Opponent challenged our VALID play. Let sim_env.step handle it below.
 
                     # --- Apply opponent action if not handled by heuristic/bluff return ---
+                    # This part is reached only if it wasn't our bluff being challenged, or if it was our valid play being challenged.
                     sim_env.step(opponent_action)
                     action_sequence.append((current_agent, opponent_action))
 
