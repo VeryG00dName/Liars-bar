@@ -54,6 +54,23 @@ def setup_logging(log_file=None, level=logging.INFO):
     
     return logger
 
+def train_val_split(data, validation_split=0.1, max_val_samples=50000):
+    """Split data into training and validation sets with a cap on validation samples.
+    
+    Args:
+        data: List of all data samples
+        validation_split: Fraction of data to use for validation
+        max_val_samples: Maximum number of validation samples
+        
+    Returns:
+        tuple: (train_data, val_data)
+    """
+    np.random.shuffle(data)
+    val_size = min(int(len(data) * validation_split), max_val_samples)
+    val_data = data[:val_size]
+    train_data = data[val_size:]
+    return train_data, val_data
+
 def create_opponent_mapping(data_dir, use_cache=True, cache_file="opponent_mapping_cache.pkl"):
     """Create mapping of opponent names to indices.
     
@@ -219,222 +236,6 @@ class PSDataset(Dataset):
     def __getitem__(self, idx):
         return self.data[idx]
 
-def load_opponent_mapping_from_stats(stats_file):
-    """Load opponent mapping directly from stats file without scanning data files.
-    
-    Args:
-        stats_file: Path to stats JSON file
-    
-    Returns:
-        Dictionary mapping opponent names to indices
-    """
-    import json
-    print(f"Loading opponent mapping from stats file: {stats_file}")
-    try:
-        with open(stats_file, 'r') as f:
-            stats = json.load(f)
-            
-        opponent_names = set()
-        for combo in stats.get('opponent_combinations', {}).keys():
-            opponents = combo.split('_vs_')
-            opponent_names.update(opponents)
-        
-        print(f"Found {len(opponent_names)} unique opponent types in stats")
-        opponent_mapping = HARD_CODED_LABELS.copy()
-        next_idx = max(opponent_mapping.values()) + 1 if opponent_mapping else 0
-        for name in sorted(opponent_names):
-            if name not in opponent_mapping:
-                opponent_mapping[name] = next_idx
-                next_idx += 1
-                print(f"Assigned index {next_idx-1} to opponent type: {name}")
-        
-        return opponent_mapping
-    
-    except Exception as e:
-        print(f"Error loading opponent mapping from stats: {e}")
-        print("Falling back to scanning data files")
-        return None
-
-def find_stats_file(data_dir, checkpoint_num=None):
-    """Find the appropriate stats file in the data directory.
-    
-    Args:
-        data_dir: Directory containing data and stats files
-        checkpoint_num: Optional specific checkpoint number to look for
-    
-    Returns:
-        Path to stats file if found, else None
-    """
-    import glob
-    if checkpoint_num is not None:
-        stats_file = os.path.join(data_dir, f"stats_checkpoint_{checkpoint_num}.json")
-        if os.path.exists(stats_file):
-            return stats_file
-    
-    stats_files = glob.glob(os.path.join(data_dir, "stats_checkpoint_*.json"))
-    if stats_files:
-        stats_files.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
-        return stats_files[-1]
-    
-    final_stats = os.path.join(data_dir, "stats_final.json")
-    if os.path.exists(final_stats):
-        return final_stats
-    
-    return None
-
-def guided_sampling(all_data, stats_file, max_samples):
-    """Sample data using stats information for better representation.
-    
-    Args:
-        all_data: List of all data samples
-        stats_file: Path to stats JSON file
-        max_samples: Maximum number of samples to select
-    
-    Returns:
-        List of selected samples
-    """
-    import json
-    import random
-    from collections import defaultdict
-    
-    print(f"Using guided sampling based on stats from: {stats_file}")
-    try:
-        with open(stats_file, 'r') as f:
-            stats = json.load(f)
-        
-        samples_by_combo = defaultdict(list)
-        for sample in all_data:
-            if 'opponent_types' in sample:
-                combo = '_vs_'.join(sample['opponent_types'])
-                samples_by_combo[combo].append(sample)
-        
-        combo_dist = stats.get('opponent_combinations', {})
-        total_combos = sum(combo_dist.values())
-        
-        combo_samples = {}
-        for combo, count in combo_dist.items():
-            allocation = max(10, int((count / total_combos) * max_samples))
-            combo_samples[combo] = min(allocation, len(samples_by_combo.get(combo, [])))
-        
-        total_allocated = sum(combo_samples.values())
-        if total_allocated > max_samples:
-            scale = max_samples / total_allocated
-            for combo in combo_samples:
-                combo_samples[combo] = int(combo_samples[combo] * scale)
-        
-        selected_samples = []
-        for combo, num_samples in combo_samples.items():
-            if combo in samples_by_combo and samples_by_combo[combo]:
-                if num_samples <= len(samples_by_combo[combo]):
-                    selected = random.sample(samples_by_combo[combo], num_samples)
-                else:
-                    selected = samples_by_combo[combo]
-                selected_samples.extend(selected)
-        
-        if len(selected_samples) < max_samples:
-            remaining = max_samples - len(selected_samples)
-            unused_samples = [s for s in all_data if s not in selected_samples]
-            if unused_samples:
-                additional = random.sample(unused_samples, min(remaining, len(unused_samples)))
-                selected_samples.extend(additional)
-        
-        print(f"Guided sampling selected {len(selected_samples)} samples using opponent distribution")
-        return selected_samples
-    
-    except Exception as e:
-        print(f"Error in guided sampling: {e}")
-        print("Falling back to random sampling")
-        random.shuffle(all_data)
-        return all_data[:max_samples]
-
-def analyze_sample_quality(all_data, stats_file):
-    """Analyze sample quality using stats and add quality scores to samples.
-    
-    Args:
-        all_data: List of all data samples
-        stats_file: Path to stats JSON file
-    
-    Returns:
-        Same data with quality scores added
-    """
-    import json
-    
-    try:
-        with open(stats_file, 'r') as f:
-            stats = json.load(f)
-        
-        avg_value = stats.get('avg_value', 0)
-        win_rate = stats.get('win_rate', 0)
-        
-        for sample in all_data:
-            value = sample.get('value', 0)
-            quality_score = value / max(1, avg_value)
-            sample['quality_score'] = quality_score
-        
-        all_data.sort(key=lambda x: x.get('quality_score', 0), reverse=True)
-        
-        print(f"Added quality scores based on value comparison to avg_value={avg_value}")
-        return all_data
-    
-    except Exception as e:
-        print(f"Error analyzing sample quality: {e}")
-        return all_data
-
-def optimize_training_with_stats(data_dir, stats_file=None, max_samples=100000):
-    """Prepare optimized training data using stats information.
-    
-    Args:
-        data_dir: Directory containing data files
-        stats_file: Path to stats file (auto-detected if None)
-        max_samples: Maximum number of samples to use
-        
-    Returns:
-        tuple: (opponent_mapping, train_data, val_data)
-    """
-    if stats_file is None:
-        stats_file = find_stats_file(data_dir)
-    
-    if stats_file and os.path.exists(stats_file):
-        print(f"Using stats file for optimization: {stats_file}")
-        opponent_mapping = load_opponent_mapping_from_stats(stats_file)
-        
-        data_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) 
-                      if f.endswith('.pkl') and "ps_data" in f]
-        
-        if not data_files:
-            data_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) 
-                         if f.endswith('.pkl')]
-        
-        files_to_load = sorted(data_files, key=os.path.getmtime, reverse=True)[:5]
-        
-        all_data = []
-        for file_path in tqdm(files_to_load, desc="Loading sample data files"):
-            try:
-                with open(file_path, 'rb') as f:
-                    file_data = pickle.load(f)
-                    if isinstance(file_data, list):
-                        if len(file_data) > max_samples // len(files_to_load):
-                            subset = random.sample(file_data, max_samples // len(files_to_load))
-                        else:
-                            subset = file_data
-                        all_data.extend(subset)
-            except Exception as e:
-                print(f"Error loading {os.path.basename(file_path)}: {e}")
-        
-        all_data = analyze_sample_quality(all_data, stats_file)
-        
-        if len(all_data) > max_samples:
-            all_data = guided_sampling(all_data, stats_file, max_samples)
-        
-        np.random.shuffle(all_data)
-        val_size = int(len(all_data) * 0.1)
-        train_data = all_data[val_size:]
-        val_data = all_data[:val_size]
-        
-        return opponent_mapping, train_data, val_data
-    else:
-        print("No stats file found, using standard data loading")
-        return None, None, None
 
 def load_ps_data(data_dir, max_files=None, max_samples=None, use_sample_cache=True):
     """Load data from PS data pickle files with efficient sampling and caching.
@@ -621,11 +422,7 @@ def train_belief_space_policy(
     logger.info(f"Filtered data from {len(all_data)} to {len(filtered_data)} samples")
     all_data = filtered_data
     
-    np.random.shuffle(all_data)
-    val_size = int(len(all_data) * validation_split)
-    train_data = all_data[val_size:]
-    val_data = all_data[:val_size]
-    logger.info(f"Training samples: {len(train_data)}, Validation samples: {len(val_data)}")
+    train_data, val_data = train_val_split(all_data, validation_split, max_val_samples=50000)
     
     # Create datasets that now pre-store data on the GPU
     train_dataset = PSDataset(train_data, opponent_mapping, num_opponent_types, device)
@@ -861,7 +658,7 @@ def evaluate_model(model, data_loader, opponent_mapping, device):
 
 def main():
     parser = argparse.ArgumentParser(description="Train BeliefSpacePolicy using PS-generated data")
-    parser.add_argument("--data-dir", type=str, default="./ps_data", help="Directory containing PS data files")
+    parser.add_argument("--data-dir", type=str, default="./ps_data/ps_v4_data", help="Directory containing PS data files")
     parser.add_argument("--data-file", type=str, default=None, help="Specific data file to load (instead of directory)")
     parser.add_argument("--num-opponent-types", type=int, default=None, help="Number of opponent types (auto-detected if None)")
     parser.add_argument("--hidden-dim", type=int, default=config.HIDDEN_DIM, help="Hidden dimension of the policy network")
@@ -873,7 +670,7 @@ def main():
     parser.add_argument("--log-dir", type=str, default=None, help="Log directory for TensorBoard")
     parser.add_argument("--device", type=str, default='cuda', help="Device to use (cuda/cpu)")
     parser.add_argument("--max-files", type=int, default=10, help="Maximum number of data files to load")
-    parser.add_argument("--max-samples", type=int, default=2000000, help="Maximum number of samples to load (default: 500k)")
+    parser.add_argument("--max-samples", type=int, default=20000000, help="Maximum number of samples to load (default: 500k)")
     
     args = parser.parse_args()
     set_seed(config.SEED)
@@ -884,44 +681,6 @@ def main():
         device = torch.device(device)
     
     print(f"Using device: {device}")
-    
-    if args.data_file:
-        print(f"Loading single data file: {args.data_file}")
-        if not os.path.exists(args.data_file):
-            raise FileNotFoundError(f"Data file not found: {args.data_file}")
-            
-        try:
-            with open(args.data_file, 'rb') as f:
-                all_data = pickle.load(f)
-                if not isinstance(all_data, list):
-                    raise ValueError(f"Data file {args.data_file} does not contain a list of samples")
-                print(f"Loaded {len(all_data)} samples from {args.data_file}")
-                
-                if args.checkpoint_dir is None:
-                    args.checkpoint_dir = os.path.join("checkpoints", f"bsp_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-                    os.makedirs(args.checkpoint_dir, exist_ok=True)
-                
-                opponent_mapping = HARD_CODED_LABELS.copy()
-                all_opponent_names = set()
-                for sample in all_data:
-                    if 'opponent_types' in sample:
-                        all_opponent_names.update(sample['opponent_types'])
-                
-                next_idx = max(opponent_mapping.values()) + 1 if opponent_mapping else 0
-                for name in sorted(all_opponent_names):
-                    if name.startswith("Historical_") and name not in opponent_mapping:
-                        opponent_mapping[name] = next_idx
-                        next_idx += 1
-                
-                np.random.shuffle(all_data)
-                val_size = int(len(all_data) * args.validation_split)
-                train_data = all_data[val_size:]
-                val_data = all_data[:val_size]
-                
-                # Further training logic can follow here...
-        except Exception as e:
-            print(f"Error loading data file: {e}")
-            raise
     
     model, opponent_mapping = train_belief_space_policy(
         data_dir=args.data_dir,
