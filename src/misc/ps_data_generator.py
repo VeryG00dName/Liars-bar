@@ -34,7 +34,7 @@ from src.model.hard_coded_agents import (
 from src.training.train_utils import load_specific_historical_models
 
 # Import PS - updated to lowercase module name
-from src.model.ps import PerfectSearch
+from src.model.ps_v3 import PerfectSearch
 
 def setup_logging(log_file=None, level=logging.INFO):
     """Configure logging for the data generator."""
@@ -149,12 +149,38 @@ def setup_opponents(opponent_pool, opponent_types, agent_names):
     
     return current_opponents, opponent_models
 
+def append_to_data_file(data, file_path):
+    """
+    Append new data to an existing pickle file, or create if it doesn't exist.
+    
+    Args:
+        data: List of transitions to append
+        file_path: Path to the pickle file
+    """
+    # If file exists, load existing data, append new data, and save
+    if os.path.exists(file_path):
+        with open(file_path, 'rb') as f:
+            try:
+                existing_data = pickle.load(f)
+                if not isinstance(existing_data, list):
+                    existing_data = []
+            except (pickle.PickleError, EOFError):
+                existing_data = []
+        
+        combined_data = existing_data + data
+        
+        with open(file_path, 'wb') as f:
+            pickle.dump(combined_data, f)
+    else:
+        # Create new file with just the new data
+        with open(file_path, 'wb') as f:
+            pickle.dump(data, f)
+
 def generate_data(
     num_episodes=1000,
     output_dir="./ps_data",
     include_historical=True,
     save_frequency=100,
-    chunk_size=None,
     verbose=False,
     debug_ps=False,
     start_seed=42
@@ -166,8 +192,7 @@ def generate_data(
         num_episodes: Number of episodes to generate
         output_dir: Directory to save data
         include_historical: Whether to include historical models
-        save_frequency: How often to save checkpoints
-        chunk_size: Size of data chunks for saving (None = save all at once)
+        save_frequency: How often to save and clear data
         verbose: Whether to print detailed progress
         debug_ps: Whether to enable debug mode in PerfectSearch
         start_seed: Starting seed for random number generators
@@ -186,6 +211,9 @@ def generate_data(
     logger.info(f"Starting data generation: {num_episodes} episodes")
     logger.info(f"Output directory: {output_dir}")
     
+    # Create main data file path
+    main_data_file = os.path.join(output_dir, "ps_data.pkl")
+    
     # Load opponent pool
     opponent_pool = load_opponent_pool(include_historical)
     opponent_types = list(opponent_pool.keys())
@@ -202,6 +230,7 @@ def generate_data(
         "losses": 0,
         "win_rate": 0.0,
         "transitions": 0,
+        "total_saved_transitions": 0,
         "opponent_combinations": defaultdict(int),
         "action_distribution": defaultdict(int),
         "avg_value": 0.0,
@@ -212,9 +241,8 @@ def generate_data(
         "invalid_transitions": 0
     }
     
-    # Dataset storage
-    all_data = []
-    episode_data = []
+    # Dataset storage for current batch only
+    current_batch_data = []
     
     # Enable debug mode in PerfectSearch if requested
     if debug_ps:
@@ -399,43 +427,34 @@ def generate_data(
             transition["final_penalties"] = {agent: env.penalties.get(agent, 0) for agent in env.possible_agents}
             transition["winner"] = env.winner
         
-        # Add episode data to the full dataset
-        all_data.extend(episode_data)
+        # Add episode data to the current batch
+        current_batch_data.extend(episode_data)
         stats["transitions"] += len(episode_data)
         
-        # Save checkpoint if needed
+        # Save data and clear memory if needed
         if (episode + 1) % save_frequency == 0:
-            checkpoint_file = os.path.join(output_dir, f"ps_data_checkpoint_{episode+1}.pkl")
+            # Append current batch to the data file
+            append_to_data_file(current_batch_data, main_data_file)
             
-            if chunk_size is None:
-                # Save all data
-                with open(checkpoint_file, 'wb') as f:
-                    pickle.dump(all_data, f)
-            else:
-                # Save the last chunk_size transitions
-                chunk_data = all_data[-chunk_size:]
-                with open(checkpoint_file, 'wb') as f:
-                    pickle.dump(chunk_data, f)
+            # Update total saved transitions
+            stats["total_saved_transitions"] += len(current_batch_data)
             
             # Save statistics
-            stats_file = os.path.join(output_dir, f"stats_checkpoint_{episode+1}.json")
+            stats_file = os.path.join(output_dir, "stats_current.json")
             with open(stats_file, 'w') as f:
                 # Convert defaultdict to regular dict for JSON serialization
                 json_stats = {k: v if not isinstance(v, defaultdict) else dict(v) for k, v in stats.items()}
                 json.dump(json_stats, f, indent=2)
             
-            logger.info(f"Checkpoint saved at episode {episode+1}: {len(all_data)} transitions, win rate: {stats['win_rate']:.4f}")
+            logger.info(f"Batch saved at episode {episode+1}: {len(current_batch_data)} transitions, total saved: {stats['total_saved_transitions']}, win rate: {stats['win_rate']:.4f}")
             
-            # If using chunks, clear memory
-            if chunk_size is not None:
-                all_data = all_data[-chunk_size:]
-                logger.info(f"Keeping last {chunk_size} transitions in memory")
+            # Clear the batch data to free memory
+            current_batch_data = []
     
-    # Final save if not already saved
-    if num_episodes % save_frequency != 0:
-        final_file = os.path.join(output_dir, f"ps_data_final.pkl")
-        with open(final_file, 'wb') as f:
-            pickle.dump(all_data, f)
+    # Final save if there's remaining data not yet saved
+    if len(current_batch_data) > 0:
+        append_to_data_file(current_batch_data, main_data_file)
+        stats["total_saved_transitions"] += len(current_batch_data)
         
         stats_file = os.path.join(output_dir, "stats_final.json")
         with open(stats_file, 'w') as f:
@@ -450,7 +469,7 @@ def generate_data(
     
     logger.info("\n===== Data Generation Summary =====")
     logger.info(f"Episodes: {stats['episodes']}")
-    logger.info(f"Transitions: {stats['transitions']} ({stats['transitions_per_episode']:.2f} per episode)")
+    logger.info(f"Total saved transitions: {stats['total_saved_transitions']} ({stats['transitions_per_episode']:.2f} per episode)")
     logger.info(f"Win rate: {stats['win_rate']:.4f} ({stats['wins']}/{stats['episodes']})")
     logger.info(f"Total time: {total_time:.2f}s ({stats['episodes_per_second']:.2f} episodes/s)")
     logger.info(f"Avg search time: {stats['avg_search_time']:.3f}s")
@@ -473,8 +492,7 @@ def main():
     parser.add_argument("--episodes", type=int, default=1000, help="Number of episodes to generate")
     parser.add_argument("--output-dir", type=str, default="./ps_data", help="Output directory")
     parser.add_argument("--no-historical", action="store_true", help="Do not include historical models")
-    parser.add_argument("--save-frequency", type=int, default=100, help="How often to save checkpoints")
-    parser.add_argument("--chunk-size", type=int, help="Size of data chunks for saving (None = save all)")
+    parser.add_argument("--save-frequency", type=int, default=100, help="How often to save and clear data")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument("--debug-ps", action="store_true", help="Enable debug mode in PerfectSearch")
     parser.add_argument("--seed", type=int, default=42, help="Starting seed for games")
@@ -490,14 +508,13 @@ def main():
         output_dir=output_dir,
         include_historical=not args.no_historical,
         save_frequency=args.save_frequency,
-        chunk_size=args.chunk_size,
         verbose=args.verbose,
         debug_ps=args.debug_ps,
         start_seed=args.seed
     )
     
     print(f"\nData generation complete. Output saved to {output_dir}")
-    print(f"Generated {stats['transitions']} transitions from {stats['episodes']} episodes")
+    print(f"Generated {stats['total_saved_transitions']} total transitions from {stats['episodes']} episodes")
     print(f"Win rate: {stats['win_rate']:.4f}")
 
 if __name__ == "__main__":
