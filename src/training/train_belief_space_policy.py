@@ -239,13 +239,13 @@ class PSDataset(Dataset):
 
 def load_ps_data(data_dir, max_files=None, max_samples=None, use_sample_cache=True):
     """Load data from PS data pickle files with efficient sampling and caching.
-    
+
     Args:
         data_dir: Directory containing data files
         max_files: Maximum number of files to load
         max_samples: Maximum total samples to load
         use_sample_cache: Whether to cache sampled data for faster loading
-    
+
     Returns:
         List of data samples
     """
@@ -266,7 +266,7 @@ def load_ps_data(data_dir, max_files=None, max_samples=None, use_sample_cache=Tr
     
     if max_files is not None:
         data_files = sorted(data_files)[-max_files:]
-    
+
     print(f"Found {len(data_files)} data files: {[os.path.basename(f) for f in data_files]}")
     
     sample_cache_file = os.path.join(data_dir, "sample_cache.pkl")
@@ -293,7 +293,7 @@ def load_ps_data(data_dir, max_files=None, max_samples=None, use_sample_cache=Tr
     
     all_data = []
     file_sizes = []
-    
+
     for data_file in tqdm(data_files, desc="Getting file sizes"):
         try:
             file_size = os.path.getsize(data_file)
@@ -301,60 +301,40 @@ def load_ps_data(data_dir, max_files=None, max_samples=None, use_sample_cache=Tr
         except Exception as e:
             print(f"Error getting size of {os.path.basename(data_file)}: {e}")
     
-    file_sizes.sort(key=lambda x: x[1])
-    
-    if max_samples is not None:
-        samples_per_file = max_samples // len(file_sizes)
-    else:
-        samples_per_file = None
-    
+    file_sizes.sort(key=lambda x: x[1])  # Load smaller files first
+
     total_loaded = 0
+
     for data_file, file_size in tqdm(file_sizes, desc="Loading data files"):
         try:
-            if file_size < 100 * 1024 * 1024 or samples_per_file is None:
-                with open(data_file, 'rb') as f:
-                    data = pickle.load(f)
-                    if isinstance(data, list):
-                        if samples_per_file is not None:
-                            if len(data) > samples_per_file:
-                                sampled_data = random.sample(data, samples_per_file)
-                                all_data.extend(sampled_data)
-                                total_loaded += len(sampled_data)
-                                print(f"Sampled {len(sampled_data)} from {os.path.basename(data_file)} ({len(data)} total)")
-                            else:
-                                all_data.extend(data)
-                                total_loaded += len(data)
-                                print(f"Loaded all {len(data)} samples from {os.path.basename(data_file)}")
-                        else:
-                            all_data.extend(data)
-                            total_loaded += len(data)
-                            print(f"Loaded all {len(data)} samples from {os.path.basename(data_file)}")
-                    else:
-                        print(f"Warning: {os.path.basename(data_file)} does not contain a list of samples")
-            else:
-                print(f"File {os.path.basename(data_file)} is large ({file_size/(1024*1024):.1f} MB), using sampling")
-                with open(data_file, 'rb') as f:
-                    data = pickle.load(f)
-                    if isinstance(data, list):
-                        if samples_per_file is not None:
-                            sampled_data = random.sample(data, min(samples_per_file, len(data)))
-                            all_data.extend(sampled_data)
-                            total_loaded += len(sampled_data)
-                            print(f"Sampled {len(sampled_data)} from {os.path.basename(data_file)} ({len(data)} total)")
-                        else:
-                            all_data.extend(data)
-                            total_loaded += len(data)
-                            print(f"Loaded all {len(data)} samples from {os.path.basename(data_file)}")
-                    else:
-                        print(f"Warning: {os.path.basename(data_file)} does not contain a list of samples")
+            with open(data_file, 'rb') as f:
+                data = pickle.load(f)
+                if not isinstance(data, list):
+                    print(f"Warning: {os.path.basename(data_file)} does not contain a list of samples")
+                    continue
+                
+                remaining = max_samples - total_loaded if max_samples is not None else len(data)
+                if remaining <= 0:
+                    print(f"Reached sample limit of {max_samples}")
+                    break
+
+                if len(data) > remaining:
+                    sampled_data = random.sample(data, remaining)
+                    all_data.extend(sampled_data)
+                    total_loaded += len(sampled_data)
+                    print(f"Sampled {len(sampled_data)} from {os.path.basename(data_file)} ({len(data)} total)")
+                else:
+                    all_data.extend(data)
+                    total_loaded += len(data)
+                    print(f"Loaded all {len(data)} samples from {os.path.basename(data_file)}")
         except Exception as e:
             print(f"Error loading {os.path.basename(data_file)}: {e}")
-        
+            continue
+
         if max_samples is not None and total_loaded >= max_samples:
-            all_data = all_data[:max_samples]
             print(f"Reached sample limit of {max_samples}")
             break
-    
+
     if not all_data:
         raise ValueError("No valid data samples found in any of the .pkl files. Check file format and content.")
     
@@ -658,7 +638,7 @@ def evaluate_model(model, data_loader, opponent_mapping, device):
 
 def main():
     parser = argparse.ArgumentParser(description="Train BeliefSpacePolicy using PS-generated data")
-    parser.add_argument("--data-dir", type=str, default="./ps_data/ps_v4_data", help="Directory containing PS data files")
+    parser.add_argument("--data-dir", type=str, default="./ps_data", help="Directory containing PS data files")
     parser.add_argument("--data-file", type=str, default=None, help="Specific data file to load (instead of directory)")
     parser.add_argument("--num-opponent-types", type=int, default=None, help="Number of opponent types (auto-detected if None)")
     parser.add_argument("--hidden-dim", type=int, default=config.HIDDEN_DIM, help="Hidden dimension of the policy network")
