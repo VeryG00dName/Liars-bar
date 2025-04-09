@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# src/eval/eval_belief_space_policy.py
 import os
 import argparse
 import pickle
@@ -88,62 +89,6 @@ class EvalPSDataset(Dataset):
     def __getitem__(self, idx):
         return self.data[idx]
 
-class ModifiedBeliefSpacePolicy(BeliefSpacePolicy):
-    """Subclass that handles dimension adjustments for evaluation"""
-    def forward(self, obs, belief):
-        """
-        Modified forward pass to handle dimension mismatch
-        """
-        # Get actual dimensions from the inputs
-        actual_obs_dim = obs.shape[1]
-        actual_belief_dim = belief.shape[1]
-        expected_input_dim = self.network[0].weight.shape[1]  # First layer's expected input dim
-        
-        # Print dimensions for the first batch
-        if not hasattr(self, 'printed_dims'):
-            print(f"Actual obs dim: {actual_obs_dim}, Actual belief dim: {actual_belief_dim}")
-            print(f"Model expects total input dim: {expected_input_dim}")
-            self.printed_dims = True
-        
-        # Handle dimension mismatch by padding with zeros
-        if actual_obs_dim + actual_belief_dim != expected_input_dim:
-            padding_size = expected_input_dim - (actual_obs_dim + actual_belief_dim)
-            if padding_size > 0:
-                # Add zero padding
-                zero_padding = torch.zeros(obs.shape[0], padding_size, device=obs.device)
-                combined = torch.cat([obs, belief, zero_padding], dim=1)
-                if not hasattr(self, 'printed_padding'):
-                    print(f"Added {padding_size} zeros as padding")
-                    self.printed_padding = True
-            else:
-                # Need to trim - prioritize keeping all of belief and trimming from obs
-                trim_size = -padding_size
-                if not hasattr(self, 'printed_trimming'):
-                    print(f"Need to trim {trim_size} elements from combined vector")
-                    self.printed_trimming = True
-                # Try to keep the belief intact and trim from observation
-                combined = torch.cat([obs[:, :actual_obs_dim-trim_size], belief], dim=1)
-        else:
-            # Dimensions match correctly
-            combined = torch.cat([obs, belief], dim=1)
-        
-        # Ensure both tensors have proper values (no NaN/Inf)
-        combined = torch.nan_to_num(combined, nan=0.0, posinf=1.0, neginf=-1.0)
-        
-        # Process through network with additional safeguards
-        features = self.network(combined)
-        features = torch.nan_to_num(features, nan=0.0, posinf=1.0, neginf=-1.0)
-        
-        # Get action logits from policy head
-        action_logits = self.policy_head(features)
-        action_logits = torch.clamp(action_logits, min=-10.0, max=10.0)  # Prevent extreme values
-        
-        # Get state value from value head
-        state_value = self.value_head(features)
-        state_value = torch.clamp(state_value, min=-100.0, max=100.0)  # Reasonable value range
-        
-        return action_logits, state_value
-
 def evaluate(model, data_loader, device, num_opponent_types, uniform_belief=False):
     """
     Evaluates the model on the given data loader.
@@ -218,7 +163,7 @@ def main():
     default_checkpoint_dir = os.path.join(config.CHECKPOINT_DIR, "bsp_20250401_132645")
     parser.add_argument("--checkpoint-dir", type=str, default=default_checkpoint_dir,
                         help="Directory containing the checkpoint and (optionally) data files")
-    parser.add_argument("--data-dir", type=str, default="./ps_data/old",
+    parser.add_argument("--data-dir", type=str, default="./ps_data/ps_v3_data",
                         help="Directory containing PS-generated data files")
     parser.add_argument("--max-samples", type=int, default=50000,
                         help="Maximum number of samples to load for evaluation")
@@ -230,7 +175,7 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() or args.device == 'cpu' else 'cpu')
     print(f"Using device: {device}")
 
-    checkpoint_path = os.path.join(args.checkpoint_dir, "belief_space_policy_final.pth")
+    checkpoint_path = os.path.join(args.checkpoint_dir, "belief_space_policy_best.pth")
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
 
@@ -246,7 +191,7 @@ def main():
     print(f"Model dimensions from checkpoint: obs_dim={obs_dim}, belief_dim={belief_dim}, total_input={obs_dim+belief_dim}")
 
     # Use our modified model class that can handle dimension mismatches
-    model = ModifiedBeliefSpacePolicy(
+    model = BeliefSpacePolicy(
         belief_dim=belief_dim,
         obs_dim=obs_dim,
         hidden_dim=hidden_dim,
