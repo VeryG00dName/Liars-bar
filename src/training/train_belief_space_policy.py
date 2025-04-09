@@ -192,7 +192,6 @@ class PSDataset(Dataset):
             observation = torch.tensor(observation_np, device=device)
 
             # --- Keep the rest of the original logic ---
-            action = torch.tensor(sample['action'], dtype=torch.long, device=device)
             action_probs = torch.tensor(np.array(sample['action_probs'], dtype=np.float32), device=device)
             value = torch.tensor(sample['value'], dtype=torch.float32, device=device)
             action_mask = torch.tensor(np.array(sample['action_mask'], dtype=np.float32), device=device)
@@ -223,7 +222,6 @@ class PSDataset(Dataset):
 
             self.data.append({
                 'observation': observation,
-                'action': action,
                 'action_probs': action_probs,
                 'value': value,
                 'action_mask': action_mask,
@@ -437,6 +435,7 @@ def train_belief_space_policy(
     value_criterion = nn.MSELoss()
     
     best_val_loss = float('inf')
+    best_val_loss_policy = float('inf')
     for epoch in tqdm(range(num_epochs), desc="Training Progress"):
         epoch_start_time = time.time()
         
@@ -450,7 +449,6 @@ def train_belief_space_policy(
         for batch in train_progress:
             # Since samples are already on GPU, simply stack them
             observations = batch['observation']
-            actions = batch['action']
             target_probs = batch['action_probs']
             target_values = batch['value'].unsqueeze(1)
             action_masks = batch['action_mask']
@@ -494,7 +492,6 @@ def train_belief_space_policy(
         with torch.no_grad():
             for batch in val_progress:
                 observations = batch['observation']
-                actions = batch['action']
                 target_probs = batch['action_probs']
                 target_values = batch['value'].unsqueeze(1)
                 action_masks = batch['action_mask']
@@ -553,6 +550,23 @@ def train_belief_space_policy(
                 'hidden_dim': hidden_dim
             }, checkpoint_path)
             logger.info(f"  Saved new best model with validation loss: {val_total_loss:.6f}")
+        if val_policy_loss < best_val_loss_policy:
+            best_val_loss_policy = val_policy_loss
+            checkpoint_path = os.path.join(checkpoint_dir, f"belief_space_policy_best_2.pth")
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_loss': train_total_loss,
+                'val_loss': val_total_loss,
+                'opponent_mapping': opponent_mapping,
+                'num_opponent_types': num_opponent_types,
+                'obs_dim': obs_dim,
+                'belief_dim': belief_dim,
+                'output_dim': output_dim,
+                'hidden_dim': hidden_dim
+            }, checkpoint_path)
+            logger.info(f"  Saved new best model with validation policyloss: {val_policy_loss:.6f}")
         
         if (epoch + 1) % 10 == 0 or epoch == num_epochs - 1:
             checkpoint_path = os.path.join(checkpoint_dir, f"belief_space_policy_epoch_{epoch+1}.pth")
@@ -591,54 +605,9 @@ def train_belief_space_policy(
     
     return model, opponent_mapping
 
-def evaluate_model(model, data_loader, opponent_mapping, device):
-    """Evaluate the trained model on the test set."""
-    model.eval()
-    
-    total_samples = 0
-    correct_predictions = 0
-    total_policy_loss = 0
-    total_value_loss = 0
-    
-    policy_criterion = nn.KLDivLoss(reduction='batchmean')
-    value_criterion = nn.MSELoss()
-    
-    with torch.no_grad():
-        for batch in tqdm(data_loader, desc="Evaluating"):
-            observations = torch.stack(batch['observation'])
-            actions = torch.stack(batch['action'])
-            target_probs = torch.stack(batch['action_probs'])
-            target_values = torch.stack(batch['value']).unsqueeze(1)
-            action_masks = torch.stack(batch['action_mask'])
-            beliefs = torch.stack(batch['belief'])
-            
-            logits, predicted_values = model(observations, beliefs)
-            masked_logits = logits + (1 - action_masks) * -1e9
-            log_probs = F.log_softmax(masked_logits, dim=1)
-            predicted_actions = torch.argmax(masked_logits, dim=1)
-            
-            policy_loss = policy_criterion(log_probs, target_probs)
-            value_loss = value_criterion(predicted_values, target_values)
-            
-            correct_predictions += (predicted_actions == actions).sum().item()
-            total_samples += actions.size(0)
-            
-            total_policy_loss += policy_loss.item() * actions.size(0)
-            total_value_loss += value_loss.item() * actions.size(0)
-    
-    accuracy = correct_predictions / total_samples
-    avg_policy_loss = total_policy_loss / total_samples
-    avg_value_loss = total_value_loss / total_samples
-    
-    return {
-        'accuracy': accuracy,
-        'policy_loss': avg_policy_loss,
-        'value_loss': avg_value_loss
-    }
-
 def main():
     parser = argparse.ArgumentParser(description="Train BeliefSpacePolicy using PS-generated data")
-    parser.add_argument("--data-dir", type=str, default="./ps_data", help="Directory containing PS data files")
+    parser.add_argument("--data-dir", type=str, default="./ps_data/ps_v3_data", help="Directory containing PS data files")
     parser.add_argument("--data-file", type=str, default=None, help="Specific data file to load (instead of directory)")
     parser.add_argument("--num-opponent-types", type=int, default=None, help="Number of opponent types (auto-detected if None)")
     parser.add_argument("--hidden-dim", type=int, default=config.HIDDEN_DIM, help="Hidden dimension of the policy network")
@@ -650,7 +619,7 @@ def main():
     parser.add_argument("--log-dir", type=str, default=None, help="Log directory for TensorBoard")
     parser.add_argument("--device", type=str, default='cuda', help="Device to use (cuda/cpu)")
     parser.add_argument("--max-files", type=int, default=10, help="Maximum number of data files to load")
-    parser.add_argument("--max-samples", type=int, default=20000000, help="Maximum number of samples to load (default: 500k)")
+    parser.add_argument("--max-samples", type=int, default=1770000, help="Maximum number of samples to load (default: 500k)")
     
     args = parser.parse_args()
     set_seed(config.SEED)
