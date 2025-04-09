@@ -36,7 +36,7 @@ def main():
 
     checkpoint_dir = args.checkpoint_dir
     bsp_dir = os.path.join(checkpoint_dir, args.bsp_subdir)
-    bsp_path = os.path.join(bsp_dir, "belief_space_policy_best.pth")
+    bsp_path = os.path.join(bsp_dir, "belief_space_policy_best_2.pth")
     opponent_belief_path = os.path.join(checkpoint_dir, "opponent_belief_model.pth")
 
     if not os.path.exists(bsp_path):
