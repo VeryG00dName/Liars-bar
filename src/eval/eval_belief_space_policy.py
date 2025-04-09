@@ -175,7 +175,7 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() or args.device == 'cpu' else 'cpu')
     print(f"Using device: {device}")
 
-    checkpoint_path = os.path.join(args.checkpoint_dir, "belief_space_policy_best.pth")
+    checkpoint_path = os.path.join(args.checkpoint_dir, "belief_space_policy_best_2.pth")
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
 
