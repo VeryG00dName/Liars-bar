@@ -355,7 +355,7 @@ class BattlegroundWorker(QThread):
                                 belief_model = OpponentBeliefModel(
                                     event_feature_dim=5,
                                     max_seq_length=config.MAX_SQUENCE_LENGTH,
-                                    hidden_dim=config.HIDDEN_DIM // 4,
+                                    hidden_dim=256 // 4,
                                     num_opponent_types=10
                                 ).to(device)
                                 # Load state dict with error handling
