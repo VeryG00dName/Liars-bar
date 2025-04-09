@@ -1338,253 +1338,195 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         combine = (not self.two_player_checkbox.isChecked()) and self.combine_ai_checkbox.isChecked()
         is_onev2 = self.onev2_checkbox.isChecked()
         is_duo = self.duo_checkbox.isChecked()
-        
+
+        # Track overall totals
+        total_ai = total_opp = total_opp1 = total_opp2 = total_ai1 = total_ai2 = 0
+
+        # Track minimum win rate
+        min_rate = 1.0
+        min_opp = None
+
+        # Start table
+        html = """
+        <table style="border: 1px solid #7289da; border-collapse: collapse; width: 100%;">
+        <thead>
+            <tr style="background-color: #4f545c;">
+        """
+
+        # Header based on mode
         if combine:
             if is_onev2 or is_duo:
-                # In 1v2 mode, combine opponent columns.
-                html = """
-                <table style="border: 1px solid #7289da; border-collapse: collapse; width: 100%;">
-                <thead>
-                    <tr style="background-color: #4f545c;">
-                        <th style="border: 1px solid #7289da; padding: 8px;">Opponent Name</th>
-                        <th style="border: 1px solid #7289da; padding: 8px;">AI Wins</th>
-                        <th style="border: 1px solid #7289da; padding: 8px;">Combined Opponent Wins</th>
-                        <th style="border: 1px solid #7289da; padding: 8px;">AI Win Rate</th>
-                        <th style="border: 1px solid #7289da; padding: 8px;">Opponent Win Rate</th>
-                        <th style="border: 1px solid #7289da; padding: 8px;">Result</th>
-                    </tr>
-                </thead>
-                <tbody>
-                """
-                total_ai = total_opp = 0
-                for opp_name, wins in results.items():
-                    # wins[0] is AI wins; wins[1] and wins[2] are opponent wins
-                    combined_opp_wins = wins[1] + wins[2]
-                    total = wins[0] + combined_opp_wins
-                    ai_rate = wins[0] / total if total > 0 else 0.0
-                    opp_rate = combined_opp_wins / total if total > 0 else 0.0
-                    result_str = "Win" if ai_rate > 0.5 else "Loss"
-                    total_ai += wins[0]
-                    total_opp += combined_opp_wins
-                    row = f"""
-                    <tr>
-                        <td style="border: 1px solid #7289da; padding: 6px;">{opp_name}</td>
-                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{wins[0]}</td>
-                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{combined_opp_wins}</td>
-                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{ai_rate:.2%}</td>
-                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp_rate:.2%}</td>
-                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{result_str}</td>
-                    </tr>
-                    """
-                    html += row
-                # Add overall row
-                overall_total = total_ai + total_opp
-                overall_ai_rate = total_ai / overall_total if overall_total > 0 else 0.0
-                overall_opp_rate = total_opp / overall_total if overall_total > 0 else 0.0
-                overall_result = "Win" if overall_ai_rate > 0.5 else "Loss"
-                overall_row = f"""
-                <tr>
-                    <td style="border: 1px solid #7289da; padding: 6px;">Overall</td>
-                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{total_ai}</td>
-                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{total_opp}</td>
-                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_ai_rate:.2%}</td>
-                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_opp_rate:.2%}</td>
-                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_result}</td>
-                </tr>
-                """
-                html += overall_row
                 html += """
-                </tbody>
-                </table>
+                    <th style="border: 1px solid #7289da; padding: 8px;">Opponent Name</th>
+                    <th style="border: 1px solid #7289da; padding: 8px;">AI Wins</th>
+                    <th style="border: 1px solid #7289da; padding: 8px;">Combined Opponent Wins</th>
+                    <th style="border: 1px solid #7289da; padding: 8px;">AI Win Rate</th>
+                    <th style="border: 1px solid #7289da; padding: 8px;">Opponent Win Rate</th>
+                    <th style="border: 1px solid #7289da; padding: 8px;">Result</th>
                 """
             else:
-                # Normal mode: combine AI columns.
-                html = """
-                <table style="border: 1px solid #7289da; border-collapse: collapse; width: 100%;">
-                <thead>
-                    <tr style="background-color: #4f545c;">
-                        <th style="border: 1px solid #7289da; padding: 8px;">Opponent Name</th>
-                        <th style="border: 1px solid #7289da; padding: 8px;">Combined AI Wins</th>
-                        <th style="border: 1px solid #7289da; padding: 8px;">Opponent Wins</th>
-                        <th style="border: 1px solid #7289da; padding: 8px;">Combined AI Win Rate</th>
-                        <th style="border: 1px solid #7289da; padding: 8px;">Opponent Win Rate</th>
-                        <th style="border: 1px solid #7289da; padding: 8px;">Result</th>
-                    </tr>
-                </thead>
-                <tbody>
-                """
-                total_ai = total_opp = 0
-                for opp_name, wins in results.items():
-                    combined_ai_wins = wins[0] + wins[1]
-                    opp_wins = wins[2]
-                    total = combined_ai_wins + opp_wins
-                    ai_rate = combined_ai_wins / total if total > 0 else 0.0
-                    opp_rate = opp_wins / total if total > 0 else 0.0
-                    result_str = "Win" if ai_rate > 0.5 else "Loss"
-                    total_ai += combined_ai_wins
-                    total_opp += opp_wins
-                    row = f"""
-                    <tr>
-                        <td style="border: 1px solid #7289da; padding: 6px;">{opp_name}</td>
-                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{combined_ai_wins}</td>
-                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp_wins}</td>
-                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{ai_rate:.2%}</td>
-                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp_rate:.2%}</td>
-                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{result_str}</td>
-                    </tr>
-                    """
-                    html += row
-                # Add overall row
-                overall_total = total_ai + total_opp
-                overall_ai_rate = total_ai / overall_total if overall_total > 0 else 0.0
-                overall_opp_rate = total_opp / overall_total if overall_total > 0 else 0.0
-                overall_result = "Win" if overall_ai_rate > 0.5 else "Loss"
-                overall_row = f"""
-                <tr>
-                    <td style="border: 1px solid #7289da; padding: 6px;">Overall</td>
-                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{total_ai}</td>
-                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{total_opp}</td>
-                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_ai_rate:.2%}</td>
-                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_opp_rate:.2%}</td>
-                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_result}</td>
-                </tr>
-                """
-                html += overall_row
                 html += """
-                </tbody>
-                </table>
+                    <th style="border: 1px solid #7289da; padding: 8px;">Opponent Name</th>
+                    <th style="border: 1px solid #7289da; padding: 8px;">Combined AI Wins</th>
+                    <th style="border: 1px solid #7289da; padding: 8px;">Opponent Wins</th>
+                    <th style="border: 1px solid #7289da; padding: 8px;">Combined AI Win Rate</th>
+                    <th style="border: 1px solid #7289da; padding: 8px;">Opponent Win Rate</th>
+                    <th style="border: 1px solid #7289da; padding: 8px;">Result</th>
                 """
         else:
             if is_onev2 or is_duo:
-                # In 1v2 mode without combining, show separate opponent win columns.
-                html = """
-                <table style="border: 1px solid #7289da; border-collapse: collapse; width: 100%;">
-                <thead>
-                    <tr style="background-color: #4f545c;">
-                        <th style="border: 1px solid #7289da; padding: 8px;">Opponent Name</th>
-                        <th style="border: 1px solid #7289da; padding: 8px;">AI Wins</th>
-                        <th style="border: 1px solid #7289da; padding: 8px;">Opponent1 Wins</th>
-                        <th style="border: 1px solid #7289da; padding: 8px;">Opponent2 Wins</th>
-                        <th style="border: 1px solid #7289da; padding: 8px;">AI Win Rate</th>
-                        <th style="border: 1px solid #7289da; padding: 8px;">Opponent1 Win Rate</th>
-                        <th style="border: 1px solid #7289da; padding: 8px;">Opponent2 Win Rate</th>
-                        <th style="border: 1px solid #7289da; padding: 8px;">Result</th>
-                    </tr>
-                </thead>
-                <tbody>
-                """
-                total_ai = total_opp1 = total_opp2 = 0
-                for opp_name, wins in results.items():
-                    ai_wins, opp1_wins, opp2_wins = wins
-                    total = ai_wins + opp1_wins + opp2_wins
-                    ai_rate = ai_wins / total if total > 0 else 0.0
-                    opp1_rate = opp1_wins / total if total > 0 else 0.0
-                    opp2_rate = opp2_wins / total if total > 0 else 0.0
-                    total_ai += ai_wins
-                    total_opp1 += opp1_wins
-                    total_opp2 += opp2_wins
-                    row = f"""
-                    <tr>
-                        <td style="border: 1px solid #7289da; padding: 6px;">{opp_name}</td>
-                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{ai_wins}</td>
-                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp1_wins}</td>
-                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp2_wins}</td>
-                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{ai_rate:.2%}</td>
-                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp1_rate:.2%}</td>
-                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp2_rate:.2%}</td>
-                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{"Win" if ai_rate > 0.5 else "Loss"}</td>
-                    </tr>
-                    """
-                    html += row
-                # Add overall row
-                overall_total = total_ai + total_opp1 + total_opp2
-                overall_ai_rate = total_ai / overall_total if overall_total > 0 else 0.0
-                overall_opp1_rate = total_opp1 / overall_total if overall_total > 0 else 0.0
-                overall_opp2_rate = total_opp2 / overall_total if overall_total > 0 else 0.0
-                overall_result = "Win" if overall_ai_rate > 0.5 else "Loss"
-                overall_row = f"""
-                <tr>
-                    <td style="border: 1px solid #7289da; padding: 6px;">Overall</td>
-                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{total_ai}</td>
-                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{total_opp1}</td>
-                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{total_opp2}</td>
-                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_ai_rate:.2%}</td>
-                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_opp1_rate:.2%}</td>
-                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_opp2_rate:.2%}</td>
-                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_result}</td>
-                </tr>
-                """
-                html += overall_row
                 html += """
-                </tbody>
-                </table>
+                    <th style="border: 1px solid #7289da; padding: 8px;">Opponent Name</th>
+                    <th style="border: 1px solid #7289da; padding: 8px;">AI Wins</th>
+                    <th style="border: 1px solid #7289da; padding: 8px;">Opponent1 Wins</th>
+                    <th style="border: 1px solid #7289da; padding: 8px;">Opponent2 Wins</th>
+                    <th style="border: 1px solid #7289da; padding: 8px;">AI Win Rate</th>
+                    <th style="border: 1px solid #7289da; padding: 8px;">Opponent1 Win Rate</th>
+                    <th style="border: 1px solid #7289da; padding: 8px;">Opponent2 Win Rate</th>
+                    <th style="border: 1px solid #7289da; padding: 8px;">Result</th>
                 """
             else:
-                # Normal mode without combining: show separate AI win columns.
-                html = """
-                <table style="border: 1px solid #7289da; border-collapse: collapse; width: 100%;">
-                <thead>
-                    <tr style="background-color: #4f545c;">
-                        <th style="border: 1px solid #7289da; padding: 8px;">Opponent Name</th>
-                        <th style="border: 1px solid #7289da; padding: 8px;">AI1 Wins</th>
-                        <th style="border: 1px solid #7289da; padding: 8px;">AI2 Wins</th>
-                        <th style="border: 1px solid #7289da; padding: 8px;">Opponent Wins</th>
-                        <th style="border: 1px solid #7289da; padding: 8px;">AI1 Win Rate</th>
-                        <th style="border: 1px solid #7289da; padding: 8px;">AI2 Win Rate</th>
-                        <th style="border: 1px solid #7289da; padding: 8px;">Opponent Win Rate</th>
-                        <th style="border: 1px solid #7289da; padding: 8px;">Result</th>
-                    </tr>
-                </thead>
-                <tbody>
+                html += """
+                    <th style="border: 1px solid #7289da; padding: 8px;">Opponent Name</th>
+                    <th style="border: 1px solid #7289da; padding: 8px;">AI1 Wins</th>
+                    <th style="border: 1px solid #7289da; padding: 8px;">AI2 Wins</th>
+                    <th style="border: 1px solid #7289da; padding: 8px;">Opponent Wins</th>
+                    <th style="border: 1px solid #7289da; padding: 8px;">AI1 Win Rate</th>
+                    <th style="border: 1px solid #7289da; padding: 8px;">AI2 Win Rate</th>
+                    <th style="border: 1px solid #7289da; padding: 8px;">Opponent Win Rate</th>
+                    <th style="border: 1px solid #7289da; padding: 8px;">Result</th>
                 """
-                total_ai1 = total_ai2 = total_opp = 0
-                for opp_name, wins in results.items():
-                    ai1_wins, ai2_wins, opp_wins = wins
-                    total = ai1_wins + ai2_wins + opp_wins
-                    rate1 = ai1_wins / total if total > 0 else 0.0
-                    rate2 = ai2_wins / total if total > 0 else 0.0
-                    opp_rate = opp_wins / total if total > 0 else 0.0
-                    total_ai1 += ai1_wins
-                    total_ai2 += ai2_wins
-                    total_opp += opp_wins
-                    combined_rate = (ai1_wins + ai2_wins) / total if total > 0 else 0.0
-                    row = f"""
-                    <tr>
-                        <td style="border: 1px solid #7289da; padding: 6px;">{opp_name}</td>
-                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{ai1_wins}</td>
-                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{ai2_wins}</td>
-                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp_wins}</td>
-                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{rate1:.2%}</td>
-                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{rate2:.2%}</td>
-                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{opp_rate:.2%}</td>
-                        <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{"Win" if combined_rate > 0.5 else "Loss"}</td>
-                    </tr>
-                    """
-                    html += row
-                # Add overall row
-                overall_total = total_ai1 + total_ai2 + total_opp
-                overall_rate1 = total_ai1 / overall_total if overall_total > 0 else 0.0
-                overall_rate2 = total_ai2 / overall_total if overall_total > 0 else 0.0
-                overall_opp_rate = total_opp / overall_total if overall_total > 0 else 0.0
-                overall_combined_rate = (total_ai1 + total_ai2) / overall_total if overall_total > 0 else 0.0
-                overall_result = "Win" if overall_combined_rate > 0.5 else "Loss"
-                overall_row = f"""
+
+        html += """
+            </tr>
+        </thead>
+        <tbody>
+        """
+
+        # Rows
+        for opp_name, wins in results.items():
+            # Unpack & compute per-mode values
+            if combine:
+                if is_onev2 or is_duo:
+                    ai_wins = wins[0]
+                    opp_wins = wins[1] + wins[2]
+                else:
+                    ai_wins = wins[0] + wins[1]
+                    opp_wins = wins[2]
+            else:
+                if is_onev2 or is_duo:
+                    ai_wins = wins[0]
+                    opp1_wins, opp2_wins = wins[1], wins[2]
+                    opp_wins = opp1_wins + opp2_wins
+                else:
+                    ai_wins = wins[0] + wins[1]
+                    opp_wins = wins[2]
+
+            total_games = ai_wins + opp_wins
+            ai_rate = ai_wins / total_games if total_games else 0.0
+            opp_rate = 1 - ai_rate if total_games else 0.0
+            result_str = "Win" if ai_rate > 0.5 else "Loss"
+
+            # Update totals
+            total_ai += ai_wins
+            total_opp += opp_wins
+
+            # Track minimum rate
+            if total_games and ai_rate < min_rate:
+                min_rate = ai_rate
+                min_opp = opp_name
+
+            # Build the row HTML
+            if combine and is_onev2 or combine and is_duo:
+                html += f"""
                 <tr>
-                    <td style="border: 1px solid #7289da; padding: 6px;">Overall</td>
-                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{total_ai1}</td>
-                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{total_ai2}</td>
-                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{total_opp}</td>
-                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_rate1:.2%}</td>
-                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_rate2:.2%}</td>
-                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_opp_rate:.2%}</td>
-                    <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">{overall_result}</td>
+                    <td style="border:1px solid #7289da;padding:6px;">{opp_name}</td>
+                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{ai_wins}</td>
+                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{opp_wins}</td>
+                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{ai_rate:.2%}</td>
+                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{opp_rate:.2%}</td>
+                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{result_str}</td>
                 </tr>
                 """
-                html += overall_row
-                html += """
-                </tbody>
-                </table>
+            elif combine:
+                html += f"""
+                <tr>
+                    <td style="border:1px solid #7289da;padding:6px;">{opp_name}</td>
+                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{ai_wins}</td>
+                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{opp_wins}</td>
+                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{ai_rate:.2%}</td>
+                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{opp_rate:.2%}</td>
+                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{result_str}</td>
+                </tr>
                 """
+            elif is_onev2 or is_duo:
+                # Need opp1_wins and opp2_wins unpacked again
+                ai_wins = wins[0]
+                opp1_wins, opp2_wins = wins[1], wins[2]
+                rate1 = ai_wins / total_games if total_games else 0.0
+                rate2 = opp1_wins / total_games if total_games else 0.0
+                rate3 = opp2_wins / total_games if total_games else 0.0
+                html += f"""
+                <tr>
+                    <td style="border:1px solid #7289da;padding:6px;">{opp_name}</td>
+                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{ai_wins}</td>
+                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{opp1_wins}</td>
+                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{opp2_wins}</td>
+                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{rate1:.2%}</td>
+                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{rate2:.2%}</td>
+                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{rate3:.2%}</td>
+                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{result_str}</td>
+                </tr>
+                """
+            else:
+                ai1_wins, ai2_wins = wins[0], wins[1]
+                rate1 = ai1_wins / total_games if total_games else 0.0
+                rate2 = ai2_wins / total_games if total_games else 0.0
+                html += f"""
+                <tr>
+                    <td style="border:1px solid #7289da;padding:6px;">{opp_name}</td>
+                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{ai1_wins}</td>
+                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{ai2_wins}</td>
+                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{opp_wins}</td>
+                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{rate1:.2%}</td>
+                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{rate2:.2%}</td>
+                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{opp_rate:.2%}</td>
+                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{result_str}</td>
+                </tr>
+                """
+
+        # Overall row
+        overall_total = total_ai + total_opp
+        overall_rate = total_ai / overall_total if overall_total else 0.0
+        overall_result = "Win" if overall_rate > 0.5 else "Loss"
+        html += f"""
+        <tr>
+            <td style="border:1px solid #7289da;padding:6px;">Overall</td>
+            <td style="border:1px solid #7289da;padding:6px;text-align:center;">{total_ai}</td>
+            <td style="border:1px solid #7289da;padding:6px;text-align:center;">{total_opp}</td>
+            <td style="border:1px solid #7289da;padding:6px;text-align:center;">{overall_rate:.2%}</td>
+            <td style="border:1px solid #7289da;padding:6px;text-align:center;">{overall_result}</td>
+        </tr>
+        """
+
+        # Min Win Rate row
+        if min_opp is not None:
+            min_result = "Win" if min_rate > 0.5 else "Loss"
+            html += f"""
+            <tr style="background-color:#2f3136;">
+                <td style="border:1px solid #7289da;padding:6px;color:#fff;">Lowest AI Win Rate vs</td>
+                <td style="border:1px solid #7289da;padding:6px;color:#fff;">{min_opp}</td>
+                <td style="border:1px solid #7289da;padding:6px;text-align:center;color:#fff;" colspan="2">{min_rate:.2%}</td>
+                <td style="border:1px solid #7289da;padding:6px;text-align:center;color:#fff;">{min_result}</td>
+            </tr>
+            """
+
+        # Close table
+        html += """
+        </tbody>
+        </table>
+        """
+
         self.results_text.setHtml(html)
         
     def update_results_display(self):
