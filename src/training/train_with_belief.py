@@ -311,7 +311,7 @@ def train_with_belief_space_policy(env, device, num_episodes=10000, load_checkpo
     opponent_agents = ['player_1', 'player_2']
     
     # Get observation dimension - use regular new observation format, not newer
-    sample_obs = env.observe(env.agents[0], new=True)[env.agents[0]]
+    sample_obs = env.observe(env.agents[0], newer=True)[env.agents[0]]
     obs_dim = sample_obs.shape[0]
     action_dim = env.action_spaces[env.agents[0]].n
     
@@ -608,7 +608,7 @@ def train_with_belief_space_policy(env, device, num_episodes=10000, load_checkpo
                 continue
             
             # Get BOTH observation formats
-            observation_dict_new = env.observe(agent, new=True)
+            observation_dict_new = env.observe(agent, newer=True)
             observation_new = observation_dict_new[agent]
             observation_dict_old = env.observe(agent, new=False)
             observation_old = observation_dict_old[agent]
