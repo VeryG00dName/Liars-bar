@@ -4,7 +4,7 @@ import pprint
 
 def main():
     # Path to the pickle file (adjust the path if needed)
-    filename = "ps_data/ps_data_checkpoint_70000.pkl"
+    filename = "ps_data/ps_v3_data/ps_data_240000_v3.pkl"
     
     # Load the data from the pickle file
     try:
