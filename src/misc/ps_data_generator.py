@@ -358,7 +358,8 @@ def generate_data(
                     "opponent_types": [opp_info["name"] for agent, opp_info in current_opponents.items()],
                     "step": episode_step,
                     "episode": episode,
-                    "source": action_source
+                    "source": action_source,
+                    "opponents_action": None
                 }
                 
                 # Append to episode data
@@ -410,7 +411,8 @@ def generate_data(
                     
                     action_source = f"Opponent Model ({current_opponents[current_agent]['name']})"
                     env.step(best_action)
-            
+                    if episode_data:
+                        episode_data[-1]["opponents_action"] = best_action
         episode_result = 1.0 if env.winner == training_agent else -1.0
         
         if env.winner == training_agent:
