@@ -508,6 +508,7 @@ def get_newer_observations(env, agent_specific=None):
         # Concatenate in the following order:
         # [hand_vector (2), last_actions (num_players-1), active_players (num_players)]
         obs = np.concatenate([hand_vector, last_actions, active_players], axis=0)
+        obs = np.round(obs, 2)
         observations[agent] = obs
     return observations
 
