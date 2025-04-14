@@ -1,0 +1,373 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class AutoregressiveGameModel(nn.Module):
+    """
+    Autoregressive model for Liar's Deck that predicts next actions sequentially.
+    
+    The model takes a round sequence history and predicts the next action in the sequence.
+    It can handle both agent actions and opponent actions, with special handling for opponent
+    actions where only card counts may be observed during evaluation.
+    
+    Features:
+    - Transformer-based architecture for sequence modeling
+    - Separate embeddings for observations, actions, agent types, and positions
+    - Support for variable-length sequences with causal masking
+    - Action prediction with proper masking of invalid actions
+    - Support for both explicit actions (0-6) and card count actions (7-10)
+    """
+    def __init__(self, 
+                 obs_dim, 
+                 action_dim=7,
+                 belief_dim=20,
+                 hidden_dim=256, 
+                 num_heads=8,
+                 num_layers=4,
+                 dropout_rate=0.1,
+                 max_seq_length=50):
+        """
+        Initialize the autoregressive game model.
+        
+        Args:
+            obs_dim: Dimension of observation vectors
+            action_dim: Number of possible actions (typically 7 for Liar's Deck)
+            belief_dim: Dimension of belief vectors (if None, belief encoder is not used)
+            hidden_dim: Hidden dimension for transformer and other layers
+            num_heads: Number of attention heads in transformer
+            num_layers: Number of transformer layers
+            dropout_rate: Dropout rate for regularization
+            max_seq_length: Maximum sequence length to support
+        """
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.action_dim = action_dim
+        self.belief_dim = belief_dim
+        self.hidden_dim = hidden_dim
+        self.max_seq_length = max_seq_length
+        
+        # Extended action space for card counts and challenge token
+        # Regular actions: 0-6
+        # Card count representations: 7=1 card, 8=2 cards, 9=3 cards, 10=Challenge
+        self.extended_action_dim = action_dim + 4
+        
+        # === Input Encoders ===
+        # Observation encoder (only for training agent turns)
+        self.obs_encoder = nn.Sequential(
+            nn.Linear(obs_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout_rate)
+        )
+        
+        # Belief encoder for external beliefs from a separate belief model
+        if belief_dim is not None:
+            self.belief_encoder = nn.Sequential(
+                nn.Linear(belief_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout_rate)
+            )
+        else:
+            self.belief_encoder = None
+        
+        # === Embeddings ===
+        # Action embedding (includes special tokens for card count)
+        self.action_embedding = nn.Embedding(self.extended_action_dim, hidden_dim)
+        
+        # Agent type embedding (0=training agent, 1=opponent)
+        self.agent_embedding = nn.Embedding(2, hidden_dim)
+        
+        # Position embedding for sequence positions
+        self.position_embedding = nn.Embedding(max_seq_length, hidden_dim)
+        
+        # === Transformer Encoder ===
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout_rate,
+            activation='gelu',
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer=encoder_layer,
+            num_layers=num_layers
+        )
+        
+        # === Output Heads ===
+        # Main output: predict actions in original action space (0-6)
+        self.action_head = nn.Linear(hidden_dim, action_dim)
+        
+        # Secondary output: predict extended actions including card counts (0-10)
+        self.extended_action_head = nn.Linear(hidden_dim, self.extended_action_dim)
+        
+        # Value prediction head
+        self.value_head = nn.Linear(hidden_dim, 1)
+        
+        # === Null/Padding Token ===
+        # Learnable null token for padding (initialized as zeros)
+        self.null_token = nn.Parameter(torch.zeros(hidden_dim))
+    
+    def _encode_inputs(self, obs_sequence, belief_sequence, action_sequence, 
+                      agent_types, positions, action_masks=None):
+        """
+        Encode all inputs into a unified sequence representation.
+        
+        Args:
+            obs_sequence: Tensor of shape [batch_size, seq_len, obs_dim] or None for steps
+            belief_sequence: Tensor of shape [batch_size, seq_len, belief_dim] or None
+            action_sequence: Tensor of shape [batch_size, seq_len] - previous actions
+            agent_types: Tensor of shape [batch_size, seq_len] - 0=training agent, 1=opponent
+            positions: Tensor of shape [batch_size, seq_len] - positions in sequence
+            action_masks: Tensor of shape [batch_size, seq_len, action_dim] or None
+        
+        Returns:
+            Tensor of shape [batch_size, seq_len, hidden_dim]
+        """
+        batch_size, seq_len = action_sequence.shape
+        device = action_sequence.device
+        
+        # Initialize combined representation with zeros
+        combined = torch.zeros(batch_size, seq_len, self.hidden_dim, device=device)
+        
+        # 1. Embed actions (all steps)
+        action_embedded = self.action_embedding(action_sequence)
+        combined = combined + action_embedded
+        
+        # 2. Embed agent types (all steps)
+        agent_embedded = self.agent_embedding(agent_types)
+        combined = combined + agent_embedded
+        
+        # 3. Embed positions (all steps)
+        position_embedded = self.position_embedding(positions)
+        combined = combined + position_embedded
+        
+        # 4. Encode observations (only for training agent turns)
+        if obs_sequence is not None:
+            # Create a mask for training agent turns
+            training_agent_mask = (agent_types == 0).unsqueeze(-1)
+            
+            # Encode observations
+            obs_encoded = self.obs_encoder(obs_sequence)
+            
+            # Only add observation encoding for training agent turns
+            combined = combined + (obs_encoded * training_agent_mask)
+        
+        # 5. Encode beliefs (if provided)
+        if belief_sequence is not None and self.belief_encoder is not None:
+            belief_encoded = self.belief_encoder(belief_sequence)
+            combined = combined + belief_encoded
+        
+        return combined
+    
+    def _generate_causal_mask(self, seq_len, device):
+        """
+        Generate a causal mask for transformer to prevent looking at future tokens.
+        
+        Args:
+            seq_len: Length of the sequence
+            device: Device to place the mask on
+        
+        Returns:
+            Tensor of shape [seq_len, seq_len] with 1s in upper triangle
+        """
+        # Create a mask that prevents attending to future positions
+        return torch.triu(
+            torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
+            diagonal=1
+        )
+    
+    def _generate_padding_mask(self, seq_len, valid_lens, device):
+        """
+        Generate padding mask for sequences of different lengths.
+        
+        Args:
+            seq_len: Maximum sequence length
+            valid_lens: Tensor of shape [batch_size] with valid lengths
+            device: Device to place the mask on
+        
+        Returns:
+            Tensor of shape [batch_size, seq_len] with True for padding positions
+        """
+        batch_size = valid_lens.size(0)
+        mask = torch.arange(seq_len, device=device).expand(batch_size, seq_len) >= valid_lens.unsqueeze(1)
+        return mask
+    
+    def forward(self, obs_sequence=None, belief_sequence=None, action_sequence=None, 
+                agent_types=None, positions=None, action_masks=None, valid_lengths=None):
+        """
+        Forward pass through the model.
+        
+        Args:
+            obs_sequence: Tensor of observations [batch_size, seq_len, obs_dim] or None
+            belief_sequence: Tensor of beliefs [batch_size, seq_len, belief_dim] or None
+            action_sequence: Tensor of previous actions [batch_size, seq_len]
+            agent_types: Tensor indicating agent type [batch_size, seq_len] (0=ours, 1=opponent)
+            positions: Tensor of positions in sequence [batch_size, seq_len]
+            action_masks: Tensor of action masks [batch_size, seq_len, action_dim] or None
+            valid_lengths: Tensor of valid sequence lengths [batch_size] or None
+        
+        Returns:
+            tuple: (action_logits, extended_action_logits, state_values)
+                action_logits: Tensor of shape [batch_size, seq_len, action_dim]
+                extended_action_logits: Tensor of shape [batch_size, seq_len, extended_action_dim]
+                state_values: Tensor of shape [batch_size, seq_len, 1]
+        """
+        batch_size, seq_len = action_sequence.shape
+        device = action_sequence.device
+        
+        # 1. Encode all inputs
+        encoded_inputs = self._encode_inputs(
+            obs_sequence, belief_sequence, action_sequence, 
+            agent_types, positions, action_masks
+        )
+        
+        # 2. Generate attention masks
+        # Causal mask to prevent looking at future tokens
+        causal_mask = self._generate_causal_mask(seq_len, device)
+        
+        # Padding mask for variable length sequences (if provided)
+        padding_mask = None
+        if valid_lengths is not None:
+            padding_mask = self._generate_padding_mask(seq_len, valid_lengths, device)
+        
+        # 3. Process through transformer
+        transformer_output = self.transformer(
+            encoded_inputs,
+            mask=causal_mask,
+            src_key_padding_mask=padding_mask
+        )
+        
+        # 4. Generate outputs
+        # Standard action predictions (0-6)
+        action_logits = self.action_head(transformer_output)
+        
+        # Extended action predictions (0-10, including card counts)
+        extended_action_logits = self.extended_action_head(transformer_output)
+        
+        # Value predictions
+        state_values = self.value_head(transformer_output)
+        
+        # Apply action masks if provided
+        if action_masks is not None:
+            action_logits = action_logits.masked_fill(~action_masks.bool(), float('-inf'))
+        
+        return action_logits, extended_action_logits, state_values
+    
+    def predict_next_action(self, sequence_data, agent_type, valid_actions_mask=None):
+        """
+        Predict the next action given the sequence history.
+        
+        Args:
+            sequence_data: Dictionary containing sequence data:
+                obs_sequence: Tensor of observations [1, seq_len, obs_dim] or None
+                belief_sequence: Tensor of beliefs [1, seq_len, belief_dim] or None
+                action_sequence: Tensor of previous actions [1, seq_len]
+                agent_types: Tensor indicating agent type [1, seq_len] (0=ours, 1=opponent)
+                positions: Tensor of positions in sequence [1, seq_len]
+            agent_type: 0 for training agent, 1 for opponent
+            valid_actions_mask: Tensor of valid actions [1, action_dim] or None
+        
+        Returns:
+            tuple: (best_action, action_probs)
+                best_action: Integer representing the best action
+                action_probs: Tensor of action probabilities [action_dim]
+        """
+        # Set model to evaluation mode
+        self.eval()
+        
+        with torch.no_grad():
+            # Extract sequence data
+            obs_sequence = sequence_data.get('obs_sequence')
+            belief_sequence = sequence_data.get('belief_sequence')
+            action_sequence = sequence_data['action_sequence']
+            agent_types = sequence_data['agent_types']
+            positions = sequence_data['positions']
+            
+            # Get the current sequence length
+            seq_len = action_sequence.shape[1]
+            
+            # Run forward pass
+            action_logits, extended_action_logits, _ = self.forward(
+                obs_sequence, belief_sequence, action_sequence, 
+                agent_types, positions
+            )
+            
+            # Get predictions for the last position
+            last_step_logits = action_logits[0, -1]
+            
+            # If it's an opponent turn, we might want to use extended action space
+            if agent_type == 1:  # opponent
+                last_step_logits = extended_action_logits[0, -1]
+            
+            # Apply action mask if provided
+            if valid_actions_mask is not None:
+                last_step_logits = last_step_logits.masked_fill(
+                    ~valid_actions_mask.bool(), float('-inf')
+                )
+            
+            # Get probabilities
+            action_probs = F.softmax(last_step_logits, dim=-1)
+            
+            # Get best action
+            best_action = torch.argmax(action_probs, dim=-1).item()
+            
+            return best_action, action_probs
+    
+    def sample_action(self, sequence_data, agent_type, valid_actions_mask=None, temperature=1.0):
+        """
+        Sample an action given the sequence history.
+        
+        Args:
+            sequence_data: Dictionary containing sequence data
+            agent_type: 0 for training agent, 1 for opponent
+            valid_actions_mask: Tensor of valid actions [1, action_dim] or None
+            temperature: Temperature parameter for sampling (higher = more random)
+        
+        Returns:
+            tuple: (sampled_action, action_probs)
+                sampled_action: Integer representing the sampled action
+                action_probs: Tensor of action probabilities [action_dim]
+        """
+        self.eval()
+        
+        with torch.no_grad():
+            # Extract sequence data
+            obs_sequence = sequence_data.get('obs_sequence')
+            belief_sequence = sequence_data.get('belief_sequence')
+            action_sequence = sequence_data['action_sequence']
+            agent_types = sequence_data['agent_types']
+            positions = sequence_data['positions']
+            
+            # Run forward pass
+            action_logits, extended_action_logits, _ = self.forward(
+                obs_sequence, belief_sequence, action_sequence, 
+                agent_types, positions
+            )
+            
+            # Get predictions for the last position
+            last_step_logits = action_logits[0, -1]
+            
+            # If it's an opponent turn, we might want to use extended action space
+            if agent_type == 1:  # opponent
+                last_step_logits = extended_action_logits[0, -1]
+            
+            # Apply action mask if provided
+            if valid_actions_mask is not None:
+                last_step_logits = last_step_logits.masked_fill(
+                    ~valid_actions_mask.bool(), float('-inf')
+                )
+            
+            # Apply temperature
+            if temperature != 1.0:
+                last_step_logits = last_step_logits / temperature
+            
+            # Get probabilities
+            action_probs = F.softmax(last_step_logits, dim=-1)
+            
+            # Sample action
+            action_distribution = torch.distributions.Categorical(action_probs)
+            sampled_action = action_distribution.sample().item()
+            
+            return sampled_action, action_probs
