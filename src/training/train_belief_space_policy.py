@@ -175,7 +175,7 @@ class PSDataset(Dataset):
         for i, sample in enumerate(tqdm(data, desc="Processing samples")):
             # Load observation as NumPy array first for shape check and trimming
             observation_np = np.array(sample['observation'], dtype=np.float32)
-
+            observation_np = np.round(observation_np, 2)
             # Check if observation has 9 dimensions and trim if necessary
             if observation_np.shape[0] == 9:
                 observation_np = observation_np[:-2] # Trim the last two elements
