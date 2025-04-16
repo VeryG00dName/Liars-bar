@@ -128,7 +128,7 @@ def main():
     parser.add_argument("--data_dir", type=str, default=config.CHECKPOINT_DIR,
                         help="Directory where transformer training data files are stored")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for evaluation")
-    parser.add_argument("--max_seq_length", type=int, default=config.MAX_SQUENCE_LENGTH, help="Max sequence length for belief model")
+    parser.add_argument("--max_seq_length", type=int, default=config.MAX_SEQUENCE_LENGTH, help="Max sequence length for belief model")
     parser.add_argument("--device", type=str, default=config.DEVICE, help="Device for evaluation")
     parser.add_argument("--checkpoint_file", type=str, default="opponent_belief_model.pth",
                         help="Checkpoint file for the OpponentBeliefModel")
