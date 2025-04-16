@@ -87,7 +87,7 @@ class AutoregressiveAgent(BaseAgent):
         # --- Infer dimensions ---
         inferred_hidden_dim = None; inferred_action_dim = None; inferred_ext_action_dim = None
         inferred_obs_dim = None; inferred_max_seq = None
-        default_num_heads = 8 # Default number of heads used in model constructor
+        default_num_heads = 4 # Default number of heads used in model constructor
 
         try:
             # Infer hidden dim (embedding dimension)
@@ -160,8 +160,8 @@ class AutoregressiveAgent(BaseAgent):
                   obs_dim=self.obs_dim, action_dim=self.action_dim, belief_dim=self.belief_dim,
                   hidden_dim=self.hidden_dim, # Use validated hidden_dim
                   num_heads=default_num_heads, # Use the hardcoded default
-                  num_layers=4, # Assuming 4 layers is default
-                  max_seq_length=self.max_seq_length
+                  num_layers=2, # Assuming 4 layers is default
+                  max_seq_length=20
              ).to(self.device)
         except TypeError as e: logger.error(...); raise e
 
@@ -251,8 +251,6 @@ class AutoregressiveAgent(BaseAgent):
 
         # Populate tensors
         for i, step_data in enumerate(history):
-             action_to_use = step_data.get("masked_action", step_data.get("action", 0))
-             action_seq[0, i] = action_to_use
              hist_agent_id = step_data["agent_id_env"]
              hist_agent_type = self.env_agent_id_map.get(hist_agent_id, 1)
              agent_type_seq[0, i] = hist_agent_type
@@ -278,285 +276,251 @@ class AutoregressiveAgent(BaseAgent):
             'valid_lengths': torch.tensor([valid_len], device=self.device) if valid_len < max_len else None
         }
 
-    def get_action(self, env, agent_id_env: str, observation: Dict[str, Any], info: Dict[str, Any], cheat_expert_index: Optional[Any] = None) -> int:
-        if self.model is None: 
+    def get_action(
+                        self,
+                        env,
+                        agent_id_env: str,
+                        observation: Dict[str, Any],
+                        info: Dict[str, Any],
+                        cheat_expert_index: Optional[Any] = None
+                    ) -> int:
+        if self.model is None:
             raise RuntimeError(f"AR model not loaded for {self.player_id}")
-
         logger = logging.getLogger(__name__)
-        
-        # Initialize agent mapping and beliefs if first call
-        if self.env_agent_id_map is None:
-            self.env_agent_id_map = {pid: 0 if pid == agent_id_env else 1 for pid in env.possible_agents}
-            # Note: belief_state will now be lazily initialized inside our turn update below
 
-        # --- 1. Update Masking for PREVIOUS Opponent Step (if any) ---
-        last_agent_took_turn = env.last_action_agent
-        if self.sequence_history and last_agent_took_turn != agent_id_env:
-            # Find the history entry for the opponent's last turn
-            prev_step_index = -1
-            for i in range(len(self.sequence_history) - 1, -1, -1):
-                if self.sequence_history[i]["agent_id_env"] == last_agent_took_turn:
-                    prev_step_index = i
+        # --- Initialize mapping on first call ---
+        if self.env_agent_id_map is None:
+            self.env_agent_id_map = {
+                pid: 0 if pid == agent_id_env else 1
+                for pid in env.possible_agents
+            }
+
+        # --- 1. Update masking for the two most recent opponent turns ---
+        prev_opps = []
+        for entry in reversed(self.sequence_history):
+            opp = entry["agent_id_env"]
+            if opp != agent_id_env and opp not in prev_opps:
+                prev_opps.append(opp)
+                if len(prev_opps) == 2:
                     break
 
-            if prev_step_index != -1:
-                prev_step_data = self.sequence_history[prev_step_index]
-                last_raw_action = env.last_action  # Use env's record of the action index
-                last_played_cards = env.last_played_cards.get(last_agent_took_turn, [])
-                actual_cards_played_count = len(last_played_cards)
+        for idx, opp_id in enumerate(prev_opps, start=1):
+            prev_idx = next(
+                (i for i in range(len(self.sequence_history) - 1, -1, -1)
+                if self.sequence_history[i]["agent_id_env"] == opp_id),
+                None
+            )
+            if prev_idx is None or prev_idx == 0:
+                continue
+            prev_data = self.sequence_history[prev_idx]
 
-                # Retrieve the prediction made before the opponent's turn
-                prediction_made_at_step = prev_step_index - 1
-                predicted_action = None
-                if prediction_made_at_step >= 0:
-                    predicted_action = self.sequence_history[prediction_made_at_step].get("predicted_action_for_opp1")
+            raw_action = env.last_actions.get(opp_id, None)
+            pred_key = f"predicted_action_for_opp{idx}"
+            predicted = self.sequence_history[prev_idx - 1].get(pred_key)
 
-                # Decode actions to compare
-                prev_action_type, _, _ = decode_action(last_raw_action)
-                predicted_type, _, predicted_count = decode_action(predicted_action) if predicted_action is not None else (None, None, None)
+            real_type, _, real_count = decode_action(raw_action)
+            pred_type, _, pred_count = decode_action(predicted) if predicted is not None else (None, None, None)
+            masked_value = raw_action
 
-                masked_act_value_to_use = last_raw_action  # Default to actual action
+            if real_type == "Play":
+                if predicted is not None and pred_type == "Play" and pred_count == real_count:
+                    masked_value = predicted
+                else:
+                    mapped = self.CARD_COUNT_MAPPING.get(real_count)
+                    if mapped is not None:
+                        masked_value = mapped
+            elif real_type == "Challenge":
+                masked_value = self.CHALLENGE_REPRESENTATION
 
-                if prev_action_type == "Play":
-                    # Check if prediction count matches actual count
-                    if (predicted_action is not None and 
-                        predicted_type == "Play" and 
-                        predicted_count == actual_cards_played_count):
-                        # Use the prediction since its card count matches actual cards played
-                        masked_act_value_to_use = predicted_action
-                        logger.debug(f"Agent {self.player_id}: Using prediction {predicted_action} for prev opp {last_agent_took_turn} "
-                                    f"(Pred count {predicted_count} == Actual {actual_cards_played_count})")
+            prev_data["masked_action"] = masked_value
+            logger.debug(f"Masking opp{idx} turn: raw={raw_action}, pred={predicted} -> using {masked_value}")
+
+            if raw_action == 6:
+                logger.debug(f"Agent {self.player_id}: reset history on challenge from {opp_id}")
+                self.sequence_history.clear()
+                self.last_opponent_claim = None
+                break
+
+        # --- 2. PREPARE CURRENT STEP: Observation, Action Mask & Belief ---
+        current_step_info = {
+            "agent_id_env": agent_id_env,
+            "step_in_round": len(self.sequence_history)
+        }
+
+        # 2a) fresh observation
+        fresh_obs = env.observe(agent_id_env, newer=True)[agent_id_env]
+        current_step_info["observation"] = list(fresh_obs)
+
+        # 2b) action mask
+        if isinstance(info.get("action_mask"), (list, np.ndarray)):
+            current_step_info["action_mask"] = list(info.get("action_mask"))
+
+        # 2c) belief for each opponent
+        opponent_beliefs_list = []
+        opponent_peak_beliefs = {}
+        original_opponents = sorted([p for p in env.possible_agents if p != agent_id_env])
+        opp_id_to_cheat_tuple_idx = {opp: i for i, opp in enumerate(original_opponents)}
+
+        if self.belief_state is None:
+            self.belief_state = {}
+
+        for opp_id in original_opponents:
+            # ensure we have a belief vector
+            if opp_id not in self.belief_state:
+                self.belief_state[opp_id] = np.ones(self.num_opponent_types, dtype=np.float32) / self.num_opponent_types
+
+            if env.terminations.get(opp_id, False):
+                current_belief_np = self.belief_state[opp_id]
+                opponent_peak_beliefs[opp_id] = {
+                    "expert_index": int(np.argmax(current_belief_np)),
+                    "source": "terminated"
+                }
+            else:
+                # Decide whether to apply cheat
+                apply_cheat = False
+                cheat_idx_to_use = None
+                if cheat_expert_index is not None:
+                    temp_cheat_idx = None
+                    source = "unknown"
+                    original_idx = opp_id_to_cheat_tuple_idx.get(opp_id)
+
+                    if isinstance(cheat_expert_index, (tuple, list)):
+                        source = f"tuple[{original_idx}]"
+                        if original_idx is not None and original_idx < len(cheat_expert_index):
+                            temp_cheat_idx = cheat_expert_index[original_idx]
+                        else:
+                            logger.warning(f"Cannot get cheat index for {opp_id} (mapped_idx={original_idx}).")
+                    elif isinstance(cheat_expert_index, int):
+                        source = "scalar"
+                        temp_cheat_idx = cheat_expert_index
                     else:
-                        # Use card count representation since prediction doesn't match
-                        mapped_count_action = self.CARD_COUNT_MAPPING.get(actual_cards_played_count)
-                        if mapped_count_action is not None:
-                            masked_act_value_to_use = mapped_count_action
-                        logger.debug(f"Agent {self.player_id}: Using card count {actual_cards_played_count} for prev opp {last_agent_took_turn} "
-                                    f"(Pred was {predicted_action} -> Count {predicted_count})")
-                elif prev_action_type == "Challenge":
-                    masked_act_value_to_use = self.CHALLENGE_REPRESENTATION
-                    logger.debug(f"Agent {self.player_id}: Using CHALLENGE representation for prev opp {last_agent_took_turn}")
+                        logger.warning(f"Invalid cheat type: {type(cheat_expert_index)}")
 
-                # Update the history entry with masked action
-                prev_step_data["masked_action"] = masked_act_value_to_use
-                logger.debug(f"Agent {self.player_id}: Updated history step {prev_step_index} masked action to {masked_act_value_to_use}")
+                    if isinstance(temp_cheat_idx, int):
+                        if 0 <= temp_cheat_idx < self.num_opponent_types:
+                            apply_cheat = True
+                            cheat_idx_to_use = temp_cheat_idx
+                            logger.debug(
+                                f"Agent {self.player_id}: Applying CHEAT index {cheat_idx_to_use} "
+                                f"(from {source}) for active opp {opp_id}."
+                            )
+                        else:
+                            logger.warning(
+                                f"Cheat index {temp_cheat_idx} (from {source}) OOB for {opp_id}. Using fallback 0."
+                            )
+                            apply_cheat = True
+                            cheat_idx_to_use = 0
+                    elif temp_cheat_idx is None and isinstance(cheat_expert_index, (tuple, list)):
+                        logger.debug(
+                            f"Agent {self.player_id}: Cheat index was None (from {source}) for opp {opp_id}. NOT applying cheat."
+                        )
+                        apply_cheat = False
+                    else:
+                        apply_cheat = False
 
-        # --- 2. FORWARD PASS #1: Predict OUR OWN Action ---
-        logger.debug(f"AR Agent {self.player_id}: Predicting own action (History len: {len(self.sequence_history)})")
-        # Prepare input based on current history (including updated masks)
+                # Update belief
+                if apply_cheat:
+                    artificial = np.zeros(self.num_opponent_types, dtype=np.float32)
+                    artificial[cheat_idx_to_use] = 1.0
+                    self.belief_state[opp_id] = artificial
+                    current_belief_np = artificial
+                    opponent_peak_beliefs[opp_id] = {"expert_index": cheat_idx_to_use, "source": "cheat"}
+                    logger.debug(
+                        f"Agent {self.player_id}: Belief for {opp_id} SET BY CHEAT to index {cheat_idx_to_use}."
+                    )
+                elif self.belief_model is not None:
+                    logger.debug(f"Agent {self.player_id}: Updating belief via MODEL for active opp {opp_id}.")
+                    self._update_belief(agent_id_env, opp_id)
+                    current_belief_np = self.belief_state[opp_id]
+                    opponent_peak_beliefs[opp_id] = {
+                        "expert_index": int(np.argmax(current_belief_np)),
+                        "source": "model"
+                    }
+                else:
+                    logger.debug(f"Agent {self.player_id}: Keeping UNIFORM belief for active opp {opp_id}.")
+                    current_belief_np = self.belief_state[opp_id]
+                    opponent_peak_beliefs[opp_id] = {
+                        "expert_index": int(np.argmax(current_belief_np)),
+                        "source": "uniform"
+                    }
+
+            log_b = ", ".join(f"{b:.2f}" for b in current_belief_np)
+            logger.debug(f"Agent {self.player_id}: Final belief for {opp_id}: [{log_b}]")
+            opponent_beliefs_list.append(current_belief_np)
+
+        # pad/truncate opponent beliefs
+        expected = len(original_opponents)
+        if len(opponent_beliefs_list) != expected:
+            logger.warning(
+                f"Agent {self.player_id}: Belief list has {len(opponent_beliefs_list)} entries, expected {expected}. Fixing."
+            )
+            while len(opponent_beliefs_list) < expected:
+                uniform = np.ones(self.num_opponent_types, dtype=np.float32) / self.num_opponent_types
+                opponent_beliefs_list.append(uniform)
+            opponent_beliefs_list = opponent_beliefs_list[:expected]
+
+        current_step_info["belief"] = np.concatenate(opponent_beliefs_list).tolist()
+        self.sequence_history.append(current_step_info)
+
+        # --- 3. FORWARD PASS #1: Predict OUR OWN Action ---
+        logger.debug(
+            f"AR Agent {self.player_id}: Predicting own action (History len: {len(self.sequence_history)})"
+        )
         model_input_self = self._prepare_model_input(self.sequence_history)
-        chosen_action = 0  # Default action
-
         with torch.no_grad():
             action_logits, _, _ = self.model(**model_input_self)
-            # Get prediction for our current action
-            last_valid_idx = max(0, len(self.sequence_history) - 1)
-            # Logits for *our* current turn's decision ONLY
-            pred_logits_for_decision = action_logits[0, last_valid_idx]
-
-            # Sample our action
-            current_action_mask_np = np.array(info.get('action_mask', [1] * self.action_dim))
-            current_action_mask = torch.from_numpy(current_action_mask_np).bool().to(self.device)
-            masked_pred_logits = pred_logits_for_decision.masked_fill(~current_action_mask, float('-inf'))
-            probs = F.softmax(masked_pred_logits, dim=-1)
+            last_idx = 19
+            logits = action_logits[0, last_idx]
+            mask = torch.from_numpy(
+                np.array(info.get("action_mask", [1] * self.action_dim))
+            ).bool().to(self.device)
+            masked = logits.masked_fill(~mask, float("-inf"))
+            probs = F.softmax(masked, dim=-1)
             if torch.isnan(probs).any() or probs.sum() <= 1e-8:
-                probs = current_action_mask.float()
-                probs = probs / probs.sum()
+                probs = mask.float(); probs /= probs.sum()
             chosen_action = torch.distributions.Categorical(probs).sample().item()
             logger.debug(f"AR Agent {self.player_id}: Chose action {chosen_action}")
 
-        # Create our step info and add to history
-        current_step_info = {
-            "agent_id_env": agent_id_env,
-            "action": chosen_action,
-            "masked_action": chosen_action,  # Default mask, updated next turn if needed
-            "step_in_round": len(self.sequence_history)  # Step number *before* adding this one
-        }
+        # patch back into history and reset on self-challenge
+        self.sequence_history[last_idx]["action"] = chosen_action
+        self.sequence_history[last_idx]["masked_action"] = chosen_action
+        if chosen_action == 6:
+            logger.debug(f"Agent {self.player_id}: reset history on challenge from self")
+            self.sequence_history.clear()
+            self.last_opponent_claim = None
+        else:
+            # --- 4. FORWARD PASS #2 & #3: Predict Opponent 1 & 2 Actions ---
+            temp_hist = copy.deepcopy(self.sequence_history)
+            opponents = [o for o in original_opponents if not env.terminations.get(o, False)]
 
-        # --- 3. Add Observation, Action Mask, and Updated Belief (if it is our turn) ---
-        current_agent_type = self.env_agent_id_map[agent_id_env]
-        if current_agent_type == 0:
-            # Process observation
-            current_raw_obs = observation[agent_id_env]
-            if isinstance(current_raw_obs, np.ndarray):
-                if current_raw_obs.shape[0] != self.obs_dim:
-                    if current_raw_obs.shape[0] > self.obs_dim:
-                        current_raw_obs = current_raw_obs[:self.obs_dim]
-                    else:
-                        current_raw_obs = np.pad(current_raw_obs, (0, self.obs_dim - current_raw_obs.shape[0]))
-                current_step_info["observation"] = current_raw_obs.tolist()
-            else:
-                obs_list = current_raw_obs if isinstance(current_raw_obs, list) else list(current_raw_obs)
-                if len(obs_list) != self.obs_dim:
-                    if len(obs_list) > self.obs_dim:
-                        obs_list = obs_list[:self.obs_dim]
-                    else:
-                        obs_list.extend([0] * (self.obs_dim - len(obs_list)))
-                current_step_info["observation"] = obs_list
-
-            # Store action mask if provided
-            if isinstance(info.get('action_mask'), (list, np.ndarray)):
-                current_step_info["action_mask"] = list(info.get('action_mask'))
-
-            # --- Correct Belief Logic (as in the belief agent) ---
-            opponent_beliefs_list = []
-            opponent_peak_beliefs = {}
-
-            # Determine original opponents and fixed mapping
-            original_opponents = sorted([opp for opp in env.possible_agents if opp != agent_id_env])
-            opp_id_to_cheat_tuple_idx = {opp_id: i for i, opp_id in enumerate(original_opponents)}
-            active_opponents = [opp for opp in original_opponents if not env.terminations.get(opp, False)]
-            logger.debug(f"Agent {self.player_id}: Original opponents: {original_opponents}")
-            logger.debug(f"Agent {self.player_id}: Active opponents this step: {active_opponents}")
-            
-            # Initialize belief state dictionary if needed
-            if self.belief_state is None:
-                self.belief_state = {}
-            for opp_id in original_opponents:
-                if opp_id not in self.belief_state:
-                    self.belief_state[opp_id] = np.ones(self.num_opponent_types, dtype=np.float32) / self.num_opponent_types
-
-                # For terminated opponents, simply use the stored belief
-                if opp_id not in active_opponents:
-                    current_belief_np = self.belief_state[opp_id]
-                    opponent_peak_beliefs[opp_id] = {'expert_index': int(np.argmax(current_belief_np)), 'source': 'terminated'}
-                    logger.debug(f"Agent {self.player_id}: Opponent {opp_id} terminated. Using stored belief.")
-                else:
-                    # Process active opponent
-                    apply_cheat = False
-                    cheat_idx_to_use = None
-                    if cheat_expert_index is not None:
-                        temp_cheat_idx = None
-                        source = "unknown"
-                        original_cheat_idx_for_opp = opp_id_to_cheat_tuple_idx.get(opp_id)
-                        if isinstance(cheat_expert_index, (tuple, list)):
-                            source = f"tuple[{original_cheat_idx_for_opp}]"
-                            if original_cheat_idx_for_opp is not None and original_cheat_idx_for_opp < len(cheat_expert_index):
-                                temp_cheat_idx = cheat_expert_index[original_cheat_idx_for_opp]
-                            else:
-                                logger.warning(f"Cannot get cheat index for {opp_id} (mapped_idx={original_cheat_idx_for_opp}).")
-                        elif isinstance(cheat_expert_index, int):
-                            source = "scalar"
-                            temp_cheat_idx = cheat_expert_index
-                        else:
-                            logger.warning(f"Invalid cheat type: {type(cheat_expert_index)}")
-
-                        if temp_cheat_idx is not None and isinstance(temp_cheat_idx, int):
-                            if 0 <= temp_cheat_idx < self.num_opponent_types:
-                                apply_cheat = True
-                                cheat_idx_to_use = temp_cheat_idx
-                                logger.debug(f"Agent {self.player_id}: Applying CHEAT index {cheat_idx_to_use} (from {source}) for active opp {opp_id}.")
-                            else:
-                                logger.warning(f"Cheat index {temp_cheat_idx} (from {source}) OOB for {opp_id}. Using fallback 0.")
-                                apply_cheat = True
-                                cheat_idx_to_use = 0
-                        elif temp_cheat_idx is None and isinstance(cheat_expert_index, (tuple, list)):
-                            logger.debug(f"Agent {self.player_id}: Cheat index was None (from {source}) for opp {opp_id}. NOT applying cheat.")
-                            apply_cheat = False
-                        else:
-                            apply_cheat = False
-
-                    # Update belief for active opponent
-                    if apply_cheat:
-                        artificial_belief = np.zeros(self.num_opponent_types, dtype=np.float32)
-                        artificial_belief[cheat_idx_to_use] = 1.0
-                        self.belief_state[opp_id] = artificial_belief
-                        current_belief_np = artificial_belief
-                        opponent_peak_beliefs[opp_id] = {'expert_index': cheat_idx_to_use, 'source': 'cheat'}
-                        logger.debug(f"Agent {self.player_id}: Belief for {opp_id} SET BY CHEAT to index {cheat_idx_to_use}.")
-                    elif self.belief_model is not None:
-                        logger.debug(f"Agent {self.player_id}: Updating belief via MODEL for active opp {opp_id}.")
-                        self._update_belief(agent_id_env, opp_id)
-                        current_belief_np = self.belief_state[opp_id]
-                        opponent_peak_beliefs[opp_id] = {'expert_index': int(np.argmax(current_belief_np)), 'source': 'model'}
-                    else:
-                        logger.debug(f"Agent {self.player_id}: Keeping UNIFORM belief for active opp {opp_id}.")
-                        current_belief_np = self.belief_state[opp_id]
-                        opponent_peak_beliefs[opp_id] = {'expert_index': int(np.argmax(current_belief_np)), 'source': 'uniform'}
-
-                    log_belief = ", ".join([f"{b:.2f}" for b in current_belief_np])
-                    logger.debug(f"Agent {self.player_id}: Final belief vector for active {opp_id} this step: [{log_belief}]")
-                
-                opponent_beliefs_list.append(current_belief_np)
-            
-            # Ensure we have exactly 2 belief vectors (for the 2 original opponents); pad or trim if necessary.
-            if len(opponent_beliefs_list) != 2:
-                logger.error(f"Agent {self.player_id}: Belief list has {len(opponent_beliefs_list)} entries, expected 2. Padding/truncating.")
-                while len(opponent_beliefs_list) < 2:
-                    opponent_beliefs_list.append(np.ones(self.num_opponent_types, dtype=np.float32) / self.num_opponent_types)
-                opponent_beliefs_list = opponent_beliefs_list[:2]
-            
-            # Concatenate beliefs
-            combined_belief_np = np.concatenate(opponent_beliefs_list)
-            # Optionally, if your AR model uses the belief vector later, you might convert it here.
-            current_step_info["belief"] = combined_belief_np.tolist()
-            # Store expert info if needed for reporting
-            self.last_expert_info = opponent_peak_beliefs
-
-        # --- 4. Add our step to temporary history for prediction ---
-        temp_history = copy.deepcopy(self.sequence_history)
-        temp_history.append(current_step_info)
-
-        # --- 5. FORWARD PASS #2: Predict Opponent 1 Action ---
-        predicted_action_opp1 = 0  # Default
-        opponents = sorted([oid for oid in self.env_agent_id_map if oid != agent_id_env])
-
-        if opponents and not env.terminations.get(opponents[0], False):  # If at least one active opponent
-            opp1_id = opponents[0]
-            # Run model again with updated history INCLUDING our action
-            model_input_opp1 = self._prepare_model_input(temp_history)
-
-            with torch.no_grad():
-                action_logits_opp1, _, _ = self.model(**model_input_opp1)
-                last_valid_idx = max(0, len(temp_history) - 1)
-                logits_for_opp1_pred = action_logits_opp1[0, last_valid_idx]
-
-                try:
-                    opp1_pred_probs = F.softmax(logits_for_opp1_pred, dim=-1)
-                    predicted_action_opp1 = torch.argmax(opp1_pred_probs).item()
-                    logger.debug(f"AR Agent {self.player_id}: Predicted action for Opponent 1: {predicted_action_opp1}")
-                except IndexError:
-                    logger.error(f"IndexError getting prediction for Opponent 1. Logits shape: {action_logits_opp1.shape}, Index: {last_valid_idx}")
-                    predicted_action_opp1 = 0
-
-            current_step_info["predicted_action_for_opp1"] = predicted_action_opp1
-
-            # --- 6. FORWARD PASS #3: Predict Opponent 2 Action (if needed) ---
-            predicted_action_opp2 = 0  # Default
-
-            if len(opponents) > 1 and not env.terminations.get(opponents[1], False):
-                opp2_id = opponents[1]
-                temp_history_with_opp1 = copy.deepcopy(temp_history)
-                opp1_placeholder_step = {
-                    "agent_id_env": opp1_id,
-                    "action": predicted_action_opp1,
-                    "masked_action": predicted_action_opp1,
-                    "step_in_round": len(temp_history)
-                }
-                temp_history_with_opp1.append(opp1_placeholder_step)
-
-                logger.debug(f"AR Agent {self.player_id}: Predicting Opponent 2 action (Temp hist len: {len(temp_history_with_opp1)})")
-                model_input_opp2 = self._prepare_model_input(temp_history_with_opp1)
-
+            if opponents:
+                # Opponent 1
+                opp1 = opponents[0]
+                model_input_opp1 = self._prepare_model_input(temp_hist)
                 with torch.no_grad():
-                    action_logits_opp2, _, _ = self.model(**model_input_opp2)
-                    last_valid_idx_opp2 = max(0, len(temp_history_with_opp1) - 1)
-                    pred_logits_for_opp2 = action_logits_opp2[0, last_valid_idx_opp2]
+                    logits1, _, _ = self.model(**model_input_opp1)
+                    pidx1 = 19
+                    pred1 = torch.argmax(F.softmax(logits1[0, pidx1], dim=-1)).item()
+                self.sequence_history[last_idx]["predicted_action_for_opp1"] = pred1
+                temp_hist.append({
+                    "agent_id_env": opp1,
+                    "action": pred1,
+                    "masked_action": pred1,
+                    "step_in_round": len(temp_hist)
+                })
 
-                    try:
-                        opp2_pred_probs = F.softmax(pred_logits_for_opp2, dim=-1)
-                        predicted_action_opp2 = torch.argmax(opp2_pred_probs).item()
-                        logger.debug(f"AR Agent {self.player_id}: Predicted action for Opponent 2: {predicted_action_opp2}")
-                    except IndexError:
-                        logger.error(f"IndexError getting prediction for Opponent 2. Logits shape: {action_logits_opp2.shape}, Index: {last_valid_idx_opp2}")
-                        predicted_action_opp2 = 0
+                # Opponent 2
+                if len(opponents) > 1:
+                    opp2 = opponents[1]
+                    model_input_opp2 = self._prepare_model_input(temp_hist)
+                    with torch.no_grad():
+                        logits2, _, _ = self.model(**model_input_opp2)
+                        pidx2 = 19
+                        pred2 = torch.argmax(F.softmax(logits2[0, pidx2], dim=-1)).item()
+                    self.sequence_history[last_idx]["predicted_action_for_opp2"] = pred2
 
-                current_step_info["predicted_action_for_opp2"] = predicted_action_opp2
-
-        # --- 7. Store Final Step and Manage History ---
-        self.sequence_history.append(current_step_info)
+        # --- 5. Trim history to max length ---
         if len(self.sequence_history) > self.max_seq_length:
             self.sequence_history.pop(0)
 
-        # --- 8. Return Chosen Action ---
         return chosen_action
