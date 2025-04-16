@@ -25,95 +25,118 @@ class AgentFactory:
         self.device = device
 
     def create_agent_from_checkpoint(self, checkpoint_path: str, player_id_prefix: str, agent_key: str) -> BaseAgent:
-        # ... (file loading) ...
-        if not os.path.exists(checkpoint_path): raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-        logger.info(f"Loading checkpoint for agent {agent_key} from: {checkpoint_path}")
-        try:
-            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-        except Exception as e:
-            logger.error(f"Failed to load torch checkpoint {checkpoint_path}: {e}")
-            raise ValueError(f"Failed to load checkpoint {checkpoint_path}") from e
-        if not isinstance(checkpoint, dict): raise ValueError(f"Invalid checkpoint format in {checkpoint_path}.")
-
+        if not os.path.exists(checkpoint_path): raise FileNotFoundError(...)
+        logger.info(f"Loading checkpoint for '{agent_key}' from: {checkpoint_path}")
+        try: checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        except Exception as e: logger.error(...); raise e
+        if not isinstance(checkpoint, dict): raise ValueError(...)
 
         policy_state_dict = None
         belief_state_dict = None
         obp_state_dict = None
-        is_direct_player_key = False # Flag for belief model save format
+        agent_class: Type[BaseAgent] = None # Determine class FIRST
+        agent_config = {}
+        is_direct_player_key_format = False # Flag format where policy is under agent_key
 
-        if "policy_nets" in checkpoint and agent_key in checkpoint["policy_nets"]:
-            # ... (standard format handling) ...
-            policy_state_dict = checkpoint["policy_nets"][agent_key]
-            belief_state_dict = checkpoint.get("belief_model") or checkpoint.get("belief_models", {}).get(agent_key)
-            obp_state_dict = checkpoint.get("obp_model") or checkpoint.get("obp_models", {}).get(agent_key)
+        # --- Determine Structure and Potential Policy State Dict ---
+        if agent_key in checkpoint and isinstance(checkpoint[agent_key], dict):
+             # Potential direct key format (AR or BSP)
+             potential_policy_sd = checkpoint[agent_key]
+             is_direct_player_key_format = True
+             logger.debug(f"Found direct key '{agent_key}'. Checking structure...")
+             # Check if this *is* the policy state dict by checking its type
+             if MFactoryUtil.is_autoregressive_model(potential_policy_sd):
+                  logger.info(f"Identified as Autoregressive model via direct key '{agent_key}'.")
+                  agent_class = AutoregressiveAgent
+                  policy_state_dict = potential_policy_sd
+                  belief_state_dict = checkpoint.get("belief_model") # AR format has top-level belief
+                  agent_config = {'belief_state_dict': belief_state_dict}
+             elif MFactoryUtil.is_belief_space_policy(potential_policy_sd):
+                  logger.info(f"Identified as BeliefSpacePolicy via direct key '{agent_key}'.")
+                  agent_class = BeliefAgent
+                  policy_state_dict = potential_policy_sd
+                  belief_state_dict = checkpoint.get("belief_model")
+                  agent_config = {'belief_state_dict': belief_state_dict}
+             else:
+                  logger.warning(f"Direct key '{agent_key}' found but structure didn't match AR or BSP.")
+                  # Don't assume it's policy_state_dict yet, check other formats
+
+        elif "policy_nets" in checkpoint and agent_key in checkpoint["policy_nets"]:
+             # Standard/MoE old format
+             policy_state_dict = checkpoint["policy_nets"][agent_key]
+             belief_state_dict = checkpoint.get("belief_model") or checkpoint.get("belief_models", {}).get(agent_key)
+             obp_state_dict = checkpoint.get("obp_model") or checkpoint.get("obp_models", {}).get(agent_key)
+             logger.debug(f"Detected 'policy_nets' structure for key '{agent_key}'.")
+             # Now determine type based on this policy_state_dict
+             if MFactoryUtil.is_autoregressive_model(policy_state_dict):
+                  logger.warning(f"Single 'model' key looks like Autoregressive Model - loading as AR for '{agent_key}'.")
+                  agent_class = AutoregressiveAgent
+                  agent_config = {'belief_state_dict': belief_state_dict}
+             elif MFactoryUtil.is_moe_policy(policy_state_dict):
+                  logger.debug(f"Identifying as MoE Policy for {agent_key}")
+                  agent_class = MoEAgent
+             else:
+                  logger.debug(f"Identifying as Standard Policy for {agent_key}")
+                  agent_class = StandardAgent
+                  agent_config = {'obp_state_dict': obp_state_dict}
+
         elif "model" in checkpoint:
-             # ... (single model format handling) ...
+             # Single model (Stacked or maybe misidentified AR/BSP?)
              policy_state_dict = checkpoint["model"]
              belief_state_dict = checkpoint.get("belief_model")
              obp_state_dict = checkpoint.get("obp_model")
-        elif agent_key in checkpoint and isinstance(checkpoint[agent_key], dict):
-             potential_policy_sd = checkpoint[agent_key]
-             # --- MODIFIED: Check keys directly for belief policy ---
-             # Check if it *looks* like a policy dict, specifically BSP which has 'network'
-             if 'network.0.weight' in potential_policy_sd and 'policy_head.weight' in potential_policy_sd:
-                  # Assume it's the policy state dict
-                  policy_state_dict = potential_policy_sd
-                  # Belief model is stored at the top level in this format
-                  belief_state_dict = checkpoint.get("belief_model") # Key used in save_checkpoint
-                  is_direct_player_key = True
-                  logger.info(f"Detected direct player key '{agent_key}' with BSP structure.")
+             logger.debug(f"Detected single 'model' structure.")
+             # Check type based on this policy_state_dict
+             if MFactoryUtil.is_autoregressive_model(policy_state_dict):
+                  logger.warning(f"Single 'model' key looks like Autoregressive Model - loading as AR for '{agent_key}'.")
+                  agent_class = AutoregressiveAgent
+                  agent_config = {'belief_state_dict': belief_state_dict}
+             elif MFactoryUtil.is_belief_space_policy(policy_state_dict):
+                   logger.warning(f"Single 'model' key looks like BeliefSpacePolicy - loading as BSP for '{agent_key}'.")
+                   agent_class = BeliefAgent
+                   agent_config = {'belief_state_dict': belief_state_dict}
+             elif MFactoryUtil.is_stacked_newer_observation_model(policy_state_dict):
+                  logger.debug(f"Identifying as Stacked Newer Model for {agent_key}")
+                  agent_class = StackedObsAgent; agent_config = {'use_newer_format': True}
+             elif MFactoryUtil.is_stacked_observation_model(policy_state_dict):
+                  logger.debug(f"Identifying as Stacked Older Model for {agent_key}")
+                  agent_class = StackedObsAgent; agent_config = {'use_newer_format': False}
              else:
-                  raise ValueError(f"Found key '{agent_key}' but it lacks expected BSP keys ('network.0.weight', 'policy_head.weight') in {checkpoint_path}")
-        else:
+                  logger.warning(f"Single 'model' key doesn't match known special types. Assuming Standard Policy for '{agent_key}'.")
+                  agent_class = StandardAgent
+                  agent_config = {'obp_state_dict': obp_state_dict}
+
+        else: # No policy found
              available_keys = list(checkpoint.keys())
-             raise ValueError(f"Could not find policy network for agent '{agent_key}' in {checkpoint_path}. Tried 'policy_nets', 'model', direct key '{agent_key}'. Available keys: {available_keys}")
+             raise ValueError(f"Cannot find policy for '{agent_key}'. Tried 'policy_nets', 'model', direct key. Keys: {available_keys}")
 
-        if policy_state_dict is None: raise ValueError(f"Policy state dict for agent '{agent_key}' is None.")
+        # --- Final Checks ---
+        if policy_state_dict is None:
+            raise ValueError(f"Policy state dict could not be determined for '{agent_key}'.")
+        if agent_class is None:
+             # If policy was found but class wasn't determined (shouldn't happen with current logic)
+             logger.warning(f"Policy state dict found but agent class not determined. Defaulting to StandardAgent for '{agent_key}'.")
+             agent_class = StandardAgent
+             agent_config = {'obp_state_dict': obp_state_dict}
 
-        # --- Determine Agent Type (Corrected Order) ---
-        agent_class: Type[BaseAgent] = None
-        agent_config = {}
-
-        # Use the utility functions on the confirmed policy_state_dict
-        if MFactoryUtil.is_belief_space_policy(policy_state_dict):
-            logger.debug(f"Confirmed BeliefSpacePolicy for {agent_key}")
-            agent_class = BeliefAgent
-            if belief_state_dict is None: logger.warning(f"BeliefSpacePolicy for {agent_key} but no belief model state found.")
-            agent_config = {'belief_state_dict': belief_state_dict}
-        elif MFactoryUtil.is_stacked_newer_observation_model(policy_state_dict):
-            logger.debug(f"Detected Stacked Newer Observation Model for {agent_key}")
-            agent_class = StackedObsAgent
-            agent_config = {'use_newer_format': True}
-        elif MFactoryUtil.is_stacked_observation_model(policy_state_dict):
-             logger.debug(f"Detected Stacked Older Observation Model for {agent_key}")
-             agent_class = StackedObsAgent
-             agent_config = {'use_newer_format': False}
-        elif MFactoryUtil.is_moe_policy(policy_state_dict):
-            logger.debug(f"Detected MoE Policy for {agent_key}")
-            agent_class = MoEAgent
-        else:
-            logger.debug(f"Detected Standard Policy for {agent_key}")
-            agent_class = StandardAgent
-            if obp_state_dict is None: logger.info(f"Standard agent {agent_key} created without OBP state.")
-            agent_config = {'obp_state_dict': obp_state_dict}
-
-        # ... (Instantiation and loading models - use the is_direct_player_key flag correctly) ...
-        if agent_class is None: raise ValueError(f"Could not determine agent type for {agent_key} in {checkpoint_path}")
+        # --- Instantiate Agent ---
         player_id = f"{player_id_prefix}_{agent_key}"
-        try: agent_instance = agent_class(device=self.device, player_id=player_id, **agent_config)
-        except TypeError as e: logger.error(f"TypeError during {agent_class.__name__} init for {player_id}: {e}."); raise e
+        logger.info(f"Attempting to instantiate agent {player_id} as type {agent_class.__name__}")
+        try:
+            agent_instance = agent_class(device=self.device, player_id=player_id, **agent_config)
+            logger.debug(f"Instantiated agent {player_id}")
+        except TypeError as e:
+             logger.error(f"TypeError during {agent_class.__name__} init for {player_id}: {e}. Config: {agent_config}")
+             raise e
 
-        # Pass appropriate checkpoint structure to agent's load method
-        if is_direct_player_key:
-             agent_specific_checkpoint = {
-                  'policy_nets': {agent_key: policy_state_dict}, # Reconstruct expected structure
-                  'belief_model': belief_state_dict
-                  # Note: Value nets missing from this save format
-             }
-             # The BeliefAgent needs to handle potentially missing value_nets
-             agent_instance.load_models_from_checkpoint(agent_specific_checkpoint, agent_key)
-        else:
-             agent_instance.load_models_from_checkpoint(checkpoint, agent_key) # Pass original
+        # --- Load Models ---
+        try:
+            # Pass the original checkpoint, agent's load method handles structure
+            agent_instance.load_models_from_checkpoint(checkpoint, agent_key)
+            logger.debug(f"Called load_models_from_checkpoint for agent {player_id}")
+        except Exception as e:
+             logger.error(f"Error during agent's load_models_from_checkpoint for {player_id}: {e}", exc_info=True)
+             raise e
 
         logger.info(f"Successfully created agent '{player_id}' of type {agent_class.__name__}")
         return agent_instance
