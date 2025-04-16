@@ -38,7 +38,7 @@ def process_variant(variant, bsp_dir, opponent_belief_path, checkpoint_dir, epis
 
     belief_model = OpponentBeliefModel(
         event_feature_dim=5,
-        max_seq_length=config.MAX_SQUENCE_LENGTH,
+        max_seq_length=config.MAX_SEQUENCE_LENGTH,
         hidden_dim=256 // 4,
         num_opponent_types=bsp_checkpoint["num_opponent_types"]
     )
