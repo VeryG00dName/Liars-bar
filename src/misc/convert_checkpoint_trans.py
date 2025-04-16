@@ -31,7 +31,7 @@ def process_variant(variant, bsp_dir, opponent_belief_path, checkpoint_dir, epis
     obs_dim = bsp_checkpoint["obs_dim"]
     belief_dim = bsp_checkpoint["belief_dim"]
     hidden_dim = config.HIDDEN_DIM
-    max_seq_length = 50
+    max_seq_length = 20
 
     # --- Reconstruct the AutoregressiveGameModel ---
     ar_model = AutoregressiveGameModel(
@@ -39,10 +39,10 @@ def process_variant(variant, bsp_dir, opponent_belief_path, checkpoint_dir, epis
         action_dim=7,
         belief_dim=belief_dim,
         hidden_dim=hidden_dim,
-        num_heads=8,
-        num_layers=4,
+        num_heads=4,
+        num_layers=2,
         dropout_rate=0.1,
-        max_seq_length=50
+        max_seq_length=20
     )
     ar_model.load_state_dict(bsp_checkpoint["model_state_dict"])
 
