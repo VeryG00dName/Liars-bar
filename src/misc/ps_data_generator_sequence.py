@@ -275,7 +275,7 @@ def generate_data(
     # Regular actions: 0-6
     # Card count representations: 7=1 card, 8=2 cards, 9=3 cards, 10=Challenge
     CARD_COUNT_MAPPING = {1: 7, 2: 8, 3: 9}
-    CHALLENGE_REPRESENTATION = 10  # Special code for challenge
+    CHALLENGE_REPRESENTATION = 6  # Special code for challenge
     
     # Main episode loop
     for episode in tqdm(range(num_episodes), desc="Generating episodes"):
