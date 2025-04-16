@@ -5,6 +5,7 @@ import os
 import json
 import logging
 import random
+from typing import Any, Dict, Optional
 import numpy as np
 import torch
 import seaborn as sns
@@ -24,6 +25,7 @@ from rich.progress import Progress, BarColumn, TextColumn
 # OpenSkill for rating updates
 from openskill.models import PlackettLuce
 
+from src.agents.base_agent import BaseAgent
 from src.model.model_factory import ModelFactory
 from src.model.other_models import PolicyNetwork, ValueNetwork, StrategyTransformer ,OpponentBehaviorPredictor
 from src.model.memory import delete_opponent_memory
@@ -362,98 +364,6 @@ def get_opponent_memory_embedding(current_agent, opponent, device):
     else:
         logger.debug("No features extracted from memory; returning zeros.")
         return torch.zeros((1, config.STRATEGY_DIM), dtype=torch.float32, device=device)
-
-
-# ----------------------------
-# OBP Inference Functions (unchanged except normalization)
-# ----------------------------
-
-def run_obp_inference(obp_model, obs, device, num_players, agent_version, current_agent, env, memory_embeddings=None):
-    """
-    Runs OBP inference for an observation.
-    If memory_embeddings is provided (and the OBP model was trained with transformer memory),
-    it will be passed to the OBP model.
-    """
-    logger = logging.getLogger("Evaluate")
-    if obp_model is None:
-        num_opponents = num_players - 1
-        logger.debug(f"No OBP model available for agent version {agent_version}. Returning default 0.0s.")
-        return [0.0] * num_opponents
-
-    if agent_version == 1:
-        opp_feature_dim = 5
-    elif agent_version == 2:
-        opp_feature_dim = 4
-    else:
-        raise ValueError(f"Unknown agent_version: {agent_version}")
-
-    # Determine whether the OBP model requires memory.
-    fc1_weight = obp_model.state_dict().get("fc1.weight", None)
-    is_new_obp = False
-    if fc1_weight is not None:
-        input_dim = fc1_weight.shape[1]
-        if input_dim == config.OPPONENT_INPUT_DIM + config.STRATEGY_DIM:
-            is_new_obp = True
-
-    num_opponents = num_players - 1
-    opp_features_start = len(obs) - (num_opponents * opp_feature_dim)
-    opponents = [opp for opp in env.possible_agents if opp != current_agent]
-    obp_probs = []
-    for i, opp in enumerate(opponents):
-        start_idx = opp_features_start + i * opp_feature_dim
-        end_idx = start_idx + opp_feature_dim
-        opp_vec = obs[start_idx:end_idx]
-        opp_vec_tensor = torch.tensor(opp_vec, dtype=torch.float32, device=device).unsqueeze(0)
-        with torch.no_grad():
-            if is_new_obp and memory_embeddings is not None:
-                mem_emb = memory_embeddings[i]
-                logits = obp_model(opp_vec_tensor, mem_emb)
-            else:
-                logits = obp_model(opp_vec_tensor)
-            probs = torch.softmax(logits, dim=-1)
-            obp_probs.append(probs[0, 1].item())
-    return obp_probs
-
-def run_obp_inference_tournament(obp_model, obs, device, num_players, obs_version, current_agent, opponents, memory_embeddings=None):
-    """
-    Specialized OBP inference for tournament mode.
-    If memory_embeddings is provided and the OBP model requires memory,
-    each opponent's memory embedding is passed along with its observation vector.
-    """
-    if obp_model is None:
-        return []
-    if obs_version == 1 or obs_version == "OBS_VERSION_1":
-        opp_feature_dim = 5
-    elif obs_version == 2 or obs_version == "OBS_VERSION_2":
-        opp_feature_dim = 4
-    else:
-        raise ValueError(f"Unknown observation version: {obs_version}")
-    
-    num_opponents = len(opponents)
-    opp_features_start = len(obs) - (num_opponents * opp_feature_dim)
-    obp_probs = []
-    
-    fc1_weight = obp_model.state_dict().get("fc1.weight", None)
-    is_new_obp = False
-    if fc1_weight is not None:
-        input_dim = fc1_weight.shape[1]
-        if input_dim == config.OPPONENT_INPUT_DIM + config.STRATEGY_DIM:
-            is_new_obp = True
-
-    for i, opp in enumerate(opponents):
-        start_idx = opp_features_start + i * opp_feature_dim
-        end_idx = start_idx + opp_feature_dim
-        opp_vec = obs[start_idx:end_idx]
-        opp_vec_tensor = torch.tensor(opp_vec, dtype=torch.float32, device=device).unsqueeze(0)
-        with torch.no_grad():
-            if is_new_obp and memory_embeddings is not None:
-                mem_emb = memory_embeddings[i]
-                logits = obp_model(opp_vec_tensor, mem_emb)
-            else:
-                logits = obp_model(opp_vec_tensor)
-            probs = torch.softmax(logits, dim=-1)
-            obp_probs.append(probs[0, 1].item())
-    return obp_probs
 
 # ----------------------------
 # New Unified Rich Progress and Scoreboard
@@ -800,414 +710,143 @@ def initialize_players(base_dir, device):
 # Unified Evaluation Function
 # ----------------------------
 
-def evaluate_agents(env, device, players_in_this_game, episodes=11, is_tournament=False, two_player=None, track_experts=False, progress_callback=None, cheat_expert_index=None):
+def evaluate_agents(
+    env,
+    device: torch.device,
+    players_in_this_game: Dict[str, BaseAgent],
+    episodes: int = 11,
+    two_player: Optional[str] = None,
+    track_experts: bool = False,
+    progress_callback=None,
+    cheat_expert_index: Optional[Any] = None # Keep Any type hint
+    ) -> tuple:
     """
-    Optimized evaluation function with support for BeliefSpacePolicy, MoE models, and StackedObservationConvModel.
-    Combines functionalities from two versions and includes robust belief-based action selection and updates.
-    Now updates beliefs for each opponent with cheat_expert_index (scalar or 2-element list) and tracks expert activations
-    for every player, including two activations per belief model.
+    Evaluate multiple agents over a number of episodes.
+
+    Returns:
+      cumulative_wins, action_counts, game_wins_list,
+      avg_steps, steps_per_sec,
+      expert_activations_by_player_id (or None),
+      player_id_map
     """
     logger = logging.getLogger("Evaluate")
-    global global_response2idx2, global_action2idx2, global_event_encoder2, global_strategy_transformer2
-    transformer_checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "transformer_classifier.pth")
-    # Load categorical mappings if not already loaded.
-    if global_response2idx2 is None or global_action2idx2 is None:
-        logger.debug("Global response/action mappings not set; loading from checkpoint if available.")
-        if os.path.exists(transformer_checkpoint_path):
-            ckpt = torch.load(transformer_checkpoint_path, map_location=device, weights_only=False)
-            global_response2idx2 = ckpt.get("response2idx", {})
-            global_action2idx2 = ckpt.get("action2idx", {})
-            logger.debug(f"Loaded response2idx with {len(global_response2idx2)} entries and action2idx with {len(global_action2idx2)} entries.")
-        else:
-            global_response2idx2 = {}
-            global_action2idx2 = {}
-            logger.debug("Transformer checkpoint not found; using empty mappings.")
-            
-    player_ids = list(players_in_this_game.keys())
-    agent_to_player = {f'player_{i}': player_ids[i] for i in range(env.num_players)}
+    logger.info(f"Starting evaluation with {len(players_in_this_game)} agents for {episodes} episodes.")
+
+    # Map from your BaseAgent.get_player_id() → environment agent_id
+    player_id_map = {agent.get_player_id(): env_id
+                     for env_id, agent in players_in_this_game.items()}
+    all_player_ids = list(player_id_map.keys())
+
+    # Clear any persistent opponent memory before evaluation
     delete_opponent_memory()
-    # Precompute tournament mode per player.
-    player_tournament_mode = {}
-    for pid in player_ids:
-        player_data = players_in_this_game[pid]
-        obp_model = player_data.get('obp_model', None)
-        if obp_model:
-            fc1_weight = obp_model.state_dict().get("fc1.weight", None)
-            player_tournament_mode[pid] = (fc1_weight is not None and 
-                                           fc1_weight.shape[1] == config.OPPONENT_INPUT_DIM + config.STRATEGY_DIM)
-        else:
-            player_tournament_mode[pid] = is_tournament
 
-    action_counts = {pid: defaultdict(int) for pid in player_ids}
-    cumulative_wins = {pid: 0 for pid in player_ids}
-    total_steps = 0
+    # Initialize statistics
+    action_counts = {pid: defaultdict(int) for pid in all_player_ids}
+    cumulative_wins = {pid: 0 for pid in all_player_ids}
     game_wins_list = []
-    start_time = time.time()
-    set_seed(config.SEED)
-    # Initialize expert tracking for all agents if enabled.
-    expert_activations = {} if track_experts else None
-    if track_experts:
-        for agent in agent_to_player.keys():
-            expert_activations[agent] = {}
+    total_steps = 0
 
-    # --- BeliefSpacePolicy setup ---
-    belief_models = {}  # maps agent name -> belief model (if any)
-    belief_spaces = {}  # maps agent name -> dict(opponent -> belief distribution)
-    
-    # Collect all opponent models for belief updates.
-    all_opponent_models = []
-    for pid in player_ids:
-        player_data = players_in_this_game[pid]
-        if player_data.get('hardcoded_bot', False):
-            all_opponent_models.append(player_data['agent'])
-    for pid in player_ids:
-        player_data = players_in_this_game[pid]
-        if 'policy_net' in player_data and not player_data.get('is_belief_space_policy', False):
-            all_opponent_models.append(player_data['policy_net'])
-    
-    # Initialize belief tracking for agents that use belief space.
-    for agent in env.possible_agents:
-        pid = agent_to_player.get(agent)
-        if pid and players_in_this_game[pid].get('is_belief_space_policy', False):
-            player_data = players_in_this_game[pid]
-            belief_models[agent] = player_data.get('belief_model')
-            belief_spaces[agent] = {}
-            num_opponent_types = player_data.get('num_opponent_types', 10)
-            for opp_agent in env.possible_agents:
-                if opp_agent != agent:
-                    belief_spaces[agent][opp_agent] = np.ones(num_opponent_types) / num_opponent_types
-    
-    # Helper function to detect if a policy is a MoE model.
-    def is_moe_policy(policy_net):
-        state_dict = policy_net.state_dict()
-        return any('experts.' in k for k in state_dict.keys())
-    
-    with torch.no_grad():
-        for game_idx in range(1, episodes + 1):
-            env.reset(seed=game_idx)
-            if two_player is not None and two_player in env.penalties:
-                env.penalties[two_player] = env.penalty_thresholds[two_player]
-                env.terminations[two_player] = True
-                logger.debug(f"Pre-eliminated {two_player} for 2-player game.")
-            
-            env.agents = list(agent_to_player.keys())
-            env._agent_selector = agent_selector(env.agents)
-            env.agent_selection = env._agent_selector.next() if env.agents else None
-            
-            steps_in_game = 0
-            game_wins = {pid: 0 for pid in player_ids}
-            
-            while env.agent_selection is not None:
-                steps_in_game += 1
-                agent = env.agent_selection
-                obs, reward, termination, truncation, info = env.last()
-                if env.terminations.get(agent, False) or env.truncations.get(agent, False):
-                    env.step(None)
-                    continue
-                
-                player_id = agent_to_player[agent]
-                player_data = players_in_this_game[player_id]
-                
-                # --- BeliefSpacePolicy handling ---
-                if player_data.get('is_belief_space_policy', False):
-                    # Get observation in the appropriate format
-                    if player_data['policy_net'].total_input_dim == 29:
-                        observation_dict = env.observe(agent, new=True)
-                    else:
-                        observation_dict = env.observe(agent, newer=True)
-                    observation = observation_dict[agent]
-                    # Get beliefs about all opponents
-                    opponent_beliefs = []
-                    for opp_agent in env.possible_agents:
-                        if opp_agent != agent and opp_agent in belief_spaces[agent]:
-                            opponent_beliefs.append(belief_spaces[agent][opp_agent])
-                    
-                    # Combine beliefs into a single vector
-                    combined_belief = np.concatenate(opponent_beliefs)
-                    
-                    # *** Updated: Track top-2 expert activations for belief models ***
-                    if track_experts:
-                        top2_experts = np.argsort(combined_belief)[-2:]
-                        for expert_idx in top2_experts:
-                            expert_idx_str = str(int(expert_idx))
-                            expert_activations[agent][expert_idx_str] = expert_activations[agent].get(expert_idx_str, 0) + 1
-                    
-                    # Convert to tensors
-                    obs_tensor = torch.tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
-                    belief_tensor = torch.tensor(combined_belief, dtype=torch.float32, device=device).unsqueeze(0)
-                    
-                    # Get policy output with error handling
-                    try:
-                        policy_net = player_data['policy_net']
-                        action_logits, _ = policy_net(obs_tensor, belief_tensor)
-                        
-                        # Process action probabilities
-                        probs = F.softmax(action_logits, dim=-1).squeeze(0)
-                        
-                        # Check for NaN/Inf values and replace with uniform distribution if needed
-                        if torch.isnan(probs).any() or torch.isinf(probs).any():
-                            logger.warning(f"NaN or Inf values in policy output for {agent}. Using uniform distribution.")
-                            probs = torch.ones(probs.size(), device=device) / probs.size(0)
-                        
-                        probs = torch.clamp(probs, 1e-8, 1.0)
-                        
-                        # Apply action mask
-                        mask = info.get('action_mask', [1] * config.OUTPUT_DIM)
-                        mask_tensor = torch.tensor(mask, dtype=torch.float32, device=device)
-                        masked_probs = probs * mask_tensor
-                        
-                        # Ensure valid probabilities
-                        if masked_probs.sum() <= 0:
-                            valid_indices = torch.nonzero(mask_tensor, as_tuple=True)[0]
-                            if len(valid_indices) > 0:
-                                masked_probs[valid_indices] = 1.0 / valid_indices.numel()
-                            else:
-                                masked_probs = torch.ones_like(probs) / probs.size(0)
-                        else:
-                            masked_probs = masked_probs / masked_probs.sum()
-                        
-                        # Sample action
-                        action = torch.distributions.Categorical(masked_probs).sample().item()
-                    except Exception as e:
-                        print('test')
-                        logger.error(f"Error in belief-based action selection for {agent}: {e}")
-                        valid_actions = [i for i, m in enumerate(mask) if m == 1]
-                        if valid_actions:
-                            action = random.choice(valid_actions)
-                        else:
-                            action = random.randint(0, env.action_spaces[agent].n - 1)
-                    
-                    action_counts[player_id][action] += 1
-                    
-                    if agent in belief_spaces:
-                        opp_counter = 0
-                        for opp_agent in env.possible_agents:
-                            if opp_agent == agent:
-                                continue
-                            num_opponent_types = player_data.get('num_opponent_types', 10)
-                            
-                            # If a cheat override is provided, bypass compute and assign artificial belief.
-                            if cheat_expert_index is not None:
-                                if isinstance(cheat_expert_index, (list, tuple)):
-                                    cheat_idx = cheat_expert_index[opp_counter] if opp_counter < len(cheat_expert_index) else cheat_expert_index[-1]
-                                else:
-                                    cheat_idx = cheat_expert_index
-                                artificial_belief = np.zeros(num_opponent_types, dtype=np.float32)
-                                if cheat_idx < num_opponent_types:
-                                    artificial_belief[cheat_idx] = 1.0
-                                else:
-                                    logger.warning(f"cheat_expert_index {cheat_idx} out of range; defaulting to index 0")
-                                    artificial_belief[0] = 1.0
-                                belief_spaces[agent][opp_agent] = artificial_belief
-                            else:
-                                # Unconditionally update belief using memory.
-                                memory_full = query_opponent_memory_full(agent, opp_agent)
-                                features_list = None
-                                if memory_full is not None:
-                                    features_list = convert_memory_to_features2(memory_full, global_response2idx2, global_action2idx2)
-                                if features_list:
-                                    features_tensor = torch.tensor(features_list, dtype=torch.float32, device=device).unsqueeze(0)
-                                    current_belief = belief_spaces[agent][opp_agent]
-                                    belief_tensor = torch.tensor(current_belief, dtype=torch.float32, device=device).unsqueeze(0)
-                                    seq_len = torch.tensor([len(features_list)], dtype=torch.long, device=device)
-                                    with torch.no_grad():
-                                        updated_belief = belief_models[agent](features_tensor, belief_tensor, sequence_lengths=seq_len)
-                                        updated_belief_np = updated_belief.squeeze().cpu().numpy()
-                                        if np.isnan(updated_belief_np).any() or np.isinf(updated_belief_np).any():
-                                            updated_belief_np = current_belief
-                                else:
-                                    # If no memory features are available, reset to a uniform distribution.
-                                    updated_belief_np = np.ones(num_opponent_types, dtype=np.float32) / num_opponent_types
-                                belief_spaces[agent][opp_agent] = updated_belief_np
-                            opp_counter += 1
-                    env.step(action)
-                    continue
-                
-                # --- Hardcoded bot handling ---
-                if player_data.get('hardcoded_bot', False):
-                    observation = env.observe(agent)
-                    if isinstance(observation, dict):
-                        observation = observation.get(agent, None)
-                    if not isinstance(observation, np.ndarray):
-                        logger.error(f"Unexpected observation type: {type(observation)}")
-                        env.step(None)
-                        continue
-                    mask = info.get('action_mask', [1] * config.OUTPUT_DIM)
-                    table_card = getattr(env, 'table_card', None)
-                    action = player_data['agent'].play_turn(observation, mask, table_card)
-                    action_counts[player_id][action] += 1
-                    
-                    env.step(action)
-                    continue
-                
-                # --- Stacked observation model handling ---
-                is_stacked_model = player_data.get('is_stacked_model', False)
-                if is_stacked_model:
-                    observation_dict = env.observe(agent, new=True)
-                    observation = observation_dict[agent]
-                    
-                    observation_stack = player_data.get('observation_stacks', deque(maxlen=10))
-                    observation_stack.append(observation)
-                    stacked_obs = np.array(list(observation_stack), dtype=np.float32)
-                    stacked_obs_tensor = torch.tensor(stacked_obs, dtype=torch.float32, device=device).unsqueeze(0)
-                    
-                    policy_net = player_data['policy_net']
-                    policy_logits, _ = policy_net(stacked_obs_tensor)
-                    
-                    probs = F.softmax(policy_logits, dim=-1).squeeze(0)
-                    probs = probs.clamp(1e-8, 1.0)
-                    
-                    mask = info.get('action_mask', [1] * config.OUTPUT_DIM)
-                    mask_tensor = torch.as_tensor(mask, dtype=torch.float32, device=device)
-                    masked_probs = probs * mask_tensor
-                    if masked_probs.sum() <= 0:
-                        masked_probs = mask_tensor + 1e-8
-                    masked_probs /= masked_probs.sum()
-                    
-                    action = torch.distributions.Categorical(masked_probs).sample().item()
-                    action_counts[player_id][action] += 1
-                    env.step(action)
-                    continue
-                
-                # --- Standard model handling ---
-                policy_net = player_data['policy_net']
-                obp_model = player_data.get('obp_model', None)
-                version = player_data['obs_version']
-                
-                if version == 3:
-                    observation_dict = env.observe(agent, new=True)
-                    observation = observation_dict[agent]
-                else:
-                    observation = env.observe(agent)
-                    if isinstance(observation, dict):
-                        observation = observation.get(agent, None)
-                
-                if not isinstance(observation, np.ndarray):
-                    logger.error(f"Unexpected observation type: {type(observation)}")
-                    env.step(None)
-                    continue
-                
-                converted_obs = adapt_observation_for_version(observation, env.num_players, version)
-                use_tournament = player_tournament_mode[player_id]
-                mem_tensor = None
-                expert_index = None
-                
-                is_moe = is_moe_policy(policy_net)
-                
-                if obp_model is not None and use_tournament:
-                    opponents = [opp for opp in env.possible_agents if opp != agent]
-                    if opponents:
-                        mem_emb_list = []
-                        for opp in opponents:
-                            emb = get_opponent_memory_embedding(agent, opp, device)
-                            if opp == 'player_2':
-                                mem_tensor_unnorm = emb
-                            mem_emb_list.append(emb)
-                        mem_tensor = torch.cat(mem_emb_list, dim=0)
-                        if mem_tensor.numel() > 0:
-                            norm_val = torch.norm(mem_tensor, p=2)
-                            mem_tensor = mem_tensor if norm_val.item() == 0 else mem_tensor / norm_val
-                        memory_embeddings = torch.split(mem_tensor, 1, dim=0) if mem_tensor is not None else []
-                    else:
-                        memory_embeddings = []
-                else:
-                    memory_embeddings = None
-                
-                if use_tournament:
-                    obp_probs = run_obp_inference_tournament(
-                        obp_model, converted_obs, device, env.num_players, version, agent, opponents,
-                        memory_embeddings=memory_embeddings
-                    )
-                else:
-                    obp_probs = run_obp_inference(
-                        obp_model, converted_obs, device, env.num_players, version, agent, env,
-                        memory_embeddings=memory_embeddings
-                    )
-                
-                converted_obs_tensor = torch.from_numpy(converted_obs).float().to(device)
-                obp_probs_tensor = torch.as_tensor(obp_probs, dtype=torch.float32, device=device)
-                default_obs_tensor = torch.cat([converted_obs_tensor, obp_probs_tensor], dim=0)
-                
-                if is_moe:
-                    final_obs_tensor = default_obs_tensor
-                    if 'mem_tensor_unnorm' in locals() and mem_tensor_unnorm is not None:
-                        learning_expert_input = mem_tensor_unnorm.cpu().detach().numpy().flatten()[:5]
-                        learning_expert_tensor = torch.tensor(learning_expert_input, dtype=torch.float32, device=device).unsqueeze(0)
-                        with torch.no_grad():
-                            if 'global_strategy_transformer' in globals():
-                                classification_head = global_strategy_transformer.classification_head
-                                expert_logits = classification_head(learning_expert_tensor)
-                                expert_index = expert_logits.argmax(dim=-1).item()
-                                logger.debug(f"Computed expert index {expert_index} for MoE model")
-                    if cheat_expert_index is not None:
-                        expert_index = cheat_expert_index
-                        logger.debug(f"Using cheat expert index {expert_index} for MoE model")
-                    elif expert_index is None:
-                        expert_index = 0
-                    if track_experts:
-                        # Track expert activation regardless of agent role.
-                        expert_idx_str = str(expert_index)
-                        expert_activations[agent][expert_idx_str] = expert_activations[agent].get(expert_idx_str, 0) + 1
-                else:
-                    if player_data.get('uses_memory', False) and version == 2 and mem_tensor is not None:
-                        transformer_features_tensor = mem_tensor.flatten()
-                        final_obs_tensor = torch.cat([default_obs_tensor, transformer_features_tensor], dim=0)
-                    else:
-                        final_obs_tensor = default_obs_tensor
-                
-                final_obs_tensor = final_obs_tensor.unsqueeze(0)
-                
-                if not is_moe:
-                    num_layers = policy_net.lstm.num_layers if hasattr(policy_net, 'lstm') else 1
-                    batch_size = final_obs_tensor.size(0)
-                    hidden_size = policy_net.lstm.hidden_size if hasattr(policy_net, 'lstm') else 64
-                    hidden_state = (
-                        torch.zeros(num_layers, batch_size, hidden_size, device=device),
-                        torch.zeros(num_layers, batch_size, hidden_size, device=device)
-                    )
-                    if hasattr(policy_net, 'fc_classifier'):
-                        probs, _, gating_logits = policy_net(final_obs_tensor, hidden_state)
-                        if track_experts and gating_logits is not None:
-                            # For traditional models, still track expert activations even if not a belief model.
-                            _, top_expert = torch.topk(gating_logits, 1, dim=1)
-                            expert_idx = top_expert.squeeze().item()
-                            expert_idx_str = str(expert_idx)
-                            expert_activations[agent][expert_idx_str] = expert_activations[agent].get(expert_idx_str, 0) + 1
-                            logger.debug(f"Traditional model: Agent {agent} used expert {expert_idx}")
-                    else:
-                        probs, _ = policy_net(final_obs_tensor, hidden_state)
-                else:
-                    probs, _ = policy_net(final_obs_tensor, expert_index)
-                
-                probs = probs.clamp(1e-8, 1.0)
-                mask = info.get('action_mask', [1] * config.OUTPUT_DIM)
-                mask_tensor = torch.as_tensor(mask, dtype=torch.float32, device=device)
-                masked_probs = probs * mask_tensor
-                if masked_probs.sum() <= 0:
-                    masked_probs = mask_tensor + 1e-8
-                masked_probs /= masked_probs.sum()
-                action = torch.distributions.Categorical(masked_probs).sample().item()
-                action_counts[player_id][action] += 1
-                env.step(action)
-            
-            # --- End of game loop: record results ---
-            winner_agent = env.winner
-            if winner_agent:
-                winner_player = agent_to_player.get(winner_agent, None)
-                if winner_player:
-                    game_wins[winner_player] += 1
-            for pid in player_ids:
-                cumulative_wins[pid] += game_wins[pid]
-            total_steps += steps_in_game
-            game_wins_list.append(game_wins)
-            if progress_callback is not None:
-                progress_callback(game_idx)
-    
-    elapsed_time = time.time() - start_time
-    steps_per_sec = total_steps / elapsed_time if elapsed_time > 0 else 0
-    avg_steps = total_steps / episodes if episodes > 0 else 0
-    
+    # Expert tracking container
+    expert_activations_by_player_id = None
     if track_experts:
-        return cumulative_wins, action_counts, game_wins_list, avg_steps, steps_per_sec, expert_activations
+        expert_activations_by_player_id = {
+            pid: {'steps': []}
+            for pid in all_player_ids
+        }
+
+    # Fix randomness
+    set_seed(config.SEED)
+
+    start_time = time.time()
+    for game_idx in range(1, episodes + 1):
+        # Reset environment and agents
+        env.reset(seed=game_idx)
+        for agent in players_in_this_game.values():
+            agent.reset()
+
+        # Optionally pre-eliminate one player
+        if two_player is not None and two_player in env.penalties:
+            env.penalties[two_player] = env.penalty_thresholds[two_player]
+            env.terminations[two_player] = True
+            logger.debug(f"Pre-eliminated {two_player}")
+            alive = [a for a in env.possible_agents if not env.terminations.get(a, False)]
+            env.agents = alive
+            env._agent_selector = agent_selector(alive)
+            env.agent_selection = env._agent_selector.next()
+        else:
+            env.agents = env.possible_agents[:]
+            env._agent_selector = agent_selector(env.agents)
+            env.agent_selection = env._agent_selector.next()
+
+        # Play one game
+        steps_in_game = 0
+        game_active = True
+        while game_active and env.agent_selection is not None:
+            steps_in_game += 1
+            agent_id_env = env.agent_selection
+            observation = env.observe(agent_id_env)
+            _, _, terminated, truncated, info = env.last()
+            if terminated or truncated:
+                env.step(None)
+                continue
+
+            current_agent = players_in_this_game[agent_id_env]
+            player_id = current_agent.get_player_id()
+
+            try:
+                action = current_agent.get_action(
+                    env, agent_id_env, observation, info, cheat_expert_index
+                )
+                action_counts[player_id][action] += 1
+
+                # Step-level expert info capture
+                if track_experts and hasattr(current_agent, 'get_last_expert_info'):
+                    expert_info = current_agent.get_last_expert_info()
+                    if expert_info:
+                        expert_activations_by_player_id[player_id]['steps'].append(expert_info)
+                        logger.debug(
+                            f"[Game {game_idx} Step {steps_in_game}] "
+                            f"Agent {player_id} expert info: {expert_info}"
+                        )
+
+            except Exception as e:
+                logger.error(
+                    f"Error during get_action for {player_id} ({agent_id_env}): {e}",
+                    exc_info=True
+                )
+                mask = info.get('action_mask', [1] * env.action_spaces[agent_id_env].n)
+                valid_actions = [i for i, m in enumerate(mask) if m == 1]
+                action = random.choice(valid_actions) if valid_actions else 0
+
+            env.step(action)
+            if not env.agents:
+                game_active = False
+
+        # End of one game: record win
+        total_steps += steps_in_game
+        wins = {pid: 0 for pid in all_player_ids}
+        winner_env = env.winner
+        if winner_env and winner_env in players_in_this_game:
+            pid = players_in_this_game[winner_env].get_player_id()
+            cumulative_wins[pid] += 1
+            wins[pid] = 1
+        game_wins_list.append(wins)
+
+        if progress_callback is not None:
+            progress_callback(game_idx)
+
+    # Final stats
+    elapsed = time.time() - start_time
+    steps_per_sec = total_steps / elapsed if elapsed > 0 else 0.0
+    avg_steps = total_steps / episodes if episodes > 0 else 0.0
+
+    logger.info(
+        f"Evaluation finished in {elapsed:.2f}s "
+        f"({steps_per_sec:.2f} steps/s, {avg_steps:.2f} steps/game)."
+    )
+    logger.info(f"Cumulative wins: {cumulative_wins}")
+
+    if track_experts:
+        return cumulative_wins, action_counts, game_wins_list, avg_steps, steps_per_sec, expert_activations_by_player_id, player_id_map
     else:
-        return cumulative_wins, action_counts, game_wins_list, avg_steps, steps_per_sec
+        return cumulative_wins, action_counts, game_wins_list, avg_steps, steps_per_sec, None, player_id_map
