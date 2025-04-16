@@ -1,12 +1,17 @@
-# src/evaluation/ai_vs_hardcoded.py
+# src/evaluation/eval_gui.py
 import itertools
 import os
+from typing import Any, Dict, Optional, Type
+from PyQt5 import QtCore
+from src.agents.base_agent import BaseAgent
+from src.agents.hardcoded_agent_wrapper import HardcodedAgentWrapper
+from src.agents.agent_factory import AgentFactory
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import logging
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from collections import deque
+from collections import defaultdict, deque
 import re
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 from PyQt5 import QtWidgets
@@ -164,1164 +169,589 @@ class BattlegroundWorker(QThread):
     error_signal = pyqtSignal(str)
     
     # Now include extra parameters "onev2" and "duo"
-    def __init__(self, ai_agents, historical_models, hardcoded_agents, rounds, two_player=None, parent=None, cheat=False, onev2=False, duo=False):
+    def __init__(self,
+                 selected_ai_agent_configs: Dict[str, Dict],
+                 # MODIFIED: Expects {identifier: {'path': ..., 'key': ...}}
+                 historical_model_configs: Dict[str, Dict[str, str]],
+                 hardcoded_agent_classes: Dict[str, type],
+                 rounds: int,
+                 device: torch.device,
+                 two_player: Optional[str] = None,
+                 cheat: bool = False,
+                 onev2: bool = False,
+                 duo: bool = False,
+                 parent=None):
         super().__init__(parent)
-        self.ai_agents = ai_agents
-        self.historical_models = historical_models
-        self.hardcoded_agents = hardcoded_agents
+        self.selected_ai_agent_configs = selected_ai_agent_configs
+        self.historical_model_configs = historical_model_configs # Store the dict
+        self.hardcoded_agent_classes = hardcoded_agent_classes
+        # ... rest of __init__ ...
         self.rounds = rounds
-        self.two_player = two_player  # if not None, pass the player id to eliminate
+        self.device = device
+        self.two_player = two_player
         self.cheat = cheat
-        self.onev2 = onev2      # if True, run 1v2 mode (one AI against the same opponent in both slots)
-        self.duo = duo          # if True, run duo mode (one AI against a pair of different opponents)
+        self.onev2 = onev2
+        self.duo = duo
         self.expert_activations = {}
+        self.agent_factory = AgentFactory(self.device)
     
     def run(self):
-        combined_opponents = {}
-        # Add hardcoded agents.
-        for name, cls in self.hardcoded_agents.items():
-            combined_opponents[name] = ("hardcoded", cls)
-        # Then add historical models.
-        for identifier, hist_model in self.historical_models.items():
-            combined_opponents[identifier] = ("historical", hist_model)
-        
+        # --- Prepare Opponent Pool ---
+        opponent_pool = {} # Maps opponent_name -> (type, config)
+
+        # Add hardcoded agent configs
+        for name, cls in self.hardcoded_agent_classes.items():
+            opponent_pool[name] = ("hardcoded", self.agent_factory.create_hardcoded_agent_config(cls, name))
+
+        # Add historical models using the new config structure
+        # MODIFIED: Iterate through the historical config dict
+        for identifier, hist_config in self.historical_model_configs.items():
+            # Config already contains path and key
+            opponent_pool[identifier] = ("historical_ai", {
+                'path': hist_config['path'],
+                'key': hist_config['key'],
+                'id_prefix': identifier # Use the unique ID as prefix
+            })
+
+        # ... (progress calculation, results/expert dict init) ...
         progress_counter = 0
-        results = {}
-        # Initialize expert activation tracking
-        self.expert_activations = {}
-        
-        # Duo mode: iterate over every pair of opponents.
-        if self.duo:
-            duo_pairs = list(itertools.combinations(combined_opponents.items(), 2))
-            for ((opp_name1, (opp_type1, opp_obj1)), (opp_name2, (opp_type2, opp_obj2))) in duo_pairs:
-                opponent_name = f"{opp_name1}+{opp_name2}"
-                if self.cheat:
-                    cheat_index1 = LABELS.get(opp_name1, None)
-                    cheat_index2 = LABELS.get(opp_name2, None)
-                    cheat_expert_index = (cheat_index1, cheat_index2)
-                else:
-                    cheat_expert_index = None
-                # Pass a tuple of opponent types and a tuple of opponent objects.
-                cumulative_wins, expert_acts = self.run_match(
-                    (opp_type1, opp_type2), 
-                    (opp_obj1, opp_obj2), 
-                    opponent_name, 
-                    episodes=self.rounds, 
-                    progress_callback=lambda ep: self.progress_signal.emit(progress_counter + ep), 
-                    cheat_expert_index=cheat_expert_index
-                )
-                wins = [
-                    cumulative_wins.get("player_0", 0),
-                    cumulative_wins.get("player_1", 0),
-                    cumulative_wins.get("player_2", 0)
-                ]
-                self.expert_activations[opponent_name] = expert_acts
-                progress_counter += self.rounds
-                self.progress_signal.emit(progress_counter)
-                results[opponent_name] = wins
-        else:
-            # Normal and onev2 modes.
-            for opp_name, (opp_type, opp_obj) in combined_opponents.items():
-                if self.onev2:
-                    if self.cheat:
-                        cheat_index1 = LABELS.get(opp_name, None)
-                        cheat_expert_index = (cheat_index1, cheat_index1)
-                    else:
-                        cheat_expert_index = None
-                    cumulative_wins, expert_acts = self.run_match(opp_type, opp_obj, opp_name, episodes=self.rounds, progress_callback=lambda ep: self.progress_signal.emit(progress_counter + ep), cheat_expert_index=cheat_expert_index)
-                else:
-                    if self.cheat:
-                        cheat_expert_index = LABELS.get(opp_name, None)
-                    else:
-                        cheat_expert_index = None
-                    cumulative_wins, expert_acts = self.run_match(opp_type, opp_obj, opp_name, episodes=self.rounds, progress_callback=lambda ep: self.progress_signal.emit(progress_counter + ep), cheat_expert_index=cheat_expert_index)
-                wins = [
-                    cumulative_wins.get("player_0", 0),
-                    cumulative_wins.get("player_1", 0),
-                    cumulative_wins.get("player_2", 0)
-                ]
-                self.expert_activations[opp_name] = expert_acts
-                progress_counter += self.rounds
-                self.progress_signal.emit(progress_counter)
-                results[opp_name] = wins
-        
-        # Emit the expert activations and the results
-        self.expert_signal.emit(self.expert_activations)
-        self.results_signal.emit(results)
-    
-    def run_match(self, opponent_type, opponent_obj, opponent_name, episodes, progress_callback=None, cheat_expert_index=None): 
+        total_matches_estimate = self.rounds * len(opponent_pool)
+        if self.duo: total_matches_estimate = self.rounds * (len(opponent_pool) * (len(opponent_pool) - 1) // 2) if len(opponent_pool)>1 else 0
+
+        results = {} # Stores {display_name: [p0, p1, p2 wins]}
+        self.expert_activations = {} # Stores {display_name: {player_id: {expert_idx: count}}}
+
+        try:
+            # --- Main Loop (Duo, OneV2, Standard) ---
+            if self.duo:
+                # ... (duo loop setup) ...
+                duo_pairs = list(itertools.combinations(opponent_pool.items(), 2))
+                logger.info(f"Running Duo Mode with {len(duo_pairs)} opponent pairs.")
+                for ((opp_name1, (opp_type1, opp_config1)), (opp_name2, (opp_type2, opp_config2))) in duo_pairs:
+                    opponent_display_name = f"{opp_name1}+{opp_name2}"
+                    # Pass tuples of configs and types
+                    opponent_configs = (opp_config1, opp_config2)
+                    opponent_types = (opp_type1, opp_type2)
+
+                    cheat_idx1 = LABELS.get(opp_name1)
+                    cheat_idx2 = LABELS.get(opp_name2)
+                    current_cheat_index = (cheat_idx1, cheat_idx2) if self.cheat and cheat_idx1 is not None and cheat_idx2 is not None else None
+
+                    # Run the match
+                    cumulative_wins, expert_acts, player_id_map = self.run_match( # Get player_id_map
+                        opponent_configs=opponent_configs,
+                        opponent_types=opponent_types,
+                        opponent_display_name=opponent_display_name,
+                        episodes=self.rounds,
+                        progress_callback=lambda ep: self.progress_signal.emit(progress_counter + ep),
+                        cheat_expert_index=current_cheat_index,
+                        mode='duo' # Pass mode
+                    )
+
+                    # Format results using the map
+                    results[opponent_display_name] = self._format_wins(cumulative_wins, player_id_map)
+                    self.expert_activations[opponent_display_name] = expert_acts
+                    progress_counter += self.rounds
+                    self.progress_signal.emit(progress_counter) # Update progress bar
+
+            elif self.onev2:
+                 # ... (onev2 loop setup) ...
+                 logger.info(f"Running 1v2 Mode against {len(opponent_pool)} opponents.")
+                 for opp_name, (opp_type, opp_config) in opponent_pool.items():
+                     opponent_display_name = f"{opp_name}(x2)"
+                     cheat_idx = LABELS.get(opp_name)
+                     current_cheat_index = (cheat_idx, cheat_idx) if self.cheat and cheat_idx is not None else None
+
+                     cumulative_wins, expert_acts, player_id_map = self.run_match(
+                         opponent_configs=(opp_config, opp_config), # Duplicate config
+                         opponent_types=(opp_type, opp_type),       # Duplicate type
+                         opponent_display_name=opponent_display_name,
+                         episodes=self.rounds,
+                         progress_callback=lambda ep: self.progress_signal.emit(progress_counter + ep),
+                         cheat_expert_index=current_cheat_index,
+                         mode='onev2' # Pass mode
+                     )
+                     results[opponent_display_name] = self._format_wins(cumulative_wins, player_id_map)
+                     self.expert_activations[opponent_display_name] = expert_acts
+                     progress_counter += self.rounds
+                     self.progress_signal.emit(progress_counter)
+
+            else: # Standard mode
+                 # ... (standard loop setup) ...
+                 logger.info(f"Running Standard Mode against {len(opponent_pool)} opponents.")
+                 for opp_name, (opp_type, opp_config) in opponent_pool.items():
+                     cheat_idx = LABELS.get(opp_name)
+                     current_cheat_index = cheat_idx if self.cheat and cheat_idx is not None else None
+
+                     cumulative_wins, expert_acts, player_id_map = self.run_match(
+                         opponent_configs=(opp_config,), # Single opponent config
+                         opponent_types=(opp_type,),     # Single opponent type
+                         opponent_display_name=opp_name,
+                         episodes=self.rounds,
+                         progress_callback=lambda ep: self.progress_signal.emit(progress_counter + ep),
+                         cheat_expert_index=current_cheat_index,
+                         mode='standard' # Pass mode
+                     )
+                     results[opp_name] = self._format_wins(cumulative_wins, player_id_map)
+                     self.expert_activations[opp_name] = expert_acts
+                     progress_counter += self.rounds
+                     self.progress_signal.emit(progress_counter)
+
+
+            # Emit final signals
+            logger.info("Battleground run finished.")
+            self.expert_signal.emit(self.expert_activations)
+            self.results_signal.emit(results)
+
+        except Exception as e:
+            logger.error(f"Error during battleground run: {e}", exc_info=True)
+            self.error_signal.emit(str(e))
+
+    def _format_wins(self, cumulative_wins: Dict[str, int], player_id_map: Dict[str, str]) -> list:
+        """Formats wins into [p0_wins, p1_wins, p2_wins] using the player_id -> env_id map."""
+        formatted = [0] * 3 # Assuming 3 players
+        env_id_to_wins = {env_id: cumulative_wins.get(pid, 0) for pid, env_id in player_id_map.items()}
+
+        for i in range(3):
+            env_id = f"player_{i}"
+            formatted[i] = env_id_to_wins.get(env_id, 0)
+
+        return formatted
+
+    def run_match(self, opponent_configs: tuple, opponent_types: tuple, opponent_display_name: str, episodes: int, mode:str, progress_callback=None, cheat_expert_index=None):
+        """Runs a single match configuration using the AgentFactory."""
         env = LiarsDeckEnv(num_players=3, render_mode=None)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        players_in_this_game = {}
-        logger = logging.getLogger("BattlegroundWorker")
-        
-        # --- Set up AI agent(s) and opponent(s) based on mode ---
-        if isinstance(opponent_type, (tuple, list)):
-            # Duo mode: Use a single AI agent in player_0, and two different opponents for player_1 and player_2.
-            # Load AI agent from self.ai_agents["player_0"]
-            agent_data = self.ai_agents["player_0"]
-            policy_state_dict = agent_data["policy_net"]
-            if agent_data.get("is_belief_space_policy", False):
-                try:
-                    # Get dimensions from the model's state dict
-                    if 'network.0.weight' in policy_state_dict:
-                        hidden_dim = policy_state_dict['network.0.weight'].shape[0]
-                        total_input_dim = policy_state_dict['network.0.weight'].shape[1]
-                    else:
-                        # Try fallback methods
-                        hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, "network.0")
-                        if 'network.0.bias' in policy_state_dict:
-                            hidden_dim = policy_state_dict['network.0.bias'].shape[0]
+        players_for_eval: Dict[str, BaseAgent] = {} # Maps env_id -> Agent object
 
-                        # Try to find any linear layer to infer dimensions
-                        for net_key, tensor in policy_state_dict.items():
-                            if isinstance(tensor, torch.Tensor) and tensor.ndim == 2 and '.weight' in net_key and 'network' in net_key:
-                                total_input_dim = tensor.shape[1]
-                                break
-                        else:
-                            # If still not found, use ModelFactory to estimate dimensions
-                            dimensions = ModelFactory.get_belief_dimensions(policy_state_dict)
-                            if dimensions[0] is not None:
-                                total_input_dim, obs_dim, belief_dim = dimensions
-                            else:
-                                # Last resort fallback
-                                total_input_dim = 29  # Default if we can't determine
-                    
-                    if total_input_dim is not None:
-                        # Compute a better estimate of observation and belief dimensions
-                        
-                        # First check if the model has configuration attributes saved
-                        if hasattr(policy_state_dict, 'get') and policy_state_dict.get('total_input_dim') is not None:
-                            total_input_dim = policy_state_dict['total_input_dim'].item()
-                        if hasattr(policy_state_dict, 'get') and policy_state_dict.get('obs_dim') is not None:
-                            obs_dim = policy_state_dict['obs_dim'].item()
-                            belief_dim = total_input_dim - obs_dim
-                        else:
-                            key = "player_0"
-                            # Make a better estimate by analyzing the observation
-                            sample_obs = env.observe(key, newer=True)[key]
-                            estimated_obs_dim = min(sample_obs.shape[0], total_input_dim - 10)  # Ensure at least 10 for belief
-                            
-                            # For display and initialization
-                            obs_dim = estimated_obs_dim
-                            belief_dim = total_input_dim - obs_dim
-                        
-                        # Create BeliefSpacePolicy with the exact dimensions from the checkpoint
-                        policy_net = BeliefSpacePolicy(
-                            belief_dim=belief_dim,
-                            obs_dim=obs_dim,
-                            hidden_dim=hidden_dim,
-                            output_dim=env.action_spaces[key].n
-                        )
-                        
-                        # Load state dict with better error handling
-                        policy_net.load_state_dict(policy_state_dict, strict=True)
-                        
-                        # Check for NaN/Inf in loaded weights and fix them
-                        has_invalid_params = False
-                        for name, param in policy_net.named_parameters():
-                            if torch.isnan(param).any() or torch.isinf(param).any():
-                                logger.warning(f"NaN/Inf found in parameter {name}, fixing...")
-                                has_invalid_params = True
-                                # Zero out the problematic values
-                                param.data = torch.nan_to_num(param.data, nan=0.0, posinf=0.0, neginf=0.0)
-                        
-                        if has_invalid_params:
-                            logger.info("Fixed NaN/Inf values in model parameters")
-                        
-                        policy_net.to(device).eval()
-                        
-                        # Load OpponentBeliefModel if available with similar error handling
-                        belief_model_state = agent_data["belief_model"]
-                        belief_model = None
-                        
-                        if belief_model_state is not None:
-                            try:
-                                # Get belief model dimensions with fallbacks
-                                if 'encoder.0.weight' in belief_model_state:
-                                    belief_hidden_dim = belief_model_state['encoder.0.weight'].shape[0]
-                                    belief_obs_dim = belief_model_state['encoder.0.weight'].shape[1]
-                                else:
-                                    belief_hidden_dim = get_hidden_dim_from_state_dict(belief_model_state, "encoder.0")
-                                    belief_obs_dim = obs_dim  # Use the same as policy network
-                                
-                                # Get num_opponent_types from final layer
-                                if 'belief_update.2.weight' in belief_model_state:
-                                    num_opponent_types = belief_model_state['belief_update.2.weight'].shape[0]
-                                else:
-                                    num_opponent_types = agent_data.get('num_opponent_types', 10)
-                                
-                                # Create and load belief model
-                                belief_model = OpponentBeliefModel(
-                                    event_feature_dim=5,
-                                    max_seq_length=config.MAX_SQUENCE_LENGTH,
-                                    hidden_dim=256 // 4,
-                                    num_opponent_types=10
-                                ).to(device)
-                                # Load state dict with error handling
-                                belief_model.load_state_dict(belief_model_state, strict=True)
-                                
-                                # Check for NaN/Inf values
-                                for name, param in belief_model.named_parameters():
-                                    if torch.isnan(param).any() or torch.isinf(param).any():
-                                        logger.warning(f"NaN/Inf found in belief model parameter {name}, fixing...")
-                                        param.data = torch.nan_to_num(param.data, nan=0.0, posinf=0.0, neginf=0.0)
-                                    
-                                belief_model.to(device).eval()
-                            except Exception as e:
-                                logger.warning(f"Failed to create belief model: {str(e)}")
-                                belief_model = None
-                        
-                        players_in_this_game[key] = {
-                            "policy_net": policy_net,
-                            "belief_model": belief_model,
-                            "obs_version": 2,  # New observation format
-                            "rating": None,
-                            "uses_memory": False,
-                            "track_experts": False,
-                            "is_stacked_model": False,
-                            "is_newer_obs_model": False,
-                            "is_belief_space_policy": True,
-                            "num_opponent_types": num_opponent_types if 'num_opponent_types' in locals() else 10
-                        }
-                    else:
-                        raise ValueError("Could not determine total input dimension for BeliefSpacePolicy")
-                except Exception as e:
-                    logger.error(f"Failed to create BeliefSpacePolicy: {str(e)}")
-                    raise
-            else:
-                # Otherwise, use the traditional model initialization.
-                hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, "fc1")
-                obs_dim = agent_data["input_dim"]
-                policy_net = ModelFactory.create_policy_network(
-                    input_dim=obs_dim,
-                    hidden_dim=hidden_dim,
-                    output_dim=env.action_spaces["player_0"].n,
-                    use_new_model=True
+        try:
+            # --- Instantiate AI Agents ---
+            num_ai_agents = 1 if mode in ['duo', 'onev2'] else 2
+            for i in range(num_ai_agents):
+                env_id = f"player_{i}"
+                # Need to handle case where config might be missing (e.g., user didn't select agent 2 in standard mode)
+                if env_id not in self.selected_ai_agent_configs:
+                     raise ValueError(f"Configuration missing for required AI agent {env_id} in {mode} mode.")
+                ai_config = self.selected_ai_agent_configs[env_id]
+                agent = self.agent_factory.create_agent_from_checkpoint(
+                    checkpoint_path=ai_config['path'],
+                    player_id_prefix=ai_config['id_prefix'],
+                    agent_key=ai_config['key']
                 )
-                policy_net.load_state_dict(policy_state_dict, strict=False)
-                policy_net.to(device).eval()
-                belief_model = None
-            players_in_this_game["player_0"] = {
-                "policy_net": policy_net,
-                "belief_model": belief_model,
-                "obs_version": 2,
-                "rating": None,
-                "uses_memory": False,
-                "track_experts": False,
-                "is_belief_space_policy": agent_data.get("is_belief_space_policy", False)
-            }
-            # Now create opponent players for player_1 and player_2 from the duo pair.
-            for idx, (opp_type, opp_obj) in enumerate(zip(opponent_type, opponent_obj), start=1):
-                key = f"player_{idx}"
-                if opp_type == "hardcoded":
-                    opponent_instance = opp_obj(opponent_name)
-                    players_in_this_game[key] = {
-                        "hardcoded_bot": True,
-                        "agent": opponent_instance,
-                        "obs_version": 2,
-                        "rating": None,
-                        "uses_memory": False
-                    }
-                elif opp_type == "historical":
-                    hist_state_dict = opp_obj.state_dict()
-                    hidden_dim = get_hidden_dim_from_state_dict(hist_state_dict, "fc1")
-                    obs_dim = hist_state_dict["fc1.weight"].shape[1]
-                    policy_net = ModelFactory.create_policy_network(
-                        input_dim=obs_dim,
-                        hidden_dim=hidden_dim,
-                        output_dim=env.action_spaces[key].n,
-                        use_new_model=True
-                    )
-                    policy_net.load_state_dict(hist_state_dict, strict=False)
-                    policy_net.to(device).eval()
-                    obp_model = ModelFactory.create_obp(
-                        use_transformer_memory=True,
-                        input_dim=config.OPPONENT_INPUT_DIM,
-                        hidden_dim=config.OPPONENT_HIDDEN_DIM,
-                        output_dim=2
-                    )
-                    obp_model.to(device).eval()
-                    players_in_this_game[key] = {
-                        "policy_net": policy_net,
-                        "obp_model": obp_model,
-                        "obs_version": 2,
-                        "rating": None,
-                        "uses_memory": True
-                    }
-                else:
-                    raise ValueError(f"Unsupported opponent type in duo mode: {opp_type}")
-        elif self.onev2:
-            # onev2 mode: Use a single AI agent for player_0 and assign the same opponent to both player_1 and player_2.
-            agent_data = self.ai_agents["player_0"]
-            policy_state_dict = agent_data["policy_net"]
-            if agent_data.get("is_belief_space_policy", False):
-                hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, "network.0")
-                total_input_dim = policy_state_dict['network.0.weight'].shape[1]
-                sample_obs = env.observe("player_0", newer=True)["player_0"]
-                obs_dim = min(sample_obs.shape[0], total_input_dim - 10)
-                belief_dim = total_input_dim - obs_dim
-                policy_net = BeliefSpacePolicy(
-                    belief_dim=belief_dim,
-                    obs_dim=obs_dim,
-                    hidden_dim=hidden_dim,
-                    output_dim=env.action_spaces["player_0"].n
-                )
-                policy_net.load_state_dict(policy_state_dict, strict=False)
-                policy_net.to(device).eval()
-                belief_model_state = agent_data["belief_model"]
-                if belief_model_state is not None:
-                    # Determine dimensions (example values; adjust based on your requirements)
-                    belief_hidden_dim = get_hidden_dim_from_state_dict(belief_model_state, "encoder.0")
-                    belief_obs_dim = belief_model_state["encoder.0.weight"].shape[1] if "encoder.0.weight" in belief_model_state else obs_dim
-                    num_opponent_types = 10  # or retrieve from agent_data if available
+                players_for_eval[env_id] = agent
 
-                    # Instantiate the belief model.
-                    belief_model = OpponentBeliefModel(
-                        event_feature_dim=5,
-                        max_seq_length=config.MAX_SQUENCE_LENGTH,
-                        hidden_dim=belief_hidden_dim,
-                        num_opponent_types=num_opponent_types
-                    ).to(device)
-                    # Load the parameters.
-                    belief_model.load_state_dict(belief_model_state, strict=True)
-                else:
-                    belief_model = None
-            else:
-                hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, "fc1")
-                obs_dim = agent_data["input_dim"]
-                policy_net = ModelFactory.create_policy_network(
-                    input_dim=obs_dim,
-                    hidden_dim=hidden_dim,
-                    output_dim=env.action_spaces["player_0"].n,
-                    use_new_model=True
-                )
-                policy_net.load_state_dict(policy_state_dict, strict=False)
-                policy_net.to(device).eval()
-                belief_model = None
-            players_in_this_game["player_0"] = {
-                "policy_net": policy_net,
-                "belief_model": belief_model,
-                "obs_version": 2,
-                "rating": None,
-                "uses_memory": False,
-                "track_experts": False,
-                "is_belief_space_policy": agent_data.get("is_belief_space_policy", False)
-            }
-            # For onev2, assign the same opponent to both player_1 and player_2.
-            if opponent_type == "hardcoded":
-                opponent_instance = opponent_obj(opponent_name)
-                for key in ["player_1", "player_2"]:
-                    players_in_this_game[key] = {
-                        "hardcoded_bot": True,
-                        "agent": opponent_instance,
-                        "obs_version": 2,
-                        "rating": None,
-                        "uses_memory": False
-                    }
-            elif opponent_type == "historical":
-                hist_state_dict = opponent_obj.state_dict()
-                hidden_dim = get_hidden_dim_from_state_dict(hist_state_dict, "fc1")
-                obs_dim = hist_state_dict["fc1.weight"].shape[1]
-                policy_net = ModelFactory.create_policy_network(
-                    input_dim=obs_dim,
-                    hidden_dim=hidden_dim,
-                    output_dim=env.action_spaces["player_2"].n,
-                    use_new_model=True
-                )
-                policy_net.load_state_dict(hist_state_dict, strict=False)
-                policy_net.to(device).eval()
-                obp_model = ModelFactory.create_obp(
-                    use_transformer_memory=True,
-                    input_dim=config.OPPONENT_INPUT_DIM,
-                    hidden_dim=config.OPPONENT_HIDDEN_DIM,
-                    output_dim=2
-                )
-                obp_model.to(device).eval()
-                for key in ["player_1", "player_2"]:
-                    players_in_this_game[key] = {
-                        "policy_net": policy_net,
-                        "obp_model": obp_model,
-                        "obs_version": 2,
-                        "rating": None,
-                        "uses_memory": True
-                    }
-            else:
-                raise ValueError(f"Unknown opponent type in onev2 mode: {opponent_type}")
-        else:
-            # Normal mode: Load AI agents for player_0 and player_1, and assign opponent to player_2.
-            for key in ["player_0", "player_1"]:
-                agent_data = self.ai_agents[key]
-                policy_state_dict = agent_data["policy_net"]
-                if agent_data.get("is_belief_space_policy", False):
-                    try:
-                        if 'network.0.weight' in policy_state_dict:
-                            hidden_dim = policy_state_dict['network.0.weight'].shape[0]
-                            total_input_dim = policy_state_dict['network.0.weight'].shape[1]
-                        else:
-                            hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, "network.0")
-                            if 'network.0.bias' in policy_state_dict:
-                                hidden_dim = policy_state_dict['network.0.bias'].shape[0]
-                            for net_key, tensor in policy_state_dict.items():
-                                if isinstance(tensor, torch.Tensor) and tensor.ndim == 2 and '.weight' in net_key and 'network' in net_key:
-                                    total_input_dim = tensor.shape[1]
-                                    break
-                            else:
-                                dimensions = ModelFactory.get_belief_dimensions(policy_state_dict)
-                                if dimensions[0] is not None:
-                                    total_input_dim, obs_dim, belief_dim = dimensions
-                                else:
-                                    total_input_dim = 29
-                        if total_input_dim is not None:
-                            if hasattr(policy_state_dict, 'get') and policy_state_dict.get('total_input_dim') is not None:
-                                total_input_dim = policy_state_dict['total_input_dim'].item()
-                            if hasattr(policy_state_dict, 'get') and policy_state_dict.get('obs_dim') is not None:
-                                obs_dim = policy_state_dict['obs_dim'].item()
-                                belief_dim = total_input_dim - obs_dim
-                            else:
-                                sample_obs = env.observe(key, newer=True)[key]
-                                estimated_obs_dim = min(sample_obs.shape[0], total_input_dim - 10)
-                                obs_dim = estimated_obs_dim
-                                belief_dim = total_input_dim - obs_dim
-                            policy_net = BeliefSpacePolicy(
-                                belief_dim=belief_dim,
-                                obs_dim=obs_dim,
-                                hidden_dim=hidden_dim,
-                                output_dim=env.action_spaces[key].n
-                            )
-                            try:
-                                policy_net.load_state_dict(policy_state_dict, strict=False)
-                                has_invalid_params = False
-                                for name, param in policy_net.named_parameters():
-                                    if torch.isnan(param).any() or torch.isinf(param).any():
-                                        logger.warning(f"NaN/Inf found in parameter {name}, fixing...")
-                                        has_invalid_params = True
-                                        param.data = torch.nan_to_num(param.data, nan=0.0, posinf=0.0, neginf=0.0)
-                                if has_invalid_params:
-                                    logger.info("Fixed NaN/Inf values in model parameters")
-                            except Exception as e:
-                                logger.warning(f"Error loading state dict: {str(e)}. Attempting to adjust...")
-                                mismatched_keys = []
-                                for name, param in policy_net.named_parameters():
-                                    if name in policy_state_dict:
-                                        checkpoint_param = policy_state_dict[name]
-                                        if param.shape != checkpoint_param.shape:
-                                            mismatched_keys.append(name)
-                                            logger.warning(f"Shape mismatch for {name}: model {param.shape} vs checkpoint {checkpoint_param.shape}")
-                                if mismatched_keys:
-                                    adjusted_state_dict = {}
-                                    for name, param in policy_state_dict.items():
-                                        if name in mismatched_keys:
-                                            continue
-                                        adjusted_state_dict[name] = param
-                                    policy_net.load_state_dict(adjusted_state_dict, strict=False)
-                                    logger.info("Loaded adjusted state dict with skipped mismatched keys")
-                            policy_net.to(device).eval()
-                            belief_model_state = agent_data["belief_model"]
-                            if belief_model_state is not None:
-                                # Determine dimensions (example values; adjust based on your requirements)
-                                belief_hidden_dim = get_hidden_dim_from_state_dict(belief_model_state, "encoder.0")
-                                belief_obs_dim = belief_model_state["encoder.0.weight"].shape[1] if "encoder.0.weight" in belief_model_state else obs_dim
-                                num_opponent_types = 10  # or retrieve from agent_data if available
+            # --- Instantiate Opponent(s) ---
+            num_opponents = len(opponent_configs)
+            for i in range(num_opponents):
+                 env_id = f"player_{num_ai_agents + i}"
+                 opp_config = opponent_configs[i]
+                 opp_type = opponent_types[i]
 
-                                # Instantiate the belief model.
-                                belief_model = OpponentBeliefModel(
-                                    event_feature_dim=5,
-                                    max_seq_length=config.MAX_SQUENCE_LENGTH,
-                                    hidden_dim=belief_hidden_dim,
-                                    num_opponent_types=num_opponent_types
-                                ).to(device)
-                                # Load the parameters.
-                                belief_model.load_state_dict(belief_model_state, strict=True)
-                            else:
-                                belief_model = None
-                        else:
-                            raise ValueError("Could not determine total input dimension for BeliefSpacePolicy")
-                    except Exception as e:
-                        logger.error(f"Failed to create BeliefSpacePolicy: {str(e)}")
-                        raise
-                    players_in_this_game[key] = {
-                        "policy_net": policy_net,
-                        "belief_model": belief_model,
-                        "obs_version": 2,
-                        "rating": None,
-                        "uses_memory": False,
-                        "track_experts": False,
-                        "is_stacked_model": False,
-                        "is_newer_obs_model": False,
-                        "is_belief_space_policy": True,
-                        "num_opponent_types": agent_data.get('num_opponent_types', 10)
-                    }
-                elif agent_data.get("is_newer_obs_model", False):
-                    obs_dim = agent_data.get("input_dim")
-                    if obs_dim is None:
-                        obs_dim = get_obs_dim_from_stacked_model(policy_state_dict)
-                        if obs_dim is None:
-                            obs = env.observe(key, newer=True)[key]
-                            obs_dim = obs.shape[0]
-                    hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, "fc_layers.0")
-                    if hidden_dim is None:
-                        hidden_dim = config.HIDDEN_DIM
-                    policy_net = ModelFactory.create_stacked_observation_model(
-                        obs_dim=obs_dim,
-                        num_actions=env.action_spaces[key].n,
-                        hidden_dim=hidden_dim,
-                        num_obs_stack=config.NUM_OBS_STACK
-                    )
-                    policy_net.load_state_dict(policy_state_dict, strict=False)
-                    policy_net.to(device).eval()
-                    players_in_this_game[key] = {
-                        "policy_net": policy_net,
-                        "obp_model": obp_model,
-                        "obs_version": 5,
-                        "rating": None,
-                        "uses_memory": False,
-                        "track_experts": False,
-                        "is_stacked_model": True,
-                        "is_newer_obs_model": True,
-                        "is_conditional_model": False,
-                        "is_belief_space_policy": False,
-                        "observation_stacks": deque(maxlen=config.NUM_OBS_STACK)
-                    }
-                    sample_obs = env.observe(key, newer=True)[key]
-                    for _ in range(config.NUM_OBS_STACK):
-                        players_in_this_game[key]["observation_stacks"].append(np.zeros_like(sample_obs))
-                elif agent_data.get("is_stacked_model", False):
-                    obs_dim = agent_data.get("input_dim")
-                    if obs_dim is None:
-                        obs_dim = get_obs_dim_from_stacked_model(policy_state_dict)
-                        if obs_dim is None:
-                            obs = env.observe(key, new=True)[key]
-                            obs_dim = obs.shape[0]
-                    hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, "fc_layers.0")
-                    if hidden_dim is None:
-                        hidden_dim = config.HIDDEN_DIM
-                    policy_net = ModelFactory.create_stacked_observation_model(
-                        obs_dim=obs_dim,
-                        num_actions=env.action_spaces[key].n,
-                        hidden_dim=hidden_dim,
-                        num_obs_stack=config.NUM_OBS_STACK
-                    )
-                    policy_net.load_state_dict(policy_state_dict, strict=False)
-                    policy_net.to(device).eval()
-                    players_in_this_game[key] = {
-                        "policy_net": policy_net,
-                        "obp_model": None,
-                        "obs_version": 3,
-                        "rating": None,
-                        "uses_memory": False,
-                        "track_experts": False,
-                        "is_stacked_model": True,
-                        "is_newer_obs_model": False,
-                        "is_conditional_model": False,
-                        "is_belief_space_policy": False,
-                        "observation_stacks": deque(maxlen=config.NUM_OBS_STACK)
-                    }
-                    sample_obs = env.observe(key, new=True)[key]
-                    for _ in range(config.NUM_OBS_STACK):
-                        players_in_this_game[key]["observation_stacks"].append(np.zeros_like(sample_obs))
-                else:
-                    hidden_dim = get_hidden_dim_from_state_dict(policy_state_dict, "fc1")
-                    obs_dim = agent_data["input_dim"]
-                    is_moe_model = ModelFactory.is_moe_policy(policy_state_dict)
-                    new_model_flag = is_new_policy(policy_state_dict)
-                    if is_moe_model:
-                        policy_net = ModelFactory.create_policy_network(
-                            input_dim=obs_dim,
-                            hidden_dim=hidden_dim,
-                            output_dim=env.action_spaces[key].n,
-                            use_aux_classifier=True,
-                            num_opponent_classes=config.NUM_OPPONENT_CLASSES,
-                            use_moe_model=True,
-                            num_experts=10
-                        )
-                    elif new_model_flag:
-                        policy_net = ModelFactory.create_policy_network(
-                            input_dim=obs_dim,
-                            hidden_dim=hidden_dim,
-                            output_dim=env.action_spaces[key].n,
-                            use_aux_classifier=True,
-                            num_opponent_classes=config.NUM_OPPONENT_CLASSES,
-                            use_new_model=True
-                        )
-                    else:
-                        policy_net = ModelFactory.create_policy_network(
-                            input_dim=obs_dim,
-                            hidden_dim=hidden_dim,
-                            output_dim=env.action_spaces[key].n,
-                            use_new_model=False,
-                            strategy_dim=config.STRATEGY_DIM,
-                            num_opponents=env.num_players - 1
-                        )
-                    policy_net.load_state_dict(policy_state_dict, strict=False)
-                    policy_net.to(device).eval()
-                    obp_state = agent_data["obp_model"]
-                    if obp_state is not None:
-                        obp_hidden_dim = get_hidden_dim_from_state_dict(obp_state, "fc1")
-                        obp_input_dim = obp_state["fc1.weight"].shape[1]
-                        if obp_input_dim == config.OPPONENT_INPUT_DIM + config.STRATEGY_DIM:
-                            obp_model = ModelFactory.create_obp(
-                                use_transformer_memory=True,
-                                input_dim=config.OPPONENT_INPUT_DIM,
-                                hidden_dim=obp_hidden_dim,
-                                output_dim=2
-                            )
-                        elif obp_input_dim == config.OPPONENT_INPUT_DIM:
-                            obp_model = ModelFactory.create_obp(
-                                use_transformer_memory=False,
-                                input_dim=config.OPPONENT_INPUT_DIM,
-                                hidden_dim=obp_hidden_dim,
-                                output_dim=2
-                            )
-                        else:
-                            raise ValueError(f"Unexpected OBP input dimension: {obp_input_dim}")
-                        obp_model = ModelFactory.load_obp_state_dict(obp_model, obp_state)
-                        obp_model.to(device).eval()
-                        example_observation = torch.randn(1, config.OPPONENT_INPUT_DIM).to(device)
-                        example_memory_embedding = torch.randn(1, config.STRATEGY_DIM).to(device)
-                        obp_model = torch.jit.trace(obp_model, (example_observation, example_memory_embedding))
-                    else:
-                        obp_model = None
-                    players_in_this_game[key] = {
-                        "policy_net": policy_net,
-                        "obp_model": obp_model,
-                        "obs_version": agent_data["obs_version"],
-                        "rating": None,
-                        "uses_memory": agent_data["uses_memory"],
-                        "track_experts": True,
-                        "is_stacked_model": False,
-                        "is_newer_obs_model": False,
-                        "is_belief_space_policy": False,
-                        "is_conditional_model": False
-                    }
-            # --- Opponent as player_2 ---
-            if opponent_type == "hardcoded":
-                opponent_instance = opponent_obj(opponent_name)
-                players_in_this_game["player_2"] = {
-                    "hardcoded_bot": True,
-                    "agent": opponent_instance,
-                    "obs_version": 2,
-                    "rating": None,
-                    "uses_memory": False
-                }
-            elif opponent_type == "historical":
-                hist_state_dict = opponent_obj.state_dict()
-                hidden_dim = get_hidden_dim_from_state_dict(hist_state_dict, "fc1")
-                obs_dim = hist_state_dict["fc1.weight"].shape[1]
-                is_moe_model = ModelFactory.is_moe_policy(hist_state_dict)
-                new_model_flag = is_new_policy(hist_state_dict)
-                if is_moe_model:
-                    policy_net = ModelFactory.create_policy_network(
-                        input_dim=obs_dim,
-                        hidden_dim=hidden_dim,
-                        output_dim=env.action_spaces["player_2"].n,
-                        use_aux_classifier=True,
-                        num_opponent_classes=config.NUM_OPPONENT_CLASSES,
-                        use_moe_model=True,
-                        num_experts=10
-                    )
-                elif new_model_flag:
-                    policy_net = ModelFactory.create_policy_network(
-                        input_dim=obs_dim,
-                        hidden_dim=hidden_dim,
-                        output_dim=env.action_spaces["player_2"].n,
-                        use_aux_classifier=True,
-                        num_opponent_classes=config.NUM_OPPONENT_CLASSES,
-                        use_new_model=True
-                    )
-                else:
-                    policy_net = ModelFactory.create_policy_network(
-                        input_dim=obs_dim,
-                        hidden_dim=hidden_dim,
-                        output_dim=env.action_spaces["player_2"].n,
-                        use_new_model=False,
-                        strategy_dim=config.STRATEGY_DIM,
-                        num_opponents=env.num_players - 1
-                    )
-                policy_net.load_state_dict(hist_state_dict, strict=False)
-                policy_net.to(device).eval()
-                obp_model = ModelFactory.create_obp(
-                    use_transformer_memory=True,
-                    input_dim=config.OPPONENT_INPUT_DIM,
-                    hidden_dim=config.OPPONENT_HIDDEN_DIM,
-                    output_dim=2
-                )
-                obp_model.to(device).eval()
-                players_in_this_game["player_2"] = {
-                    "policy_net": policy_net,
-                    "obp_model": obp_model,
-                    "obs_version": 2,
-                    "rating": None,
-                    "uses_memory": True
-                }
-            else:
-                raise ValueError(f"Unknown opponent type: {opponent_type}")
-        env.reset(seed=42)
-        # When calling evaluate_agents, pass the cheat_expert_index (which may be scalar or a tuple).
-        cumulative_wins, _, _, _, _, expert_activations = evaluate_agents(
-            env, device, players_in_this_game, episodes=episodes, 
-            two_player=self.two_player, track_experts=True,
-            progress_callback=progress_callback,
-            cheat_expert_index=cheat_expert_index
-        )
-        return cumulative_wins, expert_activations
+                 if opp_type == "hardcoded":
+                     # Instantiate hardcoded agent here using the config
+                     hc_class = opp_config['class']
+                     hc_name = opp_config['name']
+                     player_id = f"Hardcoded_{hc_name}" # Unique ID
+                     # --- MODIFIED: Instantiate hardcoded agent with context ---
+                     try:
+                          # Determine agent index from env_id
+                          agent_index = int(env_id.split('_')[-1])
+                          # Try instantiating with context (name, num_players, agent_index)
+                          hc_instance = hc_class(hc_name, 3, agent_index)
+                          logger.debug(f"Instantiated {hc_name} with name, num_players=3, agent_index={agent_index}")
+                     except TypeError:
+                          # Fallback to just name if the constructor doesn't accept context
+                          hc_instance = hc_class(hc_name)
+                          logger.debug(f"Instantiated {hc_name} with just name.")
+                     except Exception as e:
+                          logger.error(f"Failed to instantiate hardcoded agent {hc_name}: {e}", exc_info=True)
+                          raise ValueError(f"Cannot instantiate hardcoded agent {hc_name}") from e
+
+                     # Wrap the instantiated agent
+                     agent = HardcodedAgentWrapper(hc_instance, self.device, player_id)
+                     # --- End Modification ---
+
+                 elif opp_type == "historical_ai":
+                     agent = self.agent_factory.create_agent_from_checkpoint(
+                         checkpoint_path=opp_config['path'],
+                         player_id_prefix=opp_config['id_prefix'],
+                         agent_key=opp_config['key']
+                     )
+                 else:
+                     raise ValueError(f"Unsupported opponent type: {opp_type}")
+
+                 players_for_eval[env_id] = agent
+
+            # --- Run Evaluation ---
+            logger.info(f"Starting match vs {opponent_display_name}. Mode: {mode}. Agents: { {env_id: agent.get_player_id() for env_id, agent in players_for_eval.items()} }")
+            # MODIFIED: Get player_id_map from return value
+            cumulative_wins, _, _, _, _, expert_activations, player_id_map = evaluate_agents(
+                env,
+                self.device,
+                players_for_eval,
+                episodes=episodes,
+                two_player=self.two_player,
+                track_experts=True,
+                progress_callback=progress_callback,
+                cheat_expert_index=cheat_expert_index
+            )
+
+            # Return wins keyed by unique player_id, expert activations, AND the map
+            return cumulative_wins, expert_activations, player_id_map
+
+        except Exception as e:
+             logger.error(f"Error running match against {opponent_display_name}: {e}", exc_info=True)
+             # Return empty results and map on error
+             return {}, {}, {}
 
 # --- Main GUI class using PyQt with a Discord-like style ---
 class AgentBattlegroundGUI(QtWidgets.QMainWindow):
     def __init__(self):
+        # ... (Initialization remains the same as previous version) ...
         super().__init__()
         self.setWindowTitle("Agent Battleground")
-        self.resize(1000, 700)
-        self.loaded_models = {}
-        self.hardcoded_agents = {
-            "Classic": Classic,
-            "GreedyCardSpammer": GreedyCardSpammer,
-            "RandomAgent": RandomAgent,
-            "SelectiveTableConservativeChallenger": lambda name: SelectiveTableConservativeChallenger(name),
-            "StrategicChallenger": lambda name: StrategicChallenger(name, 3, 2),
-            "TableFirstConservativeChallenger": TableFirstConservativeChallenger,
-            "TableNonTableAgent": TableNonTableAgent
+        self.resize(1000, 750)
+        self.loaded_model_paths: Dict[str, Dict[str, Any]] = {}
+        self.hardcoded_agents: Dict[str, Type] = { # Hardcoded agents ...
+             "Classic": Classic, "GreedyCardSpammer": GreedyCardSpammer, "RandomAgent": RandomAgent,
+             "SelectiveTableConservativeChallenger": SelectiveTableConservativeChallenger,
+             "StrategicChallenger": StrategicChallenger, "TableFirstConservativeChallenger": TableFirstConservativeChallenger,
+             "TableNonTableAgent": TableNonTableAgent
         }
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.historical_models = {}
-        hist_models_list = load_specific_historical_models(config.HISTORICAL_MODEL_DIR, device)
-        for model, identifier in hist_models_list:
-            self.historical_models[identifier] = model
-
-        # Store previous results for comparison.
-        self.previous_results = None
-        self.current_results = None
-        # Store expert activations
-        self.expert_activations = None
-
+        self.historical_model_configs: Dict[str, Dict[str, str]] = {}
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info(f"Using device: {self.device}")
+        # Load specific historical configs (as refined previously)
+        hist_dir = config.HISTORICAL_MODEL_DIR
+        required_models = {"Version_A": "player_2", "Version_C": "player_0", "Version_E": "player_1"}
+        logger.info(f"Attempting to load specific historical model configs from base: {hist_dir}")
+        found_count = 0
+        for version_dir_name, player_key in required_models.items():
+            version_path = os.path.join(hist_dir, version_dir_name)
+            identifier = f"{version_dir_name}_{player_key}"
+            if os.path.isdir(version_path):
+                checkpoint_file = next((f for f in os.listdir(version_path) if f.endswith(".pth")), None)
+                if checkpoint_file:
+                    full_path = os.path.join(version_path, checkpoint_file)
+                    self.historical_model_configs[identifier] = {'path': full_path, 'key': player_key}
+                    found_count += 1; logger.info(f"Found config: {identifier} at {full_path}")
+                else: logger.warning(f"No .pth found in {version_path} for {identifier}")
+            else: logger.warning(f"Directory not found: {version_path} for {identifier}")
+        logger.info(f"Found configs for {found_count} specific historical models.")
+        # State tracking
+        self.previous_results: Optional[Dict[str, list]] = None
+        self.current_results: Optional[Dict[str, list]] = None
+        self.expert_activations: Optional[Dict[str, Dict[str, Any]]] = None # Changed type hint slightly
+        self.worker: Optional[BattlegroundWorker] = None
         self.initUI()
 
+
     def initUI(self):
+        # ... (Setup central widget, main layout) ...
         central_widget = QtWidgets.QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QtWidgets.QVBoxLayout(central_widget)
 
-        # --- Model Files Group ---
-        model_files_group = QtWidgets.QGroupBox("Model Files")
+        # ... (Model Files Group, Model Info Group, AI Agents Selection Group remain the same) ...
+        model_files_group = QtWidgets.QGroupBox("Load AI Model Files (.pth)")
         model_files_layout = QtWidgets.QVBoxLayout(model_files_group)
-        self.file_list = DropListWidget(self)
-        self.file_list.setMaximumHeight(60)
+        self.file_list = DropListWidget(self); self.file_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         model_files_layout.addWidget(self.file_list)
-        drop_label = QtWidgets.QLabel("Drag and drop .pth files here")
+        drop_label = QtWidgets.QLabel("Drag and drop model files here."); drop_label.setAlignment(QtCore.Qt.AlignCenter); drop_label.setStyleSheet("color: #aaa;")
         model_files_layout.addWidget(drop_label)
-        main_layout.addWidget(model_files_group, 0)
-
-        # --- Model Info Group ---
-        model_info_group = QtWidgets.QGroupBox("Model Info")
+        main_layout.addWidget(model_files_group)
+        model_info_group = QtWidgets.QGroupBox("Status / Info")
         model_info_layout = QtWidgets.QVBoxLayout(model_info_group)
-        self.info_text = QtWidgets.QTextEdit()
-        self.info_text.setReadOnly(True)
-        self.info_text.setFixedHeight(80)
+        self.info_text = QtWidgets.QTextEdit(); self.info_text.setReadOnly(True); self.info_text.setFixedHeight(80); self.info_text.setPlaceholderText("Status messages...")
         model_info_layout.addWidget(self.info_text)
         main_layout.addWidget(model_info_group)
-
-        # --- AI Agents Selection Group ---
-        ai_selection_group = QtWidgets.QGroupBox("AI Agents Selection")
+        ai_selection_group = QtWidgets.QGroupBox("Select AI Agents for Battle")
         ai_selection_layout = QtWidgets.QGridLayout(ai_selection_group)
-        self.agent_selectors = {}
+        self.agent_selectors: Dict[int, QtWidgets.QComboBox] = {}
         for i in range(2):
-            label = QtWidgets.QLabel(f"AI Agent {i+1}:")
-            ai_selection_layout.addWidget(label, i, 0)
-            combo = QtWidgets.QComboBox()
-            combo.setEditable(False)
-            ai_selection_layout.addWidget(combo, i, 1)
-            self.agent_selectors[i] = combo
+            label = QtWidgets.QLabel(f"AI Agent {i+1}:"); ai_selection_layout.addWidget(label, i, 0)
+            combo = QtWidgets.QComboBox(); combo.setEditable(False); combo.setMinimumWidth(300); combo.addItem("No models loaded"); combo.setEnabled(False)
+            ai_selection_layout.addWidget(combo, i, 1); self.agent_selectors[i] = combo
         main_layout.addWidget(ai_selection_group)
 
-        # --- Control Buttons and Options Layout ---
+
+        # --- Layout: Controls & Options ---
         control_layout = QtWidgets.QHBoxLayout()
-        refresh_button = QtWidgets.QPushButton("Refresh Agents")
-        refresh_button.clicked.connect(self.update_agent_selectors)
+        refresh_button = QtWidgets.QPushButton("Refresh Agents"); refresh_button.setToolTip("Update agent selection dropdowns."); refresh_button.clicked.connect(self.update_agent_selectors)
         control_layout.addWidget(refresh_button)
-        start_button = QtWidgets.QPushButton("Start Battleground")
-        start_button.clicked.connect(self.start_battleground)
-        control_layout.addWidget(start_button)
-        rounds_label = QtWidgets.QLabel("Rounds:")
-        control_layout.addWidget(rounds_label)
-        self.rounds_spinbox = QtWidgets.QSpinBox()
-        self.rounds_spinbox.setMinimum(1)
-        self.rounds_spinbox.setMaximum(1000)
-        self.rounds_spinbox.setValue(20)
+        control_layout.addStretch(1)
+        rounds_label = QtWidgets.QLabel("Rounds:"); control_layout.addWidget(rounds_label)
+        self.rounds_spinbox = QtWidgets.QSpinBox(); self.rounds_spinbox.setMinimum(1); self.rounds_spinbox.setMaximum(10000); self.rounds_spinbox.setValue(20); self.rounds_spinbox.setFixedWidth(80)
         control_layout.addWidget(self.rounds_spinbox)
+        control_layout.addStretch(1)
 
-        # --- New Checkboxes ---
-        self.two_player_checkbox = QtWidgets.QCheckBox("2 Player Mode")
-        control_layout.addWidget(self.two_player_checkbox)
-        self.combine_ai_checkbox = QtWidgets.QCheckBox("Combine Columns")
-        control_layout.addWidget(self.combine_ai_checkbox)
-        self.combine_ai_checkbox.stateChanged.connect(self.update_results_display)
-        # Disable combine checkbox when 2 Player is active.
-        self.two_player_checkbox.stateChanged.connect(
-            lambda state: self.combine_ai_checkbox.setEnabled(state == Qt.Unchecked)
-        )
-        self.cheat_checkbox = QtWidgets.QCheckBox("Cheat")  # <-- New cheat checkbox
-        control_layout.addWidget(self.cheat_checkbox)
+        # --- Mode Selection ---
+        mode_group = QtWidgets.QGroupBox("Mode")
+        mode_layout = QtWidgets.QHBoxLayout(mode_group)
+        self.standard_mode_radio = QtWidgets.QRadioButton("Standard (2v1)")
+        self.onev2_mode_radio = QtWidgets.QRadioButton("1 AI vs 2 Opponents")
+        self.duo_mode_radio = QtWidgets.QRadioButton("1 AI vs Duo Opponents")
+        self.standard_mode_radio.setChecked(True)
+        # Connect radio buttons AFTER they are all defined
+        self.standard_mode_radio.toggled.connect(self._update_agent_selector_states)
+        self.onev2_mode_radio.toggled.connect(self._update_agent_selector_states)
+        self.duo_mode_radio.toggled.connect(self._update_agent_selector_states) # Connect duo mode too
+        mode_layout.addWidget(self.standard_mode_radio)
+        mode_layout.addWidget(self.onev2_mode_radio)
+        mode_layout.addWidget(self.duo_mode_radio)
+        control_layout.addWidget(mode_group)
 
-        # --- New Checkboxes for 1v2 and Duo Modes ---
-        self.onev2_checkbox = QtWidgets.QCheckBox("1v2 Mode")
-        control_layout.addWidget(self.onev2_checkbox)
+        # --- Other Options ---
+        options_group = QtWidgets.QGroupBox("Options")
+        options_layout = QtWidgets.QHBoxLayout(options_group)
+        self.two_player_checkbox = QtWidgets.QCheckBox("2 Player Only"); self.two_player_checkbox.setToolTip("Eliminate Player 2 at start.")
+        options_layout.addWidget(self.two_player_checkbox)
+        # --- MODIFIED: Checkbox Renamed and Connected ---
+        self.combine_results_checkbox = QtWidgets.QCheckBox("Combine Results")
+        self.combine_results_checkbox.setToolTip("Combine AI wins (Standard) or Opponent wins (Duo/1v2).") # Updated tooltip
+        self.combine_results_checkbox.stateChanged.connect(self.update_results_display)
+        options_layout.addWidget(self.combine_results_checkbox)
+        # --- End Modification ---
+        self.cheat_checkbox = QtWidgets.QCheckBox("Cheat (Expert Index)"); self.cheat_checkbox.setToolTip("Provide opponent type index via LABELS.")
+        options_layout.addWidget(self.cheat_checkbox)
+        control_layout.addWidget(options_group)
 
-        self.duo_checkbox = QtWidgets.QCheckBox("Duo Mode")
-        control_layout.addWidget(self.duo_checkbox)
-
-        # --- Compare Results Button ---
-        self.compare_button = QtWidgets.QPushButton("Compare Results")
-        self.compare_button.clicked.connect(self.compare_results)
-        control_layout.addWidget(self.compare_button)
-        
-        # --- Show Expert Usage Button ---
-        self.expert_button = QtWidgets.QPushButton("Show Expert Usage")
-        self.expert_button.clicked.connect(self.show_expert_usage)
-        control_layout.addWidget(self.expert_button)
-
+        control_layout.addStretch(2)
+        self.start_button = QtWidgets.QPushButton(" Start Battleground "); self.start_button.setStyleSheet("padding: 8px 15px; font-weight: bold;")
+        self.start_button.clicked.connect(self.start_battleground)
+        control_layout.addWidget(self.start_button)
         main_layout.addLayout(control_layout)
 
-        # --- Progress Bar ---
-        progress_layout = QtWidgets.QHBoxLayout()
-        progress_label = QtWidgets.QLabel("Progress:")
-        progress_layout.addWidget(progress_label)
-        self.progress_bar = QtWidgets.QProgressBar()
-        progress_layout.addWidget(self.progress_bar)
+        # ... (Progress Bar, Results Group remain the same visually) ...
+        progress_layout = QtWidgets.QHBoxLayout(); progress_label = QtWidgets.QLabel("Progress:"); progress_layout.addWidget(progress_label)
+        self.progress_bar = QtWidgets.QProgressBar(); self.progress_bar.setTextVisible(True); progress_layout.addWidget(self.progress_bar)
         main_layout.addLayout(progress_layout)
+        results_analysis_group = QtWidgets.QGroupBox("Results / Analysis")
+        results_analysis_layout = QtWidgets.QHBoxLayout(results_analysis_group)
+        self.results_text = QtWidgets.QTextEdit(); self.results_text.setReadOnly(True); self.results_text.setMinimumHeight(300); self.results_text.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding); self.results_text.setPlaceholderText("Results...")
+        results_analysis_layout.addWidget(self.results_text, 4)
+        analysis_button_layout = QtWidgets.QVBoxLayout(); analysis_button_layout.setAlignment(QtCore.Qt.AlignTop)
+        self.compare_button = QtWidgets.QPushButton("Compare Results"); self.compare_button.setToolTip("Compare current vs previous results."); self.compare_button.clicked.connect(self.compare_results)
+        analysis_button_layout.addWidget(self.compare_button)
+        self.expert_button = QtWidgets.QPushButton("Show Expert Usage"); self.expert_button.setToolTip("Analyze MoE/Gating/Belief activations."); self.expert_button.clicked.connect(self.show_expert_usage)
+        analysis_button_layout.addWidget(self.expert_button)
+        analysis_button_layout.addStretch(1)
+        results_analysis_layout.addLayout(analysis_button_layout, 1)
+        main_layout.addWidget(results_analysis_group, 1)
 
-        # --- Results Group ---
-        results_group = QtWidgets.QGroupBox("Results")
-        results_layout = QtWidgets.QVBoxLayout(results_group)
-        self.results_text = QtWidgets.QTextEdit()
-        self.results_text.setReadOnly(True)
-        self.results_text.setMinimumHeight(320)
-        self.results_text.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
-        results_layout.addWidget(self.results_text)
-        main_layout.addWidget(results_group, 1)
+
+        # Call explicitly after all relevant widgets are created
+        self._update_agent_selector_states()
+
+    def _update_agent_selector_states(self):
+        is_standard_mode = self.standard_mode_radio.isChecked()
+        is_duo_mode = self.duo_mode_radio.isChecked()
+        if 1 in self.agent_selectors:
+             models_loaded = self.agent_selectors[1].count() > 1
+             self.agent_selectors[1].setEnabled(is_standard_mode and models_loaded)
+        # --- CORRECTED: Checkbox enable logic ---
+        self.combine_results_checkbox.setEnabled(is_standard_mode or is_duo_mode)
+        if not (is_standard_mode or is_duo_mode): self.combine_results_checkbox.setChecked(False)
+        # --- End Correction ---
 
     def on_file_drop(self, file_path):
+        """Handles dropped files, inspects checkpoints for players, and adds them."""
         file_path = file_path.strip()
         if not file_path.endswith(".pth"):
             self.show_info("Only .pth files are supported")
             return
-        if file_path in self.loaded_models:
-            self.show_info("Model already loaded")
-            return
-        try:
-            self.load_model(file_path)
-            self.file_list.addItem(os.path.basename(file_path))
-            self.update_agent_selectors()
-            self.show_info(f"Loaded: {os.path.basename(file_path)}")
-        except Exception as e:
-            self.show_info(f"Error: {str(e)}")
 
-    def load_model(self, file_path):
-        checkpoint = torch.load(file_path, map_location="cpu", weights_only=False)
-        if not isinstance(checkpoint, dict):
-            raise ValueError("Invalid checkpoint format")
-        
-        # Check for different model formats
-        if "policy_nets" in checkpoint:
-            # Traditional format with separate policy_nets and value_nets
-            required_keys = ["policy_nets"]
-            if any(k not in checkpoint for k in required_keys):
-                raise ValueError("Missing required keys in checkpoint")
-            
-            any_policy = next(iter(checkpoint["policy_nets"].values()))
-            
-            # Check if this is a BeliefSpacePolicy model
-            if ModelFactory.is_belief_space_policy(any_policy):
-                # For BeliefSpacePolicy, determine dimensions and opponent types
-                hidden_dim = get_hidden_dim_from_state_dict(any_policy, "network.0")
-                total_input_dim = any_policy['network.0.weight'].shape[1]
-                # Observation dimension is total input minus belief dimension
-                obs_dim = ModelFactory.get_belief_input_dim(any_policy)
-                
-                # Get the belief model if available
-                belief_model = checkpoint.get("belief_model", None)
-                
-                # Determine number of opponent types from belief model
-                if belief_model:
-                    num_opponent_types = ModelFactory.get_num_opponent_types(belief_model)
-                else:
-                    num_opponent_types = 10  # Default value if we can't determine it
-                
-                self.loaded_models[file_path] = {
-                    "policy_nets": checkpoint["policy_nets"],
-                    "belief_model": belief_model,
-                    "obs_version": 2,  # Assume version 2 for BeliefSpacePolicy (new observation format)
-                    "input_dim": obs_dim,
-                    "uses_memory": False,
-                    "is_stacked_model": False,
-                    "is_newer_obs_model": False,
-                    "is_belief_space_policy": True,
-                    "num_opponent_types": num_opponent_types
-                }
-                return
-            # First check if the loaded model is a StackedObservationConvModel with newer obs format
-            if is_stacked_newer_observation_model(any_policy):
-                # For StackedNewerObservationModel, determine obs_dim from the model
-                obs_dim = get_obs_dim_from_stacked_model(any_policy)  # Reuse this function as it works the same way
-                if obs_dim is None:
-                    # Fallback: estimate from input tensors
-                    try:
-                        # Try an alternative approach
-                        for key in any_policy.keys():
-                            if key.startswith('conv_layers') and key.endswith('weight'):
-                                if len(any_policy[key].shape) == 3:  # Conv1d weight tensor
-                                    obs_dim = any_policy[key].shape[2]
-                                    break
-                    except:
-                        # Fallback to default
-                        obs_dim = 8  # Default for newer observation format
-                
-                # Set observation version to 5 for StackedNewerObservationModel
-                obs_version = 5
-                uses_memory = False
-                
-                self.loaded_models[file_path] = {
-                    "policy_nets": checkpoint["policy_nets"],
-                    "obp_model": checkpoint.get("obp_model", None),
-                    "obs_version": obs_version,
-                    "input_dim": obs_dim,
-                    "uses_memory": uses_memory,
-                    "is_stacked_model": True,
-                    "is_newer_obs_model": True,
-                    "is_conditional_model": False
-                }
-            # Then check if the loaded model is a standard StackedObservationConvModel
-            elif is_stacked_observation_model(any_policy):
-                # For StackedObservationConvModel, determine obs_dim from the model
-                obs_dim = get_obs_dim_from_stacked_model(any_policy)
-                if obs_dim is None:
-                    # Fallback: estimate from input tensors
-                    try:
-                        # Try an alternative approach to determine the dimension
-                        for key in any_policy.keys():
-                            if key.startswith('conv_layers') and key.endswith('weight'):
-                                if len(any_policy[key].shape) == 3:  # Conv1d weight tensor
-                                    obs_dim = any_policy[key].shape[2]
-                                    break
-                    except:
-                        # If all else fails, default to a reasonable value
-                        obs_dim = 14  # Default for new observation format
-                
-                # Set observation version to 3 for StackedObservationConvModel
-                obs_version = 3
-                uses_memory = False
-                
-                self.loaded_models[file_path] = {
-                    "policy_nets": checkpoint["policy_nets"],
-                    "obp_model": checkpoint.get("obp_model", None),
-                    "obs_version": obs_version,
-                    "input_dim": obs_dim,
-                    "uses_memory": uses_memory,
-                    "is_stacked_model": True,
-                    "is_newer_obs_model": False,
-                    "is_conditional_model": False
-                }
+        # Use a base display name from the path
+        base_display_name = f"{os.path.basename(os.path.dirname(file_path))}/{os.path.basename(file_path)}"
+
+        try:
+            # Load checkpoint just to inspect keys
+            ckpt = torch.load(file_path, map_location='cpu', weights_only=False)
+            policy_keys = []
+            if 'policy_nets' in ckpt:
+                 policy_keys = list(ckpt['policy_nets'].keys())
+            elif 'model' in ckpt:
+                 # If single 'model' key, treat it as player_0 for selection purposes
+                 policy_keys = ['player_0'] # Represent the single model as 'player_0'
             else:
-                # For traditional models, determine input_dim as before
-                if "base_encoder.0.weight" in any_policy:
-                    base_dim = any_policy["base_encoder.0.weight"].shape[1]
-                    num_opponents = 2  # Default value
-                    input_dim = base_dim + (config.STRATEGY_DIM * num_opponents)
-                else:
-                    try:
-                        input_dim = any_policy['fc1.weight'].shape[1]
-                    except KeyError:
-                        input_dim = get_input_dim_from_state_dict(any_policy, candidate_prefix='fc1')
-                
-                obs_dim = input_dim
-                
-                # Set observation version based on input_dim
-                if input_dim == 18:
-                    obs_version = 1
-                elif input_dim in (16, 24, 26):
-                    obs_version = 2
-                else:
-                    obs_version = 2  # Default to newer format if unsure
-                
-                uses_memory = True
-                
-                self.loaded_models[file_path] = {
-                    "policy_nets": checkpoint["policy_nets"],
-                    "obp_model": checkpoint.get("obp_model", None),
-                    "obs_version": obs_version,
-                    "input_dim": obs_dim,
-                    "uses_memory": uses_memory,
-                    "is_stacked_model": False,
-                    "is_newer_obs_model": False,
-                    "is_conditional_model": False
-                }
-            
-        elif "model" in checkpoint:
-            # New format with a single model
-            any_policy = checkpoint["model"]
-            
-            # First check for stacked newer observation model
-            if is_stacked_newer_observation_model(any_policy):
-                # For StackedNewerObservationModel
-                obs_dim = get_obs_dim_from_stacked_model(any_policy)
-                if obs_dim is None:
-                    obs_dim = 8  # Default for newer observation format
-                
-                # Create two entries for player_0 and player_1 with the same model
-                self.loaded_models[file_path] = {
-                    "policy_nets": {
-                        "player_0": checkpoint["model"],
-                        "player_1": checkpoint["model"]
-                    },
-                    "obp_model": None,
-                    "obs_version": 5,  # Use version 5 for StackedNewerObservationModel
-                    "input_dim": obs_dim,
-                    "uses_memory": False,
-                    "is_stacked_model": True,
-                    "is_newer_obs_model": True,
-                    "is_conditional_model": False
-                }
-            # Then check for standard stacked observation model
-            elif is_stacked_observation_model(any_policy):
-                # For StackedObservationConvModel
-                obs_dim = get_obs_dim_from_stacked_model(any_policy)
-                if obs_dim is None:
-                    obs_dim = 14  # Default for new observation format
-                
-                # Create two entries for player_0 and player_1 with the same model
-                self.loaded_models[file_path] = {
-                    "policy_nets": {
-                        "player_0": checkpoint["model"],
-                        "player_1": checkpoint["model"]
-                    },
-                    "obp_model": None,
-                    "obs_version": 3,  # Use version 3 for StackedObservationConvModel
-                    "input_dim": obs_dim,
-                    "uses_memory": False,
-                    "is_stacked_model": True,
-                    "is_newer_obs_model": False,
-                    "is_conditional_model": False
-                }
+                 self.show_info(f"Checkpoint '{base_display_name}' has no recognizable policy keys ('policy_nets' or 'model').")
+                 return
+
+            if not policy_keys:
+                 self.show_info(f"No player keys found within policy networks in '{base_display_name}'.")
+                 return
+
+            added_count = 0
+            for key in sorted(policy_keys): # Sort keys for consistent order
+                # Create a unique display name including the player key
+                display_name_with_key = f"{base_display_name} [{key}]"
+
+                if display_name_with_key in self.loaded_model_paths:
+                    # Silently skip if this specific player from this file is already added
+                    continue
+
+                # Store path and the specific key for this player entry
+                self.loaded_model_paths[display_name_with_key] = {'path': file_path, 'key': key, 'display_name': base_display_name}
+                self.file_list.addItem(display_name_with_key) # Add the specific player entry to the list
+                added_count += 1
+
+            if added_count > 0:
+                self.update_agent_selectors() # Update dropdowns
+                self.show_info(f"Added {added_count} player(s) from: {base_display_name}")
             else:
-                raise ValueError("Unrecognized model format in checkpoint")
-        else:
-            raise ValueError("Unrecognized checkpoint format")
+                 self.show_info(f"All players from '{base_display_name}' were already added.")
+
+
+        except Exception as e:
+            logger.error(f"Error inspecting checkpoint {file_path}: {e}", exc_info=True)
+            self.show_info(f"Error reading checkpoint: {os.path.basename(file_path)}")
+
+    def get_selected_ai_configs(self) -> Dict[str, Dict]:
+        """Gets the configuration for the AI agents selected in the dropdowns."""
+        selected_configs = {}
+        # --- CORRECTED: Check radio buttons for mode ---
+        num_ai_needed = 1 if self.onev2_mode_radio.isChecked() or self.duo_mode_radio.isChecked() else 2
+
+        for i in range(num_ai_needed):
+             env_id = f"player_{i}"
+             selector = self.agent_selectors[i]
+             # --- MODIFIED: Get selection text AND associated data ---
+             selected_index = selector.currentIndex()
+             if selected_index <= 0: # Index 0 is placeholder "Select..." or "No models..."
+                  # Check if this agent is actually needed for the current mode
+                  if i == 0 or (i == 1 and self.standard_mode_radio.isChecked()):
+                       raise ValueError(f"Please select a model for AI Agent {i+1}.")
+                  else:
+                       continue # Skip agent 2 if not in standard mode
+
+             # Retrieve data stored with the item
+             item_data = selector.itemData(selected_index)
+             if not item_data or 'path' not in item_data or 'key' not in item_data:
+                  # Fallback if data wasn't stored correctly (shouldn't happen with new update_selectors)
+                  display_name_with_key = selector.itemText(selected_index)
+                  raise ValueError(f"Missing data for selected agent: {display_name_with_key}. Please reload models.")
+
+             path = item_data['path']
+             agent_key = item_data['key'] # Key like 'player_0'
+             display_name = item_data['display_name'] # Original display name without key
+
+             prefix = display_name.replace("/", "_").replace("\\", "_").replace(".pth", "")
+             selected_configs[env_id] = {
+                 'path': path,
+                 'key': agent_key, # Key *within* the checkpoint
+                 'id_prefix': prefix
+             }
+             selected_configs[env_id]['id'] = f"{prefix}_{agent_key}" # Unique ID
+
+        return selected_configs
 
     def show_info(self, message):
         self.info_text.setPlainText(message)
 
     def update_agent_selectors(self):
-        agent_options = []
-        for file_path, data in self.loaded_models.items():
-            folder_name = os.path.basename(os.path.dirname(file_path))
-            if data.get("is_belief_space_policy", False):
-                model_type = "Belief"
-            elif data.get("is_stacked_model", False):
-                model_type = "StackedObs"
-            elif ModelFactory.is_moe_policy(next(iter(data["policy_nets"].values()))):
-                model_type = "MoE"
-            else:
-                model_type = "Standard"
-            for agent_name in data["policy_nets"].keys():
-                display_text = f"{folder_name} - {os.path.basename(file_path)} - {agent_name} ({model_type})"
-                agent_options.append(display_text)
-        for i in range(2):
-            self.agent_selectors[i].clear()
-            self.agent_selectors[i].addItems(agent_options)
-            if agent_options:
-                self.agent_selectors[i].setCurrentIndex(0)
+        """Populates agent selectors with 'Model File [player_key]' entries."""
+        # Get sorted list of display names with keys (e.g., "dir/model.pth [player_0]")
+        agent_options = sorted(list(self.loaded_model_paths.keys()))
 
-    def load_selected_agents(self):
-        """Loads the selected AI agents from the selectors."""
-        ai_agents = {}
-        try:
-            for i in range(2):
-                selection = self.agent_selectors[i].currentText()
-                if not selection:
-                    raise ValueError(f"Select AI Agent {i+1}")
-                parts = selection.split(" - ")
-                if len(parts) < 3:
-                    raise ValueError("Invalid agent format")
-                
-                # Handle the model type in parentheses
-                agent_part = parts[2]
-                agent_name = agent_part.split(" (")[0]
-                
-                folder_name, file_name = parts[0], parts[1]
-                file_path_candidates = [p for p in self.loaded_models.keys() if os.path.basename(p) == file_name]
-                if not file_path_candidates:
-                    raise ValueError(f"File for {file_name} not found among loaded models.")
-                file_path = file_path_candidates[0]
-                model_data = self.loaded_models[file_path]
-                key = f"player_{i}"
-                
-                # Check if this is a BeliefSpacePolicy model (has belief_model instead of obp_model)
-                if model_data.get("is_belief_space_policy", False):
-                    ai_agents[key] = {
-                        "policy_net": model_data["policy_nets"][agent_name],
-                        "belief_model": model_data.get("belief_model"),
-                        "obs_version": model_data["obs_version"],
-                        "input_dim": model_data["input_dim"],
-                        "uses_memory": model_data["uses_memory"],
-                        "is_stacked_model": model_data.get("is_stacked_model", False),
-                        "is_belief_space_policy": True,
-                        "num_opponent_types": model_data.get("num_opponent_types", 10)
-                    }
-                else:
-                    # Handle standard models
-                    ai_agents[key] = {
-                        "policy_net": model_data["policy_nets"][agent_name],
-                        "obp_model": model_data.get("obp_model"),
-                        "obs_version": model_data["obs_version"],
-                        "input_dim": model_data["input_dim"],
-                        "uses_memory": model_data["uses_memory"],
-                        "is_stacked_model": model_data.get("is_stacked_model", False),
-                        "is_newer_obs_model": model_data.get("is_newer_obs_model", False)
-                    }
-            return ai_agents
-        except Exception as e:
-            self.show_info(f"Error loading selected agents: {str(e)}")
-            return None
+        for i in range(2): # Update both selectors
+            selector = self.agent_selectors[i]
+            # Store current selection's data to restore it if possible
+            current_index = selector.currentIndex()
+            current_data = selector.itemData(current_index) if current_index > 0 else None
+
+            selector.clear()
+            if not agent_options:
+                 selector.addItem("No models loaded")
+                 selector.setEnabled(False)
+            else:
+                 selector.addItem("Select Model...") # Placeholder at index 0
+                 # Add each specific player as an item
+                 for display_name_with_key in agent_options:
+                      item_data = self.loaded_model_paths[display_name_with_key]
+                      # Store path and key as data associated with the item
+                      selector.addItem(display_name_with_key, userData=item_data)
+
+                 # Re-enable based on mode and if models exist
+                 is_standard_mode = self.standard_mode_radio.isChecked()
+                 selector.setEnabled(True if i == 0 else is_standard_mode)
+
+                 # Try to restore previous selection by matching item data
+                 restored = False
+                 if current_data:
+                      for idx in range(1, selector.count()): # Start from 1 to skip placeholder
+                           if selector.itemData(idx) == current_data:
+                                selector.setCurrentIndex(idx)
+                                restored = True
+                                break
+                 if not restored:
+                      selector.setCurrentIndex(0) # Default to "Select Model..."
+
+
+        # Explicitly update enabled state after populating
+        self._update_agent_selector_states() # Call the helper to ensure correct enable/disable state
 
     def start_battleground(self):
-        ai_agents = self.load_selected_agents()
-        if not ai_agents:
+        # ... (implementation from previous step, ensure it reads radio buttons for mode) ...
+        if self.worker is not None and self.worker.isRunning():
+            self.show_info("A battleground run is already in progress.")
             return
 
-        # Determine two_player parameter from checkbox:
-        two_player_param = "player_1" if self.two_player_checkbox.isChecked() else None
-        onev2_enabled = self.onev2_checkbox.isChecked()
-        duo_enabled = self.duo_checkbox.isChecked()
-        rounds = self.rounds_spinbox.value()
-        if duo_enabled:
-            total_opponents = len(self.hardcoded_agents) + len(self.historical_models)
-            total_matches = rounds * (total_opponents * (total_opponents - 1) // 2)
-        else:
-            total_matches = rounds * (len(self.hardcoded_agents) + len(self.historical_models))
-        self.progress_bar.setMaximum(total_matches)
-        self.progress_bar.setValue(0)
-        # If there are already results, store them for later comparison.
-        if self.results_text.toPlainText().strip():
-            try:
-                # For simplicity, assume previous results have been stored in self.current_results.
-                self.previous_results = self.current_results
-            except Exception:
-                self.previous_results = None
-        self.results_text.clear()
-        
-        # Read cheat checkbox state
-        cheat_flag = self.cheat_checkbox.isChecked()
+        try:
+            selected_ai_configs = self.get_selected_ai_configs()
+        except ValueError as e:
+            self.show_info(f"Selection Error: {e}")
+            return
 
+        two_player_param = "player_1" if self.two_player_checkbox.isChecked() else None
+        cheat_flag = self.cheat_checkbox.isChecked()
+        # Determine mode from radio buttons
+        onev2_enabled = self.onev2_mode_radio.isChecked()
+        duo_enabled = self.duo_mode_radio.isChecked()
+        # Standard mode is implicitly handled if neither onev2 nor duo is checked
+
+        rounds = self.rounds_spinbox.value()
+
+        # Calculate Progress Max
+        num_hardcoded = len(self.hardcoded_agents)
+        num_historical = len(self.historical_model_configs)
+        num_opponents_total = num_hardcoded + num_historical
+        if num_opponents_total == 0:
+             self.show_info("No opponents (hardcoded or historical) found to run against.")
+             return
+
+        if duo_enabled:
+            total_matches = rounds * (num_opponents_total * (num_opponents_total - 1) // 2) if num_opponents_total > 1 else 0
+        else:
+            total_matches = rounds * num_opponents_total
+        self.progress_bar.setMaximum(max(1, total_matches))
+        self.progress_bar.setValue(0)
+
+        if self.results_text.toPlainText().strip():
+             self.previous_results = self.current_results
+        self.results_text.clear()
+        self.expert_activations = None # Clear previous expert data
+
+        # Disable start button during run
+        self.start_button.setEnabled(False)
+        self.show_info(f"Starting battleground ({'1v2' if onev2_enabled else 'Duo' if duo_enabled else 'Standard'} mode)...")
+
+
+        # Start Worker
         self.worker = BattlegroundWorker(
-            ai_agents, self.historical_models, self.hardcoded_agents, rounds,
+            selected_ai_agent_configs=selected_ai_configs,
+            historical_model_configs=self.historical_model_configs,
+            hardcoded_agent_classes=self.hardcoded_agents,
+            rounds=rounds,
+            device=self.device,
             two_player=two_player_param,
             cheat=cheat_flag,
             onev2=onev2_enabled,
             duo=duo_enabled
         )
         self.worker.progress_signal.connect(self.update_progress)
-        self.worker.results_signal.connect(self.display_results)
+        self.worker.results_signal.connect(self.on_results_received) # Connect to handler
         self.worker.expert_signal.connect(self.store_expert_activations)
-        self.worker.error_signal.connect(lambda msg: self.show_info(f"Error: {msg}"))
+        self.worker.error_signal.connect(self.on_worker_error) # Connect to handler
+        self.worker.finished.connect(self.on_worker_finished) # Connect to handler
         self.worker.start()
 
     def update_progress(self, value):
@@ -1332,202 +762,145 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         self.expert_activations = expert_activations
         logger.info(f"Received expert activations for {len(expert_activations)} opponents")
 
+    def on_results_received(self, results):
+         """Handles receiving results from the worker."""
+         self.display_results(results)
+         self.show_info("Battleground finished.")
+
+    def on_worker_error(self, error_message):
+         """Handles errors reported by the worker."""
+         self.show_info(f"Worker Error: {error_message}")
+         logger.error(f"Worker thread reported error: {error_message}")
+         self.start_button.setEnabled(True) # Re-enable start button on error
+
+    def on_worker_finished(self):
+         """Handles the worker thread finishing naturally."""
+         self.start_button.setEnabled(True) # Re-enable start button
+         # Optionally show a final "Finished" message if not already shown by results handler
+         if not self.current_results: # If no results were emitted (e.g., zero rounds)
+              self.show_info("Battleground worker finished.")
+
     # --- Display results with optional combining ---
-    def display_results(self, results):
-        self.current_results = results  # Save the current results
-        combine = (not self.two_player_checkbox.isChecked()) and self.combine_ai_checkbox.isChecked()
-        is_onev2 = self.onev2_checkbox.isChecked()
-        is_duo = self.duo_checkbox.isChecked()
+    def display_results(self, results: Dict[str, list]):
+        """Displays results, triggering HTML generation."""
+        self.current_results = results
+        # --- MODIFIED: Pass correct checkbox state ---
+        combine = self.combine_results_checkbox.isChecked()
+        # --- End Modification ---
+        is_onev2 = self.onev2_mode_radio.isChecked()
+        is_duo = self.duo_mode_radio.isChecked()
 
-        # Track overall totals
-        total_ai = total_opp = total_opp1 = total_opp2 = total_ai1 = total_ai2 = 0
-
-        # Track minimum win rate
-        min_rate = 1.0
-        min_opp = None
-
-        # Start table
-        html = """
-        <table style="border: 1px solid #7289da; border-collapse: collapse; width: 100%;">
-        <thead>
-            <tr style="background-color: #4f545c;">
-        """
-
-        # Header based on mode
-        if combine:
-            if is_onev2 or is_duo:
-                html += """
-                    <th style="border: 1px solid #7289da; padding: 8px;">Opponent Name</th>
-                    <th style="border: 1px solid #7289da; padding: 8px;">AI Wins</th>
-                    <th style="border: 1px solid #7289da; padding: 8px;">Combined Opponent Wins</th>
-                    <th style="border: 1px solid #7289da; padding: 8px;">AI Win Rate</th>
-                    <th style="border: 1px solid #7289da; padding: 8px;">Opponent Win Rate</th>
-                    <th style="border: 1px solid #7289da; padding: 8px;">Result</th>
-                """
-            else:
-                html += """
-                    <th style="border: 1px solid #7289da; padding: 8px;">Opponent Name</th>
-                    <th style="border: 1px solid #7289da; padding: 8px;">Combined AI Wins</th>
-                    <th style="border: 1px solid #7289da; padding: 8px;">Opponent Wins</th>
-                    <th style="border: 1px solid #7289da; padding: 8px;">Combined AI Win Rate</th>
-                    <th style="border: 1px solid #7289da; padding: 8px;">Opponent Win Rate</th>
-                    <th style="border: 1px solid #7289da; padding: 8px;">Result</th>
-                """
-        else:
-            if is_onev2 or is_duo:
-                html += """
-                    <th style="border: 1px solid #7289da; padding: 8px;">Opponent Name</th>
-                    <th style="border: 1px solid #7289da; padding: 8px;">AI Wins</th>
-                    <th style="border: 1px solid #7289da; padding: 8px;">Opponent1 Wins</th>
-                    <th style="border: 1px solid #7289da; padding: 8px;">Opponent2 Wins</th>
-                    <th style="border: 1px solid #7289da; padding: 8px;">AI Win Rate</th>
-                    <th style="border: 1px solid #7289da; padding: 8px;">Opponent1 Win Rate</th>
-                    <th style="border: 1px solid #7289da; padding: 8px;">Opponent2 Win Rate</th>
-                    <th style="border: 1px solid #7289da; padding: 8px;">Result</th>
-                """
-            else:
-                html += """
-                    <th style="border: 1px solid #7289da; padding: 8px;">Opponent Name</th>
-                    <th style="border: 1px solid #7289da; padding: 8px;">AI1 Wins</th>
-                    <th style="border: 1px solid #7289da; padding: 8px;">AI2 Wins</th>
-                    <th style="border: 1px solid #7289da; padding: 8px;">Opponent Wins</th>
-                    <th style="border: 1px solid #7289da; padding: 8px;">AI1 Win Rate</th>
-                    <th style="border: 1px solid #7289da; padding: 8px;">AI2 Win Rate</th>
-                    <th style="border: 1px solid #7289da; padding: 8px;">Opponent Win Rate</th>
-                    <th style="border: 1px solid #7289da; padding: 8px;">Result</th>
-                """
-
-        html += """
-            </tr>
-        </thead>
-        <tbody>
-        """
-
-        # Rows
-        for opp_name, wins in results.items():
-            # Unpack & compute per-mode values
-            if combine:
-                if is_onev2 or is_duo:
-                    ai_wins = wins[0]
-                    opp_wins = wins[1] + wins[2]
-                else:
-                    ai_wins = wins[0] + wins[1]
-                    opp_wins = wins[2]
-            else:
-                if is_onev2 or is_duo:
-                    ai_wins = wins[0]
-                    opp1_wins, opp2_wins = wins[1], wins[2]
-                    opp_wins = opp1_wins + opp2_wins
-                else:
-                    ai_wins = wins[0] + wins[1]
-                    opp_wins = wins[2]
-
-            total_games = ai_wins + opp_wins
-            ai_rate = ai_wins / total_games if total_games else 0.0
-            opp_rate = 1 - ai_rate if total_games else 0.0
-            result_str = "Win" if ai_rate > 0.5 else "Loss"
-
-            # Update totals
-            total_ai += ai_wins
-            total_opp += opp_wins
-
-            # Track minimum rate
-            if total_games and ai_rate < min_rate:
-                min_rate = ai_rate
-                min_opp = opp_name
-
-            # Build the row HTML
-            if combine and is_onev2 or combine and is_duo:
-                html += f"""
-                <tr>
-                    <td style="border:1px solid #7289da;padding:6px;">{opp_name}</td>
-                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{ai_wins}</td>
-                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{opp_wins}</td>
-                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{ai_rate:.2%}</td>
-                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{opp_rate:.2%}</td>
-                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{result_str}</td>
-                </tr>
-                """
-            elif combine:
-                html += f"""
-                <tr>
-                    <td style="border:1px solid #7289da;padding:6px;">{opp_name}</td>
-                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{ai_wins}</td>
-                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{opp_wins}</td>
-                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{ai_rate:.2%}</td>
-                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{opp_rate:.2%}</td>
-                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{result_str}</td>
-                </tr>
-                """
-            elif is_onev2 or is_duo:
-                # Need opp1_wins and opp2_wins unpacked again
-                ai_wins = wins[0]
-                opp1_wins, opp2_wins = wins[1], wins[2]
-                rate1 = ai_wins / total_games if total_games else 0.0
-                rate2 = opp1_wins / total_games if total_games else 0.0
-                rate3 = opp2_wins / total_games if total_games else 0.0
-                html += f"""
-                <tr>
-                    <td style="border:1px solid #7289da;padding:6px;">{opp_name}</td>
-                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{ai_wins}</td>
-                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{opp1_wins}</td>
-                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{opp2_wins}</td>
-                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{rate1:.2%}</td>
-                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{rate2:.2%}</td>
-                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{rate3:.2%}</td>
-                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{result_str}</td>
-                </tr>
-                """
-            else:
-                ai1_wins, ai2_wins = wins[0], wins[1]
-                rate1 = ai1_wins / total_games if total_games else 0.0
-                rate2 = ai2_wins / total_games if total_games else 0.0
-                html += f"""
-                <tr>
-                    <td style="border:1px solid #7289da;padding:6px;">{opp_name}</td>
-                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{ai1_wins}</td>
-                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{ai2_wins}</td>
-                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{opp_wins}</td>
-                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{rate1:.2%}</td>
-                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{rate2:.2%}</td>
-                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{opp_rate:.2%}</td>
-                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{result_str}</td>
-                </tr>
-                """
-
-        # Overall row
-        overall_total = total_ai + total_opp
-        overall_rate = total_ai / overall_total if overall_total else 0.0
-        overall_result = "Win" if overall_rate > 0.5 else "Loss"
-        html += f"""
-        <tr>
-            <td style="border:1px solid #7289da;padding:6px;">Overall</td>
-            <td style="border:1px solid #7289da;padding:6px;text-align:center;">{total_ai}</td>
-            <td style="border:1px solid #7289da;padding:6px;text-align:center;">{total_opp}</td>
-            <td style="border:1px solid #7289da;padding:6px;text-align:center;">{overall_rate:.2%}</td>
-            <td style="border:1px solid #7289da;padding:6px;text-align:center;">{overall_result}</td>
-        </tr>
-        """
-
-        # Min Win Rate row
-        if min_opp is not None:
-            min_result = "Win" if min_rate > 0.5 else "Loss"
-            html += f"""
-            <tr style="background-color:#2f3136;">
-                <td style="border:1px solid #7289da;padding:6px;color:#fff;">Lowest AI Win Rate vs</td>
-                <td style="border:1px solid #7289da;padding:6px;color:#fff;">{min_opp}</td>
-                <td style="border:1px solid #7289da;padding:6px;text-align:center;color:#fff;" colspan="2">{min_rate:.2%}</td>
-                <td style="border:1px solid #7289da;padding:6px;text-align:center;color:#fff;">{min_result}</td>
-            </tr>
-            """
-
-        # Close table
-        html += """
-        </tbody>
-        </table>
-        """
-
+        html = self._generate_results_html(results, combine, is_onev2, is_duo)
         self.results_text.setHtml(html)
+
+    def _generate_results_html(self, results, combine, is_onev2, is_duo):
+        """Generates the results HTML table based on mode and combine flag."""
+        html = """<table style="border: 1px solid #7289da; border-collapse: collapse; width: 100%;"><thead><tr style="background-color: #4f545c;">"""
+        num_data_cols = 0 # Track number of columns between Name and Result
+
+        # --- Table Header Logic ---
+        if is_onev2 or is_duo: # 1 AI (P0) vs 2 Opponents (P1, P2)
+            html += """<th style="border: 1px solid #7289da; padding: 8px;">Opponent Name / Pair</th>
+                       <th style="border: 1px solid #7289da; padding: 8px;">AI Wins (P0)</th>"""
+            if combine: # Combine Opponent wins
+                html += """<th style="border: 1px solid #7289da; padding: 8px;">Opponent Wins (P1+P2)</th>
+                           <th style="border: 1px solid #7289da; padding: 8px;">AI Win Rate</th>
+                           <th style="border: 1px solid #7289da; padding: 8px;">Opponent Win Rate</th>"""
+                num_data_cols = 4 # Wins(2) + Rates(2)
+            else: # Show Opponents separately
+                html += """<th style="border: 1px solid #7289da; padding: 8px;">Opponent1 Wins (P1)</th>
+                           <th style="border: 1px solid #7289da; padding: 8px;">Opponent2 Wins (P2)</th>
+                           <th style="border: 1px solid #7289da; padding: 8px;">AI Win Rate</th>
+                           <th style="border: 1px solid #7289da; padding: 8px;">Opp1 Win Rate</th>
+                           <th style="border: 1px solid #7289da; padding: 8px;">Opp2 Win Rate</th>"""
+                num_data_cols = 6 # Wins(3) + Rates(3)
+        else: # Standard Mode (2 AI (P0, P1) vs 1 Opponent (P2))
+            html += """<th style="border: 1px solid #7289da; padding: 8px;">Opponent Name</th>"""
+            if combine: # Combine AI wins
+                 html += """<th style="border: 1px solid #7289da; padding: 8px;">AI Wins (P0+P1)</th>
+                            <th style="border: 1px solid #7289da; padding: 8px;">Opponent Wins (P2)</th>
+                            <th style="border: 1px solid #7289da; padding: 8px;">AI Win Rate</th>
+                            <th style="border: 1px solid #7289da; padding: 8px;">Opponent Win Rate</th>"""
+                 num_data_cols = 4 # Wins(2) + Rates(2)
+            else: # Show AI separately
+                 html += """<th style="border: 1px solid #7289da; padding: 8px;">AI1 Wins (P0)</th>
+                            <th style="border: 1px solid #7289da; padding: 8px;">AI2 Wins (P1)</th>
+                            <th style="border: 1px solid #7289da; padding: 8px;">Opponent Wins (P2)</th>
+                            <th style="border: 1px solid #7289da; padding: 8px;">AI1 Win Rate</th>
+                            <th style="border: 1px solid #7289da; padding: 8px;">AI2 Win Rate</th>
+                            <th style="border: 1px solid #7289da; padding: 8px;">Opponent Win Rate</th>"""
+                 num_data_cols = 6 # Wins(3) + Rates(3)
+
+        html += """<th style="border: 1px solid #7289da; padding: 8px;">Result vs AI</th></tr></thead><tbody>""" # Result relative to AI performance
+
+        # --- Table Rows ---
+        # ... (Row generation logic remains the same, correctly uses combine/is_duo/is_onev2 flags) ...
+        total_ai_wins_overall = 0; total_opp_wins_overall = 0; total_games_overall = 0
+        min_ai_rate = 1.0; min_opp_name = None
+        for opp_display_name, wins_list in results.items():
+            if len(wins_list) < 3: wins_list.extend([0] * (3 - len(wins_list)))
+            p0_wins, p1_wins, p2_wins = wins_list
+            # Calculate wins based on mode
+            if is_onev2 or is_duo: ai_wins = p0_wins; opp1_wins = p1_wins; opp2_wins = p2_wins; opp_wins_combined = opp1_wins + opp2_wins; total_games_match = ai_wins + opp_wins_combined
+            else: ai1_wins = p0_wins; ai2_wins = p1_wins; ai_wins_combined = ai1_wins + ai2_wins; opp_wins = p2_wins; total_games_match = ai_wins_combined + opp_wins
+            # Update totals
+            total_games_overall += total_games_match
+            current_ai_wins_in_match = ai_wins if (is_onev2 or is_duo) else ai_wins_combined
+            current_opp_wins_in_match = opp_wins_combined if (is_onev2 or is_duo) else opp_wins
+            total_ai_wins_overall += current_ai_wins_in_match
+            total_opp_wins_overall += current_opp_wins_in_match
+            # Calculate AI rate for this match
+            ai_rate = current_ai_wins_in_match / total_games_match if total_games_match > 0 else 0.0
+            # Track min rate
+            if total_games_match > 0 and ai_rate < min_ai_rate: min_ai_rate = ai_rate; min_opp_name = opp_display_name
+            result_str = "Win" if ai_rate > 0.5 else "Loss" if ai_rate < 0.5 else "Draw"
+            # Build Row HTML
+            html += f"""<tr><td style="border:1px solid #7289da;padding:6px;">{opp_display_name}</td>"""
+            if is_onev2 or is_duo:
+                html += f"""<td style="border:1px solid #7289da;padding:6px;text-align:center;">{ai_wins}</td>"""
+                if combine: opp_rate = 1.0 - ai_rate if total_games_match > 0 else 0.0; html += f"""<td style="border:1px solid #7289da;padding:6px;text-align:center;">{opp_wins_combined}</td><td style="border:1px solid #7289da;padding:6px;text-align:center;">{ai_rate:.2%}</td><td style="border:1px solid #7289da;padding:6px;text-align:center;">{opp_rate:.2%}</td>"""
+                else: opp1_rate = opp1_wins / total_games_match if total_games_match > 0 else 0.0; opp2_rate = opp2_wins / total_games_match if total_games_match > 0 else 0.0; html += f"""<td style="border:1px solid #7289da;padding:6px;text-align:center;">{opp1_wins}</td><td style="border:1px solid #7289da;padding:6px;text-align:center;">{opp2_wins}</td><td style="border:1px solid #7289da;padding:6px;text-align:center;">{ai_rate:.2%}</td><td style="border:1px solid #7289da;padding:6px;text-align:center;">{opp1_rate:.2%}</td><td style="border:1px solid #7289da;padding:6px;text-align:center;">{opp2_rate:.2%}</td>"""
+            else: # Standard
+                if combine: opp_rate = 1.0 - ai_rate if total_games_match > 0 else 0.0; html += f"""<td style="border:1px solid #7289da;padding:6px;text-align:center;">{ai_wins_combined}</td><td style="border:1px solid #7289da;padding:6px;text-align:center;">{opp_wins}</td><td style="border:1px solid #7289da;padding:6px;text-align:center;">{ai_rate:.2%}</td><td style="border:1px solid #7289da;padding:6px;text-align:center;">{opp_rate:.2%}</td>"""
+                else: ai1_rate = ai1_wins / total_games_match if total_games_match > 0 else 0.0; ai2_rate = ai2_wins / total_games_match if total_games_match > 0 else 0.0; opp_rate = opp_wins / total_games_match if total_games_match > 0 else 0.0; html += f"""<td style="border:1px solid #7289da;padding:6px;text-align:center;">{ai1_wins}</td><td style="border:1px solid #7289da;padding:6px;text-align:center;">{ai2_wins}</td><td style="border:1px solid #7289da;padding:6px;text-align:center;">{opp_wins}</td><td style="border:1px solid #7289da;padding:6px;text-align:center;">{ai1_rate:.2%}</td><td style="border:1px solid #7289da;padding:6px;text-align:center;">{ai2_rate:.2%}</td><td style="border:1px solid #7289da;padding:6px;text-align:center;">{opp_rate:.2%}</td>"""
+            html += f"""<td style="border:1px solid #7289da;padding:6px;text-align:center;">{result_str}</td></tr>"""
+
+
+        # --- Overall Summary Row ---
+        overall_ai_rate = total_ai_wins_overall / total_games_overall if total_games_overall > 0 else 0.0
+        overall_opp_rate = total_opp_wins_overall / total_games_overall if total_games_overall > 0 else 0.0
+        overall_result = "Win" if overall_ai_rate > 0.5 else "Loss" if overall_ai_rate < 0.5 else "Draw"
+        html += f"""<tr style="background-color:#2f3136;font-weight:bold;">
+                    <td style="border:1px solid #7289da;padding:6px;">Overall</td>
+                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{total_ai_wins_overall}</td>
+                    <td style="border:1px solid #7289da;padding:6px;text-align:center;">{total_opp_wins_overall}</td>"""
+        # Add rates/padding depending on number of data cols
+        if num_data_cols == 4: # Combined view
+             html += f"""<td style="border:1px solid #7289da;padding:6px;text-align:center;">{overall_ai_rate:.2%}</td>
+                         <td style="border:1px solid #7289da;padding:6px;text-align:center;">{overall_opp_rate:.2%}</td>"""
+        elif num_data_cols == 6: # Separate view
+             html += f"""<td style="border:1px solid #7289da;padding:6px;text-align:center;">N/A</td>
+                         <td style="border:1px solid #7289da;padding:6px;text-align:center;">N/A</td>
+                         <td style="border:1px solid #7289da;padding:6px;text-align:center;">{overall_ai_rate:.2%}</td>
+                         <td style="border:1px solid #7289da;padding:6px;text-align:center;">N/A</td>
+                         <td style="border:1px solid #7289da;padding:6px;text-align:center;">N/A</td>""" # Adjust cols/rates as needed
+        html += f"""<td style="border:1px solid #7289da;padding:6px;text-align:center;">{overall_result}</td></tr>"""
+
+
+        # --- Min Win Rate Row ---
+        if min_opp_name is not None:
+             min_result_str = "Win" if min_ai_rate > 0.5 else "Loss" if min_ai_rate < 0.5 else "Draw"
+             html += f"""<tr style="background-color:#202225;color:#aaa;">
+                         <td style="border:1px solid #7289da;padding:6px;">Lowest AI Rate vs:</td>
+                         <td style="border:1px solid #7289da;padding:6px;" colspan="2">{min_opp_name}</td>
+                         <td style="border:1px solid #7289da;padding:6px;text-align:center;">{min_ai_rate:.2%}</td>"""
+             # Add padding to match data columns
+             html += f"""<td style="border:1px solid #7289da;padding:6px;"></td>""" * (num_data_cols - 3) # 1 for name, 2 for value
+             html += f"""<td style="border:1px solid #7289da;padding:6px;text-align:center;">{min_result_str}</td></tr>"""
+
+        html += "</tbody></table>"
+        return html
+
         
     def update_results_display(self):
         """ Updates the displayed results when Combine AI Columns is toggled. """
@@ -1570,7 +943,7 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         opp_curr_rates = []
 
         # Determine mode: if either onev2 or duo is checked.
-        is_special_mode = self.onev2_checkbox.isChecked() or self.duo_checkbox.isChecked()
+        is_special_mode = self.onev2_mode_radio.isChecked() or self.duo_mode_radio.isChecked()
 
         for opp in opp_names:
             prev = self.previous_results.get(opp, [0, 0, 0])
@@ -1632,144 +1005,163 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         plt.show()
 
     def show_expert_usage(self):
-        """Display expert activation information"""
+        """Display expert activation information, adapting for Duo mode Belief Agents."""
         if not self.expert_activations:
-            QtWidgets.QMessageBox.information(self, "Expert Usage", 
-                                            "No expert activation data available. Run a battle first.")
+            QtWidgets.QMessageBox.information(self, "Expert Usage", "No expert data available.")
             return
 
-        dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle("Expert Activation Analysis")
-        dialog.setMinimumSize(800, 600)
-        layout = QtWidgets.QVBoxLayout(dialog)
-
-        # Create a tab widget to show data for each AI agent separately.
+        dialog = QtWidgets.QDialog(self); dialog.setWindowTitle("Expert/Belief Activation Analysis")
+        dialog.setMinimumSize(900, 700); layout = QtWidgets.QVBoxLayout(dialog)
         tab_widget = QtWidgets.QTabWidget()
 
-        for player_idx, player in enumerate(["player_0", "player_1"]):
+        # Identify AI player IDs (as before)
+        # ... (code to get ai_player_ids) ...
+        ai_player_ids = []
+        try: 
+            configs = self.get_selected_ai_configs(); is_standard = self.standard_mode_radio.isChecked()
+            if 'player_0' in configs: ai_player_ids.append(configs['player_0']['id'])
+            if is_standard and 'player_1' in configs: ai_player_ids.append(configs['player_1']['id'])
+        except ValueError:
+            logger.warning("Could not get AI configs for expert analysis.")
+        if not ai_player_ids and self.expert_activations: first_match_data = next(iter(self.expert_activations.values()), {}); ai_player_ids = list(first_match_data.keys())
+        if not ai_player_ids: QtWidgets.QMessageBox.warning(self, "Expert Usage", "Could not identify AI player IDs."); return
+
+
+        is_duo_mode = self.duo_mode_radio.isChecked()
+
+        for idx, player_id in enumerate(ai_player_ids):
             player_tab = QtWidgets.QWidget()
             player_layout = QtWidgets.QVBoxLayout(player_tab)
 
-            # Build an HTML table showing per-opponent most used expert info.
-            html = f"""<h2>Expert Activations for AI Agent {player_idx+1}</h2>
-            <table style="border: 1px solid #7289da; border-collapse: collapse; width: 100%;">
-            <thead>
-                <tr style="background-color: #4f545c;">
-                <th style="border: 1px solid #7289da; padding: 8px;">Opponent</th>
-                <th style="border: 1px solid #7289da; padding: 8px;">Set 1 - Most Used Expert</th>
-                <th style="border: 1px solid #7289da; padding: 8px;">Set 2 - Most Used Expert</th>
-                </tr>
-            </thead>
-            <tbody>
-            """
+            # Check if this player has belief data (check the structure of the first step's info)
+            first_match_data = next(iter(self.expert_activations.values()), {})
+            first_step_info = first_match_data.get(player_id, {}).get('steps', [None])[0]
+            # Check if the first step info is a dict with keys that look like opponent IDs
+            is_belief_agent_data = isinstance(first_step_info, dict) and \
+                                   all(k.startswith('player_') or k.startswith('Hardcoded_') or k.startswith('Version_') for k in first_step_info.keys())
 
-            # Lists for plotting
-            opponent_names = []
-            set1_rates = []
-            set1_experts = []
-            set2_rates = []
-            set2_experts = []
+            # Build Table Header (as before)
+            # ... (HTML header generation) ...
+            html = f"""<h2>{'Belief Peak' if is_belief_agent_data else 'Expert/Gate'} Activations for AI Agent {idx+1} ({player_id})</h2>...""" # Shortened
+            html += """<table ...><thead><tr><th>Opponent Match</th>"""
+            if is_belief_agent_data and is_duo_mode: html += """<th>Opp1 Peak (Rate)</th><th>Opp2 Peak (Rate)</th>""" # Simpler Duo display
+            else: html += """<th>Most Used</th><th>Rate</th>"""
+            html += """<th>Total Steps</th></tr></thead><tbody>"""
 
-            for opp_name, activations in self.expert_activations.items():
-                player_activations = activations.get(player, {})
-                if not player_activations:
-                    continue
+            plot_match_names = []; plot_data1 = []; plot_data2 = [] # Reset plot data
 
-                # Partition activations based on key value.
-                set1 = {}
-                set2 = {}
-                for k, v in player_activations.items():
-                    try:
-                        key_int = int(k)
-                    except ValueError:
-                        continue
-                    if key_int < 10:
-                        set1[k] = v
-                    else:
-                        # Reindex second set so that keys become 0-9.
-                        set2[str(key_int - 10)] = v
+            for match_name, match_data in self.expert_activations.items():
+                player_expert_step_data = match_data.get(player_id, {}).get('steps')
+                if not player_expert_step_data: continue # No data for this player/match
 
-                # Process Set 1.
-                total1 = sum(set1.values())
-                if total1 > 0:
-                    expert1, count1 = max(set1.items(), key=lambda x: x[1])
-                    rate1 = count1 / total1
-                else:
-                    expert1, rate1 = "N/A", 0
+                html += f"""<tr><td ...>{match_name}</td>"""
+                plot_match_names.append(match_name)
+                total_steps_in_match = len(player_expert_step_data)
 
-                # Process Set 2.
-                if set2:
-                    total2 = sum(set2.values())
-                    if total2 > 0:
-                        expert2, count2 = max(set2.items(), key=lambda x: x[1])
-                        rate2 = count2 / total2
-                    else:
-                        expert2, rate2 = "N/A", 0
-                else:
-                    expert2, rate2 = "N/A", 0
+                if is_belief_agent_data:
+                     # --- Aggregate Belief Peaks from Step Data ---
+                     agg_peaks_per_opponent = defaultdict(lambda: defaultdict(int))
+                     for step_info in player_expert_step_data:
+                          if isinstance(step_info, dict): # Should be dict of {opp_id: {'expert_index': peak, 'source':...}}
+                               for opp_id, peak_info in step_info.items():
+                                    if peak_info and 'expert_index' in peak_info:
+                                         peak_idx_str = str(peak_info['expert_index'])
+                                         agg_peaks_per_opponent[opp_id][peak_idx_str] += 1
+                     # --- End Aggregation ---
 
-                # Add row to HTML table.
-                html += f"""
-                <tr>
-                <td style="border: 1px solid #7289da; padding: 6px;">{opp_name}</td>
-                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">Expert {expert1} ({rate1:.1%})</td>
-                <td style="border: 1px solid #7289da; padding: 6px; text-align: center;">Expert {expert2} ({rate2:.1%})</td>
-                </tr>
-                """
+                     if is_duo_mode: # Duo mode Belief Agent display
+                         opp_ids = sorted(list(agg_peaks_per_opponent.keys()))
+                         opp1_html = "N/A (0.0%)"; opp1_plot = ("N/A", 0.0)
+                         opp2_html = "N/A (0.0%)"; opp2_plot = ("N/A", 0.0)
 
-                opponent_names.append(opp_name)
-                set1_rates.append(rate1)
-                set1_experts.append(expert1)
-                set2_rates.append(rate2)
-                set2_experts.append(expert2)
+                         if len(opp_ids) > 0: # Opponent 1
+                              opp1_peaks = agg_peaks_per_opponent.get(opp_ids[0], {})
+                              opp1_total = sum(opp1_peaks.values())
+                              if opp1_total > 0:
+                                   opp1_peak_expert, opp1_count = max(opp1_peaks.items(), key=lambda i: i[1])
+                                   opp1_rate = opp1_count / opp1_total # Rate over steps where this opponent had a peak recorded
+                                   opp1_html = f"T{opp1_peak_expert} ({opp1_rate:.1%})"
+                                   opp1_plot = (opp1_peak_expert, opp1_rate)
+                         if len(opp_ids) > 1: # Opponent 2
+                              opp2_peaks = agg_peaks_per_opponent.get(opp_ids[1], {})
+                              opp2_total = sum(opp2_peaks.values())
+                              if opp2_total > 0:
+                                   opp2_peak_expert, opp2_count = max(opp2_peaks.items(), key=lambda i: i[1])
+                                   opp2_rate = opp2_count / opp2_total
+                                   opp2_html = f"T{opp2_peak_expert} ({opp2_rate:.1%})"
+                                   opp2_plot = (opp2_peak_expert, opp2_rate)
 
-            html += """
-            </tbody>
-            </table>
-            <p><b>Note:</b> For each opponent the graph shows two bars (if available) representing the activation rate of the most used expert for each of the two activation sets.</p>
-            """
+                         html += f"""<td ...>{opp1_html}</td><td ...>{opp2_html}</td>""" # Combine rate in cell
+                         plot_data1.append(opp1_plot); plot_data2.append(opp2_plot)
 
-            text = QtWidgets.QTextEdit()
-            text.setReadOnly(True)
-            text.setHtml(html)
+                     else: # Non-Duo Belief Agent: Aggregate across opponents
+                         all_peaks_agg = defaultdict(int)
+                         for opp_peaks in agg_peaks_per_opponent.values():
+                              for expert_idx, count in opp_peaks.items(): all_peaks_agg[expert_idx] += 1
+                         total_agg_activations = sum(all_peaks_agg.values())
+                         if total_agg_activations > 0:
+                              peak_expert, peak_count = max(all_peaks_agg.items(), key=lambda i: i[1])
+                              peak_rate = peak_count / total_agg_activations
+                              html += f"""<td ...>Peak T{peak_expert}</td><td ...>{peak_rate:.1%}</td>"""
+                              plot_data1.append((peak_expert, peak_rate)); plot_data2.append(("N/A", 0.0))
+                         else: html += """<td>N/A</td><td>0.0%</td>"""; plot_data1.append(("N/A", 0.0)); plot_data2.append(("N/A", 0.0))
+
+                else: # MoE or StackedObs Agent
+                     # Aggregate counts from step data
+                     expert_counts = defaultdict(int)
+                     for step_info in player_expert_step_data:
+                          if isinstance(step_info, dict) and 'expert_index' in step_info:
+                               expert_idx_str = str(step_info['expert_index'])
+                               expert_counts[expert_idx_str] += 1
+                     # Calculate peak rate
+                     total_activations = sum(expert_counts.values())
+                     if total_activations > 0:
+                          most_used_expert, max_count = max(expert_counts.items(), key=lambda i: i[1])
+                          activation_rate = max_count / total_activations
+                          html += f"""<td ...>E/G {most_used_expert}</td><td ...>{activation_rate:.1%}</td>"""
+                          plot_data1.append((most_used_expert, activation_rate)); plot_data2.append(("N/A", 0.0))
+                     else: html += """<td>N/A</td><td>0.0%</td>"""; plot_data1.append(("N/A", 0.0)); plot_data2.append(("N/A", 0.0))
+
+                html += f"""<td>{total_steps_in_match}</td></tr>"""
+
+            # --- End Row Population ---
+            html += "</tbody></table>"
+            text = QtWidgets.QTextEdit(); text.setReadOnly(True); text.setHtml(html)
             player_layout.addWidget(text)
 
-            if opponent_names:
-                num_opponents = len(opponent_names)
-                x = np.arange(num_opponents)
-                bar_width = 0.35
+            # Plotting (logic for grouped vs single bar remains the same)
+            # ... (Plotting code uses plot_data1/plot_data2) ...
+            if plot_match_names:
+                 num_matches = len(plot_match_names); x = np.arange(num_matches)
+                 figure = plt.figure(figsize=(max(8, num_matches * 0.7), 6)); ax = figure.add_subplot(111)
+                 plot_experts1 = [p[0] for p in plot_data1]; plot_rates1 = [p[1] for p in plot_data1]
+                 plot_experts2 = [p[0] for p in plot_data2]; plot_rates2 = [p[1] for p in plot_data2]
+                 if is_belief_agent_data and is_duo_mode:
+                     bar_width = 0.35; bars1 = ax.bar(x - bar_width/2, plot_rates1, bar_width, label='Opp 1 Peak Rate'); bars2 = ax.bar(x + bar_width/2, plot_rates2, bar_width, label='Opp 2 Peak Rate')
+                     # ... annotations ...
+                     for bar, expert in zip(bars1, plot_experts1):
+                          if expert != "N/A": ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.01, f"T{expert}", ha='center', va='bottom', fontsize=8)
+                     for bar, expert in zip(bars2, plot_experts2):
+                          if expert != "N/A": ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.01, f"T{expert}", ha='center', va='bottom', fontsize=8)
+                     ax.set_title(f'Opponent Belief Peak Analysis (AI {idx+1}: {player_id})'); ax.set_ylabel('Rate of Peak Belief Type')
+                 else:
+                     bar_width = 0.6; bars1 = ax.bar(x, plot_rates1, bar_width, label='Dominant Rate')
+                     # ... annotations ...
+                     for bar, expert in zip(bars1, plot_experts1):
+                          if expert != "N/A": ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.01, f"E/T{expert}", ha='center', va='bottom', fontsize=8)
+                     ax.set_title(f'Dominant Activation (AI {idx+1}: {player_id})'); ax.set_ylabel('Activation Rate')
+                 ax.set_xticks(x); ax.set_xticklabels(plot_match_names, rotation=45, ha='right', fontsize=9)
+                 ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0); ax.set_ylim(0, 1.05); ax.grid(axis='y', linestyle='--', alpha=0.7)
+                 figure.tight_layout(rect=[0, 0, 0.85, 1]); canvas = FigureCanvasQTAgg(figure)
+                 player_layout.addWidget(canvas)
 
-                figure = plt.figure(figsize=(10, 6))
-                ax = figure.add_subplot(111)
 
-                bars1 = ax.bar(x - bar_width/2, set1_rates, bar_width, label='Set 1')
-                bars2 = ax.bar(x + bar_width/2, set2_rates, bar_width, label='Set 2')
+            tab_widget.addTab(player_tab, f"AI Agent {idx+1}")
 
-                ax.set_xticks(x)
-                ax.set_xticklabels(opponent_names, rotation=45, ha='right')
-                ax.set_ylabel('Activation Rate')
-                ax.set_title(f'Most Used Expert Activation for AI Agent {player_idx+1}')
-                ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0)
-
-                # Annotate bars with expert id.
-                for bar, expert in zip(bars1, set1_experts):
-                    height = bar.get_height()
-                    ax.text(bar.get_x() + bar.get_width()/2, height, f"E{expert}", ha='center', va='bottom', fontsize=9)
-                for bar, expert in zip(bars2, set2_experts):
-                    height = bar.get_height()
-                    ax.text(bar.get_x() + bar.get_width()/2, height, f"E{expert}", ha='center', va='bottom', fontsize=9)
-
-                canvas = FigureCanvasQTAgg(figure)
-                player_layout.addWidget(canvas)
-
-            tab_widget.addTab(player_tab, f"AI Agent {player_idx+1}")
-
+        # ... (Add tab widget, close button, show dialog) ...
         layout.addWidget(tab_widget)
-
-        button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
-        button_box.rejected.connect(dialog.reject)
+        button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close); button_box.rejected.connect(dialog.reject)
         layout.addWidget(button_box)
-
         dialog.setLayout(layout)
         dialog.exec_()
 
