@@ -75,7 +75,7 @@ NUM_OPPONENT_CLASSES = 10
 OPPONENT_INPUT_DIM = 4
 OPPONENT_HIDDEN_DIM = 128
 OPPONENT_LEARNING_RATE = 1e-4
-MAX_SQUENCE_LENGTH = 400
+MAX_SEQUENCE_LENGTH = 400
 # ============================
 # Transformer Configuration (Strategy Embedding)
 # ============================
