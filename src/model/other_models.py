@@ -86,6 +86,9 @@ class PolicyNetwork(nn.Module):
             action_probs (Tensor): (batch_size, output_dim) action probability distribution.
             hidden_state: LSTM hidden state from the selected expert.
         """
+        if isinstance(expert_index, tuple):
+        # Use the first expert in the tuple by default
+            expert_index = expert_index[0]
         if expert_index < 0 or expert_index >= self.num_experts:
             raise ValueError(f"Expert index {expert_index} is out of range.")
         expert = self.experts[expert_index]
