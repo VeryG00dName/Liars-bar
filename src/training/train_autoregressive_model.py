@@ -181,92 +181,48 @@ class AutoregressiveGameDataset(Dataset):
         self.num_opponent_types = num_opponent_types
         self.device = device
         self.max_seq_length = max_seq_length
-        
+
         # Debug counters
         self.obs_trimmed_count = 0
         self.total_sequences = 0
         self.sequence_lengths = []
-        
-        # Process each round sequence
+
         for round_data in tqdm(data, desc="Processing sequences"):
-            sequence = round_data['sequence']
-            
-            # Skip if sequence is too long
-            if len(sequence) > max_seq_length:
+            sequence = round_data["sequence"]
+            seq_len = len(sequence)
+            if seq_len > max_seq_length:
                 continue
-            
+
             self.total_sequences += 1
-            self.sequence_lengths.append(len(sequence))
+            self.sequence_lengths.append(seq_len)
+
+            # 1) Collect raw actions (with transformed_action when available for opponents)
+            raw_actions = []
+            for step in sequence:
+                is_train = step.get("is_training_agent", False)
+                a = step["action"]
+                if not is_train and "transformed_action" in step:
+                    a = step["transformed_action"]
+                raw_actions.append(a)
+
+            raw_actions = [6 if a == 10 else a for a in raw_actions]
             
-            # Initialize lists for sequence data
+            # 2) Build shifted inputs and aligned targets
+            PAD = 0
+            input_actions  = [PAD] + raw_actions[:-1]  # length == seq_len
+            target_actions = raw_actions.copy()        # length == seq_len
+
+            # 3) Build the rest of the features in one pass
             obs_list = []
-            action_list = []
             action_mask_list = []
-            belief_list = []
             agent_type_list = []
             position_list = []
-            
-            # Build the target action list (shifted by 1 from input actions)
-            target_action_list = []
-            
-            # Initialize latest_belief_vector for THIS SEQUENCE
+            belief_list = []
+
             latest_belief_vector = None
-            
-            # Iterate through the sequence steps
-            for i, step in enumerate(sequence):
-                # Get agent type (0 for training agent, 1 for opponents)
-                is_training_agent = step.get('is_training_agent', False)
-                agent_type = 0 if is_training_agent else 1
-                agent_type_list.append(agent_type)
-                
-                # Position in sequence
-                position_list.append(i)
-                
-                # Process action
-                action = step['action']
-                # Check if we have a transformed action (for opponent actions)
-                if 'transformed_action' in step and not is_training_agent:
-                    # Use the transformed action for training (dropout version)
-                    action = step['transformed_action']
-                action_list.append(action)
-                
-                # For target actions, use the next action in sequence
-                if i < len(sequence) - 1:
-                    next_step = sequence[i + 1]
-                    next_agent_type = 0 if next_step.get('is_training_agent', False) else 1
-                    next_action = next_step['action']
-                    if 'transformed_action' in next_step and next_agent_type == 1:
-                        next_action = next_step['transformed_action']
-                    target_action_list.append(next_action)
-                else:
-                    # For the last step, use a padding action (will be masked out)
-                    target_action_list.append(0)
-                
-                # Process observation (only for training agent turns)
-                if is_training_agent:
-                    observation = np.array(step['observation'], dtype=np.float32)
-                    # Check if observation has 9 dimensions and trim if necessary
-                    if observation.shape[0] == 9:
-                        observation = observation[:-2]  # Trim the last two elements
-                        self.obs_trimmed_count += 1
-                    obs_list.append(observation)
-                else:
-                    # For opponent turns, use zeros as placeholder
-                    obs_list.append(np.zeros(7, dtype=np.float32))
-                
-                # Process action mask (only for training agent turns)
-                if is_training_agent and 'action_mask' in step:
-                    action_mask_list.append(step['action_mask'])
-                else:
-                    # For opponent turns, use all-zeros mask
-                    action_mask_list.append([0] * 7)
-            
-            # Define the complete label mapping that includes all opponent types
             LABELS = {
-                "GreedyCardSpammer": 1,
-                "StrategicChallenger": 4,
-                "TableNonTableAgent": 6,
-                "Classic": 0,
+                "GreedyCardSpammer": 1, "StrategicChallenger": 4,
+                "TableNonTableAgent": 6, "Classic": 0,
                 "TableFirstConservativeChallenger": 5,
                 "SelectiveTableConservativeChallenger": 3,
                 "RandomAgent": 2,
@@ -274,104 +230,91 @@ class AutoregressiveGameDataset(Dataset):
                 "Historical_Version_C_player_0": 8,
                 "Historical_Version_A_player_2": 7
             }
-            
-                # Process beliefs
-            if 'belief' in step:
-                # Process the belief that exists in this step
-                opponent_names = step['belief']  # List of opponent type names (strings)
-                
-                # Initialize full belief vector
-                full_belief_vector = []
-                
-                # Generate a separate distribution for each opponent
-                for opponent_idx in range(2):  # Assuming exactly 2 opponents
-                    # Create a belief vector for this specific opponent
-                    belief_vector = np.zeros(10, dtype=np.float32)
-                    
-                    if opponent_idx < len(opponent_names):
-                        opp_name = opponent_names[opponent_idx]
-                        
-                        if opp_name in LABELS:
-                            # Known opponent type - use the exact index from LABELS
-                            correct_idx = LABELS[opp_name]
-                            belief_vector[correct_idx] = 1.0
+
+            for i, step in enumerate(sequence):
+                # agent type & position
+                is_train = step.get("is_training_agent", False)
+                agent_type_list.append(0 if is_train else 1)
+                position_list.append(i)
+
+                # observation (only for training agent)
+                if is_train:
+                    obs = np.array(step["observation"], dtype=np.float32)
+                    obs_list.append(obs)
+                else:
+                    obs_list.append(np.zeros(7, dtype=np.float32))
+
+                # action mask
+                if is_train and "action_mask" in step:
+                    action_mask_list.append(step["action_mask"])
+                else:
+                    action_mask_list.append([0] * 7)
+
+                # belief (external list of opponent names)
+                if "belief" in step:
+                    names = step["belief"]
+                    full_belief = []
+                    # two opponents assumed
+                    for opp_idx in range(2):
+                        vec = np.zeros(len(LABELS), dtype=np.float32)
+                        if opp_idx < len(names):
+                            n = names[opp_idx]
+                            idx = LABELS.get(n, None)
+                            if idx is not None:
+                                vec[idx] = 1.0
+                            else:
+                                vec[:] = 1.0 / len(LABELS)
                         else:
-                            # Unknown opponent type, use uniform distribution
-                            belief_vector = np.ones(10, dtype=np.float32) / 10
-                    else:
-                        # Missing opponent info, use uniform distribution
-                        belief_vector = np.ones(10, dtype=np.float32) / 10
-                    
-                    # Add this opponent's distribution to the full vector
-                    full_belief_vector.extend(belief_vector)
-                
-                # Update this sequence's latest belief vector
-                latest_belief_vector = full_belief_vector.copy()  # Make a copy to be safe
-                belief_list.append(full_belief_vector)
-            else:
-                # No belief in this step - use the latest available belief
-                if latest_belief_vector is not None:
-                    # Use the most recent belief vector for this sequence
+                            vec[:] = 1.0 / len(LABELS)
+                        full_belief.extend(vec)
+                    latest_belief_vector = np.array(full_belief, dtype=np.float32)
                     belief_list.append(latest_belief_vector)
                 else:
-                    # No previous belief available for this sequence, use uniform
-                    uniform_dist = np.ones(10, dtype=np.float32) / 10
-                    full_belief_vector = np.concatenate([uniform_dist, uniform_dist])
-                    belief_list.append(full_belief_vector)
-                    
-                    # Also update the latest belief for this sequence
-                    latest_belief_vector = full_belief_vector.copy()
+                    # fallback to last belief or uniform
+                    if latest_belief_vector is not None:
+                        belief_list.append(latest_belief_vector)
+                    else:
+                        uniform = np.ones(len(LABELS), dtype=np.float32) / len(LABELS)
+                        fb = np.concatenate([uniform, uniform])
+                        latest_belief_vector = fb
+                        belief_list.append(fb)
 
-            
-            # Convert lists to tensors
-            seq_length = len(sequence)
-            
-            # Convert observation tensor (shape: [seq_len, obs_dim])
-            obs_tensor = torch.tensor(np.array(obs_list), dtype=torch.float32, device=device)
-            
-            # Convert action tensors
-            action_tensor = torch.tensor(action_list, dtype=torch.long, device=device)
-            target_action_tensor = torch.tensor(target_action_list, dtype=torch.long, device=device)
-            
-            # Convert action mask tensor
-            action_mask_tensor = torch.tensor(np.array(action_mask_list), dtype=torch.bool, device=device)
-            
-            # Convert belief tensor - using the externally provided beliefs
-            belief_tensor = torch.tensor(np.array(belief_list), dtype=torch.float32, device=device)
-            
-            # Convert agent type and position tensors
-            agent_type_tensor = torch.tensor(agent_type_list, dtype=torch.long, device=device)
-            position_tensor = torch.tensor(position_list, dtype=torch.long, device=device)
-            
-            # Create attention mask for causal attention
-            # This mask prevents positions from attending to future positions
+            # 4) Convert lists into tensors
+            obs_tensor        = torch.tensor(np.stack(obs_list),       dtype=torch.float32, device=device)
+            action_tensor     = torch.tensor(input_actions,            dtype=torch.long,    device=device)
+            target_tensor     = torch.tensor(target_actions,           dtype=torch.long,    device=device)
+            mask_tensor       = torch.tensor(np.array(action_mask_list), dtype=torch.bool,  device=device)
+            belief_tensor     = torch.tensor(np.stack(belief_list),    dtype=torch.float32, device=device)
+            agent_type_tensor = torch.tensor(agent_type_list,          dtype=torch.long,    device=device)
+            position_tensor   = torch.tensor(position_list,            dtype=torch.long,    device=device)
+
+            # causal attention mask (optional—model can recompute internally)
             attention_mask = torch.triu(
-                torch.ones(seq_length, seq_length, device=device, dtype=torch.bool), 
+                torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
                 diagonal=1
             )
-            
-            # Store the processed sequence
+
+            # 5) Store the processed sequence
             self.sequences.append({
-                'obs': obs_tensor,
-                'action': action_tensor,
-                'target_action': target_action_tensor,
-                'action_mask': action_mask_tensor,
-                'belief': belief_tensor,  # Using the external beliefs
-                'agent_type': agent_type_tensor,
-                'position': position_tensor,
-                'attention_mask': attention_mask,
-                'length': seq_length,
-                'round_id': round_data['round_id']
+                "obs":            obs_tensor,
+                "action":         action_tensor,
+                "target_action":  target_tensor,
+                "action_mask":    mask_tensor,
+                "belief":         belief_tensor,
+                "agent_type":     agent_type_tensor,
+                "position":       position_tensor,
+                "attention_mask": attention_mask,
+                "length":         seq_len,
+                "round_id":       round_data["round_id"]
             })
-        
-        # Log data statistics
+
+        # summary
         print(f"Processed {len(self.sequences)} sequences (from {self.total_sequences} total)")
         print(f"Observation trimming occurred {self.obs_trimmed_count} times")
-        avg_length = sum(self.sequence_lengths) / max(1, len(self.sequence_lengths))
-        print(f"Average sequence length: {avg_length:.2f} steps")
-        print(f"Sequence length distribution: "
-              f"min={min(self.sequence_lengths)}, "
-              f"max={max(self.sequence_lengths)}")
+        if self.sequence_lengths:
+            avg_len = sum(self.sequence_lengths) / len(self.sequence_lengths)
+            print(f"Avg sequence length: {avg_len:.2f} steps, "
+                  f"min={min(self.sequence_lengths)}, max={max(self.sequence_lengths)}")
     
     def __len__(self):
         return len(self.sequences)
@@ -635,7 +578,7 @@ def compute_accuracy(logits, targets, mask=None):
 def train_autoregressive_model(
     data_dir,
     num_opponent_types=None,
-    hidden_dim=512,
+    hidden_dim=256,
     learning_rate=1e-4,
     batch_size=32,
     num_epochs=100,
@@ -645,7 +588,7 @@ def train_autoregressive_model(
     device=None,
     max_files=None,
     max_samples=None,
-    max_seq_length=50,
+    max_seq_length=20,
     resume_from=None
 ):
     """Train the AutoregressiveGameModel on sequence data."""
@@ -711,7 +654,7 @@ def train_autoregressive_model(
     
     # Extended action space (0-6 regular actions, 7-10 special tokens)
     action_dim = 7
-    extended_action_dim = 11
+    extended_action_dim = 10
     
     logger.info(f"Model dimensions: obs_dim={obs_dim}, belief_dim={belief_dim}, "
                f"action_dim={action_dim}, extended_action_dim={extended_action_dim}")
@@ -722,8 +665,8 @@ def train_autoregressive_model(
         action_dim=action_dim,
         belief_dim=belief_dim,
         hidden_dim=hidden_dim,
-        num_heads=8,
-        num_layers=4,
+        num_heads=4,
+        num_layers=2,
         dropout_rate=0.1,
         max_seq_length=max_seq_length
     ).to(device)
@@ -773,25 +716,22 @@ def train_autoregressive_model(
         train_progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Train)", leave=False)
         for batch in train_progress:
             # Forward pass
-            action_logits, extended_action_logits, value_pred = model(
-                obs_sequence=batch['obs'],
-                belief_sequence=batch['belief'],
-                action_sequence=batch['action'],
-                agent_types=batch['agent_type'],
-                positions=batch['position']
-            )
-            
-            # Calculate loss
+            action_logits, extended_action_logits, _ = model(
+            obs_sequence      = batch['obs'],
+            belief_sequence  = batch['belief'],
+            action_sequence  = batch['action'],        # <— input_actions from above
+            agent_types      = batch['agent_type'],
+            positions        = batch['position'],
+        )
+            # compare against batch['target_action']
             total_loss, agent_loss, opponent_loss, value_loss = calculate_autoregressive_loss(
-                action_logits=action_logits[:, :-1],  # Remove last prediction
-                extended_action_logits=extended_action_logits[:, :-1],  # Remove last prediction
-                target_actions=batch['target_action'][:, :-1],  # Remove last target
-                agent_types=batch['agent_type'][:, :-1],  # Remove last agent type
-                padding_mask=batch['padding_mask'][:, :-1],  # Remove last padding
-                value_pred=value_pred[:, :-1],  # Remove last value prediction
-                value_target=None  # No value target for now
+                action_logits,
+                extended_action_logits,
+                batch['target_action'],   # <— target_actions from above
+                batch['agent_type'],
+                batch['padding_mask']
             )
-            
+                
             # Backward pass
             optimizer.zero_grad()
             total_loss.backward()
@@ -799,16 +739,16 @@ def train_autoregressive_model(
             optimizer.step()
             
             # Calculate accuracy
-            our_agent_mask = (batch['agent_type'][:, :-1] == 0) & (~batch['padding_mask'][:, :-1])
-            opponent_mask = (batch['agent_type'][:, :-1] == 1) & (~batch['padding_mask'][:, :-1])
+            our_agent_mask = (batch['agent_type'] == 0) & (~batch['padding_mask'])
+            opponent_mask = (batch['agent_type'] == 1) & (~batch['padding_mask'])
             agent_acc = compute_accuracy(
-                action_logits[:, :-1], 
-                batch['target_action'][:, :-1], 
+                action_logits, 
+                batch['target_action'], 
                 ~our_agent_mask
             )
             opponent_acc = compute_accuracy(
-                extended_action_logits[:, :-1], 
-                batch['target_action'][:, :-1], 
+                extended_action_logits, 
+                batch['target_action'], 
                 ~opponent_mask
             )
             
@@ -859,26 +799,26 @@ def train_autoregressive_model(
                 
                 # Calculate loss
                 total_loss, agent_loss, opponent_loss, value_loss = calculate_autoregressive_loss(
-                    action_logits=action_logits[:, :-1],
-                    extended_action_logits=extended_action_logits[:, :-1],
-                    target_actions=batch['target_action'][:, :-1],
-                    agent_types=batch['agent_type'][:, :-1],
-                    padding_mask=batch['padding_mask'][:, :-1],
-                    value_pred=value_pred[:, :-1],
+                    action_logits=action_logits,
+                    extended_action_logits=extended_action_logits,
+                    target_actions=batch['target_action'],
+                    agent_types=batch['agent_type'],
+                    padding_mask=batch['padding_mask'],
+                    value_pred=value_pred,
                     value_target=None
                 )
                 
                 # Calculate accuracy
-                our_agent_mask = (batch['agent_type'][:, :-1] == 0) & (~batch['padding_mask'][:, :-1])
-                opponent_mask = (batch['agent_type'][:, :-1] == 1) & (~batch['padding_mask'][:, :-1])
+                our_agent_mask = (batch['agent_type'] == 0) & (~batch['padding_mask'])
+                opponent_mask = (batch['agent_type'] == 1) & (~batch['padding_mask'])
                 agent_acc = compute_accuracy(
-                    action_logits[:, :-1], 
-                    batch['target_action'][:, :-1], 
+                    action_logits, 
+                    batch['target_action'], 
                     ~our_agent_mask
                 )
                 opponent_acc = compute_accuracy(
-                    extended_action_logits[:, :-1], 
-                    batch['target_action'][:, :-1], 
+                    extended_action_logits, 
+                    batch['target_action'], 
                     ~opponent_mask
                 )
                 
@@ -1014,7 +954,7 @@ def main():
     parser.add_argument("--device", type=str, default='cuda', help="Device to use (cuda/cpu)")
     parser.add_argument("--max-files", type=int, default=None, help="Maximum number of data files to load")
     parser.add_argument("--max-samples", type=int, default=1770000, help="Maximum number of samples to load")
-    parser.add_argument("--max-seq-length", type=int, default=50, help="Maximum sequence length to process")
+    parser.add_argument("--max-seq-length", type=int, default=20, help="Maximum sequence length to process")
     parser.add_argument("--resume-from", type=str, default=None, help="Path to checkpoint to resume from")
     
     args = parser.parse_args()
