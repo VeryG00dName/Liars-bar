@@ -1,5 +1,7 @@
 # src/model/model_factory.py
+import logging
 import torch
+import torch.nn as nn # Added nn
 from src import config
 from src.model.common_model_api import BasePolicyNetwork, BaseValueNetwork, BaseOpponentBehaviorPredictor
 from src.model.shen_models import BeliefSpacePolicy, OpponentBeliefModel
@@ -8,359 +10,287 @@ from src.model.new_models import PolicyNetwork as NewPolicyNetwork, ValueNetwork
 # Import MoE models when needed (dynamic import in create_policy_network)
 
 class ModelFactory:
-    # Add these new methods
-    
+
+    # --- ADD THESE STATIC METHODS ---
+    @staticmethod
+    def get_hidden_dim_from_state_dict(state_dict, layer_prefix='fc1'):
+        """Determines the hidden dimension from a state dictionary."""
+        # Try several candidate prefixes.
+        candidate_prefixes = [
+            layer_prefix,
+            "base_encoder.0",
+            "policy_net.fc1",
+            "model.fc1",
+            "network.0", # For BeliefSpacePolicy
+            "experts.0.fc1" # For MoE
+        ]
+        for prefix in candidate_prefixes:
+            key = f"{prefix}.weight"
+            if key in state_dict:
+                return state_dict[key].shape[0] # Output dimension of the layer
+        # Fallback: return the first dimension of the first 2D tensor found.
+        for key, tensor in state_dict.items():
+            if hasattr(tensor, "ndim") and tensor.ndim == 2:
+                return tensor.shape[0]
+        # If still not found, include available keys in the error message.
+        available_keys = list(state_dict.keys())
+        raise ValueError(f"Cannot determine hidden_dim from state_dict. Tried prefixes: {candidate_prefixes}. Available keys: {available_keys}")
+
+    @staticmethod
+    def get_input_dim_from_state_dict(state_dict, layer_prefix='fc1'):
+        """Determines the input dimension from a state dictionary."""
+        candidate_prefixes = [
+            layer_prefix,
+            "base_encoder.0",
+            "policy_net.fc1",
+            "model.fc1",
+            "network.0", # For BeliefSpacePolicy
+            "experts.0.fc1" # For MoE
+        ]
+        for prefix in candidate_prefixes:
+            key = f"{prefix}.weight"
+            if key in state_dict:
+                return state_dict[key].shape[1] # Input dimension of the layer
+        # Fallback: iterate over all keys and return the input dimension from the first 2D tensor found.
+        for key, tensor in state_dict.items():
+            if hasattr(tensor, "ndim") and tensor.ndim == 2:
+                return tensor.shape[1]
+        available_keys = list(state_dict.keys())
+        raise ValueError(f"Cannot determine input_dim from state_dict. Tried prefixes: {candidate_prefixes}. Available keys: {available_keys}")
+    # --- END OF ADDED METHODS ---
+
+    # (Keep other existing static methods: is_belief_space_policy, create_belief_space_policy, etc.)
     @staticmethod
     def is_belief_space_policy(state_dict):
-        """
-        Detects if a state dictionary comes from a BeliefSpacePolicy model.
-        
-        Args:
-            state_dict: The state dictionary of a model.
-            
-        Returns:
-            bool: True if the state dictionary is from a BeliefSpacePolicy model, False otherwise.
-        """
-        # BeliefSpacePolicy has network, policy_head and value_head components
         network_key = 'network.0.weight'
         policy_key = 'policy_head.weight'
-        value_key = 'value_head.0.weight'
-        
+        value_key = 'value_head.0.weight' # Check first layer of value head
         return network_key in state_dict and policy_key in state_dict and value_key in state_dict
-    
+
     @staticmethod
     def create_belief_space_policy(belief_dim, obs_dim, hidden_dim, output_dim):
-        """
-        Creates a BeliefSpacePolicy model.
-        
-        Args:
-            belief_dim (int): Dimension of the belief vector.
-            obs_dim (int): Dimension of the observation vector.
-            hidden_dim (int): Dimension of hidden layers.
-            output_dim (int): Dimension of action space.
-            
-        Returns:
-            BeliefSpacePolicy: A belief space policy instance.
-        """
         model = BeliefSpacePolicy(
-            belief_dim=belief_dim,
-            obs_dim=obs_dim,
-            hidden_dim=hidden_dim,
-            output_dim=output_dim
+            belief_dim=belief_dim, obs_dim=obs_dim, hidden_dim=hidden_dim, output_dim=output_dim
         )
         return model
-    
+
     @staticmethod
-    def create_opponent_belief_model(obs_dim, num_opponent_types, hidden_dim):
-        """
-        Creates an OpponentBeliefModel for updating beliefs about opponent types.
-        
-        Args:
-            obs_dim (int): Dimension of the observation vector.
-            num_opponent_types (int): Number of opponent types to model.
-            hidden_dim (int): Dimension of hidden layers.
-            
-        Returns:
-            OpponentBeliefModel: An opponent belief model instance.
-        """
+    def create_opponent_belief_model(event_feature_dim, hidden_dim, num_opponent_types, max_seq_length=400): # Match args
         model = OpponentBeliefModel(
-            obs_dim=obs_dim,
-            num_opponent_types=num_opponent_types,
-            hidden_dim=hidden_dim
+            event_feature_dim=event_feature_dim, hidden_dim=hidden_dim,
+            num_opponent_types=num_opponent_types, max_seq_length=max_seq_length
         )
         return model
-    
+
+    @staticmethod
+    def is_autoregressive_model(state_dict):
+        """Detects if a state dict likely comes from AutoregressiveGameModel."""
+        # Check for key components like transformer layers and specific heads
+        has_transformer = any(k.startswith('transformer.layers.') for k in state_dict)
+        has_action_emb = 'action_embedding.weight' in state_dict
+        has_action_head = 'action_head.weight' in state_dict
+        has_ext_action_head = 'extended_action_head.weight' in state_dict
+        return has_transformer and has_action_emb and has_action_head and has_ext_action_head
+
     @staticmethod
     def get_belief_dimensions(state_dict):
-        """
-        Extract exact dimensions from a BeliefSpacePolicy state dictionary.
-        
-        Args:
-            state_dict: The state dictionary of a BeliefSpacePolicy.
-            
-        Returns:
-            tuple: (total_input_dim, suggested_obs_dim, suggested_belief_dim)
-        """
-        # Get the exact total input dimension
+        """ Extracts dimensions from a BeliefSpacePolicy state dictionary. """
+        logger = logging.getLogger(__name__)
         total_input_dim = None
-        
-        # Check for the weight of the first network layer
-        if 'network.0.weight' in state_dict:
-            total_input_dim = state_dict['network.0.weight'].shape[1]
-        
-        # If we couldn't find it, try other keys
+        if 'network.0.weight' in state_dict: total_input_dim = state_dict['network.0.weight'].shape[1]
         if total_input_dim is None:
             for key, tensor in state_dict.items():
-                if isinstance(tensor, torch.Tensor) and tensor.ndim == 2 and 'network' in key and 'weight' in key:
-                    total_input_dim = tensor.shape[1]
-                    break
-        
-        # If still not found, use a default
-        if total_input_dim is None:
-            return (None, 16, 20)  # Default values
-        
-        # Make a reasonable split: around 2/3 for obs_dim, 1/3 for belief_dim
-        # This is just a suggestion, as we'll use the exact total_input_dim
-        suggested_obs_dim = int(total_input_dim * 0.67)
-        suggested_belief_dim = total_input_dim - suggested_obs_dim
-        
-        return (total_input_dim, suggested_obs_dim, suggested_belief_dim)
-    
+                if hasattr(tensor, "ndim") and tensor.ndim == 2 and 'network' in key and 'weight' in key:
+                    total_input_dim = tensor.shape[1]; break
+        if total_input_dim is None: return (None, 7, 10) # Default obs=7, belief_per_opp=10
+
+        # --- MODIFIED HEURISTIC ---
+        # Prioritize known observation sizes if total input dim matches known combinations
+        known_belief_dim_per_opp = 10 # Common value
+        known_total_belief_dim = known_belief_dim_per_opp * 2 # Assume 2 opponents
+
+        if total_input_dim == 7 + known_total_belief_dim: # Check for obs=7 + belief=20
+             suggested_obs_dim = 7
+             suggested_belief_per_opp = known_belief_dim_per_opp
+             logger.debug(f"Belief Dim Heuristic: Matched total_input={total_input_dim} to obs=7 + belief=20")
+        elif total_input_dim == 9 + known_total_belief_dim: # Check for obs=9 + belief=20 (newer format?)
+             suggested_obs_dim = 9
+             suggested_belief_per_opp = known_belief_dim_per_opp
+             logger.debug(f"Belief Dim Heuristic: Matched total_input={total_input_dim} to obs=9 + belief=20")
+        elif total_input_dim > known_total_belief_dim and (total_input_dim - known_total_belief_dim) > 0:
+             # If total dim implies some obs dim + known belief dim
+             suggested_obs_dim = total_input_dim - known_total_belief_dim
+             suggested_belief_per_opp = known_belief_dim_per_opp
+             logger.debug(f"Belief Dim Heuristic: Deduced obs={suggested_obs_dim} based on total={total_input_dim} and belief_types={known_belief_dim_per_opp}")
+        else:
+             # Fallback generic split (less reliable)
+             suggested_obs_dim = 7 # Default to known correct size
+             suggested_belief_per_opp = (total_input_dim - suggested_obs_dim)//2 if (total_input_dim > suggested_obs_dim and (total_input_dim - suggested_obs_dim)%2==0) else 10
+             logger.debug(f"Belief Dim Heuristic: Using fallback split for total_input={total_input_dim} -> obs={suggested_obs_dim}, belief_per_opp={suggested_belief_per_opp}")
+
+
+        return (total_input_dim, suggested_obs_dim, suggested_belief_per_opp)
+
+    @staticmethod
+    def is_stacked_observation_model(state_dict):
+        """Detects if a state dict is from the older StackedObservationConvModel."""
+        is_newer = ModelFactory.is_stacked_newer_observation_model(state_dict)
+        has_conv = any(k.startswith('conv_layers.') for k in state_dict.keys())
+        has_old_policy_head = 'policy_head.weight' in state_dict
+        has_old_value_head = 'value_head.weight' in state_dict
+
+        # It's an older stacked model if it has conv layers and the old heads, BUT NOT the newer heads
+        return has_conv and has_old_policy_head and has_old_value_head and not is_newer
+
     @staticmethod
     def get_belief_input_dim(state_dict):
-        """
-        Extracts the observation dimension from a BeliefSpacePolicy state dictionary.
-        
-        For BeliefSpacePolicy, the input dimension to the network is the sum of 
-        observation dimension and belief dimension. This method attempts to determine
-        the observation dimension by examining the state dictionary.
-        
-        Args:
-            state_dict: The state dictionary of a BeliefSpacePolicy.
-            
-        Returns:
-            int: The estimated observation dimension.
-        """
-        # First, try to determine the total input dimension (obs_dim + belief_dim)
-        total_input_dim = None
-        
-        # Check for the weight of the first network layer
-        if 'network.0.weight' in state_dict:
-            total_input_dim = state_dict['network.0.weight'].shape[1]
-        
-        # If we couldn't find it through direct keys, try examining each key
-        if total_input_dim is None:
-            for key, tensor in state_dict.items():
-                if isinstance(tensor, torch.Tensor) and tensor.ndim == 2 and 'network' in key and 'weight' in key:
-                    # This is likely a linear layer in the network
-                    total_input_dim = tensor.shape[1]
-                    break
-        
-        # If we still can't determine it, provide a reasonable default
-        if total_input_dim is None:
-            return 16  # Default observation dimension for BeliefSpacePolicy
-        
-        # For BeliefSpacePolicy, a reasonable heuristic is that
-        # observation_dim is about 75-80% of the total input dimension
-        # The rest is for the belief dimension
-        obs_dim = int(total_input_dim * 0.75)
-        
-        # Ensure the dimension is positive and reasonable
-        return max(obs_dim, 16)  # Minimum 16 as a reasonable default
-    
+        _, suggested_obs_dim, _ = ModelFactory.get_belief_dimensions(state_dict)
+        return suggested_obs_dim
+
     @staticmethod
     def get_num_opponent_types(belief_model_state_dict):
-        """
-        Extracts the number of opponent types from an OpponentBeliefModel state dictionary.
-        
-        Args:
-            belief_model_state_dict: The state dictionary of an OpponentBeliefModel.
-            
-        Returns:
-            int: The number of opponent types.
-        """
-        if 'belief_update.2.weight' in belief_model_state_dict:
-            return belief_model_state_dict['belief_update.2.weight'].shape[0]
-        return 10  # Default value if we can't determine it
-    
+        """ Extracts the number of opponent types from an OpponentBeliefModel state dictionary."""
+        # --- MODIFIED: Check index 4 based on error log ---
+        output_layer_key = 'belief_update.4.weight'
+        if output_layer_key not in belief_model_state_dict:
+             # Try older keys if structure changed
+             output_layer_key = 'belief_update.3.weight'
+             if output_layer_key not in belief_model_state_dict:
+                  output_layer_key = 'belief_update.2.weight' # Fallback
+
+        if output_layer_key in belief_model_state_dict:
+            return belief_model_state_dict[output_layer_key].shape[0] # Output size is num_types
+        else:
+             keys_found = list(belief_model_state_dict.keys())
+             print(f"Warning: Could not find belief update output layer (tried indices 4, 3, 2). Available keys: {keys_found}")
+             return 10 # Default
+
+    @staticmethod
+    def get_output_dim_from_state_dict(state_dict, layer_prefix='fc4'):
+        """Determines the output dimension (action space size) from a policy state dictionary."""
+        # Check standard policy output layers first
+        candidate_prefixes = [ layer_prefix, 'policy_head', 'experts.0.fc_out', 'strategy_query']
+        # Add AR model specific head
+        candidate_prefixes.append('action_head') # AR model's standard action head
+
+        for prefix in candidate_prefixes:
+            key_w = f"{prefix}.weight"; key_b = f"{prefix}.bias"
+            if key_w in state_dict: return state_dict[key_w].shape[0]
+            if key_b in state_dict: return state_dict[key_b].shape[0]
+
+        return 7
+
     @staticmethod
     def create_policy_network(use_aux_classifier: bool = False, num_opponent_classes: int = None,
                               input_dim: int = 26, hidden_dim: int = config.HIDDEN_DIM, output_dim: int = config.OUTPUT_DIM,
                               use_lstm: bool = True, use_dropout: bool = True, use_layer_norm: bool = True,
                               use_new_model: bool = True, strategy_dim: int = 5, num_opponents: int = 2,
                               use_moe_model: bool = False, num_experts: int = 10) -> BasePolicyNetwork:
+        # (Keep implementation as before)
         if use_moe_model:
-            # Import and instantiate the MoE model from other_models
             from src.model.other_models import PolicyNetwork as MoEPolicyNetwork
             model = MoEPolicyNetwork(
-                input_dim=input_dim,
-                hidden_dim=hidden_dim,
-                output_dim=output_dim,
-                use_lstm=use_lstm,
-                use_dropout=use_dropout,
-                use_layer_norm=use_layer_norm,
-                num_experts=num_experts
+                input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim, num_experts=num_experts,
+                use_lstm=use_lstm, use_dropout=use_dropout, use_layer_norm=use_layer_norm
             )
         elif use_new_model:
-            # Instantiate the new model version.
             model = NewPolicyNetwork(
-                input_dim=input_dim,
-                hidden_dim=hidden_dim,
-                output_dim=output_dim,
-                use_lstm=use_lstm,
-                use_dropout=use_dropout,
-                use_layer_norm=use_layer_norm,
-                use_aux_classifier=use_aux_classifier,
-                num_opponent_classes=num_opponent_classes
+                input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim, use_lstm=use_lstm,
+                use_dropout=use_dropout, use_layer_norm=use_layer_norm,
+                use_aux_classifier=use_aux_classifier, num_opponent_classes=num_opponent_classes
             )
-        else:
-            # Import and instantiate the older version from other_models.
-            from src.model.other_models import PolicyNetwork as OtherPolicyNetwork
-            model = OtherPolicyNetwork(
-                input_dim=input_dim,
-                hidden_dim=hidden_dim,
-                output_dim=output_dim,
-                strategy_dim=strategy_dim,
-                num_opponents=num_opponents,
-                use_lstm=use_lstm,
-                use_dropout=use_dropout
-            )
+        else: # Older model from other_models
+             from src.model.other_models import PolicyNetwork as OtherPolicyNetwork
+             try:
+                  model = OtherPolicyNetwork(
+                       input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim,
+                       strategy_dim=strategy_dim, num_opponents=num_opponents,
+                       use_lstm=use_lstm, use_dropout=use_dropout
+                  )
+             except TypeError: # Handle potential changes in constructor signature
+                  print("Warning: Old PolicyNetwork constructor might have changed. Trying without strategy/opponent args.")
+                  model = OtherPolicyNetwork(
+                       input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim,
+                       use_lstm=use_lstm, use_dropout=use_dropout
+                  )
         return model
-    
+
+
     @staticmethod
-    def create_stacked_observation_model(
-        obs_dim: int,
-        num_actions: int, 
-        hidden_dim: int = config.HIDDEN_DIM,
-        num_obs_stack: int = 10
-    ) -> torch.nn.Module:
-        """
-        Creates a StackedObservationConvModel that handles both policy and value functions.
-        
-        Args:
-            obs_dim: Dimension of each observation
-            num_actions: Number of possible actions
-            hidden_dim: Dimension of hidden layers
-            num_obs_stack: Number of historical observations to include in the stack
-            
-        Returns:
-            A StackedObservationConvModel instance
-        """
+    def create_stacked_observation_model(obs_dim: int, num_actions: int, hidden_dim: int = config.HIDDEN_DIM, num_obs_stack: int = 10) -> nn.Module:
         from src.model.models import StackedObservationConvModel
         model = StackedObservationConvModel(
-            obs_dim=obs_dim,
-            num_actions=num_actions,
-            hidden_dim=hidden_dim,
+            obs_dim=obs_dim, num_actions=num_actions, hidden_dim=hidden_dim,
             num_obs_stack=num_obs_stack
+            # Note: Older version might not take num_players
         )
         return model
-    
+
     @staticmethod
-    def create_stacked_newer_observation_model(
-        obs_dim: int,
-        num_actions: int, 
-        hidden_dim: int = config.HIDDEN_DIM,
-        num_obs_stack: int = 10,
-        num_players: int = 3
-    ) -> torch.nn.Module:
-        """
-        Creates a StackedObservationConvModel that handles policy, value, and game state prediction
-        with the newer observation format.
-        
-        Args:
-            obs_dim: Dimension of each observation
-            num_actions: Number of possible actions
-            hidden_dim: Dimension of hidden layers
-            num_obs_stack: Number of historical observations to include in the stack
-            num_players: Number of players in the game (for game state dimension calculation)
-            
-        Returns:
-            A StackedObservationConvModel instance with the updated prediction head
-        """
+    def create_stacked_newer_observation_model(obs_dim: int, num_actions: int, hidden_dim: int = config.HIDDEN_DIM, num_obs_stack: int = 10, num_players: int = 3) -> nn.Module:
         from src.model.models import StackedObservationConvModel
         model = StackedObservationConvModel(
-            obs_dim=obs_dim,
-            num_actions=num_actions,
-            hidden_dim=hidden_dim,
-            num_obs_stack=num_obs_stack,
-            num_players=num_players
+            obs_dim=obs_dim, num_actions=num_actions, hidden_dim=hidden_dim,
+            num_obs_stack=num_obs_stack, num_players=num_players # Newer version includes num_players
         )
         return model
 
     @staticmethod
     def is_stacked_newer_observation_model(state_dict):
-        """
-        Detects if a state dictionary comes from an updated StackedObservationConvModel
-        that uses the newer observation format.
-        
-        Args:
-            state_dict: The state dictionary of a model.
-            
-        Returns:
-            bool: True if the state dictionary is from an updated StackedObservationConvModel, False otherwise.
-        """
-        # The updated model uses dual heads named policy_head1/2 and value_head1/2 instead of policy_head and value_head
-        # And it has a game_state_head instead of next_obs_head
-        return (any(k.startswith('conv_layers.') for k in state_dict.keys()) and 
-                'policy_head1.weight' in state_dict and 
-                'value_head1.weight' in state_dict and
-                'policy_head2.weight' in state_dict and
-                'value_head2.weight' in state_dict and
+        return (any(k.startswith('conv_layers.') for k in state_dict.keys()) and
+                'policy_head1.weight' in state_dict and 'value_head1.weight' in state_dict and
+                'policy_head2.weight' in state_dict and 'value_head2.weight' in state_dict and
                 'game_state_head.weight' in state_dict)
-    
+
     @staticmethod
     def is_moe_policy(state_dict):
-        """
-        Detects if a policy state dictionary comes from a Mixture of Experts model.
-        
-        Args:
-            state_dict: The state dictionary of a policy network.
-            
-        Returns:
-            bool: True if the state dictionary is from an MoE model, False otherwise.
-        """
-        # MoE models have expert-specific layers like 'experts.0.fc1.weight'
         return any(k.startswith('experts.') for k in state_dict.keys())
 
     @staticmethod
-    def create_value_network(input_dim: int = 26, hidden_dim: int = 64,
-                             use_dropout: bool = True, use_layer_norm: bool = True) -> BaseValueNetwork:
+    def create_value_network(input_dim: int = 26, hidden_dim: int = 64, use_dropout: bool = True, use_layer_norm: bool = True) -> BaseValueNetwork:
         model = PPOValueNetwork(
-            input_dim=input_dim,
-            hidden_dim=hidden_dim,
-            use_dropout=use_dropout,
-            use_layer_norm=use_layer_norm
+            input_dim=input_dim, hidden_dim=hidden_dim, use_dropout=use_dropout, use_layer_norm=use_layer_norm
         )
         return model
 
     @staticmethod
-    def create_obp(use_transformer_memory: bool = True, 
-                   input_dim: int = None, hidden_dim: int = 64, output_dim: int = 2) -> BaseOpponentBehaviorPredictor:
-        if input_dim is None:
-            input_dim = config.OPPONENT_INPUT_DIM
+    def create_obp(use_transformer_memory: bool = True, input_dim: int = None, hidden_dim: int = 64, output_dim: int = 2) -> BaseOpponentBehaviorPredictor:
+        if input_dim is None: input_dim = config.OPPONENT_INPUT_DIM
         if use_transformer_memory:
-            # Use the new OBP which requires memory integration.
             from src.model.new_models import OpponentBehaviorPredictor as NewOpponentBehaviorPredictor
             model = NewOpponentBehaviorPredictor(
-                input_dim=input_dim,
-                hidden_dim=hidden_dim,
-                output_dim=output_dim,
-                memory_dim=config.STRATEGY_DIM
+                input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim, memory_dim=config.STRATEGY_DIM
             )
         else:
-            # Use the old OBP from src.model.models that doesn't require memory.
-            from src.model.models import OpponentBehaviorPredictor as OldOpponentBehaviorPredictor
-            model = OldOpponentBehaviorPredictor(
-                input_dim=input_dim,
-                hidden_dim=hidden_dim,
-                output_dim=output_dim
-            )
+            # Ensure the old OBP model is correctly imported and instantiated
+            try:
+                from src.model.models import OpponentBehaviorPredictor as OldOpponentBehaviorPredictor
+                # Check if the old constructor expects memory_dim=0 or just omits it
+                try:
+                     model = OldOpponentBehaviorPredictor(
+                          input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim
+                     )
+                except TypeError: # If constructor changed (e.g., added memory_dim=0)
+                     model = OldOpponentBehaviorPredictor(
+                          input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim, memory_dim=0
+                     )
+            except ImportError:
+                 print("Error: Could not import old OpponentBehaviorPredictor from src.model.models")
+                 raise # Re-raise if import fails
+
         return model
 
     @staticmethod
     def load_obp_state_dict(model: BaseOpponentBehaviorPredictor, checkpoint_state: dict):
-        """
-        Loads the checkpoint state into the OBP model.
-        If the checkpoint's fc1.weight has a smaller second dimension than the model,
-        then copy the overlapping columns and leave the rest as initialized.
-        """
+        # (Keep implementation as before)
         model_state = model.state_dict()
         new_state = {}
         for key in model_state:
             if key in checkpoint_state:
-                ckpt_param = checkpoint_state[key]
-                model_param = model_state[key]
-                if ckpt_param.shape == model_param.shape:
-                    new_state[key] = ckpt_param
+                ckpt_param = checkpoint_state[key]; model_param = model_state[key]
+                if ckpt_param.shape == model_param.shape: new_state[key] = ckpt_param
                 elif key == "fc1.weight" and ckpt_param.shape[1] < model_param.shape[1]:
-                    new_weight = model_param.clone()
-                    new_weight[:, :ckpt_param.shape[1]] = ckpt_param
-                    new_state[key] = new_weight
-                else:
-                    print(f"Warning: skipping parameter {key} due to shape mismatch: "
-                          f"checkpoint {ckpt_param.shape} vs model {model_param.shape}")
-                    new_state[key] = model_param
-            else:
-                new_state[key] = model_state[key]
-        model.load_state_dict(new_state)
-        return model
+                    new_weight = model_param.clone(); new_weight[:, :ckpt_param.shape[1]] = ckpt_param; new_state[key] = new_weight
+                else: print(f"Warning: skipping OBP parameter {key} due to shape mismatch"); new_state[key] = model_param
+            else: new_state[key] = model_state[key]
+        model.load_state_dict(new_state); return model
