@@ -22,10 +22,10 @@ class AutoregressiveGameModel(nn.Module):
                  action_dim=7,
                  belief_dim=20,
                  hidden_dim=256, 
-                 num_heads=8,
-                 num_layers=4,
+                 num_heads=4,
+                 num_layers=2,
                  dropout_rate=0.1,
-                 max_seq_length=50):
+                 max_seq_length=20):
         """
         Initialize the autoregressive game model.
         
@@ -48,8 +48,8 @@ class AutoregressiveGameModel(nn.Module):
         
         # Extended action space for card counts and challenge token
         # Regular actions: 0-6
-        # Card count representations: 7=1 card, 8=2 cards, 9=3 cards, 10=Challenge
-        self.extended_action_dim = action_dim + 4
+        # Card count representations: 7=1 card, 8=2 cards, 9=3 cards
+        self.extended_action_dim = action_dim + 3
         
         # === Input Encoders ===
         # Observation encoder (only for training agent turns)
