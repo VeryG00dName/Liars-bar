@@ -13,7 +13,6 @@ from src import config
 
 # Import utilities needed WITHIN the agent
 from src.eval.evaluate_utils import adapt_observation_for_version, get_opponent_memory_embedding
-# REMOVE: run_obp_inference, run_obp_inference_tournament (logic moved here)
 
 class StandardAgent(BaseAgent):
     """
