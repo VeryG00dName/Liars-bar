@@ -175,7 +175,7 @@ class AutoregressiveGameDataset(Dataset):
     """
     
     
-    def __init__(self, data, opponent_mapping, num_opponent_types, device, max_seq_length=50):
+    def __init__(self, data, opponent_mapping, num_opponent_types, device, max_seq_length=20):
         self.sequences = []
         self.opponent_mapping = opponent_mapping
         self.num_opponent_types = num_opponent_types
