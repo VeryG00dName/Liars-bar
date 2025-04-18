@@ -16,7 +16,6 @@ import re
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 from PyQt5 import QtWidgets
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from src.model.shen_models import BeliefSpacePolicy, OpponentBeliefModel
 # Import your environment, agents, evaluation helpers, and model factory.
 from src.env.liars_deck_env_core import LiarsDeckEnv
 from src import config
@@ -29,12 +28,7 @@ from src.model.hard_coded_agents import (
     TableNonTableAgent,
     Classic
 )
-from src.eval.evaluate_utils import (
-    get_hidden_dim_from_state_dict,
-    evaluate_agents
-)
-from src.model.model_factory import ModelFactory
-from src.training.train_vs_everyone import load_specific_historical_models
+from src.eval.evaluate_utils import evaluate_agents
 
 from src.misc.cheat.ai_vs_hardcoded_cheat import LABELS
 torch.backends.cudnn.benchmark = True
