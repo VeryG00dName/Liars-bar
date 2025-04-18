@@ -222,11 +222,20 @@ class AutoregressiveAgent(BaseAgent):
         """Resets sequence history, belief state, and last opponent claim."""
         self.sequence_history = []
         self.env_agent_id_map = None
-        self.last_opponent_claim = None # Reset last claim
+        self.last_opponent_claim = None
         if self.belief_model and self.num_opponent_types:
             self.belief_state = {}
         else:
             self.belief_state = None
+        # ← NEW: clear expert‐info cache
+        self._last_expert_info = None
+
+    def get_last_expert_info(self):
+        """
+        Return the most‐recent step’s expert activation info
+        (i.e. the belief‐peak index and its source for each opponent).
+        """
+        return self._last_expert_info
 
     def _prepare_model_input(self, history: List[Dict[str, Any]]) -> Dict[str, Optional[torch.Tensor]]:
         """Prepares padded tensors from a history list for the AR model."""
@@ -496,7 +505,13 @@ class AutoregressiveAgent(BaseAgent):
 
         # Append the step BEFORE any forward passes so history[-1] always exists
         self.sequence_history.append(current_step_info)
-
+        self._last_expert_info = {
+        opp_id: {
+            "expert_index": data["expert_index"],
+            "source": data["source"]
+        }
+        for opp_id, data in opponent_peak_beliefs.items()
+        }
         # --- 3. FORWARD PASS #1: Predict OUR OWN Action ---
         logger.debug(
             f"AR Agent {self.player_id}: Predicting own action "
