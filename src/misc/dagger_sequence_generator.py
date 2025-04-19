@@ -318,9 +318,8 @@ def generate_data(
     
     # Action type mapping for card count representation
     # Regular actions: 0-6
-    # Card count representations: 7=1 card, 8=2 cards, 9=3 cards, 10=Challenge
+    # Card count representations: 7=1 card, 8=2 cards, 9=3 cards
     CARD_COUNT_MAPPING = {1: 7, 2: 8, 3: 9}
-    CHALLENGE_REPRESENTATION = 6  # Special code for challenge
     
     # Main episode loop
     for episode in tqdm(range(num_episodes), desc="Generating episodes"):
@@ -651,9 +650,6 @@ def generate_data(
                         # Map count to special actions: 7=1 card, 8=2 cards, 9=3 cards
                         transformed_action = CARD_COUNT_MAPPING.get(count, count + 6)
                         step_data["transformed_action"] = transformed_action
-                elif action_type == "Challenge" and np.random.random() < opponent_action_dropout_rate:
-                    # Replace challenge action with special challenge code
-                    step_data["transformed_action"] = CHALLENGE_REPRESENTATION
                 
                 # Execute the action
                 env.step(best_action)
