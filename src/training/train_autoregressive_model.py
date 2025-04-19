@@ -200,7 +200,10 @@ class AutoregressiveGameDataset(Dataset):
             raw_actions = []
             for step in sequence:
                 is_train = step.get("is_training_agent", False)
-                a = step["action"]
+                if "action" in step:
+                    a = step["action"]
+                elif is_train and "expert_action" in step:
+                    a = step["expert_action"]
                 if not is_train and "transformed_action" in step:
                     a = step["transformed_action"]
                 raw_actions.append(a)
