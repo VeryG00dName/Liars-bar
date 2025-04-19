@@ -358,9 +358,6 @@ class AutoregressiveAgent(BaseAgent):
 
             # Use true last agent action attribute
             raw_action = env.last_agent_action[opp_id]
-            if env.terminations[opp_id] or env.round_eliminated[opp_id]:
-                prev_data["masked_action"] = None
-                continue
             predicted = self.sequence_history[prev_idx - 1]['masked_action']
             if raw_action is None:
                 real_type = None
@@ -385,10 +382,6 @@ class AutoregressiveAgent(BaseAgent):
             prev_data["masked_action"] = masked_value
             logger.debug(f"Masking opp{idx} turn: raw={raw_action}, pred={predicted} -> using {masked_value}")
 
-            if raw_action == None or raw_action == 6:
-                logger.debug(f"Agent {self.player_id}: reset history on challenge from {opp_id}")
-                self.sequence_history.clear()
-                break
 
         # --- 2. PREPARE CURRENT STEP ---
         current_step_info = {"agent_id_env": agent_id_env, "step_in_round": len(self.sequence_history)}
@@ -461,7 +454,7 @@ class AutoregressiveAgent(BaseAgent):
             if torch.isnan(probs).any() or probs.sum() < 1e-8:
                 probs = mask_tensor.float()
                 probs /= probs.sum()
-            chosen_action = torch.distributions.Categorical(probs).sample().item()
+            chosen_action = torch.argmax(probs).item()
         #print(f"eval data", model_input_self)
         # record and reset if challenge
         self.sequence_history[-1]["action"] = chosen_action
@@ -523,8 +516,6 @@ class AutoregressiveAgent(BaseAgent):
             })
 
         # --- 5. Trim history and return ---
-        if len(self.sequence_history) > 14:
-            print(len(self.sequence_history))
         if len(self.sequence_history) > self.max_seq_length:
             self.sequence_history.pop(0)
         return chosen_action
