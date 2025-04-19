@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# ar_dagger_sequence_generator.py - Implementing DAGGER with PS as expert and AR model as student
+# dagger_sequence_generator.py - Implementing DAGGER with PS as expert and AR model as student
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import time
@@ -37,6 +37,19 @@ from src.training.train_utils import load_specific_historical_models
 
 # Import PS
 from src.model.ps_v3 import PerfectSearch
+
+LABELS = {
+    "GreedyCardSpammer": 1,
+    "StrategicChallenger": 4,
+    "TableNonTableAgent": 6,
+    "Classic": 0,
+    "TableFirstConservativeChallenger": 5,
+    "SelectiveTableConservativeChallenger": 3,
+    "RandomAgent": 2,
+    "Historical_Version_E_player_1": 9,
+    "Historical_Version_C_player_0": 8,
+    "Historical_Version_A_player_2": 7
+}
 
 def setup_logging(log_file=None, level=logging.INFO):
     """Configure logging for the data generator."""
@@ -328,15 +341,29 @@ def generate_data(
             opponent_agent_names
         )
         
+        # Prepare cheat_expert_index for perfect belief if enabled
+        cheat_expert_index = None
+        # Create a tuple of expert indices for opponents
+        cheat_indices = []
+        for opp_name in selected_opponents:
+            cheat_idx = LABELS.get(opp_name)
+            if cheat_idx is not None:
+                cheat_indices.append(cheat_idx)
+            else:
+                logger.warning(f"No expert index found for opponent type {opp_name}")
+                # Use a default index or None if not found
+                cheat_indices.append(0)  # Using 0 as fallback
+        
+        # Convert to tuple for passing to agent
+        cheat_expert_index = tuple(cheat_indices)
+        logger.debug(f"Using cheat_expert_index: {cheat_expert_index}")
+        
         # Reset environment and AR model
         obs, infos = env.reset(seed=episode_seed)
         ar_agent.reset()
         
         # Create players_for_eval dictionary for AR model
-        players_for_eval = {
-            training_agent: ar_agent
-        }
-        
+        training_agent = 'player_0'
         # Initialize PerfectSearch engine
         ps = PerfectSearch(
             env=env,
@@ -505,7 +532,7 @@ def generate_data(
                         agent_id_env=current_agent,
                         observation=obs_current,
                         info=env.infos[current_agent],
-                        cheat_expert_index=None  # No cheating with expert index
+                        cheat_expert_index=cheat_expert_index  # Pass perfect belief indices
                     )
                     model_source = "AR Model"
                 except Exception as e:
@@ -742,14 +769,14 @@ def main():
     parser.add_argument("--episodes", type=int, default=1000, help="Number of episodes to generate")
     parser.add_argument("--output-dir", type=str, default="./ar_dagger_data", help="Output directory")
     parser.add_argument("--no-historical", action="store_true", help="Do not include historical models")
-    parser.add_argument("--save-frequency", type=int, default=100, help="How often to save and clear data")
+    parser.add_argument("--save-frequency", type=int, default=1000, help="How often to save and clear data")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument("--debug-ps", action="store_true", help="Enable debug mode in PerfectSearch")
     parser.add_argument("--seed", type=int, default=42, help="Starting seed for games")
     parser.add_argument("--dropout-rate", type=float, default=0.3, 
                         help="Probability to replace opponent action with card count (0.0-1.0)")
     parser.add_argument("--max-rounds", type=int, default=50, help="Maximum rounds per episode")
-    parser.add_argument("--beta", type=float, default=0.7, 
+    parser.add_argument("--beta", type=float, default=0, 
                         help="DAGGER mixing parameter - probability of using expert action (0.0-1.0)")
     parser.add_argument("--iteration", type=int, default=0, help="DAGGER iteration number")
     
