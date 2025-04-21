@@ -529,8 +529,6 @@ def get_derivable_game_state(env, agent_specific=None):
             - active_players: Whether each player is active (not eliminated/terminated)
             - penalties: Current penalty count for each player
     """
-    from src.env.liars_deck_env_utils_2 import encode_hand
-    import numpy as np
     
     agents_to_process = [agent_specific] if agent_specific else env.agents
     result = {}
