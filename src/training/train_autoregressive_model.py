@@ -55,7 +55,7 @@ def setup_logging(log_file=None, level=logging.INFO):
     
     return logger
 
-def train_val_split(data, validation_split=0.1, max_val_samples=1000):
+def train_val_split(data, validation_split=0.1, max_val_samples=50000):
     """Split data into training and validation sets with a cap on validation samples.
     
     Args:
@@ -198,22 +198,26 @@ class AutoregressiveGameDataset(Dataset):
 
             # 1) Collect raw actions (with transformed_action when available for opponents)
             raw_actions = []
+            raw_target_actions = []
             for step in sequence:
                 is_train = step.get("is_training_agent", False)
                 if "action" in step:
                     a = step["action"]
+                    b = step["action"]
                 elif is_train and "expert_action" in step:
                     a = step["expert_action"]
+                    b = step["expert_action"]
                 if not is_train and "transformed_action" in step:
                     a = step["transformed_action"]
+                raw_target_actions.append(b)
                 raw_actions.append(a)
-
-            raw_actions = [6 if a == 10 else a for a in raw_actions]
             
+            raw_actions = [6 if a == 10 else a for a in raw_actions]
+            raw_target_actions = [6 if a == 10 else a for a in raw_target_actions]
             # 2) Build shifted inputs and aligned targets
             PAD = 0
             input_actions  = [PAD] + raw_actions[:-1]  # length == seq_len
-            target_actions = raw_actions.copy()        # length == seq_len
+            target_actions = raw_target_actions.copy() # length == seq_len
 
             # 3) Build the rest of the features in one pass
             obs_list = []
@@ -482,76 +486,60 @@ def load_autoreg_data(data_dir, max_files=None, max_samples=None):
     print(f"Total loaded sequences: {len(all_data)}")
     return all_data
 
-def calculate_autoregressive_loss(action_logits, extended_action_logits, target_actions, 
-                                 agent_types, padding_mask, value_pred=None, value_target=None):
+def calculate_autoregressive_loss(
+    self_logits,  # [B, T, 7] your‐agent head
+    opp_logits,   # [B, T, 7] opponent head
+    target_actions,  # [B, T] in 0–6
+    agent_types,     # [B, T] 0=self, 1=opp
+    padding_mask,    # [B, T] True=pad
+    value_pred=None,
+    value_target=None
+):
     """
-    Calculate loss for autoregressive prediction with proper handling of different target spaces.
+    Compute loss using two 7‐way heads:
+      - self_logits: your turns
+      - opp_logits: opponent turns
+    We weight your‐agent loss ×2, opponent loss ×1, plus 0.5× value loss.
     """
-    batch_size, seq_len = target_actions.shape
-    device = action_logits.device
-    
-    # Generate masks for our agent vs opponents and valid positions
-    our_agent_mask = (agent_types == 0) & (~padding_mask)
-    opponent_mask = (agent_types == 1) & (~padding_mask)
-    
-    # Create valid target masks to filter out invalid indices
-    # For standard actions (0-6), we need targets < 7
-    action_dim = action_logits.size(-1)  # Should be 7
-    standard_valid_targets = (target_actions < action_dim) & our_agent_mask
-    
-    # For extended actions (0-10), we need targets < 11
-    extended_action_dim = extended_action_logits.size(-1)  # Should be 11
-    extended_valid_targets = (target_actions < extended_action_dim) & opponent_mask
-    
-    # Initialize losses as tensors
-    our_agent_loss = torch.tensor(0.0, device=device)
-    opponent_loss = torch.tensor(0.0, device=device)
-    
-    # Calculate loss for our agent (standard action space)
-    if standard_valid_targets.sum() > 0:
-        # Flatten both tensors for loss calculation
-        flat_logits = action_logits.reshape(-1, action_dim)
-        flat_targets = target_actions.reshape(-1)
-        flat_mask = standard_valid_targets.reshape(-1)
-        
-        # Select only valid target indices
-        valid_logits = flat_logits[flat_mask]
-        valid_targets = flat_targets[flat_mask]
-        
-        # Compute loss on valid targets only
-        our_agent_loss = F.cross_entropy(valid_logits, valid_targets)
-    
-    # Calculate loss for opponents (extended action space)
-    if extended_valid_targets.sum() > 0:
-        # Flatten both tensors for loss calculation
-        flat_ext_logits = extended_action_logits.reshape(-1, extended_action_dim)
-        flat_targets = target_actions.reshape(-1)
-        flat_mask = extended_valid_targets.reshape(-1)
-        
-        # Select only valid target indices
-        valid_ext_logits = flat_ext_logits[flat_mask]
-        valid_targets = flat_targets[flat_mask]
-        
-        # Compute loss on valid targets only
-        opponent_loss = F.cross_entropy(valid_ext_logits, valid_targets)
-    
-    # Combined action loss with higher weight on our agent's actions
-    action_loss_combined = 2.0 * our_agent_loss + opponent_loss
-    
-    # Value prediction loss if provided
+    device = self_logits.device
+    # masks for valid non‐padding positions
+    valid = ~padding_mask
+    our_mask = valid & (agent_types == 0)
+    opp_mask = valid & (agent_types == 1)
+
+    # flatten everything
+    flat_targets   = target_actions.reshape(-1)
+    flat_self_logits = self_logits.reshape(-1, self_logits.size(-1))
+    flat_opp_logits  = opp_logits .reshape(-1, opp_logits .size(-1))
+    flat_our_mask  = our_mask.reshape(-1)
+    flat_opp_mask  = opp_mask.reshape(-1)
+
+    # your‐agent loss
+    if flat_our_mask.sum() > 0:
+        sel_logits = flat_self_logits[flat_our_mask]
+        sel_targs  = flat_targets[flat_our_mask]
+        our_loss   = F.cross_entropy(sel_logits, sel_targs)
+
+    # opponent loss
+    if flat_opp_mask.sum() > 0:
+        sel_logits = flat_opp_logits[flat_opp_mask]
+        sel_targs  = flat_targets[flat_opp_mask]
+        opp_loss   = F.cross_entropy(sel_logits, sel_targs)
+
+    # combined
+    action_loss = 2.0 * our_loss + 1.0 * opp_loss
     value_loss = torch.tensor(0.0, device=device)
+    # value loss
     if value_pred is not None and value_target is not None:
-        # Only apply loss on valid positions
-        valid_mask = ~padding_mask
-        if valid_mask.sum() > 0:
-            masked_value_pred = value_pred.squeeze(-1)[valid_mask]
-            masked_value_target = value_target[valid_mask]
-            value_loss = F.mse_loss(masked_value_pred, masked_value_target)
-    
-    # Total loss
-    total_loss = action_loss_combined + 0.5 * value_loss
-    
-    return total_loss, our_agent_loss, opponent_loss, value_loss
+        vp = value_pred.squeeze(-1)  # [B, T]
+        vt = value_target            # [B, T]
+        flat_vp = vp.reshape(-1)[valid.reshape(-1)]
+        flat_vt = vt.reshape(-1)[valid.reshape(-1)]
+        if flat_vp.numel() > 0:
+            value_loss = F.mse_loss(flat_vp, flat_vt)
+
+    total_loss = action_loss + 0.5 * value_loss
+    return total_loss, our_loss, opp_loss, value_loss
 
 def compute_accuracy(logits, targets, mask=None):
     """
@@ -594,75 +582,41 @@ def train_autoregressive_model(
     max_seq_length=20,
     resume_from=None
 ):
-    """Train the AutoregressiveGameModel on sequence data."""
+    """Train the AutoregressiveGameModel on sequence data with a single action head."""
+
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if checkpoint_dir is None:
-        checkpoint_dir = os.path.join("checkpoints", f"autoreg_{timestamp}")
+    checkpoint_dir = checkpoint_dir or os.path.join("checkpoints", f"autoreg_{timestamp}")
     os.makedirs(checkpoint_dir, exist_ok=True)
-    
-    if log_dir is None:
-        log_dir = os.path.join("logs", f"autoreg_{timestamp}")
+    log_dir = log_dir or os.path.join("logs", f"autoreg_{timestamp}")
     os.makedirs(log_dir, exist_ok=True)
-    
     logger = setup_logging(os.path.join(log_dir, "training.log"))
     logger.info(f"Starting AutoregressiveGameModel training with device: {device}")
-    
     writer = SummaryWriter(log_dir=log_dir)
-    
+
     opponent_mapping = create_opponent_mapping(data_dir)
     logger.info(f"Created opponent mapping with {len(opponent_mapping)} types")
-    
     if num_opponent_types is None:
         num_opponent_types = max(opponent_mapping.values()) + 1
         logger.info(f"Setting num_opponent_types to {num_opponent_types}")
-    
-    logger.info(f"Loading data from {data_dir}")
+
     all_data = load_autoreg_data(data_dir, max_files, max_samples)
-    
     train_data, val_data = train_val_split(all_data, validation_split, max_val_samples=1000)
-    
     logger.info(f"Creating datasets with {len(train_data)} training and {len(val_data)} validation sequences")
-    
-    # Create datasets
-    train_dataset = AutoregressiveGameDataset(
-        train_data, opponent_mapping, num_opponent_types, device, max_seq_length
-    )
-    val_dataset = AutoregressiveGameDataset(
-        val_data, opponent_mapping, num_opponent_types, device, max_seq_length
-    )
-    
-    # Create data loaders with custom collate function
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0,
-        collate_fn=collate_variable_length_sequences
-    )
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-        collate_fn=collate_variable_length_sequences
-    )
-    
-    # Get model dimensions from a sample
+
+    train_dataset = AutoregressiveGameDataset(train_data, opponent_mapping, num_opponent_types, device, max_seq_length)
+    val_dataset = AutoregressiveGameDataset(val_data, opponent_mapping, num_opponent_types, device, max_seq_length)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=collate_variable_length_sequences)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=collate_variable_length_sequences)
+
     sample = next(iter(train_loader))
     obs_dim = sample['obs'].shape[2]
     belief_dim = sample['belief'].shape[2]
-    
-    # Extended action space (0-6 regular actions, 7-10 special tokens)
     action_dim = 7
-    extended_action_dim = 10
-    
-    logger.info(f"Model dimensions: obs_dim={obs_dim}, belief_dim={belief_dim}, "
-               f"action_dim={action_dim}, extended_action_dim={extended_action_dim}")
-    
-    # Create the model
+    logger.info(f"Model dimensions: obs_dim={obs_dim}, belief_dim={belief_dim}, action_dim={action_dim}")
+
     model = AutoregressiveGameModel(
         obs_dim=obs_dim,
         action_dim=action_dim,
@@ -673,215 +627,176 @@ def train_autoregressive_model(
         dropout_rate=0.1,
         max_seq_length=max_seq_length
     ).to(device)
-    
     logger.info(f"Model architecture:\n{model}")
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Total parameters: {total_params}, Trainable parameters: {trainable_params}")
-    
-    # Create optimizer
+
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)
-    
-    # Create learning rate scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5, verbose=True
-    )
-    
-    # Resume from checkpoint if specified
-    start_epoch = 0
-    best_val_loss = float('inf')
-    if resume_from:
-        if os.path.exists(resume_from):
-            logger.info(f"Loading checkpoint from {resume_from}")
-            checkpoint = torch.load(resume_from, map_location=device)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            start_epoch = checkpoint['epoch'] + 1
-            best_val_loss = checkpoint.get('val_loss', float('inf'))
-            logger.info(f"Resuming from epoch {start_epoch} with validation loss {best_val_loss}")
-        else:
-            logger.warning(f"Checkpoint file {resume_from} not found. Starting from scratch.")
-    
-    # Training loop
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+
+    start_epoch, best_val_loss = 0, float('inf')
+    if resume_from and os.path.exists(resume_from):
+        checkpoint = torch.load(resume_from, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_val_loss = checkpoint.get('val_loss', best_val_loss)
+        logger.info(f"Resuming from epoch {start_epoch} with validation loss {best_val_loss}")
+
     for epoch in range(start_epoch, num_epochs):
-        epoch_start_time = time.time()
-        
-        # Training phase
+        epoch_start = time.time()
         model.train()
-        train_total_loss = 0.0
-        train_agent_loss = 0.0
-        train_opponent_loss = 0.0
-        train_value_loss = 0.0
-        train_agent_acc = 0.0
+
+        # reset metrics
+        train_total_loss   = 0.0
+        train_self_loss    = 0.0
+        train_opp_loss     = 0.0
+        train_value_loss   = 0.0
+        train_batches      = 0
+        train_agent_acc    = 0.0
         train_opponent_acc = 0.0
-        train_batches = 0
-        
+
         train_progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Train)", leave=False)
         for batch in train_progress:
-            # Forward pass
-            action_logits, extended_action_logits, _ = model(
-            obs_sequence      = batch['obs'],
-            belief_sequence  = batch['belief'],
-            action_sequence  = batch['action'],        # <— input_actions from above
-            agent_types      = batch['agent_type'],
-            positions        = batch['position'],
-        )
-            # compare against batch['target_action']
-            total_loss, agent_loss, opponent_loss, value_loss = calculate_autoregressive_loss(
-                action_logits,
-                extended_action_logits,
-                batch['target_action'],   # <— target_actions from above
-                batch['agent_type'],
-                batch['padding_mask']
+            self_logits, opp_logits, value_pred = model(
+                obs_sequence=batch['obs'],
+                belief_sequence=batch['belief'],
+                action_sequence=batch['action'],
+                agent_types=batch['agent_type'],
+                positions=batch['position']
             )
-                
-            # Backward pass
+
+            total_loss, self_loss, opp_loss, value_loss = calculate_autoregressive_loss(
+                self_logits=self_logits,
+                opp_logits=opp_logits,
+                target_actions=batch['target_action'],
+                agent_types=batch['agent_type'],
+                padding_mask=batch['padding_mask'],
+                value_pred=value_pred,
+                value_target=None
+            )
+
             optimizer.zero_grad()
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            
-            # Calculate accuracy
-            our_agent_mask = (batch['agent_type'] == 0) & (~batch['padding_mask'])
-            opponent_mask = (batch['agent_type'] == 1) & (~batch['padding_mask'])
-            agent_acc = compute_accuracy(
-                action_logits, 
-                batch['target_action'], 
-                ~our_agent_mask
-            )
-            opponent_acc = compute_accuracy(
-                extended_action_logits, 
-                batch['target_action'], 
-                ~opponent_mask
-            )
-            
-            # Update metrics
+
+            # accumulate losses
             train_total_loss += total_loss.item()
-            train_agent_loss += agent_loss.item()
-            train_opponent_loss += opponent_loss.item()
+            train_self_loss  += self_loss.item()
+            train_opp_loss   += opp_loss.item()
             train_value_loss += value_loss.item()
-            train_agent_acc += agent_acc
+            train_batches    += 1
+
+            # compute accuracies
+            our_mask     = (batch['agent_type'] == 0) & (~batch['padding_mask'])
+            opp_mask     = (batch['agent_type'] == 1) & (~batch['padding_mask'])
+            agent_acc    = compute_accuracy(self_logits, batch['target_action'], ~our_mask)
+            opponent_acc = compute_accuracy(opp_logits,  batch['target_action'], ~opp_mask)
+            train_agent_acc    += agent_acc
             train_opponent_acc += opponent_acc
-            train_batches += 1
-            
+
             train_progress.set_postfix({
-                'loss': total_loss.item(),
-                'agent_acc': agent_acc,
-                'opp_acc': opponent_acc
+                'tot': total_loss.item(),
+                'self': self_loss.item(),
+                'opp': opp_loss.item()
             })
-        
-        # Calculate average metrics
-        train_total_loss /= train_batches
-        train_agent_loss /= train_batches
-        train_opponent_loss /= train_batches
-        train_value_loss /= train_batches
-        train_agent_acc /= train_batches
+
+        # average metrics
+        train_total_loss   /= train_batches
+        train_self_loss    /= train_batches
+        train_opp_loss     /= train_batches
+        train_value_loss   /= train_batches
+        train_agent_acc    /= train_batches
         train_opponent_acc /= train_batches
-        
-        # Validation phase
+
+        # --- validation ---
         model.eval()
-        val_total_loss = 0.0
-        val_agent_loss = 0.0
-        val_opponent_loss = 0.0
-        val_value_loss = 0.0
-        val_agent_acc = 0.0
+        val_total_loss   = 0.0
+        val_self_loss    = 0.0
+        val_opp_loss     = 0.0
+        val_value_loss   = 0.0
+        val_batches      = 0
+        val_agent_acc    = 0.0
         val_opponent_acc = 0.0
-        val_batches = 0
-        
+
         val_progress = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Val)", leave=False)
         with torch.no_grad():
             for batch in val_progress:
-                # Forward pass
-                action_logits, extended_action_logits, value_pred = model(
+                self_logits, opp_logits, value_pred = model(
                     obs_sequence=batch['obs'],
                     belief_sequence=batch['belief'],
                     action_sequence=batch['action'],
                     agent_types=batch['agent_type'],
                     positions=batch['position']
                 )
-                
-                # Calculate loss
-                total_loss, agent_loss, opponent_loss, value_loss = calculate_autoregressive_loss(
-                    action_logits=action_logits,
-                    extended_action_logits=extended_action_logits,
+
+                total_loss, self_loss, opp_loss, value_loss = calculate_autoregressive_loss(
+                    self_logits=self_logits,
+                    opp_logits=opp_logits,
                     target_actions=batch['target_action'],
                     agent_types=batch['agent_type'],
                     padding_mask=batch['padding_mask'],
                     value_pred=value_pred,
                     value_target=None
                 )
-                
-                # Calculate accuracy
-                our_agent_mask = (batch['agent_type'] == 0) & (~batch['padding_mask'])
-                opponent_mask = (batch['agent_type'] == 1) & (~batch['padding_mask'])
-                agent_acc = compute_accuracy(
-                    action_logits, 
-                    batch['target_action'], 
-                    ~our_agent_mask
-                )
-                opponent_acc = compute_accuracy(
-                    extended_action_logits, 
-                    batch['target_action'], 
-                    ~opponent_mask
-                )
-                
-                # Update metrics
-                val_total_loss += total_loss.item()
-                val_agent_loss += agent_loss.item()
-                val_opponent_loss += opponent_loss.item()
-                val_value_loss += value_loss.item()
-                val_agent_acc += agent_acc
+
+                our_mask     = (batch['agent_type'] == 0) & (~batch['padding_mask'])
+                opp_mask     = (batch['agent_type'] == 1) & (~batch['padding_mask'])
+                agent_acc    = compute_accuracy(self_logits, batch['target_action'], ~our_mask)
+                opponent_acc = compute_accuracy(opp_logits, batch['target_action'], ~opp_mask)
+                val_agent_acc    += agent_acc
                 val_opponent_acc += opponent_acc
-                val_batches += 1
-                
+
+                val_total_loss   += total_loss.item()
+                val_self_loss    += self_loss.item()
+                val_opp_loss     += opp_loss.item()
+                val_value_loss   += value_loss.item()
+                val_batches      += 1
+
                 val_progress.set_postfix({
-                    'loss': total_loss.item(),
-                    'agent_acc': agent_acc,
-                    'opp_acc': opponent_acc
+                    'tot': total_loss.item(),
+                    'self': self_loss.item(),
+                    'opp': opp_loss.item()
                 })
-        
-        # Calculate average metrics
-        val_total_loss /= val_batches
-        val_agent_loss /= val_batches
-        val_opponent_loss /= val_batches
-        val_value_loss /= val_batches
-        val_agent_acc /= val_batches
+
+        # average val metrics
+        val_total_loss   /= val_batches
+        val_self_loss    /= val_batches
+        val_opp_loss     /= val_batches
+        val_value_loss   /= val_batches
+        val_agent_acc    /= val_batches
         val_opponent_acc /= val_batches
-        
-        # Update learning rate scheduler
+
+        # scheduler step
         scheduler.step(val_total_loss)
-        
-        # Calculate epoch duration
-        epoch_duration = time.time() - epoch_start_time
-        
-        # Log metrics
-        logger.info(f"Epoch {epoch+1}/{num_epochs} (Time: {epoch_duration:.2f}s)")
-        logger.info(f"  Train - Loss: {train_total_loss:.6f}, "
-                   f"Agent Loss: {train_agent_loss:.6f}, "
-                   f"Opponent Loss: {train_opponent_loss:.6f}, "
-                   f"Agent Acc: {train_agent_acc:.4f}, "
-                   f"Opponent Acc: {train_opponent_acc:.4f}")
-        logger.info(f"  Val   - Loss: {val_total_loss:.6f}, "
-                   f"Agent Loss: {val_agent_loss:.6f}, "
-                   f"Opponent Loss: {val_opponent_loss:.6f}, "
-                   f"Agent Acc: {val_agent_acc:.4f}, "
-                   f"Opponent Acc: {val_opponent_acc:.4f}")
-        
-        # Write to TensorBoard
+        epoch_time = time.time() - epoch_start
+
+        # print summary
+        logger.info(
+            f"Epoch {epoch+1}/{num_epochs} (Time: {epoch_time:.2f}s)\n"
+            f"  Train - Loss: {train_total_loss:.6f}, Self: {train_self_loss:.6f}, Opp: {train_opp_loss:.6f}, Value: {train_value_loss:.6f}, "
+            f"Agent Acc: {train_agent_acc:.4f}, Opp Acc: {train_opponent_acc:.4f}\n"
+            f"  Val   - Loss: {val_total_loss:.6f}, Self: {val_self_loss:.6f}, Opp: {val_opp_loss:.6f}, Value: {val_value_loss:.6f}, "
+            f"Agent Acc: {val_agent_acc:.4f}, Opp Acc: {val_opponent_acc:.4f}"
+        )
+
+        # log to TensorBoard
         writer.add_scalar("Loss/Train/Total", train_total_loss, epoch)
-        writer.add_scalar("Loss/Train/Agent", train_agent_loss, epoch)
-        writer.add_scalar("Loss/Train/Opponent", train_opponent_loss, epoch)
+        writer.add_scalar("Loss/Train/Self", train_self_loss, epoch)
+        writer.add_scalar("Loss/Train/Opp", train_opp_loss, epoch)
         writer.add_scalar("Loss/Train/Value", train_value_loss, epoch)
-        writer.add_scalar("Accuracy/Train/Agent", train_agent_acc, epoch)
-        writer.add_scalar("Accuracy/Train/Opponent", train_opponent_acc, epoch)
-        
+        writer.add_scalar("Acc/Train/Agent", train_agent_acc, epoch)
+        writer.add_scalar("Acc/Train/Opponent", train_opponent_acc, epoch)
+
         writer.add_scalar("Loss/Val/Total", val_total_loss, epoch)
-        writer.add_scalar("Loss/Val/Agent", val_agent_loss, epoch)
-        writer.add_scalar("Loss/Val/Opponent", val_opponent_loss, epoch)
+        writer.add_scalar("Loss/Val/Self", val_self_loss, epoch)
+        writer.add_scalar("Loss/Val/Opp", val_opp_loss, epoch)
         writer.add_scalar("Loss/Val/Value", val_value_loss, epoch)
-        writer.add_scalar("Accuracy/Val/Agent", val_agent_acc, epoch)
-        writer.add_scalar("Accuracy/Val/Opponent", val_opponent_acc, epoch)
-        
+        writer.add_scalar("Acc/Val/Agent", val_agent_acc, epoch)
+        writer.add_scalar("Acc/Val/Opponent", val_opponent_acc, epoch)
+
         # Save model if validation loss improved
         if val_total_loss < best_val_loss:
             best_val_loss = val_total_loss
@@ -897,7 +812,6 @@ def train_autoregressive_model(
                 'obs_dim': obs_dim,
                 'belief_dim': belief_dim,
                 'action_dim': action_dim,
-                'extended_action_dim': extended_action_dim,
                 'hidden_dim': hidden_dim
             }, checkpoint_path)
             logger.info(f"  Saved new best model with validation loss: {val_total_loss:.6f}")
@@ -916,7 +830,6 @@ def train_autoregressive_model(
                 'obs_dim': obs_dim,
                 'belief_dim': belief_dim,
                 'action_dim': action_dim,
-                'extended_action_dim': extended_action_dim,
                 'hidden_dim': hidden_dim
             }, checkpoint_path)
             logger.info(f"  Saved checkpoint at epoch {epoch+1}")
@@ -934,7 +847,6 @@ def train_autoregressive_model(
         'obs_dim': obs_dim,
         'belief_dim': belief_dim,
         'action_dim': action_dim,
-        'extended_action_dim': extended_action_dim,
         'hidden_dim': hidden_dim
     }, final_path)
     logger.info(f"Saved final model to {final_path}")
@@ -957,7 +869,7 @@ def main():
     parser.add_argument("--device", type=str, default='cuda', help="Device to use (cuda/cpu)")
     parser.add_argument("--max-files", type=int, default=None, help="Maximum number of data files to load")
     parser.add_argument("--max-samples", type=int, default=1770000, help="Maximum number of samples to load")
-    parser.add_argument("--max-seq-length", type=int, default=20, help="Maximum sequence length to process")
+    parser.add_argument("--max-seq-length", type=int, default=17, help="Maximum sequence length to process")
     parser.add_argument("--resume-from", type=str, default=None, help="Path to checkpoint to resume from")
     
     args = parser.parse_args()
