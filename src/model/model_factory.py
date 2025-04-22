@@ -89,8 +89,7 @@ class ModelFactory:
         has_transformer = any(k.startswith('transformer.layers.') for k in state_dict)
         has_action_emb = 'action_embedding.weight' in state_dict
         has_action_head = 'action_head.weight' in state_dict
-        has_ext_action_head = 'extended_action_head.weight' in state_dict
-        return has_transformer and has_action_emb and has_action_head and has_ext_action_head
+        return has_transformer and has_action_emb and has_action_head
 
     @staticmethod
     def get_belief_dimensions(state_dict):
