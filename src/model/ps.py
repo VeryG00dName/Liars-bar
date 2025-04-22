@@ -143,11 +143,8 @@ class PerfectSearch:
         action_sequence = [(self.training_agent, action)] # Store initial action
         pre_step_termination_us = sim_env.terminations.get(self.training_agent, False)
 
-        try:
-            sim_env.step(action) # Apply our initial action
-        except Exception as e:
-             self._log(f"[Depth {depth} ERROR] Exception during initial sim_env.step({action}): {e}")
-             return -10000.0, action_sequence, True, False
+
+        sim_env.step(action)
 
         post_step_termination_us = sim_env.terminations.get(self.training_agent, False)
         post_step_penalty_us = sim_env.penalties.get(self.training_agent, 0)
@@ -222,8 +219,6 @@ class PerfectSearch:
                     self._log(f"[Depth {depth}] Outcome Detail: Opponent got penalized.")
                     # Return the defined positive value for opponent penalty
                     return self.OPPONENT_PENALTY_THRESHOLD, action_sequence, False, True
-                self._log(f"[Depth {depth}] Outcome Detail: Round changed, no penalties detected (neutral).")
-                return 50.0, action_sequence, False, True
 
             # --- Check 3: Max Depth ---
             if depth >= max_depth:
@@ -253,7 +248,7 @@ class PerfectSearch:
                 best_sequence_continuation = None
                 best_is_terminal_recursive = False
                 best_is_new_round_recursive = False
-                simulation_order = [3, 5, 4, 0, 2, 1]
+                simulation_order = [6, 3, 5, 4, 0, 2, 1]
                 actions_to_simulate = [act for act in simulation_order if act in valid_actions]
                 for next_action in actions_to_simulate:
                     self._log(f"[Depth {depth}, SimStep {step_count}] Exploring recursive action {next_action} for {self.training_agent} (Depth {depth + 1})")
@@ -498,7 +493,7 @@ class PerfectSearch:
                              best_sequence_found = sequence
 
         # --- Define Simulation Order and Filter Valid Actions ---
-        simulation_order = [3, 5, 4, 0, 2, 1]
+        simulation_order = [6, 3, 5, 4, 0, 2, 1]
         actions_to_simulate = [act for act in simulation_order if act in valid_actions]
         if 6 in valid_actions and best_action_found != 6:
             actions_to_simulate.append(6)
@@ -612,8 +607,10 @@ class PerfectSearch:
             action_probs[action_to_return] = 1.0
         else:
              self._log(f"ERROR: Final action_to_return '{action_to_return}' is invalid. Defaulting.")
-             final_valid_actions_list = sorted(list(valid_actions))
-             action_to_return = final_valid_actions_list[0] if final_valid_actions_list else 0
+             # Re-fetch mask in case it changed? Unlikely needed here.
+             # Use the mask obtained at the start of search.
+             final_valid_actions = [i for i, m in enumerate(action_mask) if m == 1]
+             action_to_return = final_valid_actions[0] if final_valid_actions else 0
              action_probs[action_to_return] = 1.0
 
         self._log(f"--- Search Complete ---")
