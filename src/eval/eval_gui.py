@@ -7,12 +7,12 @@ from src.agents.base_agent import BaseAgent
 from src.agents.hardcoded_agent_wrapper import HardcodedAgentWrapper
 from src.agents.agent_factory import AgentFactory
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+import sys
 import logging
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from collections import defaultdict, deque
-import re
+from collections import defaultdict
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 from PyQt5 import QtWidgets
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
@@ -37,85 +37,6 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(name)s %(levelname)s: %(message)s")
 logger = logging.getLogger("AgentBattleground")
 logger.propagate = True
-# --- Helper function (unchanged) ---
-
-def get_input_dim_from_state_dict(state_dict, candidate_prefix='fc1'):
-    """
-    Attempts to determine the input dimension from a policy state dictionary.
-    It searches for candidate keys (e.g. "fc1.weight", "base_encoder.0.weight", etc.)
-    and returns the second dimension of the first matching weight tensor.
-    """
-    candidate_prefixes = [
-        candidate_prefix,
-        "base_encoder.0",
-        "policy_net.fc1",
-        "model.fc1"
-    ]
-    for prefix in candidate_prefixes:
-        key = f"{prefix}.weight"
-        if key in state_dict:
-            return state_dict[key].shape[1]
-    # Fallback: iterate over all keys and return the input dimension from the first 2D tensor found.
-    for key, tensor in state_dict.items():
-        if hasattr(tensor, "ndim") and tensor.ndim == 2:
-            return tensor.shape[1]
-    available_keys = list(state_dict.keys())
-    raise ValueError(f"Cannot determine input_dim from state_dict. Tried prefixes: {candidate_prefixes}. "
-                     f"Available keys: {available_keys}")
-
-# --- New helper: Detect if a state dict is from StackedObservationConvModel ---
-def is_stacked_observation_model(state_dict):
-    """
-    Detects if a state dictionary comes from a StackedObservationConvModel.
-    
-    Args:
-        state_dict: The state dictionary of a model.
-        
-    Returns:
-        bool: True if the state dictionary is from a StackedObservationConvModel, False otherwise.
-    """
-    # StackedObservationConvModel will have conv_layers and both policy_head and value_head
-    return (any(k.startswith('conv_layers.') for k in state_dict.keys()) and 
-            'policy_head.weight' in state_dict and 
-            'value_head.weight' in state_dict)
-
-def is_stacked_newer_observation_model(state_dict):
-    """
-    Detects if a state dictionary comes from a StackedObservationConvModel.
-    
-    Args:
-        state_dict: The state dictionary of a model.
-        
-    Returns:
-        bool: True if the state dictionary is from a StackedObservationConvModel, False otherwise.
-    """
-    # StackedObservationConvModel will have conv_layers and both policy_head and value_head
-    return (any(k.startswith('conv_layers.') for k in state_dict.keys()) and 
-            'policy_head1.weight' in state_dict and 
-            'value_head1.weight' in state_dict)
-
-# --- New helper: Get observation dimension from StackedObservationConvModel state dict ---
-def get_obs_dim_from_stacked_model(state_dict):
-    """
-    Extracts the observation dimension from a StackedObservationConvModel state dictionary.
-    
-    Args:
-        state_dict: The state dictionary of a StackedObservationConvModel.
-        
-    Returns:
-        int: The observation dimension.
-    """
-    # Try to find the first convolutional layer
-    for key in state_dict.keys():
-        if key.endswith('weight') and 'conv_layers' in key:
-            # Conv1d weight shape is (out_channels, in_channels, kernel_size)
-            # For the first conv layer, in_channels is the observation dimension
-            shape = state_dict[key].shape
-            if len(shape) == 3:  # Conv1d weight
-                return shape[2]  # kernel_size dimension gives the observation dimension
-    
-    # Fallback
-    return None
 
 # --- Custom QListWidget for drag-and-drop ---
 class DropListWidget(QtWidgets.QListWidget):
@@ -144,16 +65,6 @@ class DropListWidget(QtWidgets.QListWidget):
             event.acceptProposedAction()
         else:
             event.ignore()
-
-# --- Helper: Detect if a policy state dict comes from new_models ---
-def is_new_policy(state_dict):
-    if "fc_classifier.weight" in state_dict:
-        return True
-    elif "strategy_query.weight" in state_dict:
-        return False
-    else:
-        # Default to new model if unclear.
-        return True
 
 # --- Worker thread to run the battleground matches ---
 class BattlegroundWorker(QThread):
@@ -1160,7 +1071,6 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         dialog.exec_()
 
 if __name__ == "__main__":
-    import sys
 
     app = QtWidgets.QApplication(sys.argv)
     # Apply a dark, Discord-like style
