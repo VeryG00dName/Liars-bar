@@ -15,7 +15,7 @@ class AutoregressiveGameModel(nn.Module):
     - Separate embeddings for observations, actions, agent types, and positions
     - Support for variable-length sequences with causal masking
     - Action prediction with proper masking of invalid actions
-    - Support for both explicit actions (0-6) and card count actions (7-10)
+    - Support for both explicit actions (0-6)
     """
     def __init__(self, 
                  obs_dim, 
@@ -99,8 +99,8 @@ class AutoregressiveGameModel(nn.Module):
         # Main output: predict actions in original action space (0-6)
         self.action_head = nn.Linear(hidden_dim, action_dim)
         
-        # Secondary output: predict extended actions including card counts (0-10)
-        self.extended_action_head = nn.Linear(hidden_dim, self.extended_action_dim)
+        # opponent output: predict actions in original action space (0-6)
+        self.opp_action_head  = nn.Linear(hidden_dim, action_dim)
         
         # Value prediction head
         self.value_head = nn.Linear(hidden_dim, 1)
@@ -211,7 +211,6 @@ class AutoregressiveGameModel(nn.Module):
         Returns:
             tuple: (action_logits, extended_action_logits, state_values)
                 action_logits: Tensor of shape [batch_size, seq_len, action_dim]
-                extended_action_logits: Tensor of shape [batch_size, seq_len, extended_action_dim]
                 state_values: Tensor of shape [batch_size, seq_len, 1]
         """
         batch_size, seq_len = action_sequence.shape
@@ -243,8 +242,7 @@ class AutoregressiveGameModel(nn.Module):
         # Standard action predictions (0-6)
         action_logits = self.action_head(transformer_output)
         
-        # Extended action predictions (0-10, including card counts)
-        extended_action_logits = self.extended_action_head(transformer_output)
+        opp_logits  = self.opp_action_head(transformer_output)
         
         # Value predictions
         state_values = self.value_head(transformer_output)
@@ -253,4 +251,4 @@ class AutoregressiveGameModel(nn.Module):
         if action_masks is not None:
             action_logits = action_logits.masked_fill(~action_masks.bool(), float('-inf'))
         
-        return action_logits, extended_action_logits, state_values
+        return action_logits, opp_logits, state_values
