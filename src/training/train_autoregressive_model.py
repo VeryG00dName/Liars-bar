@@ -16,7 +16,6 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
-from torch.nn.utils.rnn import pad_sequence
 from src.training.train_extras import set_seed
 from src.model.autoregressive_model import AutoregressiveGameModel
 from src import config
@@ -205,7 +204,7 @@ class AutoregressiveGameDataset(Dataset):
                     a = step["action"]
                     b = step["action"]
                 elif is_train and "expert_action" in step:
-                    a = step["expert_action"]
+                    a = step["chosen_action"]
                     b = step["expert_action"]
                 if not is_train and "transformed_action" in step:
                     a = step["transformed_action"]
