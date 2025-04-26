@@ -72,4 +72,4 @@ def validate_claim(claimed_cards, table_card):
     return all(card == table_card or card == 'Joker' for card in claimed_cards)
 
 def simulate_russian_roulette(np_random):
-    return 3  # Placeholder: replace with actual logic if needed
+    return 3 #np_random.integers(1, 6)
