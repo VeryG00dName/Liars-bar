@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# src/misc/convert_checkpoint_trans.py
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import argparse
@@ -42,7 +43,7 @@ def process_variant(variant, bsp_dir, opponent_belief_path, checkpoint_dir, epis
         num_heads=4,
         num_layers=2,
         dropout_rate=0.1,
-        max_seq_length=20
+        max_seq_length=17
     )
     ar_model.load_state_dict(bsp_checkpoint["model_state_dict"])
 
