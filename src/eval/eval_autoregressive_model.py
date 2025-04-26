@@ -14,7 +14,7 @@ from tqdm import tqdm
 # Import configuration and model class
 from src import config
 from src.model.autoregressive_model import AutoregressiveGameModel
-
+from src.env.liars_deck_env_utils_2 import decode_action
 def load_autoreg_data(data_dir, max_samples=None):
     """Load autoregressive data from pickle files."""
     if not os.path.exists(data_dir):
@@ -122,7 +122,7 @@ class EvalAutoregDataset(Dataset):
             "Historical_Version_C_player_0": 8,
             "Historical_Version_A_player_2": 7
         }
-
+        CARD_COUNT_MAPPING = {1: 7, 2: 8, 3: 9}
         raw_actions = []
         raw_target_actions = []
         for step in sequence:
@@ -136,9 +136,11 @@ class EvalAutoregDataset(Dataset):
             else:
                 return None  # Can't process step
 
-            if not is_train and "transformed_action" in step:
-                a = step["transformed_action"]
-
+            if not is_train:
+                if np.random.random() < 0.3:
+                    real_type, _, real_count = decode_action(a)
+                    if real_type == "Play":
+                        a = CARD_COUNT_MAPPING[real_count]
             raw_target_actions.append(6 if b == 10 else b)
             raw_actions.append(6 if a == 10 else a)
 
@@ -591,7 +593,7 @@ def main():
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     opponent_mapping = checkpoint['opponent_mapping']
     num_opponent_types = checkpoint['num_opponent_types']
     obs_dim = checkpoint['obs_dim']
