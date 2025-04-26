@@ -14,6 +14,7 @@ from src.env.liars_deck_env_utils_2 import (
     create_deck,
     encode_hand,
     decode_action,
+    simulate_russian_roulette,
     TABLE_CARD_MAP
 )
 from src.env.liars_deck_env_utils import (
@@ -201,7 +202,7 @@ class LiarsDeckEnv(AECEnv):
         random.seed(seed)
         self.deck = create_deck(self.np_random)
         self.penalties = {agent: 0 for agent in self.possible_agents}
-        self.penalty_thresholds = {agent: 3 for agent in self.possible_agents}
+        self.penalty_thresholds = {agent: simulate_russian_roulette(self.np_random) for agent in self.possible_agents}
         self.successful_bluffs = {agent: 0 for agent in self.possible_agents}
         self.failed_bluffs = {agent: 0 for agent in self.possible_agents}
         self.successful_challenges = {agent: 0 for agent in self.possible_agents}
