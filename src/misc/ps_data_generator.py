@@ -34,7 +34,7 @@ from src.model.hard_coded_agents import (
 from src.training.train_utils import load_specific_historical_models
 
 # Import PS - updated to lowercase module name
-from src.model.ps_v3 import PerfectSearch
+from src.model.ps import PerfectSearch
 
 def setup_logging(log_file=None, level=logging.INFO):
     """Configure logging for the data generator."""
@@ -494,7 +494,7 @@ def main():
     parser.add_argument("--episodes", type=int, default=1000, help="Number of episodes to generate")
     parser.add_argument("--output-dir", type=str, default="./ps_data", help="Output directory")
     parser.add_argument("--no-historical", action="store_true", help="Do not include historical models")
-    parser.add_argument("--save-frequency", type=int, default=100, help="How often to save and clear data")
+    parser.add_argument("--save-frequency", type=int, default=1000, help="How often to save and clear data")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument("--debug-ps", action="store_true", help="Enable debug mode in PerfectSearch")
     parser.add_argument("--seed", type=int, default=42, help="Starting seed for games")
