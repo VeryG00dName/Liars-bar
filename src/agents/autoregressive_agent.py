@@ -6,7 +6,6 @@ import torch.nn.functional as F
 import numpy as np
 import logging
 from typing import Optional, Dict, Any, List
-from collections import deque
 
 from src.agents.base_agent import BaseAgent
 from src.model.autoregressive_model import AutoregressiveGameModel
@@ -31,7 +30,6 @@ class AutoregressiveAgent(BaseAgent):
     """
     # Action mapping for opponent masking
     CARD_COUNT_MAPPING = {1: 7, 2: 8, 3: 9} # count -> extended action idx
-    CHALLENGE_REPRESENTATION = 6
 
     def __init__(self, device: torch.device, player_id: str, belief_state_dict: Optional[Dict] = None):
         super().__init__(device, player_id)
@@ -159,8 +157,8 @@ class AutoregressiveAgent(BaseAgent):
                   obs_dim=self.obs_dim, action_dim=self.action_dim, belief_dim=self.belief_dim,
                   hidden_dim=self.hidden_dim, # Use validated hidden_dim
                   num_heads=default_num_heads, # Use the hardcoded default
-                  num_layers=2, # Assuming 4 layers is default
-                  max_seq_length=20
+                  num_layers=2,
+                  max_seq_length=17
              ).to(self.device)
         except TypeError as e: logger.error(...); raise e
 
@@ -358,27 +356,20 @@ class AutoregressiveAgent(BaseAgent):
 
             # Use true last agent action attribute
             raw_action = env.last_agent_action[opp_id]
-            predicted = self.sequence_history[prev_idx - 1]['masked_action']
+            predicted = self.sequence_history[prev_idx]['masked_action']
             if raw_action is None:
                 real_type = None
             else:
                 real_type, _, real_count = decode_action(raw_action)
-            if predicted is None or predicted == 10:
-                pred_type = None
-            else:
-                pred_type, _, pred_count = decode_action(predicted)
             if real_type == "Play":
-                if pred_type == "Play" and pred_count == real_count:
-                    masked_value = predicted
-                else:
-                    masked_value = self.CARD_COUNT_MAPPING[real_count]
+                masked_value = self.CARD_COUNT_MAPPING[real_count]
             elif real_type == "Challenge":
                 masked_value = 6
             elif real_type is None:
                 masked_value = None
             else:
                 raise ValueError(f"Unknown action type {real_type} for opp {opp_id}")
-
+            #masked_value = raw_action
             prev_data["masked_action"] = masked_value
             logger.debug(f"Masking opp{idx} turn: raw={raw_action}, pred={predicted} -> using {masked_value}")
 
@@ -459,7 +450,6 @@ class AutoregressiveAgent(BaseAgent):
         # record and reset if challenge
         self.sequence_history[-1]["action"] = chosen_action
         self.sequence_history[-1]["masked_action"] = chosen_action
-
         # --- 3b. Even if we challenged, keep building the interleaved history ---
         opponents = [o for o in original_opponents if not env.terminations[o]]
         if chosen_action == 6:
@@ -484,17 +474,17 @@ class AutoregressiveAgent(BaseAgent):
             return chosen_action
 
         # --- 4. Predict and append real opponent turns normally ---
-        temp_hist = copy.deepcopy(self.sequence_history)
+        #temp_hist = copy.deepcopy(self.sequence_history)
         if opponents:
             # Opponent 1
             opp1 = opponents[0]
-            logits1, _, _ = self.model(**self._prepare_model_input(temp_hist))
-            pred1 = torch.argmax(F.softmax(logits1[0, -1], dim=-1)).item()
+            #_, logits1, _  = self.model(**self._prepare_model_input(temp_hist))
+            #pred1 = torch.argmax(F.softmax(logits1[0, -1], dim=-1)).item()
             self.sequence_history.append({
                 "agent_id_env":    opp1,
                 "step_in_round":   len(self.sequence_history),
-                "action":          pred1,
-                "masked_action":   pred1,
+                "action":          10,
+                "masked_action":   10,
                 "observation":     [0.0] * self.obs_dim,
                 "action_mask":     [0]   * self.action_dim,
                 "belief":          current_step_info["belief"]
@@ -503,13 +493,13 @@ class AutoregressiveAgent(BaseAgent):
         if len(opponents) > 1:
             # Opponent 2
             opp2 = opponents[1]
-            logits2, _, _ = self.model(**self._prepare_model_input(self.sequence_history))
-            pred2 = torch.argmax(F.softmax(logits2[0, -1], dim=-1)).item()
+            #_, logits2, _  = self.model(**self._prepare_model_input(self.sequence_history))
+            #pred2 = torch.argmax(F.softmax(logits2[0, -1], dim=-1)).item()
             self.sequence_history.append({
                 "agent_id_env":    opp2,
                 "step_in_round":   len(self.sequence_history),
-                "action":          pred2,
-                "masked_action":   pred2,
+                "action":          10,
+                "masked_action":   10,
                 "observation":     [0.0] * self.obs_dim,
                 "action_mask":     [0]   * self.action_dim,
                 "belief":          current_step_info["belief"]
