@@ -4,10 +4,11 @@ import pprint
 import torch
 from src.training.train_autoregressive_model import AutoregressiveGameDataset, create_opponent_mapping
 
+MATCHUP_FILTER = "Classic_vs_GreedyCardSpammer"
 
 def main():
     # Path to the pickle file (adjust the path if needed)
-    filename = "ps_autoreg_data/ps_autoreg_data_100000.pkl"
+    filename = "ps_autoreg_data/ps_autoreg_data_20250421_234658/ps_autoreg_data.pkl"
     
     # Load raw data
     try:
@@ -22,12 +23,25 @@ def main():
         print("The data format is not as expected or the file is empty.")
         return
 
-    # Display unprocessed samples
-    print("Unprocessed samples:\n")
-    for i, sample in enumerate(raw_data[:5]):
+    # Filter unprocessed samples
+    filtered_unprocessed = [
+        s for s in raw_data if (
+            s.get("opponent_combo") == MATCHUP_FILTER or 
+            ("sequence" in s and isinstance(s["sequence"], list) and 
+             len(s["sequence"]) > 0 and 
+             "_vs_".join(s["sequence"][0].get("belief", [])) == MATCHUP_FILTER)
+        )
+    ][:5]  # limit to 5 samples
+
+    print(f"Unprocessed samples from matchup {MATCHUP_FILTER}:\n")
+    for i, sample in enumerate(filtered_unprocessed):
         print(f"Sample {i+1} (unprocessed):")
         pprint.pprint(sample)
         print("\n" + "-"*40 + "\n")
+
+    if not filtered_unprocessed:
+        print("No matching samples found.")
+        return
 
     # Process samples using the same pipeline as training
     data_dir = "ps_autoreg_data"
@@ -35,10 +49,8 @@ def main():
     num_opponent_types = max(opponent_mapping.values()) + 1
     device = torch.device('cpu')
 
-    # Only process the first 5 for demonstration
-    samples_to_process = raw_data[:5]
     dataset = AutoregressiveGameDataset(
-        samples_to_process,
+        filtered_unprocessed,
         opponent_mapping,
         num_opponent_types,
         device
@@ -46,8 +58,7 @@ def main():
 
     processed = dataset.sequences
 
-    # Display processed samples
-    print("Processed samples:\n")
+    print(f"Processed samples from matchup {MATCHUP_FILTER}:\n")
     for i, seq in enumerate(processed):
         print(f"Sample {i+1} (processed):")
         # Convert tensors to lists for pretty printing
