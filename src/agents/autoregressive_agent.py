@@ -450,6 +450,7 @@ class AutoregressiveAgent(BaseAgent):
         # record and reset if challenge
         self.sequence_history[-1]["action"] = chosen_action
         self.sequence_history[-1]["masked_action"] = chosen_action
+
         # --- 3b. Even if we challenged, keep building the interleaved history ---
         opponents = [o for o in original_opponents if not env.terminations[o]]
         if chosen_action == 6:
