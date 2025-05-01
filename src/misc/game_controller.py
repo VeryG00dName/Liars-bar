@@ -44,7 +44,7 @@ def format_card(card_num: int, game_type: str = "Default") -> str:
         card_text = "Ace"
         color = "green" 
     elif card_num == 4: 
-        card_text = "Joker"  # Changed from Jack to Joker
+        card_text = "Joker"
         color = "cyan"
     elif card_num == -1: 
         card_text = "Devil"
