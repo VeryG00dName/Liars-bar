@@ -8,7 +8,7 @@ MATCHUP_FILTER = "Classic_vs_GreedyCardSpammer"
 
 def main():
     # Path to the pickle file (adjust the path if needed)
-    filename = "ps_autoreg_data/ps_autoreg_data_20250421_234658/ps_autoreg_data.pkl"
+    filename = "ps_autoreg_data/ps_autoreg_data_33000.pkl"
     
     # Load raw data
     try:
