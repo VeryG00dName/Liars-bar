@@ -34,8 +34,8 @@ from src.model.hard_coded_agents import (
 from src.training.train_utils import load_specific_historical_models
 
 # Import PS
-from src.model.ps import PerfectSearch
-
+from src.model.ps_v3 import PerfectSearch
+AGENT_ID_MAP = {'player_0': 0, 'player_1': 1, 'player_2': 2}
 def setup_logging(log_file=None, level=logging.INFO):
     """Configure logging for the data generator."""
     logger = logging.getLogger()
@@ -206,52 +206,117 @@ def generate_data(
     max_rounds_per_episode=50
 ):
     """
-    Generate training data using Perfect Search, organized as round sequences.
-    
-    Args:
-        num_episodes: Number of episodes to generate
-        output_dir: Directory to save data
-        include_historical: Whether to include historical models
-        save_frequency: How often to save and clear data
-        verbose: Whether to print detailed progress
-        debug_ps: Whether to enable debug mode in PerfectSearch
-        start_seed: Starting seed for random number generators
-        opponent_action_dropout_rate: Probability of replacing opponent action with card count
-        max_rounds_per_episode: Maximum number of rounds to generate per episode
+    Generate training data using Perfect Search, organized by game (with rounds in sequence)
+    and tagging each step by agent_id (0=training, 1=opponent1, 2=opponent2).
     """
-    log_level = logging.INFO if verbose else logging.WARNING
-    logger = setup_logging(os.path.join(output_dir, 'generation.log'), log_level)
-    
-    # Set random seeds
+    import random
+    import time
+    import numpy as np
+    import torch
+    import os
+    import json
+    import pickle
+    import logging
+    from collections import defaultdict
+    from tqdm import tqdm
+    from src.env.liars_deck_env_core import LiarsDeckEnv
+    from src.training.train_utils import load_specific_historical_models
+    from src.env.liars_deck_env_utils_2 import decode_action
+    from src.model.hard_coded_agents import (
+        GreedyCardSpammer,
+        TableFirstConservativeChallenger,
+        StrategicChallenger,
+        SelectiveTableConservativeChallenger,
+        RandomAgent,
+        TableNonTableAgent,
+        Classic
+    )
+    from src.model.ps_v3 import PerfectSearch
+    from src import config
+
+    AGENT_ID_MAP = {'player_0': 0, 'player_1': 1, 'player_2': 2}
+    CARD_COUNT_MAPPING = {1: 7, 2: 8, 3: 9}
+
+    def setup_logging(log_file=None, level=logging.INFO):
+        logger = logging.getLogger()
+        logger.setLevel(level)
+        if logger.hasHandlers():
+            logger.handlers.clear()
+        formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s')
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+        if log_file:
+            file_handler = logging.FileHandler(log_file)
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+        return logger
+
+    def append_to_data_file(data, file_path):
+        if os.path.exists(file_path):
+            with open(file_path, 'rb') as f:
+                try:
+                    existing_data = pickle.load(f)
+                    if not isinstance(existing_data, list):
+                        existing_data = []
+                except Exception:
+                    existing_data = []
+            combined_data = existing_data + data
+            with open(file_path, 'wb') as f:
+                pickle.dump(combined_data, f)
+        else:
+            with open(file_path, 'wb') as f:
+                pickle.dump(data, f)
+
+    def load_opponent_pool(include_historical=True):
+        opponent_pool = {
+            "RandomAgent": RandomAgent,
+            "GreedyCardSpammer": GreedyCardSpammer,
+            "TableFirstConservativeChallenger": TableFirstConservativeChallenger,
+            "SelectiveTableConservativeChallenger": SelectiveTableConservativeChallenger,
+            "TableNonTableAgent": TableNonTableAgent,
+            "StrategicChallenger": StrategicChallenger,
+            "Classic": Classic
+        }
+        if include_historical:
+            try:
+                historical_models = load_specific_historical_models(config.HISTORICAL_MODEL_DIR, 'cpu')
+                for model_instance, identifier in historical_models:
+                    opponent_pool[f"Historical_{identifier}"] = model_instance
+            except Exception as e:
+                logging.getLogger().error(f"Error loading historical models: {e}")
+        return opponent_pool
+
+    def setup_opponents(pool, types, names):
+        opponents = {}
+        models = {}
+        for name, typ in zip(names, types):
+            instance = pool[typ]() if not typ.startswith("Historical_") else pool[typ]
+            opponents[name] = {"instance": instance, "name": typ, "type": "historical" if typ.startswith("Historical_") else "hardcoded"}
+            models[name] = instance
+        return opponents, models
+
+    def create_belief_vector(opponent_types, opponents):
+        return [info["name"] for _, info in opponents.items()]
+
+    logger = setup_logging(os.path.join(output_dir, 'generation.log'), logging.INFO if verbose else logging.WARNING)
     random.seed(start_seed)
     np.random.seed(start_seed)
     torch.manual_seed(start_seed)
-    
-    logger.info(f"Starting data generation: {num_episodes} episodes")
-    logger.info(f"Output directory: {output_dir}")
-    logger.info(f"Opponent action dropout rate: {opponent_action_dropout_rate}")
-    
-    # Create main data file path
+
     main_data_file = os.path.join(output_dir, "ps_autoreg_data.pkl")
-    
-    # Load opponent pool
     opponent_pool = load_opponent_pool(include_historical)
     opponent_types = list(opponent_pool.keys())
-    logger.info(f"Loaded {len(opponent_types)} opponent types")
-    
-    # Define the training agent and opponent agents
     training_agent = 'player_0'
-    opponent_agent_names = ['player_1', 'player_2']  # For a 3-player game
-    
-    # Statistics tracking
+    opponent_agent_names = ['player_1', 'player_2']
+
     stats = {
         "episodes": 0,
         "rounds": 0,
-        "sequences": 0,
+        "steps": 0,
         "wins": 0,
         "losses": 0,
         "win_rate": 0.0,
-        "steps": 0,
         "total_saved_sequences": 0,
         "opponent_combinations": defaultdict(int),
         "action_distribution": defaultdict(int),
@@ -261,354 +326,147 @@ def generate_data(
         "failed_searches": 0,
         "start_time": time.time()
     }
-    
-    # Dataset storage for current batch only
-    current_batch_sequences = []
-    
-    # Enable debug mode in PerfectSearch if requested
-    if debug_ps:
-        PerfectSearch.debug = True
-        logger.info("Debug mode enabled for PerfectSearch")
-    
-    # Initialize environment with fixed number of players
+
+    current_batch_games = []
     env = LiarsDeckEnv(num_players=config.NUM_PLAYERS)
-    env.logger.setLevel(logging.WARNING)  # Reduce environment logging noise
-    
-    # Action type mapping for card count representation
-    # Regular actions: 0-6
-    # Card count representations: 7=1 card, 8=2 cards, 9=3 cards
-    CARD_COUNT_MAPPING = {1: 7, 2: 8, 3: 9}
-    
-    # Main episode loop
-    for episode in tqdm(range(num_episodes), desc="Generating episodes"):
+    env.logger.setLevel(logging.WARNING)
+
+    for episode in tqdm(range(num_episodes), desc="Generating games"):
         episode_seed = start_seed + episode
-        
-        # Select opponents for this episode
         selected_opponents = random.sample(opponent_types, len(opponent_agent_names))
-        opponent_combo = "_vs_".join(selected_opponents)
-        stats["opponent_combinations"][opponent_combo] += 1
-        
-        if verbose:
-            logger.info(f"Episode {episode+1}/{num_episodes}: Using opponents {selected_opponents}")
-        
-        # Setup opponents
-        current_opponents, opponent_models = setup_opponents(
-            opponent_pool, 
-            selected_opponents, 
-            opponent_agent_names
-        )
-        
-        # Reset environment
+        stats["opponent_combinations"]["_vs_".join(selected_opponents)] += 1
+
+        current_opponents, opponent_models = setup_opponents(opponent_pool, selected_opponents, opponent_agent_names)
         obs, infos = env.reset(seed=episode_seed)
-        
-        # Initialize PerfectSearch engine
-        ps = PerfectSearch(
-            env=env,
-            training_agent=training_agent,
-            opponent_models=opponent_models
-        )
-        
-        # Episode tracking
-        episode_sequences = []
+        ps = PerfectSearch(env=env, training_agent=training_agent, opponent_models=opponent_models)
+
+        game_data = {"game_id": episode, "rounds": []}
         current_round = env.round
         episode_step = 0
         round_step = 0
-        
-        # Create initial round sequence
-        current_round_sequence = {
-            "round_id": f"{episode}_{current_round}",
-            "episode_id": episode,
-            "table_card": env.table_card,
-            "sequence": [],
-            "round_outcome": {
-                "winner": None,
-                "penalties": {},
-                "result": 0.0
-            }
-        }
-        
-        # Episode loop
-        while not all(env.terminations.values()) and episode_step < 1000 and len(episode_sequences) < max_rounds_per_episode:
+
+        current_round_sequence = {"round_id": f"{episode}_{current_round}", "episode_id": episode, "table_card": env.table_card, "sequence": [], "round_outcome": {"winner": None, "penalties": {}, "result": 0.0}}
+
+        while not all(env.terminations.values()) and episode_step < 1000 and len(game_data["rounds"]) < max_rounds_per_episode:
             episode_step += 1
             round_step += 1
             current_agent = env.agent_selection
-            
-            # Check if round has changed or ended
+
             if env.round > current_round or current_agent is None:
-                # Update the outcome for current round
-                if current_round_sequence["sequence"]:
-                    current_round_sequence["round_outcome"].update({
-                        "penalties": {agent: env.penalties.get(agent, 0) for agent in env.possible_agents},
-                        "winner": env.winner,
-                    })
-                    
-                    # Add value judgment from PS if available
-                    # This is placeholder - in a real implementation, you'd use PS search value
-                    # for the round or some other appropriate value metric
-                    result_value = 0.0
-                    if env.winner == training_agent:
-                        result_value = 100.0
-                    elif env.winner in env.possible_agents:
-                        result_value = -100.0
-                    current_round_sequence["round_outcome"]["result"] = result_value
-                    
-                    # Only save sequences with at least 2 steps
-                    if len(current_round_sequence["sequence"]) >= 2:
-                        episode_sequences.append(current_round_sequence)
-                        stats["rounds"] += 1
-                        stats["sequences"] += 1
-                        stats["avg_sequence_length"] = ((stats["avg_sequence_length"] * (stats["sequences"] - 1)) + 
-                                                      len(current_round_sequence["sequence"])) / stats["sequences"]
-                
-                # Break if game has ended
+                if len(current_round_sequence["sequence"]) >= 2:
+                    current_round_sequence["round_outcome"].update({"winner": env.winner, "penalties": {a: env.penalties.get(a, 0) for a in env.possible_agents}, "result": 100.0 if env.winner == training_agent else -100.0 if env.winner else 0.0})
+                    game_data["rounds"].append(current_round_sequence)
+                    stats["rounds"] += 1
+                    stats["avg_sequence_length"] = ((stats["avg_sequence_length"] * (stats["rounds"] - 1)) + len(current_round_sequence["sequence"])) / stats["rounds"]
                 if current_agent is None:
                     break
-                
-                # Start tracking new round
                 current_round = env.round
                 round_step = 0
-                
-                current_round_sequence = {
-                    "round_id": f"{episode}_{current_round}",
-                    "episode_id": episode,
-                    "table_card": env.table_card,
-                    "sequence": [],
-                    "round_outcome": {
-                        "winner": None,
-                        "penalties": {},
-                        "result": 0.0
-                    }
-                }
-            
-            # Skip if no agent is selected
+                current_round_sequence = {"round_id": f"{episode}_{current_round}", "episode_id": episode, "table_card": env.table_card, "sequence": [], "round_outcome": {"winner": None, "penalties": {}, "result": 0.0}}
+
             if current_agent is None:
-                logger.warning(f"Episode {episode+1}: No agent selected, game might have ended")
                 break
-            
-            # Initialize step data
-            step_data = {
-                "agent": current_agent,
-                "is_training_agent": (current_agent == training_agent),
-                "step_in_round": round_step
-            }
-            
-            # Handle the agent's turn
+
+            step_data = {"agent_id": AGENT_ID_MAP[current_agent], "step_in_round": round_step}
+
             if current_agent == training_agent:
-                # Training agent's turn: Include observations and action mask
-                obs_current = env.observe(current_agent, newer=True)
-                observation_current = obs_current[current_agent]
-                observation_current_round = np.round(observation_current, 2)
-                action_mask = env.infos[current_agent].get('action_mask', [0] * 7)
-                
-                step_data["observation"] = observation_current_round.tolist()
-                step_data["action_mask"] = action_mask
-                
-                # Get action from PS
-                planned_action = ps.get_next_agent_action(current_agent)
-                
-                if planned_action is not None:
-                    best_action = planned_action
+                obs_curr = env.observe(current_agent, newer=True)[current_agent]
+                step_data["observation"] = np.round(obs_curr, 2).tolist()
+                step_data["action_mask"] = env.infos[current_agent].get('action_mask', [0] * 7)
+                planned = ps.get_next_agent_action(current_agent)
+                if planned is not None:
+                    best_action = planned
                     action_probs = np.zeros(7)
                     action_probs[best_action] = 1.0
-                    action_source = "PS Plan Sequence"
+                    step_data["action_source"] = "PS Plan Sequence"
                 else:
                     try:
                         start_time = time.time()
                         current_state = env.get_state()
                         action_probs, best_action, search_value = ps.search(current_state)
                         search_time = time.time() - start_time
-                        
-                        # Update search stats
                         stats["avg_search_time"] = (stats["avg_search_time"] * stats["simulation_count"] + search_time) / (stats["simulation_count"] + 1)
                         stats["simulation_count"] += 1
-                        
-                        action_source = "PS Search"
-                        
-                        # Store search value for round outcome
                         step_data["search_value"] = float(search_value)
-                        
+                        step_data["action_source"] = "PS Search"
                     except Exception as e:
-                        logger.error(f"Error during PS search: {e}")
                         stats["failed_searches"] += 1
-                        
-                        # Fallback to a valid action
-                        valid_actions = [i for i, mask in enumerate(action_mask) if mask == 1]
-                        if valid_actions:
-                            best_action = valid_actions[0]
-                            action_probs = np.zeros(7)
-                            action_probs[best_action] = 1.0
-                        else:
-                            logger.error(f"No valid actions available for {current_agent}. Skipping turn.")
-                            continue
-                        
-                        action_source = "Error Fallback"
-                
-                # Decode the action for logging
-                action_type, card_category, count = decode_action(best_action)
-                
-                # Track action distribution
-                action_key = f"{action_type}_{card_category}_{count}"
-                stats["action_distribution"][action_key] += 1
-                
-                # Add to step data
+                        best_action = step_data["action_mask"].index(1) if 1 in step_data["action_mask"] else 0
+                        action_probs = np.zeros(7)
+                        action_probs[best_action] = 1.0
+                        step_data["action_source"] = "Error Fallback"
                 step_data["action"] = best_action
                 step_data["action_probs"] = action_probs.tolist()
-                step_data["action_source"] = action_source
-                
-                # Create beliefs for opponents (simplified for this implementation)
-                belief_vector = create_belief_vector(selected_opponents, current_opponents)
-                step_data["belief"] = belief_vector
-                
-                # If it's a play action, record the card count too
+                step_data["belief"] = create_belief_vector(selected_opponents, current_opponents)
+                action_type, _, count = decode_action(best_action)
+                stats["action_distribution"][f"{action_type}_{count}"] += 1
                 if action_type == "Play" and count is not None:
                     step_data["card_count"] = count
-                
-                # Execute the action and capture reward
                 env.step(best_action)
                 step_data["reward"] = env.rewards.get(training_agent, 0)
-                
             else:
-                # Opponent's turn: Don't include observations or action mask
-                # First try to get action from PS plan
-                planned_action = ps.get_next_agent_action(current_agent)
-                
-                if planned_action is not None:
-                    best_action = planned_action
-                    action_source = "PS Plan Sequence"
+                planned = ps.get_next_agent_action(current_agent)
+                if planned is not None:
+                    best_action = planned
+                    step_data["action_source"] = "PS Plan Sequence"
                 else:
-                    # Use opponent's own policy
-                    opponent_model = opponent_models[current_agent]
-                    observation_opponent = env.observe(current_agent, newer=True)[current_agent]
-                    
-                    if hasattr(opponent_model, 'play_turn'):
-                        best_action = opponent_model.play_turn(
-                            observation_opponent, 
-                            env.infos[current_agent].get('action_mask', [0] * 7), 
-                            table_card=env.table_card
-                        )
-                    else:
-                        old_observation = env.observe(current_agent, new=False)[current_agent]
-                        obp_placeholder = np.zeros(2, dtype=np.float32)
-                        memory_placeholder = np.zeros(config.STRATEGY_DIM * (env.num_players - 1), dtype=np.float32)
-                        nn_obs = np.concatenate([old_observation, obp_placeholder, memory_placeholder], axis=0)
-                        observation_tensor = torch.tensor(nn_obs, dtype=torch.float32, device='cpu').unsqueeze(0)
-                        
-                        with torch.no_grad():
-                            try:
-                                probs, _, _ = opponent_model(observation_tensor, None)
-                            except ValueError:
-                                probs, _ = opponent_model(observation_tensor, None)
-                        
-                        probs = probs.squeeze().cpu().numpy()
-                        action_mask = env.infos[current_agent].get('action_mask', [0] * 7)
-                        masked_probs = probs * action_mask
-                        if masked_probs.sum() > 0:
-                            masked_probs /= masked_probs.sum()
-                            best_action = np.argmax(masked_probs)
-                        else:
-                            # Fallback
-                            valid_actions = [i for i, m in enumerate(action_mask) if m == 1]
-                            best_action = valid_actions[0]
-                    
-                    action_source = f"Opponent Model ({current_opponents[current_agent]['name']})"
-                
-                # Decode the action
-                action_type, card_category, count = decode_action(best_action)
-                
-                # Add to step data
+                    opp_model = opponent_models[current_agent]
+                    mask = env.infos[current_agent].get('action_mask', [0] * 7)
+                    obs_opp = env.observe(current_agent, newer=True)[current_agent]
+                    best_action = opp_model.play_turn(obs_opp, mask, table_card=env.table_card) if hasattr(opp_model, 'play_turn') else mask.index(1)
+                    step_data["action_source"] = f"Opponent Model ({current_opponents[current_agent]['name']})"
                 step_data["action"] = best_action
-                step_data["action_source"] = action_source
-                belief_vector = create_belief_vector(selected_opponents, current_opponents)
-                step_data["belief"] = belief_vector
-                # For opponent actions, apply the dropout mechanism
-                # This teaches the model to handle both action numbers and card counts
+                step_data["belief"] = create_belief_vector(selected_opponents, current_opponents)
+                action_type, _, count = decode_action(best_action)
                 if action_type == "Play" and count is not None:
                     step_data["card_count"] = count
-                    
-                    # With probability p, replace action with card count representation
                     if np.random.random() < opponent_action_dropout_rate:
-                        # Map count to special actions: 7=1 card, 8=2 cards, 9=3 cards
-                        transformed_action = CARD_COUNT_MAPPING.get(count, count + 6)
-                        step_data["transformed_action"] = transformed_action
-                
-                # Execute the action
+                        step_data["transformed_action"] = CARD_COUNT_MAPPING.get(count, count + 6)
                 env.step(best_action)
-            
-            # Add step to current round sequence
             current_round_sequence["sequence"].append(step_data)
             stats["steps"] += 1
-        
-        # End of episode processing
+
         if env.winner == training_agent:
             stats["wins"] += 1
         elif env.winner is not None:
             stats["losses"] += 1
-        
         stats["episodes"] += 1
         stats["win_rate"] = stats["wins"] / stats["episodes"]
-        
-        # Add the last round if it has steps
-        if current_round_sequence["sequence"] and len(current_round_sequence["sequence"]) >= 2:
-            current_round_sequence["round_outcome"].update({
-                "penalties": {agent: env.penalties.get(agent, 0) for agent in env.possible_agents},
-                "winner": env.winner,
-            })
-            
-            # Add final round result value
-            result_value = 0.0
-            if env.winner == training_agent:
-                result_value = 100.0
-            elif env.winner in env.possible_agents:
-                result_value = -100.0
-            current_round_sequence["round_outcome"]["result"] = result_value
-            
-            episode_sequences.append(current_round_sequence)
+        if len(current_round_sequence["sequence"]) >= 2:
+            current_round_sequence["round_outcome"].update({"winner": env.winner, "penalties": {a: env.penalties.get(a, 0) for a in env.possible_agents}, "result": 100.0 if env.winner == training_agent else -100.0 if env.winner else 0.0})
+            game_data["rounds"].append(current_round_sequence)
             stats["rounds"] += 1
-            stats["sequences"] += 1
-            stats["avg_sequence_length"] = ((stats["avg_sequence_length"] * (stats["sequences"] - 1)) + 
-                                          len(current_round_sequence["sequence"])) / stats["sequences"]
-        
-        # Add episode sequences to the batch
-        current_batch_sequences.extend(episode_sequences)
-        
-        # Save data and clear memory if needed
+            stats["avg_sequence_length"] = ((stats["avg_sequence_length"] * (stats["rounds"] - 1)) + len(current_round_sequence["sequence"])) / stats["rounds"]
+        current_batch_games.append(game_data)
         if (episode + 1) % save_frequency == 0:
-            # Append current batch to the data file
-            append_to_data_file(current_batch_sequences, main_data_file)
-            
-            # Update total saved sequences
-            stats["total_saved_sequences"] += len(current_batch_sequences)
-            
-            # Save statistics
-            stats_file = os.path.join(output_dir, "stats_current.json")
-            with open(stats_file, 'w') as f:
-                # Convert defaultdict to regular dict for JSON serialization
-                json_stats = {k: v if not isinstance(v, defaultdict) else dict(v) for k, v in stats.items()}
-                json.dump(json_stats, f, indent=2)
-            
-            logger.info(f"Batch saved at episode {episode+1}: {len(current_batch_sequences)} sequences, "
-                       f"total saved: {stats['total_saved_sequences']}, win rate: {stats['win_rate']:.4f}")
-            
-            # Clear the batch data to free memory
-            current_batch_sequences = []
-    
+            append_to_data_file(current_batch_games, main_data_file)
+            stats["total_saved_sequences"] += sum(len(g["rounds"]) for g in current_batch_games)
+            current_batch_games = []
+
+    if current_batch_games:
+        append_to_data_file(current_batch_games, main_data_file)
+        stats["total_saved_sequences"] += sum(len(g["rounds"]) for g in current_batch_games)
+
     # Final save if there's remaining data not yet saved
-    if len(current_batch_sequences) > 0:
-        append_to_data_file(current_batch_sequences, main_data_file)
-        stats["total_saved_sequences"] += len(current_batch_sequences)
-        
-        stats_file = os.path.join(output_dir, "stats_final.json")
-        with open(stats_file, 'w') as f:
-            json_stats = {k: v if not isinstance(v, defaultdict) else dict(v) for k, v in stats.items()}
-            json.dump(json_stats, f, indent=2)
-    
+    if len(current_batch_games) > 0:
+        append_to_data_file(current_batch_games, main_data_file)
+        stats["total_saved_sequences"] += sum(len(g["rounds"]) for g in current_batch_games)
+
+    # Save stats to file
+    stats_file = os.path.join(output_dir, "stats_final.json")
+    with open(stats_file, 'w') as f:
+        json_stats = {k: v if not isinstance(v, defaultdict) else dict(v) for k, v in stats.items()}
+        json.dump(json_stats, f, indent=2)
+
     # Calculate final statistics
     total_time = time.time() - stats["start_time"]
     stats["total_time"] = total_time
-    stats["sequences_per_episode"] = stats["sequences"] / max(1, stats["episodes"])
-    stats["steps_per_sequence"] = stats["steps"] / max(1, stats["sequences"])
+    total_sequences = stats["rounds"]
+    stats["sequences_per_episode"] = total_sequences / max(1, stats["episodes"])
+    stats["steps_per_sequence"] = stats["steps"] / max(1, total_sequences)
     stats["episodes_per_second"] = stats["episodes"] / max(1, total_time)
-    
+
+    # Logging
     logger.info("\n===== Data Generation Summary =====")
     logger.info(f"Episodes: {stats['episodes']}")
     logger.info(f"Total saved sequences: {stats['total_saved_sequences']} ({stats['sequences_per_episode']:.2f} per episode)")
@@ -617,12 +475,12 @@ def generate_data(
     logger.info(f"Total time: {total_time:.2f}s ({stats['episodes_per_second']:.2f} episodes/s)")
     logger.info(f"Avg search time: {stats['avg_search_time']:.3f}s")
     logger.info(f"Failed searches: {stats['failed_searches']} ({stats['failed_searches']/max(1, stats['simulation_count']):.4f}%)")
-    
+
     logger.info(f"\nTop 5 opponent combinations:")
     top_combos = sorted(stats["opponent_combinations"].items(), key=lambda x: x[1], reverse=True)[:5]
     for combo, count in top_combos:
         logger.info(f"  {combo}: {count} episodes ({count/stats['episodes']:.2f})")
-    
+
     logger.info(f"\nTop 5 actions:")
     top_actions = sorted(stats["action_distribution"].items(), key=lambda x: x[1], reverse=True)[:5]
     for action, count in top_actions:
