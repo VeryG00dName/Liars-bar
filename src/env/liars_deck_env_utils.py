@@ -463,10 +463,7 @@ def get_newer_observations(env, agent_specific=None):
     Constructs a new observation vector for each agent.
     Components:
       - Hand vector (2-dim) via encode_hand.
-      - Last actions vector (length = num_players - 1): For each opponent (ordered by env.possible_agents),
-        if the opponent is eliminated or has not acted, use 0.
-        Otherwise, use 4 if they challenged, or the count (1, 2, or 3) if they played.
-      - Active players vector: normalized hand sizes for all players.
+      - Active players vector: normalized hand sizes for all opponents.
     """
     observations = {}
     agents_to_observe = [agent_specific] if agent_specific else env.agents
@@ -476,38 +473,16 @@ def get_newer_observations(env, agent_specific=None):
         current_hand = env.players_hands.get(agent, [])
         hand_vector = encode_hand(current_hand, env.table_card).astype(np.float32)
 
-        # 2. Last actions vector for each opponent (length = num_players - 1)
-        last_actions = []
-        for opp in env.possible_agents:
-            if opp == agent:
-                continue
-            # If the opponent is eliminated, code is 0.
-            if env.terminations.get(opp, False) or env.round_eliminated.get(opp, False):
-                code = 0.0
-            else:
-                last_act = env.last_agent_action.get(opp, None)
-                if last_act is None:
-                    code = 0.0
-                else:
-                    action_type, _, count = decode_action(last_act)
-                    if action_type == "Challenge":
-                        code = 4.0
-                    elif action_type == "Play":
-                        code = float(count) if count is not None else 0.0
-                    else:
-                        code = 0.0
-            last_actions.append(code)
-        last_actions = np.array(last_actions, dtype=np.float32)
-
-        # 3. Active players vector: normalized hand sizes (for all agents)
+        # 3. Active players vector: normalized hand sizes (for all opponents)
         active_players = np.array([
             len(env.players_hands.get(ag, [])) / 5.0
             for ag in env.possible_agents
+            if ag != agent
         ], dtype=np.float32)
 
         # Concatenate in the following order:
-        # [hand_vector (2), last_actions (num_players-1), active_players (num_players)]
-        obs = np.concatenate([hand_vector, last_actions, active_players], axis=0)
+        # [hand_vector (2), active_players (num_players-1)]
+        obs = np.concatenate([hand_vector, active_players], axis=0)
         obs = np.round(obs, 2)
         observations[agent] = obs
     return observations
