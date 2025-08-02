@@ -195,31 +195,6 @@ def generate_data(
     sequence for each episode and tagging each step by agent_id
     (0=training, 1=opponent1, 2=opponent2).
     """
-    import random
-    import time
-    import numpy as np
-    import torch
-    import os
-    import json
-    import pickle
-    import logging
-    from collections import defaultdict
-    from tqdm import tqdm
-    from src.env.liars_deck_env_core import LiarsDeckEnv
-    from src.training.train_utils import load_specific_historical_models
-    from src.env.liars_deck_env_utils_2 import decode_action
-    from src.model.hard_coded_agents import (
-        GreedyCardSpammer,
-        TableFirstConservativeChallenger,
-        StrategicChallenger,
-        SelectiveTableConservativeChallenger,
-        RandomAgent,
-        TableNonTableAgent,
-        Classic
-    )
-    from src.model.ps_v3 import PerfectSearch
-    from src import config
-
     AGENT_ID_MAP = {'player_0': 0, 'player_1': 1, 'player_2': 2}
     CARD_COUNT_MAPPING = {1: 7, 2: 8, 3: 9}
 
@@ -272,16 +247,6 @@ def generate_data(
             except Exception as e:
                 logging.getLogger().error(f"Error loading historical models: {e}")
         return opponent_pool
-
-    def setup_opponents(pool, types, names):
-        opponents = {}
-        models = {}
-        for name, typ in zip(names, types):
-            instance = pool[typ]() if not typ.startswith("Historical_") else pool[typ]
-            opponents[name] = {"instance": instance, "name": typ, "type": "historical" if typ.startswith("Historical_") else "hardcoded"}
-            models[name] = instance
-        return opponents, models
-
 
     logger = setup_logging(os.path.join(output_dir, 'generation.log'), logging.INFO if verbose else logging.WARNING)
     random.seed(start_seed)
@@ -377,8 +342,8 @@ def generate_data(
                     step_data["action_source"] = "PS Plan Sequence"
                 else:
                     opp_model = opponent_models[current_agent]
-                    mask = env.infos[current_agent].get('action_mask', [0] * 7)
                     obs_opp = env.observe(current_agent, newer=True)[current_agent]
+                    mask = env.infos[current_agent]['action_mask']
                     best_action = opp_model.play_turn(obs_opp, mask, table_card=env.table_card) if hasattr(opp_model, 'play_turn') else mask.index(1)
                     step_data["action_source"] = f"Opponent Model ({current_opponents[current_agent]['name']})"
                 step_data["action"] = best_action
