@@ -17,11 +17,11 @@ class AutoregressiveGameModel(nn.Module):
     - Action prediction with proper masking of invalid actions
     - Support for both explicit actions (0-6)
     """
-    def __init__(self, 
-                 obs_dim, 
+    def __init__(self,
+                 obs_dim,
                  action_dim=7,
-                 belief_dim=20,
-                 hidden_dim=256, 
+                 belief_dim=None,
+                 hidden_dim=256,
                  num_heads=4,
                  num_layers=2,
                  dropout_rate=0.1,
@@ -32,7 +32,11 @@ class AutoregressiveGameModel(nn.Module):
         Args:
             obs_dim: Dimension of observation vectors
             action_dim: Number of possible actions (typically 7 for Liar's Deck)
-            belief_dim: Dimension of belief vectors (if None, belief encoder is not used)
+            belief_dim: Dimension of belief vectors. If ``None`` the model will not
+                use external belief inputs. This allows training on full game
+                sequences without a separate belief model while remaining
+                backwards compatible with older checkpoints that expect a belief
+                vector.
             hidden_dim: Hidden dimension for transformer and other layers
             num_heads: Number of attention heads in transformer
             num_layers: Number of transformer layers
@@ -109,18 +113,19 @@ class AutoregressiveGameModel(nn.Module):
         # Learnable null token for padding (initialized as zeros)
         self.null_token = nn.Parameter(torch.zeros(hidden_dim))
     
-    def _encode_inputs(self, obs_sequence, belief_sequence, action_sequence, 
-                      agent_types, positions, action_masks=None):
+    def _encode_inputs(self, obs_sequence, belief_sequence=None, action_sequence=None,
+                      agent_types=None, positions=None, action_masks=None):
         """
         Encode all inputs into a unified sequence representation.
         
         Args:
-            obs_sequence: Tensor of shape [batch_size, seq_len, obs_dim] or None for steps
-            belief_sequence: Tensor of shape [batch_size, seq_len, belief_dim] or None
-            action_sequence: Tensor of shape [batch_size, seq_len] - previous actions
-            agent_types: Tensor of shape [batch_size, seq_len] - 0=training agent, 1=opponent
-            positions: Tensor of shape [batch_size, seq_len] - positions in sequence
-            action_masks: Tensor of shape [batch_size, seq_len, action_dim] or None
+            obs_sequence: Tensor of shape ``[batch_size, seq_len, obs_dim]`` or ``None``
+            belief_sequence: Optional tensor of shape ``[batch_size, seq_len, belief_dim]``
+            action_sequence: Tensor of shape ``[batch_size, seq_len]`` with previous actions
+            agent_types: Tensor of shape ``[batch_size, seq_len]`` where 0 denotes the
+                training agent and 1 an opponent
+            positions: Tensor of shape ``[batch_size, seq_len]`` indicating positions
+            action_masks: Optional tensor of shape ``[batch_size, seq_len, action_dim]``
         
         Returns:
             Tensor of shape [batch_size, seq_len, hidden_dim]
@@ -194,24 +199,22 @@ class AutoregressiveGameModel(nn.Module):
         mask = torch.arange(seq_len, device=device).expand(batch_size, seq_len) >= valid_lens.unsqueeze(1)
         return mask
     
-    def forward(self, obs_sequence=None, belief_sequence=None, action_sequence=None, 
+    def forward(self, obs_sequence=None, belief_sequence=None, action_sequence=None,
                 agent_types=None, positions=None, action_masks=None, valid_lengths=None):
-        """
-        Forward pass through the model.
-        
+        """Forward pass through the model.
+
         Args:
-            obs_sequence: Tensor of observations [batch_size, seq_len, obs_dim] or None
-            belief_sequence: Tensor of beliefs [batch_size, seq_len, belief_dim] or None
-            action_sequence: Tensor of previous actions [batch_size, seq_len]
-            agent_types: Tensor indicating agent type [batch_size, seq_len] (0=ours, 1=opponent)
-            positions: Tensor of positions in sequence [batch_size, seq_len]
-            action_masks: Tensor of action masks [batch_size, seq_len, action_dim] or None
-            valid_lengths: Tensor of valid sequence lengths [batch_size] or None
-        
+            obs_sequence: Tensor of observations ``[batch, seq, obs_dim]`` or ``None``.
+            belief_sequence: Optional tensor of beliefs ``[batch, seq, belief_dim]``.
+            action_sequence: Tensor of previous actions ``[batch, seq]``.
+            agent_types: Tensor indicating agent type ``[batch, seq]`` (0=ours, 1=opponent).
+            positions: Tensor of positions in sequence ``[batch, seq]``.
+            action_masks: Optional tensor of action masks ``[batch, seq, action_dim]``.
+            valid_lengths: Optional tensor of valid sequence lengths ``[batch]``.
+
         Returns:
-            tuple: (action_logits, extended_action_logits, state_values)
-                action_logits: Tensor of shape [batch_size, seq_len, action_dim]
-                state_values: Tensor of shape [batch_size, seq_len, 1]
+            Tuple ``(action_logits, opp_logits, state_values)`` where each tensor has
+            shape ``[batch, seq, ...]``.
         """
         batch_size, seq_len = action_sequence.shape
         device = action_sequence.device
