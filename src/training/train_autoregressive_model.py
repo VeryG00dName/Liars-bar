@@ -199,7 +199,7 @@ class AutoregressiveGameDataset(Dataset):
             raw_actions = []
             raw_target_actions = []
             for step in sequence:
-                is_train = step.get("is_training_agent", False)
+                is_train = step.get("is_training_agent", step.get("agent_id", 0) == 0)
                 if "action" in step:
                     a = step["action"]
                     b = step["action"]
@@ -210,13 +210,13 @@ class AutoregressiveGameDataset(Dataset):
                     a = step["transformed_action"]
                 raw_target_actions.append(b)
                 raw_actions.append(a)
-            
+
             raw_actions = [6 if a == 10 else a for a in raw_actions]
             raw_target_actions = [6 if a == 10 else a for a in raw_target_actions]
             # 2) Build shifted inputs and aligned targets
             PAD = 0
-            input_actions  = [PAD] + raw_actions[:-1]  # length == seq_len
-            target_actions = raw_target_actions.copy() # length == seq_len
+            input_actions  = [PAD] + raw_actions[:-1]
+            target_actions = raw_target_actions.copy()
 
             # 3) Build the rest of the features in one pass
             obs_list = []
@@ -224,6 +224,7 @@ class AutoregressiveGameDataset(Dataset):
             agent_type_list = []
             position_list = []
             belief_list = []
+            has_belief = False
 
             latest_belief_vector = None
             LABELS = {
@@ -238,29 +239,25 @@ class AutoregressiveGameDataset(Dataset):
             }
 
             for i, step in enumerate(sequence):
-                # agent type & position
-                is_train = step.get("is_training_agent", False)
+                is_train = step.get("is_training_agent", step.get("agent_id", 0) == 0)
                 agent_type_list.append(0 if is_train else 1)
                 position_list.append(i)
 
-                # observation (only for training agent)
                 if is_train:
                     obs = np.array(step["observation"], dtype=np.float32)
                     obs_list.append(obs)
                 else:
                     obs_list.append(np.zeros(7, dtype=np.float32))
 
-                # action mask
                 if is_train and "action_mask" in step:
                     action_mask_list.append(step["action_mask"])
                 else:
                     action_mask_list.append([0] * 7)
 
-                # belief (external list of opponent names)
                 if "belief" in step:
+                    has_belief = True
                     names = step["belief"]
                     full_belief = []
-                    # two opponents assumed
                     for opp_idx in range(2):
                         vec = np.zeros(len(LABELS), dtype=np.float32)
                         if opp_idx < len(names):
@@ -275,44 +272,40 @@ class AutoregressiveGameDataset(Dataset):
                         full_belief.extend(vec)
                     latest_belief_vector = np.array(full_belief, dtype=np.float32)
                     belief_list.append(latest_belief_vector)
-                else:
-                    # fallback to last belief or uniform
-                    if latest_belief_vector is not None:
-                        belief_list.append(latest_belief_vector)
-                    else:
-                        uniform = np.ones(len(LABELS), dtype=np.float32) / len(LABELS)
-                        fb = np.concatenate([uniform, uniform])
-                        latest_belief_vector = fb
-                        belief_list.append(fb)
+                elif has_belief and latest_belief_vector is not None:
+                    belief_list.append(latest_belief_vector)
 
             # 4) Convert lists into tensors
             obs_tensor        = torch.tensor(np.stack(obs_list),       dtype=torch.float32, device=device)
             action_tensor     = torch.tensor(input_actions,            dtype=torch.long,    device=device)
             target_tensor     = torch.tensor(target_actions,           dtype=torch.long,    device=device)
             mask_tensor       = torch.tensor(np.array(action_mask_list), dtype=torch.bool,  device=device)
-            belief_tensor     = torch.tensor(np.stack(belief_list),    dtype=torch.float32, device=device)
             agent_type_tensor = torch.tensor(agent_type_list,          dtype=torch.long,    device=device)
             position_tensor   = torch.tensor(position_list,            dtype=torch.long,    device=device)
+            belief_tensor = None
+            if has_belief:
+                belief_tensor = torch.tensor(np.stack(belief_list),    dtype=torch.float32, device=device)
 
-            # causal attention mask (optional—model can recompute internally)
             attention_mask = torch.triu(
                 torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
                 diagonal=1
             )
 
-            # 5) Store the processed sequence
-            self.sequences.append({
+            seq_dict = {
                 "obs":            obs_tensor,
                 "action":         action_tensor,
                 "target_action":  target_tensor,
                 "action_mask":    mask_tensor,
-                "belief":         belief_tensor,
                 "agent_type":     agent_type_tensor,
                 "position":       position_tensor,
                 "attention_mask": attention_mask,
                 "length":         seq_len,
-                "round_id":       round_data["round_id"]
-            })
+                "round_id":       round_data.get("round_id", round_data.get("game_id", None))
+            }
+            if belief_tensor is not None:
+                seq_dict["belief"] = belief_tensor
+
+            self.sequences.append(seq_dict)
 
         # summary
         print(f"Processed {len(self.sequences)} sequences (from {self.total_sequences} total)")
@@ -350,14 +343,16 @@ def collate_variable_length_sequences(batch):
     first_seq = batch[0]
     device = first_seq['obs'].device
     obs_dim = first_seq['obs'].shape[1]
-    belief_dim = first_seq['belief'].shape[1]
-    
+    has_belief = 'belief' in first_seq and first_seq['belief'] is not None
+    belief_dim = first_seq['belief'].shape[1] if has_belief else 0
+
     # Initialize tensors for the batch
     batched_obs = torch.zeros(batch_size, max_seq_len, obs_dim, device=device)
     batched_action = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
     batched_target_action = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
     batched_action_mask = torch.zeros(batch_size, max_seq_len, 7, dtype=torch.bool, device=device)
-    batched_belief = torch.zeros(batch_size, max_seq_len, belief_dim, device=device)
+    if has_belief:
+        batched_belief = torch.zeros(batch_size, max_seq_len, belief_dim, device=device)
     batched_agent_type = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
     batched_position = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
     
@@ -380,7 +375,8 @@ def collate_variable_length_sequences(batch):
         batched_action[i, :seq_len] = seq['action']
         batched_target_action[i, :seq_len] = seq['target_action']
         batched_action_mask[i, :seq_len] = seq['action_mask']
-        batched_belief[i, :seq_len] = seq['belief']
+        if has_belief:
+            batched_belief[i, :seq_len] = seq['belief']
         batched_agent_type[i, :seq_len] = seq['agent_type']
         batched_position[i, :seq_len] = seq['position']
         
@@ -391,18 +387,20 @@ def collate_variable_length_sequences(batch):
         round_ids.append(seq['round_id'])
     
     # Return as a dictionary
-    return {
+    batch_dict = {
         'obs': batched_obs,
         'action': batched_action,
         'target_action': batched_target_action,
         'action_mask': batched_action_mask,
-        'belief': batched_belief,
         'agent_type': batched_agent_type,
         'position': batched_position,
         'padding_mask': padding_mask,
         'lengths': lengths,
         'round_ids': round_ids
     }
+    if has_belief:
+        batch_dict['belief'] = batched_belief
+    return batch_dict
 
 def load_autoreg_data(data_dir, max_files=None, max_samples=None):
     """Load data from PS autoregressive data pickle files.
@@ -464,13 +462,22 @@ def load_autoreg_data(data_dir, max_files=None, max_samples=None):
 
                 if len(data) > remaining:
                     sampled_data = random.sample(data, remaining)
-                    all_data.extend(sampled_data)
-                    total_loaded += len(sampled_data)
+                else:
+                    sampled_data = data
+
+                # Flatten legacy game->round structure if needed
+                for item in sampled_data:
+                    if isinstance(item, dict) and 'rounds' in item:
+                        all_data.extend(item['rounds'])
+                        total_loaded += len(item['rounds'])
+                    else:
+                        all_data.append(item)
+                        total_loaded += 1
+
+                if len(data) > remaining:
                     print(f"Sampled {len(sampled_data)} from {os.path.basename(data_file)} ({len(data)} total)")
                 else:
-                    all_data.extend(data)
-                    total_loaded += len(data)
-                    print(f"Loaded all {len(data)} sequences from {os.path.basename(data_file)}")
+                    print(f"Loaded all {len(sampled_data)} sequences from {os.path.basename(data_file)}")
         except Exception as e:
             print(f"Error loading {os.path.basename(data_file)}: {e}")
             continue
@@ -612,7 +619,7 @@ def train_autoregressive_model(
 
     sample = next(iter(train_loader))
     obs_dim = sample['obs'].shape[2]
-    belief_dim = sample['belief'].shape[2]
+    belief_dim = sample['belief'].shape[2] if 'belief' in sample else None
     action_dim = 7
     logger.info(f"Model dimensions: obs_dim={obs_dim}, belief_dim={belief_dim}, action_dim={action_dim}")
 
@@ -660,7 +667,7 @@ def train_autoregressive_model(
         for batch in train_progress:
             self_logits, opp_logits, value_pred = model(
                 obs_sequence=batch['obs'],
-                belief_sequence=batch['belief'],
+                belief_sequence=batch.get('belief'),
                 action_sequence=batch['action'],
                 agent_types=batch['agent_type'],
                 positions=batch['position']
@@ -725,7 +732,7 @@ def train_autoregressive_model(
             for batch in val_progress:
                 self_logits, opp_logits, value_pred = model(
                     obs_sequence=batch['obs'],
-                    belief_sequence=batch['belief'],
+                    belief_sequence=batch.get('belief'),
                     action_sequence=batch['action'],
                     agent_types=batch['agent_type'],
                     positions=batch['position']

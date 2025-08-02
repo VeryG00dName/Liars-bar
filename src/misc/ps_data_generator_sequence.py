@@ -179,21 +179,6 @@ def append_to_data_file(data, file_path):
         with open(file_path, 'wb') as f:
             pickle.dump(data, f)
 
-def create_belief_vector(opponent_types, current_opponents):
-    """
-    Create a simplified belief vector representing opponent types.
-    
-    Args:
-        opponent_types: List of opponent type names
-        current_opponents: Dictionary of current opponent information
-    
-    Returns:
-        np.ndarray: Simple belief vector (one-hot encoding of known opponents)
-    """
-    # For simplicity in this implementation, we'll just pass the opponent types as a list
-    # In a real implementation, you would encode this as a proper belief vector
-    return [opp_info["name"] for agent, opp_info in current_opponents.items()]
-
 def generate_data(
     num_episodes=1000,
     output_dir="./ps_data",
@@ -206,8 +191,9 @@ def generate_data(
     max_rounds_per_episode=50
 ):
     """
-    Generate training data using Perfect Search, organized by game (with rounds in sequence)
-    and tagging each step by agent_id (0=training, 1=opponent1, 2=opponent2).
+    Generate training data using Perfect Search, producing a single full-game
+    sequence for each episode and tagging each step by agent_id
+    (0=training, 1=opponent1, 2=opponent2).
     """
     import random
     import time
@@ -296,8 +282,6 @@ def generate_data(
             models[name] = instance
         return opponents, models
 
-    def create_belief_vector(opponent_types, opponents):
-        return [info["name"] for _, info in opponents.items()]
 
     logger = setup_logging(os.path.join(output_dir, 'generation.log'), logging.INFO if verbose else logging.WARNING)
     random.seed(start_seed)
@@ -312,7 +296,6 @@ def generate_data(
 
     stats = {
         "episodes": 0,
-        "rounds": 0,
         "steps": 0,
         "wins": 0,
         "losses": 0,
@@ -340,34 +323,18 @@ def generate_data(
         obs, infos = env.reset(seed=episode_seed)
         ps = PerfectSearch(env=env, training_agent=training_agent, opponent_models=opponent_models)
 
-        game_data = {"game_id": episode, "rounds": []}
-        current_round = env.round
+        game_data = {"game_id": episode, "sequence": [],
+                      "game_outcome": {"winner": None, "penalties": {}, "result": 0.0}}
         episode_step = 0
-        round_step = 0
 
-        current_round_sequence = {"round_id": f"{episode}_{current_round}", "episode_id": episode, "table_card": env.table_card, "sequence": [], "round_outcome": {"winner": None, "penalties": {}, "result": 0.0}}
-
-        while not all(env.terminations.values()) and episode_step < 1000 and len(game_data["rounds"]) < max_rounds_per_episode:
+        while not all(env.terminations.values()) and episode_step < 1000:
             episode_step += 1
-            round_step += 1
             current_agent = env.agent_selection
-
-            if env.round > current_round or current_agent is None:
-                if len(current_round_sequence["sequence"]) >= 2:
-                    current_round_sequence["round_outcome"].update({"winner": env.winner, "penalties": {a: env.penalties.get(a, 0) for a in env.possible_agents}, "result": 100.0 if env.winner == training_agent else -100.0 if env.winner else 0.0})
-                    game_data["rounds"].append(current_round_sequence)
-                    stats["rounds"] += 1
-                    stats["avg_sequence_length"] = ((stats["avg_sequence_length"] * (stats["rounds"] - 1)) + len(current_round_sequence["sequence"])) / stats["rounds"]
-                if current_agent is None:
-                    break
-                current_round = env.round
-                round_step = 0
-                current_round_sequence = {"round_id": f"{episode}_{current_round}", "episode_id": episode, "table_card": env.table_card, "sequence": [], "round_outcome": {"winner": None, "penalties": {}, "result": 0.0}}
 
             if current_agent is None:
                 break
 
-            step_data = {"agent_id": AGENT_ID_MAP[current_agent], "step_in_round": round_step}
+            step_data = {"agent_id": AGENT_ID_MAP[current_agent], "step": episode_step}
 
             if current_agent == training_agent:
                 obs_curr = env.observe(current_agent, newer=True)[current_agent]
@@ -397,7 +364,6 @@ def generate_data(
                         step_data["action_source"] = "Error Fallback"
                 step_data["action"] = best_action
                 step_data["action_probs"] = action_probs.tolist()
-                step_data["belief"] = create_belief_vector(selected_opponents, current_opponents)
                 action_type, _, count = decode_action(best_action)
                 stats["action_distribution"][f"{action_type}_{count}"] += 1
                 if action_type == "Play" and count is not None:
@@ -416,41 +382,38 @@ def generate_data(
                     best_action = opp_model.play_turn(obs_opp, mask, table_card=env.table_card) if hasattr(opp_model, 'play_turn') else mask.index(1)
                     step_data["action_source"] = f"Opponent Model ({current_opponents[current_agent]['name']})"
                 step_data["action"] = best_action
-                step_data["belief"] = create_belief_vector(selected_opponents, current_opponents)
                 action_type, _, count = decode_action(best_action)
                 if action_type == "Play" and count is not None:
                     step_data["card_count"] = count
                     if np.random.random() < opponent_action_dropout_rate:
                         step_data["transformed_action"] = CARD_COUNT_MAPPING.get(count, count + 6)
                 env.step(best_action)
-            current_round_sequence["sequence"].append(step_data)
+            game_data["sequence"].append(step_data)
             stats["steps"] += 1
+        game_data["game_outcome"].update({
+            "winner": env.winner,
+            "penalties": {a: env.penalties.get(a, 0) for a in env.possible_agents},
+            "result": 100.0 if env.winner == training_agent else -100.0 if env.winner else 0.0
+        })
 
         if env.winner == training_agent:
             stats["wins"] += 1
         elif env.winner is not None:
             stats["losses"] += 1
         stats["episodes"] += 1
-        stats["win_rate"] = stats["wins"] / stats["episodes"]
-        if len(current_round_sequence["sequence"]) >= 2:
-            current_round_sequence["round_outcome"].update({"winner": env.winner, "penalties": {a: env.penalties.get(a, 0) for a in env.possible_agents}, "result": 100.0 if env.winner == training_agent else -100.0 if env.winner else 0.0})
-            game_data["rounds"].append(current_round_sequence)
-            stats["rounds"] += 1
-            stats["avg_sequence_length"] = ((stats["avg_sequence_length"] * (stats["rounds"] - 1)) + len(current_round_sequence["sequence"])) / stats["rounds"]
+        stats["win_rate"] = stats["wins"] / stats["episodes"] if stats["episodes"] else 0.0
+
+        seq_len = len(game_data["sequence"])
+        stats["avg_sequence_length"] = ((stats["avg_sequence_length"] * (stats["episodes"] - 1)) + seq_len) / stats["episodes"]
         current_batch_games.append(game_data)
         if (episode + 1) % save_frequency == 0:
             append_to_data_file(current_batch_games, main_data_file)
-            stats["total_saved_sequences"] += sum(len(g["rounds"]) for g in current_batch_games)
+            stats["total_saved_sequences"] += len(current_batch_games)
             current_batch_games = []
 
     if current_batch_games:
         append_to_data_file(current_batch_games, main_data_file)
-        stats["total_saved_sequences"] += sum(len(g["rounds"]) for g in current_batch_games)
-
-    # Final save if there's remaining data not yet saved
-    if len(current_batch_games) > 0:
-        append_to_data_file(current_batch_games, main_data_file)
-        stats["total_saved_sequences"] += sum(len(g["rounds"]) for g in current_batch_games)
+        stats["total_saved_sequences"] += len(current_batch_games)
 
     # Save stats to file
     stats_file = os.path.join(output_dir, "stats_final.json")
@@ -461,7 +424,7 @@ def generate_data(
     # Calculate final statistics
     total_time = time.time() - stats["start_time"]
     stats["total_time"] = total_time
-    total_sequences = stats["rounds"]
+    total_sequences = stats["total_saved_sequences"]
     stats["sequences_per_episode"] = total_sequences / max(1, stats["episodes"])
     stats["steps_per_sequence"] = stats["steps"] / max(1, total_sequences)
     stats["episodes_per_second"] = stats["episodes"] / max(1, total_time)
