@@ -12,7 +12,7 @@ import pickle
 import json
 from collections import defaultdict
 from tqdm import tqdm
-from datetime import datetime
+import datetime
 
 # Environment imports
 from src.env.liars_deck_env_core import LiarsDeckEnv
