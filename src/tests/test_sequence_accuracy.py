@@ -58,9 +58,9 @@ def load_sequence_data(data_dir, max_samples=None):
     return all_data
 
 def evaluate(model, loader, device):
-    """Compute accuracy for each sequence position."""
-    position_correct = defaultdict(int)
-    position_total = defaultdict(int)
+    """Compute accuracy per (step, agent_type) pair."""
+    correct = defaultdict(int)
+    total = defaultdict(int)
     model.eval()
     with torch.no_grad():
         for batch in loader:
@@ -89,13 +89,22 @@ def evaluate(model, loader, device):
             for b in range(preds.shape[0]):
                 seq_len = lengths[b].item()
                 for t in range(seq_len):
-                    position_total[t] += 1
+                    step = t
+                    agent_type = agent_types[b, t].item()
+                    key = (step, agent_type)
+                    total[key] += 1
                     if preds[b, t].item() == target[b, t].item():
-                        position_correct[t] += 1
+                        correct[key] += 1
 
-    positions = sorted(position_total.keys())
-    accuracies = [position_correct[p] / position_total[p] for p in positions]
-    return positions, accuracies
+    # Compute accuracy per (step, agent_type)
+    results = []
+    for (step, agent_type), count in total.items():
+        acc = correct[(step, agent_type)] / count
+        results.append((step, acc, agent_type))
+
+    # Sort by step
+    results.sort()
+    return results
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate sequence accuracy by step position")
@@ -149,16 +158,26 @@ def main():
     else:
         model.load_state_dict(checkpoint)
 
-    positions, accuracies = evaluate(model, loader, device)
-    for pos, acc in zip(positions, accuracies):
-        print(f"Step {pos + 1:3d}: accuracy={acc:.3f}")
+    results = evaluate(model, loader, device)
+
+    for step, acc, agent_type in results:
+        print(f"Step {step + 1:3d}: accuracy={acc:.3f} agent type={agent_type}")
 
     if not args.no_plot:
-        plt.figure(figsize=(8, 4))
-        plt.plot([p + 1 for p in positions], accuracies, marker="o")
+        from collections import defaultdict
+        plot_data = defaultdict(list)
+        for step, acc, agent_type in results:
+            plot_data[agent_type].append((step, acc))
+
+        plt.figure(figsize=(10, 5))
+        for ag_type, step_acc in plot_data.items():
+            steps = [s + 1 for s, _ in sorted(step_acc)]
+            accs = [a for _, a in sorted(step_acc)]
+            plt.plot(steps, accs, marker="o", label=f"Agent {ag_type}")
         plt.xlabel("Step in sequence")
         plt.ylabel("Accuracy")
-        plt.title("Model accuracy over game sequence")
+        plt.title("Model accuracy over game sequence by agent type")
+        plt.legend()
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
         plt.show()
