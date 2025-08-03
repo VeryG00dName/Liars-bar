@@ -247,7 +247,7 @@ class AutoregressiveGameDataset(Dataset):
                     obs = np.array(step["observation"], dtype=np.float32)
                     obs_list.append(obs)
                 else:
-                    obs_list.append(np.zeros(7, dtype=np.float32))
+                    obs_list.append(np.zeros(4, dtype=np.float32))
 
                 if is_train and "action_mask" in step:
                     action_mask_list.append(step["action_mask"])
@@ -276,6 +276,9 @@ class AutoregressiveGameDataset(Dataset):
                     belief_list.append(latest_belief_vector)
 
             # 4) Convert lists into tensors
+            for i, obs in enumerate(obs_list):
+                if obs.shape != obs_list[0].shape:
+                    print(f"Shape mismatch at index {i}: {obs.shape} vs {obs_list[0].shape}")
             obs_tensor        = torch.tensor(np.stack(obs_list),       dtype=torch.float32, device=device)
             action_tensor     = torch.tensor(input_actions,            dtype=torch.long,    device=device)
             target_tensor     = torch.tensor(target_actions,           dtype=torch.long,    device=device)
