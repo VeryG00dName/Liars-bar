@@ -291,13 +291,6 @@ class AutoregressiveGameDataset(Dataset):
 
                 elif has_belief and latest_belief_vector is not None:
                     belief_list.append(latest_belief_vector)
-                
-                # If no belief information is ever provided in the sequence, skip
-                if not has_belief and i == seq_len - 1:
-                    print(f"Skipping sequence due to missing belief information.")
-                    self.total_sequences -= 1
-                    self.sequence_lengths.pop()
-                    continue
 
             # Convert to tensors
             obs_tensor        = torch.tensor(np.stack(obs_list),       dtype=torch.float32, device=device)
@@ -311,10 +304,6 @@ class AutoregressiveGameDataset(Dataset):
             if has_belief and latest_belief_vector is not None:
                 belief_tensor = torch.tensor(np.stack(belief_list), dtype=torch.long, device=device)
             
-            # If still no belief tensor, skip
-            if belief_tensor is None:
-                continue
-
             attention_mask = torch.triu(
                 torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
                 diagonal=1
@@ -368,7 +357,7 @@ def collate_variable_length_sequences(batch):
     belief_dim = first_seq['belief'].shape[1] # Should be 2 (number of opponents)
 
     # Initialize tensors for the batch
-    batched_obs = torch.zeros(batch_size, max_seq_len, obs_dim, dtype=torch.float32, device=device)
+    batched_obs = torch.zeros(batch_size, max_seq_len, obs_dim, device=device)
     batched_action = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
     batched_target_action = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
     batched_action_mask = torch.zeros(batch_size, max_seq_len, 7, dtype=torch.bool, device=device)
@@ -379,16 +368,12 @@ def collate_variable_length_sequences(batch):
     # Padding mask (to indicate which positions are valid vs. padding)
     padding_mask = torch.ones(batch_size, max_seq_len, dtype=torch.bool, device=device)
     
-    # Sequence lengths
-    lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
-    
     # Round IDs
     round_ids = []
     
     # Fill the batch tensors
     for i, seq in enumerate(batch):
         seq_len = seq['length']
-        lengths[i] = seq_len
         
         # Copy data for the actual sequence length
         batched_obs[i, :seq_len] = seq['obs']
@@ -414,7 +399,6 @@ def collate_variable_length_sequences(batch):
         'agent_type': batched_agent_type,
         'position': batched_position,
         'padding_mask': padding_mask,
-        'lengths': lengths,
         'round_ids': round_ids,
         'belief': batched_belief # Belief targets
     }
@@ -535,7 +519,7 @@ def calculate_autoregressive_loss(
     opp_mask = valid & ((agent_types == 1) | (agent_types == 2))
     
     # Belief loss only applies when it's our turn
-    belief_mask = agent_types == 0
+    belief_mask = valid & (agent_types == 0)
     
     flat_targets = target_actions.reshape(-1)
     flat_self_logits = self_logits.reshape(-1, self_logits.size(-1))
@@ -717,8 +701,7 @@ def train_autoregressive_model(
                 obs_sequence=batch['obs'],
                 action_sequence=batch['action'],
                 agent_types=batch['agent_type'],
-                positions=batch['position'],
-                valid_lengths=batch['lengths']
+                positions=batch['position']
             )
 
             belief_targets = batch['belief']
@@ -810,8 +793,7 @@ def train_autoregressive_model(
                     obs_sequence=batch['obs'],
                     action_sequence=batch['action'],
                     agent_types=batch['agent_type'],
-                    positions=batch['position'],
-                    valid_lengths=batch['lengths']
+                    positions=batch['position']
                 )
 
                 belief_targets = batch['belief']
@@ -946,18 +928,6 @@ def train_autoregressive_model(
                 'hidden_dim': hidden_dim
             }, checkpoint_path)
             logger.info(f"  Saved checkpoint at epoch {epoch+1}")
-            
-        if epoch == 11:
-            print(f"[INFO] Resetting action_head at epoch {epoch}")
-            
-            # Re-initialize the action head
-            model.action_head = nn.Linear(hidden_dim * 2, action_dim).to(device)
-            
-            # Rebuild the optimizer and scheduler
-            optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode='min', factor=0.5, patience=5, verbose=True
-            )
             
     # Save final model
     final_path = os.path.join(checkpoint_dir, "autoreg_model_final.pth")
