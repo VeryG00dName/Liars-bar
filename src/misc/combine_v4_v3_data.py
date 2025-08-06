@@ -10,6 +10,21 @@ def normalize_name(name: str) -> str:
         return name[len("Historical_"):]
     return name
 
+def load_multiple_pickles(file_path: str) -> list:
+    """Load all pickled objects from a file with multiple pickle dumps."""
+    all_objects = []
+    with open(file_path, 'rb') as f:
+        while True:
+            try:
+                obj = pickle.load(f)
+                all_objects.append(obj)
+            except EOFError:
+                break
+            except Exception as e:
+                print(f"Error reading object from {file_path}: {e}")
+                break
+    return all_objects
+
 
 def load_round_data(data_dir: str) -> list:
     all_sequences = []
@@ -18,12 +33,14 @@ def load_round_data(data_dir: str) -> list:
             continue
         file_path = os.path.join(data_dir, fname)
         try:
-            with open(file_path, 'rb') as f:
-                data = pickle.load(f)
-                if isinstance(data, list):
-                    all_sequences.extend(data)
+            data = load_multiple_pickles(file_path)
+            for item in data:
+                if isinstance(item, list):
+                    all_sequences.extend(item)
+                elif isinstance(item, dict):
+                    all_sequences.append(item)
                 else:
-                    print(f"Warning: {fname} did not contain a list of sequences.")
+                    print(f"Warning: Unexpected item type in {fname}: {type(item)}")
         except Exception as e:
             print(f"Error loading {fname}: {e}")
     return all_sequences
@@ -46,7 +63,6 @@ def filter_and_combine(v3_data: list, v4_data: list, table_df: pd.DataFrame) -> 
     matchup_counts = defaultdict(int)
     unmatched = 0
 
-    # Build fast-access dicts
     v3_lookup = defaultdict(list)
     v4_lookup = defaultdict(list)
 
@@ -60,15 +76,12 @@ def filter_and_combine(v3_data: list, v4_data: list, table_df: pd.DataFrame) -> 
 
     all_keys = set(v3_lookup.keys()).union(set(v4_lookup.keys()))
     for key in all_keys:
-        version = better_map.get(key, 'V3')  # fallback to V3
-        if version == 'V3':
-            selected = v3_lookup.get(key, [])
-        else:
-            selected = v4_lookup.get(key, [])
+        version = better_map.get(key, 'V3')  # default to V3
+        selected = v3_lookup.get(key, []) if version == 'V3' else v4_lookup.get(key, [])
         combined.extend(selected)
         matchup_counts[key] += len(selected)
 
-    # Add unmatched entries from v3 with no detectable key
+    # Fallback for unmatched V3 sequences
     for rd in v3_lookup.get(None, []):
         combined.append(rd)
         unmatched += 1
@@ -77,9 +90,7 @@ def filter_and_combine(v3_data: list, v4_data: list, table_df: pd.DataFrame) -> 
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Filter and combine PS data from two versions based on matchup win rates"
-    )
+    parser = argparse.ArgumentParser(description="Filter and combine PS data from two versions based on matchup win rates")
     parser.add_argument('--table-file', required=True)
     parser.add_argument('--data-dir-v3', required=True)
     parser.add_argument('--data-dir-v4', required=True)
