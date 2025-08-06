@@ -138,15 +138,15 @@ class AutoregressiveGameModel(nn.Module):
         
         # 1. Embed actions (all steps)
         action_embedded = self.action_embedding(action_sequence)
-        combined = combined + action_embedded
+        combined += action_embedded
         
         # 2. Embed agent types (all steps)
         agent_embedded = self.agent_embedding(agent_types)
-        combined = combined + agent_embedded
+        combined += agent_embedded
         
         # 3. Embed positions (all steps)
         position_embedded = self.position_embedding(positions)
-        combined = combined + position_embedded
+        combined += position_embedded
         
         # 4. Encode observations (only for training agent turns)
         if obs_sequence is not None:
@@ -157,12 +157,12 @@ class AutoregressiveGameModel(nn.Module):
             obs_encoded = self.obs_encoder(obs_sequence)
             
             # Only add observation encoding for training agent turns
-            combined = combined + (obs_encoded * training_agent_mask)
+            combined += (obs_encoded * training_agent_mask)
         
         # 5. Encode beliefs (if provided)
         if belief_sequence is not None and self.belief_encoder is not None:
             belief_encoded = self.belief_encoder(belief_sequence)
-            combined = combined + belief_encoded
+            combined += belief_encoded
         
         return combined
     
