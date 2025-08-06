@@ -21,7 +21,8 @@ from src.env.liars_deck_env_utils import (
     apply_action,
     get_observations,
     get_new_observations,
-    get_newer_observations
+    get_newer_observations,
+    get_newest_observations
 )
 
 
@@ -136,14 +137,16 @@ class LiarsDeckEnv(AECEnv):
     def observation_space(self, agent):
         return self.observation_spaces[agent]
 
-    def observe(self, agent, new=False, newer=False):
+    def observe(self, agent, new=False, newer=False, newest=False):
         """
         Generates the observation for the agent.
         If new=True, it uses the new observation construction.
         If newer=True, it uses the newer observation that focuses on action history.
         In addition to the observation vector, it attaches an "action_mask" in the infos.
         """
-        if newer:
+        if newest:
+            obs_dict = get_newest_observations(self, agent_specific=agent)
+        elif newer:
             obs_dict = get_newer_observations(self, agent_specific=agent)
         elif new:
             obs_dict = get_new_observations(self, agent_specific=agent)

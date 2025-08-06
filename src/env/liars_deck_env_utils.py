@@ -460,6 +460,55 @@ def get_new_observations(env, agent_specific=None):
 
 def get_newer_observations(env, agent_specific=None):
     """
+    Constructs observation vector (used in belief-based models).
+    Components:
+      - Hand vector (2-dim) via encode_hand.
+      - Opponent last actions (num_players - 1).
+      - Active players vector: normalized hand sizes (for all agents).
+    Total dim: 7
+    """
+    observations = {}
+    agents_to_observe = [agent_specific] if agent_specific else env.agents
+
+    for agent in agents_to_observe:
+        current_hand = env.players_hands.get(agent, [])
+        hand_vector = np.round(encode_hand(current_hand, env.table_card).astype(np.float32), 2)
+
+        # Opponent last actions
+        last_actions = []
+        for opp in env.possible_agents:
+            if opp == agent:
+                continue
+            if env.terminations.get(opp, False) or env.round_eliminated.get(opp, False):
+                code = 0.0
+            else:
+                last_act = env.last_agent_action.get(opp, None)
+                if last_act is None:
+                    code = 0.0
+                else:
+                    action_type, _, count = decode_action(last_act)
+                    if action_type == "Challenge":
+                        code = 4.0
+                    elif action_type == "Play":
+                        code = float(count) if count is not None else 0.0
+                    else:
+                        code = 0.0
+            last_actions.append(code)
+        last_actions = np.round(np.array(last_actions, dtype=np.float32), 2)
+
+        # Active players (hand sizes)
+        active_players = np.round(np.array([
+            len(env.players_hands.get(ag, [])) / 5.0
+            for ag in env.possible_agents
+        ], dtype=np.float32), 2)
+
+        # Concatenate: [hand (2), last_actions (2), active_players (3)]
+        obs = np.concatenate([hand_vector, last_actions, active_players], axis=0)
+        observations[agent] = obs
+    return observations
+
+def get_newest_observations(env, agent_specific=None):
+    """
     Constructs a new observation vector for each agent.
     Components:
       - Hand vector (2-dim) via encode_hand.
