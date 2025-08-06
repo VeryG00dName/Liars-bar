@@ -34,7 +34,7 @@ from src.model.hard_coded_agents import (
 from src.training.train_utils import load_specific_historical_models
 
 # Import PS
-from src.model.ps_v3 import PerfectSearch
+from src.model.ps import PerfectSearch
 AGENT_ID_MAP = {'player_0': 0, 'player_1': 1, 'player_2': 2}
 def setup_logging(log_file=None, level=logging.INFO):
     """Configure logging for the data generator."""
@@ -152,6 +152,19 @@ def setup_opponents(opponent_pool, opponent_types, agent_names):
     
     return current_opponents, opponent_models
 
+def create_belief_vector(opponent_types, current_opponents):
+    """
+    Create a simplified belief vector representing opponent types.
+    
+    Args:
+        opponent_types: List of opponent type names
+        current_opponents: Dictionary of current opponent information
+    
+    Returns:
+        List[str]: Simple belief vector (e.g., opponent names)
+    """
+    return [info["name"] for _, info in current_opponents.items()]
+
 def append_to_data_file(data, file_path):
     """
     Append new data to an existing pickle file, or create if it doesn't exist.
@@ -214,20 +227,13 @@ def generate_data(
         return logger
 
     def append_to_data_file(data, file_path):
-        if os.path.exists(file_path):
-            with open(file_path, 'rb') as f:
-                try:
-                    existing_data = pickle.load(f)
-                    if not isinstance(existing_data, list):
-                        existing_data = []
-                except Exception:
-                    existing_data = []
-            combined_data = existing_data + data
-            with open(file_path, 'wb') as f:
-                pickle.dump(combined_data, f)
-        else:
-            with open(file_path, 'wb') as f:
-                pickle.dump(data, f)
+        """
+        Append new data to a pickle file using appendable binary format.
+        This avoids loading and rewriting the full file.
+        """
+        with open(file_path, 'ab') as f:
+            for item in data:
+                pickle.dump(item, f)
 
     def load_opponent_pool(include_historical=True):
         opponent_pool = {
@@ -300,9 +306,9 @@ def generate_data(
                 break
 
             step_data = {"agent_id": AGENT_ID_MAP[current_agent], "step": episode_step}
-
+            step_data["belief"] = create_belief_vector(selected_opponents, current_opponents)
             if current_agent == training_agent:
-                obs_curr = env.observe(current_agent, newer=True)[current_agent]
+                obs_curr = env.observe(current_agent, newest=True)[current_agent]
                 step_data["observation"] = np.round(obs_curr, 2).tolist()
                 step_data["action_mask"] = env.infos[current_agent].get('action_mask', [0] * 7)
                 planned = ps.get_next_agent_action(current_agent)
