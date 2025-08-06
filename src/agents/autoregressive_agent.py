@@ -1,5 +1,4 @@
 # src/agents/autoregressive_agent.py
-import copy
 import os
 import torch
 import torch.nn.functional as F
@@ -148,18 +147,24 @@ class AutoregressiveAgent(BaseAgent):
                   self.belief_model = OpponentBeliefModel(event_feature_dim=5, hidden_dim=belief_hidden_dim, num_opponent_types=self.num_opponent_types).to(self.device)
                   self.belief_model.load_state_dict(self.initial_belief_state_dict, strict=True); self.belief_model.eval(); logger.info(f"Agent {self.player_id}: Loaded OpponentBeliefModel.")
              except Exception as e: logger.error(...); self.belief_model = None; self.belief_dim = None; self.num_opponent_types = None
-        else: self.belief_model = None; self.belief_dim = None; self.num_opponent_types = None; logger.info(...)
+        else: 
+            self.belief_model = None
+            self.belief_dim = None
+            self.num_opponent_types = None
+            logger.info(f"Agent {self.player_id}: No belief model found. Running without beliefs.")
 
 
         # Instantiate Autoregressive Model (Now hidden_dim is guaranteed compatible with num_heads=8)
         try:
              self.model = AutoregressiveGameModel(
-                  obs_dim=self.obs_dim, action_dim=self.action_dim, belief_dim=self.belief_dim,
-                  hidden_dim=self.hidden_dim, # Use validated hidden_dim
-                  num_heads=default_num_heads, # Use the hardcoded default
-                  num_layers=2,
-                  max_seq_length=17
-             ).to(self.device)
+                    obs_dim=self.obs_dim,
+                    action_dim=self.action_dim,
+                    belief_dim=self.belief_dim,  # Will be None if no belief
+                    hidden_dim=self.hidden_dim,
+                    num_heads=default_num_heads,
+                    num_layers=2,
+                    max_seq_length=self.max_seq_length
+                ).to(self.device)
         except TypeError as e: logger.error(...); raise e
 
         # Load state dict...
@@ -299,7 +304,7 @@ class AutoregressiveAgent(BaseAgent):
                 action_mask_seq[0, i] = torch.from_numpy(mask_np)
 
             # d) belief on every row
-            if belief_seq is not None:
+            if belief_seq is not None and "belief" in step_data:
                 belief_np = np.array(step_data["belief"], dtype=np.float32)
                 if belief_np.size != self.belief_dim:
                     if belief_np.size < self.belief_dim:
@@ -329,16 +334,19 @@ class AutoregressiveAgent(BaseAgent):
         if self.model is None:
             raise RuntimeError(f"AR model not loaded for {self.player_id}")
         logger = logging.getLogger(__name__)
-
+        
         # --- Initialize mapping on first call ---
         if self.env_agent_id_map is None:
             self.env_agent_id_map = {pid: 0 if pid == agent_id_env else 1 for pid in env.possible_agents}
 
         if len(env.players_hands[agent_id_env]) == 5:
-            # preserve only the two “placeholder” entries (so you still align
-            # with the two opponents that go before you next turn)
-            if len(self.sequence_history) > 2:
-                self.sequence_history = self.sequence_history[-2:]
+            if self.belief_model is None and all(p == 0 for p in env.penalties.values()):
+                # Autoregressive agent without belief: reset fully
+                self.sequence_history.clear()
+            elif self.belief_model is not None:
+                # Belief agent: truncate to last 2 entries
+                if len(self.sequence_history) > 2:
+                    self.sequence_history = self.sequence_history[-2:]
         
         # --- 1. Update masking for the two most recent opponent turns ---
         original_opps = [p for p in env.possible_agents if p != agent_id_env]
@@ -377,7 +385,10 @@ class AutoregressiveAgent(BaseAgent):
         # --- 2. PREPARE CURRENT STEP ---
         current_step_info = {"agent_id_env": agent_id_env, "step_in_round": len(self.sequence_history)}
         # observation must exist
-        current_step_info["observation"] = list(env.observe(agent_id_env, newer=True)[agent_id_env])
+        if self.obs_dim == 7:
+            current_step_info["observation"] = list(env.observe(agent_id_env, newer=True)[agent_id_env])
+        else:
+            current_step_info["observation"] = list(env.observe(agent_id_env, newest=True)[agent_id_env])
         # action_mask must exist
         current_step_info["action_mask"] = info["action_mask"]
 
@@ -386,51 +397,69 @@ class AutoregressiveAgent(BaseAgent):
         opponent_peak_beliefs = {}
         original_opponents = sorted([p for p in env.possible_agents if p != agent_id_env])
         opp_id_to_cheat_tuple_idx = {opp: i for i, opp in enumerate(original_opponents)}
-        if self.belief_state is None:
-            self.belief_state = {}
 
-        for opp_id in original_opponents:
-            if opp_id not in self.belief_state:
-                self.belief_state[opp_id] = np.ones(self.num_opponent_types, dtype=np.float32) / self.num_opponent_types
+        if self.belief_model is None:
+            # No belief model — use dummy 0.0 beliefs per opponent
+            dummy_belief = [0.0] * self.obs_dim  # Matches new model input expectation
+            for opp_id in original_opponents:
+                opponent_beliefs_list.append(dummy_belief)
+                opponent_peak_beliefs[opp_id] = {"expert_index": -1, "source": "none"}
+            current_step_info["belief"] = [v for belief in opponent_beliefs_list for v in belief]  # flatten
+        else:
+            # Belief model is used
+            if self.belief_state is None:
+                self.belief_state = {}
 
-            apply_cheat = False
-            cheat_idx_to_use = None
-            if cheat_expert_index is not None:
-                if isinstance(cheat_expert_index, (tuple, list)):
-                    cheat_idx_to_use = cheat_expert_index[opp_id_to_cheat_tuple_idx[opp_id]]
-                elif isinstance(cheat_expert_index, int):
-                    cheat_idx_to_use = cheat_expert_index
-                if isinstance(cheat_idx_to_use, int):
-                    apply_cheat = True
+            for opp_id in original_opponents:
+                if opp_id not in self.belief_state:
+                    self.belief_state[opp_id] = np.ones(self.num_opponent_types, dtype=np.float32) / self.num_opponent_types
 
-            if apply_cheat:
-                artificial = np.zeros(self.num_opponent_types, dtype=np.float32)
-                artificial[cheat_idx_to_use] = 1.0
-                self.belief_state[opp_id] = artificial
-                current_belief_np = artificial
-                opponent_peak_beliefs[opp_id] = {"expert_index": cheat_idx_to_use, "source": "cheat"}
-            elif self.belief_model is not None:
-                self._update_belief(agent_id_env, opp_id)
-                current_belief_np = self.belief_state[opp_id]
-                opponent_peak_beliefs[opp_id] = {"expert_index": int(np.argmax(current_belief_np)), "source": "model"}
-            else:
-                current_belief_np = self.belief_state[opp_id]
-                opponent_peak_beliefs[opp_id] = {"expert_index": int(np.argmax(current_belief_np)), "source": "uniform"}
+                apply_cheat = False
+                cheat_idx_to_use = None
+                if cheat_expert_index is not None:
+                    if isinstance(cheat_expert_index, (tuple, list)):
+                        cheat_idx_to_use = cheat_expert_index[opp_id_to_cheat_tuple_idx[opp_id]]
+                    elif isinstance(cheat_expert_index, int):
+                        cheat_idx_to_use = cheat_expert_index
+                    if isinstance(cheat_idx_to_use, int):
+                        apply_cheat = True
 
-            opponent_beliefs_list.append(current_belief_np)
+                if apply_cheat:
+                    artificial = np.zeros(self.num_opponent_types, dtype=np.float32)
+                    artificial[cheat_idx_to_use] = 1.0
+                    self.belief_state[opp_id] = artificial
+                    current_belief_np = artificial
+                    opponent_peak_beliefs[opp_id] = {"expert_index": cheat_idx_to_use, "source": "cheat"}
+                elif self.belief_model is not None:
+                    self._update_belief(agent_id_env, opp_id)
+                    current_belief_np = self.belief_state[opp_id]
+                    opponent_peak_beliefs[opp_id] = {"expert_index": int(np.argmax(current_belief_np)), "source": "model"}
+                else:
+                    current_belief_np = self.belief_state[opp_id]
+                    opponent_peak_beliefs[opp_id] = {"expert_index": int(np.argmax(current_belief_np)), "source": "uniform"}
 
-        # pad/truncate beliefs
-        expected = len(original_opponents)
-        while len(opponent_beliefs_list) < expected:
-            uniform = np.ones(self.num_opponent_types, dtype=np.float32) / self.num_opponent_types
-            opponent_beliefs_list.append(uniform)
-        if len(opponent_beliefs_list) > expected:
-            opponent_beliefs_list = opponent_beliefs_list[:expected]
+                opponent_beliefs_list.append(current_belief_np)
 
-        current_step_info["belief"] = np.concatenate(opponent_beliefs_list).tolist()
+            # Pad/truncate beliefs
+            expected = len(original_opponents)
+            while len(opponent_beliefs_list) < expected:
+                uniform = np.ones(self.num_opponent_types, dtype=np.float32) / self.num_opponent_types
+                opponent_beliefs_list.append(uniform)
+            if len(opponent_beliefs_list) > expected:
+                opponent_beliefs_list = opponent_beliefs_list[:expected]
+
+            current_step_info["belief"] = np.concatenate(opponent_beliefs_list).tolist()
+
         # Append agent step and store expert info
         self.sequence_history.append(current_step_info)
-        self._last_expert_info = {opp: {"expert_index": data["expert_index"], "source": data["source"]} for opp, data in opponent_peak_beliefs.items()}
+
+        if self.belief_model is not None:
+            self._last_expert_info = {
+                opp: {"expert_index": data["expert_index"], "source": data["source"]}
+                for opp, data in opponent_peak_beliefs.items()
+            }
+        else:
+            self._last_expert_info = {}
         # --- 3. Predict our action ---
         model_input_self = self._prepare_model_input(self.sequence_history)
         #print(f"eval unproccesed", self.sequence_history)
@@ -454,8 +483,11 @@ class AutoregressiveAgent(BaseAgent):
         # --- 3b. Even if we challenged, keep building the interleaved history ---
         opponents = [o for o in original_opponents if not env.terminations[o]]
         if chosen_action == 6:
-            self.sequence_history.clear()
-            logger.debug(f"Agent {self.player_id}: self-challenge, still appending opponent placeholders")
+            if self.belief_model is not None:
+                self.sequence_history.clear()
+                logger.debug(f"Agent {self.player_id}: self-challenge, clearing history for belief model")
+            else:
+                logger.debug(f"Agent {self.player_id}: self-challenge, preserving history (no belief model)")
 
             # Append one placeholder entry per live opponent
             for opp in opponents:

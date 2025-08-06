@@ -718,7 +718,8 @@ def evaluate_agents(
     two_player: Optional[str] = None,
     track_experts: bool = False,
     progress_callback=None,
-    cheat_expert_index: Optional[Any] = None # Keep Any type hint
+    cheat_expert_index: Optional[Any] = None, # Keep Any type hint
+    clear_memory=False
     ) -> tuple:
     """
     Evaluate multiple agents over a number of episodes.
@@ -831,7 +832,9 @@ def evaluate_agents(
             cumulative_wins[pid] += 1
             wins[pid] = 1
         game_wins_list.append(wins)
-
+        
+        if clear_memory:
+            delete_opponent_memory()
         if progress_callback is not None:
             progress_callback(game_idx)
 

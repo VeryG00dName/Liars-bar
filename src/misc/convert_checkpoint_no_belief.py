@@ -7,13 +7,14 @@ import argparse
 import torch
 
 from src.training.train_utils import save_checkpoint
-from src.model.autoregressive_model import AutoregressiveGameModel
+from src.model.autoregressive_model_full import AutoregressiveGameModelFull
 from src import config
 
 def process_variant(variant, bsp_dir, checkpoint_dir, episode):
     """
-    Convert an autoregressive checkpoint that doesn't use beliefs into the unified format.
-    Saves to: autoregressive_no_belief_{variant}.pth
+    Converts a no-belief autoregressive checkpoint into the unified save format.
+    Loads the model and optimizer, reconstructs them, and saves under:
+    autoregressive_no_belief_{variant}.pth
     """
     fname = f"autoreg_model_{variant}.pth"
     bsp_path = os.path.join(bsp_dir, fname)
@@ -22,43 +23,52 @@ def process_variant(variant, bsp_dir, checkpoint_dir, episode):
         print(f"[SKIP] {fname} not found in {bsp_dir}")
         return
 
-    # Load checkpoint (trained without beliefs)
-    raw = torch.load(bsp_path, map_location='cpu', weights_only=False)
+    # --- Load original checkpoint ---
+    bsp_checkpoint = torch.load(bsp_path, map_location='cpu', weights_only=False)
 
-    model_state = raw.get("model_state_dict", raw)
-    obs_dim = raw.get("obs_dim", 4)  # Updated input: 4-dim observations
-    hidden_dim = raw.get("hidden_dim", config.HIDDEN_DIM)
-    max_seq_length = raw.get("max_seq_length", 100)
+    # --- Extract required fields (fail if missing) ---
+    try:
+        model_state = bsp_checkpoint["model_state_dict"]
+        obs_dim = bsp_checkpoint["obs_dim"]
+        hidden_dim = bsp_checkpoint["hidden_dim"]
+        action_dim = bsp_checkpoint["action_dim"]
+        belief_dim = bsp_checkpoint["belief_dim"]
+        max_seq_length = 100
+    except KeyError as e:
+        raise ValueError(f"[ERROR] Missing key in checkpoint: {e}")
 
-    # Build AR model without beliefs
-    model = AutoregressiveGameModel(
+    # --- Reconstruct AutoregressiveGameModelFull (no belief) ---
+    ar_model = AutoregressiveGameModelFull(
         obs_dim=obs_dim,
-        action_dim=7,
-        belief_dim=None,
+        action_dim=action_dim,
+        belief_dim=belief_dim,
         hidden_dim=hidden_dim,
         num_heads=4,
         num_layers=2,
         dropout_rate=0.1,
         max_seq_length=max_seq_length
     )
-    model.load_state_dict(model_state)
+    ar_model.load_state_dict(model_state)
 
-    # Reconstruct optimizer (optional)
-    optimizer = torch.optim.Adam(model.parameters())
-    if "optimizer_state_dict" in raw:
-        optimizer.load_state_dict(raw["optimizer_state_dict"])
+    # --- Reconstruct optimizer ---
+    ar_optimizer = torch.optim.Adam(ar_model.parameters())
+    if "optimizer_state_dict" in bsp_checkpoint:
+        ar_optimizer.load_state_dict(bsp_checkpoint["optimizer_state_dict"])
+    else:
+        print("[WARN] No optimizer_state_dict found — saving without optimizer state.")
 
-    # Save to unified checkpoint format (no belief model)
+    # --- Save to unified checkpoint format ---
     save_checkpoint(
-        {"player_0": model},
-        None,
-        {"player_0": optimizer},
-        None,
+        {"player_0": ar_model},
+        value_nets=None,
+        optimizers_policy={"player_0": ar_optimizer},
+        optimizers_value=None,
         belief_model=None,
         belief_optimizer=None,
         episode=episode,
         checkpoint_dir=checkpoint_dir,
-        checkpoint_filename=f"autoregressive_no_belief_{variant}.pth"
+        checkpoint_filename=f"autoregressive_no_belief_{variant}.pth",
+        extra_data={'full_game': max_seq_length > 50}
     )
     print(f"[OK] Saved: autoregressive_no_belief_{variant}.pth")
 

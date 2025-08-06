@@ -85,6 +85,7 @@ class BattlegroundWorker(QThread):
                  cheat: bool = False,
                  onev2: bool = False,
                  duo: bool = False,
+                 clear_memory: bool = False,
                  parent=None):
         super().__init__(parent)
         self.selected_ai_agent_configs = selected_ai_agent_configs
@@ -98,6 +99,7 @@ class BattlegroundWorker(QThread):
         self.onev2 = onev2
         self.duo = duo
         self.expert_activations = {}
+        self.clear_memory = clear_memory
         self.agent_factory = AgentFactory(self.device)
     
     def run(self):
@@ -150,7 +152,8 @@ class BattlegroundWorker(QThread):
                         episodes=self.rounds,
                         progress_callback=lambda ep: self.progress_signal.emit(progress_counter + ep),
                         cheat_expert_index=current_cheat_index,
-                        mode='duo' # Pass mode
+                        mode='duo', # Pass mode
+                        clear_memory=self.clear_memory
                     )
 
                     # Format results using the map
@@ -174,7 +177,8 @@ class BattlegroundWorker(QThread):
                          episodes=self.rounds,
                          progress_callback=lambda ep: self.progress_signal.emit(progress_counter + ep),
                          cheat_expert_index=current_cheat_index,
-                         mode='onev2' # Pass mode
+                         mode='onev2', # Pass mode
+                         clear_memory=self.clear_memory
                      )
                      results[opponent_display_name] = self._format_wins(cumulative_wins, player_id_map)
                      self.expert_activations[opponent_display_name] = expert_acts
@@ -195,7 +199,8 @@ class BattlegroundWorker(QThread):
                          episodes=self.rounds,
                          progress_callback=lambda ep: self.progress_signal.emit(progress_counter + ep),
                          cheat_expert_index=current_cheat_index,
-                         mode='standard' # Pass mode
+                         mode='standard', # Pass mode
+                         clear_memory=self.clear_memory
                      )
                      results[opp_name] = self._format_wins(cumulative_wins, player_id_map)
                      self.expert_activations[opp_name] = expert_acts
@@ -223,7 +228,7 @@ class BattlegroundWorker(QThread):
 
         return formatted
 
-    def run_match(self, opponent_configs: tuple, opponent_types: tuple, opponent_display_name: str, episodes: int, mode:str, progress_callback=None, cheat_expert_index=None):
+    def run_match(self, opponent_configs: tuple, opponent_types: tuple, opponent_display_name: str, episodes: int, mode:str, progress_callback=None, cheat_expert_index=None,clear_memory=False):
         """Runs a single match configuration using the AgentFactory."""
         env = LiarsDeckEnv(num_players=3, render_mode=None)
         players_for_eval: Dict[str, BaseAgent] = {} # Maps env_id -> Agent object
@@ -297,7 +302,8 @@ class BattlegroundWorker(QThread):
                 two_player=self.two_player,
                 track_experts=True,
                 progress_callback=progress_callback,
-                cheat_expert_index=cheat_expert_index
+                cheat_expert_index=cheat_expert_index,
+                clear_memory=clear_memory,
             )
 
             # Return wins keyed by unique player_id, expert activations, AND the map
@@ -419,6 +425,10 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
         self.cheat_checkbox = QtWidgets.QCheckBox("Cheat (Expert Index)"); self.cheat_checkbox.setToolTip("Provide opponent type index via LABELS.")
         options_layout.addWidget(self.cheat_checkbox)
         control_layout.addWidget(options_group)
+        
+        self.clear_memory_checkbox = QtWidgets.QCheckBox("Clear Memory")
+        self.clear_memory_checkbox.setToolTip("If enabled, clears belief memory and sequence history after each game.")
+        options_layout.addWidget(self.clear_memory_checkbox)
 
         control_layout.addStretch(2)
         self.start_button = QtWidgets.QPushButton(" Start Battleground "); self.start_button.setStyleSheet("padding: 8px 15px; font-weight: bold;")
@@ -608,6 +618,7 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
 
         two_player_param = "player_1" if self.two_player_checkbox.isChecked() else None
         cheat_flag = self.cheat_checkbox.isChecked()
+        clear_memory_flag = self.clear_memory_checkbox.isChecked()
         # Determine mode from radio buttons
         onev2_enabled = self.onev2_mode_radio.isChecked()
         duo_enabled = self.duo_mode_radio.isChecked()
@@ -650,7 +661,8 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
             two_player=two_player_param,
             cheat=cheat_flag,
             onev2=onev2_enabled,
-            duo=duo_enabled
+            duo=duo_enabled,
+            clear_memory=clear_memory_flag
         )
         self.worker.progress_signal.connect(self.update_progress)
         self.worker.results_signal.connect(self.on_results_received) # Connect to handler
