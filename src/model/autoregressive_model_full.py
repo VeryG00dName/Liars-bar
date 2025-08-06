@@ -11,7 +11,8 @@ class AutoregressiveGameModelFull(nn.Module):
                  num_heads=4,
                  num_layers=2,
                  dropout_rate=0.1,
-                 max_seq_length=20):
+                 max_seq_length=20,
+                 num_agent_types=3): # Added num_agent_types (0: Agent, 1: Opponent 0, 2: Opponent 1)
         super().__init__()
         self.obs_dim = obs_dim
         self.action_dim = action_dim
@@ -30,7 +31,8 @@ class AutoregressiveGameModelFull(nn.Module):
         )
 
         self.action_embedding = nn.Embedding(self.extended_action_dim, hidden_dim)
-        self.agent_embedding = nn.Embedding(2, hidden_dim)
+        # Use num_agent_types (3) for the embedding
+        self.agent_embedding = nn.Embedding(num_agent_types, hidden_dim)
         self.position_embedding = nn.Embedding(max_seq_length, hidden_dim)
 
         encoder_layer = nn.TransformerEncoderLayer(
@@ -47,13 +49,15 @@ class AutoregressiveGameModelFull(nn.Module):
         )
 
         # Output Heads
-        self.action_head = nn.Linear(hidden_dim*2, action_dim)
-        self.opp_action_head = nn.Linear(hidden_dim*2, action_dim)
+        # Action head for the training agent (0)
+        self.action_head = nn.Linear(hidden_dim*2, action_dim) 
+        # Opponent action head (for types 1 and 2)
+        self.opp_action_head = nn.Linear(hidden_dim*2, action_dim) 
         self.value_head = nn.Linear(hidden_dim*2, 1)
 
         # Belief prediction (one shared head, run twice with one-hot opponent indicator)
         self.belief_fc = nn.Linear(hidden_dim, hidden_dim)
-        self.belief_head = nn.Linear(hidden_dim + 2, belief_dim)
+        self.belief_head = nn.Linear(hidden_dim + 2, belief_dim) # Add 2 for one-hot opponent ID
 
         self.register_buffer("onehot_0_base", torch.tensor([1, 0], dtype=torch.float32))
         self.register_buffer("onehot_1_base", torch.tensor([0, 1], dtype=torch.float32))
@@ -64,18 +68,6 @@ class AutoregressiveGameModelFull(nn.Module):
                       agent_types=None, positions=None, action_masks=None):
         """
         Encode all inputs into a unified sequence representation.
-        
-        Args:
-            obs_sequence: Tensor of shape ``[batch_size, seq_len, obs_dim]`` or ``None``
-            belief_sequence: Optional tensor of shape ``[batch_size, seq_len, belief_dim]``
-            action_sequence: Tensor of shape ``[batch_size, seq_len]`` with previous actions
-            agent_types: Tensor of shape ``[batch_size, seq_len]`` where 0 denotes the
-                training agent and 1 an opponent
-            positions: Tensor of shape ``[batch_size, seq_len]`` indicating positions
-            action_masks: Optional tensor of shape ``[batch_size, seq_len, action_dim]``
-        
-        Returns:
-            Tensor of shape [batch_size, seq_len, hidden_dim]
         """
         batch_size, seq_len = action_sequence.shape
         device = action_sequence.device
@@ -87,7 +79,7 @@ class AutoregressiveGameModelFull(nn.Module):
         action_embedded = self.action_embedding(action_sequence)
         combined += action_embedded
         
-        # 2. Embed agent types (all steps)
+        # 2. Embed agent types (0, 1, or 2)
         agent_embedded = self.agent_embedding(agent_types)
         combined += agent_embedded
         
@@ -95,9 +87,9 @@ class AutoregressiveGameModelFull(nn.Module):
         position_embedded = self.position_embedding(positions)
         combined += position_embedded
         
-        # 4. Encode observations (only for training agent turns)
+        # 4. Encode observations (only for training agent turns, agent_type=0)
         if obs_sequence is not None:
-            # Create a mask for training agent turns
+            # Create a mask for training agent turns (agent_type 0)
             training_agent_mask = (agent_types == 0).unsqueeze(-1)
             
             # Encode observations
@@ -116,7 +108,12 @@ class AutoregressiveGameModelFull(nn.Module):
 
     def _generate_padding_mask(self, seq_len, valid_lens, device):
         batch_size = valid_lens.size(0)
-        return torch.arange(seq_len, device=device).expand(batch_size, seq_len) >= valid_lens.unsqueeze(1)
+        # We need to ensure valid_lens is on the same device as the sequence.
+        valid_lens_device = valid_lens.to(device) 
+        
+        # Create a mask where True indicates padding (should be ignored by attention)
+        mask = torch.arange(seq_len, device=device).expand(batch_size, seq_len) >= valid_lens_device.unsqueeze(1)
+        return mask
 
     def forward(self, obs_sequence=None, action_sequence=None,
                 agent_types=None, positions=None, action_masks=None, valid_lengths=None):
@@ -129,7 +126,10 @@ class AutoregressiveGameModelFull(nn.Module):
             agent_types, positions, action_masks
         )
 
+        # Causal mask ensures we only attend to past inputs
         causal_mask = self._generate_causal_mask(seq_len, device)
+        
+        # Padding mask handles variable sequence lengths
         padding_mask = self._generate_padding_mask(seq_len, valid_lengths, device) if valid_lengths is not None else None
 
         transformer_output = self.transformer(
@@ -139,8 +139,11 @@ class AutoregressiveGameModelFull(nn.Module):
         )
 
         # Shared hidden layer for belief prediction
+        # Belief prediction is done based on the agent's current hidden state.
         belief_hidden = F.relu(self.belief_fc(transformer_output))
 
+        # One-hot encoding for the target opponent slot (0 or 1)
+        # We assume the model predicts beliefs for both opponent slots simultaneously.
         onehot_0 = self.onehot_0_base.view(1, 1, 2).expand(batch_size, seq_len, 2)
         onehot_1 = self.onehot_1_base.view(1, 1, 2).expand(batch_size, seq_len, 2)
 
@@ -150,7 +153,7 @@ class AutoregressiveGameModelFull(nn.Module):
         belief_logits_0 = self.belief_head(belief_input_0)
         belief_logits_1 = self.belief_head(belief_input_1)
 
-        # Inject belief influence into transformer output
+        # Inject belief influence into transformer output (e.g., using belief hidden)
         fused_output = torch.cat([transformer_output, belief_hidden], dim=-1)
 
         action_logits = self.action_head(fused_output)
@@ -158,6 +161,8 @@ class AutoregressiveGameModelFull(nn.Module):
         state_values = self.value_head(fused_output)
 
         if action_masks is not None:
-            action_logits = action_logits.masked_fill(~action_masks.bool(), float('-inf'))
+            # Mask actions logits for the training agent (type 0)
+            agent_mask = (agent_types == 0).unsqueeze(-1).expand_as(action_logits)
+            action_logits = torch.where(agent_mask, action_logits.masked_fill(~action_masks.bool(), float('-inf')), action_logits)
 
         return action_logits, opp_logits, state_values, belief_logits_0, belief_logits_1

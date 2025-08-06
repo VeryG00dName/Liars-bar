@@ -191,7 +191,7 @@ class AutoregressiveGameDataset(Dataset):
             hand_vec = obs_7d[:2]
             hand_sizes = obs_7d[4:]  # Length 3: hand sizes of all agents
             opp_hand_sizes = [hand_sizes[i] for i in range(3) if i != agent_id]
-            return np.round(np.concatenate([hand_vec, opp_hand_sizes]).astype(np.float16), 2)
+            return np.round(np.concatenate([hand_vec, opp_hand_sizes]).astype(np.float32), 2)
 
         for round_data in tqdm(data, desc="Processing sequences"):
             sequence = round_data["sequence"]
@@ -204,6 +204,7 @@ class AutoregressiveGameDataset(Dataset):
 
             raw_actions = []
             raw_target_actions = []
+            
             for step in sequence:
                 is_train = step.get("is_training_agent", step.get("agent_id", 0) == 0)
                 if "action" in step:
@@ -212,13 +213,13 @@ class AutoregressiveGameDataset(Dataset):
                 elif is_train and "expert_action" in step:
                     a = step["chosen_action"]
                     b = step["expert_action"]
-                if not is_train and "transformed_action" in step:
+                # Opponent action logic
+                elif not is_train and "transformed_action" in step:
                     a = step["transformed_action"]
-                raw_target_actions.append(b)
-                raw_actions.append(a)
+                    b = step["transformed_action"] # Target action is the transformed one
 
-            raw_actions = [6 if a == 10 else a for a in raw_actions]
-            raw_target_actions = [6 if a == 10 else a for a in raw_target_actions]
+                raw_target_actions.append(6 if b == 10 else b) # Normalize actions
+                raw_actions.append(6 if a == 10 else a)
 
             PAD = 0
             input_actions  = [PAD] + raw_actions[:-1]
@@ -244,44 +245,45 @@ class AutoregressiveGameDataset(Dataset):
             }
 
             for i, step in enumerate(sequence):
-                is_train = step.get("is_training_agent", step.get("agent_id", 0) == 0)
-                agent_type_list.append(0 if is_train else 1)
+                # Determine agent type based on ID
+                # 0: Training Agent, 1: Opponent 0, 2: Opponent 1
+                agent_id = step.get("agent_id", 0)
+                agent_type_list.append(agent_id)
                 position_list.append(i)
 
-                if is_train:
+                # Observations are only provided for the training agent (ID 0)
+                if agent_id == 0:
                     obs = np.array(step["observation"], dtype=np.float32)
                     if obs.shape[0] == 7:
                         obs = convert_old_obs_to_new(obs, agent_id=0)
                     elif obs.shape[0] != 4:
                         print(f"⚠️ Unexpected obs shape at step {i}: {obs.shape}, skipping sequence.")
-                        obs = np.zeros(4, dtype=np.float16)
+                        obs = np.zeros(4, dtype=np.float32)
                         self.obs_trimmed_count += 1
                     obs_list.append(obs)
                 else:
-                    obs_list.append(np.zeros(4, dtype=np.float16))
+                    obs_list.append(np.zeros(4, dtype=np.float32))
 
-                if is_train and "action_mask" in step:
+                # Action masks are only for the training agent
+                if agent_id == 0 and "action_mask" in step:
                     action_mask_list.append(step["action_mask"])
                 else:
                     action_mask_list.append([0] * 7)
 
+                # Belief targets (agent types for opponent 0 and 1)
                 if "belief" in step:
                     has_belief = True
                     names = step["belief"]
                     full_belief = []
 
+                    # We expect belief to be a list of 2 opponent names
                     for opp_idx in range(2):
                         if opp_idx < len(names):
                             name = names[opp_idx]
-                            idx = LABELS.get(name, None)
-
-                            if idx is not None:
-                                full_belief.append(idx)
-                            else:
-                                # Unknown belief → fallback (e.g., uniform random, or just 0)
-                                full_belief.append(0)
+                            idx = LABELS.get(name, 0)
+                            full_belief.append(idx)
                         else:
-                            # Missing opponent → fallback
+                            # Missing opponent → fallback to 0 (Classic)
                             full_belief.append(0)
 
                     latest_belief_vector = np.array(full_belief, dtype=np.int64)  # shape: [2]
@@ -289,17 +291,29 @@ class AutoregressiveGameDataset(Dataset):
 
                 elif has_belief and latest_belief_vector is not None:
                     belief_list.append(latest_belief_vector)
+                
+                # If no belief information is ever provided in the sequence, skip
+                if not has_belief and i == seq_len - 1:
+                    print(f"Skipping sequence due to missing belief information.")
+                    self.total_sequences -= 1
+                    self.sequence_lengths.pop()
+                    continue
 
             # Convert to tensors
-            obs_tensor        = torch.tensor(np.stack(obs_list),       dtype=torch.float16, device=device)
+            obs_tensor        = torch.tensor(np.stack(obs_list),       dtype=torch.float32, device=device)
             action_tensor     = torch.tensor(input_actions,            dtype=torch.long,    device=device)
             target_tensor     = torch.tensor(target_actions,           dtype=torch.long,    device=device)
             mask_tensor       = torch.tensor(np.array(action_mask_list), dtype=torch.bool,  device=device)
             agent_type_tensor = torch.tensor(agent_type_list,          dtype=torch.long,    device=device)
             position_tensor   = torch.tensor(position_list,            dtype=torch.long,    device=device)
+            
             belief_tensor = None
-            if has_belief:
+            if has_belief and latest_belief_vector is not None:
                 belief_tensor = torch.tensor(np.stack(belief_list), dtype=torch.long, device=device)
+            
+            # If still no belief tensor, skip
+            if belief_tensor is None:
+                continue
 
             attention_mask = torch.triu(
                 torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
@@ -315,10 +329,9 @@ class AutoregressiveGameDataset(Dataset):
                 "position":       position_tensor,
                 "attention_mask": attention_mask,
                 "length":         seq_len,
-                "round_id":       round_data.get("round_id", round_data.get("game_id", None))
+                "round_id":       round_data.get("round_id", round_data.get("game_id", None)),
+                "belief":         belief_tensor
             }
-            if belief_tensor is not None:
-                seq_dict["belief"] = belief_tensor
 
             self.sequences.append(seq_dict)
 
@@ -341,12 +354,6 @@ def collate_variable_length_sequences(batch):
     Custom collate function for batching variable-length sequences.
     
     This handles padding sequences to the same length within a batch.
-    
-    Args:
-        batch: List of sequence dictionaries
-        
-    Returns:
-        Dictionary with batched tensors
     """
     # Find max sequence length in this batch
     max_seq_len = max([seq['length'] for seq in batch])
@@ -358,16 +365,14 @@ def collate_variable_length_sequences(batch):
     first_seq = batch[0]
     device = first_seq['obs'].device
     obs_dim = first_seq['obs'].shape[1]
-    has_belief = 'belief' in first_seq and first_seq['belief'] is not None
-    belief_dim = first_seq['belief'].shape[1] if has_belief else 0
+    belief_dim = first_seq['belief'].shape[1] # Should be 2 (number of opponents)
 
     # Initialize tensors for the batch
-    batched_obs = torch.zeros(batch_size, max_seq_len, obs_dim, device=device)
+    batched_obs = torch.zeros(batch_size, max_seq_len, obs_dim, dtype=torch.float32, device=device)
     batched_action = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
     batched_target_action = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
     batched_action_mask = torch.zeros(batch_size, max_seq_len, 7, dtype=torch.bool, device=device)
-    if has_belief:
-        batched_belief = torch.zeros(batch_size, max_seq_len, belief_dim, dtype=torch.long, device=device)
+    batched_belief = torch.zeros(batch_size, max_seq_len, belief_dim, dtype=torch.long, device=device)
     batched_agent_type = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
     batched_position = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
     
@@ -390,8 +395,7 @@ def collate_variable_length_sequences(batch):
         batched_action[i, :seq_len] = seq['action']
         batched_target_action[i, :seq_len] = seq['target_action']
         batched_action_mask[i, :seq_len] = seq['action_mask']
-        if has_belief:
-            batched_belief[i, :seq_len] = seq['belief']
+        batched_belief[i, :seq_len] = seq['belief']
         batched_agent_type[i, :seq_len] = seq['agent_type']
         batched_position[i, :seq_len] = seq['position']
         
@@ -411,10 +415,9 @@ def collate_variable_length_sequences(batch):
         'position': batched_position,
         'padding_mask': padding_mask,
         'lengths': lengths,
-        'round_ids': round_ids
+        'round_ids': round_ids,
+        'belief': batched_belief # Belief targets
     }
-    if has_belief:
-        batch_dict['belief'] = batched_belief
     return batch_dict
 
 def load_autoreg_data(data_dir, max_files=None, max_samples=None):
@@ -518,44 +521,57 @@ def calculate_autoregressive_loss(
     padding_mask,
     belief_logits_0=None,
     belief_logits_1=None,
-    belief_targets_0=None,
-    belief_targets_1=None,
+    belief_targets=None,
     value_pred=None,
     value_target=None,
     belief_loss_weight=1.0
 ):
     device = self_logits.device
     valid = ~padding_mask
+    
+    # Agent type 0: Training Agent
     our_mask = valid & (agent_types == 0)
-    opp_mask = valid & (agent_types == 1)
-    belief_mask = agent_types == 0  # Only your turn
-    belief_loss = torch.tensor(0.0, device=device)
+    # Agent types 1 and 2: Opponents
+    opp_mask = valid & ((agent_types == 1) | (agent_types == 2))
+    
+    # Belief loss only applies when it's our turn
+    belief_mask = agent_types == 0
+    
     flat_targets = target_actions.reshape(-1)
     flat_self_logits = self_logits.reshape(-1, self_logits.size(-1))
     flat_opp_logits = opp_logits.reshape(-1, opp_logits.size(-1))
+    
     flat_our_mask = our_mask.reshape(-1)
     flat_opp_mask = opp_mask.reshape(-1)
-    flat_belief_logits_0 = belief_logits_0.reshape(-1, belief_logits_0.size(-1))
-    flat_belief_targets_0 = belief_targets_0.reshape(-1)
-
-    flat_belief_logits_1 = belief_logits_1.reshape(-1, belief_logits_1.size(-1))
-    flat_belief_targets_1 = belief_targets_1.reshape(-1)
-
     flat_belief_mask = belief_mask.reshape(-1)
     
-    # your‐agent loss
-    our_loss = F.cross_entropy(flat_self_logits[flat_our_mask], flat_targets[flat_our_mask]) if flat_our_mask.sum() > 0 else torch.tensor(0.0, device=device)
-    # opponent loss
-    opp_loss = F.cross_entropy(flat_opp_logits[flat_opp_mask], flat_targets[flat_opp_mask]) if flat_opp_mask.sum() > 0 else torch.tensor(0.0, device=device)
+    # your-agent loss (using self_logits)
+    our_loss = F.cross_entropy(
+        flat_self_logits[flat_our_mask], 
+        flat_targets[flat_our_mask]
+    ) if flat_our_mask.sum() > 0 else torch.tensor(0.0, device=device)
+    
+    # opponent loss (using opp_logits)
+    opp_loss = F.cross_entropy(
+        flat_opp_logits[flat_opp_mask], 
+        flat_targets[flat_opp_mask]
+    ) if flat_opp_mask.sum() > 0 else torch.tensor(0.0, device=device)
 
     # belief loss
-    if belief_logits_0 is not None and belief_targets_0 is not None:
+    belief_loss = torch.tensor(0.0, device=device)
+    if belief_logits_0 is not None and belief_targets is not None:
+        flat_belief_logits_0 = belief_logits_0.reshape(-1, belief_logits_0.size(-1))
+        flat_belief_targets_0 = belief_targets[:, :, 0].reshape(-1)
+        
         belief_loss += F.cross_entropy(
             flat_belief_logits_0[flat_belief_mask],
             flat_belief_targets_0[flat_belief_mask]
         )
 
-    if belief_logits_1 is not None and belief_targets_1 is not None:
+    if belief_logits_1 is not None and belief_targets is not None:
+        flat_belief_logits_1 = belief_logits_1.reshape(-1, belief_logits_1.size(-1))
+        flat_belief_targets_1 = belief_targets[:, :, 1].reshape(-1)
+        
         belief_loss += F.cross_entropy(
             flat_belief_logits_1[flat_belief_mask],
             flat_belief_targets_1[flat_belief_mask]
@@ -567,6 +583,7 @@ def calculate_autoregressive_loss(
         flat_vt = value_target[valid]
         value_loss = F.mse_loss(flat_vp, flat_vt)
 
+    # Action loss weighting: Agent actions are weighted higher (e.g., 2.0)
     action_loss = 2.0 * our_loss + 1.0 * opp_loss
     total_loss = action_loss + 0.5 * value_loss + belief_loss_weight * belief_loss
     return total_loss, our_loss, opp_loss, value_loss, belief_loss
@@ -578,19 +595,24 @@ def compute_accuracy(logits, targets, mask=None):
     Args:
         logits: Tensor of shape [batch_size, seq_len, num_classes]
         targets: Tensor of shape [batch_size, seq_len]
-        mask: Tensor of shape [batch_size, seq_len] (1=invalid, 0=valid)
+        mask: Tensor of shape [batch_size, seq_len] (Boolean mask, True=valid, False=invalid)
         
     Returns:
         float: Accuracy value
     """
     with torch.no_grad():
-        preds = logits.argmax(dim=-1)
+        if logits.dim() == 3:
+            preds = logits.argmax(dim=-1)
+        elif logits.dim() == 2:
+            preds = logits.argmax(dim=-1)
+        else:
+            return 0.0
+
         correct = (preds == targets)
         
         if mask is not None:
-            valid_mask = ~mask
-            correct = correct & valid_mask
-            total = valid_mask.sum().item()
+            correct = correct & mask
+            total = mask.sum().item()
             return correct.sum().item() / total if total > 0 else 0.0
         return correct.float().mean().item()
 
@@ -652,7 +674,8 @@ def train_autoregressive_model(
         num_heads=4,
         num_layers=2,
         dropout_rate=0.1,
-        max_seq_length=max_seq_length
+        max_seq_length=max_seq_length,
+        num_agent_types=3 # 0: Agent, 1: Opponent 0, 2: Opponent 1
     ).to(device)
     logger.info(f"Model architecture:\n{model}")
     total_params = sum(p.numel() for p in model.parameters())
@@ -664,7 +687,7 @@ def train_autoregressive_model(
 
     start_epoch, best_val_loss = 0, float('inf')
     if resume_from and os.path.exists(resume_from):
-        checkpoint = torch.load(resume_from, map_location=device)
+        checkpoint = torch.load(resume_from, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
@@ -694,14 +717,12 @@ def train_autoregressive_model(
                 obs_sequence=batch['obs'],
                 action_sequence=batch['action'],
                 agent_types=batch['agent_type'],
-                positions=batch['position']
+                positions=batch['position'],
+                valid_lengths=batch['lengths']
             )
 
-            belief_targets = batch['belief']  # shape: [B, T, 2 * num_opponent_types]
-            bt = belief_targets.shape[-1] // 2
-            belief_targets_0 = belief_targets[:, :, :bt]
-            belief_targets_1 = belief_targets[:, :, bt:]
-
+            belief_targets = batch['belief']
+            
             total_loss, self_loss, opp_loss, value_loss, belief_loss = calculate_autoregressive_loss(
                 self_logits=self_logits,
                 opp_logits=opp_logits,
@@ -710,8 +731,7 @@ def train_autoregressive_model(
                 padding_mask=batch['padding_mask'],
                 belief_logits_0=belief_logits_0,
                 belief_logits_1=belief_logits_1,
-                belief_targets_0=belief_targets_0,
-                belief_targets_1=belief_targets_1,
+                belief_targets=belief_targets,
                 value_pred=value_pred,
                 value_target=None
             )
@@ -730,17 +750,25 @@ def train_autoregressive_model(
             train_batches    += 1
 
             # compute accuracies
+            # Agent type 0: Agent
             our_mask     = (batch['agent_type'] == 0) & (~batch['padding_mask'])
-            opp_mask     = (batch['agent_type'] == 1) & (~batch['padding_mask'])
-            agent_acc    = compute_accuracy(self_logits, batch['target_action'], ~our_mask)
-            opponent_acc = compute_accuracy(opp_logits,  batch['target_action'], ~opp_mask)
+            # Agent types 1 or 2: Opponent
+            opp_mask     = ((batch['agent_type'] == 1) | (batch['agent_type'] == 2)) & (~batch['padding_mask'])
+            
+            agent_acc    = compute_accuracy(self_logits, batch['target_action'], our_mask)
+            opponent_acc = compute_accuracy(opp_logits,  batch['target_action'], opp_mask)
             train_agent_acc    += agent_acc
             train_opponent_acc += opponent_acc
 
-            if belief_logits_0 is not None and belief_targets_0 is not None:
+            if belief_logits_0 is not None and belief_targets is not None:
+                belief_targets_0 = belief_targets[:, :, 0]
+                belief_targets_1 = belief_targets[:, :, 1]
                 
-                acc_belief_0 = compute_accuracy(belief_logits_0, belief_targets_0.squeeze(-1), ~our_mask)
-                acc_belief_1 = compute_accuracy(belief_logits_1, belief_targets_1.squeeze(-1), ~our_mask)
+                # Belief accuracy is only relevant on the agent's turn (type 0)
+                belief_eval_mask = our_mask 
+
+                acc_belief_0 = compute_accuracy(belief_logits_0, belief_targets_0, belief_eval_mask)
+                acc_belief_1 = compute_accuracy(belief_logits_1, belief_targets_1, belief_eval_mask)
 
                 train_belief_acc_0 += acc_belief_0
                 train_belief_acc_1 += acc_belief_1
@@ -782,13 +810,11 @@ def train_autoregressive_model(
                     obs_sequence=batch['obs'],
                     action_sequence=batch['action'],
                     agent_types=batch['agent_type'],
-                    positions=batch['position']
+                    positions=batch['position'],
+                    valid_lengths=batch['lengths']
                 )
 
-                belief_targets = batch['belief']  # shape: [B, T, 2 * num_opponent_types]
-                bt = belief_targets.shape[-1] // 2
-                belief_targets_0 = belief_targets[:, :, :bt]
-                belief_targets_1 = belief_targets[:, :, bt:]
+                belief_targets = batch['belief']
 
                 total_loss, self_loss, opp_loss, value_loss, belief_loss = calculate_autoregressive_loss(
                     self_logits=self_logits,
@@ -798,16 +824,16 @@ def train_autoregressive_model(
                     padding_mask=batch['padding_mask'],
                     belief_logits_0=belief_logits_0,
                     belief_logits_1=belief_logits_1,
-                    belief_targets_0=belief_targets_0,
-                    belief_targets_1=belief_targets_1,
+                    belief_targets=belief_targets,
                     value_pred=value_pred,
                     value_target=None
                 )
 
                 our_mask     = (batch['agent_type'] == 0) & (~batch['padding_mask'])
-                opp_mask     = (batch['agent_type'] == 1) & (~batch['padding_mask'])
-                agent_acc    = compute_accuracy(self_logits, batch['target_action'], ~our_mask)
-                opponent_acc = compute_accuracy(opp_logits, batch['target_action'], ~opp_mask)
+                opp_mask     = ((batch['agent_type'] == 1) | (batch['agent_type'] == 2)) & (~batch['padding_mask'])
+                
+                agent_acc    = compute_accuracy(self_logits, batch['target_action'], our_mask)
+                opponent_acc = compute_accuracy(opp_logits, batch['target_action'], opp_mask)
                 val_agent_acc    += agent_acc
                 val_opponent_acc += opponent_acc
 
@@ -818,9 +844,14 @@ def train_autoregressive_model(
                 val_belief_loss  += belief_loss.item()
                 val_batches      += 1
 
-                if belief_logits_0 is not None:
-                    acc_0 = compute_accuracy(belief_logits_0, belief_targets_0.squeeze(-1), ~our_mask)
-                    acc_1 = compute_accuracy(belief_logits_1, belief_targets_1.squeeze(-1), ~our_mask)
+                if belief_logits_0 is not None and belief_targets is not None:
+                    belief_targets_0 = belief_targets[:, :, 0]
+                    belief_targets_1 = belief_targets[:, :, 1]
+                    
+                    belief_eval_mask = our_mask
+                    
+                    acc_0 = compute_accuracy(belief_logits_0, belief_targets_0, belief_eval_mask)
+                    acc_1 = compute_accuracy(belief_logits_1, belief_targets_1, belief_eval_mask)
 
                     val_belief_acc_0 += acc_0
                     val_belief_acc_1 += acc_1
