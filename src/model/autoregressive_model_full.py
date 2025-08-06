@@ -68,6 +68,17 @@ class AutoregressiveGameModelFull(nn.Module):
                       agent_types=None, positions=None, action_masks=None):
         """
         Encode all inputs into a unified sequence representation.
+        
+        Args:
+            obs_sequence: Tensor of shape ``[batch_size, seq_len, obs_dim]`` or ``None``
+            belief_sequence: Optional tensor of shape ``[batch_size, seq_len, belief_dim]``
+            agent_types: Tensor of shape ``[batch_size, seq_len]`` where 0 denotes the
+                training agent and 1 an opponent
+            positions: Tensor of shape ``[batch_size, seq_len]`` indicating positions
+            action_masks: Optional tensor of shape ``[batch_size, seq_len, action_dim]``
+        
+        Returns:
+            Tensor of shape [batch_size, seq_len, hidden_dim]
         """
         batch_size, seq_len = action_sequence.shape
         device = action_sequence.device
@@ -79,7 +90,7 @@ class AutoregressiveGameModelFull(nn.Module):
         action_embedded = self.action_embedding(action_sequence)
         combined += action_embedded
         
-        # 2. Embed agent types (0, 1, or 2)
+        # 2. Embed agent types (all steps)
         agent_embedded = self.agent_embedding(agent_types)
         combined += agent_embedded
         
@@ -87,9 +98,9 @@ class AutoregressiveGameModelFull(nn.Module):
         position_embedded = self.position_embedding(positions)
         combined += position_embedded
         
-        # 4. Encode observations (only for training agent turns, agent_type=0)
+        # 4. Encode observations (only for training agent turns)
         if obs_sequence is not None:
-            # Create a mask for training agent turns (agent_type 0)
+            # Create a mask for training agent turns
             training_agent_mask = (agent_types == 0).unsqueeze(-1)
             
             # Encode observations
@@ -108,12 +119,7 @@ class AutoregressiveGameModelFull(nn.Module):
 
     def _generate_padding_mask(self, seq_len, valid_lens, device):
         batch_size = valid_lens.size(0)
-        # We need to ensure valid_lens is on the same device as the sequence.
-        valid_lens_device = valid_lens.to(device) 
-        
-        # Create a mask where True indicates padding (should be ignored by attention)
-        mask = torch.arange(seq_len, device=device).expand(batch_size, seq_len) >= valid_lens_device.unsqueeze(1)
-        return mask
+        return torch.arange(seq_len, device=device).expand(batch_size, seq_len) >= valid_lens.unsqueeze(1)
 
     def forward(self, obs_sequence=None, action_sequence=None,
                 agent_types=None, positions=None, action_masks=None, valid_lengths=None):
@@ -159,10 +165,5 @@ class AutoregressiveGameModelFull(nn.Module):
         action_logits = self.action_head(fused_output)
         opp_logits = self.opp_action_head(fused_output)
         state_values = self.value_head(fused_output)
-
-        if action_masks is not None:
-            # Mask actions logits for the training agent (type 0)
-            agent_mask = (agent_types == 0).unsqueeze(-1).expand_as(action_logits)
-            action_logits = torch.where(agent_mask, action_logits.masked_fill(~action_masks.bool(), float('-inf')), action_logits)
 
         return action_logits, opp_logits, state_values, belief_logits_0, belief_logits_1
