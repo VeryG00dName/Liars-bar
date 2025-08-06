@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class AutoregressiveGameModel(nn.Module):
+class AutoregressiveGameModelFull(nn.Module):
     def __init__(self,
                  obs_dim,
                  action_dim=7,
@@ -60,20 +60,52 @@ class AutoregressiveGameModel(nn.Module):
 
         self.null_token = nn.Parameter(torch.zeros(hidden_dim))
 
-    def _encode_inputs(self, obs_sequence, action_sequence, agent_types, positions, action_masks=None):
+    def _encode_inputs(self, obs_sequence, action_sequence=None,
+                      agent_types=None, positions=None, action_masks=None):
+        """
+        Encode all inputs into a unified sequence representation.
+        
+        Args:
+            obs_sequence: Tensor of shape ``[batch_size, seq_len, obs_dim]`` or ``None``
+            belief_sequence: Optional tensor of shape ``[batch_size, seq_len, belief_dim]``
+            action_sequence: Tensor of shape ``[batch_size, seq_len]`` with previous actions
+            agent_types: Tensor of shape ``[batch_size, seq_len]`` where 0 denotes the
+                training agent and 1 an opponent
+            positions: Tensor of shape ``[batch_size, seq_len]`` indicating positions
+            action_masks: Optional tensor of shape ``[batch_size, seq_len, action_dim]``
+        
+        Returns:
+            Tensor of shape [batch_size, seq_len, hidden_dim]
+        """
         batch_size, seq_len = action_sequence.shape
         device = action_sequence.device
+        
+        # Initialize combined representation with zeros
         combined = torch.zeros(batch_size, seq_len, self.hidden_dim, device=device)
-
-        combined += self.action_embedding(action_sequence)
-        combined += self.agent_embedding(agent_types)
-        combined += self.position_embedding(positions)
-
+        
+        # 1. Embed actions (all steps)
+        action_embedded = self.action_embedding(action_sequence)
+        combined += action_embedded
+        
+        # 2. Embed agent types (all steps)
+        agent_embedded = self.agent_embedding(agent_types)
+        combined += agent_embedded
+        
+        # 3. Embed positions (all steps)
+        position_embedded = self.position_embedding(positions)
+        combined += position_embedded
+        
+        # 4. Encode observations (only for training agent turns)
         if obs_sequence is not None:
-            training_mask = (agent_types == 0).unsqueeze(-1)
+            # Create a mask for training agent turns
+            training_agent_mask = (agent_types == 0).unsqueeze(-1)
+            
+            # Encode observations
             obs_encoded = self.obs_encoder(obs_sequence)
-            combined += obs_encoded * training_mask
-
+            
+            # Only add observation encoding for training agent turns
+            combined += (obs_encoded * training_agent_mask)
+        
         return combined
 
     def _generate_causal_mask(self, seq_len, device):
