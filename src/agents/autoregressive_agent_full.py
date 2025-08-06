@@ -200,99 +200,102 @@ class AutoregressiveAgentFull(BaseAgent):
         if self.model is None:
             raise RuntimeError(f"AR-Full model not loaded for player {self.player_id}")
 
-        # --- Initialize agent ID mapping on the first call of a game ---
+        # --- 1. One-time Initialization ---
         if self.env_agent_id_map is None:
             opponents = sorted([p for p in env.possible_agents if p != agent_id_env])
             self.env_agent_id_map = {agent_id_env: 0}
             if len(opponents) > 0: self.env_agent_id_map[opponents[0]] = 1
             if len(opponents) > 1: self.env_agent_id_map[opponents[1]] = 2
 
-        # --- History Management: Reset on new game ---
+        # --- 2. Check for New Game Start (and clear history if so) ---
         if len(env.players_hands[agent_id_env]) == 5 and all(p == 0 for p in env.penalties.values()):
             self.sequence_history.clear()
+            logger.debug(f"Agent {self.player_id}: New game detected, history cleared.")
 
-        # --- 1. Update (mask) previous opponent turns with true actions ---
-        opp_ids = [p for p in env.possible_agents if p != agent_id_env]
-        for opp_id in opp_ids:
-            # Find the most recent turn for this opponent in our history
-            for i in range(len(self.sequence_history) - 1, -1, -1):
-                if self.sequence_history[i]["agent_id_env"] == opp_id:
-                    # Get the true action taken from the environment
-                    raw_action = env.last_agent_action.get(opp_id)
-                    masked_value = None
-                    if raw_action is not None:
-                        real_type, _, real_count = decode_action(raw_action)
-                        if real_type == "Play":
-                            masked_value = self.CARD_COUNT_MAPPING.get(real_count)
-                        elif real_type == "Challenge":
-                            masked_value = 6 # Standard challenge action index
-                    
-                    self.sequence_history[i]["masked_action"] = masked_value
-                    break # Move to the next opponent
-        # --- 2. Prepare and append the current agent's step ---
+        # --- 3. Reactively Append Opponent Actions Since Our Last Turn ---
+        turn_order = env.agents # Current round's active agents
+        if not turn_order: # Skip if no one is active
+             pass
+        else:
+            last_agent_in_history = self.sequence_history[-1]["agent_id_env"] if self.sequence_history else None
+
+            agents_to_add = []
+            if last_agent_in_history is None:
+                # First turn of the game for us; add everyone who played before us.
+                try:
+                    our_idx = turn_order.index(agent_id_env)
+                    agents_to_add = turn_order[:our_idx]
+                except ValueError: pass # We are not in the turn order, do nothing.
+            elif last_agent_in_history != agent_id_env:
+                # This logic catches up on opponent moves that happened since we last recorded something.
+                try:
+                    # Use a cycle to handle round wrap-around
+                    turn_cycle = turn_order * 2
+                    start_idx = turn_cycle.index(last_agent_in_history)
+                    our_idx = turn_cycle.index(agent_id_env, start_idx + 1)
+                    agents_to_add = turn_cycle[start_idx + 1 : our_idx]
+                except ValueError: pass # An agent was eliminated, skip update.
+
+            for opp_id in agents_to_add:
+                raw_action = env.last_agent_action.get(opp_id)
+                if raw_action is None: continue
+
+                real_type, _, real_count = decode_action(raw_action)
+                if real_type == "Play":
+                    masked_value = self.CARD_COUNT_MAPPING[real_count] # Default to 10 if count invalid
+                elif real_type == "Challenge":
+                    masked_value = 6
+                else:
+                    continue
+
+                self.sequence_history.append({
+                    "agent_id_env": opp_id,
+                    "action": raw_action,
+                    "masked_action": masked_value,
+                    "observation": [0.0] * self.obs_dim,
+                    "action_mask": [0] * self.action_dim,
+                })
+
+        # --- 4. Append Our Current Step (observation only) ---
         current_step_info = {
             "agent_id_env": agent_id_env,
             "observation": list(env.observe(agent_id_env, newest=True)[agent_id_env]),
             "action_mask": info["action_mask"]
         }
         self.sequence_history.append(current_step_info)
-        print("Current sequence history:", self.sequence_history)
-        # --- 3. Prepare model input and predict action ---
+
+        # --- 5. Prepare Input and Predict Action ---
         model_input = self._prepare_model_input(self.sequence_history)
-        
+
         with torch.no_grad():
-            print("model_input:",model_input)
             action_logits, _, _, belief_logits_0, belief_logits_1 = self.model(**model_input)
-            
-            # Select logits for the last valid time step
             last_step_idx = model_input['valid_lengths'][0].item() - 1
             logits = action_logits[0, last_step_idx]
 
-            # Apply action mask and select action
             mask_tensor = torch.tensor(info["action_mask"], dtype=torch.bool, device=self.device)
             masked_logits = logits.masked_fill(~mask_tensor, float("-inf"))
             probs = F.softmax(masked_logits, dim=-1)
 
-            # Fallback for numerical instability
             if torch.isnan(probs).any() or probs.sum() < 1e-6:
-                probs = mask_tensor.float() / mask_tensor.sum()
-            
+                probs = (mask_tensor.float() / mask_tensor.sum()) if mask_tensor.sum() > 0 else torch.ones_like(logits)
+
             chosen_action = torch.argmax(probs).item()
 
-            # --- 4. Store internal belief predictions from the model output ---
             if belief_logits_0 is not None and belief_logits_1 is not None:
                 opponents = sorted([p for p in env.possible_agents if p != agent_id_env])
                 self._last_expert_info = {}
                 if len(opponents) > 0:
-                    belief_0 = belief_logits_0[0, last_step_idx]
-                    self._last_expert_info[opponents[0]] = {"expert_index": int(torch.argmax(belief_0).item()), "source": "internal"}
+                    self._last_expert_info[opponents[0]] = {"expert_index": int(torch.argmax(belief_logits_0[0, last_step_idx]).item()), "source": "internal"}
                 if len(opponents) > 1:
-                    belief_1 = belief_logits_1[0, last_step_idx]
-                    self._last_expert_info[opponents[1]] = {"expert_index": int(torch.argmax(belief_1).item()), "source": "internal"}
+                    self._last_expert_info[opponents[1]] = {"expert_index": int(torch.argmax(belief_logits_1[0, last_step_idx]).item()), "source": "internal"}
 
-        # Update history with the action we decided to take
+        # --- 6. Finalize History and Return ---
         self.sequence_history[-1]["action"] = chosen_action
         self.sequence_history[-1]["masked_action"] = chosen_action
 
-        # --- 5. Append placeholders for subsequent opponent turns ---
-        live_opponents = [o for o in env.possible_agents if o != agent_id_env and not env.terminations[o]]
-        
-        # If we challenge, history is reset on the next turn anyway. No placeholders needed.
-        if chosen_action != 6: 
-            for opp_id in live_opponents:
-                # Append a placeholder entry for each opponent to maintain sequence structure
-                self.sequence_history.append({
-                    "agent_id_env": opp_id,
-                    "action": 10,  # A placeholder value
-                    "masked_action": 10,
-                    "observation": [0.0] * self.obs_dim,
-                    "action_mask": [0] * self.action_dim
-                })
+        if len(self.sequence_history) > (self.max_seq_length or 100):
+            self.sequence_history = self.sequence_history[-(self.max_seq_length or 100):]
 
-        # --- 6. Trim history and return ---
-        if len(self.sequence_history) > self.max_seq_length:
-            self.sequence_history = self.sequence_history[-self.max_seq_length:]
-            
         return chosen_action
 
     def get_last_expert_info(self):
