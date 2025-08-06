@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# train_autoregressive_model.py - Train AutoregressiveGameModel using PS-generated sequence data
+# train_autoregressive_model.py - Train AutoregressiveGameModelFull using PS-generated sequence data
 import os
 import random
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -17,7 +17,7 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from src.training.train_extras import set_seed
-from src.model.autoregressive_model_full import AutoregressiveGameModel
+from src.model.autoregressive_model_full import AutoregressiveGameModelFull
 from src import config
 
 # Define hardcoded opponent labels consistent with other training scripts
@@ -644,7 +644,7 @@ def train_autoregressive_model(
     action_dim = 7
     logger.info(f"Model dimensions: obs_dim={obs_dim}, action_dim={action_dim}")
 
-    model = AutoregressiveGameModel(
+    model = AutoregressiveGameModelFull(
         obs_dim=obs_dim,
         action_dim=action_dim,
         hidden_dim=hidden_dim,
@@ -923,7 +923,7 @@ def train_autoregressive_model(
             model.action_head = nn.Linear(hidden_dim * 2, action_dim).to(device)
             
             # Rebuild the optimizer and scheduler
-            optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)
+            optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
             scheduler = optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer, mode='min', factor=0.5, patience=5, verbose=True
             )
