@@ -31,7 +31,7 @@ def compute_gae(rewards, dones, values, next_values, gamma=0.99, lam=0.95):
     returns = [adv + val for adv, val in zip(advantages, values)]
     return advantages, returns
 
-def save_checkpoint(policy_nets, value_nets, optimizers_policy, optimizers_value, belief_model, belief_optimizer, episode, checkpoint_dir=config.CHECKPOINT_DIR, checkpoint_filename=None):
+def save_checkpoint(policy_nets, value_nets, optimizers_policy, optimizers_value, belief_model, belief_optimizer, episode, checkpoint_dir=config.CHECKPOINT_DIR, checkpoint_filename=None, extra_data=None):
     """
     Saves the current state of the training process, including models and optimizers.
     Modified to handle cases where value_nets, value optimizers, belief_model, and belief_optimizer may be None.
@@ -65,6 +65,9 @@ def save_checkpoint(policy_nets, value_nets, optimizers_policy, optimizers_value
     # Save belief optimizer if provided.
     if belief_optimizer is not None:
         checkpoint['belief_optimizer'] = belief_optimizer.state_dict()
+    
+    if extra_data is not None:
+        checkpoint.update(extra_data)
     
     torch.save(checkpoint, checkpoint_path)
     print(f"Checkpoint saved to {checkpoint_path}")
