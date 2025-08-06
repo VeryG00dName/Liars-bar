@@ -2,13 +2,13 @@
 import pickle
 import pprint
 import torch
-from src.training.train_autoregressive_model import AutoregressiveGameDataset, create_opponent_mapping
+from src.training.train_autoregressive_model_full import AutoregressiveGameDataset, create_opponent_mapping
 
 MATCHUP_FILTER = "Classic_vs_GreedyCardSpammer"
 
 def main():
     # Path to the pickle file (adjust the path if needed)
-    filename = "ps_autoreg_data/ps_autoreg_data_33000.pkl"
+    filename = "ps_autoreg_data/ps_autoreg_data_mixed_full_game_blielfs/combined_data.pkl"
     
     # Load raw data
     try:
