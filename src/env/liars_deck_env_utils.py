@@ -293,6 +293,8 @@ def apply_action(env, agent, action):
                     challenger_agent = [ag for ag in active_agents if ag != claimant_agent][0]
                     env.logger.info(f"Forced challenge triggered by {challenger_agent} against {claimant_agent}")
                     apply_challenge(env, challenger_agent, claimant_agent, forced=True)
+                    record_action_history(env, agent, "Challenge", card_category=None, count=None, was_challenged=True)
+                    env.global_step += 1
                     if not env.terminations.get(claimant_agent, False):
                         env.round_eliminated[claimant_agent] = True
                         env.logger.debug(f"{claimant_agent} round eliminated after forced challenge resolution.")
