@@ -120,7 +120,8 @@ class LiarsDeckEnv(AECEnv):
         self._agent_selector = None
         self.rewards = {}
         self.round = 0
-        
+        self.game_history = []
+        self.global_step = 0
         # Initialize tracking for newer observations
         self.last_challenge_success = None  # Track outcome of the last challenge
         
@@ -221,6 +222,8 @@ class LiarsDeckEnv(AECEnv):
         self.last_action_bluff = None
         self.winner = None
         self.round = 0
+        self.game_history = []
+        self.global_step = 0
         
         self.opponent_histories = {agent: [] for agent in self.possible_agents}
         self.bluff_counts = {agent: 0 for agent in self.possible_agents}
@@ -524,7 +527,10 @@ class LiarsDeckEnv(AECEnv):
         cloned_env.truncations = copy.deepcopy(self.truncations)
         cloned_env.round_eliminated = copy.deepcopy(self.round_eliminated)
         cloned_env.winner = self.winner
-
+        
+        cloned_env.game_history = copy.deepcopy(self.game_history)
+        cloned_env.global_step = self.global_step
+        
         cloned_env.rewards = copy.deepcopy(self.rewards)
         cloned_env._cumulative_rewards = copy.deepcopy(self._cumulative_rewards)
         cloned_env.infos = copy.deepcopy(self.infos)
@@ -610,6 +616,8 @@ class LiarsDeckEnv(AECEnv):
         self.round_eliminated = copy.deepcopy(state_dict['round_eliminated'])
         self.winner = state_dict['winner']
         self.round = state_dict['round']
+        self.game_history = copy.deepcopy(state_dict.get('game_history', []))
+        self.global_step = state_dict.get('global_step', 0)
         self.rewards = copy.deepcopy(state_dict['rewards'])
         self._cumulative_rewards = copy.deepcopy(state_dict['_cumulative_rewards'])
         self.infos = copy.deepcopy(state_dict['infos'])
@@ -690,6 +698,8 @@ class LiarsDeckEnv(AECEnv):
             'round_eliminated': self.round_eliminated.copy(),
             'winner': self.winner,
             'round': self.round,
+            'game_history': self.game_history.copy(),
+            'global_step': self.global_step,
             'num_players': self.num_players, # Include num_players
 
             # Rewards and other info

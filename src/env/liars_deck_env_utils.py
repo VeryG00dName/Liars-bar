@@ -11,14 +11,37 @@ def record_action_history(env, agent, action_type, card_category, count, was_cha
         'count': count,
         'was_challenged': was_challenged
     }
-
-    # Keep only basic action tracking
     env.public_opponent_histories[agent].append(entry)
-    
-    # Maintain history length
     H = 10
     if len(env.public_opponent_histories[agent]) > H:
         env.public_opponent_histories[agent].pop(0)
+
+    game_entry = {
+        'step': env.global_step,                   # monotonic across the whole game
+        'round': getattr(env, 'round', None),     # current round number
+        'player': agent,                          # who acted
+        'action_type': action_type,               # "Play" or "Challenge"
+        'card_category': card_category,           # "table" | "non-table" | None
+        'count': count,                           # 1..3 or None
+        'claimant': None,                         # filled for challenges
+        'challenge_success': None                 # filled for challenges
+    }
+
+    if action_type == "Challenge":
+        # Who are we challenging? (the last actor who played)
+        claimant = getattr(env, "last_action_agent", None)
+        game_entry['claimant'] = claimant
+
+        # Your rule of thumb: non-table play => challenge success; table play => fail.
+        # env.last_action_bluff is already set on the Play action.
+        # If there is a claimant and they actually played cards, use that flag.
+        if claimant and env.last_played_cards.get(claimant):
+            game_entry['challenge_success'] = bool(getattr(env, "last_action_bluff", False))
+        else:
+            # No valid claim to challenge → leave as None (invalid challenge)
+            game_entry['challenge_success'] = None
+
+    env.game_history.append(game_entry)
 
 def apply_challenge(env, challenger_agent, claimant_agent, forced=False):
     claimed_cards = env.last_played_cards.get(claimant_agent, [])
