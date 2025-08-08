@@ -31,7 +31,7 @@ def main():
              len(s["sequence"]) > 0 and 
              "_vs_".join(s["sequence"][0].get("belief", [])) == MATCHUP_FILTER)
         )
-    ][:5]  # limit to 5 samples
+    ][:1]  # limit to 1 samples
 
     print(f"Unprocessed samples from matchup {MATCHUP_FILTER}:\n")
     for i, sample in enumerate(filtered_unprocessed):
