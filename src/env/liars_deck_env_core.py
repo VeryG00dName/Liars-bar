@@ -315,6 +315,7 @@ class LiarsDeckEnv(AECEnv):
 
     def step(self, action):
         agent = self.agent_selection
+        self.global_step += 1
 
         # Decode the action early for use in our new bluff logic.
         action_type, _, count = decode_action(action)
