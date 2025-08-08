@@ -89,7 +89,7 @@ def apply_challenge(env, challenger_agent, claimant_agent, forced=False):
         if public_last_play:
             public_last_play['was_bluff'] = True
             env.logger.debug(f"Updated public history for {claimant_agent}: was_bluff=True")
-        challenge_success = not is_valid
+        challenge_success = True
         # Memory updates ...
         for observer in env.possible_agents:
             if observer != claimant_agent:
@@ -292,12 +292,7 @@ def apply_action(env, agent, action):
                     claimant_agent = agent
                     challenger_agent = [ag for ag in active_agents if ag != claimant_agent][0]
                     env.logger.info(f"Forced challenge triggered by {challenger_agent} against {claimant_agent}")
-                    apply_challenge(env, challenger_agent, claimant_agent, forced=True)
-                    record_action_history(env, agent, "Challenge", card_category=None, count=None, was_challenged=True)
-                    env.global_step += 1
-                    if not env.terminations.get(claimant_agent, False):
-                        env.round_eliminated[claimant_agent] = True
-                        env.logger.debug(f"{claimant_agent} round eliminated after forced challenge resolution.")
+                    env.must_force = True
                 else:
                     env.round_eliminated[agent] = True
                     env.logger.debug(f"{agent} round eliminated (no forced challenge triggered).")
@@ -313,7 +308,11 @@ def apply_action(env, agent, action):
             challenger = agent
             claimant = env.last_action_agent
             env.logger.info(f"{challenger} initiated a challenge against {claimant}")
-            apply_challenge(env, challenger, claimant, forced=False)
+            if env.must_force:
+                apply_challenge(env, challenger, claimant, forced=True)
+                env.must_force = False
+            else:
+                apply_challenge(env, challenger, claimant, forced=False)
         else:
             env.penalties[agent] += 1
             info["penalty"] = "Invalid Challenge (No claim available)"

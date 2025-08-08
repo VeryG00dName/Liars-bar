@@ -97,7 +97,8 @@ class LiarsDeckEnv(AECEnv):
         self.last_played_cards = {agent: [] for agent in self.possible_agents}
         self.last_action_agent = None
         self.last_action_bluff = None
-
+        self.must_force = False
+        
         # Tracking results and statistics
         self.successful_bluffs = {}
         self.failed_bluffs = {}
@@ -220,6 +221,7 @@ class LiarsDeckEnv(AECEnv):
         self.last_played_cards = {agent: [] for agent in self.possible_agents}
         self.last_action_agent = None
         self.last_action_bluff = None
+        self.must_force = False
         self.winner = None
         self.round = 0
         self.game_history = []
@@ -240,7 +242,7 @@ class LiarsDeckEnv(AECEnv):
         self.last_challenge_success = None
         
         # Reset table_card at the start of each episode
-        self.table_card = random.choice(["King", "Queen", "Ace"])
+        self.table_card = self.np_random.choice(["King", "Queen", "Ace"])
         self.logger.debug(f"Resetting environment. Initial table_card: {self.table_card}")
 
         # Reset the last_agent_action and consecutive_action_count
@@ -316,7 +318,6 @@ class LiarsDeckEnv(AECEnv):
     def step(self, action):
         agent = self.agent_selection
         self.global_step += 1
-
         # Decode the action early for use in our new bluff logic.
         action_type, _, count = decode_action(action)
 
@@ -378,6 +379,9 @@ class LiarsDeckEnv(AECEnv):
 
         if self.render_mode == 'human':
             self.render()
+        
+        if self.must_force == True:
+            self.step(6)
 
     def _check_round_end(self):
         active_agents = self._active_agents_in_round()
@@ -517,6 +521,7 @@ class LiarsDeckEnv(AECEnv):
         cloned_env.last_action = self.last_action
         cloned_env.last_action_agent = self.last_action_agent
         cloned_env.last_action_bluff = self.last_action_bluff
+        cloned_env.must_force = self.must_force
         cloned_env.round = self.round
 
         cloned_env.last_played_cards = {
@@ -611,6 +616,7 @@ class LiarsDeckEnv(AECEnv):
         self.last_action = state_dict['last_action']
         self.last_action_agent = state_dict['last_action_agent']
         self.last_action_bluff = state_dict['last_action_bluff']
+        self.must_force = state_dict.get('must_force', False)
         self.last_played_cards = copy.deepcopy(state_dict['last_played_cards'])
         self.terminations = copy.deepcopy(state_dict['terminations'])
         self.truncations = copy.deepcopy(state_dict['truncations'])
@@ -691,6 +697,7 @@ class LiarsDeckEnv(AECEnv):
             'last_action': self.last_action,
             'last_action_agent': self.last_action_agent,
             'last_action_bluff': self.last_action_bluff,
+            'must_force': self.must_force,
             'last_played_cards': {a: c.copy() if c else [] for a, c in self.last_played_cards.items()},
 
             # Game status flags
