@@ -213,12 +213,10 @@ class AutoregressiveGameDataset(Dataset):
                 elif is_train and "expert_action" in step:
                     a = step["chosen_action"]
                     b = step["expert_action"]
-                # Opponent action logic
-                elif not is_train and "transformed_action" in step:
+                if not is_train and "transformed_action" in step:
                     a = step["transformed_action"]
-                    b = step["transformed_action"] # Target action is the transformed one
 
-                raw_target_actions.append(6 if b == 10 else b) # Normalize actions
+                raw_target_actions.append(6 if b == 10 else b)
                 raw_actions.append(6 if a == 10 else a)
 
             PAD = 0
