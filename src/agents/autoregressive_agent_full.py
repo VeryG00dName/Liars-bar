@@ -142,10 +142,9 @@ class AutoregressiveAgentFull(BaseAgent):
         PAD = 0 # Padding token for actions
 
         # 1. Filter out any steps that couldn't be masked (shouldn't happen in eval)
-        filtered = [step for step in history if not ("masked_action" in step and step["masked_action"] is None)]
-
+        filtered = list(history)
         # 2. Build the action sequences (raw actions and left-shifted input actions)
-        raw_actions = [step.get("masked_action", step.get("action", PAD)) for step in filtered]
+        raw_actions = [step.get("action", PAD) for step in filtered]
         input_actions = [PAD] + raw_actions[:-1]
 
         # 3. Handle sequence length, truncating if necessary
@@ -163,22 +162,24 @@ class AutoregressiveAgentFull(BaseAgent):
         agent_type_seq = torch.ones((1, valid_len), dtype=torch.long, device=self.device) # Default to 1 (opponent)
         pos_seq = torch.arange(valid_len, dtype=torch.long, device=self.device).unsqueeze(0)
         action_mask_seq = torch.zeros((1, valid_len, self.action_dim), dtype=torch.bool, device=self.device)
-
         # 5. Populate tensors from the filtered history
         for i, step_data in enumerate(filtered):
             agent_type = self.env_agent_id_map[step_data["agent_id_env"]]
             agent_type_seq[0, i] = agent_type
             action_seq[0, i] = input_actions[i]
-
-            # Observations and action masks are only available on our turn (agent_type == 0)
             if agent_type == 0:
+                # Our turn: real obs + real mask
                 obs_np = np.array(step_data["observation"], dtype=np.float32)
-                if obs_np.size != self.obs_dim: # Pad/truncate if needed
+                if obs_np.size != self.obs_dim:  # pad/truncate if needed
                     obs_np = np.resize(obs_np, self.obs_dim)
                 obs_seq[0, i] = torch.from_numpy(obs_np)
 
                 mask_np = np.array(step_data.get("action_mask", [1] * self.action_dim), dtype=bool)
                 action_mask_seq[0, i] = torch.from_numpy(mask_np)
+            else:
+                # Opponent turn: zero obs + zero mask (keeps alignment with training)
+                obs_seq[0, i] = torch.zeros(self.obs_dim, dtype=torch.float32, device=self.device)
+                action_mask_seq[0, i] = torch.zeros(self.action_dim, dtype=torch.bool, device=self.device)
 
         return {
             'obs_sequence': obs_seq,
@@ -202,59 +203,72 @@ class AutoregressiveAgentFull(BaseAgent):
 
         # --- 1. One-time Initialization ---
         if self.env_agent_id_map is None:
-            opponents = sorted([p for p in env.possible_agents if p != agent_id_env])
-            self.env_agent_id_map = {agent_id_env: 0}
-            if len(opponents) > 0: self.env_agent_id_map[opponents[0]] = 1
-            if len(opponents) > 1: self.env_agent_id_map[opponents[1]] = 2
+            if agent_id_env == 'player_0':
+                self.env_agent_id_map = {'player_0': 0, 'player_1': 1, 'player_2': 2}
+            else:
+                opponents = sorted([p for p in env.possible_agents if p != agent_id_env])
+                self.env_agent_id_map = {agent_id_env: 0}
+                if len(opponents) > 0: self.env_agent_id_map[opponents[0]] = 1
+                if len(opponents) > 1: self.env_agent_id_map[opponents[1]] = 2
 
         # --- 2. Check for New Game Start (and clear history if so) ---
         if len(env.players_hands[agent_id_env]) == 5 and all(p == 0 for p in env.penalties.values()):
             self.sequence_history.clear()
             logger.debug(f"Agent {self.player_id}: New game detected, history cleared.")
 
+        # --- Pre-step: Fix last recorded action if it doesn't match game history ---
+        gh = getattr(env, "game_history", [])
+        if self.sequence_history:
+            # Find the most recent action we actually took in game_history
+            last_my_action = None
+            for e in reversed(gh):
+                if e.get("player") == agent_id_env:
+                    a_type = e.get("action_type")
+                    if a_type == "Play":
+                        cnt = e.get("count")
+                        last_my_action = self.CARD_COUNT_MAPPING.get(cnt, self.CARD_COUNT_MAPPING[1])  # 7/8/9
+                    elif a_type == "Challenge":
+                        last_my_action = 6
+                    # If it's some other action type, you may choose to skip or map accordingly
+                    break
+
+            # If we found a last action and it's different from what we stored, fix it
+            if last_my_action is not None and self.sequence_history[-1].get("action") != last_my_action:
+                self.sequence_history[-1]["action"] = last_my_action
+
         # --- 3. Reactively Append Opponent Actions Since Our Last Turn ---
-        turn_order = env.agents # Current round's active agents
-        if not turn_order: # Skip if no one is active
-             pass
-        else:
-            last_agent_in_history = self.sequence_history[-1]["agent_id_env"] if self.sequence_history else None
+        # Find the last time WE acted in the global log
+        last_my_step = -1
+        for e in reversed(gh):
+            if e.get("player") == agent_id_env:
+                last_my_step = e.get("step", -1)
+                break
 
-            agents_to_add = []
-            if last_agent_in_history is None:
-                # First turn of the game for us; add everyone who played before us.
-                try:
-                    our_idx = turn_order.index(agent_id_env)
-                    agents_to_add = turn_order[:our_idx]
-                except ValueError: pass # We are not in the turn order, do nothing.
-            elif last_agent_in_history != agent_id_env:
-                # This logic catches up on opponent moves that happened since we last recorded something.
-                try:
-                    # Use a cycle to handle round wrap-around
-                    turn_cycle = turn_order * 2
-                    start_idx = turn_cycle.index(last_agent_in_history)
-                    our_idx = turn_cycle.index(agent_id_env, start_idx + 1)
-                    agents_to_add = turn_cycle[start_idx + 1 : our_idx]
-                except ValueError: pass # An agent was eliminated, skip update.
+        # Append EVERY opponent action that happened after our last action
+        for e in gh:
+            step = e.get("step", 0)
+            if step <= last_my_step:
+                continue
 
-            for opp_id in agents_to_add:
-                raw_action = env.last_agent_action.get(opp_id)
-                if raw_action is None: continue
+            opp_id = e.get("player")
+            if opp_id == agent_id_env:
+                continue  # only opponents
 
-                real_type, _, real_count = decode_action(raw_action)
-                if real_type == "Play":
-                    masked_value = self.CARD_COUNT_MAPPING[real_count] # Default to 10 if count invalid
-                elif real_type == "Challenge":
-                    masked_value = 6
-                else:
-                    continue
+            a_type = e.get("action_type")
+            if a_type == "Play":
+                cnt = e.get("count")
+                action_token = self.CARD_COUNT_MAPPING.get(cnt, self.CARD_COUNT_MAPPING[1])  # 7/8/9
+            elif a_type == "Challenge":
+                action_token = 6
+            else:
+                continue  # ignore anything else
 
-                self.sequence_history.append({
-                    "agent_id_env": opp_id,
-                    "action": raw_action,
-                    "masked_action": masked_value,
-                    "observation": [0.0] * self.obs_dim,
-                    "action_mask": [0] * self.action_dim,
-                })
+            self.sequence_history.append({
+                "agent_id_env": opp_id,
+                "action": action_token,   # <-- store the token directly, no masked_action
+                "observation": [0.0] * self.obs_dim,
+                "action_mask": [0] * self.action_dim
+            })
 
         # --- 4. Append Our Current Step (observation only) ---
         current_step_info = {
@@ -291,7 +305,6 @@ class AutoregressiveAgentFull(BaseAgent):
 
         # --- 6. Finalize History and Return ---
         self.sequence_history[-1]["action"] = chosen_action
-        self.sequence_history[-1]["masked_action"] = chosen_action
 
         if len(self.sequence_history) > (self.max_seq_length or 100):
             self.sequence_history = self.sequence_history[-(self.max_seq_length or 100):]
