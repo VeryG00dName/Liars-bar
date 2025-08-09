@@ -36,12 +36,14 @@ class AutoregressiveAgentFull(BaseAgent):
         self.sequence_history: List[Dict[str, Any]] = []
         self.env_agent_id_map: Optional[Dict[str, int]] = None # Maps env_id to 0 (self), 1 (opp0), 2 (opp1)
         self._last_expert_info: Optional[Dict[str, Any]] = None
+        self._last_seen_gh_step: int = -1  # highest env.game_history 'step' we’ve copied in
 
     def reset(self):
         """Resets sequence history and internal state for a new game."""
         self.sequence_history = []
         self.env_agent_id_map = None
         self._last_expert_info = None
+        self._last_seen_gh_step = -1
 
     def load_models_from_checkpoint(self, checkpoint: Dict[str, Any], agent_key: str):
         """
@@ -170,11 +172,9 @@ class AutoregressiveAgentFull(BaseAgent):
             if agent_type == 0:
                 # Our turn: real obs + real mask
                 obs_np = np.array(step_data["observation"], dtype=np.float32)
-                if obs_np.size != self.obs_dim:  # pad/truncate if needed
-                    obs_np = np.resize(obs_np, self.obs_dim)
                 obs_seq[0, i] = torch.from_numpy(obs_np)
 
-                mask_np = np.array(step_data.get("action_mask", [1] * self.action_dim), dtype=bool)
+                mask_np = np.array(step_data["action_mask"], dtype=bool)
                 action_mask_seq[0, i] = torch.from_numpy(mask_np)
             else:
                 # Opponent turn: zero obs + zero mask (keeps alignment with training)
@@ -219,56 +219,54 @@ class AutoregressiveAgentFull(BaseAgent):
         # --- Pre-step: Fix last recorded action if it doesn't match game history ---
         gh = getattr(env, "game_history", [])
         if self.sequence_history:
-            # Find the most recent action we actually took in game_history
             last_my_action = None
             for e in reversed(gh):
                 if e.get("player") == agent_id_env:
                     a_type = e.get("action_type")
                     if a_type == "Play":
                         cnt = e.get("count")
-                        last_my_action = self.CARD_COUNT_MAPPING.get(cnt, self.CARD_COUNT_MAPPING[1])  # 7/8/9
+                        cat = e.get("card_category")
+                        if cat == "table":
+                            last_my_action = cnt - 1            # 0,1,2
+                        elif cat == "non-table":
+                            last_my_action = 3 + (cnt - 1)      # 3,4,5
                     elif a_type == "Challenge":
                         last_my_action = 6
-                    # If it's some other action type, you may choose to skip or map accordingly
                     break
 
-            # If we found a last action and it's different from what we stored, fix it
             if last_my_action is not None and self.sequence_history[-1].get("action") != last_my_action:
                 self.sequence_history[-1]["action"] = last_my_action
 
-        # --- 3. Reactively Append Opponent Actions Since Our Last Turn ---
-        # Find the last time WE acted in the global log
-        last_my_step = -1
-        for e in reversed(gh):
-            if e.get("player") == agent_id_env:
-                last_my_step = e.get("step", -1)
-                break
-
-        # Append EVERY opponent action that happened after our last action
+        # --- 3. Reactively Append Opponent Actions Since Last Copy ---
         for e in gh:
-            step = e.get("step", 0)
-            if step <= last_my_step:
+            step = int(e["step"])
+            if step <= self._last_seen_gh_step:
                 continue
 
             opp_id = e.get("player")
             if opp_id == agent_id_env:
-                continue  # only opponents
+                # skip our own rows (we only append our own current-step below)
+                self._last_seen_gh_step = step
+                continue
 
             a_type = e.get("action_type")
             if a_type == "Play":
                 cnt = e.get("count")
-                action_token = self.CARD_COUNT_MAPPING.get(cnt, self.CARD_COUNT_MAPPING[1])  # 7/8/9
+                action_token = self.CARD_COUNT_MAPPING.get(int(cnt) if cnt is not None else 1, 7)  # 7/8/9
             elif a_type == "Challenge":
                 action_token = 6
             else:
+                self._last_seen_gh_step = step
                 continue  # ignore anything else
 
+            # Opponent step: zero obs + zero mask (shape matches training)
             self.sequence_history.append({
                 "agent_id_env": opp_id,
-                "action": action_token,   # <-- store the token directly, no masked_action
-                "observation": [0.0] * self.obs_dim,
-                "action_mask": [0] * self.action_dim
+                "action": action_token,     # extended token (7/8/9) or 6 for challenge
+                "observation": [0.0] * int(self.obs_dim),
+                "action_mask": [0] * int(self.action_dim),
             })
+            self._last_seen_gh_step = step
 
         # --- 4. Append Our Current Step (observation only) ---
         current_step_info = {
@@ -280,7 +278,6 @@ class AutoregressiveAgentFull(BaseAgent):
 
         # --- 5. Prepare Input and Predict Action ---
         model_input = self._prepare_model_input(self.sequence_history)
-
         with torch.no_grad():
             action_logits, _, _, belief_logits_0, belief_logits_1 = self.model(**model_input)
             last_step_idx = model_input['valid_lengths'][0].item() - 1
