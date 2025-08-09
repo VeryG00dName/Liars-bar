@@ -35,7 +35,7 @@ from src.training.train_utils import load_specific_historical_models
 
 # Import PS
 from src.model.ps import PerfectSearch
-AGENT_ID_MAP = {'player_0': 0, 'player_1': 1, 'player_2': 2}
+
 def setup_logging(log_file=None, level=logging.INFO):
     """Configure logging for the data generator."""
     logger = logging.getLogger()
@@ -356,8 +356,7 @@ def generate_data(
                 action_type, _, count = decode_action(best_action)
                 if action_type == "Play" and count is not None:
                     step_data["card_count"] = count
-                    if np.random.random() < opponent_action_dropout_rate:
-                        step_data["transformed_action"] = CARD_COUNT_MAPPING.get(count, count + 6)
+                    step_data["transformed_action"] = CARD_COUNT_MAPPING.get(count, count + 6)
                 env.step(best_action)
             game_data["sequence"].append(step_data)
             stats["steps"] += 1
