@@ -14,6 +14,7 @@ from tqdm import tqdm
 # Import configuration and model class
 from src import config
 from src.model.autoregressive_model_full import AutoregressiveGameModelFull
+from src.training.train_autoregressive_model_full import AutoregressiveGameDataset
 from src.env.liars_deck_env_utils_2 import decode_action
 
 def load_autoreg_data(data_dir, max_samples=None):
@@ -116,6 +117,8 @@ class EvalAutoregDataset(Dataset):
                 a = step["expert_action"]
             else: # Fallback for older data formats
                 a = step.get("chosen_action", 0)
+            if not is_train and "transformed_action" in step:
+                    a = step["transformed_action"]
             raw_actions.append(a)
 
         raw_actions = [6 if a == 10 else a for a in raw_actions]
@@ -222,8 +225,6 @@ def collate_variable_length_sequences(batch):
     padding_mask = torch.ones(batch_size, max_seq_len, dtype=torch.bool, device=device)
     lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
     
-    opponent_combos = []
-    
     for i, seq in enumerate(batch):
         seq_len = seq['length']
         lengths[i] = seq_len
@@ -233,12 +234,10 @@ def collate_variable_length_sequences(batch):
         batched_action[i, :seq_len] = seq['action']
         batched_target_action[i, :seq_len] = seq['target_action']
         batched_action_mask[i, :seq_len] = seq['action_mask']
-        batched_belief_targets[i, :seq_len] = seq['belief_targets']
+        batched_belief_targets[i, :seq_len] = seq['belief']
         batched_agent_type[i, :seq_len] = seq['agent_type']
         batched_position[i, :seq_len] = seq['position']
         
-        opponent_combos.append(seq['opponent_combo'])
-    
     return {
         'obs': batched_obs,
         'action': batched_action,
@@ -248,8 +247,7 @@ def collate_variable_length_sequences(batch):
         'agent_type': batched_agent_type,
         'position': batched_position,
         'padding_mask': padding_mask,
-        'lengths': lengths,
-        'opponent_combos': opponent_combos
+        'lengths': lengths
     }
 
 def evaluate_autoregressive_model(model, data_loader, device, max_seq_length):
@@ -437,9 +435,13 @@ def main():
 
     data = load_autoreg_data(data_dir=args.data_dir, max_samples=args.max_samples)
     
-    eval_dataset = EvalAutoregDataset(
+    if num_opponent_types is None:
+        num_opponent_types = max(opponent_mapping.values()) + 1
+        
+    eval_dataset = AutoregressiveGameDataset(
         data, 
         opponent_mapping, 
+        num_opponent_types, 
         device, 
         max_seq_length=args.max_seq_length
     )
