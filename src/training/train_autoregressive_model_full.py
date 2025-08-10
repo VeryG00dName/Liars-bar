@@ -409,98 +409,135 @@ def collate_variable_length_sequences(batch):
     }
     return batch_dict
 
+def _iter_pickled_objects(file_path):
+    """Yield every pickled object from a file that may contain multiple dumps."""
+    with open(file_path, "rb") as f:
+        while True:
+            try:
+                yield pickle.load(f)
+            except EOFError:
+                break
+
+def _normalize_to_round_sequences(objects):
+    """
+    Convert a list of loaded objects (lists/dicts/etc.) into a flat list
+    of round-level dicts that have either 'sequence' or are inside 'rounds'.
+    """
+    rounds = []
+    for obj in objects:
+        # If this object is itself a list, iterate its members
+        candidates = obj if isinstance(obj, list) else [obj]
+        for item in candidates:
+            if not isinstance(item, dict):
+                # Unknown type — skip quietly
+                continue
+            if "rounds" in item and isinstance(item["rounds"], list):
+                # Legacy game->rounds structure
+                rounds.extend([r for r in item["rounds"] if isinstance(r, dict)])
+            elif "sequence" in item:
+                rounds.append(item)
+            # else: not a recognized shape — skip
+    return rounds
+
+def _load_all_objects_from_file(file_path):
+    """
+    Load *all* objects from a pickle file that might contain one or many dumps.
+    Returns a list of Python objects (any types).
+    """
+    objs = []
+    for obj in _iter_pickled_objects(file_path):
+        objs.append(obj)
+    return objs
+
 def load_autoreg_data(data_dir, max_files=None, max_samples=None):
-    """Load data from PS autoregressive data pickle files.
+    """Load data from PS autoregressive data pickle files, supporting multi-pickle files.
 
     Args:
-        data_dir: Directory containing data files
-        max_files: Maximum number of files to load
-        max_samples: Maximum total samples to load
+        data_dir: Directory containing data files.
+        max_files: Max number of files to consider (smallest files first).
+        max_samples: Max total round-level samples to return.
 
     Returns:
-        List of round sequence data
+        List[dict]: round-level records (each should have 'sequence', or came from 'rounds').
     """
     if not os.path.exists(data_dir):
         raise FileNotFoundError(f"Data directory not found: {data_dir}")
-    
-    data_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) 
-                  if f.endswith('.pkl') and "ps_autoreg_data" in f]
-    
+
+    # Prefer ps_autoreg_data*.pkl, otherwise fall back to any .pkl (excluding *cache*)
+    data_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir)
+                  if f.endswith(".pkl") and "ps_autoreg_data" in f]
     if not data_files:
         print(f"No files matching 'ps_autoreg_data*.pkl' found in {data_dir}")
-        data_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) 
-                    if f.endswith('.pkl') and 'cache' not in f]
+        data_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir)
+                      if f.endswith(".pkl") and "cache" not in f]
         print(f"Found {len(data_files)} generic .pkl files instead")
-    
+
     if not data_files:
-        raise ValueError(f"No .pkl files found in {data_dir}. Make sure you've generated data with ps_data_generator.py first.")
-    
+        raise ValueError(
+            f"No .pkl files found in {data_dir}. Make sure you've generated data with ps_data_generator.py first."
+        )
+
     if max_files is not None:
         data_files = sorted(data_files)[-max_files:]
 
     print(f"Found {len(data_files)} data files: {[os.path.basename(f) for f in data_files]}")
-    
-    all_data = []
+
+    # Load smaller files first for snappier progress
     file_sizes = []
-
-    for data_file in tqdm(data_files, desc="Getting file sizes"):
+    for fp in tqdm(data_files, desc="Getting file sizes"):
         try:
-            file_size = os.path.getsize(data_file)
-            file_sizes.append((data_file, file_size))
+            file_sizes.append((fp, os.path.getsize(fp)))
         except Exception as e:
-            print(f"Error getting size of {os.path.basename(data_file)}: {e}")
-    
-    file_sizes.sort(key=lambda x: x[1])  # Load smaller files first
+            print(f"Error getting size of {os.path.basename(fp)}: {e}")
+    file_sizes.sort(key=lambda x: x[1])
 
+    all_rounds = []
     total_loaded = 0
+    sample_cap = max_samples if max_samples is not None else float("inf")
 
-    for data_file, file_size in tqdm(file_sizes, desc="Loading data files"):
+    for data_file, _ in tqdm(file_sizes, desc="Loading data files"):
         try:
-            with open(data_file, 'rb') as f:
-                data = pickle.load(f)
-                if not isinstance(data, list):
-                    print(f"Warning: {os.path.basename(data_file)} does not contain a list of sequences")
-                    continue
-                
-                remaining = max_samples - total_loaded if max_samples is not None else len(data)
-                if remaining <= 0:
-                    print(f"Reached sample limit of {max_samples}")
-                    break
+            # Load ALL objects from this file (one or many pickles)
+            objs = _load_all_objects_from_file(data_file)
 
-                if len(data) > remaining:
-                    sampled_data = random.sample(data, remaining)
-                else:
-                    sampled_data = data
+            # Normalize to a flat list of round-level dicts
+            file_rounds = _normalize_to_round_sequences(objs)
 
-                # Flatten legacy game->round structure if needed
-                for item in sampled_data:
-                    if isinstance(item, dict):
-                        if 'rounds' in item:
-                            all_data.extend(item['rounds'])
-                            total_loaded += len(item['rounds'])
-                        elif 'sequence' in item:
-                            all_data.append(item)
-                            total_loaded += 1
-                        else:
-                            continue  # Skip invalid dicts
+            if not file_rounds:
+                print(f"Warning: {os.path.basename(data_file)} yielded 0 recognizable round sequences")
+                continue
 
-                if len(data) > remaining:
-                    print(f"Sampled {len(sampled_data)} from {os.path.basename(data_file)} ({len(data)} total)")
-                else:
-                    print(f"Loaded all {len(sampled_data)} sequences from {os.path.basename(data_file)}")
+            remaining = int(sample_cap - total_loaded)
+            if remaining <= 0:
+                print(f"Reached sample limit of {max_samples}")
+                break
+
+            # Per-file sampling, if needed
+            if len(file_rounds) > remaining:
+                selected = random.sample(file_rounds, remaining)
+                print(f"Sampled {len(selected)} from {os.path.basename(data_file)} ({len(file_rounds)} available)")
+            else:
+                selected = file_rounds
+                print(f"Loaded all {len(selected)} rounds from {os.path.basename(data_file)}")
+
+            all_rounds.extend(selected)
+            total_loaded += len(selected)
+
+            if total_loaded >= sample_cap:
+                print(f"Reached sample limit of {max_samples}")
+                break
+
         except Exception as e:
             print(f"Error loading {os.path.basename(data_file)}: {e}")
             continue
 
-        if max_samples is not None and total_loaded >= max_samples:
-            print(f"Reached sample limit of {max_samples}")
-            break
+    if not all_rounds:
+        raise ValueError(
+            "No valid data samples found in any of the .pkl files. Check file format and content."
+        )
 
-    if not all_data:
-        raise ValueError("No valid data samples found in any of the .pkl files. Check file format and content.")
-    
-    print(f"Total loaded sequences: {len(all_data)}")
-    return all_data
+    print(f"Total loaded sequences: {len(all_rounds)}")
+    return all_rounds
 
 def calculate_autoregressive_loss(
     self_logits,
