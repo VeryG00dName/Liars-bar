@@ -3,6 +3,7 @@
 import os
 import argparse
 import pickle
+import random
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -111,7 +112,7 @@ def replay_and_debug(game_data, agent, env, opponent_mapping, device, max_seq_le
     logger = logging.getLogger("ReplayDebugger")
     game_id = game_data["game_id"]
     logger.info(f"--- Starting Replay for Game ID: {game_id} ---")
-
+    
     # Reset environment and the agent
     episode_seed = 42 + game_id  # or however you seed episodes
     obs, infos = env.reset(seed=episode_seed)
@@ -203,7 +204,9 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Enable detailed INFO logging.")
     
     args = parser.parse_args()
-
+    random.seed(42)
+    np.random.seed(42)
+    torch.manual_seed(42)
     log_level = logging.INFO if args.verbose else logging.WARNING
     logger = setup_logging(log_level)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
