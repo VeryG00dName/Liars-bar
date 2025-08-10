@@ -180,7 +180,11 @@ class AutoregressiveGameDataset(Dataset):
         self.num_opponent_types = num_opponent_types
         self.device = device
         self.max_seq_length = max_seq_length
-
+        TRANSFORM_MAP = {
+            0: 7, 3: 7,
+            1: 8, 4: 8,
+            2: 9, 5: 9
+        }
         # Debug counters
         self.obs_trimmed_count = 0
         self.total_sequences = 0
@@ -213,8 +217,11 @@ class AutoregressiveGameDataset(Dataset):
                 elif is_train and "expert_action" in step:
                     a = step["chosen_action"]
                     b = step["expert_action"]
-                if not is_train and "transformed_action" in step:
-                    a = step["transformed_action"]
+                if not is_train and a != 6 and a != 10:
+                    a = TRANSFORM_MAP[step["action"]]
+
+                if a in (6, 10) and raw_actions:  
+                    raw_actions[-1] = raw_target_actions[-1]
 
                 raw_target_actions.append(6 if b == 10 else b)
                 raw_actions.append(6 if a == 10 else a)
@@ -422,7 +429,7 @@ def load_autoreg_data(data_dir, max_files=None, max_samples=None):
     if not data_files:
         print(f"No files matching 'ps_autoreg_data*.pkl' found in {data_dir}")
         data_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) 
-                     if f.endswith('.pkl')]
+                    if f.endswith('.pkl') and 'cache' not in f]
         print(f"Found {len(data_files)} generic .pkl files instead")
     
     if not data_files:
