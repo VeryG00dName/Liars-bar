@@ -200,7 +200,6 @@ def generate_data(
     verbose=False,
     debug_ps=False,
     start_seed=42,
-    opponent_action_dropout_rate=0.3,
     max_rounds_per_episode=50
 ):
     """
@@ -430,8 +429,6 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument("--debug-ps", action="store_true", help="Enable debug mode in PerfectSearch")
     parser.add_argument("--seed", type=int, default=42, help="Starting seed for games")
-    parser.add_argument("--dropout-rate", type=float, default=0.3, 
-                        help="Probability to replace opponent action with card count (0.0-1.0)")
     parser.add_argument("--max-rounds", type=int, default=50, help="Maximum rounds per episode")
     
     args = parser.parse_args()
@@ -448,7 +445,6 @@ def main():
         verbose=args.verbose,
         debug_ps=args.debug_ps,
         start_seed=args.seed,
-        opponent_action_dropout_rate=args.dropout_rate,
         max_rounds_per_episode=args.max_rounds
     )
     
