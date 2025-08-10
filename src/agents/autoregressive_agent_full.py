@@ -37,6 +37,7 @@ class AutoregressiveAgentFull(BaseAgent):
         self.env_agent_id_map: Optional[Dict[str, int]] = None # Maps env_id to 0 (self), 1 (opp0), 2 (opp1)
         self._last_expert_info: Optional[Dict[str, Any]] = None
         self._last_seen_gh_step: int = -1  # highest env.game_history 'step' we’ve copied in
+        self._gh_step_to_seq_idx = {}
 
     def reset(self):
         """Resets sequence history and internal state for a new game."""
@@ -44,6 +45,7 @@ class AutoregressiveAgentFull(BaseAgent):
         self.env_agent_id_map = None
         self._last_expert_info = None
         self._last_seen_gh_step = -1
+        self._gh_step_to_seq_idx.clear()
 
     def load_models_from_checkpoint(self, checkpoint: Dict[str, Any], agent_key: str):
         """
@@ -214,10 +216,11 @@ class AutoregressiveAgentFull(BaseAgent):
         # --- 2. Check for New Game Start (and clear history if so) ---
         if len(env.players_hands[agent_id_env]) == 5 and all(p == 0 for p in env.penalties.values()):
             self.sequence_history.clear()
+            self._gh_step_to_seq_idx.clear()
             logger.debug(f"Agent {self.player_id}: New game detected, history cleared.")
 
         # --- Pre-step: Fix last recorded action if it doesn't match game history ---
-        gh = getattr(env, "game_history", [])
+        gh = list(getattr(env, "game_history", []))  # ensure list for indexing
         if self.sequence_history:
             last_my_action = None
             for e in reversed(gh):
@@ -227,9 +230,9 @@ class AutoregressiveAgentFull(BaseAgent):
                         cnt = e.get("count")
                         cat = e.get("card_category")
                         if cat == "table":
-                            last_my_action = cnt - 1            # 0,1,2
+                            last_my_action = (cnt or 1) - 1            # 0,1,2
                         elif cat == "non-table":
-                            last_my_action = 3 + (cnt - 1)      # 3,4,5
+                            last_my_action = 3 + ((cnt or 1) - 1)      # 3,4,5
                     elif a_type == "Challenge":
                         last_my_action = 6
                     break
@@ -237,35 +240,80 @@ class AutoregressiveAgentFull(BaseAgent):
             if last_my_action is not None and self.sequence_history[-1].get("action") != last_my_action:
                 self.sequence_history[-1]["action"] = last_my_action
 
+        # Helper: revealed token from a Play row (0-5)
+        def _revealed_token_from_play(play_row) -> int:
+            cnt = play_row.get("count") or 1
+            cat = play_row.get("card_category")
+            if cat == "table":
+                return cnt - 1              # 0,1,2
+            elif cat == "non-table":
+                return 3 + (cnt - 1)        # 3,4,5
+            # Fallback: if category missing, just treat as smallest table
+            return 0
+
         # --- 3. Reactively Append Opponent Actions Since Last Copy ---
-        for e in gh:
+        # We’ll (a) look ahead: if a Play is immediately followed by a Challenge, use 0-5 instead of 7/8/9
+        # and (b) when we *see* a Challenge, retro-correct the last Play we recorded (whoever played it).
+        for i, e in enumerate(gh):
             step = int(e["step"])
             if step <= self._last_seen_gh_step:
                 continue
 
-            opp_id = e.get("player")
-            if opp_id == agent_id_env:
-                # skip our own rows (we only append our own current-step below)
+            a_type = e.get("action_type")
+            actor_id = e.get("player")
+
+            # If this is a Challenge, retro-correct the most recent Play before it.
+            if a_type == "Challenge":
+                # find most recent prior Play
+                prev_play = None
+                for j in range(i - 1, -1, -1):
+                    if int(gh[j].get("step", -1)) < step and gh[j].get("action_type") == "Play":
+                        prev_play = gh[j]
+                        break
+                if prev_play is not None:
+                    prev_step = int(prev_play["step"])
+                    if prev_step in self._gh_step_to_seq_idx:
+                        idx = self._gh_step_to_seq_idx[prev_step]
+                        self.sequence_history[idx]["action"] = _revealed_token_from_play(prev_play)
+
+                # Append the challenge action if done by an opponent (we already encode our own via our own step)
+                if actor_id != agent_id_env:
+                    self.sequence_history.append({
+                        "agent_id_env": actor_id,
+                        "action": 6,
+                        "observation": [0.0] * int(self.obs_dim),
+                        "action_mask": [0] * int(self.action_dim),
+                    })
+
                 self._last_seen_gh_step = step
                 continue
 
-            a_type = e.get("action_type")
+            # Handle Plays (possibly by opponent). We only *append* opponent rows here.
             if a_type == "Play":
+                # Default (hidden) encoding is 7/8/9 by count
                 cnt = e.get("count")
-                action_token = self.CARD_COUNT_MAPPING.get(int(cnt) if cnt is not None else 1, 7)  # 7/8/9
-            elif a_type == "Challenge":
-                action_token = 6
-            else:
-                self._last_seen_gh_step = step
-                continue  # ignore anything else
+                action_token = self.CARD_COUNT_MAPPING.get(int(cnt) if cnt is not None else 1, 7)
 
-            # Opponent step: zero obs + zero mask (shape matches training)
-            self.sequence_history.append({
-                "agent_id_env": opp_id,
-                "action": action_token,     # extended token (7/8/9) or 6 for challenge
-                "observation": [0.0] * int(self.obs_dim),
-                "action_mask": [0] * int(self.action_dim),
-            })
+                # Look ahead: if the very next GH event is a Challenge, treat this Play as revealed (0-5)
+                next_e = gh[i + 1] if i + 1 < len(gh) else None
+                if next_e is not None and next_e.get("action_type") == "Challenge":
+                    action_token = _revealed_token_from_play(e)
+
+                # Append opponent step only (we skip our own rows and handle ours later)
+                if actor_id != agent_id_env:
+                    self.sequence_history.append({
+                        "agent_id_env": actor_id,
+                        "action": action_token,  # either revealed 0-5 or hidden 7/8/9
+                        "observation": [0.0] * int(self.obs_dim),
+                        "action_mask": [0] * int(self.action_dim),
+                    })
+                    # remember where this Play landed for possible retro-correction
+                    self._gh_step_to_seq_idx[step] = len(self.sequence_history) - 1
+
+                self._last_seen_gh_step = step
+                continue
+
+            # Ignore anything else, but keep step cursor moving
             self._last_seen_gh_step = step
 
         # --- 4. Append Our Current Step (observation only) ---
