@@ -166,7 +166,10 @@ class LiarsDeckEnv(AECEnv):
         # If the agent is terminated or round-eliminated, no actions are valid.
         if self.terminations.get(agent, False) or self.round_eliminated.get(agent, False):
             return [0]*7
-
+        if self.must_force:
+            mask= [0]*7
+            mask[6] = 1
+            return mask
         # Start with all actions valid.
         mask = [1]*7
 
@@ -379,9 +382,6 @@ class LiarsDeckEnv(AECEnv):
 
         if self.render_mode == 'human':
             self.render()
-        
-        if self.must_force == True:
-            self.step(6)
 
     def _check_round_end(self):
         active_agents = self._active_agents_in_round()
