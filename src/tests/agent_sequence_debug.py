@@ -4,9 +4,9 @@ training pipeline labels.
 
 This script combines the environment/game loop from
 ``ps_data_generator_sequence.py`` with the tensor comparison utilities from
-``debug_agent_replay.py``.  A single game is played using PerfectSearch for the
+``debug_agent_replay.py``.  Multiple games are played using PerfectSearch for the
 training agent while an ``AutoregressiveAgentFull`` instance observes the game.
-At the end of the episode the agent's ``sequence_history`` and the tensors
+At the end of each episode the agent's ``sequence_history`` and the tensors
 produced by ``_prepare_model_input`` are compared with the ground-truth tensors
 constructed by ``AutoregressiveGameDataset``.
 """
@@ -51,7 +51,8 @@ TRANSFORM_MAP = {
     0: 7, 3: 7,
     1: 8, 4: 8,
     2: 9, 5: 9,
-    6: 6
+    6: 6,   # keep challenge as-is
+    10: 6,  # normalize if 10 ever appears
 }
 
 def setup_logging(level=logging.INFO):
@@ -112,7 +113,6 @@ def create_belief_vector(current_opponents):
 
 def compare_tensors(agent_tensor: torch.Tensor, truth_tensor: torch.Tensor, name: str) -> bool:
     """Compare two tensors and log differences; print full tensors if shape mismatch or allclose fails."""
-    
     try:
         if agent_tensor.shape != truth_tensor.shape:
             logging.error(f"{name}: shape mismatch {agent_tensor.shape} vs {truth_tensor.shape}")
@@ -159,21 +159,17 @@ def compare_histories(agent_hist: List[Dict[str, any]], game_seq: List[Dict[str,
             logging.warning(f"Step {i}: agent_id mismatch {hid} != {g.get('agent_id')}")
             ok = False
 
-        # Look ahead using the FULL trimmed sequence, not the shortened one,
-        # so we can see the final training challenge if it exists.
+        # Look ahead using the FULL trimmed sequence to detect final training challenge
         next_step = game_seq[i + 1] if i + 1 < len(game_seq) else None
         next_is_challenge = next_step is not None and next_step.get("action") in (6, 10)
 
-        # If the *next* action is a challenge, dataset normally uses raw (untransformed) for this step.
-        # BUT if that next challenge is the final step and it's from agent 0, the agent hasn't retro-corrected yet.
-        # In that end-of-episode case, keep transformed_action to match agent history.
+        # If the next action is a challenge, dataset uses raw (untransformed) for this step.
+        # BUT if that next challenge is the final step by agent 0, the agent hasn't retro-corrected yet.
         use_transformed = True
         if next_is_challenge:
             if last_is_training_challenge and (i + 1 == len(game_seq) - 1) and next_step.get("agent_id") == 0:
-                # end-of-episode training challenge → don't de-transform
                 use_transformed = True
             else:
-                # mid-episode challenge → de-transform to raw
                 use_transformed = False
 
         if use_transformed:
@@ -239,7 +235,7 @@ def run_episode(env, ps, agent, current_opponents, selected_opponents):
                 else:
                     best_action = mask.index(1)
             step_data["action"] = best_action
-            step_data["transformed_action"] = TRANSFORM_MAP[best_action]
+            step_data["transformed_action"] = TRANSFORM_MAP.get(best_action, best_action)
             action_type, _, count = decode_action(best_action)
             if action_type == "Play" and count is not None:
                 step_data["card_count"] = count
@@ -248,6 +244,34 @@ def run_episode(env, ps, agent, current_opponents, selected_opponents):
     game_data["game_outcome"] = {"winner": env.winner}
     return game_data
 
+# ---- Helper to mirror dataset action construction (retro-correct + shift) ----
+def build_actions_like_dataset(seq):
+    PAD = 0
+    raw_actions = []
+    raw_target_actions = []
+
+    for step in seq:
+        aid = step.get("agent_id", 0)
+
+        # Default a/b from 'action'
+        a = step["action"]
+        b = step["action"]
+
+        # Transform opponents unless challenge (6 or 10)
+        if aid != 0 and a not in (6, 10):
+            a = TRANSFORM_MAP.get(a, a)
+
+        # Retro-correct: if current is challenge, rewrite previous raw_actions entry to the raw target
+        if a in (6, 10) and raw_actions:
+            raw_actions[-1] = raw_target_actions[-1]
+
+        # Normalize 10 -> 6 like the dataset does
+        raw_target_actions.append(6 if b == 10 else b)
+        raw_actions.append(6 if a == 10 else a)
+
+    # Shift for teacher forcing
+    input_actions = [PAD] + raw_actions[:-1]
+    return input_actions
 
 def main():
     parser = argparse.ArgumentParser(description="PS generator with agent debug")
@@ -274,13 +298,24 @@ def main():
     opponent_pool = load_opponent_pool(include_historical=False)
     opponent_types = list(opponent_pool.keys())
     opponent_agent_names = ["player_1", "player_2"]
+
+    # Base seeds
     random.seed(42)
     np.random.seed(42)
     torch.manual_seed(42)
+
     # Run 5 episodes
     for episode_num in range(1, 6):
         seed = 42 + episode_num
         logger.info(f"=== Episode {episode_num} | Seed {seed} ===")
+
+        # Per-episode seeds for determinism
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+
+        # Reset per-episode agent buffers to avoid leakage
+        agent.sequence_history = []
 
         selected = random.sample(opponent_types, len(opponent_agent_names))
         current_opponents, opponent_models = setup_opponents(opponent_pool, selected, opponent_agent_names)
@@ -290,11 +325,11 @@ def main():
         ps = PerfectSearch(env=env, training_agent="player_0", opponent_models=opponent_models)
         game_data = run_episode(env, ps, agent, current_opponents, selected)
 
-        # Trim after last agent_id == 0
+        # --- Trim after last agent_id == 0 ---
         last_agent0_index = max(i for i, s in enumerate(game_data["sequence"]) if s.get("agent_id") == 0)
         game_data["sequence"] = game_data["sequence"][: last_agent0_index + 1]
 
-        # Fix agent's last speculative action if it differs from game's actual action
+        # --- Sync speculative last self action (if our logged guess differs) ---
         if agent.sequence_history:
             hist_last = agent.sequence_history[-1]
             game_last = game_data["sequence"][-1]
@@ -302,13 +337,14 @@ def main():
             if hid == 0 and hist_last.get("action") != game_last.get("action"):
                 hist_last["action"] = game_last.get("action")
 
-        # Compare histories
+        # --- History sanity check (with end-of-episode challenge handling) ---
         history_ok = compare_histories(agent.sequence_history, game_data["sequence"])
         if history_ok:
             logger.info("Sequence history matches game data")
         else:
             logger.warning("Sequence history mismatch detected")
 
+        # --- Build dataset batch (truth) ---
         opponent_mapping = create_opponent_mapping(args.data_dir)
         dataset = AutoregressiveGameDataset(
             data=[game_data],
@@ -318,8 +354,17 @@ def main():
             max_seq_length=args.max_seq_length,
         )
         truth_batch = collate_variable_length_sequences([dataset[0]])
+
+        # --- Build agent inputs, then overwrite action_sequence to match dataset logic exactly ---
         agent_input = agent._prepare_model_input(agent.sequence_history)
 
+        ds_like_actions = build_actions_like_dataset(game_data["sequence"])
+        ds_like_actions_tensor = torch.tensor(
+            [ds_like_actions], dtype=torch.long, device=agent_input["action_sequence"].device
+        )
+        agent_input["action_sequence"] = ds_like_actions_tensor
+
+        # --- Compare tensors ---
         key_map = {
             "obs_sequence": "obs",
             "action_sequence": "action",
