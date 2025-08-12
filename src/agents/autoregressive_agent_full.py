@@ -31,7 +31,7 @@ class AutoregressiveAgentFull(BaseAgent):
         self.hidden_dim: Optional[int] = None
         self.max_seq_length: Optional[int] = None
         self.belief_dim: Optional[int] = None # Inferred from the model's belief head
-
+        self._obs_by_step = {}
         # --- Runtime state ---
         self.sequence_history: List[Dict[str, Any]] = []
         self.env_agent_id_map: Optional[Dict[str, int]] = None # Maps env_id to 0 (self), 1 (opp0), 2 (opp1)
@@ -46,16 +46,73 @@ class AutoregressiveAgentFull(BaseAgent):
         self._last_expert_info = None
         self._last_seen_gh_step = -1
         self._gh_step_to_seq_idx.clear()
+        self._obs_by_step.clear()
 
-    def _revealed_token_from_play(self, play_row) -> int:
-                cnt = play_row.get("count") or 1
-                cat = play_row.get("card_category")
-                if cat == "table":
-                    return cnt - 1              # 0,1,2
-                elif cat == "non-table":
-                    return 3 + (cnt - 1)        # 3,4,5
-                # Fallback: smallest table
-                return 0
+    def _revealed_token_from_play(self, e):
+        # map GH play to 0..5 (table/non-table + count)
+        cnt = int(e.get("count") or 1)
+        cat = e.get("card_category", "table")  # or however GH names it
+        # 0..2 => table 1..3, 3..5 => non-table 1..3
+        base = 0 if cat == "table" else 3
+        return base + (cnt - 1)
+
+    def _rebuild_history_from_gh(self, env, me):
+        gh = list(getattr(env, "game_history", []))
+        seq = []
+        step_to_idx_for_reveal = {}  # only for opponent Plays we may reveal
+
+        for i, e in enumerate(gh):
+            a_type = e.get("action_type")
+            actor  = e.get("player")
+            step   = int(e.get("step"))
+
+            # Pull cached obs/mask for OUR rows; zeros otherwise
+            if actor == me and step in self._obs_by_step:
+                obs, mask = self._obs_by_step[step]
+            else:
+                obs  = [0.0] * int(self.obs_dim)
+                mask = [0]   * int(self.action_dim)
+
+            if a_type == "Play":
+                cnt = int(e.get("count") or 1)
+                if actor == me:
+                    action = self._revealed_token_from_play(e)   # 0..5
+                else:
+                    action = {1:7, 2:8, 3:9}.get(cnt, 7)         # hidden 7/8/9
+                seq.append({
+                    "agent_id_env": actor,
+                    "action": action,
+                    "observation": obs,
+                    "action_mask": mask if actor == me else [0]*int(self.action_dim),
+                })
+                # Remember opponent play index for later reveal
+                if actor != me:
+                    step_to_idx_for_reveal[step] = len(seq) - 1
+
+            elif a_type == "Challenge":
+                # Reveal the immediately previous Play
+                prev_play = None
+                for j in range(i - 1, -1, -1):
+                    if gh[j].get("action_type") == "Play":
+                        prev_play = gh[j]
+                        break
+                if prev_play is not None and prev_play.get("player") != me:
+                    prev_step = int(prev_play.get("step"))
+                    idx = step_to_idx_for_reveal.get(prev_step)
+                    if idx is not None:
+                        seq[idx]["action"] = self._revealed_token_from_play(prev_play)
+
+                # Append the challenge row for whoever challenged (including us)
+                seq.append({
+                    "agent_id_env": actor,
+                    "action": 6,
+                    "observation": obs,
+                    "action_mask": mask if actor == me else [0]*int(self.action_dim),
+                })
+
+            # ignore other types, but you can extend here if needed
+
+        return seq
 
     def load_models_from_checkpoint(self, checkpoint: Dict[str, Any], agent_key: str):
         """
@@ -212,189 +269,61 @@ class AutoregressiveAgentFull(BaseAgent):
         if self.model is None:
             raise RuntimeError(f"AR-Full model not loaded for player {self.player_id}")
 
-        # --- 1. Check for New Game Start (and clear history if so) ---
         if len(env.players_hands[agent_id_env]) == 5 and all(p == 0 for p in env.penalties.values()):
-            self.sequence_history.clear()
-            self._gh_step_to_seq_idx.clear()
-            self._last_seen_gh_step = -1
-            self.env_agent_id_map = None
+            self.reset()
             logger.debug(f"Agent {self.player_id}: New game detected, history cleared.")
 
-        # --- 2. One-time Initialization ---
         if self.env_agent_id_map is None:
-            if agent_id_env == 'player_0':
-                self.env_agent_id_map = {'player_0': 0, 'player_1': 1, 'player_2': 2}
+            # Keep this consistent with how you trained
+            # Prefer actual seat order if your dataset used fixed player_0/1/2
+            if agent_id_env == "player_0":
+                self.env_agent_id_map = {"player_0": 0, "player_1": 1, "player_2": 2}
             else:
-                opponents = sorted([p for p in env.possible_agents if p != agent_id_env])
+                others = [a for a in env.possible_agents if a != agent_id_env]
+                # sorted() if that matches training, otherwise keep env.possible_agents order
+                others = sorted(others)
                 self.env_agent_id_map = {agent_id_env: 0}
-                if len(opponents) > 0: self.env_agent_id_map[opponents[0]] = 1
-                if len(opponents) > 1: self.env_agent_id_map[opponents[1]] = 2
-        
-        # --- Pre-step: Fix last recorded action if it doesn't match game history ---
-        gh = list(getattr(env, "game_history", []))  # ensure list for indexing
+                for i, opp in enumerate(others, start=1):
+                    if i <= 2:  # we only embed 3 agent types
+                        self.env_agent_id_map[opp] = i
+        gh = list(getattr(env, "game_history", []))
+        next_step = (gh[-1]["step"] + 1) if gh else 1
 
-        if self.sequence_history and gh:
-            # Find our most recent GH event (forward index)
-            my_last_idx = None
-            for idx in range(len(gh) - 1, -1, -1):
-                if gh[idx].get("player") == agent_id_env:
-                    my_last_idx = idx
-                    break
+        # Cache OUR obs/mask for the step that will be written to GH after env.step()
+        obs_curr = env.observe(agent_id_env, newest=True)[agent_id_env]
+        self._obs_by_step[next_step] = (
+            obs_curr,
+            list(info.get("action_mask", [0]*self.action_dim))
+)
+        # 1) rebuild everything up-to-now
+        self.sequence_history = self._rebuild_history_from_gh(env, agent_id_env)
 
-            # Helper: find last self row in sequence_history
-            def _last_self_hist_idx() -> int:
-                for k in range(len(self.sequence_history) - 1, -1, -1):
-                    if self.sequence_history[k].get("agent_id_env") == agent_id_env:
-                        return k
-                return -1
-
-            if my_last_idx is not None:
-                e_my = gh[my_last_idx]
-                a_type = e_my.get("action_type")
-
-                if a_type == "Play":
-                    # Sync our last recorded SELF action to raw 0..5
-                    cnt = e_my.get("count") or 1
-                    cat = e_my.get("card_category")
-                    if cat == "table":
-                        last_my_action = cnt - 1
-                    elif cat == "non-table":
-                        last_my_action = 3 + (cnt - 1)
-                    else:
-                        last_my_action = 0
-
-                    idx_self = _last_self_hist_idx()
-                    if idx_self >= 0 and self.sequence_history[idx_self].get("action") != last_my_action:
-                        self.sequence_history[idx_self]["action"] = last_my_action
-
-                elif a_type == "Challenge":
-                    # Ensure our last recorded SELF action is 6
-                    idx_self = _last_self_hist_idx()
-                    if idx_self >= 0:
-                        self.sequence_history[idx_self]["action"] = 6
-
-                    # Retro-correct the Play that this Challenge refers to (previous GH Play)
-                    prev_play = None
-                    for j in range(my_last_idx - 1, -1, -1):
-                        if gh[j].get("action_type") == "Play":
-                            prev_play = gh[j]
-                            break
-
-                    if prev_play is not None:
-                        prev_actor = prev_play.get("player")
-                        prev_step  = int(prev_play.get("step", -1))
-                        revealed   = self._revealed_token_from_play(prev_play)
-
-                        # Only retro-correct opponent plays, and only via exact GH-step mapping
-                        if prev_actor != agent_id_env:
-                            idx_to_fix = self._gh_step_to_seq_idx.get(prev_step)
-                            if idx_to_fix is not None:
-                                self.sequence_history[idx_to_fix]["action"] = revealed
-                        # else: our own play is already 0..5; nothing to change
-
-        # --- 3. Reactively Append Opponent Actions Since Last Copy ---
-        # NOTE: We no longer "look ahead" on Play. We always record opponent plays as hidden (7/8/9),
-        # and only reveal them when we actually see a Challenge row.
-        for i, e in enumerate(gh):
-            step = int(e["step"])
-            if step <= self._last_seen_gh_step:
-                continue
-
-            a_type = e.get("action_type")
-            actor_id = e.get("player")
-
-            if a_type == "Challenge":
-                # Find most recent prior Play and retro-correct it
-                prev_play = None
-                for j in range(i - 1, -1, -1):
-                    if gh[j].get("action_type") == "Play":
-                        prev_play = gh[j]
-                        break
-
-                if prev_play is not None:
-                    prev_actor = prev_play.get("player")
-                    if prev_actor != agent_id_env:
-                        prev_step = int(prev_play.get("step", -1))
-                        idx = self._gh_step_to_seq_idx.get(prev_step)  # exact mapping only
-                        if idx is not None:
-                            revealed = self._revealed_token_from_play(prev_play)
-                            self.sequence_history[idx]["action"] = revealed
-                        # else: mapping missing → do nothing (avoid corrupting a wrong row)
-
-
-                # Append the challenge if done by an opponent
-                if actor_id != agent_id_env:
-                    self.sequence_history.append({
-                        "agent_id_env": actor_id,
-                        "action": 6,
-                        "observation": [0.0] * int(self.obs_dim),
-                        "action_mask": [0] * int(self.action_dim),
-                    })
-
-                self._last_seen_gh_step = step
-                continue
-
-            if a_type == "Play":
-                # Always record opponent Play as hidden (7/8/9). Reveal later on Challenge.
-                cnt = e.get("count")
-                action_token = self.CARD_COUNT_MAPPING.get(int(cnt) if cnt is not None else 1, 7)
-
-                if actor_id != agent_id_env:
-                    self.sequence_history.append({
-                        "agent_id_env": actor_id,
-                        "action": action_token,  # hidden: 7/8/9
-                        "observation": [0.0] * int(self.obs_dim),
-                        "action_mask": [0] * int(self.action_dim),
-                    })
-                    # remember where this Play landed for later retro-correction
-                    self._gh_step_to_seq_idx[step] = len(self.sequence_history) - 1
-
-                self._last_seen_gh_step = step
-                continue
-
-            # Ignore anything else, but keep step cursor moving
-            self._last_seen_gh_step = step
-
-
-        # --- 4. Append Our Current Step (observation only) ---
-        current_step_info = {
+        # 3) append the current (not-yet-in-GH) row for the model to act on
+        self.sequence_history.append({
             "agent_id_env": agent_id_env,
-            "observation": list(env.observe(agent_id_env, newest=True)[agent_id_env]),
-            "action_mask": info["action_mask"]
-        }
-        self.sequence_history.append(current_step_info)
+            "observation": obs_curr,
+            "action_mask": list(info.get("action_mask", [0]*self.action_dim)),
+        })
 
-        # --- 5. Prepare Input and Predict Action ---
+        # 4) run model, write chosen action to the last row
         model_input = self._prepare_model_input(self.sequence_history)
         with torch.no_grad():
-            action_logits, _, _, belief_logits_0, belief_logits_1 = self.model(**model_input)
+            action_logits, _, _, belief0, belief1 = self.model(**model_input)
             last_step_idx = model_input['valid_lengths'][0].item() - 1
             logits = action_logits[0, last_step_idx]
+            mask_t = torch.tensor(info["action_mask"], dtype=torch.bool, device=self.device)
+            chosen = torch.argmax(logits.masked_fill(~mask_t, float("-inf"))).item()
 
-            mask_tensor = torch.tensor(info["action_mask"], dtype=torch.bool, device=self.device)
-            masked_logits = logits.masked_fill(~mask_tensor, float("-inf"))
-            probs = F.softmax(masked_logits, dim=-1)
-
-            if torch.isnan(probs).any() or probs.sum() < 1e-6:
-                probs = (mask_tensor.float() / mask_tensor.sum()) if mask_tensor.sum() > 0 else torch.ones_like(logits)
-
-            chosen_action = torch.argmax(probs).item()
-
-            if belief_logits_0 is not None and belief_logits_1 is not None:
-                opponents = sorted([p for p in env.possible_agents if p != agent_id_env])
-                self._last_expert_info = {}
-                if len(opponents) > 0:
-                    self._last_expert_info[opponents[0]] = {"expert_index": int(torch.argmax(belief_logits_0[0, last_step_idx]).item()), "source": "internal"}
-                if len(opponents) > 1:
-                    self._last_expert_info[opponents[1]] = {"expert_index": int(torch.argmax(belief_logits_1[0, last_step_idx]).item()), "source": "internal"}
-
-        # --- 6. Finalize History and Return ---
-        self.sequence_history[-1]["action"] = chosen_action
-
-        if len(self.sequence_history) > (self.max_seq_length or 100):
-            self.sequence_history = self.sequence_history[-(self.max_seq_length or 100):]
-
-        return chosen_action
+        if belief0 is not None and belief1 is not None:
+            opponents = sorted([p for p in env.possible_agents if p != agent_id_env])
+            self._last_expert_info = {}
+            if len(opponents) > 0:
+                self._last_expert_info[opponents[0]] = {"expert_index": int(torch.argmax(belief0[0, last_step_idx]).item()), "source": "internal"}
+            if len(opponents) > 1:
+                self._last_expert_info[opponents[1]] = {"expert_index": int(torch.argmax(belief1[0, last_step_idx]).item()), "source": "internal"}
+                
+        self.sequence_history[-1]["action"] = chosen
+        return chosen
 
     def get_last_expert_info(self):
         """Returns the most recent internal belief predictions."""
