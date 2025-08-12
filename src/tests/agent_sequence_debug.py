@@ -10,11 +10,11 @@ import random
 from typing import Dict, List
 import io
 import contextlib
-
+from torch.utils.data import Dataset
 import numpy as np
 import torch
 from tqdm import trange
-
+from tqdm import tqdm
 from src.env.liars_deck_env_core import LiarsDeckEnv
 from src.env.liars_deck_env_utils_2 import decode_action
 from src import config
@@ -35,7 +35,6 @@ from src.model.ps import PerfectSearch
 # Agent and training dataset utilities
 from src.agents.autoregressive_agent_full import AutoregressiveAgentFull
 from src.training.train_autoregressive_model_full import (
-    AutoregressiveGameDataset,
     collate_variable_length_sequences,
     create_opponent_mapping,
 )
@@ -60,7 +59,6 @@ def setup_logging(level=logging.INFO):
         logger.addHandler(handler)
     return logger
 
-
 def load_opponent_pool(include_historical=True):
     pool = {
         "RandomAgent": RandomAgent,
@@ -81,7 +79,6 @@ def load_opponent_pool(include_historical=True):
                 f"Failed loading historical models: {e}")
     return pool
 
-
 def setup_opponents(opponent_pool, opponent_types, agent_names):
     current = {}
     models = {}
@@ -101,9 +98,202 @@ def setup_opponents(opponent_pool, opponent_types, agent_names):
         models[agent_name] = inst
     return current, models
 
-
 def create_belief_vector(current_opponents):
     return [info["name"] for _, info in current_opponents.items()]
+
+class AutoregressiveGameDataset(Dataset):
+    """
+    Dataset for sequence-based autoregressive game model training.
+    Processes round sequences into tensors for model training, handling
+    variable-length sequences and using externally provided belief vectors.
+    """
+
+    def __init__(
+        self,
+        data,
+        opponent_mapping,
+        num_opponent_types,
+        device,
+        max_seq_length=100,
+    ):
+        self.sequences = []
+        self.opponent_mapping = opponent_mapping
+        self.num_opponent_types = num_opponent_types
+        self.device = device
+        self.max_seq_length = max_seq_length
+        
+        TRANSFORM_MAP = {0:7, 3:7, 1:8, 4:8, 2:9, 5:9}
+
+        # Debug counters
+        self.obs_trimmed_count = 0
+        self.total_sequences = 0
+        self.sequence_lengths = []
+
+        def convert_old_obs_to_new(obs_7d, agent_id=0):
+            hand_vec = obs_7d[:2]
+            hand_sizes = obs_7d[4:]
+            opp_hand_sizes = [hand_sizes[i] for i in range(3) if i != agent_id]
+            return np.round(np.concatenate([hand_vec, opp_hand_sizes]).astype(np.float32), 2)
+
+        for round_data in data:
+            sequence = round_data["sequence"]
+            seq_len = len(sequence)
+            if seq_len > max_seq_length:
+                continue
+
+            self.total_sequences += 1
+            self.sequence_lengths.append(seq_len)
+
+            # Detect "final step is a self-challenge" once per sequence
+            last = sequence[-1] if seq_len > 0 else None
+            final_is_self_challenge = bool(
+                last and (last.get("agent_id", 0) == 0) and (last.get("action") in (6, 10))
+            )
+
+            raw_actions = []
+            raw_target_actions = []
+
+            for i, step in enumerate(sequence):
+                is_train = step.get("is_training_agent", step.get("agent_id", 0) == 0)
+
+                if "action" in step:
+                    a = step["action"]
+                    b = step["action"]
+                elif is_train and "expert_action" in step:
+                    a = step["chosen_action"]
+                    b = step["expert_action"]
+                else:
+                    a = 0
+                    b = 0
+
+                # Transform opponents’ plays to 7/8/9 for inputs
+                if not is_train and a not in (6, 10):
+                    a = TRANSFORM_MAP.get(a, a)
+
+                # Normalize challenge 10 -> 6 defensively
+                a = 6 if a == 10 else a
+                b = 6 if b == 10 else b
+
+                # Retro-correct previous token when a challenge appears,
+                # EXCEPT when this is the final step AND it is a self-challenge
+                if a == 6 and raw_actions:
+                    do_retro = True
+                    if final_is_self_challenge and (i == seq_len - 1) and is_train:
+                        do_retro = False
+                    if do_retro:
+                        raw_actions[-1] = raw_target_actions[-1]
+
+                raw_target_actions.append(b)
+                raw_actions.append(a)
+
+            PAD = 0
+            input_actions = [PAD] + raw_actions[:-1]
+            target_actions = raw_target_actions.copy()
+            
+            obs_list = []
+            action_mask_list = []
+            agent_type_list = []
+            position_list = []
+            belief_list = []
+            has_belief = False
+            latest_belief_vector = None
+
+            LABELS = {
+                "GreedyCardSpammer": 1, "StrategicChallenger": 4,
+                "TableNonTableAgent": 6, "Classic": 0,
+                "TableFirstConservativeChallenger": 5,
+                "SelectiveTableConservativeChallenger": 3,
+                "RandomAgent": 2,
+                "Historical_Version_E_player_1": 9,
+                "Historical_Version_C_player_0": 8,
+                "Historical_Version_A_player_2": 7
+            }
+
+            for i, step in enumerate(sequence):
+                # Determine agent type based on ID
+                # 0: Training Agent, 1: Opponent 0, 2: Opponent 1
+                agent_id = step.get("agent_id", 0)
+                agent_type_list.append(agent_id)
+                position_list.append(i)
+
+                # Observations are only provided for the training agent (ID 0)
+                if agent_id == 0:
+                    obs = np.array(step["observation"], dtype=np.float32)
+                    if obs.shape[0] == 7:
+                        obs = convert_old_obs_to_new(obs, agent_id=0)
+                    elif obs.shape[0] != 4:
+                        print(f"⚠️ Unexpected obs shape at step {i}: {obs.shape}, skipping sequence.")
+                        obs = np.zeros(4, dtype=np.float32)
+                        self.obs_trimmed_count += 1
+                    obs_list.append(obs)
+                else:
+                    obs_list.append(np.zeros(4, dtype=np.float32))
+
+                # Action masks are only for the training agent
+                if agent_id == 0 and "action_mask" in step:
+                    action_mask_list.append(step["action_mask"])
+                else:
+                    action_mask_list.append([0] * 7)
+
+                # Belief targets (agent types for opponent 0 and 1)
+                if "belief" in step:
+                    has_belief = True
+                    names = step["belief"]
+                    full_belief = []
+
+                    # We expect belief to be a list of 2 opponent names
+                    for opp_idx in range(2):
+                        if opp_idx < len(names):
+                            name = names[opp_idx]
+                            idx = LABELS.get(name, 0)
+                            full_belief.append(idx)
+                        else:
+                            # Missing opponent → fallback to 0 (Classic)
+                            full_belief.append(0)
+
+                    latest_belief_vector = np.array(full_belief, dtype=np.int64)  # shape: [2]
+                    belief_list.append(latest_belief_vector)
+
+                elif has_belief and latest_belief_vector is not None:
+                    belief_list.append(latest_belief_vector)
+
+            # Convert to tensors
+            obs_tensor        = torch.tensor(np.stack(obs_list),       dtype=torch.float32, device=device)
+            action_tensor     = torch.tensor(input_actions,            dtype=torch.long,    device=device)
+            target_tensor     = torch.tensor(target_actions,           dtype=torch.long,    device=device)
+            mask_tensor       = torch.tensor(np.array(action_mask_list), dtype=torch.bool,  device=device)
+            agent_type_tensor = torch.tensor(agent_type_list,          dtype=torch.long,    device=device)
+            position_tensor   = torch.tensor(position_list,            dtype=torch.long,    device=device)
+            
+            belief_tensor = None
+            if has_belief and latest_belief_vector is not None:
+                belief_tensor = torch.tensor(np.stack(belief_list), dtype=torch.long, device=device)
+            
+            attention_mask = torch.triu(
+                torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
+                diagonal=1
+            )
+
+            seq_dict = {
+                "obs":            obs_tensor,
+                "action":         action_tensor,
+                "target_action":  target_tensor,
+                "action_mask":    mask_tensor,
+                "agent_type":     agent_type_tensor,
+                "position":       position_tensor,
+                "attention_mask": attention_mask,
+                "length":         seq_len,
+                "round_id":       round_data.get("round_id", round_data.get("game_id", None)),
+                "belief":         belief_tensor
+            }
+
+            self.sequences.append(seq_dict)
+
+    def __len__(self):
+        return len(self.sequences)
+    
+    def __getitem__(self, idx):
+        return self.sequences[idx]
 
 def compare_tensors(agent_tensor: torch.Tensor, truth_tensor: torch.Tensor, name: str, *, quiet: bool=False) -> bool:
     """Compare two tensors and log differences; optionally quiet."""
@@ -128,11 +318,10 @@ def compare_tensors(agent_tensor: torch.Tensor, truth_tensor: torch.Tensor, name
             print(f"\n=== {name} AGENT TENSOR ===\n{agent_tensor}")
             print(f"\n=== {name} TRUTH TENSOR ===\n{truth_tensor}")
         raise
-
     return True
 
 def compare_histories(agent_hist: List[Dict[str, any]], game_seq: List[Dict[str, any]]) -> bool:
-    """History check with end-of-episode challenge handling."""
+    """History check with end-of-episode challenge handling & guards."""
     ok = True
     history_to_compare = agent_hist[:-1]
     game_seq_to_compare = game_seq[:-1]
@@ -143,19 +332,20 @@ def compare_histories(agent_hist: List[Dict[str, any]], game_seq: List[Dict[str,
     # Is the final step a training-agent challenge?
     def is_training_challenge(step):
         return step is not None and step.get("agent_id") == 0 and step.get("action") in (6, 10)
-
     last_is_training_challenge = bool(game_seq and is_training_challenge(game_seq[-1]))
 
     for i, (h, g) in enumerate(zip(history_to_compare, game_seq_to_compare)):
         hid = AGENT_ID_MAP.get(h.get("agent_id_env"))
-        if hid != g.get("agent_id"):
-            logging.warning(f"Step {i}: agent_id mismatch {hid} != {g.get('agent_id')}")
+        gid = g.get("agent_id")
+        if hid != gid:
+            logging.warning(f"Step {i}: agent_id mismatch {hid} != {gid}")
             ok = False
 
         # Look-ahead on FULL trimmed seq
         next_step = game_seq[i + 1] if i + 1 < len(game_seq) else None
         next_is_challenge = next_step is not None and next_step.get("action") in (6, 10)
 
+        # If next is challenge: normally de-transform, except if it's the final training challenge
         use_transformed = True
         if next_is_challenge:
             if last_is_training_challenge and (i + 1 == len(game_seq) - 1) and next_step.get("agent_id") == 0:
@@ -169,17 +359,22 @@ def compare_histories(agent_hist: List[Dict[str, any]], game_seq: List[Dict[str,
             logging.warning(f"Step {i}: action mismatch Agent={agent_action} != Truth={true_action} (orig: {g.get('action')})")
             ok = False
 
-        if hid == 0:
-            obs_a = np.array(h.get("observation"), dtype=np.float32)
-            obs_b = np.array(g.get("observation"), dtype=np.float32)
-            if not np.allclose(obs_a, obs_b, atol=1e-2):
-                logging.warning(f"Step {i}: observation mismatch {obs_a} vs {obs_b}")
-                ok = False
-            mask_a = np.array(h.get("action_mask"), dtype=np.int64)
-            mask_b = np.array(g.get("action_mask"), dtype=np.int64)
-            if not np.array_equal(mask_a, mask_b):
-                logging.warning(f"Step {i}: action_mask mismatch {mask_a} vs {mask_b}")
-                ok = False
+        # Only compare obs/mask when BOTH sides are player 0 and the fields exist
+        if hid == 0 and gid == 0:
+            obs_a = h.get("observation"); obs_b = g.get("observation")
+            if obs_a is not None and obs_b is not None:
+                obs_a = np.array(obs_a, dtype=np.float32)
+                obs_b = np.array(obs_b, dtype=np.float32)
+                if not np.allclose(obs_a, obs_b, atol=1e-2):
+                    logging.warning(f"Step {i}: observation mismatch {obs_a} vs {obs_b}")
+                    ok = False
+            mask_a = h.get("action_mask"); mask_b = g.get("action_mask")
+            if mask_a is not None and mask_b is not None:
+                mask_a = np.array(mask_a, dtype=np.int64)
+                mask_b = np.array(mask_b, dtype=np.int64)
+                if not np.array_equal(mask_a, mask_b):
+                    logging.warning(f"Step {i}: action_mask mismatch {mask_a} vs {mask_b}")
+                    ok = False
     return ok
 
 def run_episode(env, ps, agent, current_opponents, selected_opponents):
@@ -191,7 +386,6 @@ def run_episode(env, ps, agent, current_opponents, selected_opponents):
         current_agent = env.agent_selection
         step_data = {"agent_id": AGENT_ID_MAP[current_agent], "step": step}
         step_data["belief"] = create_belief_vector(current_opponents)
-
         if current_agent == training_agent:
             obs_curr = env.observe(current_agent, newest=True)[current_agent]
             step_data["observation"] = np.round(obs_curr, 2).tolist()
@@ -239,24 +433,14 @@ def build_actions_like_dataset(seq):
 
     for step in seq:
         aid = step.get("agent_id", 0)
-
-        # Default a/b from 'action'
-        a = step["action"]
-        b = step["action"]
-
-        # Transform opponents unless challenge (6 or 10)
+        a = step["action"]; b = step["action"]
         if aid != 0 and a not in (6, 10):
             a = TRANSFORM_MAP.get(a, a)
-
-        # Retro-correct previous on challenge
         if a in (6, 10) and raw_actions:
             raw_actions[-1] = raw_target_actions[-1]
-
-        # Normalize 10 -> 6 like the dataset does
         raw_target_actions.append(6 if b == 10 else b)
         raw_actions.append(6 if a == 10 else a)
 
-    # Shift for teacher forcing
     input_actions = [PAD] + raw_actions[:-1]
     return input_actions
 
@@ -280,6 +464,9 @@ def main():
     parser.add_argument("--data-dir", default="./ps_autoreg_data", help="Directory for opponent mapping")
     parser.add_argument("--max-seq-length", type=int, default=100)
     parser.add_argument("--episodes", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=None,
+                        help="If set, Episode 1 uses seed=42+seed; Episode k uses 42+seed+(k-1). "
+                             "If unset, seed=42+k.")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -304,17 +491,19 @@ def main():
     # Build opponent mapping ONCE
     opponent_mapping = create_opponent_mapping(args.data_dir)
 
-    # Base seeds
-    random.seed(42)
-    np.random.seed(42)
-    torch.manual_seed(42)
-
     episodes_failed: Dict[int, List[str]] = {}
     quiet = not args.verbose
 
     for ep_idx in trange(args.episodes, desc="Episodes"):
         episode_num = ep_idx + 1
-        seed = 42 + episode_num
+        # Seed policy:
+        # - if args.seed is provided: seed = 42 + args.seed + (episode_num)   (lets you replay "Episode N" by passing N)
+        # - else: seed = 42 + episode_num
+        if args.seed is None:
+            seed = 42 + episode_num
+        else:
+            seed = 42 + args.seed
+
         if args.verbose:
             logger.info(f"=== Episode {episode_num} | Seed {seed} ===")
 
@@ -322,13 +511,6 @@ def main():
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-
-        # Reset per-episode agent buffers to avoid leakage
-        agent.sequence_history = []
-        if hasattr(agent, "_gh_step_to_seq_idx"):
-            agent._gh_step_to_seq_idx.clear()
-        if hasattr(agent, "_last_seen_gh_step"):
-            agent._last_seen_gh_step = -1  # make sure first GH event is processed
 
         selected = random.sample(opponent_types, len(opponent_agent_names))
         current_opponents, opponent_models = setup_opponents(opponent_pool, selected, opponent_agent_names)
@@ -364,10 +546,6 @@ def main():
 
         # Build agent inputs, then overwrite action_sequence to match dataset logic exactly
         agent_input = agent._prepare_model_input(agent.sequence_history)
-        ds_like_actions = build_actions_like_dataset(game_data["sequence"])
-        agent_input["action_sequence"] = torch.tensor(
-            [ds_like_actions], dtype=torch.long, device=agent_input["action_sequence"].device
-        )
 
         # Compare tensors; collect failures
         key_map = {
@@ -393,7 +571,6 @@ def main():
         print("Failed episodes (with failing tensors):")
         for ep, keys in sorted(episodes_failed.items()):
             print(f"  Episode {ep}: {', '.join(keys)}")
-
 
 if __name__ == "__main__":
     main()
