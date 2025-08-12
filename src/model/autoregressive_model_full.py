@@ -12,7 +12,7 @@ class AutoregressiveGameModelFull(nn.Module):
                  num_layers=2,
                  dropout_rate=0.1,
                  max_seq_length=100,
-                 num_agent_types=3): # Added num_agent_types (0: Agent, 1: Opponent 0, 2: Opponent 1)
+                 num_agent_types=3):
         super().__init__()
         self.obs_dim = obs_dim
         self.action_dim = action_dim
@@ -22,6 +22,11 @@ class AutoregressiveGameModelFull(nn.Module):
 
         self.extended_action_dim = action_dim + 3
 
+        self.register_buffer(
+            "causal_bool_mask_full",
+            torch.triu(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool), 1)
+        )
+        
         # === Input Encoders ===
         self.obs_encoder = nn.Sequential(
             nn.Linear(obs_dim, hidden_dim),
@@ -52,10 +57,11 @@ class AutoregressiveGameModelFull(nn.Module):
         # Action head for the training agent (0)
         self.action_head = nn.Linear(hidden_dim*2, action_dim) 
         # Opponent action head (for types 1 and 2)
-        self.opp_action_head = nn.Linear(hidden_dim*2, action_dim) 
+        self.opp_action_head = nn.Linear(hidden_dim*2, action_dim)
+        # Value head (not used)
         self.value_head = nn.Linear(hidden_dim*2, 1)
 
-        # Belief prediction (one shared head, run twice with one-hot opponent indicator)
+        # Belief prediction
         self.belief_fc = nn.Linear(hidden_dim, hidden_dim)
         self.belief_head_op0 = nn.Linear(hidden_dim, belief_dim)
         self.belief_head_op1 = nn.Linear(hidden_dim, belief_dim)
@@ -67,9 +73,9 @@ class AutoregressiveGameModelFull(nn.Module):
         
         Args:
             obs_sequence: Tensor of shape ``[batch_size, seq_len, obs_dim]`` or ``None``
-            belief_sequence: Optional tensor of shape ``[batch_size, seq_len, belief_dim]``
             agent_types: Tensor of shape ``[batch_size, seq_len]`` where 0 denotes the
-                training agent and 1 an opponent
+                training agent and 1 a opponent_0 and 2 opponent_1
+            action_sequence: Tensor of shape ``[batch_size, seq_len]`` with action indices
             positions: Tensor of shape ``[batch_size, seq_len]`` indicating positions
             action_masks: Optional tensor of shape ``[batch_size, seq_len, action_dim]``
         
@@ -107,29 +113,16 @@ class AutoregressiveGameModelFull(nn.Module):
         
         return combined
 
-    def _generate_causal_mask(self, seq_len, device):
-        return torch.triu(
-            torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
-            diagonal=1
-        )
-
-    def _generate_padding_mask(self, seq_len, valid_lens, device):
-        batch_size = valid_lens.size(0)
-        return torch.arange(seq_len, device=device).expand(batch_size, seq_len) >= valid_lens.unsqueeze(1)
-
     def forward(self, obs_sequence=None, action_sequence=None,
-            agent_types=None, positions=None, action_masks=None, valid_lengths=None):
-
-        batch_size, seq_len = action_sequence.shape
-        device = action_sequence.device
+            agent_types=None, positions=None, action_masks=None, padding_mask=None, valid_lengths=None):
 
         encoded_inputs = self._encode_inputs(
             obs_sequence, action_sequence,
             agent_types, positions, action_masks
         )
 
-        causal_mask = self._generate_causal_mask(seq_len, device)
-        padding_mask = self._generate_padding_mask(seq_len, valid_lengths, device) if valid_lengths is not None else None
+        T = encoded_inputs.size(1)
+        causal_mask = self.causal_bool_mask_full[:T, :T]
 
         transformer_output = self.transformer(
             encoded_inputs,
@@ -169,7 +162,7 @@ class AutoregressiveGameModelFull(nn.Module):
 
             # Only mask rows that have at least one legal action; otherwise skip to avoid all -inf
             # Use a large negative constant for stability instead of -inf
-            LARGE_NEG = -1e9
+            LARGE_NEG = torch.finfo(action_logits.dtype).min
             action_logits = torch.where(
                 gate,                                            # per-row switch
                 action_logits.masked_fill(invalid, LARGE_NEG),   # mask invalid on our rows with any legal
