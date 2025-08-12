@@ -34,7 +34,7 @@ from src.model.hard_coded_agents import (
 from src.training.train_utils import load_specific_historical_models
 
 # Import PS
-from src.model.ps import PerfectSearch
+from src.model.ps_v3 import PerfectSearch
 
 def setup_logging(log_file=None, level=logging.INFO):
     """Configure logging for the data generator."""
