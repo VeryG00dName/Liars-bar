@@ -10,16 +10,17 @@ import logging
 from datetime import datetime
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+import torch.amp as amp
+from torch.utils.data import Dataset, DataLoader, Sampler
 from tqdm import tqdm
+from typing import List
 from torch.utils.tensorboard import SummaryWriter
 from src.training.train_extras import set_seed
 from src.model.autoregressive_model_full import AutoregressiveGameModelFull
 from src import config
-
+torch.set_float32_matmul_precision("high")
 # Define hardcoded opponent labels consistent with other training scripts
 HARD_CODED_LABELS = {
     "GreedyCardSpammer": 1,
@@ -164,6 +165,37 @@ def create_opponent_mapping(data_dir, use_cache=True, cache_file="opponent_mappi
         print(f"Error saving opponent mapping cache: {e}")
     
     return opponent_mapping
+
+class BucketSampler(Sampler):
+    def __init__(self, data_source: List[int], batch_size: int, shuffle=True):
+        self.lengths = [seq['length'] for seq in data_source]
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        
+        # Create a list of indices
+        self.indices = list(range(len(self.lengths)))
+        
+        # Sort indices by length
+        self.sorted_indices = sorted(self.indices, key=lambda i: self.lengths[i])
+        
+    def __iter__(self):
+        # Batch the sorted indices
+        batches = [
+            self.sorted_indices[i:i + self.batch_size]
+            for i in range(0, len(self.sorted_indices), self.batch_size)
+        ]
+        
+        # Optionally shuffle the batches themselves (good compromise)
+        if self.shuffle:
+            random.shuffle(batches)
+            
+        # Yield indices from each batch
+        for batch in batches:
+            yield batch
+            
+    def __len__(self):
+        n = len(self.sorted_indices)
+        return (n + self.batch_size - 1) // self.batch_size
 
 class AutoregressiveGameDataset(Dataset):
     """
@@ -680,11 +712,12 @@ def train_autoregressive_model(
     all_data = load_autoreg_data(data_dir, max_files, max_samples)
     train_data, val_data = train_val_split(all_data, validation_split, max_val_samples=1000)
     logger.info(f"Creating datasets with {len(train_data)} training and {len(val_data)} validation sequences")
-
+    
     train_dataset = AutoregressiveGameDataset(train_data, opponent_mapping, num_opponent_types, device, max_seq_length)
     val_dataset = AutoregressiveGameDataset(val_data, opponent_mapping, num_opponent_types, device, max_seq_length)
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=collate_variable_length_sequences)
+    
+    train_sampler = BucketSampler(train_dataset.sequences, batch_size=batch_size, shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,  num_workers=0, collate_fn=collate_variable_length_sequences)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=collate_variable_length_sequences)
 
     sample = next(iter(train_loader))
@@ -703,13 +736,16 @@ def train_autoregressive_model(
         max_seq_length=max_seq_length,
         num_agent_types=3 # 0: Agent, 1: Opponent 0, 2: Opponent 1
     ).to(device)
+    #model = torch.compile(model, backend="aot_eager", mode="reduce-overhead")
+    pt_dtype = torch.float16 if device.type == 'cuda' else torch.bfloat16
     logger.info(f"Model architecture:\n{model}")
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Total parameters: {total_params}, Trainable parameters: {trainable_params}")
-
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+    
+    scaler = amp.GradScaler(device=device, enabled=(device.type == 'cuda'))
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5, fused=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
     start_epoch, best_val_loss = 0, float('inf')
     if resume_from and os.path.exists(resume_from):
@@ -739,32 +775,37 @@ def train_autoregressive_model(
         
         train_progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Train)", leave=False)
         for batch in train_progress:
-            self_logits, opp_logits, value_pred, belief_logits_0, belief_logits_1 = model(
-                obs_sequence=batch['obs'],
-                action_sequence=batch['action'],
-                agent_types=batch['agent_type'],
-                positions=batch['position']
-            )
+            with amp.autocast(device_type=device.type, dtype=pt_dtype):
+                self_logits, opp_logits, value_pred, belief_logits_0, belief_logits_1 = model(
+                    obs_sequence=batch['obs'],
+                    action_sequence=batch['action'],
+                    agent_types=batch['agent_type'],
+                    positions=batch['position'],
+                    action_masks=batch['action_mask'],
+                    padding_mask=batch['padding_mask']
+                )
 
-            belief_targets = batch['belief']
-            
-            total_loss, self_loss, opp_loss, value_loss, belief_loss = calculate_autoregressive_loss(
-                self_logits=self_logits,
-                opp_logits=opp_logits,
-                target_actions=batch['target_action'],
-                agent_types=batch['agent_type'],
-                padding_mask=batch['padding_mask'],
-                belief_logits_0=belief_logits_0,
-                belief_logits_1=belief_logits_1,
-                belief_targets=belief_targets,
-                value_pred=value_pred,
-                value_target=None
-            )
+                belief_targets = batch['belief']
+                
+                total_loss, self_loss, opp_loss, value_loss, belief_loss = calculate_autoregressive_loss(
+                    self_logits=self_logits,
+                    opp_logits=opp_logits,
+                    target_actions=batch['target_action'],
+                    agent_types=batch['agent_type'],
+                    padding_mask=batch['padding_mask'],
+                    belief_logits_0=belief_logits_0,
+                    belief_logits_1=belief_logits_1,
+                    belief_targets=belief_targets,
+                    value_pred=value_pred,
+                    value_target=None
+                )
 
             optimizer.zero_grad()
-            total_loss.backward()
+            scaler.scale(total_loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             # accumulate losses
             train_total_loss += total_loss.item()
@@ -831,27 +872,30 @@ def train_autoregressive_model(
         val_progress = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Val)", leave=False)
         with torch.no_grad():
             for batch in val_progress:
-                self_logits, opp_logits, value_pred, belief_logits_0, belief_logits_1 = model(
-                    obs_sequence=batch['obs'],
-                    action_sequence=batch['action'],
-                    agent_types=batch['agent_type'],
-                    positions=batch['position']
-                )
+                with amp.autocast(device_type=device.type, dtype=pt_dtype):
+                    self_logits, opp_logits, value_pred, belief_logits_0, belief_logits_1 = model(
+                        obs_sequence=batch['obs'],
+                        action_sequence=batch['action'],
+                        agent_types=batch['agent_type'],
+                        positions=batch['position'],
+                        action_masks=batch['action_mask'],
+                        padding_mask=batch['padding_mask']
+                    )
 
-                belief_targets = batch['belief']
+                    belief_targets = batch['belief']
 
-                total_loss, self_loss, opp_loss, value_loss, belief_loss = calculate_autoregressive_loss(
-                    self_logits=self_logits,
-                    opp_logits=opp_logits,
-                    target_actions=batch['target_action'],
-                    agent_types=batch['agent_type'],
-                    padding_mask=batch['padding_mask'],
-                    belief_logits_0=belief_logits_0,
-                    belief_logits_1=belief_logits_1,
-                    belief_targets=belief_targets,
-                    value_pred=value_pred,
-                    value_target=None
-                )
+                    total_loss, self_loss, opp_loss, value_loss, belief_loss = calculate_autoregressive_loss(
+                        self_logits=self_logits,
+                        opp_logits=opp_logits,
+                        target_actions=batch['target_action'],
+                        agent_types=batch['agent_type'],
+                        padding_mask=batch['padding_mask'],
+                        belief_logits_0=belief_logits_0,
+                        belief_logits_1=belief_logits_1,
+                        belief_targets=belief_targets,
+                        value_pred=value_pred,
+                        value_target=None
+                    )
 
                 our_mask     = (batch['agent_type'] == 0) & (~batch['padding_mask'])
                 opp_mask     = ((batch['agent_type'] == 1) | (batch['agent_type'] == 2)) & (~batch['padding_mask'])
