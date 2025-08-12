@@ -232,6 +232,7 @@ class AutoregressiveAgentFull(BaseAgent):
         agent_type_seq = torch.ones((1, valid_len), dtype=torch.long, device=self.device) # Default to 1 (opponent)
         pos_seq = torch.arange(valid_len, dtype=torch.long, device=self.device).unsqueeze(0)
         action_mask_seq = torch.zeros((1, valid_len, self.action_dim), dtype=torch.bool, device=self.device)
+        padding_mask = torch.zeros(1, valid_len, dtype=torch.bool, device=self.device)
         # 5. Populate tensors from the filtered history
         for i, step_data in enumerate(filtered):
             agent_type = self.env_agent_id_map[step_data["agent_id_env"]]
@@ -255,6 +256,7 @@ class AutoregressiveAgentFull(BaseAgent):
             'agent_types': agent_type_seq,
             'positions': pos_seq,
             'action_masks': action_mask_seq,
+            'padding_mask': padding_mask,
             'valid_lengths': torch.tensor([valid_len], device=self.device)
         }
 
