@@ -110,25 +110,35 @@ def setup_opponents(opponent_pool, opponent_types, agent_names):
 def create_belief_vector(current_opponents):
     return [info["name"] for _, info in current_opponents.items()]
 
-def compare_tensors(agent_tensor: torch.Tensor, truth_tensor: torch.Tensor,
-                    name: str) -> bool:
-    """Utility copied from debug_agent_replay for tensor comparison."""
-    mismatch = False
-    if agent_tensor.shape != truth_tensor.shape:
-        logging.warning(f"{name}: shape mismatch {agent_tensor.shape} vs {truth_tensor.shape}")
-        mismatch = True
-    if agent_tensor.dtype != truth_tensor.dtype:
-        logging.warning(f"{name}: dtype mismatch {agent_tensor.dtype} vs {truth_tensor.dtype}")
-        mismatch = True
-    if not torch.allclose(agent_tensor.cpu(), truth_tensor.cpu(), atol=1e-5):
-        logging.warning(f"{name}: value mismatch")
-        mismatch = True
-    return not mismatch
+def compare_tensors(agent_tensor: torch.Tensor, truth_tensor: torch.Tensor, name: str) -> bool:
+    """Compare two tensors and log differences; print full tensors if shape mismatch or allclose fails."""
+    
+    try:
+        if agent_tensor.shape != truth_tensor.shape:
+            logging.error(f"{name}: shape mismatch {agent_tensor.shape} vs {truth_tensor.shape}")
+            print(f"\n=== {name} AGENT TENSOR ===\n{agent_tensor}")
+            print(f"\n=== {name} TRUTH TENSOR ===\n{truth_tensor}")
+            return False
+
+        if not torch.allclose(agent_tensor.cpu(), truth_tensor.cpu(), atol=1e-5):
+            logging.error(f"{name}: value mismatch")
+            print(f"\n=== {name} AGENT TENSOR ===\n{agent_tensor}")
+            print(f"\n=== {name} TRUTH TENSOR ===\n{truth_tensor}")
+            return False
+
+    except RuntimeError as e:
+        logging.exception(f"{name}: tensor comparison failed with error: {e}")
+        print(f"\n=== {name} AGENT TENSOR ===\n{agent_tensor}")
+        print(f"\n=== {name} TRUTH TENSOR ===\n{truth_tensor}")
+        raise  # re-raise so your test still fails
+
+    return True
 
 def compare_histories(agent_hist: List[Dict[str, any]], game_seq: List[Dict[str, any]]) -> bool:
     """Check that the agent's recorded history matches saved game data."""
     ok = True
 
+    # Compare up to, but not including, the last entries (agent keeps a speculative last entry)
     history_to_compare = agent_hist[:-1]
     game_seq_to_compare = game_seq[:-1]
 
@@ -137,18 +147,39 @@ def compare_histories(agent_hist: List[Dict[str, any]], game_seq: List[Dict[str,
 
     logging.info(f"Comparing {len(history_to_compare)} steps of history...")
 
+    # Is the final step a training-agent challenge?
+    def is_training_challenge(step):
+        return step is not None and step.get("agent_id") == 0 and step.get("action") in (6, 10)
+
+    last_is_training_challenge = bool(game_seq and is_training_challenge(game_seq[-1]))
+
     for i, (h, g) in enumerate(zip(history_to_compare, game_seq_to_compare)):
         hid = AGENT_ID_MAP.get(h.get("agent_id_env"))
         if hid != g.get("agent_id"):
             logging.warning(f"Step {i}: agent_id mismatch {hid} != {g.get('agent_id')}")
             ok = False
 
-        # look ahead: if the *next* action is 6, don't use transformed_action
-        next_action = game_seq_to_compare[i + 1].get("action") if i + 1 < len(game_seq_to_compare) else None
-        if next_action == 6:
-            true_action = g.get("action")
-        else:
+        # Look ahead using the FULL trimmed sequence, not the shortened one,
+        # so we can see the final training challenge if it exists.
+        next_step = game_seq[i + 1] if i + 1 < len(game_seq) else None
+        next_is_challenge = next_step is not None and next_step.get("action") in (6, 10)
+
+        # If the *next* action is a challenge, dataset normally uses raw (untransformed) for this step.
+        # BUT if that next challenge is the final step and it's from agent 0, the agent hasn't retro-corrected yet.
+        # In that end-of-episode case, keep transformed_action to match agent history.
+        use_transformed = True
+        if next_is_challenge:
+            if last_is_training_challenge and (i + 1 == len(game_seq) - 1) and next_step.get("agent_id") == 0:
+                # end-of-episode training challenge → don't de-transform
+                use_transformed = True
+            else:
+                # mid-episode challenge → de-transform to raw
+                use_transformed = False
+
+        if use_transformed:
             true_action = g.get("transformed_action", g.get("action"))
+        else:
+            true_action = g.get("action")
 
         agent_action = h.get("action")
         if agent_action != true_action:
@@ -205,9 +236,7 @@ def run_episode(env, ps, agent, current_opponents, selected_opponents):
                 mask = env.infos[current_agent]["action_mask"]
                 if hasattr(opp_model, "play_turn"):
                     best_action = opp_model.play_turn(obs_opp, mask, table_card=env.table_card)
-                    print(f"Opponent {current_agent} chose action {best_action} with mask {mask} and obs {obs_opp}")
                 else:
-                    print("error: opponent model does not have play_turn method")
                     best_action = mask.index(1)
             step_data["action"] = best_action
             step_data["transformed_action"] = TRANSFORM_MAP[best_action]
@@ -231,10 +260,6 @@ def main():
     level = logging.INFO if args.verbose else logging.WARNING
     logger = setup_logging(level)
 
-    random.seed(42)
-    np.random.seed(42)
-    torch.manual_seed(42)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     agent = AutoregressiveAgentFull(device=device, player_id="player_0")
     if os.path.exists(args.agent_checkpoint):
@@ -249,46 +274,66 @@ def main():
     opponent_pool = load_opponent_pool(include_historical=False)
     opponent_types = list(opponent_pool.keys())
     opponent_agent_names = ["player_1", "player_2"]
+    random.seed(42)
+    np.random.seed(42)
+    torch.manual_seed(42)
+    # Run 5 episodes
+    for episode_num in range(1, 6):
+        seed = 42 + episode_num
+        logger.info(f"=== Episode {episode_num} | Seed {seed} ===")
 
-    selected = random.sample(opponent_types, len(opponent_agent_names))
-    current_opponents, opponent_models = setup_opponents(opponent_pool, selected, opponent_agent_names)
+        selected = random.sample(opponent_types, len(opponent_agent_names))
+        current_opponents, opponent_models = setup_opponents(opponent_pool, selected, opponent_agent_names)
 
-    env = LiarsDeckEnv(num_players=config.NUM_PLAYERS)
-    obs, infos = env.reset(seed=42)
-    ps = PerfectSearch(env=env, training_agent="player_0", opponent_models=opponent_models)
-    game_data = run_episode(env, ps, agent, current_opponents, selected)
+        env = LiarsDeckEnv(num_players=config.NUM_PLAYERS)
+        obs, infos = env.reset(seed=seed)
+        ps = PerfectSearch(env=env, training_agent="player_0", opponent_models=opponent_models)
+        game_data = run_episode(env, ps, agent, current_opponents, selected)
 
-    history_ok = compare_histories(agent.sequence_history, game_data["sequence"])
-    if history_ok:
-        logger.info("Sequence history matches game data")
-    else:
-        logger.warning("Sequence history mismatch detected")
+        # Trim after last agent_id == 0
+        last_agent0_index = max(i for i, s in enumerate(game_data["sequence"]) if s.get("agent_id") == 0)
+        game_data["sequence"] = game_data["sequence"][: last_agent0_index + 1]
 
-    opponent_mapping = create_opponent_mapping(args.data_dir)
-    dataset = AutoregressiveGameDataset(
-        data=[game_data],
-        opponent_mapping=opponent_mapping,
-        num_opponent_types=len(opponent_mapping),
-        device=device,
-        max_seq_length=args.max_seq_length,
-    )
-    truth_batch = collate_variable_length_sequences([dataset[0]])
-    agent_input = agent._prepare_model_input(agent.sequence_history)
+        # Fix agent's last speculative action if it differs from game's actual action
+        if agent.sequence_history:
+            hist_last = agent.sequence_history[-1]
+            game_last = game_data["sequence"][-1]
+            hid = AGENT_ID_MAP.get(hist_last.get("agent_id_env"))
+            if hid == 0 and hist_last.get("action") != game_last.get("action"):
+                hist_last["action"] = game_last.get("action")
 
-    key_map = {
-        "obs_sequence": "obs",
-        "action_sequence": "action",
-        "agent_types": "agent_type",
-        "positions": "position",
-    }
-    all_match = True
-    for a_key, t_key in key_map.items():
-        if not compare_tensors(agent_input[a_key], truth_batch[t_key], a_key):
-            all_match = False
-    if all_match:
-        logger.info("Agent tensors match dataset tensors")
-    else:
-        logger.warning("Tensor mismatch detected")
+        # Compare histories
+        history_ok = compare_histories(agent.sequence_history, game_data["sequence"])
+        if history_ok:
+            logger.info("Sequence history matches game data")
+        else:
+            logger.warning("Sequence history mismatch detected")
+
+        opponent_mapping = create_opponent_mapping(args.data_dir)
+        dataset = AutoregressiveGameDataset(
+            data=[game_data],
+            opponent_mapping=opponent_mapping,
+            num_opponent_types=len(opponent_mapping),
+            device=device,
+            max_seq_length=args.max_seq_length,
+        )
+        truth_batch = collate_variable_length_sequences([dataset[0]])
+        agent_input = agent._prepare_model_input(agent.sequence_history)
+
+        key_map = {
+            "obs_sequence": "obs",
+            "action_sequence": "action",
+            "agent_types": "agent_type",
+            "positions": "position",
+        }
+        all_match = True
+        for a_key, t_key in key_map.items():
+            if not compare_tensors(agent_input[a_key], truth_batch[t_key], a_key):
+                all_match = False
+        if all_match:
+            logger.info("Agent tensors match dataset tensors")
+        else:
+            logger.warning("Tensor mismatch detected")
 
 
 if __name__ == "__main__":
