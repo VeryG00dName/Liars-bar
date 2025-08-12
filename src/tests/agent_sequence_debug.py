@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#src/tests/agent_sequence_debug.py
 """Generate PS games and compare AutoregressiveAgentFull perception against
 training pipeline labels, across many episodes with a summary at the end.
 """
