@@ -50,11 +50,13 @@ def evaluate_autoregressive_model(model, data_loader, device, max_seq_length):
     with torch.no_grad():
         for batch in tqdm(data_loader, desc="Evaluating"):
             main_head_logits, opp_head_logits, _, belief_logits_0, belief_logits_1 = model(
-                obs_sequence=batch['obs'],
-                action_sequence=batch['action'],
-                agent_types=batch['agent_type'],
-                positions=batch['position']
-            )
+                    obs_sequence=batch['obs'],
+                    action_sequence=batch['action'],
+                    agent_types=batch['agent_type'],
+                    positions=batch['position'],
+                    action_masks=batch['action_mask'],
+                    padding_mask=batch['padding_mask']
+                )
             
             target_actions = batch['target_action']
             agent_types = batch['agent_type']
