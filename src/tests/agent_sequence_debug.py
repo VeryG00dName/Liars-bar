@@ -30,7 +30,7 @@ from src.model.hard_coded_agents import (
     Classic,
 )
 from src.training.train_utils import load_specific_historical_models
-from src.model.ps import PerfectSearch
+from src.model.ps_v3 import PerfectSearch
 
 # Agent and training dataset utilities
 from src.agents.autoregressive_agent_full import AutoregressiveAgentFull
@@ -391,7 +391,8 @@ def run_episode(env, ps, agent, current_opponents, selected_opponents):
             step_data["observation"] = np.round(obs_curr, 2).tolist()
             step_data["action_mask"] = env.infos[current_agent].get("action_mask", [0] * 7)
             # allow the autoregressive agent to process this step
-            agent.get_action(env, current_agent, obs_curr, env.infos[current_agent], {})
+            agent_picked_action = agent.get_action(env, current_agent, obs_curr, env.infos[current_agent], {})
+            step_data["model_action"] = int(agent_picked_action)
             planned = ps.get_next_agent_action(current_agent)
             if planned is not None:
                 best_action = planned
@@ -493,7 +494,10 @@ def main():
 
     episodes_failed: Dict[int, List[str]] = {}
     quiet = not args.verbose
-
+    
+    global_match = 0
+    global_total = 0
+    
     for ep_idx in trange(args.episodes, desc="Episodes"):
         episode_num = ep_idx + 1
         # Seed policy:
@@ -524,6 +528,17 @@ def main():
         last_agent0_index = max(i for i, s in enumerate(game_data["sequence"]) if s.get("agent_id") == 0)
         game_data["sequence"] = game_data["sequence"][: last_agent0_index + 1]
 
+        # --- Model vs PS agreement (our turns only) ---
+        our_steps = [s for s in game_data["sequence"] if s.get("agent_id") == 0 and "model_action" in s]
+        matched = sum(int(s["model_action"] == s["action"]) for s in our_steps)
+        total = len(our_steps)
+        ep_acc = (matched / total) if total else float("nan")
+        if args.verbose:
+            print(f"[Episode {episode_num}] Model vs PS (our turns): {matched}/{total} = {ep_acc:.2%}")
+        
+        global_match += matched
+        global_total += total
+        
         # Sync speculative last self action
         if agent.sequence_history:
             hist_last = agent.sequence_history[-1]
@@ -532,9 +547,8 @@ def main():
             if hid == 0 and hist_last.get("action") != game_last.get("action"):
                 hist_last["action"] = game_last.get("action")
 
-        # Optional history check (verbose only)
-        if args.verbose:
-            _ = compare_histories(agent.sequence_history, game_data["sequence"])
+        # history check
+        _ = compare_histories(agent.sequence_history, game_data["sequence"])
 
         # Build dataset batch (truth) quietly
         truth_batch = build_truth_batch_quiet(
@@ -571,6 +585,9 @@ def main():
         print("Failed episodes (with failing tensors):")
         for ep, keys in sorted(episodes_failed.items()):
             print(f"  Episode {ep}: {', '.join(keys)}")
-
+    if global_total:
+        print(f"\n== Overall model-vs-PS agreement (our turns): {global_match}/{global_total} = {global_match/global_total:.2%}")
+    else:
+        print("\n== Overall model-vs-PS agreement: no agent turns recorded")
 if __name__ == "__main__":
     main()
