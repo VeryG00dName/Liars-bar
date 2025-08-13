@@ -335,7 +335,7 @@ def generate_data(
                 step_data["action"] = best_action
                 step_data["action_probs"] = action_probs.tolist()
                 action_type, _, count = decode_action(best_action)
-                stats["action_distribution"][f"{action_type}_{count}"] += 1
+                stats["action_distribution"][f"{best_action}"] += 1
                 if action_type == "Play" and count is not None:
                     step_data["card_count"] = count
                 env.step(best_action)
