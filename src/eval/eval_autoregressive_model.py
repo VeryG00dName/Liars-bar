@@ -72,6 +72,20 @@ def evaluate_autoregressive_model(model, data_loader, device, max_seq_length):
             belief_preds_0 = belief_logits_0.argmax(dim=-1)
             belief_preds_1 = belief_logits_1.argmax(dim=-1)
             
+            if 'act_dim' not in stats:
+                stats['act_dim'] = int(main_head_logits.size(-1))
+                import numpy as _np
+                stats['agent_pred_counts']   = _np.zeros(stats['act_dim'], dtype=_np.int64)
+                stats['agent_target_counts'] = _np.zeros(stats['act_dim'], dtype=_np.int64)
+
+            if agent_mask.any():
+                tgt_flat  = target_actions[agent_mask]       # [N]
+                pred_flat = main_head_preds[agent_mask]      # [N]
+                tc = torch.bincount(tgt_flat,  minlength=stats['act_dim']).cpu().numpy()
+                pc = torch.bincount(pred_flat, minlength=stats['act_dim']).cpu().numpy()
+                stats['agent_target_counts'] += tc
+                stats['agent_pred_counts']   += pc
+            
             # --- Overall Accuracy Calculation ---
             stats['main_agent_correct'] += ((main_head_preds == target_actions) & agent_mask).sum().item()
             stats['main_agent_total'] += agent_mask.sum().item()
@@ -153,6 +167,17 @@ def print_results(stats, title, max_seq_length):
             opp_opp_acc = get_acc(stats['opp_head_opp_acc_by_step'][t][0], total_opp)
 
             print(f"{t:4} | {blf0_acc:4.0f} | {blf1_acc:4.0f} | {main_agent_acc:4.0f} | {main_opp_acc:4.0f} | {opp_agent_acc:4.0f} | {opp_opp_acc:4.0f} | {total_agent:7d} | {total_opp:5d}")
+            
+    # --- SIMPLE agent-turn counts by action id ---
+    if 'agent_pred_counts' in stats and 'agent_target_counts' in stats:
+        pred = stats['agent_pred_counts']
+        tgt  = stats['agent_target_counts']
+        K = len(pred)
+        print("\n[Agent-turn counts by action id]")
+        print("action | predicted | target")
+        print("---------------------------")
+        for a in range(K):
+            print(f"{a:>6} | {int(pred[a]):>9} | {int(tgt[a])}")
 
 
 def main():
