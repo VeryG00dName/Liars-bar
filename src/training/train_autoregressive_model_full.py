@@ -212,11 +212,11 @@ class AutoregressiveGameDataset(Dataset):
         self.num_opponent_types = num_opponent_types
         self.device = device
         self.max_seq_length = max_seq_length
-        TRANSFORM_MAP = {
-            0: 7, 3: 7,
-            1: 8, 4: 8,
-            2: 9, 5: 9
-        }
+
+        # Map opponent plays (true but hidden) -> hidden tokens 7/8/9
+        TRANSFORM_MAP = {0: 7, 3: 7, 1: 8, 4: 8, 2: 9, 5: 9}
+        NO_REVEAL = 7  # sentinel index for "no reveal yet" in 0..6 + NO_REVEAL space
+
         # Debug counters
         self.obs_trimmed_count = 0
         self.total_sequences = 0
@@ -238,35 +238,49 @@ class AutoregressiveGameDataset(Dataset):
             self.total_sequences += 1
             self.sequence_lengths.append(seq_len)
 
+            # ---- Build normalized action streams (model inputs/targets) ----
             raw_actions = []
             raw_target_actions = []
-            
             for step in sequence:
                 is_train = step.get("is_training_agent", step.get("agent_id", 0) == 0)
+
                 if "action" in step:
                     a = step["action"]
                     b = step["action"]
                 elif is_train and "expert_action" in step:
                     a = step["chosen_action"]
                     b = step["expert_action"]
-                if not is_train and a != 6 and a != 10:
-                    a = TRANSFORM_MAP[step["action"]]
+                else:
+                    a = 0
+                    b = 0
 
-                if a in (6, 10) and raw_actions:  
+                # Hide opponents' plays (use 7/8/9) in the input token stream
+                if not is_train and a not in (6, 10):
+                    a = TRANSFORM_MAP.get(a, a)
+
+                # Normalize challenge 10 -> 6
+                a = 6 if a == 10 else a
+                b = 6 if b == 10 else b
+
+                # Retro-correct previous token when a challenge occurs
+                if a == 6 and raw_actions:
                     raw_actions[-1] = raw_target_actions[-1]
 
-                raw_target_actions.append(6 if b == 10 else b)
-                raw_actions.append(6 if a == 10 else a)
+                raw_target_actions.append(b)  # targets always 0..6
+                raw_actions.append(a)         # inputs: 0..5 for our plays, 7/8/9 for opp until reveal, 6 for challenge
 
             PAD = 0
             input_actions  = [PAD] + raw_actions[:-1]
             target_actions = raw_target_actions.copy()
 
+            # ---- Build per-step features ----
             obs_list = []
             action_mask_list = []
             agent_type_list = []
             position_list = []
             belief_list = []
+            reveal_seq = []          # NEW: 0..6 revealed class, or 7 (NO_REVEAL)
+            current_reveal = NO_REVEAL
             has_belief = False
             latest_belief_vector = None
 
@@ -282,65 +296,69 @@ class AutoregressiveGameDataset(Dataset):
             }
 
             for i, step in enumerate(sequence):
-                # Determine agent type based on ID
-                # 0: Training Agent, 1: Opponent 0, 2: Opponent 1
+                # Agent type and position
                 agent_id = step.get("agent_id", 0)
                 agent_type_list.append(agent_id)
                 position_list.append(i)
 
-                # Observations are only provided for the training agent (ID 0)
+                # ---- Reveal feature visible *at this step* (no leak on challenge step) ----
+                reveal_seq.append(current_reveal)
+
+                # Observations (only on our turns)
                 if agent_id == 0:
-                    obs = np.array(step["observation"], dtype=np.float32)
+                    obs = np.array(step.get("observation", np.zeros(4, np.float32)), dtype=np.float32)
                     if obs.shape[0] == 7:
                         obs = convert_old_obs_to_new(obs, agent_id=0)
                     elif obs.shape[0] != 4:
-                        print(f"⚠️ Unexpected obs shape at step {i}: {obs.shape}, skipping sequence.")
+                        print(f"⚠️ Unexpected obs shape at step {i}: {obs.shape}, using zeros.")
                         obs = np.zeros(4, dtype=np.float32)
                         self.obs_trimmed_count += 1
                     obs_list.append(obs)
                 else:
                     obs_list.append(np.zeros(4, dtype=np.float32))
 
-                # Action masks are only for the training agent
+                # Action mask (only our turns)
                 if agent_id == 0 and "action_mask" in step:
                     action_mask_list.append(step["action_mask"])
                 else:
                     action_mask_list.append([0] * 7)
 
-                # Belief targets (agent types for opponent 0 and 1)
+                # Belief targets (carry forward last if missing)
                 if "belief" in step:
                     has_belief = True
                     names = step["belief"]
                     full_belief = []
-
-                    # We expect belief to be a list of 2 opponent names
                     for opp_idx in range(2):
                         if opp_idx < len(names):
                             name = names[opp_idx]
                             idx = LABELS.get(name, 0)
                             full_belief.append(idx)
                         else:
-                            # Missing opponent → fallback to 0 (Classic)
                             full_belief.append(0)
-
-                    latest_belief_vector = np.array(full_belief, dtype=np.int64)  # shape: [2]
+                    latest_belief_vector = np.array(full_belief, dtype=np.int64)
                     belief_list.append(latest_belief_vector)
-
                 elif has_belief and latest_belief_vector is not None:
                     belief_list.append(latest_belief_vector)
 
-            # Convert to tensors
-            obs_tensor        = torch.tensor(np.stack(obs_list),       dtype=torch.float32, device=device)
-            action_tensor     = torch.tensor(input_actions,            dtype=torch.long,    device=device)
-            target_tensor     = torch.tensor(target_actions,           dtype=torch.long,    device=device)
-            mask_tensor       = torch.tensor(np.array(action_mask_list), dtype=torch.bool,  device=device)
-            agent_type_tensor = torch.tensor(agent_type_list,          dtype=torch.long,    device=device)
-            position_tensor   = torch.tensor(position_list,            dtype=torch.long,    device=device)
-            
+                # ---- AFTER emitting this step's reveal value, update current_reveal if this step is a challenge of an opponent play ----
+                # If this step's *target* is challenge and previous actor was opponent, reveal their previous true play (0..5) for subsequent steps.
+                if target_actions[i] == 6 and i > 0 and sequence[i-1].get("agent_id", 0) != 0:
+                    prev_true = target_actions[i-1]
+                    current_reveal = prev_true if prev_true in (0, 1, 2, 3, 4, 5) else NO_REVEAL
+
+            # ---- Convert to tensors ----
+            obs_tensor        = torch.tensor(np.stack(obs_list),          dtype=torch.float32, device=device)
+            action_tensor     = torch.tensor(input_actions,               dtype=torch.long,    device=device)
+            target_tensor     = torch.tensor(target_actions,              dtype=torch.long,    device=device)
+            mask_tensor       = torch.tensor(np.array(action_mask_list),  dtype=torch.bool,    device=device)
+            agent_type_tensor = torch.tensor(agent_type_list,             dtype=torch.long,    device=device)
+            position_tensor   = torch.tensor(position_list,               dtype=torch.long,    device=device)
+            reveal_tensor     = torch.tensor(reveal_seq,                  dtype=torch.long,    device=device)
+
             belief_tensor = None
             if has_belief and latest_belief_vector is not None:
                 belief_tensor = torch.tensor(np.stack(belief_list), dtype=torch.long, device=device)
-            
+
             attention_mask = torch.triu(
                 torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
                 diagonal=1
@@ -356,8 +374,13 @@ class AutoregressiveGameDataset(Dataset):
                 "attention_mask": attention_mask,
                 "length":         seq_len,
                 "round_id":       round_data.get("round_id", round_data.get("game_id", None)),
-                "belief":         belief_tensor
+                "belief":         belief_tensor,
+                "reveal":         reveal_tensor,   # NEW: 0..6 revealed class, or 7 (NO_REVEAL)
             }
+
+            # Optional guard: no leak on our challenge steps
+            # if any((agent_type_tensor == 0) & (target_tensor == 6) & (reveal_tensor != NO_REVEAL)).any():
+            #     raise RuntimeError("Leak: reveal visible at challenge step")
 
             self.sequences.append(seq_dict)
 
@@ -378,53 +401,54 @@ class AutoregressiveGameDataset(Dataset):
 def collate_variable_length_sequences(batch):
     """
     Custom collate function for batching variable-length sequences.
-    
-    This handles padding sequences to the same length within a batch.
+
+    Pads to the max length in the batch and returns masks.
+    Adds 'reveal' (0..6, or 7=NO_REVEAL) to the batch.
     """
     # Find max sequence length in this batch
-    max_seq_len = max([seq['length'] for seq in batch])
-    
+    max_seq_len = max(seq['length'] for seq in batch)
+
     # Get batch size
     batch_size = len(batch)
-    
-    # Get the first sequence to determine tensor shapes
+
+    # Device & dims
     first_seq = batch[0]
     device = first_seq['obs'].device
     obs_dim = first_seq['obs'].shape[1]
-    belief_dim = first_seq['belief'].shape[1] # Should be 2 (number of opponents)
+    belief_dim = first_seq['belief'].shape[1] if first_seq['belief'] is not None else 2
+    NO_REVEAL = 7
 
-    # Initialize tensors for the batch
-    batched_obs = torch.zeros(batch_size, max_seq_len, obs_dim, device=device)
-    batched_action = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
+    # Initialize tensors
+    batched_obs           = torch.zeros(batch_size, max_seq_len, obs_dim, device=device)
+    batched_action        = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
     batched_target_action = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
-    batched_action_mask = torch.zeros(batch_size, max_seq_len, 7, dtype=torch.bool, device=device)
-    batched_belief = torch.zeros(batch_size, max_seq_len, belief_dim, dtype=torch.long, device=device)
-    batched_agent_type = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
-    batched_position = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
-    
-    # Padding mask (to indicate which positions are valid vs. padding)
+    batched_action_mask   = torch.zeros(batch_size, max_seq_len, 7, dtype=torch.bool, device=device)
+    batched_belief        = torch.zeros(batch_size, max_seq_len, belief_dim, dtype=torch.long, device=device)
+    batched_agent_type    = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
+    batched_position      = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
+    batched_reveal        = torch.full((batch_size, max_seq_len), NO_REVEAL, dtype=torch.long, device=device)
+
+    # Padding mask (True=padding, False=valid)
     padding_mask = torch.ones(batch_size, max_seq_len, dtype=torch.bool, device=device)
-    
+
     # Round IDs
     round_ids = []
-    
-    # Fill the batch tensors
+
+    # Fill tensors
     for i, seq in enumerate(batch):
         seq_len = seq['length']
-        
-        # Copy data for the actual sequence length
-        batched_obs[i, :seq_len] = seq['obs']
-        batched_action[i, :seq_len] = seq['action']
+
+        batched_obs[i, :seq_len]           = seq['obs']
+        batched_action[i, :seq_len]        = seq['action']
         batched_target_action[i, :seq_len] = seq['target_action']
-        batched_action_mask[i, :seq_len] = seq['action_mask']
-        batched_belief[i, :seq_len] = seq['belief']
-        batched_agent_type[i, :seq_len] = seq['agent_type']
-        batched_position[i, :seq_len] = seq['position']
-        
-        # Mark valid positions in padding mask (0 = valid, 1 = padding)
-        padding_mask[i, :seq_len] = 0
-        
-        # Store round ID
+        batched_action_mask[i, :seq_len]   = seq['action_mask']
+        if seq['belief'] is not None:
+            batched_belief[i, :seq_len]    = seq['belief']
+        batched_agent_type[i, :seq_len]    = seq['agent_type']
+        batched_position[i, :seq_len]      = seq['position']
+        batched_reveal[i, :seq_len]        = seq['reveal']
+
+        padding_mask[i, :seq_len] = False
         round_ids.append(seq['round_id'])
     
     # Return as a dictionary
@@ -437,7 +461,8 @@ def collate_variable_length_sequences(batch):
         'position': batched_position,
         'padding_mask': padding_mask,
         'round_ids': round_ids,
-        'belief': batched_belief # Belief targets
+        'belief': batched_belief,   # Belief targets
+        'reveal': batched_reveal,   # 0..6 or 7 (NO_REVEAL)
     }
     return batch_dict
 
@@ -1042,7 +1067,7 @@ def main():
     parser.add_argument("--num-opponent-types", type=int, default=None, help="Number of opponent types (auto-detected if None)")
     parser.add_argument("--hidden-dim", type=int, default=256, help="Hidden dimension for the model")
     parser.add_argument("--learning-rate", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--batch-size", type=int, default=2048, help="Batch size")
+    parser.add_argument("--batch-size", type=int, default=1024, help="Batch size")
     parser.add_argument("--num-epochs", type=int, default=100, help="Number of epochs")
     parser.add_argument("--validation-split", type=float, default=0.1, help="Validation split ratio")
     parser.add_argument("--checkpoint-dir", type=str, default=None, help="Checkpoint directory")
