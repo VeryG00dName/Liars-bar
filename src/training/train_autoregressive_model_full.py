@@ -241,6 +241,7 @@ class AutoregressiveGameDataset(Dataset):
             # ---- Build normalized action streams (model inputs/targets) ----
             raw_actions = []
             raw_target_actions = []
+            raw_reveal_seq = []
             for step in sequence:
                 is_train = step.get("is_training_agent", step.get("agent_id", 0) == 0)
 
@@ -253,7 +254,7 @@ class AutoregressiveGameDataset(Dataset):
                 else:
                     a = 0
                     b = 0
-
+                c = NO_REVEAL
                 # Hide opponents' plays (use 7/8/9) in the input token stream
                 if not is_train and a not in (6, 10):
                     a = TRANSFORM_MAP.get(a, a)
@@ -264,12 +265,13 @@ class AutoregressiveGameDataset(Dataset):
 
                 # Retro-correct previous token when a challenge occurs
                 if a == 6 and raw_actions:
-                    raw_actions[-1] = raw_target_actions[-1]
+                    c = raw_target_actions[-1]
 
                 raw_target_actions.append(b)  # targets always 0..6
                 raw_actions.append(a)         # inputs: 0..5 for our plays, 7/8/9 for opp until reveal, 6 for challenge
-
+                raw_reveal_seq.append(c)
             PAD = 0
+            reveal_seq = [NO_REVEAL] + raw_reveal_seq[:-1]
             input_actions  = [PAD] + raw_actions[:-1]
             target_actions = raw_target_actions.copy()
 
@@ -279,7 +281,6 @@ class AutoregressiveGameDataset(Dataset):
             agent_type_list = []
             position_list = []
             belief_list = []
-            reveal_seq = []          # NEW: 0..6 revealed class, or 7 (NO_REVEAL)
             current_reveal = NO_REVEAL
             has_belief = False
             latest_belief_vector = None
@@ -300,9 +301,6 @@ class AutoregressiveGameDataset(Dataset):
                 agent_id = step.get("agent_id", 0)
                 agent_type_list.append(agent_id)
                 position_list.append(i)
-
-                # ---- Reveal feature visible *at this step* (no leak on challenge step) ----
-                reveal_seq.append(current_reveal)
 
                 # Observations (only on our turns)
                 if agent_id == 0:
@@ -339,12 +337,6 @@ class AutoregressiveGameDataset(Dataset):
                     belief_list.append(latest_belief_vector)
                 elif has_belief and latest_belief_vector is not None:
                     belief_list.append(latest_belief_vector)
-
-                # ---- AFTER emitting this step's reveal value, update current_reveal if this step is a challenge of an opponent play ----
-                # If this step's *target* is challenge and previous actor was opponent, reveal their previous true play (0..5) for subsequent steps.
-                if target_actions[i] == 6 and i > 0 and sequence[i-1].get("agent_id", 0) != 0:
-                    prev_true = target_actions[i-1]
-                    current_reveal = prev_true if prev_true in (0, 1, 2, 3, 4, 5) else NO_REVEAL
 
             # ---- Convert to tensors ----
             obs_tensor        = torch.tensor(np.stack(obs_list),          dtype=torch.float32, device=device)
