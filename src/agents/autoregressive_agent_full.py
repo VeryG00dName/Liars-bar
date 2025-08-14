@@ -341,12 +341,12 @@ class AutoregressiveAgentFull(BaseAgent):
 
         # 4) run model, write chosen action to the last row
         model_input = self._prepare_model_input(self.sequence_history)
-        with torch.no_grad():
+        with torch.inference_mode():
             action_logits, _, _, belief0, belief1 = self.model(**model_input)
-            last_step_idx = model_input['valid_lengths'][0].item() - 1
-            logits = action_logits[0, last_step_idx]
-            mask_t = torch.tensor(info["action_mask"], dtype=torch.bool, device=self.device)
-            chosen = torch.argmax(logits.masked_fill(~mask_t, float("-inf"))).item()
+        last_step_idx = model_input['valid_lengths'][0].item() - 1
+        logits = action_logits[0, last_step_idx]
+        mask_t = torch.tensor(info["action_mask"], dtype=torch.bool, device=self.device)
+        chosen = torch.argmax(logits.masked_fill(~mask_t, float("-inf"))).item()
 
         if belief0 is not None and belief1 is not None:
             opponents = sorted([p for p in env.possible_agents if p != agent_id_env])
