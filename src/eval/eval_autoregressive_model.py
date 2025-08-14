@@ -2,20 +2,13 @@
 # src/eval/eval_autoregressive_model.py
 import os
 import argparse
-import pickle
-import random
-import numpy as np
 import torch
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from collections import defaultdict, Counter
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # Import configuration and model class
-from src import config
 from src.model.autoregressive_model_full import AutoregressiveGameModelFull
 from src.training.train_autoregressive_model_full import AutoregressiveGameDataset, collate_variable_length_sequences, load_autoreg_data
-from src.env.liars_deck_env_utils_2 import decode_action
 
 def evaluate_autoregressive_model(model, data_loader, device, max_seq_length):
     """Evaluate the model, including action and belief accuracy."""
