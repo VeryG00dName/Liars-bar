@@ -66,17 +66,11 @@ class AutoregressiveAgentFull(BaseAgent):
         - Opponent plays are hidden 7/8/9
         - Challenge is 6
         - No retro rewrite of the previous token.
-        - A per-step 'reveal' feature (0..5 or 7=NO_REVEAL) turns on *after* a challenge.
         """
         gh = list(getattr(env, "game_history", []))
         seq = []
 
-        NO_REVEAL = 7
         HIDDEN_MAP = {1: 7, 2: 8, 3: 9}
-
-        current_reveal = NO_REVEAL         # what the model may see at this step
-        last_opp_revealed = None           # 0..5 for the most recent opponent Play (true class), if any
-        last_play_was_opp = False
 
         for i, e in enumerate(gh):
             a_type = e.get("action_type")
@@ -100,35 +94,21 @@ class AutoregressiveAgentFull(BaseAgent):
                 else:
                     # Opponent play stays hidden in the token stream (7/8/9)
                     action = HIDDEN_MAP.get(cnt, 7)
-                    # But remember the true revealed class for *after* a challenge
-                    last_opp_revealed = self._revealed_token_from_play(e)
-                    last_play_was_opp = True
 
                 seq.append({
                     "agent_id_env": actor,
                     "action": action,
                     "observation": obs,
-                    "action_mask": mask if actor == me else [0] * int(self.action_dim),
-                    "reveal": current_reveal,   # side feature visible at this step
+                    "action_mask": mask if actor == me else [0] * int(self.action_dim)
                 })
 
             elif a_type == "Challenge":
-                # Append the challenge row with the *current* reveal value (no leak on this step)
                 seq.append({
                     "agent_id_env": actor,
                     "action": 6,
                     "observation": obs,
-                    "action_mask": mask if actor == me else [0] * int(self.action_dim),
-                    "reveal": current_reveal,   # still NO_REVEAL on the challenge step itself
+                    "action_mask": mask if actor == me else [0] * int(self.action_dim)
                 })
-
-                # If the last Play was by an opponent, flip reveal ON for subsequent steps
-                if last_play_was_opp and last_opp_revealed is not None:
-                    current_reveal = last_opp_revealed
-                # If it challenged our own play or no valid opp play, keep current_reveal as-is
-                last_play_was_opp = False  # consume the reveal condition
-
-            # ignore other action types if any
 
         return seq
 
@@ -229,7 +209,6 @@ class AutoregressiveAgentFull(BaseAgent):
     def _prepare_model_input(self, history: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         """Prepares tensors for the autoregressive model, matching the training format."""
         PAD = 0                     # action pad
-        NO_REVEAL = 7               # 0..6 are revealed classes, 7 means "no reveal yet"
 
         filtered = list(history)
 
@@ -251,15 +230,7 @@ class AutoregressiveAgentFull(BaseAgent):
         agent_type_seq  = torch.ones ((1, valid_len), dtype=torch.long, device=self.device)  # default to opponent
         pos_seq         = torch.arange(valid_len, dtype=torch.long, device=self.device).unsqueeze(0)
         action_mask_seq = torch.zeros((1, valid_len, self.action_dim), dtype=torch.bool, device=self.device)
-        reveal_seq      = torch.full ((1, valid_len), NO_REVEAL, dtype=torch.long, device=self.device)
         padding_mask    = torch.zeros(1, valid_len, dtype=torch.bool, device=self.device)     # no padding here
-
-        # Compute a carry-forward reveal for rows that don't include it (like the freshly appended current row)
-        carry_reveal = NO_REVEAL
-        for j in range(len(filtered) - 1, -1, -1):
-            if 'reveal' in filtered[j]:
-                carry_reveal = int(filtered[j]['reveal'])
-                break
 
         # 4) Populate
         for i, step_data in enumerate(filtered):
@@ -267,20 +238,12 @@ class AutoregressiveAgentFull(BaseAgent):
             agent_type_seq[0, i] = agent_type
             action_seq[0, i]     = input_actions[i]
 
-            # Reveal side-feature: prefer per-step value if present; else carry last known state
-            r = step_data.get('reveal', carry_reveal)
-            reveal_seq[0, i] = int(r)
-
             if agent_type == 0:
                 # Our turn: real obs + real mask
                 obs_np = np.array(step_data["observation"], dtype=np.float32)
                 obs_seq[0, i] = torch.from_numpy(obs_np)
                 mask_np = np.array(step_data.get("action_mask", [0]*self.action_dim), dtype=bool)
                 action_mask_seq[0, i] = torch.from_numpy(mask_np)
-            else:
-                # Opponent turn: zeros (keep alignment with training)
-                # (model learns from agent rows; opp rows provide context)
-                pass
 
         return {
             'obs_sequence':   obs_seq,
@@ -289,8 +252,7 @@ class AutoregressiveAgentFull(BaseAgent):
             'positions':      pos_seq,
             'action_masks':   action_mask_seq,
             'padding_mask':   padding_mask,
-            'valid_lengths':  torch.tensor([valid_len], device=self.device),
-            'reveal_sequence':reveal_seq,                 # << NEW
+            'valid_lengths':  torch.tensor([valid_len], device=self.device)
         }
 
     def get_action(

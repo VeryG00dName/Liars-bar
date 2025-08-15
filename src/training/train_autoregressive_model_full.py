@@ -215,7 +215,6 @@ class AutoregressiveGameDataset(Dataset):
 
         # Map opponent plays (true but hidden) -> hidden tokens 7/8/9
         TRANSFORM_MAP = {0: 7, 3: 7, 1: 8, 4: 8, 2: 9, 5: 9}
-        NO_REVEAL = 7  # sentinel index for "no reveal yet" in 0..6 + NO_REVEAL space
 
         # Debug counters
         self.obs_trimmed_count = 0
@@ -241,7 +240,6 @@ class AutoregressiveGameDataset(Dataset):
             # ---- Build normalized action streams (model inputs/targets) ----
             raw_actions = []
             raw_target_actions = []
-            raw_reveal_seq = []
             for step in sequence:
                 is_train = step.get("is_training_agent", step.get("agent_id", 0) == 0)
 
@@ -254,7 +252,6 @@ class AutoregressiveGameDataset(Dataset):
                 else:
                     a = 0
                     b = 0
-                c = NO_REVEAL
                 # Hide opponents' plays (use 7/8/9) in the input token stream
                 if not is_train and a not in (6, 10):
                     a = TRANSFORM_MAP.get(a, a)
@@ -263,15 +260,10 @@ class AutoregressiveGameDataset(Dataset):
                 a = 6 if a == 10 else a
                 b = 6 if b == 10 else b
 
-                # Retro-correct previous token when a challenge occurs
-                if a == 6 and raw_actions:
-                    c = raw_target_actions[-1]
-
                 raw_target_actions.append(b)  # targets always 0..6
-                raw_actions.append(a)         # inputs: 0..5 for our plays, 7/8/9 for opp until reveal, 6 for challenge
-                raw_reveal_seq.append(c)
+                raw_actions.append(a)         # inputs: 0..5 for our plays, 7/8/9 for opp, 6 for challenge
+                
             PAD = 0
-            reveal_seq = [NO_REVEAL] + raw_reveal_seq[:-1]
             input_actions  = [PAD] + raw_actions[:-1]
             target_actions = raw_target_actions.copy()
 
@@ -281,7 +273,6 @@ class AutoregressiveGameDataset(Dataset):
             agent_type_list = []
             position_list = []
             belief_list = []
-            current_reveal = NO_REVEAL
             has_belief = False
             latest_belief_vector = None
 
@@ -345,7 +336,6 @@ class AutoregressiveGameDataset(Dataset):
             mask_tensor       = torch.tensor(np.array(action_mask_list),  dtype=torch.bool,    device=device)
             agent_type_tensor = torch.tensor(agent_type_list,             dtype=torch.long,    device=device)
             position_tensor   = torch.tensor(position_list,               dtype=torch.long,    device=device)
-            reveal_tensor     = torch.tensor(reveal_seq,                  dtype=torch.long,    device=device)
 
             belief_tensor = None
             if has_belief and latest_belief_vector is not None:
@@ -366,13 +356,8 @@ class AutoregressiveGameDataset(Dataset):
                 "attention_mask": attention_mask,
                 "length":         seq_len,
                 "round_id":       round_data.get("round_id", round_data.get("game_id", None)),
-                "belief":         belief_tensor,
-                "reveal":         reveal_tensor,   # NEW: 0..6 revealed class, or 7 (NO_REVEAL)
+                "belief":         belief_tensor
             }
-
-            # Optional guard: no leak on our challenge steps
-            # if any((agent_type_tensor == 0) & (target_tensor == 6) & (reveal_tensor != NO_REVEAL)).any():
-            #     raise RuntimeError("Leak: reveal visible at challenge step")
 
             self.sequences.append(seq_dict)
 
@@ -395,7 +380,6 @@ def collate_variable_length_sequences(batch):
     Custom collate function for batching variable-length sequences.
 
     Pads to the max length in the batch and returns masks.
-    Adds 'reveal' (0..6, or 7=NO_REVEAL) to the batch.
     """
     # Find max sequence length in this batch
     max_seq_len = max(seq['length'] for seq in batch)
@@ -408,7 +392,6 @@ def collate_variable_length_sequences(batch):
     device = first_seq['obs'].device
     obs_dim = first_seq['obs'].shape[1]
     belief_dim = first_seq['belief'].shape[1] if first_seq['belief'] is not None else 2
-    NO_REVEAL = 7
 
     # Initialize tensors
     batched_obs           = torch.zeros(batch_size, max_seq_len, obs_dim, device=device)
@@ -418,7 +401,6 @@ def collate_variable_length_sequences(batch):
     batched_belief        = torch.zeros(batch_size, max_seq_len, belief_dim, dtype=torch.long, device=device)
     batched_agent_type    = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
     batched_position      = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
-    batched_reveal        = torch.full((batch_size, max_seq_len), NO_REVEAL, dtype=torch.long, device=device)
 
     # Padding mask (True=padding, False=valid)
     padding_mask = torch.ones(batch_size, max_seq_len, dtype=torch.bool, device=device)
@@ -438,7 +420,6 @@ def collate_variable_length_sequences(batch):
             batched_belief[i, :seq_len]    = seq['belief']
         batched_agent_type[i, :seq_len]    = seq['agent_type']
         batched_position[i, :seq_len]      = seq['position']
-        batched_reveal[i, :seq_len]        = seq['reveal']
 
         padding_mask[i, :seq_len] = False
         round_ids.append(seq['round_id'])
@@ -453,8 +434,7 @@ def collate_variable_length_sequences(batch):
         'position': batched_position,
         'padding_mask': padding_mask,
         'round_ids': round_ids,
-        'belief': batched_belief,   # Belief targets
-        'reveal': batched_reveal,   # 0..6 or 7 (NO_REVEAL)
+        'belief': batched_belief   # Belief targets
     }
     return batch_dict
 
