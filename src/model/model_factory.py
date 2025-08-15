@@ -83,13 +83,53 @@ class ModelFactory:
         return model
 
     @staticmethod
-    def is_autoregressive_model(state_dict):
-        """Detects if a state dict likely comes from AutoregressiveGameModel."""
-        # Check for key components like transformer layers and specific heads
-        has_transformer = any(k.startswith('transformer.layers.') for k in state_dict)
-        #has_action_emb = 'action_embedding.weight' in state_dict
-        has_action_head = 'action_head.weight' in state_dict
-        return has_transformer and has_action_head #has_action_emb
+    def is_autoregressive_model(state_dict: dict) -> bool:
+        """
+        Detect AutoregressiveGameModel (old atomic + new factorized).
+        Heuristic: must have a policy action head, and either
+        (a) look transformer-ish, or
+        (b) have our embedding stack (agent+position plus action/factors).
+        """
+
+        def has(name: str) -> bool:
+            # exact or common prefixed key
+            if name in state_dict:
+                return True
+            for p in ("module.", "model.", "policy_net.", "policy.", "net."):
+                k = p + name
+                if k in state_dict or ("module." + k) in state_dict:
+                    return True
+            # last-resort suffix match (handles extra nesting)
+            return any(k.endswith(name) for k in state_dict.keys())
+
+        # 1) AR policies have an action head (and often an opp head)
+        has_action_head = any(has(n) for n in (
+            "action_head.weight", "action_head.bias",
+            "opp_action_head.weight", "opp_action_head.bias",
+            # tolerate alt names used in some repos:
+            "actor_head.weight", "actor_head.bias",
+            "policy_head.weight", "policy_head.bias",
+        ))
+
+        # 2) “Transformer-ish” backbone or our causal mask buffer
+        has_transformerish = any(has(n) for n in (
+            "transformer.layers.0.self_attn.in_proj_weight",
+            "transformer.layers.0.linear1.weight",
+            "transformer.layers.0.self_attn.out_proj.weight",
+            "transformer.layers.0.norm1.weight",
+            "causal_bool_mask_full",  # registered buffer in your AR model
+        ))
+
+        # 3) Either old atomic action embedding or the new factorized ones
+        has_any_action_emb = any(has(n) for n in (
+            "action_embedding.weight",              # old
+            "act_kind_embedding.weight",            # new
+            "count_embedding.weight",
+            "table_flag_embedding.weight",
+        ))
+        has_agent_pos = has("agent_embedding.weight") and has("position_embedding.weight")
+
+        return bool(has_action_head and (has_transformerish or (has_any_action_emb and has_agent_pos)))
 
     @staticmethod
     def get_belief_dimensions(state_dict):
