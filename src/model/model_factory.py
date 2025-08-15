@@ -87,9 +87,9 @@ class ModelFactory:
         """Detects if a state dict likely comes from AutoregressiveGameModel."""
         # Check for key components like transformer layers and specific heads
         has_transformer = any(k.startswith('transformer.layers.') for k in state_dict)
-        has_action_emb = 'action_embedding.weight' in state_dict
+        #has_action_emb = 'action_embedding.weight' in state_dict
         has_action_head = 'action_head.weight' in state_dict
-        return has_transformer and has_action_emb and has_action_head
+        return has_transformer and has_action_head #has_action_emb
 
     @staticmethod
     def get_belief_dimensions(state_dict):
@@ -168,9 +168,7 @@ class ModelFactory:
     def get_output_dim_from_state_dict(state_dict, layer_prefix='fc4'):
         """Determines the output dimension (action space size) from a policy state dictionary."""
         # Check standard policy output layers first
-        candidate_prefixes = [ layer_prefix, 'policy_head', 'experts.0.fc_out', 'strategy_query']
-        # Add AR model specific head
-        candidate_prefixes.append('action_head') # AR model's standard action head
+        candidate_prefixes = [ layer_prefix, 'policy_head', 'experts.0.fc_out', 'strategy_query','action_head']
 
         for prefix in candidate_prefixes:
             key_w = f"{prefix}.weight"; key_b = f"{prefix}.bias"
