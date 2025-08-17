@@ -24,12 +24,12 @@ class PPOAutoregressiveAgent(BaseAgent):
         self.model: Optional[PPOAutoregressiveModel] = None
 
         # --- Model dimensions (inferred during loading) ---
-        self.obs_dim: Optional[int] = None
+        self.obs_dim: Optional[int] = 9
         self.action_dim: int = 7 # Standard actions
-        self.extended_action_dim: Optional[int] = None
-        self.hidden_dim: Optional[int] = None
-        self.max_seq_length: Optional[int] = None
-        self.belief_dim: Optional[int] = None # Inferred from the model's belief head
+        self.extended_action_dim: Optional[int] = 9
+        self.hidden_dim: Optional[int] = 256
+        self.max_seq_length: Optional[int] = 320
+        self.belief_dim: Optional[int] = 64 # Inferred from the model's belief head
         self._obs_by_step = {}
         # --- Runtime state ---
         self.sequence_history: List[Dict[str, Any]] = []
