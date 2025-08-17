@@ -560,6 +560,33 @@ def get_newest_observations(env, agent_specific=None):
         observations[agent] = obs
     return observations
 
+def get_newerest_observations(env, agent_specific=None):
+    """
+    Constructs observation vector with hand, opponent hand sizes, and all penalties.
+    """
+    observations = {}
+    agents_to_observe = [agent_specific] if agent_specific else env.agents
+
+    for agent in agents_to_observe:
+        current_hand = env.players_hands.get(agent, [])
+        hand_vector = encode_hand(current_hand, env.table_card).astype(np.float32)
+
+        opponent_hand_sizes = np.array([
+            len(env.players_hands.get(ag, [])) / 5.0
+            for ag in env.possible_agents if ag != agent
+        ], dtype=np.float32)
+
+        penalties_vector = np.array([
+            env.penalties.get(p, 0) / 6.0  # Normalize by max possible threshold
+            for p in env.possible_agents
+        ], dtype=np.float32)
+
+        # Final vector: [hand (2), opp_sizes (3), penalties (4)] for a 4-player game
+        obs = np.concatenate([hand_vector, opponent_hand_sizes, penalties_vector], axis=0)
+        obs = np.round(obs, 2)
+        observations[agent] = obs
+    return observations
+
 def get_derivable_game_state(env, agent_specific=None):
     """
     Returns game state information that is not directly available in the newer observations,
