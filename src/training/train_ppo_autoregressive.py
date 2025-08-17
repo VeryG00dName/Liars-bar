@@ -6,6 +6,7 @@ import logging
 import time
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
+import random
 
 import torch
 import torch.nn.functional as F
@@ -335,7 +336,8 @@ def train(
 
     def build_opponent_cfgs(start: int = 0) -> Tuple[List[str], List[Dict[str, Any]]]:
         n = getattr(config, "NUM_PLAYERS", 4) - 1
-        picks = [HC_POOL[(start + i) % len(HC_POOL)] for i in range(n)]
+        # pick n opponents randomly from the pool (without replacement if possible)
+        picks = random.sample(HC_POOL, n)
         opponent_types = ["hardcoded"] * n
         opponent_configs = [{"class": cls, "name": name} for (name, cls) in picks]
         return opponent_types, opponent_configs
@@ -344,18 +346,23 @@ def train(
     for update in range(1, num_updates + 1):
         update_start = time.time()
 
-        opponent_types, opponent_configs = build_opponent_cfgs(update)
-        players_in_game, opponent_label_map = build_players(device, learner, opponent_types, opponent_configs)
+        episodes = []
+        batches = 4
+        eps_per_batch = max(1, episodes_per_update // batches)
 
-        # ---- Collect episodes ----
-        episodes = collect_training_sequences(
-            env=env,
-            device=device,
-            players_in_this_game=players_in_game,
-            episodes=episodes_per_update,
-            training_agent_env_id="player_0",
-            opponent_label_map=opponent_label_map,
-        )
+        for _ in range(batches):
+            opponent_types, opponent_configs = build_opponent_cfgs()
+            players_in_game, opponent_label_map = build_players(device, learner, opponent_types, opponent_configs)
+
+            eps = collect_training_sequences(
+                env=env,
+                device=device,
+                players_in_this_game=players_in_game,
+                episodes=eps_per_batch,
+                training_agent_env_id="player_0",
+                opponent_label_map=opponent_label_map,
+            )
+            episodes.extend(eps)
 
         # ---- PPO update ----
         model.train()
@@ -437,7 +444,7 @@ if __name__ == "__main__":
     ckpt_dir = os.path.join(getattr(config, "CHECKPOINT_DIR", "checkpoints"), run_name)
     train(
         num_updates=1000,
-        episodes_per_update=10,
+        episodes_per_update=100,
         k_epochs=getattr(config, "K_EPOCHS", 2),
         checkpoint_dir=ckpt_dir,
         log_dir=log_dir,
