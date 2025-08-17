@@ -213,7 +213,7 @@ def ppo_losses_for_episode(
 
         # PPO diagnostics
         approx_kl = torch.mean(old_logp - new_logp).detach()
-        clipfrac = torch.mean((ratio - 1.0).abs() > config.EPS_CLIP).float().detach()
+        clipfrac = ((ratio - 1.0).abs() > config.EPS_CLIP).float().mean().detach()
 
         scalars.update({
             "policy_loss": float(policy_loss.detach().cpu()),
@@ -433,7 +433,7 @@ def train(
 if __name__ == "__main__":
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = f"ppo_autoreg_{timestamp}"
-    log_dir = os.path.join(getattr(config, "LOG_DIR", "logs"), run_name)
+    log_dir = os.path.join("logs", run_name)
     ckpt_dir = os.path.join(getattr(config, "CHECKPOINT_DIR", "checkpoints"), run_name)
     train(
         num_updates=1000,

@@ -209,7 +209,7 @@ class PPOAutoregressiveAgent(BaseAgent):
 
     def _prepare_model_input(self, history: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         """Prepares tensors for the autoregressive model, matching the training format."""
-        PAD = 0                     # action pad
+        PAD = 0 # action pad
 
         filtered = list(history)
 
@@ -336,7 +336,7 @@ class PPOAutoregressiveAgent(BaseAgent):
                 opp2 = ol
             elif i == 3:
                 opp3 = ol
-        self.sequence_history.append({"action": torch.argmax(masked_logits).item()})
+        self.sequence_history[-1]["action"] = torch.argmax(masked_logits).item()
          # --- Select Action and Return All Data ---
         if training:
             dist = torch.distributions.Categorical(logits=masked_logits)
