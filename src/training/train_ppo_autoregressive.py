@@ -4,7 +4,6 @@ import os
 import logging
 from typing import Dict, Any, List, Optional, Tuple
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
@@ -32,12 +31,24 @@ from src.model.hard_coded_agents import (
 from src.training.ppo_ar_data_gen import collect_training_sequences
 
 # Utilities
-
 from src.training.train_extras import set_seed
-
-from src.training.train_utils import compute_gae
+from src.training.train_utils import compute_gae  # (rewards, dones, values, next_values, gamma, lam)
 
 from src.agents.hardcoded_agent_wrapper import HardcodedAgentWrapper
+
+
+# --------------------------------------------------------------------------------------
+# Belief mapping (extend this when adding frozen/historical models)
+# --------------------------------------------------------------------------------------
+BELIEF_LABELS: Dict[str, int] = {
+    "GreedyCardSpammer": 1,
+    "StrategicChallenger": 4,
+    "TableNonTableAgent": 6,
+    "Classic": 0,
+    "TableFirstConservativeChallenger": 5,
+    "SelectiveTableConservativeChallenger": 3,
+    "RandomAgent": 2,
+}
 
 
 # --------------------------------------------------------------------------------------
@@ -45,20 +56,18 @@ from src.agents.hardcoded_agent_wrapper import HardcodedAgentWrapper
 # --------------------------------------------------------------------------------------
 
 def _instantiate_hardcoded(hc_class, hc_name: str, env_id: str, device: torch.device):
-    """Instantiate a hardcoded opponent, with graceful fallback if ctor signature differs."""
-    # Determine agent index from env_id (e.g., "player_2" -> 2)
+    """Instantiate a hardcoded opponent and wrap to BaseAgent via HardcodedAgentWrapper."""
+    # Try to provide context (name, num_players, agent_index); fallback to just name
     try:
         agent_index = int(env_id.split('_')[-1])
     except Exception:
         agent_index = 1
 
-    # Try (name, num_players, agent_index) then fallback to (name)
     try:
-        inst = hc_class(hc_name, 4, agent_index)
+        inst = hc_class(hc_name, config.NUM_PLAYERS, agent_index)
     except TypeError:
         inst = hc_class(hc_name)
 
-    # Wrap if wrapper exists
     player_id = f"Hardcoded_{hc_name}"
     return HardcodedAgentWrapper(inst, device, player_id)
 
@@ -71,40 +80,46 @@ def build_players(
 ) -> Tuple[Dict[str, Any], Dict[str, int]]:
     """
     Build the env_id -> agent map for one game, with player_0 as the learner.
-    Returns (players_in_game, opponent_label_map) for belief targets.
+    Returns (players_in_game, opponent_label_map) where opponent_label_map maps
+    **player_id -> belief class id** per BELIEF_LABELS.
     """
-    players: Dict[str, Any] = {"player_0": training_agent}
+    assert len(opponent_types) == len(opponent_configs), "opponent_types and opponent_configs must align"
 
-    # Map from opponent *player_id* (stable name) to integer class label
+    players: Dict[str, Any] = {"player_0": training_agent}
     opponent_label_map: Dict[str, int] = {}
 
-    # Instantiate opponents for env_ids player_1..player_{NUM_PLAYERS-1}
-    assert len(opponent_types) == len(opponent_configs), "opponent_types and opponent_configs must align"
-    for i in range(1, 4):
+    for i in range(1, config.NUM_PLAYERS):
         env_id = f"player_{i}"
         opp_type = opponent_types[i - 1]
         opp_cfg = opponent_configs[i - 1]
 
         if opp_type == "hardcoded":
             hc_class = opp_cfg["class"]
-            hc_name = opp_cfg["name"]
+            hc_name = opp_cfg["name"]  # must match key in BELIEF_LABELS
             agent = _instantiate_hardcoded(hc_class, hc_name, env_id, device)
+
+            # Map this opponent's player_id to the belief class id
+            if hc_name not in BELIEF_LABELS:
+                raise KeyError(f"Hardcoded agent '{hc_name}' missing from BELIEF_LABELS")
+            label = BELIEF_LABELS[hc_name]
+            pid = agent.get_player_id()  # e.g., "Hardcoded_GreedyCardSpammer"
+            opponent_label_map[pid] = label
+
         elif opp_type == "historical":
-            # TODO: load a frozen PPO agent; stub for now
+            # TODO: instantiate frozen PPO agent and add to BELIEF_LABELS when available
             raise NotImplementedError("Historical agent loading not yet implemented.")
+
         elif opp_type == "training":
-            # Reuse the current learner as a self-play opponent (rare, but allowed)
+            # Self-play (rare): use learner; you must also assign a belief label
             agent = training_agent
+            pid = agent.get_player_id() if hasattr(agent, "get_player_id") else "TrainAgent"
+            if pid not in opponent_label_map:
+                raise NotImplementedError("Belief label for training/self-play opponent is undefined. Add to BELIEF_LABELS and map here.")
+
         else:
             raise ValueError(f"Unknown opponent type: {opp_type}")
 
         players[env_id] = agent
-        # Use .get_player_id() if available, else fall back to class name
-        try:
-            pid = agent.get_player_id()
-        except Exception:
-            pid = getattr(agent, "player_id", opp_cfg.get("name", str(agent)))
-        opponent_label_map[pid] = len(opponent_label_map)
 
     return players, opponent_label_map
 
@@ -132,7 +147,6 @@ def ppo_losses_for_episode(
     our_mask = (agent_types == 0)
     opp_mask = ~our_mask
 
-    # Indices for our/opponent steps
     our_idx = torch.nonzero(our_mask, as_tuple=False).squeeze(-1)
 
     scalars = {
@@ -144,7 +158,6 @@ def ppo_losses_for_episode(
 
     # ---------------- Actor-Critic on our steps ----------------
     if our_idx.numel() > 0:
-        # Gather episode data at our steps
         actions = torch.tensor([episode["our_action"][i] for i in our_idx.tolist()], device=device, dtype=torch.long)
         old_logp = torch.tensor([episode["log_prob"][i] for i in our_idx.tolist()], device=device, dtype=torch.float32)
         rewards = [float(episode["reward"][i]) for i in our_idx.tolist()]
@@ -153,13 +166,20 @@ def ppo_losses_for_episode(
         logits_at = action_logits[0, our_idx, :]  # [N, A]
         values_at = state_values[0, our_idx, 0]   # [N]
 
-        # Build next_values for GAE: shift left, last=0 (or last value if not done)
+        # Build next_values for GAE (shifted values, last = 0)
         next_vals = values_at.detach().clone()
         if next_vals.numel() > 1:
             next_vals[:-1] = values_at.detach()[1:]
         next_vals[-1] = 0.0
 
-        adv, ret = compute_gae(rewards, dones, values_at.detach().cpu().tolist(), next_vals.detach().cpu().tolist(), config.GAMMA, config.GAE_LAMBDA)
+        adv, ret = compute_gae(
+            rewards,
+            dones,
+            values_at.detach().cpu().tolist(),
+            next_vals.detach().cpu().tolist(),
+            config.GAMMA,
+            config.GAE_LAMBDA,
+        )
         advantages = torch.tensor(adv, dtype=torch.float32, device=device)
         returns    = torch.tensor(ret, dtype=torch.float32, device=device)
         advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
@@ -183,10 +203,8 @@ def ppo_losses_for_episode(
         })
 
         # ---------------- Belief loss on our steps ----------------
-        # Use belief targets if available (they are integers 0..K-1)
         def _belief_ce(b_logits, key):
-            targets = []
-            idxs = []
+            targets, idxs = [], []
             for i in our_idx.tolist():
                 tgt = episode[key][i]
                 if tgt is not None:
@@ -206,9 +224,7 @@ def ppo_losses_for_episode(
         scalars.update({"belief_loss": float(belief_loss.detach().cpu())})
 
     # ---------------- Opponent action prediction loss ----------------
-    # Only at opponent steps that have a retro-filled prediction (mask via episode["opp_pred_logits"]) and a target action
-    opp_idxs = []
-    opp_targets = []
+    opp_idxs, opp_targets = [], []
     for i in range(T):
         if not opp_mask[i]:
             continue
@@ -242,11 +258,11 @@ def train(
 ):
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    device = torch.device(config.DEVICE if hasattr(config, "DEVICE") else ("cuda" if torch.cuda.is_available() else "cpu"))
+    device = torch.device(getattr(config, "DEVICE", "cuda" if torch.cuda.is_available() else "cpu"))
     set_seed(getattr(config, "SEED", 42))
 
     # ---- Env & model ----
-    env = LiarsDeckEnv(num_players=4)
+    env = LiarsDeckEnv(num_players=getattr(config, "NUM_PLAYERS", 4))
 
     obs_dim = 9
     action_dim = 7
@@ -265,23 +281,24 @@ def train(
     learner = PPOAutoregressiveAgent(device, "TrainAgent_v1")
     learner.set_model(model)
 
-    # ---- Opponents (example: all hardcoded; replace with your configs as needed) ----
-    # Build a simple rotating set of hardcoded opponents
-    hc_pool = { # Hardcoded agents ...
-             "Classic": Classic, "GreedyCardSpammer": GreedyCardSpammer, "RandomAgent": RandomAgent,
-             "SelectiveTableConservativeChallenger": SelectiveTableConservativeChallenger,
-             "StrategicChallenger": StrategicChallenger, "TableFirstConservativeChallenger": TableFirstConservativeChallenger,
-             "TableNonTableAgent": TableNonTableAgent
-        }
+    # ---- Opponent rotation (less confusing setup) ----
+    HC_POOL: List[Tuple[str, Any]] = [
+        ("Classic", Classic),
+        ("GreedyCardSpammer", GreedyCardSpammer),
+        ("RandomAgent", RandomAgent),
+        ("SelectiveTableConservativeChallenger", SelectiveTableConservativeChallenger),
+        ("StrategicChallenger", StrategicChallenger),
+        ("TableFirstConservativeChallenger", TableFirstConservativeChallenger),
+        ("TableNonTableAgent", TableNonTableAgent),
+    ]
 
     def build_opponent_cfgs(start: int = 0) -> Tuple[List[str], List[Dict[str, Any]]]:
-        n = 4 - 1
-        picks = [hc_pool[(start + i) % len(hc_pool)] for i in range(n)]
+        n = getattr(config, "NUM_PLAYERS", 4) - 1
+        picks = [HC_POOL[(start + i) % len(HC_POOL)] for i in range(n)]
         opponent_types = ["hardcoded"] * n
-        opponent_configs = [{"class": cls, "name": name} for cls, name in picks]
+        opponent_configs = [{"class": cls, "name": name} for (name, cls) in picks]
         return opponent_types, opponent_configs
 
-    global_step = 0
     for update in range(1, num_updates + 1):
         opponent_types, opponent_configs = build_opponent_cfgs(update)
         players_in_game, opponent_label_map = build_players(device, learner, opponent_types, opponent_configs)
@@ -301,7 +318,7 @@ def train(
         epoch_loss = 0.0
         n_loss_terms = 0
 
-        for epoch in range(k_epochs):
+        for _ in range(k_epochs):
             for ep in episodes:
                 loss, scalars = ppo_losses_for_episode(model, ep, device)
                 optimizer.zero_grad(set_to_none=True)
