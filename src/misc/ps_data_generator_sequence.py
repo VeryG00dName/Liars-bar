@@ -34,7 +34,7 @@ from src.model.hard_coded_agents import (
 from src.training.train_utils import load_specific_historical_models
 
 # Import PS
-from src.model.ps_v3 import PerfectSearch
+from src.model.ps import PerfectSearch
 
 def setup_logging(log_file=None, level=logging.INFO):
     """Configure logging for the data generator."""
@@ -68,35 +68,6 @@ def create_output_dir(base_dir):
         output_dir = base_dir
     os.makedirs(output_dir, exist_ok=True)
     return output_dir
-
-def load_opponent_pool(include_historical=True):
-    """
-    Load all available opponent models (both hardcoded and historical).
-    Returns a dictionary mapping opponent types to their class/instance.
-    """
-    logger = logging.getLogger()
-    opponent_pool = {
-        "RandomAgent": RandomAgent,
-        "GreedyCardSpammer": GreedyCardSpammer,
-        "TableFirstConservativeChallenger": TableFirstConservativeChallenger,
-        "SelectiveTableConservativeChallenger": SelectiveTableConservativeChallenger,
-        "TableNonTableAgent": TableNonTableAgent,
-        "StrategicChallenger": StrategicChallenger,
-        "Classic": Classic
-    }
-    
-    if include_historical:
-        try:
-            logger.info("Loading historical models...")
-            historical_models = load_specific_historical_models(config.HISTORICAL_MODEL_DIR, 'cpu')
-            for model_instance, identifier in historical_models:
-                opponent_pool[f"Historical_{identifier}"] = model_instance
-            logger.info(f"Loaded {len(historical_models)} historical models")
-        except Exception as e:
-            logger.error(f"Error loading historical models: {e}")
-            logger.info("Continuing with hardcoded models only")
-    
-    return opponent_pool
 
 def setup_opponents(opponent_pool, opponent_types, agent_names):
     """
@@ -207,9 +178,9 @@ def generate_data(
     sequence for each episode and tagging each step by agent_id
     (0=training, 1=opponent1, 2=opponent2).
     """
-    AGENT_ID_MAP = {'player_0': 0, 'player_1': 1, 'player_2': 2}
+    AGENT_ID_MAP = {'player_0': 0, 'player_1': 1, 'player_2': 2, 'player_3': 3}
     CARD_COUNT_MAPPING = {1: 7, 2: 8, 3: 9}
-
+    num_players = config.NUM_PLAYERS
     def setup_logging(log_file=None, level=logging.INFO):
         logger = logging.getLogger()
         logger.setLevel(level)
@@ -262,7 +233,7 @@ def generate_data(
     opponent_pool = load_opponent_pool(include_historical)
     opponent_types = list(opponent_pool.keys())
     training_agent = 'player_0'
-    opponent_agent_names = ['player_1', 'player_2']
+    opponent_agent_names = [f'player_{i}' for i in range(1, num_players)]
 
     stats = {
         "episodes": 0,
@@ -307,7 +278,7 @@ def generate_data(
             step_data = {"agent_id": AGENT_ID_MAP[current_agent], "step": episode_step}
             step_data["belief"] = create_belief_vector(selected_opponents, current_opponents)
             if current_agent == training_agent:
-                obs_curr = env.observe(current_agent, newest=True)[current_agent]
+                obs_curr = env.observe(current_agent, newerest=True)[current_agent]
                 step_data["observation"] = np.round(obs_curr, 2).tolist()
                 step_data["action_mask"] = env.infos[current_agent].get('action_mask', [0] * 7)
                 planned = ps.get_next_agent_action(current_agent)
