@@ -34,7 +34,7 @@ ensure_dirs()
 # ============================
 # Environment Configuration
 # ============================
-NUM_PLAYERS = 3
+NUM_PLAYERS = 4
 RENDER_MODE = None  # Set to 'human' to enable rendering
 USE_WRAPPER = False
 USE_TRANSFORMER_MEMORY = True
