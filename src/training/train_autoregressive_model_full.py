@@ -18,7 +18,7 @@ from tqdm import tqdm
 from typing import List
 from torch.utils.tensorboard import SummaryWriter
 from src.training.train_extras import set_seed
-from src.model.autoregressive_model_full import AutoregressiveGameModelFull
+from src.model.ppo_autoregressive_model import PPOAutoregressiveModel
 from src import config
 torch.set_float32_matmul_precision("high")
 # Define hardcoded opponent labels consistent with other training scripts
@@ -217,16 +217,8 @@ class AutoregressiveGameDataset(Dataset):
         TRANSFORM_MAP = {0: 7, 3: 7, 1: 8, 4: 8, 2: 9, 5: 9}
 
         # Debug counters
-        self.obs_trimmed_count = 0
         self.total_sequences = 0
         self.sequence_lengths = []
-
-        def convert_old_obs_to_new(obs_7d, agent_id=0):
-            """Convert 7-dim old obs to 4-dim new-style obs."""
-            hand_vec = obs_7d[:2]
-            hand_sizes = obs_7d[4:]  # Length 3: hand sizes of all agents
-            opp_hand_sizes = [hand_sizes[i] for i in range(3) if i != agent_id]
-            return np.round(np.concatenate([hand_vec, opp_hand_sizes]).astype(np.float32), 2)
 
         for round_data in tqdm(data, desc="Processing sequences"):
             sequence = round_data["sequence"]
@@ -295,16 +287,10 @@ class AutoregressiveGameDataset(Dataset):
 
                 # Observations (only on our turns)
                 if agent_id == 0:
-                    obs = np.array(step.get("observation", np.zeros(4, np.float32)), dtype=np.float32)
-                    if obs.shape[0] == 7:
-                        obs = convert_old_obs_to_new(obs, agent_id=0)
-                    elif obs.shape[0] != 4:
-                        print(f"⚠️ Unexpected obs shape at step {i}: {obs.shape}, using zeros.")
-                        obs = np.zeros(4, dtype=np.float32)
-                        self.obs_trimmed_count += 1
+                    obs = np.array(step.get("observation", np.zeros(9, np.float32)), dtype=np.float32)
                     obs_list.append(obs)
                 else:
-                    obs_list.append(np.zeros(4, dtype=np.float32))
+                    obs_list.append(np.zeros(9, dtype=np.float32))
 
                 # Action mask (only our turns)
                 if agent_id == 0 and "action_mask" in step:
@@ -317,7 +303,7 @@ class AutoregressiveGameDataset(Dataset):
                     has_belief = True
                     names = step["belief"]
                     full_belief = []
-                    for opp_idx in range(2):
+                    for opp_idx in range(3):
                         if opp_idx < len(names):
                             name = names[opp_idx]
                             idx = LABELS.get(name, 0)
@@ -362,7 +348,6 @@ class AutoregressiveGameDataset(Dataset):
             self.sequences.append(seq_dict)
 
         print(f"Processed {len(self.sequences)} sequences (from {self.total_sequences} total)")
-        print(f"Observation trimming occurred {self.obs_trimmed_count} times")
         if self.sequence_lengths:
             avg_len = sum(self.sequence_lengths) / len(self.sequence_lengths)
             print(f"Avg sequence length: {avg_len:.2f} steps, "
@@ -722,16 +707,16 @@ def train_autoregressive_model(
     action_dim = 7
     logger.info(f"Model dimensions: obs_dim={obs_dim}, action_dim={action_dim}")
 
-    model = AutoregressiveGameModelFull(
+    model = PPOAutoregressiveModel(
         obs_dim=obs_dim,
         action_dim=action_dim,
         hidden_dim=hidden_dim,
-        belief_dim=num_opponent_types,
+        belief_dim=64,
         num_heads=4,
         num_layers=2,
         dropout_rate=0.1,
         max_seq_length=max_seq_length,
-        num_agent_types=3 # 0: Agent, 1: Opponent 0, 2: Opponent 1
+        num_agent_types=4 # 0: Agent, 1: Opponent 0, 2: Opponent 1
     ).to(device)
     #model = torch.compile(model, backend="aot_eager", mode="reduce-overhead")
     pt_dtype = torch.float16 if device.type == 'cuda' else torch.bfloat16
@@ -815,8 +800,8 @@ def train_autoregressive_model(
             # compute accuracies
             # Agent type 0: Agent
             our_mask     = (batch['agent_type'] == 0) & (~batch['padding_mask'])
-            # Agent types 1 or 2: Opponent
-            opp_mask     = ((batch['agent_type'] == 1) | (batch['agent_type'] == 2)) & (~batch['padding_mask'])
+            # Agent types 1 or 2 or 3: Opponent
+            opp_mask     = ((batch['agent_type'] == 1) | (batch['agent_type'] == 2) | (batch['agent_type'] == 3)) & (~batch['padding_mask'])
             
             agent_acc    = compute_accuracy(self_logits, batch['target_action'], our_mask)
             opponent_acc = compute_accuracy(opp_logits,  batch['target_action'], opp_mask)
@@ -895,7 +880,7 @@ def train_autoregressive_model(
                     )
 
                 our_mask     = (batch['agent_type'] == 0) & (~batch['padding_mask'])
-                opp_mask     = ((batch['agent_type'] == 1) | (batch['agent_type'] == 2)) & (~batch['padding_mask'])
+                opp_mask     = ((batch['agent_type'] == 1) | (batch['agent_type'] == 2) | (batch['agent_type'] == 3)) & (~batch['padding_mask'])
                 
                 agent_acc    = compute_accuracy(self_logits, batch['target_action'], our_mask)
                 opponent_acc = compute_accuracy(opp_logits, batch['target_action'], opp_mask)
