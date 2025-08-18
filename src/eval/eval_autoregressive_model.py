@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # src/eval/eval_autoregressive_model.py
 import os
+import numpy as np
 import argparse
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-
+import torch.amp as amp
 # Import configuration and model class
-from src.model.autoregressive_model_full import AutoregressiveGameModelFull
-from src.training.train_autoregressive_model_full import AutoregressiveGameDataset, collate_variable_length_sequences, load_autoreg_data
+from src.model.ppo_autoregressive_model import PPOAutoregressiveModel
+from src.training.train_autoregressive_model_full import AutoregressiveGameDataset, collate_variable_length_sequences, load_autoreg_data, move_batch_to_device, BucketSampler
 
 def evaluate_autoregressive_model(model, data_loader, device, max_seq_length):
     """Evaluate the model, including action and belief accuracy."""
@@ -28,10 +29,12 @@ def evaluate_autoregressive_model(model, data_loader, device, max_seq_length):
         # Overall belief accuracy
         'belief_0_correct': 0, 'belief_0_total': 0,
         'belief_1_correct': 0, 'belief_1_total': 0,
+        'belief_2_correct': 0, 'belief_2_total': 0,
         
         # Per-step belief accuracy
         'belief_accuracy_by_step_0': init_step_stats(),
         'belief_accuracy_by_step_1': init_step_stats(),
+        'belief_accuracy_by_step_2': init_step_stats(),
         
         # Per-step action accuracy
         'main_agent_acc_by_step': init_step_stats(),
@@ -40,9 +43,10 @@ def evaluate_autoregressive_model(model, data_loader, device, max_seq_length):
         'opp_head_opp_acc_by_step': init_step_stats(),
     }
     
-    with torch.no_grad():
+    with torch.no_grad(), amp.autocast(device_type=device.type, dtype=torch.float16):
         for batch in tqdm(data_loader, desc="Evaluating"):
-            main_head_logits, opp_head_logits, _, belief_logits_0, belief_logits_1 = model(
+            batch = move_batch_to_device(batch, device)
+            main_head_logits, opp_head_logits, _, belief_logits_0, belief_logits_1, belief_logits_2 = model(
                     obs_sequence=batch['obs'],
                     action_sequence=batch['action'],
                     agent_types=batch['agent_type'],
@@ -64,12 +68,12 @@ def evaluate_autoregressive_model(model, data_loader, device, max_seq_length):
             opp_head_preds = torch.argmax(opp_head_logits, dim=-1)
             belief_preds_0 = belief_logits_0.argmax(dim=-1)
             belief_preds_1 = belief_logits_1.argmax(dim=-1)
+            belief_preds_2 = belief_logits_2.argmax(dim=-1)
             
             if 'act_dim' not in stats:
                 stats['act_dim'] = int(main_head_logits.size(-1))
-                import numpy as _np
-                stats['agent_pred_counts']   = _np.zeros(stats['act_dim'], dtype=_np.int64)
-                stats['agent_target_counts'] = _np.zeros(stats['act_dim'], dtype=_np.int64)
+                stats['agent_pred_counts']   = np.zeros(stats['act_dim'], dtype= np.int64)
+                stats['agent_target_counts'] = np.zeros(stats['act_dim'], dtype= np.int64)
 
             if agent_mask.any():
                 tgt_flat  = target_actions[agent_mask]       # [N]
@@ -92,10 +96,13 @@ def evaluate_autoregressive_model(model, data_loader, device, max_seq_length):
 
             belief_targets_0 = belief_targets[:, :, 0]
             belief_targets_1 = belief_targets[:, :, 1]
+            belief_targets_2 = belief_targets[:, :, 2]
             stats['belief_0_correct'] += ((belief_preds_0 == belief_targets_0) & agent_mask).sum().item()
             stats['belief_0_total'] += agent_mask.sum().item()
             stats['belief_1_correct'] += ((belief_preds_1 == belief_targets_1) & agent_mask).sum().item()
             stats['belief_1_total'] += agent_mask.sum().item()
+            stats['belief_2_correct'] += ((belief_preds_2 == belief_targets_2) & agent_mask).sum().item()
+            stats['belief_2_total'] += agent_mask.sum().item()
 
             # --- Per-Step Accuracy Calculation ---
             for t in range(batch['obs'].size(1)):
@@ -106,6 +113,8 @@ def evaluate_autoregressive_model(model, data_loader, device, max_seq_length):
                     stats['belief_accuracy_by_step_0'][t][1] += step_agent_mask.sum().item()
                     stats['belief_accuracy_by_step_1'][t][0] += ((belief_preds_1[:, t] == belief_targets_1[:, t]) & step_agent_mask).sum().item()
                     stats['belief_accuracy_by_step_1'][t][1] += step_agent_mask.sum().item()
+                    stats['belief_accuracy_by_step_2'][t][0] += ((belief_preds_2[:, t] == belief_targets_2[:, t]) & step_agent_mask).sum().item()
+                    stats['belief_accuracy_by_step_2'][t][1] += step_agent_mask.sum().item()
 
                 # Action accuracy (all valid turns)
                 step_opp_mask = opponent_mask[:, t]
@@ -138,9 +147,10 @@ def print_results(stats, title, max_seq_length):
     print(f"  - Opp head  -> opponent actions:  {get_acc(stats['opp_head_opponent_correct'], stats['opp_head_opponent_total']):.2f}%")
     print(f"  - Belief for Opponent 0:          {get_acc(stats['belief_0_correct'], stats['belief_0_total']):.2f}%")
     print(f"  - Belief for Opponent 1:          {get_acc(stats['belief_1_correct'], stats['belief_1_total']):.2f}%")
+    print(f"  - Belief for Opponent 2:          {get_acc(stats['belief_2_correct'], stats['belief_2_total']):.2f}%")
     
     print("\n[Per-Step Accuracy Breakdown (%)]")
-    header = "Step | Blf0 | Blf1 | M->A | M->O | O->A | O->O | Agent N | Opp N"
+    header = "Step | Blf0 | Blf1 | Blf2 | M->A | M->O | O->A | O->O | Agent N | Opp N"
     print(header)
     print("-" * len(header))
 
@@ -152,6 +162,7 @@ def print_results(stats, title, max_seq_length):
             # Belief acc (only on agent turns)
             blf0_acc = get_acc(stats['belief_accuracy_by_step_0'][t][0], stats['belief_accuracy_by_step_0'][t][1])
             blf1_acc = get_acc(stats['belief_accuracy_by_step_1'][t][0], stats['belief_accuracy_by_step_1'][t][1])
+            blf2_acc = get_acc(stats['belief_accuracy_by_step_2'][t][0], stats['belief_accuracy_by_step_2'][t][1])
             
             # Action acc
             main_agent_acc = get_acc(stats['main_agent_acc_by_step'][t][0], total_agent)
@@ -159,7 +170,7 @@ def print_results(stats, title, max_seq_length):
             opp_agent_acc = get_acc(stats['opp_head_agent_acc_by_step'][t][0], total_agent)
             opp_opp_acc = get_acc(stats['opp_head_opp_acc_by_step'][t][0], total_opp)
 
-            print(f"{t:4} | {blf0_acc:4.0f} | {blf1_acc:4.0f} | {main_agent_acc:4.0f} | {main_opp_acc:4.0f} | {opp_agent_acc:4.0f} | {opp_opp_acc:4.0f} | {total_agent:7d} | {total_opp:5d}")
+            print(f"{t:4} | {blf0_acc:4.0f} | {blf1_acc:4.0f}  | {blf2_acc:4.0f}  | {main_agent_acc:4.0f} | {main_opp_acc:4.0f} | {opp_agent_acc:4.0f} | {opp_opp_acc:4.0f} | {total_agent:7d} | {total_opp:5d}")
             
     # --- SIMPLE agent-turn counts by action id ---
     if 'agent_pred_counts' in stats and 'agent_target_counts' in stats:
@@ -178,10 +189,10 @@ def main():
     
     default_checkpoint_dir = "./checkpoints/autoreg_20250805_120000" # Example path
     parser.add_argument("--checkpoint-dir", type=str, default=default_checkpoint_dir, help="Directory containing the checkpoint")
-    parser.add_argument("--checkpoint-file", type=str, default="autoreg_model_best.pth", help="Checkpoint filename")
+    parser.add_argument("--checkpoint-file", type=str, default="autoreg_model_final.pth", help="Checkpoint filename")
     parser.add_argument("--data-dir", type=str, default="./ps_autoreg_data", help="Directory containing evaluation data")
     parser.add_argument("--max-samples", type=int, default=20000, help="Maximum number of samples for evaluation")
-    parser.add_argument("--batch-size", type=int, default=64, help="Batch size for evaluation")
+    parser.add_argument("--batch-size", type=int, default=512, help="Batch size for evaluation")
     parser.add_argument("--device", type=str, default='cuda', help="Device to use (cpu or cuda)")
     parser.add_argument("--max-seq-length", type=int, default=100, help="Maximum sequence length to process")
     
@@ -207,12 +218,16 @@ def main():
     print(f"  - belief_dim (num_opponent_types): {num_opponent_types}")
     print(f"  - Loaded {len(opponent_mapping)} opponent types in mapping.")
 
-    model = AutoregressiveGameModelFull(
+    model = PPOAutoregressiveModel(
         obs_dim=obs_dim,
         action_dim=action_dim,
-        belief_dim=num_opponent_types,
         hidden_dim=hidden_dim,
-        max_seq_length=args.max_seq_length
+        belief_dim=64,
+        num_heads=6,
+        num_layers=2,
+        dropout_rate=0.1,
+        max_seq_length=args.max_seq_length,
+        num_agent_types=4
     ).to(device)
     
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -220,7 +235,7 @@ def main():
     print("\nLoaded model weights from checkpoint.")
 
     data = load_autoreg_data(data_dir=args.data_dir, max_samples=args.max_samples)
-    
+    cpu_device = torch.device('cpu')
     if num_opponent_types is None:
         num_opponent_types = max(opponent_mapping.values()) + 1
         
@@ -228,15 +243,17 @@ def main():
         data, 
         opponent_mapping, 
         num_opponent_types, 
-        device, 
+        cpu_device, 
         max_seq_length=args.max_seq_length
     )
-    
+    eval_sampler = BucketSampler(eval_dataset.sequences, batch_size=512, shuffle=True)
     eval_loader = DataLoader(
-        eval_dataset, 
-        batch_size=args.batch_size, 
-        shuffle=False, 
-        collate_fn=collate_variable_length_sequences
+        eval_dataset,
+        batch_sampler=eval_sampler,
+        num_workers=0,
+        pin_memory=False,
+        persistent_workers=False,
+        collate_fn=collate_variable_length_sequences,
     )
 
     stats = evaluate_autoregressive_model(
