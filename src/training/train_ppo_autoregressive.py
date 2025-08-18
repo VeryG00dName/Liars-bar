@@ -381,10 +381,10 @@ def train(
         update_start = time.time()
 
         episodes = []
-        batches = 5
-        eps_per_batch = max(1, episodes_per_update // batches)
+        #batches = 5
+        #eps_per_batch = max(1, episodes_per_update // batches)
 
-        for _ in range(batches):
+        for _ in range(episodes_per_update):
             opponent_types, opponent_configs = build_opponent_cfgs()
             players_in_game, opponent_label_map = build_players(device, learner, opponent_types, opponent_configs)
 
@@ -392,7 +392,7 @@ def train(
                 env=env,
                 device=device,
                 players_in_this_game=players_in_game,
-                episodes=eps_per_batch,
+                episodes=1,
                 training_agent_env_id="player_0",
                 opponent_label_map=opponent_label_map,
             )

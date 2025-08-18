@@ -196,11 +196,13 @@ def collect_training_sequences(
                     env.step(int(ep["opp_target_action"][row]))
 
                     # Store training-agent terminal state on this row if it happened here
+                    
                     ep["done"][row] = bool(
                         env.terminations.get(training_agent_env_id, False)
                         or env.truncations.get(training_agent_env_id, False)
                     )
-
+                    if ep["done"][row]:
+                        ep["reward"][row] = float(env.rewards.get(training_agent_env_id, 0.0))
                 # loop control
                 game_active = bool(env.agents)
 
