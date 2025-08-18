@@ -1,5 +1,6 @@
 # src/training/train_ppo_autoregressive.py
 
+import copy
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import logging
@@ -12,7 +13,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.tensorboard import SummaryWriter
-
+import torch.amp as amp
 # Env & project imports
 from src.env.liars_deck_env_core import LiarsDeckEnv
 from src import config
@@ -145,6 +146,9 @@ def ppo_losses_for_episode(
     model: PPOAutoregressiveModel,
     episode: Dict[str, Any],
     device: torch.device,
+    sl_teacher: Optional[PPOAutoregressiveModel] = None,
+    bc_kl_weight: float = 0.0,
+    t_action_logits_precomp: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute PPO+auxiliary losses for a single episode dict produced by collect_training_sequences.
@@ -199,7 +203,8 @@ def ppo_losses_for_episode(
         returns    = torch.tensor(ret, dtype=torch.float32, device=device)
         advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
 
-        dist = torch.distributions.Categorical(logits=logits_at)
+        # PPO objective
+        dist = torch.distributions.Categorical(logits=logits_at.float())
         new_logp = dist.log_prob(actions)
         ratio = (new_logp - old_logp).exp()
 
@@ -211,6 +216,26 @@ def ppo_losses_for_episode(
         entropy_loss = -entropy_term
 
         total_loss = total_loss + policy_loss + 0.5 * value_loss + config.INIT_ENTROPY_COEF * entropy_loss
+
+        # ---- tiny KL leash to frozen SL policy (teacher) ----
+        if (bc_kl_weight > 0.0) and our_idx.numel() > 0:
+            if t_action_logits_precomp is None:
+                if sl_teacher is not None:
+                    with torch.no_grad():
+                        t_action_logits, *_ = sl_teacher(**mi)
+                else:
+                    t_action_logits = None
+            else:
+                t_action_logits = t_action_logits_precomp
+
+            if t_action_logits is not None:
+                t_logits_at = t_action_logits[0, our_idx, :].float()
+                dist_sl = torch.distributions.Categorical(logits=t_logits_at)
+                bc_kl = torch.distributions.kl_divergence(
+                    torch.distributions.Categorical(logits=logits_at.float()), dist_sl
+                ).mean()
+                total_loss = total_loss + bc_kl_weight * bc_kl
+                scalars["bc_kl"] = float(bc_kl.detach().cpu())
 
         # PPO diagnostics
         approx_kl = torch.mean(old_logp - new_logp).detach()
@@ -246,7 +271,9 @@ def ppo_losses_for_episode(
         b1_loss, acc_b1 = _belief_ce_and_acc(b1_logits, "belief_tgt1")
         b2_loss, acc_b2 = _belief_ce_and_acc(b2_logits, "belief_tgt2")
         belief_loss = b0_loss + b1_loss + b2_loss
-        total_loss = total_loss + config.AUX_LOSS_WEIGHT * belief_loss
+
+        belief_w = getattr(config, "AUX_BELIEF_WEIGHT", getattr(config, "AUX_LOSS_WEIGHT", 0.5))
+        total_loss = total_loss + belief_w * belief_loss
         scalars.update({
             "belief_loss": float(belief_loss.detach().cpu()),
             "belief_acc_0": float(acc_b0),
@@ -270,7 +297,9 @@ def ppo_losses_for_episode(
         opp_logits_sel = opp_logits[0, idx_tensor, :]
         opp_targets_t = torch.tensor(opp_targets, dtype=torch.long, device=device)
         opp_loss = F.cross_entropy(opp_logits_sel, opp_targets_t)
-        total_loss = total_loss + config.AUX_LOSS_WEIGHT * opp_loss
+
+        opp_w = getattr(config, "AUX_OPP_WEIGHT", getattr(config, "AUX_LOSS_WEIGHT", 0.5))
+        total_loss = total_loss + opp_w * opp_loss
         scalars.update({
             "opp_loss": float(opp_loss.detach().cpu()),
             "n_opp_supervised": float(len(opp_idxs)),
@@ -297,7 +326,7 @@ def train(
 
     device = torch.device(getattr(config, "DEVICE", "cuda" if torch.cuda.is_available() else "cpu"))
     set_seed(getattr(config, "SEED", 42))
-
+    scaler = amp.GradScaler(device=device, enabled=(device.type == 'cuda'))
     # ---- Logging / TB ----
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=log_dir)
@@ -305,7 +334,9 @@ def train(
 
     # ---- Env & model ----
     env = LiarsDeckEnv(num_players=getattr(config, "NUM_PLAYERS", 4))
-
+    CKPT_PATH = r"checkpoints\autoreg_20250817_195858\autoreg_model_final.pth"
+    ckpt = torch.load(CKPT_PATH, map_location=device, weights_only=False)
+    sd   = ckpt["model_state_dict"]
     obs_dim = 9
     action_dim = 7
 
@@ -313,13 +344,16 @@ def train(
         obs_dim=obs_dim,
         action_dim=action_dim,
         belief_dim=64,
-        hidden_dim=256,
-        max_seq_length=320,
+        hidden_dim=384,
+        num_heads=6,
+        max_seq_length=256,
         num_agent_types=4,
     ).to(device)
-
+    model.load_state_dict(sd, strict=True)
+    sl_teacher = copy.deepcopy(model).eval()
+    for p in sl_teacher.parameters(): p.requires_grad = False
     optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE, eps=1e-5)
-
+    logging.info(f"Loaded SL checkpoint: {CKPT_PATH}")
     learner = PPOAutoregressiveAgent(device, "TrainAgent_v1")
     learner.set_model(model)
 
@@ -347,7 +381,7 @@ def train(
         update_start = time.time()
 
         episodes = []
-        batches = 4
+        batches = 5
         eps_per_batch = max(1, episodes_per_update // batches)
 
         for _ in range(batches):
@@ -364,19 +398,36 @@ def train(
             )
             episodes.extend(eps)
 
+        # Precompute teacher logits for this update (if KL is enabled)
+        precomp_teacher = None
+        if getattr(config, "BC_KL_WEIGHT", 0.0) > 0:
+            precomp_teacher = []
+            for ep in episodes:
+                mi = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in ep["model_input"].items()}
+                with torch.no_grad():
+                    t_logits, *_ = sl_teacher(**mi)   # [1, T, A]
+                precomp_teacher.append(t_logits.detach().to(torch.float32))  # stable dtype
+
         # ---- PPO update ----
         model.train()
         agg: Dict[str, float] = {}
         n_loss_terms = 0
 
         for _ in range(k_epochs):
-            for ep in episodes:
-                loss, scalars = ppo_losses_for_episode(model, ep, device)
+            for ep, t_logits in zip(episodes, precomp_teacher if precomp_teacher is not None else [None]*len(episodes)):
+                with amp.autocast(device_type=device.type, dtype=torch.float16):
+                    loss, scalars = ppo_losses_for_episode(
+                        model, ep, device,
+                        sl_teacher=None,                             # <-- no longer used
+                        bc_kl_weight=getattr(config, "BC_KL_WEIGHT", 0.0),
+                        t_action_logits_precomp=t_logits,            # <-- use precomputed
+                    )
                 optimizer.zero_grad(set_to_none=True)
-                loss.backward()
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
                 clip_grad_norm_(model.parameters(), max_norm=getattr(config, "MAX_NORM", 0.5))
-                optimizer.step()
-
+                scaler.step(optimizer)
+                scaler.update()
                 # aggregate scalars
                 for k, v in scalars.items():
                     agg[k] = agg.get(k, 0.0) + float(v)
@@ -395,11 +446,15 @@ def train(
         logging.info(f"Update {update}/{num_updates} | episodes={episodes_per_update} | "
                      f"avg_loss={avg_total_loss:.4f} | time={time.time()-update_start:.2f}s")
 
-        # Compute returns & lengths per episode for TB (based on collection)
-        ep_returns = [sum(ep["reward"]) for ep in episodes]
-        ep_lens = [len(ep["reward"]) for ep in episodes]
+        # Compute returns & lengths (you already do this)
+        ep_returns = [ep.get("episode_return", sum(ep["reward"])) for ep in episodes]
+        ep_lens    = [len(ep["reward"]) for ep in episodes]
         mean_return = float(sum(ep_returns) / len(ep_returns)) if ep_returns else 0.0
         mean_ep_len = float(sum(ep_lens) / len(ep_lens)) if ep_lens else 0.0
+
+        # NEW: WinRate
+        wins = sum(int(ep.get("win", 1 if sum(ep["reward"]) > 0.0 else 0)) for ep in episodes)
+        win_rate = wins / max(1, len(episodes))
 
         # ---- TensorBoard scalars (mirroring supervised style + PPO-specific) ----
         writer.add_scalar("Loss/Total", avg_total_loss, update)
@@ -410,7 +465,8 @@ def train(
         writer.add_scalar("Policy/Entropy", avg("entropy"), update)
         writer.add_scalar("Policy/ApproxKL", avg("approx_kl"), update)
         writer.add_scalar("Policy/ClipFraction", avg("clip_fraction"), update)
-
+        writer.add_scalar("Policy/SL_KL", avg("bc_kl", 0.0), update)
+        
         writer.add_scalar("Acc/OpponentAction", avg("opp_action_acc"), update)
         writer.add_scalar("Acc/Belief0", avg("belief_acc_0"), update)
         writer.add_scalar("Acc/Belief1", avg("belief_acc_1"), update)
@@ -421,12 +477,15 @@ def train(
         writer.add_scalar("Rollout/EpisodeLenMean", mean_ep_len, update)
         writer.add_scalar("Rollout/OurStepsPerEpisodeMean", avg("n_our_steps"), update)
         writer.add_scalar("Rollout/TotalStepsPerEpisodeMean", avg("n_total_steps"), update)
+        writer.add_scalar("Rollout/WinRate", win_rate, update)
+        writer.add_scalar("Rollout/EpisodeReturnMean", mean_return, update)
+        writer.add_scalar("Rollout/EpisodeLenMean", mean_ep_len, update)
         writer.add_scalar("Supervision/OppStepsWithTargets", avg("n_opp_supervised"), update)
 
         # ---- Checkpoint ----
         if checkpoint_dir and (update % getattr(config, "CHECKPOINT_INTERVAL", 200) == 0):
             os.makedirs(checkpoint_dir, exist_ok=True)
-            path = os.path.join(checkpoint_dir, f"arppo_update_{update}.pt")
+            path = os.path.join(checkpoint_dir, f"arppo_update_{update}.pth")
             torch.save({
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
@@ -443,8 +502,8 @@ if __name__ == "__main__":
     log_dir = os.path.join("logs", run_name)
     ckpt_dir = os.path.join(getattr(config, "CHECKPOINT_DIR", "checkpoints"), run_name)
     train(
-        num_updates=1000,
-        episodes_per_update=100,
+        num_updates=100,
+        episodes_per_update=350,
         k_epochs=getattr(config, "K_EPOCHS", 2),
         checkpoint_dir=ckpt_dir,
         log_dir=log_dir,

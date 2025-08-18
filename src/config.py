@@ -95,10 +95,20 @@ LEARNING_RATE = 0.00019
 GAMMA = 0.974
 GAE_LAMBDA = 0.98
 EPS_CLIP = 0.3
-K_EPOCHS = 2
+K_EPOCHS = 3
 UPDATE_STEPS = 3
 MAX_NORM = 0.3
-AUX_LOSS_WEIGHT = 0.5
+
+# Old global aux weight (kept for backward-compat fallback)
+AUX_LOSS_WEIGHT = 1
+
+# NEW: split aux weights so you can match SL weighting and tune independently
+AUX_BELIEF_WEIGHT = 0.5   # belief heads weight (was 0.5 in your PPO runs)
+AUX_OPP_WEIGHT    = 1.0   # opponent action weight (1.0 to match SL)
+
+# NEW: tiny KL leash to the SL teacher (set >0 to enable in PPO loss)
+BC_KL_WEIGHT = 0.02       # good first try: 0.01–0.05
+
 INIT_ENTROPY_COEF = 0.005
 
 # ============================
