@@ -376,7 +376,7 @@ def collate_variable_length_sequences(batch):
     first_seq = batch[0]
     device = first_seq['obs'].device
     obs_dim = first_seq['obs'].shape[1]
-    belief_dim = first_seq['belief'].shape[1] if first_seq['belief'] is not None else 2
+    belief_dim = first_seq['belief'].shape[1] if first_seq['belief'] is not None else 3
 
     # Initialize tensors
     batched_obs           = torch.zeros(batch_size, max_seq_len, obs_dim, device=device)
@@ -422,6 +422,13 @@ def collate_variable_length_sequences(batch):
         'belief': batched_belief   # Belief targets
     }
     return batch_dict
+
+def move_batch_to_device(batch, device):
+    """Move a collated batch (dict of tensors/lists) to device."""
+    if device.type == 'cpu':
+        return batch
+    return {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
+            for k, v in batch.items()}
 
 def _iter_pickled_objects(file_path):
     """Yield every pickled object from a file that may contain multiple dumps."""
@@ -673,15 +680,32 @@ def train_autoregressive_model(
     train_data, val_data = train_val_split(all_data, validation_split, max_val_samples=1000)
     logger.info(f"Creating datasets with {len(train_data)} training and {len(val_data)} validation sequences")
     
-    train_dataset = AutoregressiveGameDataset(train_data, opponent_mapping, num_opponent_types, device, max_seq_length)
-    val_dataset = AutoregressiveGameDataset(val_data, opponent_mapping, num_opponent_types, device, max_seq_length)
+    cpu_device = torch.device('cpu')
+    train_dataset = AutoregressiveGameDataset(train_data, opponent_mapping, num_opponent_types, cpu_device, max_seq_length)
+    val_dataset   = AutoregressiveGameDataset(val_data,   opponent_mapping, num_opponent_types, cpu_device, max_seq_length)
     
     train_sampler = BucketSampler(train_dataset.sequences, batch_size=batch_size, shuffle=True)
-    train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,  num_workers=0, collate_fn=collate_variable_length_sequences)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=collate_variable_length_sequences)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_sampler=train_sampler,
+        num_workers=0,
+        pin_memory=False,
+        persistent_workers=False,
+        collate_fn=collate_variable_length_sequences,
+    )
 
-    sample = next(iter(train_loader))
-    obs_dim = sample['obs'].shape[2]
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+        persistent_workers=False,
+        collate_fn=collate_variable_length_sequences,
+    )
+
+    first_item = train_dataset[0]  # direct from dataset, no workers
+    obs_dim = first_item['obs'].shape[1]
     action_dim = 7
     logger.info(f"Model dimensions: obs_dim={obs_dim}, action_dim={action_dim}")
 
@@ -735,6 +759,7 @@ def train_autoregressive_model(
 
         train_progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Train)", leave=False)
         for batch in train_progress:
+            batch = move_batch_to_device(batch, device)
             with amp.autocast(device_type=device.type, dtype=pt_dtype):
                 # Support models with or without the 3rd head during transition
                 try:
@@ -849,6 +874,7 @@ def train_autoregressive_model(
         val_progress = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Val)", leave=False)
         with torch.no_grad():
             for batch in val_progress:
+                batch = move_batch_to_device(batch, device)
                 with amp.autocast(device_type=device.type, dtype=pt_dtype):
                     try:
                         (self_logits, opp_logits, value_pred,
@@ -1039,7 +1065,7 @@ def main():
     parser.add_argument("--num-opponent-types", type=int, default=None, help="Number of opponent types (auto-detected if None)")
     parser.add_argument("--hidden-dim", type=int, default=256, help="Hidden dimension for the model")
     parser.add_argument("--learning-rate", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--batch-size", type=int, default=1024, help="Batch size")
+    parser.add_argument("--batch-size", type=int, default=512, help="Batch size")
     parser.add_argument("--num-epochs", type=int, default=100, help="Number of epochs")
     parser.add_argument("--validation-split", type=float, default=0.1, help="Validation split ratio")
     parser.add_argument("--checkpoint-dir", type=str, default=None, help="Checkpoint directory")
