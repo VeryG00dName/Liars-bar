@@ -54,93 +54,56 @@ class PPOAutoregressiveAgent(BaseAgent):
         Load model state dict and re-instantiate AutoregressiveGameModelFull
         using inferred dimensions.
         """
-        # --- Extract model state dict from the unified format ---
-        if "policy_nets" not in checkpoint:
-            raise ValueError("Checkpoint is missing the 'policy_nets' section.")
-        if agent_key not in checkpoint["policy_nets"]:
+        if "policy_nets" not in checkpoint or agent_key not in checkpoint["policy_nets"]:
             raise ValueError(f"Checkpoint missing model state for agent '{agent_key}' in 'policy_nets'.")
 
         model_state_dict = checkpoint["policy_nets"][agent_key]
 
-        if not MFactoryUtil.is_autoregressive_model(model_state_dict):
-            raise ValueError(f"The model state for '{agent_key}' is not a valid autoregressive model.")
-        logger.debug(f"[{agent_key}] Model state dict successfully extracted.")
-
-        # --- Inference of model dimensions from state_dict ---
-        inferred_hidden_dim = None
-        inferred_action_dim = None
-        inferred_ext_action_dim = None
-        inferred_obs_dim = None
-        inferred_max_seq = None
-        inferred_belief_dim = None
-        default_num_heads = 4 # Matches the training script
+        if not MFactoryUtil.is_ppo_autoregressive_model(model_state_dict):
+            raise ValueError(f"The model state for '{agent_key}' is not a valid PPO autoregressive model.")
+        
+        logger.debug(f"[{self.player_id}] Model state dict extracted. Inferring dimensions...")
 
         try:
-            # Infer hidden_dim from action embedding or a transformer layer
-            if 'action_embedding.weight' in model_state_dict:
-                inferred_hidden_dim = model_state_dict['action_embedding.weight'].shape[-1]
-            elif 'transformer.layers.0.linear1.weight' in model_state_dict:
-                inferred_hidden_dim = model_state_dict['transformer.layers.0.linear1.weight'].shape[1]
-
-            # Use factory helpers for standard dimensions
-            inferred_action_dim = MFactoryUtil.get_output_dim_from_state_dict(model_state_dict, 'action_head')
-            inferred_ext_action_dim = MFactoryUtil.get_output_dim_from_state_dict(model_state_dict, 'extended_action_head')
             inferred_obs_dim = MFactoryUtil.get_input_dim_from_state_dict(model_state_dict, 'obs_encoder.0')
+            inferred_action_dim = MFactoryUtil.get_output_dim_from_state_dict(model_state_dict, 'action_head')
+            inferred_hidden_dim = MFactoryUtil.get_hidden_dim_from_state_dict(model_state_dict, 'obs_encoder.0')
+            inferred_belief_dim = MFactoryUtil.get_output_dim_from_state_dict(model_state_dict, 'belief_head_op0')
+            inferred_max_seq = model_state_dict.get('position_embedding.weight', torch.zeros(320)).shape[0]
+            
+            num_heads = 4  # Assuming this is fixed, common practice.
+            num_layers = 2 # Assuming this is fixed.
+            
+            if inferred_hidden_dim % num_heads != 0:
+                logger.warning(f"Inferred hidden_dim ({inferred_hidden_dim}) not divisible by num_heads ({num_heads}). Check model architecture.")
+        
+        except ValueError as e:
+            logger.error(f"Failed to infer dimensions for PPOAutoregressiveAgent {self.player_id}: {e}", exc_info=True)
+            raise
 
-            # Infer belief_dim from the belief_head output size
-            if 'belief_head.weight' in model_state_dict:
-                inferred_belief_dim = model_state_dict['belief_head.weight'].shape[0]
+        logger.info(f"Instantiating PPOAutoregressiveModel for {self.player_id} with dims: "
+                    f"obs={inferred_obs_dim}, action={inferred_action_dim}, belief={inferred_belief_dim}, "
+                    f"hidden={inferred_hidden_dim}, max_seq={inferred_max_seq}")
 
-            # Infer max_seq_length from position embeddings
-            if 'position_embedding.weight' in model_state_dict:
-                inferred_max_seq = model_state_dict['position_embedding.weight'].shape[0]
-
-        except (ValueError, KeyError, AttributeError) as e:
-            logger.warning(f"Dimension inference failed for AR-Full {self.player_id}: {e}. Will rely on defaults.", exc_info=True)
-
-        # --- Apply defaults and validate ---
-        temp_defaults = PPOAutoregressiveModel(obs_dim=4, action_dim=7, belief_dim=10)
-        self.action_dim = inferred_action_dim or temp_defaults.action_dim
-        self.extended_action_dim = inferred_ext_action_dim or temp_defaults.extended_action_dim
-        self.obs_dim = inferred_obs_dim or temp_defaults.obs_dim
-        self.max_seq_length = inferred_max_seq or temp_defaults.max_seq_length
-        self.belief_dim = inferred_belief_dim or temp_defaults.belief_dim
-
-        # --- Special handling and validation for hidden_dim ---
-        temp_hidden_dim = inferred_hidden_dim or temp_defaults.hidden_dim
-        if temp_hidden_dim % default_num_heads != 0:
-            logger.warning(f"Inferred/Default hidden_dim ({temp_hidden_dim}) is not divisible by num_heads ({default_num_heads}). Using default hidden_dim from model definition ({temp_defaults.hidden_dim}) instead.")
-            self.hidden_dim = temp_defaults.hidden_dim
-            if self.hidden_dim % default_num_heads != 0:
-                raise ValueError(f"FATAL: Model's default hidden_dim ({self.hidden_dim}) is also not divisible by num_heads ({default_num_heads}).")
-        else:
-            self.hidden_dim = temp_hidden_dim
-
-        # --- Instantiate the model with inferred dimensions ---
-        logger.info(f"Instantiating AR-Full model for {self.player_id} with dims: obs={self.obs_dim}, action={self.action_dim}, belief={self.belief_dim}, hidden={self.hidden_dim}, max_seq={self.max_seq_length}")
         self.model = PPOAutoregressiveModel(
-            obs_dim=self.obs_dim,
-            action_dim=self.action_dim,
-            belief_dim=self.belief_dim,
-            hidden_dim=self.hidden_dim,
-            num_heads=default_num_heads,
-            num_layers=2,
-            max_seq_length=self.max_seq_length,
-            num_agent_types=4 # 0: Self, 1: Opponent 0, 2: Opponent 1, 3: Opponent 2
+            obs_dim=inferred_obs_dim,
+            action_dim=inferred_action_dim,
+            belief_dim=inferred_belief_dim,
+            hidden_dim=inferred_hidden_dim,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            max_seq_length=inferred_max_seq,
         ).to(self.device)
 
-        # --- Load the model weights ---
         try:
-            missing, unexpected = self.model.load_state_dict(model_state_dict, strict=True)
-            if missing or unexpected:
-                logger.warning(f"[{agent_key}] load_state_dict results: missing={missing}, unexpected={unexpected}")
+            self.model.load_state_dict(model_state_dict, strict=True)
         except RuntimeError as e:
-            logger.error(f"Failed to load model state dict for {agent_key}: {e}", exc_info=True)
+            logger.error(f"Failed to load state dict for {self.player_id}: {e}", exc_info=True)
             raise
 
         self.model.eval()
         self.reset()
-        logger.info(f"Successfully loaded AR-Full model for agent {self.player_id}.")
+        logger.info(f"Successfully loaded PPOAutoregressiveModel for agent {self.player_id}.")
 
     def _revealed_token_from_play(self, e):
         """
@@ -273,22 +236,25 @@ class PPOAutoregressiveAgent(BaseAgent):
             logger.debug(f"Agent {self.player_id}: New game detected, history cleared.")
 
         if self.env_agent_id_map is None:
-            # Keep this consistent with how you trained
-            # Prefer actual seat order if your dataset used fixed player_0/1/2/3
-            if agent_id_env == "player_0":
-                self.env_agent_id_map = {"player_0": 0, "player_1": 1, "player_2": 2, "player_3": 3}
-            else:
-                others = [a for a in env.possible_agents if a != agent_id_env]
-                # sorted() if that matches training, otherwise keep env.possible_agents order
-                self.env_agent_id_map = {agent_id_env: 0}
-                for i, opp in enumerate(others, start=1):
-                    if i <= 3:  # we only embed 4 agent types
-                        self.env_agent_id_map[opp] = i
+            # Consistent mapping for evaluation
+            others = sorted([a for a in env.possible_agents if a != agent_id_env])
+            self.env_agent_id_map = {agent_id_env: 0}
+            for i, opp in enumerate(others, start=1):
+                self.env_agent_id_map[opp] = i
+
         gh = list(getattr(env, "game_history", []))
         next_step = (gh[-1]["step"] + 1) if gh else 1
-
+        PAD = 0
         # Cache OUR obs/mask for the step that will be written to GH after env.step()
         obs_curr = env.observe(agent_id_env, newerest=True)[agent_id_env]
+
+        if len(obs_curr) == 7:
+            arr = np.asarray(obs_curr)
+
+            out = np.full(9, PAD, dtype=arr.dtype)   # [*,*,*,*,0,*,*,*,0]
+            out[:4] = arr[:4]                        # 1,2,3,4
+            out[5:8] = arr[4:]
+            obs_curr = out
         _, _, _, _, info = env.last()
         self._obs_by_step[next_step] = (
             obs_curr,

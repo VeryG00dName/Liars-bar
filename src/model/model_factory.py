@@ -22,7 +22,8 @@ class ModelFactory:
             "policy_net.fc1",
             "model.fc1",
             "network.0", # For BeliefSpacePolicy
-            "experts.0.fc1" # For MoE
+            "experts.0.fc1", # For MoE
+            "obs_encoder.0" # For PPOAutoregressiveModel
         ]
         for prefix in candidate_prefixes:
             key = f"{prefix}.weight"
@@ -45,7 +46,8 @@ class ModelFactory:
             "policy_net.fc1",
             "model.fc1",
             "network.0", # For BeliefSpacePolicy
-            "experts.0.fc1" # For MoE
+            "experts.0.fc1", # For MoE
+            "obs_encoder.0" # For PPOAutoregressiveModel
         ]
         for prefix in candidate_prefixes:
             key = f"{prefix}.weight"
@@ -130,6 +132,24 @@ class ModelFactory:
         has_agent_pos = has("agent_embedding.weight") and has("position_embedding.weight")
 
         return bool(has_action_head and (has_transformerish or (has_any_action_emb and has_agent_pos)))
+    
+    @staticmethod
+    def is_ppo_autoregressive_model(state_dict: dict) -> bool:
+        """
+        Detects the PPOAutoregressiveModel.
+        Heuristic: Checks for the presence of specific factorized action embeddings,
+        belief heads, and the causal mask buffer, which are characteristic of this architecture.
+        """
+        has_factor_embeddings = all(k in state_dict for k in [
+            'act_kind_embedding.weight', 'count_embedding.weight', 'table_flag_embedding.weight'
+        ])
+        has_belief_heads = all(k in state_dict for k in [
+            'belief_head_op0.weight', 'belief_head_op1.weight', 'belief_head_op2.weight'
+        ])
+        has_causal_mask = 'causal_bool_mask_full' in state_dict
+        has_specific_heads = 'action_head.weight' in state_dict and 'opp_action_head.weight' in state_dict
+
+        return has_factor_embeddings and has_belief_heads and has_causal_mask and has_specific_heads
 
     @staticmethod
     def get_belief_dimensions(state_dict):
@@ -208,7 +228,7 @@ class ModelFactory:
     def get_output_dim_from_state_dict(state_dict, layer_prefix='fc4'):
         """Determines the output dimension (action space size) from a policy state dictionary."""
         # Check standard policy output layers first
-        candidate_prefixes = [ layer_prefix, 'policy_head', 'experts.0.fc_out', 'strategy_query','action_head']
+        candidate_prefixes = [ layer_prefix, 'policy_head', 'experts.0.fc_out', 'strategy_query','action_head', 'belief_head_op0']
 
         for prefix in candidate_prefixes:
             key_w = f"{prefix}.weight"; key_b = f"{prefix}.bias"

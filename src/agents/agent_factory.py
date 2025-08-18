@@ -12,6 +12,7 @@ from src.agents.standard_agent import StandardAgent
 from src.agents.hardcoded_agent_wrapper import HardcodedAgentWrapper
 from src.agents.autoregressive_agent import AutoregressiveAgent
 from src.agents.autoregressive_agent_full import AutoregressiveAgentFull
+from src.agents.autoregressive_ppo_agent import PPOAutoregressiveAgent
 from src.model.model_factory import ModelFactory as MFactoryUtil
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,10 @@ class AgentFactory:
             is_direct_player_key_format = True
             logger.debug(f"Found direct key '{agent_key}'. Checking structure...")
 
+            if MFactoryUtil.is_ppo_autoregressive_model(potential_policy_sd):
+                logger.debug(f"Identifying as PPO Autoregressive Model for {agent_key}")
+                agent_class = PPOAutoregressiveAgent
+            
             if MFactoryUtil.is_autoregressive_model(potential_policy_sd):
                 logger.info(f"Identified as Autoregressive model via direct key '{agent_key}'.")
                 policy_state_dict = potential_policy_sd
@@ -77,8 +82,12 @@ class AgentFactory:
             belief_state_dict = checkpoint.get("belief_model") or checkpoint.get("belief_models", {}).get(agent_key)
             obp_state_dict = checkpoint.get("obp_model") or checkpoint.get("obp_models", {}).get(agent_key)
             logger.debug(f"Detected 'policy_nets' structure for key '{agent_key}'.")
+            
+            if MFactoryUtil.is_ppo_autoregressive_model(policy_state_dict):
+                logger.debug(f"Identifying as PPO Autoregressive Model for {agent_key}")
+                agent_class = PPOAutoregressiveAgent
 
-            if MFactoryUtil.is_autoregressive_model(policy_state_dict):
+            elif MFactoryUtil.is_autoregressive_model(policy_state_dict):
                 logger.warning(f"'policy_nets' key looks like Autoregressive Model for '{agent_key}'.")
                 if 'full_game' in checkpoint:
                     agent_class = AutoregressiveAgentFull
@@ -101,6 +110,10 @@ class AgentFactory:
             obp_state_dict = checkpoint.get("obp_model")
             logger.debug(f"Detected single 'model' structure.")
 
+            if MFactoryUtil.is_ppo_autoregressive_model(policy_state_dict):
+                logger.debug(f"Identifying as PPO Autoregressive Model for {agent_key}")
+                agent_class = PPOAutoregressiveAgent
+            
             if MFactoryUtil.is_autoregressive_model(policy_state_dict):
                 logger.warning(f"Single 'model' key looks like Autoregressive Model for '{agent_key}'.")
                 if 'full_game' in checkpoint:
@@ -174,3 +187,4 @@ class AgentFactory:
         """
         logger.info(f"Preparing config for hardcoded agent {agent_name} ({hardcoded_class.__name__})")
         return {'class': hardcoded_class, 'name': agent_name}
+    
