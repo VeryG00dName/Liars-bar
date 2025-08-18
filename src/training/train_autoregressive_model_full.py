@@ -561,72 +561,50 @@ def calculate_autoregressive_loss(
     padding_mask,
     belief_logits_0=None,
     belief_logits_1=None,
+    belief_logits_2=None,
     belief_targets=None,
     value_pred=None,
     value_target=None,
     belief_loss_weight=1.0
 ):
     device = self_logits.device
-    valid = ~padding_mask
-    
-    # Agent type 0: Training Agent
+    valid  = ~padding_mask
+
     our_mask = valid & (agent_types == 0)
-    # Agent types 1 and 2: Opponents
-    opp_mask = valid & ((agent_types == 1) | (agent_types == 2))
-    
-    # Belief loss only applies when it's our turn
-    belief_mask = valid & (agent_types == 0)
-    
-    flat_targets = target_actions.reshape(-1)
-    flat_self_logits = self_logits.reshape(-1, self_logits.size(-1))
-    flat_opp_logits = opp_logits.reshape(-1, opp_logits.size(-1))
-    
-    flat_our_mask = our_mask.reshape(-1)
-    flat_opp_mask = opp_mask.reshape(-1)
-    flat_belief_mask = belief_mask.reshape(-1)
-    
-    # your-agent loss (using self_logits)
-    our_loss = F.cross_entropy(
-        flat_self_logits[flat_our_mask], 
-        flat_targets[flat_our_mask]
-    ) if flat_our_mask.sum() > 0 else torch.tensor(0.0, device=device)
-    
-    # opponent loss (using opp_logits)
-    opp_loss = F.cross_entropy(
-        flat_opp_logits[flat_opp_mask], 
-        flat_targets[flat_opp_mask]
-    ) if flat_opp_mask.sum() > 0 else torch.tensor(0.0, device=device)
+    opp_mask = valid & ((agent_types == 1) | (agent_types == 2) | (agent_types == 3))
 
-    # belief loss
+    self_loss = (F.cross_entropy(
+        self_logits[our_mask].reshape(-1, self_logits.size(-1)),
+        target_actions[our_mask].reshape(-1)
+    ) if our_mask.any() else torch.tensor(0.0, device=device))
+
+    opp_loss = (F.cross_entropy(
+        opp_logits[opp_mask].reshape(-1, opp_logits.size(-1)),
+        target_actions[opp_mask].reshape(-1)
+    ) if opp_mask.any() else torch.tensor(0.0, device=device))
+
+    value_loss = (F.mse_loss(value_pred[valid], value_target[valid])
+                  if value_pred is not None and value_target is not None
+                  else torch.tensor(0.0, device=device))
+
     belief_loss = torch.tensor(0.0, device=device)
-    if belief_logits_0 is not None and belief_targets is not None:
-        flat_belief_logits_0 = belief_logits_0.reshape(-1, belief_logits_0.size(-1))
-        flat_belief_targets_0 = belief_targets[:, :, 0].reshape(-1)
-        
-        belief_loss += F.cross_entropy(
-            flat_belief_logits_0[flat_belief_mask],
-            flat_belief_targets_0[flat_belief_mask]
+    if belief_targets is not None:
+        flat_mask = our_mask.reshape(-1)
+        def _ce(logits, tgt_slice):
+            if logits is None: return 0.0
+            flat_logits  = logits.reshape(-1, logits.size(-1))[flat_mask]
+            flat_targets = tgt_slice.reshape(-1)[flat_mask]
+            return (F.cross_entropy(flat_logits, flat_targets)
+                    if flat_targets.numel() else 0.0)
+
+        belief_loss = (
+            _ce(belief_logits_0, belief_targets[:, :, 0]) +
+            _ce(belief_logits_1, belief_targets[:, :, 1]) +
+            (_ce(belief_logits_2, belief_targets[:, :, 2]) if belief_logits_2 is not None and belief_targets.size(-1) >= 3 else 0.0)
         )
 
-    if belief_logits_1 is not None and belief_targets is not None:
-        flat_belief_logits_1 = belief_logits_1.reshape(-1, belief_logits_1.size(-1))
-        flat_belief_targets_1 = belief_targets[:, :, 1].reshape(-1)
-        
-        belief_loss += F.cross_entropy(
-            flat_belief_logits_1[flat_belief_mask],
-            flat_belief_targets_1[flat_belief_mask]
-        )
-
-    value_loss = torch.tensor(0.0, device=device)
-    if value_pred is not None and value_target is not None:
-        flat_vp = value_pred.squeeze(-1)[valid]
-        flat_vt = value_target[valid]
-        value_loss = F.mse_loss(flat_vp, flat_vt)
-
-    # Action loss weighting: Agent actions are weighted higher (e.g., 2.0)
-    action_loss = 2.0 * our_loss + 1.0 * opp_loss
-    total_loss = action_loss + 0.5 * value_loss + belief_loss_weight * belief_loss
-    return total_loss, our_loss, opp_loss, value_loss, belief_loss
+    total = self_loss + opp_loss + value_loss + belief_loss_weight * belief_loss
+    return total, self_loss, opp_loss, value_loss, belief_loss
 
 def compute_accuracy(logits, targets, mask=None):
     """
@@ -747,28 +725,42 @@ def train_autoregressive_model(
         train_self_loss    = 0.0
         train_opp_loss     = 0.0
         train_value_loss   = 0.0
-        train_belief_loss = 0.0
+        train_belief_loss  = 0.0
         train_batches      = 0
         train_agent_acc    = 0.0
         train_opponent_acc = 0.0
         train_belief_acc_0 = 0.0
         train_belief_acc_1 = 0.0
-        
-        
+        train_belief_acc_2 = 0.0
+
         train_progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Train)", leave=False)
         for batch in train_progress:
             with amp.autocast(device_type=device.type, dtype=pt_dtype):
-                self_logits, opp_logits, value_pred, belief_logits_0, belief_logits_1 = model(
-                    obs_sequence=batch['obs'],
-                    action_sequence=batch['action'],
-                    agent_types=batch['agent_type'],
-                    positions=batch['position'],
-                    action_masks=batch['action_mask'],
-                    padding_mask=batch['padding_mask']
-                )
+                # Support models with or without the 3rd head during transition
+                try:
+                    (self_logits, opp_logits, value_pred,
+                    belief_logits_0, belief_logits_1, belief_logits_2) = model(
+                        obs_sequence=batch['obs'],
+                        action_sequence=batch['action'],
+                        agent_types=batch['agent_type'],
+                        positions=batch['position'],
+                        action_masks=batch['action_mask'],
+                        padding_mask=batch['padding_mask']
+                    )
+                except ValueError:
+                    (self_logits, opp_logits, value_pred,
+                    belief_logits_0, belief_logits_1) = model(
+                        obs_sequence=batch['obs'],
+                        action_sequence=batch['action'],
+                        agent_types=batch['agent_type'],
+                        positions=batch['position'],
+                        action_masks=batch['action_mask'],
+                        padding_mask=batch['padding_mask']
+                    )
+                    belief_logits_2 = None
 
                 belief_targets = batch['belief']
-                
+
                 total_loss, self_loss, opp_loss, value_loss, belief_loss = calculate_autoregressive_loss(
                     self_logits=self_logits,
                     opp_logits=opp_logits,
@@ -777,6 +769,7 @@ def train_autoregressive_model(
                     padding_mask=batch['padding_mask'],
                     belief_logits_0=belief_logits_0,
                     belief_logits_1=belief_logits_1,
+                    belief_logits_2=belief_logits_2,
                     belief_targets=belief_targets,
                     value_pred=value_pred,
                     value_target=None
@@ -798,11 +791,9 @@ def train_autoregressive_model(
             train_batches    += 1
 
             # compute accuracies
-            # Agent type 0: Agent
-            our_mask     = (batch['agent_type'] == 0) & (~batch['padding_mask'])
-            # Agent types 1 or 2 or 3: Opponent
-            opp_mask     = ((batch['agent_type'] == 1) | (batch['agent_type'] == 2) | (batch['agent_type'] == 3)) & (~batch['padding_mask'])
-            
+            our_mask = (batch['agent_type'] == 0) & (~batch['padding_mask'])  # Agent turns
+            opp_mask = ((batch['agent_type'] == 1) | (batch['agent_type'] == 2) | (batch['agent_type'] == 3)) & (~batch['padding_mask'])
+
             agent_acc    = compute_accuracy(self_logits, batch['target_action'], our_mask)
             opponent_acc = compute_accuracy(opp_logits,  batch['target_action'], opp_mask)
             train_agent_acc    += agent_acc
@@ -811,15 +802,17 @@ def train_autoregressive_model(
             if belief_logits_0 is not None and belief_targets is not None:
                 belief_targets_0 = belief_targets[:, :, 0]
                 belief_targets_1 = belief_targets[:, :, 1]
-                
-                # Belief accuracy is only relevant on the agent's turn (type 0)
-                belief_eval_mask = our_mask 
+                belief_eval_mask = our_mask
 
                 acc_belief_0 = compute_accuracy(belief_logits_0, belief_targets_0, belief_eval_mask)
                 acc_belief_1 = compute_accuracy(belief_logits_1, belief_targets_1, belief_eval_mask)
-
                 train_belief_acc_0 += acc_belief_0
                 train_belief_acc_1 += acc_belief_1
+
+                if belief_logits_2 is not None and belief_targets.size(-1) >= 3:
+                    belief_targets_2 = belief_targets[:, :, 2]
+                    acc_belief_2 = compute_accuracy(belief_logits_2, belief_targets_2, belief_eval_mask)
+                    train_belief_acc_2 += acc_belief_2
 
             train_progress.set_postfix({
                 'tot': total_loss.item(),
@@ -837,32 +830,47 @@ def train_autoregressive_model(
         train_opponent_acc /= train_batches
         train_belief_acc_0 /= train_batches
         train_belief_acc_1 /= train_batches
-        
+        train_belief_acc_2 /= train_batches
+
         # --- validation ---
         model.eval()
         val_total_loss   = 0.0
         val_self_loss    = 0.0
         val_opp_loss     = 0.0
         val_value_loss   = 0.0
-        val_belief_loss = 0.0
+        val_belief_loss  = 0.0
         val_batches      = 0
         val_agent_acc    = 0.0
         val_opponent_acc = 0.0
         val_belief_acc_0 = 0.0
         val_belief_acc_1 = 0.0
+        val_belief_acc_2 = 0.0
 
         val_progress = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Val)", leave=False)
         with torch.no_grad():
             for batch in val_progress:
                 with amp.autocast(device_type=device.type, dtype=pt_dtype):
-                    self_logits, opp_logits, value_pred, belief_logits_0, belief_logits_1 = model(
-                        obs_sequence=batch['obs'],
-                        action_sequence=batch['action'],
-                        agent_types=batch['agent_type'],
-                        positions=batch['position'],
-                        action_masks=batch['action_mask'],
-                        padding_mask=batch['padding_mask']
-                    )
+                    try:
+                        (self_logits, opp_logits, value_pred,
+                        belief_logits_0, belief_logits_1, belief_logits_2) = model(
+                            obs_sequence=batch['obs'],
+                            action_sequence=batch['action'],
+                            agent_types=batch['agent_type'],
+                            positions=batch['position'],
+                            action_masks=batch['action_mask'],
+                            padding_mask=batch['padding_mask']
+                        )
+                    except ValueError:
+                        (self_logits, opp_logits, value_pred,
+                        belief_logits_0, belief_logits_1) = model(
+                            obs_sequence=batch['obs'],
+                            action_sequence=batch['action'],
+                            agent_types=batch['agent_type'],
+                            positions=batch['position'],
+                            action_masks=batch['action_mask'],
+                            padding_mask=batch['padding_mask']
+                        )
+                        belief_logits_2 = None
 
                     belief_targets = batch['belief']
 
@@ -874,16 +882,17 @@ def train_autoregressive_model(
                         padding_mask=batch['padding_mask'],
                         belief_logits_0=belief_logits_0,
                         belief_logits_1=belief_logits_1,
+                        belief_logits_2=belief_logits_2,
                         belief_targets=belief_targets,
                         value_pred=value_pred,
                         value_target=None
                     )
 
-                our_mask     = (batch['agent_type'] == 0) & (~batch['padding_mask'])
-                opp_mask     = ((batch['agent_type'] == 1) | (batch['agent_type'] == 2) | (batch['agent_type'] == 3)) & (~batch['padding_mask'])
-                
+                our_mask = (batch['agent_type'] == 0) & (~batch['padding_mask'])
+                opp_mask = ((batch['agent_type'] == 1) | (batch['agent_type'] == 2) | (batch['agent_type'] == 3)) & (~batch['padding_mask'])
+
                 agent_acc    = compute_accuracy(self_logits, batch['target_action'], our_mask)
-                opponent_acc = compute_accuracy(opp_logits, batch['target_action'], opp_mask)
+                opponent_acc = compute_accuracy(opp_logits,  batch['target_action'], opp_mask)
                 val_agent_acc    += agent_acc
                 val_opponent_acc += opponent_acc
 
@@ -897,14 +906,17 @@ def train_autoregressive_model(
                 if belief_logits_0 is not None and belief_targets is not None:
                     belief_targets_0 = belief_targets[:, :, 0]
                     belief_targets_1 = belief_targets[:, :, 1]
-                    
                     belief_eval_mask = our_mask
-                    
+
                     acc_0 = compute_accuracy(belief_logits_0, belief_targets_0, belief_eval_mask)
                     acc_1 = compute_accuracy(belief_logits_1, belief_targets_1, belief_eval_mask)
-
                     val_belief_acc_0 += acc_0
                     val_belief_acc_1 += acc_1
+
+                    if belief_logits_2 is not None and belief_targets.size(-1) >= 3:
+                        belief_targets_2 = belief_targets[:, :, 2]
+                        acc_2 = compute_accuracy(belief_logits_2, belief_targets_2, belief_eval_mask)
+                        val_belief_acc_2 += acc_2
 
                 val_progress.set_postfix({
                     'tot': total_loss.item(),
@@ -922,7 +934,8 @@ def train_autoregressive_model(
         val_opponent_acc /= val_batches
         val_belief_acc_0 /= val_batches
         val_belief_acc_1 /= val_batches
-        
+        val_belief_acc_2 /= val_batches
+
         # scheduler step
         scheduler.step(val_total_loss)
         epoch_time = time.time() - epoch_start
@@ -932,33 +945,35 @@ def train_autoregressive_model(
             f"Epoch {epoch+1}/{num_epochs} (Time: {epoch_time:.2f}s)\n"
             f"  Train - Loss: {train_total_loss:.6f}, Self: {train_self_loss:.6f}, Opp: {train_opp_loss:.6f}, "
             f"Value: {train_value_loss:.6f}, Agent Acc: {train_agent_acc:.4f}, Opp Acc: {train_opponent_acc:.4f}, "
-            f"Belief0 Acc: {train_belief_acc_0:.4f}, Belief1 Acc: {train_belief_acc_1:.4f}\n"
+            f"Belief0 Acc: {train_belief_acc_0:.4f}, Belief1 Acc: {train_belief_acc_1:.4f}, Belief2 Acc: {train_belief_acc_2:.4f}\n"
             f"  Val   - Loss: {val_total_loss:.6f}, Self: {val_self_loss:.6f}, Opp: {val_opp_loss:.6f}, "
             f"Value: {val_value_loss:.6f}, Agent Acc: {val_agent_acc:.4f}, Opp Acc: {val_opponent_acc:.4f}, "
-            f"Belief0 Acc: {val_belief_acc_0:.4f}, Belief1 Acc: {val_belief_acc_1:.4f}"
+            f"Belief0 Acc: {val_belief_acc_0:.4f}, Belief1 Acc: {val_belief_acc_1:.4f}, Belief2 Acc: {val_belief_acc_2:.4f}"
         )
 
         # log to TensorBoard
-        writer.add_scalar("Loss/Train/Total", train_total_loss, epoch)
-        writer.add_scalar("Loss/Train/Self", train_self_loss, epoch)
-        writer.add_scalar("Loss/Train/Opp", train_opp_loss, epoch)
-        writer.add_scalar("Loss/Train/Value", train_value_loss, epoch)
+        writer.add_scalar("Loss/Train/Total",  train_total_loss, epoch)
+        writer.add_scalar("Loss/Train/Self",   train_self_loss, epoch)
+        writer.add_scalar("Loss/Train/Opp",    train_opp_loss, epoch)
+        writer.add_scalar("Loss/Train/Value",  train_value_loss, epoch)
         writer.add_scalar("Loss/Train/Belief", train_belief_loss / train_batches, epoch)
-        writer.add_scalar("Acc/Train/Agent", train_agent_acc, epoch)
-        writer.add_scalar("Acc/Train/Opponent", train_opponent_acc, epoch)
+        writer.add_scalar("Acc/Train/Agent",   train_agent_acc, epoch)
+        writer.add_scalar("Acc/Train/Opponent",train_opponent_acc, epoch)
         writer.add_scalar("Acc/Train/Belief0", train_belief_acc_0, epoch)
         writer.add_scalar("Acc/Train/Belief1", train_belief_acc_1, epoch)
-        
-        
-        writer.add_scalar("Loss/Val/Total", val_total_loss, epoch)
-        writer.add_scalar("Loss/Val/Self", val_self_loss, epoch)
-        writer.add_scalar("Loss/Val/Opp", val_opp_loss, epoch)
-        writer.add_scalar("Loss/Val/Value", val_value_loss, epoch)
+        writer.add_scalar("Acc/Train/Belief2", train_belief_acc_2, epoch)
+
+        writer.add_scalar("Loss/Val/Total",  val_total_loss, epoch)
+        writer.add_scalar("Loss/Val/Self",   val_self_loss, epoch)
+        writer.add_scalar("Loss/Val/Opp",    val_opp_loss, epoch)
+        writer.add_scalar("Loss/Val/Value",  val_value_loss, epoch)
         writer.add_scalar("Loss/Val/Belief", val_belief_loss / val_batches, epoch)
-        writer.add_scalar("Acc/Val/Agent", val_agent_acc, epoch)
-        writer.add_scalar("Acc/Val/Opponent", val_opponent_acc, epoch)
+        writer.add_scalar("Acc/Val/Agent",   val_agent_acc, epoch)
+        writer.add_scalar("Acc/Val/Opponent",val_opponent_acc, epoch)
         writer.add_scalar("Acc/Val/Belief0", val_belief_acc_0, epoch)
         writer.add_scalar("Acc/Val/Belief1", val_belief_acc_1, epoch)
+        writer.add_scalar("Acc/Val/Belief2", val_belief_acc_2, epoch)
+
         
         # Save model if validation loss improved
         if val_total_loss < best_val_loss:
