@@ -251,8 +251,8 @@ class PPOAutoregressiveAgent(BaseAgent):
         if len(obs_curr) == 7:
             arr = np.asarray(obs_curr)
 
-            out = np.full(9, PAD, dtype=arr.dtype)   # [*,*,*,*,0,*,*,*,0]
-            out[:4] = arr[:4]                        # 1,2,3,4
+            out = np.full(9, PAD, dtype=arr.dtype)
+            out[:4] = arr[:4]
             out[5:8] = arr[4:]
             obs_curr = out
         _, _, _, _, info = env.last()
@@ -312,5 +312,11 @@ class PPOAutoregressiveAgent(BaseAgent):
             return action.item(), log_prob.item(), value.item(), opp1, opp2, opp3, b0, b1, b2
         else: # Evaluation mode
             action = torch.argmax(masked_logits).item()
-            # Return placeholder for beliefs during evaluation if not needed
+            if belief0 is not None and belief1 is not None:
+                opponents = sorted([p for p in env.possible_agents if p != agent_id_env])
+                self._last_expert_info = {}
+                if len(opponents) > 0:
+                    self._last_expert_info[opponents[0]] = {"expert_index": int(torch.argmax(belief0[0, last_step_idx]).item()), "source": "internal"}
+                if len(opponents) > 1:
+                    self._last_expert_info[opponents[1]] = {"expert_index": int(torch.argmax(belief1[0, last_step_idx]).item()), "source": "internal"}
             return action
