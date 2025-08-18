@@ -875,57 +875,185 @@ class AgentBattlegroundGUI(QtWidgets.QMainWindow):
             plt.show()
 
     def show_expert_usage(self):
+        """Display expert activation information, adapting for all game modes."""
         if not self.expert_activations:
             QtWidgets.QMessageBox.information(self, "Expert Usage", "No expert data available.")
             return
 
-        dialog = QtWidgets.QDialog(self); dialog.setWindowTitle("Expert/Belief Activation Analysis")
-        dialog.setMinimumSize(900, 700); layout = QtWidgets.QVBoxLayout(dialog)
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Expert/Belief Activation Analysis")
+        dialog.setMinimumSize(900, 700)
+        layout = QtWidgets.QVBoxLayout(dialog)
         tab_widget = QtWidgets.QTabWidget()
 
+        # --- Identify AI Player IDs ---
         ai_player_ids = []
-        try: 
+        try:
             configs = self.get_selected_ai_configs()
-            ai_player_ids = [cfg['id'] for cfg in configs.values()]
+            # Sort by player number ('player_0', 'player_1', etc.) to ensure consistent tab order
+            sorted_configs = sorted(configs.items(), key=lambda item: int(item[0].split('_')[-1]))
+            ai_player_ids = [cfg['id'] for _, cfg in sorted_configs]
         except ValueError:
-            logger.warning("Could not get AI configs for expert analysis.")
+            logger.warning("Could not get AI configs for expert analysis. Falling back to data keys.")
         
         if not ai_player_ids and self.expert_activations:
+            # Fallback: Get AI IDs from the first recorded match data
             first_match_data = next(iter(self.expert_activations.values()), {})
-            ai_player_ids = list(first_match_data.keys())
+            ai_player_ids = sorted(list(first_match_data.keys()))
         
         if not ai_player_ids:
             QtWidgets.QMessageBox.warning(self, "Expert Usage", "Could not identify AI player IDs.")
             return
 
         is_team_mode = self.team_mode_radio.isChecked()
+        num_players = 4 if self.four_player_checkbox.isChecked() else 3
+        num_opponents_in_team = num_players - 1
 
         for idx, player_id in enumerate(ai_player_ids):
             player_tab = QtWidgets.QWidget()
             player_layout = QtWidgets.QVBoxLayout(player_tab)
 
+            # --- Determine Data Type (Belief vs. MoE/Gating) ---
             first_match_data = next(iter(self.expert_activations.values()), {})
-            first_step_info = first_match_data.get(player_id, {}).get('steps', [None])[0]
-            is_belief_agent_data = isinstance(first_step_info, dict) and \
-                                   all(k.startswith(('player_', 'Hardcoded_', 'Version_')) for k in first_step_info.keys())
+            player_data_for_first_match = first_match_data.get(player_id, {})
+            steps_data = player_data_for_first_match.get('steps', []) # Default to an empty list
 
+            is_belief_agent_data = False # Default to False
+            if steps_data: # Check if the steps list is not empty
+                first_step_info = steps_data[0]
+                is_belief_agent_data = isinstance(first_step_info, dict) and \
+                                       all(k.startswith(('player_', 'Hardcoded_', 'Version_')) for k in first_step_info.keys())
+
+            # --- Build Table Header ---
             html = f"<h2>{'Belief Peak' if is_belief_agent_data else 'Expert/Gate'} Activations for AI Agent {idx+1} ({player_id})</h2>"
             html += """<table style="border: 1px solid #7289da; border-collapse: collapse; width: 100%;">
-                       <thead><tr><th>Opponent Match</th>"""
+                       <thead><tr style='background-color: #4f545c;'><th>Opponent Match</th>"""
             if is_belief_agent_data and is_team_mode:
-                 num_opps = (4 if self.four_player_checkbox.isChecked() else 3) -1
-                 for i in range(num_opps):
+                 for i in range(num_opponents_in_team):
                      html += f"<th>Opp{i+1} Peak (Rate)</th>"
             else:
                 html += "<th>Most Used</th><th>Rate</th>"
             html += "<th>Total Steps</th></tr></thead><tbody>"
 
-            # ... [Rest of the expert usage logic remains the same] ...
-            
+            # Data for plotting
+            plot_match_names = []
+            plot_data_lists = [[] for _ in range(num_opponents_in_team)] # Create lists for each potential opponent
+
+            for match_name, match_data in self.expert_activations.items():
+                player_expert_step_data = match_data.get(player_id, {}).get('steps')
+                if not player_expert_step_data:
+                    continue
+
+                html += f"""<tr><td style="border:1px solid #7289da;padding:6px;">{match_name}</td>"""
+                plot_match_names.append(match_name)
+                total_steps_in_match = len(player_expert_step_data)
+
+                if is_belief_agent_data:
+                     # Aggregate belief peaks for each opponent encountered in the match
+                     agg_peaks_per_opponent = defaultdict(lambda: defaultdict(int))
+                     for step_info in player_expert_step_data:
+                          if isinstance(step_info, dict):
+                               for opp_id, peak_info in step_info.items():
+                                    if peak_info and 'expert_index' in peak_info:
+                                         peak_idx_str = str(peak_info['expert_index'])
+                                         agg_peaks_per_opponent[opp_id][peak_idx_str] += 1
+                     
+                     if is_team_mode:
+                         opp_ids = sorted(list(agg_peaks_per_opponent.keys()))
+                         for i in range(num_opponents_in_team):
+                             if i < len(opp_ids):
+                                 opp_peaks = agg_peaks_per_opponent.get(opp_ids[i], {})
+                                 opp_total = sum(opp_peaks.values())
+                                 if opp_total > 0:
+                                     peak_expert, peak_count = max(opp_peaks.items(), key=lambda item: item[1])
+                                     peak_rate = peak_count / opp_total
+                                     html += f"""<td style="border:1px solid #7289da;padding:6px;">T{peak_expert} ({peak_rate:.1%})</td>"""
+                                     plot_data_lists[i].append((peak_expert, peak_rate))
+                                 else:
+                                     html += """<td style="border:1px solid #7289da;padding:6px;">N/A (0.0%)</td>"""
+                                     plot_data_lists[i].append(("N/A", 0.0))
+                             else: # Not enough opponents found in data for this slot
+                                 html += """<td style="border:1px solid #7289da;padding:6px;">N/A</td>"""
+                                 plot_data_lists[i].append(("N/A", 0.0))
+                     else: # Belief agent, but not team mode (e.g., standard)
+                         all_peaks_agg = defaultdict(int)
+                         for opp_peaks in agg_peaks_per_opponent.values():
+                              for expert_idx, count in opp_peaks.items(): all_peaks_agg[expert_idx] += count
+                         total_agg_activations = sum(all_peaks_agg.values())
+                         if total_agg_activations > 0:
+                              peak_expert, peak_count = max(all_peaks_agg.items(), key=lambda i: i[1])
+                              peak_rate = peak_count / total_agg_activations
+                              html += f"""<td style="border:1px solid #7289da;padding:6px;">Peak T{peak_expert}</td><td style="border:1px solid #7289da;padding:6px;">{peak_rate:.1%}</td>"""
+                              plot_data_lists[0].append((peak_expert, peak_rate))
+                         else:
+                              html += """<td>N/A</td><td>0.0%</td>"""
+                              plot_data_lists[0].append(("N/A", 0.0))
+                
+                else: # Standard MoE/Gating Agent
+                     expert_counts = defaultdict(int)
+                     for step_info in player_expert_step_data:
+                          if isinstance(step_info, dict) and 'expert_index' in step_info:
+                               expert_idx_str = str(step_info['expert_index'])
+                               expert_counts[expert_idx_str] += 1
+                     total_activations = sum(expert_counts.values())
+                     if total_activations > 0:
+                          most_used_expert, max_count = max(expert_counts.items(), key=lambda i: i[1])
+                          activation_rate = max_count / total_activations
+                          html += f"""<td style="border:1px solid #7289da;padding:6px;">E/G {most_used_expert}</td><td style="border:1px solid #7289da;padding:6px;">{activation_rate:.1%}</td>"""
+                          plot_data_lists[0].append((most_used_expert, activation_rate))
+                     else:
+                          html += """<td>N/A</td><td>0.0%</td>"""
+                          plot_data_lists[0].append(("N/A", 0.0))
+
+                html += f"""<td style="border:1px solid #7289da;padding:6px;">{total_steps_in_match}</td></tr>"""
+
             html += "</tbody></table>"
-            text = QtWidgets.QTextEdit(); text.setReadOnly(True); text.setHtml(html)
-            player_layout.addWidget(text)
-            
+            text_browser = QtWidgets.QTextBrowser()
+            text_browser.setHtml(html)
+            player_layout.addWidget(text_browser)
+
+            # --- Plotting ---
+            if plot_match_names:
+                 num_matches = len(plot_match_names)
+                 x = np.arange(num_matches)
+                 figure = plt.figure(figsize=(max(8, num_matches * 0.8), 6))
+                 ax = figure.add_subplot(111)
+
+                 if is_belief_agent_data and is_team_mode:
+                     total_bars = num_opponents_in_team
+                     bar_width = 0.8 / total_bars
+                     offsets = np.linspace(-bar_width * (total_bars - 1) / 2, bar_width * (total_bars - 1) / 2, total_bars)
+
+                     for i in range(total_bars):
+                         plot_data = plot_data_lists[i]
+                         experts = [p[0] for p in plot_data]
+                         rates = [p[1] for p in plot_data]
+                         bars = ax.bar(x + offsets[i], rates, bar_width, label=f'Opp {i+1} Peak Rate')
+                         for bar, expert in zip(bars, experts):
+                              if expert != "N/A":
+                                   ax.text(bar.get_x() + bar.get_width() / 2., bar.get_height() + 0.01, f"T{expert}", ha='center', va='bottom', fontsize=8)
+                     ax.set_title(f'Opponent Belief Peak Analysis (AI {idx+1}: {player_id})')
+                     ax.set_ylabel('Rate of Peak Belief Type')
+                 else: # Single bar plot for MoE or non-team Belief
+                     plot_data = plot_data_lists[0]
+                     experts = [p[0] for p in plot_data]
+                     rates = [p[1] for p in plot_data]
+                     bars = ax.bar(x, rates, width=0.6, label='Dominant Rate')
+                     for bar, expert in zip(bars, experts):
+                          if expert != "N/A":
+                               ax.text(bar.get_x() + bar.get_width() / 2., bar.get_height() + 0.01, f"E/T{expert}", ha='center', va='bottom', fontsize=8)
+                     ax.set_title(f'Dominant Activation Analysis (AI {idx+1}: {player_id})')
+                     ax.set_ylabel('Activation Rate')
+
+                 ax.set_xticks(x)
+                 ax.set_xticklabels(plot_match_names, rotation=45, ha='right', fontsize=9)
+                 ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
+                 ax.set_ylim(0, 1.05)
+                 ax.grid(axis='y', linestyle='--', alpha=0.7)
+                 figure.tight_layout(rect=[0, 0, 0.85, 1])
+                 canvas = FigureCanvasQTAgg(figure)
+                 player_layout.addWidget(canvas)
+
             tab_widget.addTab(player_tab, f"AI Agent {idx+1}")
 
         layout.addWidget(tab_widget)
