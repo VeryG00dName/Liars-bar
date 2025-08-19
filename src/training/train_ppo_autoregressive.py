@@ -287,8 +287,7 @@ def ppo_losses_for_episode(
         if not opp_mask[i]:
             continue
         tgt = episode["opp_target_action"][i]
-        pred_flag = episode["opp_pred_logits"][i] is not None
-        if (tgt is not None) and pred_flag:
+        if tgt is not None:
             opp_idxs.append(i)
             opp_targets.append(int(tgt))
 
