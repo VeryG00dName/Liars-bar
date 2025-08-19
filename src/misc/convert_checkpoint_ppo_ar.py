@@ -16,7 +16,7 @@ def process_variant(variant, source_dir, checkpoint_dir, episode):
     Converts a PPO autoregressive checkpoint into the unified save format.
     Loads the model state, infers dimensions, reconstructs the model, and saves it.
     """
-    fname = f"arppo_update_12.pth"
+    fname = f"autoreg_model_{variant}.pth"
     source_path = os.path.join(source_dir, fname)
 
     if not os.path.exists(source_path):
