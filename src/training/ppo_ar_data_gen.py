@@ -9,7 +9,7 @@ def _new_episode(env, players: Dict[str, Any], training_agent_env_id: str,
                  opponent_label_map: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
     """Create a fresh episode dict (one list per field; one entry per env step)."""
     # figure out which env IDs are opponents (stable order)
-    opp_env_ids = [aid for aid in env.possible_agents if aid != training_agent_env_id]
+    opp_env_ids = sorted([aid for aid in env.possible_agents if aid != training_agent_env_id])
 
     # "true" opponent labels for belief targets (either global int labels or IDs you can map later)
     if opponent_label_map is not None:
@@ -145,9 +145,7 @@ def collect_training_sequences(
 
                 if agent_id_env == training_agent_env_id:
                     # ---- OUR TURN (training=True) ----
-                    (action, log_prob, value,
-                     b0, b1, b2,
-                     opp1, opp2, opp3) = players_in_this_game[agent_id_env].get_action(
+                    (action, log_prob, value,b0, b1, b2) = players_in_this_game[agent_id_env].get_action(
                         env, agent_id_env, observation, info, training=True
                     )
 
@@ -176,15 +174,6 @@ def collect_training_sequences(
                         env.terminations.get(training_agent_env_id, False)
                         or env.truncations.get(training_agent_env_id, False)
                     )
-
-                    # Retro-fill opponent prediction *flags* (True) onto prior opponent rows (1..3 back)
-                    # (We do NOT store logits to avoid VRAM/memory blow-up.)
-                    for i, opp_pred in enumerate((opp1, opp2, opp3), start=1):
-                        if opp_pred is None:
-                            continue
-                        target_row = row - i
-                        if target_row >= 0 and ep["agent_id"][target_row] != training_agent_env_id:
-                            ep["opp_pred_logits"][target_row] = True  # boolean marker only
 
                 else:
                     # ---- OPPONENT TURN ----
