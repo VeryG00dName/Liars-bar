@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# train_autoregressive_model.py - Train AutoregressiveGameModelFull using PS-generated sequence data
+# train_autoregressive_model_full.py - Train AutoregressiveGameModelFull using PS-generated sequence data
 import os
 import random
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
