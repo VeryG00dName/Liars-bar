@@ -24,7 +24,7 @@ class PPOAutoregressiveModel(nn.Module):
                  num_heads=4,
                  num_layers=2,
                  dropout_rate=0.1,
-                 max_seq_length=320,
+                 max_seq_length=256,
                  num_agent_types=4):
         super().__init__()
         self.obs_dim = obs_dim
