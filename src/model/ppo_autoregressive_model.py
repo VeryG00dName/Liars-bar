@@ -181,12 +181,11 @@ class PPOAutoregressiveModel(nn.Module):
 
         # ---- beliefs ----
         belief_hidden  = F.relu(self.belief_fc(transformer_output))
-        belief_for_policy = belief_hidden.detach()
         belief_logits_0 = self.belief_head_op0(belief_hidden)
         belief_logits_1 = self.belief_head_op1(belief_hidden)
         belief_logits_2 = self.belief_head_op2(belief_hidden)
         # ---- fuse & heads ----
-        fused_output = torch.cat([transformer_output, belief_for_policy], dim=-1)
+        fused_output = torch.cat([transformer_output, belief_hidden], dim=-1)
 
         action_logits = self.action_head(fused_output)     # [B,T,7]
         opp_logits    = self.opp_action_head(fused_output) # [B,T,7]

@@ -655,7 +655,8 @@ def train_autoregressive_model(
     max_files=None,
     max_samples=None,
     max_seq_length=100,
-    resume_from=None
+    resume_from=None,
+    effective_batch_size=None,
 ):
     """Train the AutoregressiveGameModel on sequence data with a single action head."""
 
@@ -669,6 +670,19 @@ def train_autoregressive_model(
     logger = setup_logging(os.path.join(log_dir, "training.log"))
     logger.info(f"Starting AutoregressiveGameModel training with device: {device}")
     writer = SummaryWriter(log_dir=log_dir)
+
+    # ----- Gradient Accumulation config -----
+    if effective_batch_size is None:
+        accum_steps = 1
+        eff_bs = batch_size
+    else:
+        if effective_batch_size < batch_size:
+            raise ValueError("effective_batch_size must be >= batch_size")
+        # ceil division so you can pass values not perfectly divisible
+        accum_steps = (effective_batch_size + batch_size - 1) // batch_size
+        eff_bs = batch_size * accum_steps
+    logger.info(f"Gradient accumulation: steps={accum_steps}, micro-batch={batch_size}, effective-batch≈{eff_bs}")
+    # ---------------------------------------
 
     opponent_mapping = create_opponent_mapping(data_dir)
     logger.info(f"Created opponent mapping with {len(opponent_mapping)} types")
@@ -720,7 +734,6 @@ def train_autoregressive_model(
         max_seq_length=max_seq_length,
         num_agent_types=4 # 0: Agent, 1: Opponent 0, 2: Opponent 1
     ).to(device)
-    #model = torch.compile(model, backend="aot_eager", mode="reduce-overhead")
     pt_dtype = torch.float16 if device.type == 'cuda' else torch.bfloat16
     logger.info(f"Model architecture:\n{model}")
     total_params = sum(p.numel() for p in model.parameters())
@@ -758,8 +771,16 @@ def train_autoregressive_model(
         train_belief_acc_2 = 0.0
 
         train_progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Train)", leave=False)
-        for batch in train_progress:
+
+        # ----- GA: prepare counters & zero grads once per group -----
+        optimizer.zero_grad(set_to_none=True)
+        total_micro = len(train_loader)
+        remainder = total_micro % accum_steps  # last group size (0 means perfect multiple)
+        # -----------------------------------------------------------
+
+        for batch_idx, batch in enumerate(train_progress, 1):
             batch = move_batch_to_device(batch, device)
+
             with amp.autocast(device_type=device.type, dtype=pt_dtype):
                 # Support models with or without the 3rd head during transition
                 try:
@@ -800,12 +821,22 @@ def train_autoregressive_model(
                     value_target=None
                 )
 
-            optimizer.zero_grad()
-            scaler.scale(total_loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            # ----- GA: divide loss by group size (accum_steps or remainder on last group) -----
+            if remainder != 0 and batch_idx > (total_micro - remainder):
+                cur_divisor = remainder  # last (short) group
+            else:
+                cur_divisor = accum_steps
+
+            scaled_loss = scaler.scale(total_loss / cur_divisor)
+            scaled_loss.backward()
+            # Step at end of each full group, or at the very last batch
+            if (batch_idx % accum_steps == 0) or (batch_idx == total_micro):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+            # -----------------------------------------------------------------------------------
 
             # accumulate losses
             train_total_loss += total_loss.item()
@@ -1066,6 +1097,7 @@ def main():
     parser.add_argument("--hidden-dim", type=int, default=256, help="Hidden dimension for the model")
     parser.add_argument("--learning-rate", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--batch-size", type=int, default=512, help="Batch size")
+    parser.add_argument("--effetive-batch-size", type=int, default=1024, help="Effetive batch size")
     parser.add_argument("--num-epochs", type=int, default=100, help="Number of epochs")
     parser.add_argument("--validation-split", type=float, default=0.1, help="Validation split ratio")
     parser.add_argument("--checkpoint-dir", type=str, default=None, help="Checkpoint directory")
@@ -1096,7 +1128,8 @@ def main():
         max_files=args.max_files,
         max_samples=args.max_samples,
         max_seq_length=args.max_seq_length,
-        resume_from=args.resume_from
+        resume_from=args.resume_from,
+        effective_batch_size=args.effetive_batch_size
     )
     
     print("Training completed!")
