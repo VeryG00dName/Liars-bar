@@ -27,27 +27,26 @@ class PPOAutoregressiveAgent(BaseAgent):
         self.obs_dim: Optional[int] = 9
         self.action_dim: int = 7 # Standard actions
         self.extended_action_dim: Optional[int] = 9
-        self.hidden_dim: Optional[int] = 256
-        self.max_seq_length: Optional[int] = 320
+        self.hidden_dim: Optional[int] = 384
+        self.max_seq_length: Optional[int] = 256
         self.belief_dim: Optional[int] = 64 # Inferred from the model's belief head
         self._obs_by_step = {}
         # --- Runtime state ---
         self.sequence_history: List[Dict[str, Any]] = []
         self.env_agent_id_map: Optional[Dict[str, int]] = None # Maps env_id to 0 (self), 1 (opp0), 2 (opp1), 3 (opp2)
         self._last_expert_info: Optional[Dict[str, Any]] = None
-        self.opp__since_me = 0
 
     def reset(self):
         """Resets sequence history and internal state for a new game."""
         self.sequence_history = []
         self.env_agent_id_map = None
         self._last_expert_info = None
-        self.opp__since_me = 0
         self._obs_by_step.clear()
 
     def set_model(self, model):
         """A simple method to assign the model to the agent."""
         self.model = model
+        self.model.eval()
 
     def load_models_from_checkpoint(self, checkpoint: Dict[str, Any], agent_key: str):
         """
@@ -72,7 +71,6 @@ class PPOAutoregressiveAgent(BaseAgent):
             inferred_max_seq = model_state_dict.get('position_embedding.weight', torch.zeros(320)).shape[0]
             
             num_heads = 4  # Assuming this is fixed, common practice.
-            num_layers = 2 # Assuming this is fixed.
             
             if inferred_hidden_dim % num_heads != 0:
                 logger.warning(f"Inferred hidden_dim ({inferred_hidden_dim}) not divisible by num_heads ({num_heads}). Check model architecture.")
@@ -91,7 +89,6 @@ class PPOAutoregressiveAgent(BaseAgent):
             belief_dim=inferred_belief_dim,
             hidden_dim=inferred_hidden_dim,
             num_heads=num_heads,
-            num_layers=num_layers,
             max_seq_length=inferred_max_seq,
         ).to(self.device)
 
@@ -147,11 +144,9 @@ class PPOAutoregressiveAgent(BaseAgent):
                 if actor == me:
                     # Our own play is always revealed (0..5)
                     action = self._revealed_token_from_play(e)
-                    self.opp__since_me = 0
                 else:
                     # Opponent play stays hidden in the token stream (7/8/9)
                     action = HIDDEN_MAP.get(cnt, 7)
-                    self.opp__since_me =+ 1
 
                 seq.append({
                     "agent_id_env": actor,
@@ -236,11 +231,14 @@ class PPOAutoregressiveAgent(BaseAgent):
             logger.debug(f"Agent {self.player_id}: New game detected, history cleared.")
 
         if self.env_agent_id_map is None:
-            # Consistent mapping for evaluation
-            others = sorted([a for a in env.possible_agents if a != agent_id_env])
-            self.env_agent_id_map = {agent_id_env: 0}
-            for i, opp in enumerate(others, start=1):
-                self.env_agent_id_map[opp] = i
+            if agent_id_env == "player_0":
+                self.env_agent_id_map = {"player_0": 0, "player_1": 1, "player_2": 2, "player_3": 3}
+            else:
+                # Consistent mapping for evaluation
+                others = sorted([a for a in env.possible_agents if a != agent_id_env])
+                self.env_agent_id_map = {agent_id_env: 0}
+                for i, opp in enumerate(others, start=1):
+                    self.env_agent_id_map[opp] = i
 
         gh = list(getattr(env, "game_history", []))
         next_step = (gh[-1]["step"] + 1) if gh else 1
@@ -273,7 +271,7 @@ class PPOAutoregressiveAgent(BaseAgent):
         # 4) run model, write chosen action to the last row
         model_input = self._prepare_model_input(self.sequence_history)
         
-        action_logits, opp_logits, state_values, belief0, belief1, belief2 = self.model(**model_input)
+        action_logits, _, state_values, belief0, belief1, belief2 = self.model(**model_input)
          # --- Process Outputs for the Current Timestep ---
         last_step_idx = model_input['valid_lengths'][0].item() - 1
         logits = action_logits[0, last_step_idx]
@@ -287,29 +285,14 @@ class PPOAutoregressiveAgent(BaseAgent):
         mask_t = torch.tensor(info["action_mask"], dtype=torch.bool, device=self.device)
         masked_logits = logits.masked_fill(~mask_t, float("-inf"))
 
-        opp1, opp2, opp3 = None, None, None
-
-        for i in range(1, self.opp__since_me + 1):
-            step = last_step_idx - i
-            if step >= 0:
-                ol = opp_logits[0, step]
-            else:
-                ol = None
-
-            if i == 1:
-                opp1 = ol
-            elif i == 2:
-                opp2 = ol
-            elif i == 3:
-                opp3 = ol
-        self.sequence_history[-1]["action"] = torch.argmax(masked_logits).item()
          # --- Select Action and Return All Data ---
         if training:
             dist = torch.distributions.Categorical(logits=masked_logits)
             action = dist.sample()
             log_prob = dist.log_prob(action)
+            self.sequence_history[-1]["action"] = int(action.item())
             # Return all 7 values
-            return action.item(), log_prob.item(), value.item(), opp1, opp2, opp3, b0, b1, b2
+            return action.item(), log_prob.item(), value.item(), b0, b1, b2
         else: # Evaluation mode
             action = torch.argmax(masked_logits).item()
             if belief0 is not None and belief1 is not None:
@@ -321,6 +304,7 @@ class PPOAutoregressiveAgent(BaseAgent):
                     self._last_expert_info['player_2'] = {"expert_index": int(torch.argmax(belief1[0, last_step_idx]).item()), "source": "internal"}
                 if len(opponents) > 2:
                     self._last_expert_info['player_3'] = {"expert_index": int(torch.argmax(belief2[0, last_step_idx]).item()), "source": "internal"}
+            self.sequence_history[-1]["action"] = int(action)
             return action
         
     def get_last_expert_info(self):
