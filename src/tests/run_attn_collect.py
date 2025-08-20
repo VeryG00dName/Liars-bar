@@ -23,7 +23,6 @@ import torch.nn.functional as F
 
 from src.env.liars_deck_env_core import LiarsDeckEnv
 from src import config
-from src.model.ppo_autoregressive_model import PPOAutoregressiveModel
 
 from src.model.hard_coded_agents import (
     RandomAgent,
@@ -37,7 +36,10 @@ from src.model.hard_coded_agents import (
 
 from src.agents.hardcoded_agent_wrapper import HardcodedAgentWrapper
 
-
+if config.NUM_PLAYERS == 3:
+    from src.model.autoregressive_model_full import AutoregressiveGameModelFull as aimodel
+else:
+    from src.model.ppo_autoregressive_model import PPOAutoregressiveModel as aimodel
 BELIEF_LABELS: Dict[str, int] = {
     "GreedyCardSpammer": 1,
     "StrategicChallenger": 4,
@@ -116,7 +118,7 @@ def extract_last_token_attn(attn_list, batch_idx=0):
 
 
 class VizAgent:
-    def __init__(self, device: torch.device, model: PPOAutoregressiveModel):
+    def __init__(self, device: torch.device, model: aimodel):
         self.device = device
         self.model = model.eval()
         self.obs_dim = model.obs_dim
@@ -213,7 +215,7 @@ class VizAgent:
 
         gh = list(getattr(env, "game_history", []))
         next_step = (gh[-1]["step"] + 1) if gh else 1
-        obs_curr = env.observe(agent_id_env, newerest=True)[agent_id_env]
+        obs_curr = env.observe(agent_id_env, newest=True)[agent_id_env]
         self._obs_by_step[next_step] = (obs_curr, list(info.get("action_mask", [0]*self.action_dim)))
 
         self.sequence_history = self._rebuild_history_from_gh(env, agent_id_env)
@@ -257,8 +259,10 @@ class VizAgent:
 
         b0 = self.model.belief_head_op0(belief_hidden)[0, last_idx]
         b1 = self.model.belief_head_op1(belief_hidden)[0, last_idx]
-        b2 = self.model.belief_head_op2(belief_hidden)[0, last_idx]
-
+        if config.NUM_PLAYERS == 4:
+            b2 = self.model.belief_head_op2(belief_hidden)[0, last_idx]
+        else:
+            b2 = torch.zeros_like(b1)
         return action, attn_last, masked_logits.detach().cpu(), state_values[0, last_idx, 0].detach().cpu(), torch.stack([b0, b1, b2]).detach().cpu(), mi_row
 
 
@@ -268,16 +272,28 @@ def run_and_log(ckpt_path: str, episodes: int, save_dir: str, device_str: str = 
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     sd   = ckpt.get("model_state_dict", ckpt)
-    model = PPOAutoregressiveModel(
-        obs_dim=9,
-        action_dim=7,
-        belief_dim=64,
-        hidden_dim=256,
-        num_heads=4,
-        num_layers=2,
-        max_seq_length=320,
-        num_agent_types=4
-    ).to(device)
+    if config.NUM_PLAYERS == 3:
+        model = aimodel(
+            obs_dim=4,
+            action_dim=7,
+            belief_dim=10,
+            hidden_dim=256,
+            num_heads=4,
+            num_layers=2,
+            max_seq_length=100,
+            num_agent_types=3
+        ).to(device)
+    else:
+        model = aimodel(
+            obs_dim=9,
+            action_dim=7,
+            belief_dim=64,
+            hidden_dim=256,
+            num_heads=4,
+            num_layers=2,
+            max_seq_length=320,
+            num_agent_types=4
+        ).to(device)
     model.load_state_dict(sd, strict=True)
     model.eval()
 
