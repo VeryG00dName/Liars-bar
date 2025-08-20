@@ -27,7 +27,7 @@ class PPOAutoregressiveAgent(BaseAgent):
         self.obs_dim: Optional[int] = 9
         self.action_dim: int = 7 # Standard actions
         self.extended_action_dim: Optional[int] = 9
-        self.hidden_dim: Optional[int] = 384
+        self.hidden_dim: Optional[int] = 256
         self.max_seq_length: Optional[int] = 256
         self.belief_dim: Optional[int] = 64 # Inferred from the model's belief head
         self._obs_by_step = {}
