@@ -703,7 +703,7 @@ def train_autoregressive_model(
         train_dataset,
         batch_sampler=train_sampler,
         num_workers=0,
-        pin_memory=False,
+        pin_memory=True,
         persistent_workers=False,
         collate_fn=collate_variable_length_sequences,
     )
@@ -713,7 +713,7 @@ def train_autoregressive_model(
         batch_size=batch_size,
         shuffle=False,
         num_workers=0,
-        pin_memory=False,
+        pin_memory=True,
         persistent_workers=False,
         collate_fn=collate_variable_length_sequences,
     )
