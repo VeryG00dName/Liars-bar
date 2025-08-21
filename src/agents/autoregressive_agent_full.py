@@ -314,9 +314,9 @@ class AutoregressiveAgentFull(BaseAgent):
             opponents = sorted([p for p in env.possible_agents if p != agent_id_env])
             self._last_expert_info = {}
             if len(opponents) > 0:
-                self._last_expert_info[opponents[0]] = {"expert_index": int(torch.argmax(belief0[0, last_step_idx]).item()), "source": "internal"}
+                self._last_expert_info['player_1'] = {"expert_index": int(torch.argmax(belief0[0, last_step_idx]).item()), "source": "internal"}
             if len(opponents) > 1:
-                self._last_expert_info[opponents[1]] = {"expert_index": int(torch.argmax(belief1[0, last_step_idx]).item()), "source": "internal"}
+                self._last_expert_info['player_2'] = {"expert_index": int(torch.argmax(belief1[0, last_step_idx]).item()), "source": "internal"}
                 
         self.sequence_history[-1]["action"] = chosen
         return chosen
