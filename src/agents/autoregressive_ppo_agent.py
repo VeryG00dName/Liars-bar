@@ -167,7 +167,7 @@ class PPOAutoregressiveAgent(BaseAgent):
 
     def _prepare_model_input(self, history: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         """Prepares tensors for the autoregressive model, matching the training format."""
-        PAD = 0 # action pad
+        PAD = 11 # action pad
 
         filtered = list(history)
 
@@ -182,10 +182,10 @@ class PPOAutoregressiveAgent(BaseAgent):
         if current_seq_len > max_len:
             filtered      = filtered[-max_len:]
             input_actions = input_actions[-max_len:]
-
+        PAD_ID = 11
         # 3) Allocate tensors
         obs_seq         = torch.zeros((1, valid_len, self.obs_dim), dtype=torch.float32, device=self.device)
-        action_seq      = torch.zeros((1, valid_len), dtype=torch.long, device=self.device)
+        action_seq      = torch.full((1, valid_len), PAD_ID, dtype=torch.long, device=self.device)
         agent_type_seq  = torch.ones ((1, valid_len), dtype=torch.long, device=self.device)  # default to opponent
         pos_seq         = torch.arange(valid_len, dtype=torch.long, device=self.device).unsqueeze(0)
         action_mask_seq = torch.zeros((1, valid_len, self.action_dim), dtype=torch.bool, device=self.device)
