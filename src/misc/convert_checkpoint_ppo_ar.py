@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# src/misc/convert_checkpoint_no_belief.py
+# src/misc/convert_checkpoint_ppo_ar.py
 
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
