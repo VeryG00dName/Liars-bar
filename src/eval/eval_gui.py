@@ -31,7 +31,6 @@ from src.model.hard_coded_agents import (
 from src.eval.evaluate_utils import evaluate_agents
 
 from src.misc.cheat.ai_vs_hardcoded_cheat import LABELS
-torch.backends.cudnn.benchmark = True
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(name)s %(levelname)s: %(message)s")
