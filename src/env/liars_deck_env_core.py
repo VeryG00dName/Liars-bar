@@ -290,15 +290,17 @@ class LiarsDeckEnv(AECEnv):
             self.logger.info("No eligible agents remain for a new round. Game ends.")
             self._check_game_end()
             return
+        preferred = getattr(self, "last_action_agent", None)
+        start_agent = preferred if preferred in eligible_agents else eligible_agents[0]
 
-        # ### CHANGED: Reset consecutive action tracking for the new round
         for agent in self.possible_agents:
             self.last_agent_action[agent] = None
             self.consecutive_action_count[agent] = 0
-        random.shuffle(eligible_agents)
-        self.agents = eligible_agents
+            
+        sidx = eligible_agents.index(start_agent)
+        self.agents = eligible_agents[sidx:] + eligible_agents[:sidx]
         self._agent_selector = agent_selector(self.agents)
-        self.agent_selection = self._agent_selector.next() if self.agents else None
+        self.agent_selection = self._agent_selector.reset() if self.agents else None
 
         self.last_action = None
         self.last_played_cards = {agent: [] for agent in self.possible_agents}

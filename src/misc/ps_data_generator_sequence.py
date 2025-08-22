@@ -278,7 +278,7 @@ def generate_data(
             step_data = {"agent_id": AGENT_ID_MAP[current_agent], "step": episode_step}
             step_data["belief"] = create_belief_vector(selected_opponents, current_opponents)
             if current_agent == training_agent:
-                obs_curr = env.observe(current_agent, newerest=True)[current_agent]
+                obs_curr = env.observe(training_agent, newerest=True)[training_agent]
                 step_data["observation"] = np.round(obs_curr, 2).tolist()
                 step_data["action_mask"] = env.infos[current_agent].get('action_mask', [0] * 7)
                 planned = ps.get_next_agent_action(current_agent)
@@ -319,6 +319,8 @@ def generate_data(
                 else:
                     opp_model = opponent_models[current_agent]
                     obs_opp = env.observe(current_agent, newer=True)[current_agent]
+                    obs_curr = env.observe(training_agent, newerest=True)[training_agent]
+                    step_data["observation"] = np.round(obs_curr, 2).tolist()
                     mask = env.infos[current_agent]['action_mask']
                     best_action = opp_model.play_turn(obs_opp, mask, table_card=env.table_card) if hasattr(opp_model, 'play_turn') else mask.index(1)
                     step_data["action_source"] = f"Opponent Model ({current_opponents[current_agent]['name']})"

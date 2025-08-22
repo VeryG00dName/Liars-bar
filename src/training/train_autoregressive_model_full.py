@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# train_autoregressive_model_full.py - Train AutoregressiveGameModelFull using PS-generated sequence data
+# train_autoregressive_model_full.py - Train PPOAutoregressiveModel using PS-generated sequence data
 import os
 import random
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -230,27 +230,17 @@ class AutoregressiveGameDataset(Dataset):
             raw_actions = []
             raw_target_actions = []
             for step in sequence:
-                is_train = step.get("is_training_agent", step.get("agent_id", 0) == 0)
+                is_train = step["agent_id"] == 0
 
                 if "action" in step:
                     a = step["action"]
-                    b = step["action"]
-                elif is_train and "expert_action" in step:
-                    a = step["chosen_action"]
-                    b = step["expert_action"]
-                else:
-                    a = 0
-                    b = 0
+                    b = a
                 # Hide opponents' plays (use 7/8/9) in the input token stream
-                if not is_train and a not in (6, 10):
-                    a = TRANSFORM_MAP.get(a, a)
+                if not is_train and a != 6:
+                    b = TRANSFORM_MAP.get(a, a)
 
-                # Normalize challenge 10 -> 6
-                a = 6 if a == 10 else a
-                b = 6 if b == 10 else b
-
-                raw_target_actions.append(b)  # targets always 0..6
-                raw_actions.append(a)         # inputs: 0..5 for our plays, 7/8/9 for opp, 6 for challenge
+                raw_target_actions.append(a)  # targets always 0..6
+                raw_actions.append(b)         # inputs: 0..5 for our plays, 7/8/9 for opp, 6 for challenge
                 
             PAD = 0
             input_actions  = [PAD] + raw_actions[:-1]
@@ -265,17 +255,6 @@ class AutoregressiveGameDataset(Dataset):
             has_belief = False
             latest_belief_vector = None
 
-            LABELS = {
-                "GreedyCardSpammer": 1, "StrategicChallenger": 4,
-                "TableNonTableAgent": 6, "Classic": 0,
-                "TableFirstConservativeChallenger": 5,
-                "SelectiveTableConservativeChallenger": 3,
-                "RandomAgent": 2,
-                "Historical_Version_E_player_1": 9,
-                "Historical_Version_C_player_0": 8,
-                "Historical_Version_A_player_2": 7
-            }
-
             for i, step in enumerate(sequence):
                 # Agent type and position
                 agent_id = step.get("agent_id", 0)
@@ -283,11 +262,8 @@ class AutoregressiveGameDataset(Dataset):
                 position_list.append(i)
 
                 # Observations (only on our turns)
-                if agent_id == 0:
-                    obs = np.array(step.get("observation", np.zeros(9, np.float32)), dtype=np.float32)
-                    obs_list.append(obs)
-                else:
-                    obs_list.append(np.zeros(9, dtype=np.float32))
+                obs = np.array(step.get("observation", np.zeros(9, np.float32)), dtype=np.float32)
+                obs_list.append(obs)
 
                 # Action mask (only our turns)
                 if agent_id == 0 and "action_mask" in step:
@@ -303,7 +279,7 @@ class AutoregressiveGameDataset(Dataset):
                     for opp_idx in range(3):
                         if opp_idx < len(names):
                             name = names[opp_idx]
-                            idx = LABELS.get(name, 0)
+                            idx = self.opponent_mapping.get(name, 0)
                             full_belief.append(idx)
                         else:
                             full_belief.append(0)
@@ -693,7 +669,7 @@ def train_autoregressive_model(
         max_seq_length=max_seq_length,
         num_agent_types=4 # 0: Agent, 1: Opponent 0, 2: Opponent 1
     ).to(device)
-    #model = torch.compile(model, backend="aot_eager", mode="reduce-overhead")
+
     pt_dtype = torch.float16 if device.type == 'cuda' else torch.bfloat16
     logger.info(f"Model architecture:\n{model}")
     total_params = sum(p.numel() for p in model.parameters())

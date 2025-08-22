@@ -5,7 +5,7 @@ from src.env.liars_deck_env_utils_2 import decode_action, select_cards_to_play, 
 from src.model.memory import get_opponent_memory
 # --- Existing functions ---
 
-def record_action_history(env, agent, action_type, card_category, count, was_challenged=False):
+def record_action_history(env, agent, action_type, card_category, count, observations_for_history, was_challenged=False):
     entry = {
         'action_type': action_type,
         'count': count,
@@ -17,14 +17,15 @@ def record_action_history(env, agent, action_type, card_category, count, was_cha
         env.public_opponent_histories[agent].pop(0)
 
     game_entry = {
-        'step': env.global_step,                   # monotonic across the whole game
+        'step': env.global_step,                  # monotonic across the whole game
         'round': getattr(env, 'round', None),     # current round number
         'player': agent,                          # who acted
         'action_type': action_type,               # "Play" or "Challenge"
         'card_category': card_category,           # "table" | "non-table" | None
         'count': count,                           # 1..3 or None
         'claimant': None,                         # filled for challenges
-        'challenge_success': None                 # filled for challenges
+        'challenge_success': None,                # filled for challenges
+        'observations': observations_for_history  # agent's observation at this step
     }
 
     if action_type == "Challenge":
@@ -219,7 +220,7 @@ def apply_action(env, agent, action):
     env.logger.debug(f"Decoded action: {action_type}, {card_category}, {count}")
     env.current_action_type = action_type
     current_hand = env.players_hands.get(agent, [])
-
+    observations_for_history = {p: env.observe(p, newerest=True)[p] for p in env.possible_agents}
     if action_type == "Play":
         selected_cards = select_cards_to_play(current_hand, card_category, count, env.table_card, env.np_random)
         if selected_cards:
@@ -265,7 +266,7 @@ def apply_action(env, agent, action):
             env.logger.debug(f"{agent} played {current_play} card(s). Reward increased by {play_reward}.")
 
             # Record in public history.
-            record_action_history(env, agent, "Play", card_category, count, was_challenged=False)
+            record_action_history(env, agent, "Play", card_category, count, observations_for_history, was_challenged=False)
 
             # ----------------- PRIVATE HISTORY UPDATE -----------------
             private_entry = {
@@ -303,7 +304,7 @@ def apply_action(env, agent, action):
             env.logger.debug(f"Invalid Play by {agent}: Penalty={env.penalties[agent]}, Reward={env.rewards[agent]}")
 
     elif action_type == "Challenge":
-        record_action_history(env, agent, "Challenge", card_category=None, count=None, was_challenged=True)
+        record_action_history(env, agent, "Challenge", card_category=None, count=None,observations_for_history=observations_for_history, was_challenged=True)
         if env.last_action_agent is not None and env.last_played_cards.get(env.last_action_agent, []):
             challenger = agent
             claimant = env.last_action_agent

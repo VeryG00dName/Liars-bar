@@ -29,8 +29,8 @@ class PPOAutoregressiveAgent(BaseAgent):
         self.extended_action_dim: Optional[int] = 9
         self.hidden_dim: Optional[int] = 256
         self.max_seq_length: Optional[int] = None
-        self.belief_dim: Optional[int] = 64 # Inferred from the model's belief head
-        self._obs_by_step = {}
+        self.belief_dim: Optional[int] = 7 # Inferred from the model's belief head
+        self._mask_by_step = {}
         # --- Runtime state ---
         self.sequence_history: List[Dict[str, Any]] = []
         self.env_agent_id_map: Optional[Dict[str, int]] = None # Maps env_id to 0 (self), 1 (opp0), 2 (opp1), 3 (opp2)
@@ -41,7 +41,7 @@ class PPOAutoregressiveAgent(BaseAgent):
         self.sequence_history = []
         self.env_agent_id_map = None
         self._last_expert_info = None
-        self._obs_by_step.clear()
+        self._mask_by_step.clear()
 
     def set_model(self, model):
         """A simple method to assign the model to the agent."""
@@ -131,12 +131,11 @@ class PPOAutoregressiveAgent(BaseAgent):
             a_type = e.get("action_type")
             actor  = e.get("player")
             step   = int(e.get("step"))
-
-            # Pull cached obs/mask for OUR rows; zeros otherwise
-            if actor == me and step in self._obs_by_step:
-                obs, mask = self._obs_by_step[step]
+            obs = e.get('observations', {}).get(me, [0.0]*9)
+            # Pull cached mask for OUR rows; zeros otherwise
+            if actor == me and step in self._mask_by_step:
+                mask = self._mask_by_step[step]
             else:
-                obs  = [0.0] * int(self.obs_dim)
                 mask = [0]   * int(self.action_dim)
 
             if a_type == "Play":
@@ -232,15 +231,10 @@ class PPOAutoregressiveAgent(BaseAgent):
             logger.debug(f"Agent {self.player_id}: New game detected, history cleared.")
 
         if self.env_agent_id_map is None:
-            if agent_id_env == "player_0":
-                self.env_agent_id_map = {"player_0": 0, "player_1": 1, "player_2": 2, "player_3": 3}
-            else:
-                # Consistent mapping for evaluation
-                others = sorted([a for a in env.possible_agents if a != agent_id_env])
-                self.env_agent_id_map = {agent_id_env: 0}
-                for i, opp in enumerate(others, start=1):
-                    self.env_agent_id_map[opp] = i
-
+            turn_order_list = list(env.agents)
+            my_index = turn_order_list.index(agent_id_env)
+            relative_order = turn_order_list[my_index:] + turn_order_list[:my_index]
+            self.env_agent_id_map = {player_id: relative_pos for relative_pos, player_id in enumerate(relative_order)}
         gh = list(getattr(env, "game_history", []))
         next_step = (gh[-1]["step"] + 1) if gh else 1
         PAD = 0
@@ -255,10 +249,8 @@ class PPOAutoregressiveAgent(BaseAgent):
             out[5:8] = arr[4:]
             obs_curr = out
         _, _, _, _, info = env.last()
-        self._obs_by_step[next_step] = (
-            obs_curr,
-            list(info.get("action_mask", [0]*self.action_dim))
-)
+        self._mask_by_step[next_step] = list(info.get("action_mask", [0]*self.action_dim))
+
         # 1) rebuild everything up-to-now
         self.sequence_history = self._rebuild_history_from_gh(env, agent_id_env)
 
