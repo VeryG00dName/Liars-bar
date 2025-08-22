@@ -28,7 +28,7 @@ class PPOAutoregressiveAgent(BaseAgent):
         self.action_dim: int = 7 # Standard actions
         self.extended_action_dim: Optional[int] = 9
         self.hidden_dim: Optional[int] = 256
-        self.max_seq_length: Optional[int] = 256
+        self.max_seq_length: Optional[int] = None
         self.belief_dim: Optional[int] = 64 # Inferred from the model's belief head
         self._obs_by_step = {}
         # --- Runtime state ---
@@ -69,6 +69,7 @@ class PPOAutoregressiveAgent(BaseAgent):
             inferred_hidden_dim = MFactoryUtil.get_hidden_dim_from_state_dict(model_state_dict, 'obs_encoder.0')
             inferred_belief_dim = MFactoryUtil.get_output_dim_from_state_dict(model_state_dict, 'belief_head_op0')
             inferred_max_seq = model_state_dict.get('position_embedding.weight', torch.zeros(320)).shape[0]
+            self.max_seq_length = inferred_max_seq
             
             num_heads = 4  # Assuming this is fixed, common practice.
             
@@ -167,7 +168,7 @@ class PPOAutoregressiveAgent(BaseAgent):
 
     def _prepare_model_input(self, history: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         """Prepares tensors for the autoregressive model, matching the training format."""
-        PAD = 11 # action pad
+        PAD = 0 # action pad
 
         filtered = list(history)
 
@@ -182,10 +183,10 @@ class PPOAutoregressiveAgent(BaseAgent):
         if current_seq_len > max_len:
             filtered      = filtered[-max_len:]
             input_actions = input_actions[-max_len:]
-        PAD_ID = 11
+
         # 3) Allocate tensors
         obs_seq         = torch.zeros((1, valid_len, self.obs_dim), dtype=torch.float32, device=self.device)
-        action_seq      = torch.full((1, valid_len), PAD_ID, dtype=torch.long, device=self.device)
+        action_seq      = torch.zeros((1, valid_len), dtype=torch.long, device=self.device)
         agent_type_seq  = torch.ones ((1, valid_len), dtype=torch.long, device=self.device)  # default to opponent
         pos_seq         = torch.arange(valid_len, dtype=torch.long, device=self.device).unsqueeze(0)
         action_mask_seq = torch.zeros((1, valid_len, self.action_dim), dtype=torch.bool, device=self.device)
