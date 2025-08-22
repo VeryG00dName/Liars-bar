@@ -252,7 +252,7 @@ class AutoregressiveGameDataset(Dataset):
                 raw_target_actions.append(b)  # targets always 0..6
                 raw_actions.append(a)         # inputs: 0..5 for our plays, 7/8/9 for opp, 6 for challenge
                 
-            PAD = 10
+            PAD = 0
             input_actions  = [PAD] + raw_actions[:-1]
             target_actions = raw_target_actions.copy()
 
