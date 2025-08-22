@@ -21,6 +21,8 @@ class PerfectSearch:
         self.sequence_position = 0
         self.simulations_performed = 0
         self.debug = False
+        self.challenge_priority = 'first'
+        self.simulation_order = None
         # --- Define threshold for "opponent penalized" outcome ---
         self.OPPONENT_PENALTY_THRESHOLD = 1500.0 # Value >= this means an opponent likely got penalized
 
@@ -248,8 +250,8 @@ class PerfectSearch:
                 best_sequence_continuation = None
                 best_is_terminal_recursive = False
                 best_is_new_round_recursive = False
-                simulation_order = [6, 5, 4, 3, 0, 2, 1]
-                actions_to_simulate = [act for act in simulation_order if act in valid_actions]
+                
+                actions_to_simulate = [act for act in self.simulation_order if act in valid_actions]
                 for next_action in actions_to_simulate:
                     self._log(f"[Depth {depth}, SimStep {step_count}] Exploring recursive action {next_action} for {self.training_agent} (Depth {depth + 1})")
                     next_state = sim_env.get_state()
@@ -344,7 +346,15 @@ class PerfectSearch:
                                 action_sequence.append((current_agent, opponent_action))
                                 return penalty_value, action_sequence, False, True # Returns penalty, indicates round potentially ends
                         # else: Opponent challenged our VALID play. Let sim_env.step handle it below.
-
+                    elif action == 2 and not is_challenging_us:
+                        self._log(f"[Depth {depth}] V5 RULE: Our 'Play 3 Table Cards' (action 2) was NOT challenged by {current_agent}. Applying penalty.")
+                        # This is a bad outcome because it was a risky play that didn't pay off.
+                        # The value should be negative but not as bad as getting a penalty yourself.
+                        value = -2000.0 
+                        # Append the opponent's non-challenge action to the sequence
+                        action_sequence.append((current_agent, opponent_action))
+                        # The round continues, but we return this bad value. The search will likely discard this path.
+                        return value, action_sequence, False, False 
                     # --- Apply opponent action if not handled by heuristic/bluff return ---
                     # This part is reached only if it wasn't our bluff being challenged, or if it was our valid play being challenged.
                     sim_env.step(opponent_action)
@@ -493,12 +503,17 @@ class PerfectSearch:
                              best_sequence_found = sequence
 
         # --- Define Simulation Order and Filter Valid Actions ---
-        simulation_order = [6, 5, 4, 3, 0, 2, 1]
+        self.simulation_order = [5, 2, 4, 3, 1, 0] # New V5 play priority
+    
+        if self.challenge_priority == 'first':
+            simulation_order = [6] + self.simulation_order
+        else: # 'last'
+            simulation_order = self.simulation_order + [6]
+
         actions_to_simulate = [act for act in simulation_order if act in valid_actions]
+        self._log(f"V5 Simulation Order (filtered): {actions_to_simulate}")
         if 6 in valid_actions and best_action_found != 6:
             actions_to_simulate.append(6)
-
-        self._log(f"Simulation Order (filtered): {actions_to_simulate}")
 
         # --- Main Loop: Simulate actions in specified order ---
         if not found_opponent_penalty_action:
