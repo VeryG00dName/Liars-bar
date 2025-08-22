@@ -24,7 +24,7 @@ class PPOAutoregressiveModel(nn.Module):
                  num_heads=4,
                  num_layers=2,
                  dropout_rate=0.1,
-                 max_seq_length=256,
+                 max_seq_length=320,
                  num_agent_types=4):
         super().__init__()
         self.obs_dim = obs_dim
@@ -33,9 +33,6 @@ class PPOAutoregressiveModel(nn.Module):
         self.hidden_dim = hidden_dim
         self.max_seq_length = max_seq_length
 
-        self.count_pad_id = 4
-        self.tflag_pad_id = 3
-        
         # Causal attention mask (upper triangular = future is masked)
         self.register_buffer(
             "causal_bool_mask_full",
@@ -51,10 +48,10 @@ class PPOAutoregressiveModel(nn.Module):
         )
 
         # --- Factorized action embeddings ---
-
+        # padding_idx=0 makes PAD/NONE/NA map to zero vectors automatically.
         self.act_kind_embedding   = nn.Embedding(3, hidden_dim, padding_idx=0)  # 0=PAD, 1=PLAY, 2=CHALLENGE
-        self.count_embedding = nn.Embedding(5, hidden_dim, padding_idx=self.count_pad_id)
-        self.table_flag_embedding = nn.Embedding(4, hidden_dim, padding_idx=self.tflag_pad_id)
+        self.count_embedding      = nn.Embedding(4, hidden_dim, padding_idx=0)  # 0=NONE, 1..3
+        self.table_flag_embedding = nn.Embedding(3, hidden_dim, padding_idx=0)  # 0=NA, 1=TABLE, 2=NON_TABLE
 
         # Agent / position embeddings
         self.agent_embedding = nn.Embedding(num_agent_types, hidden_dim)
@@ -62,11 +59,11 @@ class PPOAutoregressiveModel(nn.Module):
 
         # Fast LUTs to decompose 0..9 → factor IDs
         # act_kind: 0=PAD, 1=PLAY, 2=CHALLENGE
-        self.register_buffer("lut_act_kind",   torch.tensor([1,1,1,1,1,1,2,1,1,1,0,0], dtype=torch.long))
+        self.register_buffer("lut_act_kind",   torch.tensor([1,1,1,1,1,1,2,1,1,1], dtype=torch.long))
         # count: 0=NONE, 1,2,3
-        self.register_buffer("lut_count",      torch.tensor([1,2,3,1,2,3,0,1,2,3,0,4], dtype=torch.long))
+        self.register_buffer("lut_count",      torch.tensor([1,2,3,1,2,3,0,1,2,3], dtype=torch.long))
         # table_flag: 0=NA, 1=TABLE, 2=NON_TABLE
-        self.register_buffer("lut_table_flag", torch.tensor([1,1,1,2,2,2,0,0,0,0,0,3], dtype=torch.long))
+        self.register_buffer("lut_table_flag", torch.tensor([1,1,1,2,2,2,0,0,0,0], dtype=torch.long))
 
         # === Transformer ===
         encoder_layer = nn.TransformerEncoderLayer(
@@ -99,12 +96,28 @@ class PPOAutoregressiveModel(nn.Module):
         """
         action_sequence: LongTensor [B,T] with values in {0..9}
         Returns (act_kind_ids, count_ids, table_flag_ids) as Long [B,T]
+
+        For opponent turns (agent_types != 0), table_flag is forced to NA (0),
+        since you usually don't know TABLE/NON_TABLE for them.
         """
+        # Ensure long dtype for indexing
         a = action_sequence.long()
 
         act_kind = self.lut_act_kind[a]
         count    = self.lut_count[a]
         tflag    = self.lut_table_flag[a]
+
+        if agent_types is not None:
+            opp_mask = (agent_types != 0)
+            # Force NA for opponents
+            tflag = torch.where(opp_mask, torch.zeros_like(tflag), tflag)
+
+        if padding_mask is not None:
+            # Zero-out factors on padded steps so embeddings use padding_idx=0 (zero vector)
+            zeros = torch.zeros_like(act_kind)
+            act_kind = torch.where(padding_mask, zeros, act_kind)
+            count    = torch.where(padding_mask, zeros, count)
+            tflag    = torch.where(padding_mask, zeros, tflag)
 
         return act_kind, count, tflag
 
