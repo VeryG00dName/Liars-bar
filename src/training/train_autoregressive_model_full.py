@@ -167,15 +167,18 @@ def create_opponent_mapping(data_dir, use_cache=True, cache_file="opponent_mappi
     return opponent_mapping
 
 class BucketSampler(Sampler):
-    def __init__(self, data_source: List[int], batch_size: int, shuffle=True):
-        self.lengths = [seq['length'] for seq in data_source]
+    """Group sequences of similar length into batches."""
+
+    def __init__(self, lengths: List[int], batch_size: int, shuffle: bool = True):
+        # lengths is already a simple list/iterable of sequence lengths
+        self.lengths = list(lengths)
         self.batch_size = batch_size
         self.shuffle = shuffle
         
         # Create a list of indices
         self.indices = list(range(len(self.lengths)))
         
-        # Sort indices by length
+        # Sort indices by length for efficient padding within each batch
         self.sorted_indices = sorted(self.indices, key=lambda i: self.lengths[i])
         
     def __iter__(self):
@@ -230,7 +233,7 @@ class AutoregressiveGameDataset(Dataset):
         self.data = data_list
         self.index_map = list(range(len(self.data)))
         self.lengths = [len(d["sequence"]) for d in self.data]
-        self._file_cache = {}
+        # no file cache needed when data is provided directly
 
     def _init_from_directory(self, data_dir, max_files, max_samples):
         self.file_paths = [
@@ -246,27 +249,29 @@ class AutoregressiveGameDataset(Dataset):
         total = 0
         print("Indexing data files...")
         for file_idx, path in enumerate(tqdm(self.file_paths, desc="Scanning files")):
-            objs = _load_all_objects_from_file(path)
-            rounds = _normalize_to_round_sequences(objs)
-            for seq_idx, rd in enumerate(rounds):
-                self.index_map.append((file_idx, seq_idx))
-                self.lengths.append(len(rd["sequence"]))
-                total += 1
+            for offset, obj in _iter_pickled_objects_with_positions(path):
+                rounds = _normalize_to_round_sequences([obj])
+                for seq_idx, rd in enumerate(rounds):
+                    self.index_map.append((file_idx, offset, seq_idx))
+                    self.lengths.append(len(rd["sequence"]))
+                    total += 1
+                    if max_samples is not None and total >= max_samples:
+                        break
                 if max_samples is not None and total >= max_samples:
                     break
             if max_samples is not None and total >= max_samples:
                 break
-        self._file_cache = {}
 
     def _get_round_data(self, idx):
         if self.data is not None:
             return self.data[idx]
-        file_idx, seq_idx = self.index_map[idx]
-        if file_idx not in self._file_cache:
-            path = self.file_paths[file_idx]
-            objs = _load_all_objects_from_file(path)
-            self._file_cache[file_idx] = _normalize_to_round_sequences(objs)
-        return self._file_cache[file_idx][seq_idx]
+        file_idx, offset, seq_idx = self.index_map[idx]
+        path = self.file_paths[file_idx]
+        with open(path, "rb") as f:
+            f.seek(offset)
+            obj = pickle.load(f)
+        rounds = _normalize_to_round_sequences([obj])
+        return rounds[seq_idx]
 
     def __len__(self):
         return len(self.index_map)
@@ -363,24 +368,31 @@ class AutoregressiveGameDataset(Dataset):
         return seq_dict
 
 def collate_variable_length_sequences(batch):
-    """Collate variable-length sequences on CPU."""
+    """
+    Custom collate function for batching variable-length sequences.
+    Pads to the max length in the batch and returns masks. Tensors are
+    created on the same device as the input tensors.
+    """
     if not batch:
         return {}
 
     max_seq_len = max(seq["length"] for seq in batch)
     batch_size = len(batch)
-    obs_dim = batch[0]["obs"].shape[1]
-    belief_dim = batch[0]["belief"].shape[1] if batch[0]["belief"] is not None else 0
+    
+    first_seq = batch[0]
+    device = first_seq['obs'].device
+    obs_dim = first_seq['obs'].shape[1]
+    belief_dim = first_seq['belief'].shape[1] if first_seq['belief'] is not None else 0
 
-    batched_obs = torch.zeros(batch_size, max_seq_len, obs_dim)
-    batched_action = torch.zeros(batch_size, max_seq_len, dtype=torch.long)
-    batched_target_action = torch.zeros(batch_size, max_seq_len, dtype=torch.long)
-    batched_action_mask = torch.zeros(batch_size, max_seq_len, 7, dtype=torch.bool)
-    batched_agent_type = torch.zeros(batch_size, max_seq_len, dtype=torch.long)
-    batched_position = torch.zeros(batch_size, max_seq_len, dtype=torch.long)
-    padding_mask = torch.ones(batch_size, max_seq_len, dtype=torch.bool)
+    batched_obs = torch.zeros(batch_size, max_seq_len, obs_dim, device=device)
+    batched_action = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
+    batched_target_action = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
+    batched_action_mask = torch.zeros(batch_size, max_seq_len, 7, dtype=torch.bool, device=device)
+    batched_agent_type = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
+    batched_position = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
+    padding_mask = torch.ones(batch_size, max_seq_len, dtype=torch.bool, device=device)
     batched_belief = (
-        torch.zeros(batch_size, max_seq_len, belief_dim, dtype=torch.long)
+        torch.zeros(batch_size, max_seq_len, belief_dim, dtype=torch.long, device=device)
         if belief_dim
         else None
     )
@@ -423,6 +435,17 @@ def _iter_pickled_objects(file_path):
         while True:
             try:
                 yield pickle.load(f)
+            except EOFError:
+                break
+
+def _iter_pickled_objects_with_positions(file_path):
+    """Yield (file_offset, object) for each pickled object in the file."""
+    with open(file_path, "rb") as f:
+        while True:
+            try:
+                pos = f.tell()
+                obj = pickle.load(f)
+                yield pos, obj
             except EOFError:
                 break
 
@@ -731,9 +754,10 @@ def train_autoregressive_model(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=1,
         collate_fn=collate_variable_length_sequences,
         pin_memory=True,
+        persistent_workers=True,
     )
 
     sample = next(iter(train_loader))
@@ -1096,8 +1120,8 @@ def main():
     parser.add_argument("--data-dir", type=str, default="./ps_autoreg_data", help="Directory containing PS data files")
     parser.add_argument("--num-opponent-types", type=int, default=None, help="Number of opponent types (auto-detected if None)")
     parser.add_argument("--hidden-dim", type=int, default=256, help="Hidden dimension for the model")
-    parser.add_argument("--learning-rate", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--batch-size", type=int, default=1024, help="Batch size")
+    parser.add_argument("--learning-rate", type=float, default=5e-5, help="Learning rate")
+    parser.add_argument("--batch-size", type=int, default=512, help="Batch size")
     parser.add_argument("--num-epochs", type=int, default=100, help="Number of epochs")
     parser.add_argument("--validation-split", type=float, default=0.1, help="Validation split ratio")
     parser.add_argument("--checkpoint-dir", type=str, default=None, help="Checkpoint directory")
