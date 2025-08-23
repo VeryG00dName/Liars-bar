@@ -242,7 +242,7 @@ class AutoregressiveGameDataset(Dataset):
                 raw_target_actions.append(a)  # targets always 0..6
                 raw_actions.append(b)         # inputs: 0..5 for our plays, 7/8/9 for opp, 6 for challenge
                 
-            PAD = 0
+            PAD = 10
             input_actions  = [PAD] + raw_actions[:-1]
             target_actions = raw_target_actions.copy()
 
@@ -537,46 +537,83 @@ def calculate_autoregressive_loss(
     belief_logits_2=None,
     belief_targets=None,
     value_pred=None,
-    value_target=None,
-    belief_loss_weight=1.0
+    value_target=None
 ):
     device = self_logits.device
-    valid  = ~padding_mask
+    valid  = (~padding_mask).bool()
 
+    # Masks
     our_mask = valid & (agent_types == 0)
-    opp_mask = valid & ((agent_types == 1) | (agent_types == 2) | (agent_types == 3))
+    opp_mask = valid & (agent_types != 0)
 
-    self_loss = (F.cross_entropy(
-        self_logits[our_mask].reshape(-1, self_logits.size(-1)),
-        target_actions[our_mask].reshape(-1)
-    ) if our_mask.any() else torch.tensor(0.0, device=device))
+    # Counts (effective sample sizes)
+    n_self   = int(our_mask.sum().item())
+    n_opp    = int(opp_mask.sum().item())
+    n_value  = int(valid.sum().item())
+    n_total  = max(n_self + n_opp, 1)
 
-    opp_loss = (F.cross_entropy(
-        opp_logits[opp_mask].reshape(-1, opp_logits.size(-1)),
-        target_actions[opp_mask].reshape(-1)
-    ) if opp_mask.any() else torch.tensor(0.0, device=device))
-
-    value_loss = (F.mse_loss(value_pred[valid], value_target[valid])
-                  if value_pred is not None and value_target is not None
-                  else torch.tensor(0.0, device=device))
-
-    belief_loss = torch.tensor(0.0, device=device)
-    if belief_targets is not None:
-        flat_mask = our_mask.reshape(-1)
-        def _ce(logits, tgt_slice):
-            if logits is None: return 0.0
-            flat_logits  = logits.reshape(-1, logits.size(-1))[flat_mask]
-            flat_targets = tgt_slice.reshape(-1)[flat_mask]
-            return (F.cross_entropy(flat_logits, flat_targets)
-                    if flat_targets.numel() else 0.0)
-
-        belief_loss = (
-            _ce(belief_logits_0, belief_targets[:, :, 0]) +
-            _ce(belief_logits_1, belief_targets[:, :, 1]) +
-            (_ce(belief_logits_2, belief_targets[:, :, 2]) if belief_logits_2 is not None and belief_targets.size(-1) >= 3 else 0.0)
+    # === Policy losses (means over their own samples) ===
+    if n_self > 0:
+        self_loss = F.cross_entropy(
+            self_logits[our_mask].reshape(-1, self_logits.size(-1)),
+            target_actions[our_mask].reshape(-1)
         )
+    else:
+        self_loss = torch.tensor(0.0, device=device)
 
-    total = self_loss + opp_loss + value_loss + belief_loss_weight * belief_loss
+    if n_opp > 0:
+        opp_loss = F.cross_entropy(
+            opp_logits[opp_mask].reshape(-1, opp_logits.size(-1)),
+            target_actions[opp_mask].reshape(-1)
+        )
+    else:
+        opp_loss = torch.tensor(0.0, device=device)
+
+    # === Value loss (mean over valid steps) ===
+    if (value_pred is not None) and (value_target is not None) and (n_value > 0):
+        value_loss = F.mse_loss(value_pred[valid], value_target[valid])
+    else:
+        value_loss = torch.tensor(0.0, device=device)
+
+    # === Belief losses (mean per head over *our* steps), then average across heads ===
+    belief_losses = []
+    if (belief_targets is not None) and (n_self > 0):
+        flat_our = our_mask.reshape(-1)
+
+        def _head_ce(head_logits, tgt_slice):
+            if head_logits is None:
+                return None
+            flat_logits  = head_logits.reshape(-1, head_logits.size(-1))[flat_our]
+            flat_targets = tgt_slice.reshape(-1)[flat_our]
+            if flat_targets.numel() == 0:
+                return None
+            return F.cross_entropy(flat_logits, flat_targets)
+
+        b0 = _head_ce(belief_logits_0, belief_targets[:, :, 0]) if belief_targets.size(-1) >= 1 else None
+        b1 = _head_ce(belief_logits_1, belief_targets[:, :, 1]) if belief_targets.size(-1) >= 2 else None
+        b2 = _head_ce(belief_logits_2, belief_targets[:, :, 2]) if (belief_logits_2 is not None and belief_targets.size(-1) >= 3) else None
+
+        for b in (b0, b1, b2):
+            if b is not None:
+                belief_losses.append(b)
+
+    if len(belief_losses) > 0:
+        belief_loss = torch.stack(belief_losses).mean()  # average across heads so adding heads doesn't inflate total
+    else:
+        belief_loss = torch.tensor(0.0, device=device)
+
+    # === Adaptive weights based on effective sample amounts ===
+    # Our-turns got rarer going 3P->4P; keep self & belief influence stable by ~1/p(our_turn).
+    # Use empirical p_our_hat for robustness to padding/truncation.
+    p_our_hat = n_self / max(n_total, 1)
+    inv_p_our = 1.0 / max(p_our_hat, 1e-6)
+
+    self_w   = inv_p_our                # e.g., ~num_players if batches are balanced
+    opp_w    = 1.0                      # keep opponents at 1.0 (tune if needed)
+    value_w  = 1.0                      # value stays at 1.0 by default
+    belief_w = inv_p_our                # belief is only on our turns, scale like self
+
+    total = self_w * self_loss + opp_w * opp_loss + value_w * value_loss + belief_w * belief_loss
     return total, self_loss, opp_loss, value_loss, belief_loss
 
 def compute_accuracy(logits, targets, mask=None):
