@@ -198,224 +198,203 @@ class BucketSampler(Sampler):
         return (n + self.batch_size - 1) // self.batch_size
 
 class AutoregressiveGameDataset(Dataset):
-    """Dataset for autoregressive training with optional lazy loading."""
-
-    def __init__(
-        self,
-        data=None,
-        opponent_mapping=None,
-        num_opponent_types=None,
-        device="cpu",
-        data_dir=None,
-        max_files=None,
-        max_samples=None,
-    ):
-        self.opponent_mapping = opponent_mapping or {}
+    """
+    Dataset for sequence-based autoregressive game model training.
+    
+    Processes round sequences into tensors for model training, handling
+    variable-length sequences and using externally provided belief vectors.
+    """
+    
+    
+    def __init__(self, data, opponent_mapping, num_opponent_types, device):
+        self.sequences = []
+        self.opponent_mapping = opponent_mapping
         self.num_opponent_types = num_opponent_types
         self.device = device
 
-        self.data = data
-        self.data_dir = data_dir
-        self.max_samples = max_samples
-        self.file_paths = []
-        self.index_map = []  # list of indices or (file_idx, seq_idx)
-        self.lengths = []
-
-        if data_dir is not None:
-            self._init_from_directory(data_dir, max_files, max_samples)
-        else:
-            self._init_from_data(data or [])
-
-    def _init_from_data(self, data_list):
-        self.data = data_list
-        self.index_map = list(range(len(self.data)))
-        self.lengths = [len(d["sequence"]) for d in self.data]
-        self._file_cache = {}
-
-    def _init_from_directory(self, data_dir, max_files, max_samples):
-        self.file_paths = [
-            os.path.join(data_dir, f)
-            for f in os.listdir(data_dir)
-            if f.endswith(".pkl") and "cache" not in f
-        ]
-        if not self.file_paths:
-            raise FileNotFoundError(f"No .pkl files found in {data_dir}")
-        if max_files is not None:
-            self.file_paths = sorted(self.file_paths)[-max_files:]
-
-        total = 0
-        print("Indexing data files...")
-        for file_idx, path in enumerate(tqdm(self.file_paths, desc="Scanning files")):
-            objs = _load_all_objects_from_file(path)
-            rounds = _normalize_to_round_sequences(objs)
-            for seq_idx, rd in enumerate(rounds):
-                self.index_map.append((file_idx, seq_idx))
-                self.lengths.append(len(rd["sequence"]))
-                total += 1
-                if max_samples is not None and total >= max_samples:
-                    break
-            if max_samples is not None and total >= max_samples:
-                break
-        self._file_cache = {}
-
-    def _get_round_data(self, idx):
-        if self.data is not None:
-            return self.data[idx]
-        file_idx, seq_idx = self.index_map[idx]
-        if file_idx not in self._file_cache:
-            path = self.file_paths[file_idx]
-            objs = _load_all_objects_from_file(path)
-            self._file_cache[file_idx] = _normalize_to_round_sequences(objs)
-        return self._file_cache[file_idx][seq_idx]
-
-    def __len__(self):
-        return len(self.index_map)
-
-    def __getitem__(self, idx):
-        round_data = self._get_round_data(idx)
-        sequence = round_data["sequence"]
-        seq_len = len(sequence)
-
+        # Map opponent plays (true but hidden) -> hidden tokens 7/8/9
         TRANSFORM_MAP = {0: 7, 3: 7, 1: 8, 4: 8, 2: 9, 5: 9}
 
-        raw_actions = []
-        raw_target_actions = []
-        for step in sequence:
-            is_train = step["agent_id"] == 0
-            if "action" in step:
-                a = step["action"]
-                b = a
-            if not is_train and a != 6:
-                b = TRANSFORM_MAP.get(a, a)
-            raw_target_actions.append(a)
-            raw_actions.append(b)
+        # Debug counters
+        self.total_sequences = 0
+        self.sequence_lengths = []
 
-        PAD = 10
-        input_actions = [PAD] + raw_actions[:-1]
-        target_actions = raw_target_actions.copy()
+        for round_data in tqdm(data, desc="Processing sequences"):
+            sequence = round_data["sequence"]
+            seq_len = len(sequence)
 
-        obs_list = []
-        action_mask_list = []
-        agent_type_list = []
-        position_list = []
-        belief_list = []
-        has_belief = False
-        latest_belief_vector = None
+            self.total_sequences += 1
+            self.sequence_lengths.append(seq_len)
 
-        for i, step in enumerate(sequence):
-            agent_id = step.get("agent_id", 0)
-            agent_type_list.append(agent_id)
-            position_list.append(i)
+            # ---- Build normalized action streams (model inputs/targets) ----
+            raw_actions = []
+            raw_target_actions = []
+            for step in sequence:
+                is_train = step["agent_id"] == 0
 
-            obs = np.array(step.get("observation", np.zeros(9, np.float32)), dtype=np.float32)
-            obs_list.append(obs)
+                if "action" in step:
+                    a = step["action"]
+                    b = a
+                # Hide opponents' plays (use 7/8/9) in the input token stream
+                if not is_train and a != 6:
+                    b = TRANSFORM_MAP.get(a, a)
 
-            if agent_id == 0 and "action_mask" in step:
-                action_mask_list.append(step["action_mask"])
-            else:
-                action_mask_list.append([0] * 7)
+                raw_target_actions.append(a)  # targets always 0..6
+                raw_actions.append(b)         # inputs: 0..5 for our plays, 7/8/9 for opp, 6 for challenge
+                
+            PAD = 10
+            input_actions  = [PAD] + raw_actions[:-1]
+            target_actions = raw_target_actions.copy()
 
-            if "belief" in step:
-                has_belief = True
-                names = step["belief"]
-                full_belief = []
-                for opp_idx in range(3):
-                    if opp_idx < len(names):
-                        name = names[opp_idx]
-                        idx = self.opponent_mapping.get(name, 0)
-                        full_belief.append(idx)
-                    else:
-                        full_belief.append(0)
-                latest_belief_vector = np.array(full_belief, dtype=np.int64)
-                belief_list.append(latest_belief_vector)
-            elif has_belief and latest_belief_vector is not None:
-                belief_list.append(latest_belief_vector)
+            # ---- Build per-step features ----
+            obs_list = []
+            action_mask_list = []
+            agent_type_list = []
+            position_list = []
+            belief_list = []
+            has_belief = False
+            latest_belief_vector = None
 
-        obs_tensor = torch.tensor(np.stack(obs_list), dtype=torch.float32)
-        action_tensor = torch.tensor(input_actions, dtype=torch.long)
-        target_tensor = torch.tensor(target_actions, dtype=torch.long)
-        mask_tensor = torch.tensor(np.array(action_mask_list), dtype=torch.bool)
-        agent_type_tensor = torch.tensor(agent_type_list, dtype=torch.long)
-        position_tensor = torch.tensor(position_list, dtype=torch.long)
+            for i, step in enumerate(sequence):
+                # Agent type and position
+                agent_id = step.get("agent_id", 0)
+                agent_type_list.append(agent_id)
+                position_list.append(i)
 
-        belief_tensor = None
-        if has_belief and latest_belief_vector is not None:
-            belief_tensor = torch.tensor(np.stack(belief_list), dtype=torch.long)
+                # Observations (only on our turns)
+                obs = np.array(step.get("observation", np.zeros(9, np.float32)), dtype=np.float32)
+                obs_list.append(obs)
 
-        attention_mask = torch.triu(
-            torch.ones(seq_len, seq_len, dtype=torch.bool),
-            diagonal=1,
-        )
+                # Action mask (only our turns)
+                if agent_id == 0 and "action_mask" in step:
+                    action_mask_list.append(step["action_mask"])
+                else:
+                    action_mask_list.append([0] * 7)
 
-        seq_dict = {
-            "obs": obs_tensor,
-            "action": action_tensor,
-            "target_action": target_tensor,
-            "action_mask": mask_tensor,
-            "agent_type": agent_type_tensor,
-            "position": position_tensor,
-            "attention_mask": attention_mask,
-            "length": seq_len,
-            "round_id": round_data.get("round_id", round_data.get("game_id", None)),
-            "belief": belief_tensor,
-        }
+                # Belief targets (carry forward last if missing)
+                if "belief" in step:
+                    has_belief = True
+                    names = step["belief"]
+                    full_belief = []
+                    for opp_idx in range(3):
+                        if opp_idx < len(names):
+                            name = names[opp_idx]
+                            idx = self.opponent_mapping.get(name, 0)
+                            full_belief.append(idx)
+                        else:
+                            full_belief.append(0)
+                    latest_belief_vector = np.array(full_belief, dtype=np.int64)
+                    belief_list.append(latest_belief_vector)
+                elif has_belief and latest_belief_vector is not None:
+                    belief_list.append(latest_belief_vector)
 
-        return seq_dict
+            # ---- Convert to tensors ----
+            obs_tensor        = torch.tensor(np.stack(obs_list),          dtype=torch.float32, device=device)
+            action_tensor     = torch.tensor(input_actions,               dtype=torch.long,    device=device)
+            target_tensor     = torch.tensor(target_actions,              dtype=torch.long,    device=device)
+            mask_tensor       = torch.tensor(np.array(action_mask_list),  dtype=torch.bool,    device=device)
+            agent_type_tensor = torch.tensor(agent_type_list,             dtype=torch.long,    device=device)
+            position_tensor   = torch.tensor(position_list,               dtype=torch.long,    device=device)
+
+            belief_tensor = None
+            if has_belief and latest_belief_vector is not None:
+                belief_tensor = torch.tensor(np.stack(belief_list), dtype=torch.long, device=device)
+
+            attention_mask = torch.triu(
+                torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
+                diagonal=1
+            )
+
+            seq_dict = {
+                "obs":            obs_tensor,
+                "action":         action_tensor,
+                "target_action":  target_tensor,
+                "action_mask":    mask_tensor,
+                "agent_type":     agent_type_tensor,
+                "position":       position_tensor,
+                "attention_mask": attention_mask,
+                "length":         seq_len,
+                "round_id":       round_data.get("round_id", round_data.get("game_id", None)),
+                "belief":         belief_tensor
+            }
+
+            self.sequences.append(seq_dict)
+
+        print(f"Processed {len(self.sequences)} sequences (from {self.total_sequences} total)")
+        if self.sequence_lengths:
+            avg_len = sum(self.sequence_lengths) / len(self.sequence_lengths)
+            print(f"Avg sequence length: {avg_len:.2f} steps, "
+                f"min={min(self.sequence_lengths)}, max={max(self.sequence_lengths)}")
+
+    
+    def __len__(self):
+        return len(self.sequences)
+    
+    def __getitem__(self, idx):
+        return self.sequences[idx]
 
 def collate_variable_length_sequences(batch):
-    """Collate variable-length sequences on CPU."""
-    if not batch:
-        return {}
+    """
+    Custom collate function for batching variable-length sequences.
 
-    max_seq_len = max(seq["length"] for seq in batch)
+    Pads to the max length in the batch and returns masks.
+    """
+    # Find max sequence length in this batch
+    max_seq_len = max(seq['length'] for seq in batch)
+
+    # Get batch size
     batch_size = len(batch)
-    obs_dim = batch[0]["obs"].shape[1]
-    belief_dim = batch[0]["belief"].shape[1] if batch[0]["belief"] is not None else 0
 
-    batched_obs = torch.zeros(batch_size, max_seq_len, obs_dim)
-    batched_action = torch.zeros(batch_size, max_seq_len, dtype=torch.long)
-    batched_target_action = torch.zeros(batch_size, max_seq_len, dtype=torch.long)
-    batched_action_mask = torch.zeros(batch_size, max_seq_len, 7, dtype=torch.bool)
-    batched_agent_type = torch.zeros(batch_size, max_seq_len, dtype=torch.long)
-    batched_position = torch.zeros(batch_size, max_seq_len, dtype=torch.long)
-    padding_mask = torch.ones(batch_size, max_seq_len, dtype=torch.bool)
-    batched_belief = (
-        torch.zeros(batch_size, max_seq_len, belief_dim, dtype=torch.long)
-        if belief_dim
-        else None
-    )
+    # Device & dims
+    first_seq = batch[0]
+    device = first_seq['obs'].device
+    obs_dim = first_seq['obs'].shape[1]
+    belief_dim = first_seq['belief'].shape[1] if first_seq['belief'] is not None else 2
 
+    # Initialize tensors
+    batched_obs           = torch.zeros(batch_size, max_seq_len, obs_dim, device=device)
+    batched_action        = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
+    batched_target_action = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
+    batched_action_mask   = torch.zeros(batch_size, max_seq_len, 7, dtype=torch.bool, device=device)
+    batched_belief        = torch.zeros(batch_size, max_seq_len, belief_dim, dtype=torch.long, device=device)
+    batched_agent_type    = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
+    batched_position      = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
+
+    # Padding mask (True=padding, False=valid)
+    padding_mask = torch.ones(batch_size, max_seq_len, dtype=torch.bool, device=device)
+
+    # Round IDs
     round_ids = []
-    for i, seq in enumerate(batch):
-        seq_len = seq["length"]
-        batched_obs[i, :seq_len] = seq["obs"]
-        batched_action[i, :seq_len] = seq["action"]
-        batched_target_action[i, :seq_len] = seq["target_action"]
-        batched_action_mask[i, :seq_len] = seq["action_mask"]
-        if belief_dim and seq["belief"] is not None:
-            batched_belief[i, :seq_len] = seq["belief"]
-        batched_agent_type[i, :seq_len] = seq["agent_type"]
-        batched_position[i, :seq_len] = seq["position"]
-        padding_mask[i, :seq_len] = False
-        round_ids.append(seq["round_id"])
 
+    # Fill tensors
+    for i, seq in enumerate(batch):
+        seq_len = seq['length']
+
+        batched_obs[i, :seq_len]           = seq['obs']
+        batched_action[i, :seq_len]        = seq['action']
+        batched_target_action[i, :seq_len] = seq['target_action']
+        batched_action_mask[i, :seq_len]   = seq['action_mask']
+        if seq['belief'] is not None:
+            batched_belief[i, :seq_len]    = seq['belief']
+        batched_agent_type[i, :seq_len]    = seq['agent_type']
+        batched_position[i, :seq_len]      = seq['position']
+
+        padding_mask[i, :seq_len] = False
+        round_ids.append(seq['round_id'])
+    
+    # Return as a dictionary
     batch_dict = {
-        "obs": batched_obs,
-        "action": batched_action,
-        "target_action": batched_target_action,
-        "action_mask": batched_action_mask,
-        "agent_type": batched_agent_type,
-        "position": batched_position,
-        "padding_mask": padding_mask,
-        "round_ids": round_ids,
-        "belief": batched_belief,
+        'obs': batched_obs,
+        'action': batched_action,
+        'target_action': batched_target_action,
+        'action_mask': batched_action_mask,
+        'agent_type': batched_agent_type,
+        'position': batched_position,
+        'padding_mask': padding_mask,
+        'round_ids': round_ids,
+        'belief': batched_belief   # Belief targets
     }
     return batch_dict
-
-
-def move_batch_to_device(batch, device):
-    """Move a collated batch of tensors to the specified device."""
-    return {k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v for k, v in batch.items()}
 
 def _iter_pickled_objects(file_path):
     """Yield every pickled object from a file that may contain multiple dumps."""
@@ -700,41 +679,16 @@ def train_autoregressive_model(
         num_opponent_types = max(opponent_mapping.values()) + 1
         logger.info(f"Setting num_opponent_types to {num_opponent_types}")
 
-    full_dataset = AutoregressiveGameDataset(
-        data_dir=data_dir,
-        opponent_mapping=opponent_mapping,
-        num_opponent_types=num_opponent_types,
-        max_files=max_files,
-        max_samples=max_samples,
-    )
-
-    indices = list(range(len(full_dataset)))
-    np.random.shuffle(indices)
-    val_size = int(len(indices) * validation_split)
-    val_indices = indices[:val_size]
-    train_indices = indices[val_size:]
-
-    train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
-    val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
-    train_lengths = [full_dataset.lengths[i] for i in train_indices]
-
-    train_sampler = BucketSampler(train_lengths, batch_size=batch_size, shuffle=True)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_sampler=train_sampler,
-        num_workers=4,
-        collate_fn=collate_variable_length_sequences,
-        pin_memory=True,
-        persistent_workers=True,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-        collate_fn=collate_variable_length_sequences,
-        pin_memory=True,
-    )
+    all_data = load_autoreg_data(data_dir, max_files, max_samples)
+    train_data, val_data = train_val_split(all_data, validation_split, max_val_samples=1000)
+    logger.info(f"Creating datasets with {len(train_data)} training and {len(val_data)} validation sequences")
+    
+    train_dataset = AutoregressiveGameDataset(train_data, opponent_mapping, num_opponent_types, device)
+    val_dataset = AutoregressiveGameDataset(val_data, opponent_mapping, num_opponent_types, device)
+    
+    train_sampler = BucketSampler(train_dataset.sequences, batch_size=batch_size, shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,  num_workers=0, collate_fn=collate_variable_length_sequences)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=collate_variable_length_sequences)
 
     sample = next(iter(train_loader))
     obs_dim = sample['obs'].shape[2]
@@ -791,7 +745,6 @@ def train_autoregressive_model(
 
         train_progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Train)", leave=False)
         for batch in train_progress:
-            batch = move_batch_to_device(batch, device)
             with amp.autocast(device_type=device.type, dtype=pt_dtype):
                 # Support models with or without the 3rd head during transition
                 try:
@@ -906,7 +859,6 @@ def train_autoregressive_model(
         val_progress = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Val)", leave=False)
         with torch.no_grad():
             for batch in val_progress:
-                batch = move_batch_to_device(batch, device)
                 with amp.autocast(device_type=device.type, dtype=pt_dtype):
                     try:
                         (self_logits, opp_logits, value_pred,
