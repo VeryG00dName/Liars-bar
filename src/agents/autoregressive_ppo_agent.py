@@ -167,7 +167,7 @@ class PPOAutoregressiveAgent(BaseAgent):
 
     def _prepare_model_input(self, history: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         """Prepares tensors for the autoregressive model, matching the training format."""
-        PAD = 0 # action pad
+        PAD = 10 # action pad
 
         filtered = list(history)
 
@@ -196,11 +196,11 @@ class PPOAutoregressiveAgent(BaseAgent):
             agent_type = self.env_agent_id_map[step_data["agent_id_env"]]
             agent_type_seq[0, i] = agent_type
             action_seq[0, i]     = input_actions[i]
-
+            obs_np = np.array(step_data["observation"], dtype=np.float32)
+            obs_seq[0, i] = torch.from_numpy(obs_np)
+            
             if agent_type == 0:
-                # Our turn: real obs + real mask
-                obs_np = np.array(step_data["observation"], dtype=np.float32)
-                obs_seq[0, i] = torch.from_numpy(obs_np)
+                # Our turn: real mask
                 mask_np = np.array(step_data.get("action_mask", [0]*self.action_dim), dtype=bool)
                 action_mask_seq[0, i] = torch.from_numpy(mask_np)
 
