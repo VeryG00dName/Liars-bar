@@ -2,20 +2,44 @@
 import pickle
 import pprint
 import torch
-from src.training.train_autoregressive_model_full import AutoregressiveGameDataset, create_opponent_mapping
+import os
+import numpy as np
 
-MATCHUP_FILTER = "Classic_vs_GreedyCardSpammer"
+# Import the necessary components from your training script
+# Make sure the path is correct for your project structure
+from src.training.train_autoregressive_model_full import (
+    AutoregressiveGameDataset, 
+    create_opponent_mapping,
+    _iter_pickled_objects,
+    _normalize_to_round_sequences
+)
+
+# Set print options to show full arrays without truncation for detailed inspection
+np.set_printoptions(threshold=np.inf)
+torch.set_printoptions(threshold=10_000)
+
 
 def main():
-    # Path to the pickle file (adjust the path if needed)
-    filename = "ps_autoreg_data/ps_autoreg_data_mixed_full_game_blielfs/combined_data.pkl"
+    # Path to the directory containing your new data
+    data_dir = "ps_autoreg_data/ps_autoreg_data_v4_full_game_4_player_postions/"
     
-    # Load raw data
+    # Find the main data file in that directory
     try:
-        with open(filename, "rb") as f:
-            raw_data = pickle.load(f)
+        # Assuming one .pkl file per directory for this debug script
+        filename = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.pkl')][0]
+        print(f"Found data file: {filename}")
+    except IndexError:
+        print(f"Error: No .pkl file found in directory: {data_dir}")
+        return
+
+    # --- NEW: Correctly load multi-object pickle files ---
+    print("Loading raw data from file...")
+    try:
+        all_objects = list(_iter_pickled_objects(filename))
+        raw_data = _normalize_to_round_sequences(all_objects)
+        print(f"Successfully loaded {len(raw_data)} game sequences.")
     except Exception as e:
-        print(f"Error loading file: {e}")
+        print(f"Error loading and normalizing file: {e}")
         return
 
     # Validate data format
@@ -23,17 +47,10 @@ def main():
         print("The data format is not as expected or the file is empty.")
         return
 
-    # Filter unprocessed samples
-    filtered_unprocessed = [
-        s for s in raw_data if (
-            s.get("opponent_combo") == MATCHUP_FILTER or 
-            ("sequence" in s and isinstance(s["sequence"], list) and 
-             len(s["sequence"]) > 0 and 
-             "_vs_".join(s["sequence"][0].get("belief", [])) == MATCHUP_FILTER)
-        )
-    ][:1]  # limit to 1 samples
+    # Limit to the first 2 samples for inspection
+    filtered_unprocessed = raw_data[:2]
 
-    print(f"Unprocessed samples from matchup {MATCHUP_FILTER}:\n")
+    print(f"\nUnprocessed samples:\n")
     for i, sample in enumerate(filtered_unprocessed):
         print(f"Sample {i+1} (unprocessed):")
         pprint.pprint(sample)
@@ -43,32 +60,35 @@ def main():
         print("No matching samples found.")
         return
 
-    # Process samples using the same pipeline as training
-    data_dir = "ps_autoreg_data"
-    opponent_mapping = create_opponent_mapping(data_dir)
+    # --- Process samples using the same pipeline as training ---
+    parent_data_dir = "ps_autoreg_data"
+    opponent_mapping = create_opponent_mapping(parent_data_dir)
     num_opponent_types = max(opponent_mapping.values()) + 1
-    device = torch.device('cpu')
-
+    
+    # Use your Dataset constructor, passing the sample list directly
     dataset = AutoregressiveGameDataset(
-        filtered_unprocessed,
-        opponent_mapping,
-        num_opponent_types,
-        device
+        data=filtered_unprocessed, # Pass the list of samples directly
+        opponent_mapping=opponent_mapping,
+        num_opponent_types=num_opponent_types,
+        device="cpu" # Process on CPU for easy inspection
     )
 
-    processed = dataset.sequences
+    # The dataset now processes on the fly in __getitem__
+    processed = [dataset[i] for i in range(len(dataset))]
 
-    print(f"Processed samples from matchup {MATCHUP_FILTER}:\n")
+
+    print(f"Processed samples:\n")
     for i, seq in enumerate(processed):
         print(f"Sample {i+1} (processed):")
-        # Convert tensors to lists for pretty printing
-        display_seq = {}
+        # To print the full tensors directly, we can use a custom pretty printer logic
+        # However, pprint on a dict containing tensors often truncates.
+        # A simple loop gives full control.
+        print("{")
         for key, value in seq.items():
-            if hasattr(value, 'tolist'):
-                display_seq[key] = value.tolist()
-            else:
-                display_seq[key] = value
-        pprint.pprint(display_seq)
+            # Use repr() to get the full string representation of the tensor
+            # The torch.set_printoptions at the top ensures this is not truncated
+            print(f" '{key}': {repr(value)},")
+        print("}")
         print("\n" + "-"*40 + "\n")
 
 
