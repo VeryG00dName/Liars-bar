@@ -34,7 +34,7 @@ class PerfectSearch:
         self.action_sequence = []
         self.sequence_position = 0
 
-    def _select_opponent_action(self, env, agent, opponent_action_cache):
+    def _select_opponent_action(self, env, agent):
         # Ensure we've observed the agent to generate infos.
         env.observe(agent, new=True)
 
@@ -49,16 +49,7 @@ class PerfectSearch:
             agent, hand, table_card, last_action_val,
             last_action_agent_name, current_penalties
         )
-
-        if obs_key in opponent_action_cache:
-            opponent_action = opponent_action_cache[obs_key]
-            self._log(f"[Sim Cache] Using cached action {opponent_action} for opponent {agent} based on key: {obs_key}")
-            action_mask = env.infos[agent].get('action_mask', [0] * 7)
-            if sum(action_mask) > 0 and action_mask[opponent_action] != 1:
-                 self._log(f"[Sim Cache WARNING] Cached action {opponent_action} for {agent} is INVALID in current mask {action_mask}. Recalculating.")
-            else:
-                 return opponent_action
-
+        
         # --- Calculate Action ---
         opponent_model = self.opponent_models[agent]
         observation = env.observe(agent, new=True)[agent]
@@ -119,19 +110,15 @@ class PerfectSearch:
             valid_actions = [i for i, m in enumerate(action_mask) if m == 1]
             opponent_action = valid_actions[0]
 
-        opponent_action_cache[obs_key] = opponent_action
-        self._log(f"[Sim Cache] Caching action {opponent_action} for opponent {agent} with key: {obs_key}")
         return opponent_action
 
-    def simulate_round(self, env_state, action, opponent_action_cache=None, depth=0, max_depth=40):
+    def simulate_round(self, env_state, action, depth=0, max_depth=40):
         """
         Recursively simulates possible action sequences from the initial action.
         Includes heuristic early exit if opponent challenges a bluff but table cards were possible.
         Stops simulation early if opponent penalties are detected or game ends.
         """
-        if opponent_action_cache is None:
-            opponent_action_cache = {}
-
+        
         self.simulations_performed += 1
         sim_env = self.base_env.clone()
         sim_env.set_state(env_state)
@@ -254,7 +241,7 @@ class PerfectSearch:
                     self._log(f"[Depth {depth}, SimStep {step_count}] Exploring recursive action {next_action} for {self.training_agent} (Depth {depth + 1})")
                     next_state = sim_env.get_state()
                     value, next_seq_cont, is_term, is_new_rnd = self.simulate_round(
-                        next_state, next_action, opponent_action_cache.copy(), depth + 1, max_depth
+                        next_state, next_action, depth + 1, max_depth
                     )
                     self._log(f"[Depth {depth}, SimStep {step_count}] Recursive Action {next_action} Result: V={value}, Term={is_term}, NewRnd={is_new_rnd}, Len={len(next_seq_cont)}")
 
@@ -282,7 +269,7 @@ class PerfectSearch:
                 self._log(f"[Depth {depth}, SimStep {step_count}] Opponent {current_agent}'s turn.")
                 try:
                     opp_penalty_before = sim_env.penalties.get(current_agent, 0)
-                    opponent_action = self._select_opponent_action(sim_env, current_agent, opponent_action_cache)
+                    opponent_action = self._select_opponent_action(sim_env, current_agent)
                     opp_action_type, _, _ = decode_action(opponent_action)
                     self._log(f"[Depth {depth}] Opponent {current_agent} selects action {opponent_action} ({opp_action_type})")
 
@@ -476,9 +463,9 @@ class PerfectSearch:
                     is_bluff = any(card != table_card and card != "Joker" for card in played_cards)
                     if is_bluff:
                         self._log("Heuristic Check: Opponent's last play appears to be a bluff. Evaluating challenge first.")
-                        challenge_sim_cache = {}
+
                         value, sequence, is_term, is_new_rnd = self.simulate_round(
-                            env_state, 6, challenge_sim_cache, depth=0
+                            env_state, 6, depth=0
                         )
                         self._log(f"Priority Challenge Result: V={value}, Term={is_term}, NewRnd={is_new_rnd}, Len={len(sequence)}")
                         if value >= self.OPPONENT_PENALTY_THRESHOLD:
@@ -507,10 +494,9 @@ class PerfectSearch:
                     self._log(f"Skipping re-simulation of challenge action {action} (already evaluated)")
                     continue
 
-                action_sim_cache = {}
                 self._log(f"--- Simulating Action (Order): {action} ---")
                 value, sequence, is_terminal, is_new_round = self.simulate_round(
-                    env_state, action, action_sim_cache, depth=0
+                    env_state, action, depth=0
                 )
                 self._log(f"--- Action {action} Result: V={value}, Term={is_terminal}, NewRnd={is_new_round}, Len={len(sequence)} ---")
 
@@ -568,8 +554,8 @@ class PerfectSearch:
 
             if fallback_action_chosen != best_action_found or best_action_found == -1:
                  self._log(f"Re-simulating fallback action {fallback_action_chosen} to get sequence/value.")
-                 fallback_sim_cache = {}
-                 value, sequence, _, _ = self.simulate_round(env_state, fallback_action_chosen, fallback_sim_cache, depth=0)
+                 
+                 value, sequence, _, _ = self.simulate_round(env_state, fallback_action_chosen, depth=0)
                  self._log(f"Fallback Action {fallback_action_chosen} Result: V={value}, Len={len(sequence)}")
 
                  # --- FIX: Check heuristic swap on fallback too ---
