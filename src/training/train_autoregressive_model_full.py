@@ -745,7 +745,7 @@ def train_autoregressive_model(
     train_loader = DataLoader(
         train_dataset,
         batch_sampler=train_sampler,
-        num_workers=4,
+        num_workers=6,
         collate_fn=collate_variable_length_sequences,
         pin_memory=True,
         persistent_workers=True,
@@ -754,7 +754,7 @@ def train_autoregressive_model(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=1,
+        num_workers=2,
         collate_fn=collate_variable_length_sequences,
         pin_memory=True,
         persistent_workers=True,
