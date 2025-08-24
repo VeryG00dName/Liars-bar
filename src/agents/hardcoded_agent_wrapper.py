@@ -26,7 +26,8 @@ class HardcodedAgentWrapper(BaseAgent):
         """
         Calls the wrapped hardcoded agent's play_turn method.
         """
-        raw_obs_np = observation[agent_id_env]
+        real_observation = env.observe(agent_id_env, bot=True)  # Ensure bot-specific observation is set
+        raw_obs_np = real_observation[agent_id_env]
         mask = info.get('action_mask', [1] * 7) # Default mask length 7 for Liar's Deck
         table_card = getattr(env, 'table_card', None) # Get table card if available
 
