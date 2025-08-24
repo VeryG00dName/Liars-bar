@@ -318,7 +318,7 @@ def generate_data(
                     step_data["action_source"] = "PS Plan Sequence"
                 else:
                     opp_model = opponent_models[current_agent]
-                    obs_opp = env.observe(current_agent, newer=True)[current_agent]
+                    obs_opp = env.observe(current_agent, bot=True)[current_agent]
                     obs_curr = env.observe(training_agent, newerest=True)[training_agent]
                     step_data["observation"] = np.round(obs_curr, 2).tolist()
                     mask = env.infos[current_agent]['action_mask']
