@@ -19,6 +19,7 @@ from src.env.liars_deck_env_utils_2 import (
 )
 from src.env.liars_deck_env_utils import (
     apply_action,
+    get_bot_observations,
     get_observations,
     get_new_observations,
     get_newer_observations,
@@ -140,7 +141,7 @@ class LiarsDeckEnv(AECEnv):
     def observation_space(self, agent):
         return self.observation_spaces[agent]
 
-    def observe(self, agent, new=False, newer=False, newest=False, newerest=False):
+    def observe(self, agent,bot=False, new=False, newer=False, newest=False, newerest=False):
         """
         Generates the observation for the agent.
         If new=True, it uses the new observation construction.
@@ -155,6 +156,8 @@ class LiarsDeckEnv(AECEnv):
             obs_dict = get_newer_observations(self, agent_specific=agent)
         elif new:
             obs_dict = get_new_observations(self, agent_specific=agent)
+        elif bot:
+            obs_dict = get_bot_observations(self, agent_specific=agent)
         else:
             obs_dict = get_observations(self, agent_specific=agent)
         

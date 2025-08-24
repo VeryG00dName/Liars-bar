@@ -375,6 +375,38 @@ def get_opponent_features(env, observing_agent):
     
     return features
 
+def get_bot_observations(env, agent_specific=None):
+    """
+    Observation for hard-coded bots (legacy/flat):
+      [hand(2), last_action_count(1), active_players(num_players)]
+    hand = [table/5, non_table/5], last_action_count ∈ {0,1,2,3}
+    """
+    observations = {}
+    agents_to_observe = [agent_specific] if agent_specific else env.agents
+
+    # Resolve scalar last play count once per call (same for all agents)
+    last_act = getattr(env, "last_action", None)
+    last_action_count = float(last_act) if last_act is not None else 0.0
+
+    for agent in agents_to_observe:
+        # Hand (normalized by /5)
+        current_hand = env.players_hands.get(agent, [])
+        hand_vector = encode_hand(current_hand, env.table_card).astype(np.float32)  # shape (2,)
+
+        # Active players (len(hand)/5) for all seats
+        active_players = np.array(
+            [len(env.players_hands.get(ag, [])) / 5.0 for ag in env.possible_agents],
+            dtype=np.float32
+        )
+
+        # Assemble: [hand(2), last_action_count(1), active_players(N)]
+        last_arr = np.array([last_action_count], dtype=np.float32)
+        obs = np.concatenate([hand_vector, last_arr, active_players], axis=0).astype(np.float32)
+
+        observations[agent] = np.round(obs, 2)
+
+    return observations
+
 def get_observations(env, agent_specific=None):
     """
     Generates observations for all agents or a specific agent.
