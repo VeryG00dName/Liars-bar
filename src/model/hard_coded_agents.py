@@ -72,17 +72,9 @@ class TableFirstConservativeChallenger:
 
 class StrategicChallenger:
     def __init__(self, agent_name, num_players, agent_index):
-        """
-        Initialize the StrategicChallenger.
-
-        Args:
-            agent_name (str): Name of the agent.
-            num_players (int): Total number of players in the game.
-            agent_index (int): The index of this agent (e.g., 2 for 'player_2').
-        """
         self.name = agent_name
         self.num_players = num_players
-        self.agent_index = agent_index  # Assign directly without parsing from name
+        self.agent_index = agent_index  # seat index 0..num_players-1
 
     def play_turn(self, observation, action_mask, table_card):
         """
@@ -93,40 +85,48 @@ class StrategicChallenger:
         4. Play 1 table card (action 0) if possible
         5. Final fallback to challenge
         """
-        # Extract observation components
+        # Sync with config in case constructor wasn’t passed live values
+        self.num_players = config.NUM_PLAYERS
+
+        # --- decode obs ---
         hand_vector = observation[:2]
-        last_action_count = int(round(observation[2]))  # Normalized to actual count
-        active_players_vector = observation[3:3+self.num_players]
-        
-        # Calculate actual card counts
+        last_action_count = int(round(observation[2]))
+        active_players_vector = observation[3:3 + self.num_players]
+
         table_cards = int(round(hand_vector[0] * 5))
         non_table_cards = int(round(hand_vector[1] * 5))
-        total_cards = table_cards + non_table_cards
-        
-        # 1. Challenge if last play was 2+ cards
-        if last_action_count >= 2:
+        active_counts = [int(round(c * 5)) for c in active_players_vector]
+
+        # --- 1) challenge if last play was 2+ cards (only if legal) ---
+        if action_mask[6] and last_action_count >= 2:
             return 6
 
-        # 2. Endgame challenge condition
-        active_counts = [int(round(c * 5)) for c in active_players_vector]
-        active_agents = [c for c in active_counts if c > 0]
-        
-        if len(active_agents) == 2:
+        # --- 2) endgame heuristic: exactly two players still have cards ---
+        alive = [c for c in active_counts if c > 0]
+        if action_mask[6] and len(alive) == 2:
+            # my_cards is safe: acting agent must be alive
             my_cards = active_counts[self.agent_index]
             opponent_cards = sum(active_counts) - my_cards
             if my_cards == 2 and opponent_cards == 1:
                 return 6
 
-        # 3. Play 1 non-table card (action 3)
+        # --- 3) play 1 non-table if possible ---
         if action_mask[3] and non_table_cards >= 1:
             return 3
-            
-        # 4. Play 1 table card (action 0)
+
+        # --- 4) play 1 table if possible ---
         if action_mask[0] and table_cards >= 1:
             return 0
-            
-        # 5. Final challenge
-        return 6
+
+        # --- 5) if challenge wasn’t legal earlier but is now, try it ---
+        if action_mask[6]:
+            return 6
+
+        # --- 6) last resort: first valid action ---
+        for a in range(7):
+            if action_mask[a]:
+                return a
+        return 6  # ultra-fallback (shouldn’t happen)
 
 class SelectiveTableConservativeChallenger:
     def __init__(self, agent_name):
@@ -256,47 +256,45 @@ class Classic:
         self.name = agent_name
 
     def play_turn(self, observation, action_mask, table_card):
+        """ 
+        strategy: 
+        1) Challenge if last play used more than 1 card
+        2) If exactly two players still have cards, challenge if the opponent has exactly 1
+        3) Otherwise: play one table card if we have it; else one non-table card
+        4) Fallback: challenge
         """
-        Classic Bot Strategy:
-        1. Challenge if the opponent has exactly 1 card left.
-        2. Challenge if the opponent's last played move involved more than 1 card.
-        3. Otherwise, play 1 table card at a time (action 0) as long as table cards remain.
-        4. If no table cards remain, play 1 non-table card at a time (action 3).
-        5. Fallback: challenge (action 6).
-
-        Note: This implementation assumes a 2-player game.
-        """
-        # Decode card counts (using the same scaling as the other bots).
+        # decode counts (bots expect /5 normalization in Python)
         table_cards = int(round(observation[0] * 5))
         non_table_cards = int(round(observation[1] * 5))
-        total_cards = table_cards + non_table_cards
+        my_cards = table_cards + non_table_cards
 
-        # Determine how many cards the opponent last played.
+        # scalar last action count (already a scalar at index 2)
         last_action_count = int(round(observation[2]))
 
-        # Extract active players' card counts.
-        # Assuming a 2-player game, observation[3:5] contains normalized counts for both players.
-        active_counts = [int(round(c * 5)) for c in observation[3:5]]
-        # Our card count is total_cards; thus the opponent's card count is:
-        opponent_cards = sum(active_counts) - total_cards
+        # number of players is fixed from config (3 or 4 supported)
+        num_players = config.NUM_PLAYERS
 
-        # 1. Challenge if the opponent has exactly 1 card left.
-        if opponent_cards == 1:
+        # per-player hand sizes (normalized by /5 in obs) -> ints 0..5
+        active_counts = [int(round(c * 5)) for c in observation[3:3 + num_players]]
+
+        # 1) Challenge if last play used more than 1 card
+        if action_mask[6] == 1 and last_action_count > 1:
             return 6
 
-        # 2. Challenge if the opponent's last play involved more than 1 card.
-        if last_action_count > 1:
-            return 6
+        # 2) If exactly two players still have cards, challenge if the opponent has exactly 1
+        nonzero = [c for c in active_counts if c > 0]
+        if action_mask[6] == 1 and len(nonzero) == 2:
+            opponent_cards = sum(active_counts) - my_cards
+            if opponent_cards == 1:
+                return 6
 
-        # 3. If we have any table cards, play 1 table card (action 0).
+        # 3) Otherwise: play one table card if we have it; else one non-table card
         if table_cards > 0 and action_mask[0] == 1:
             return 0
-
-        # 4. If no table cards remain but we have non-table cards, play 1 non-table card (action 3).
         if non_table_cards > 0 and action_mask[3] == 1:
             return 3
 
-        # 5. Fallback: challenge.
+        # 4) Fallback: challenge
         return 6
 
 class RandomAgent:
