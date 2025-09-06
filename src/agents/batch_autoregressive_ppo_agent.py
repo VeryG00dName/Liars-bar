@@ -8,7 +8,7 @@ from src.agents.base_agent import BaseAgent
 from src.model.ppo_autoregressive_model import PPOAutoregressiveModel
 from src.model.model_factory import ModelFactory as MFactoryUtil
 from src.misc import lb  # Correct import path
-
+import torch.amp as amp
 logger = logging.getLogger(__name__)
 
 class BatchPPOAutoregressiveAgent(BaseAgent):
@@ -211,104 +211,105 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
         and padding sequences for a single, efficient model forward pass.
         Now threads per-timestep action masks (our turns real, opponent turns zero).
         """
+        
         batch_size = len(env_indices)
         if batch_size == 0:
             return np.array([]), np.array([]), np.array([]), np.array([])
+        with amp.autocast(device_type=self.device.type, dtype=torch.float16), torch.no_grad():
+            # 1) Build per-env sequences (includes per-step action_masks)
+            all_obs, all_actions, all_agents, all_pos, all_masks = [], [], [], [], []
+            valid_lengths = []
+            for i in range(batch_size):
+                env_idx = env_indices[i]
+                my_seat = seat_indices[i]
+                obs_seq, action_seq, agent_seq, pos_seq, action_masks = self._prepare_single_sequence(
+                    arena.get_env(env_idx), my_seat
+                )
+                all_obs.append(obs_seq)            # [Li, obs_dim]
+                all_actions.append(action_seq)     # [Li]
+                all_agents.append(agent_seq)       # [Li]
+                all_pos.append(pos_seq)            # [Li]
+                all_masks.append(action_masks)     # [Li, A] (bool; our turns real, opponent turns zeros)
+                valid_lengths.append(len(action_seq))
+                Li = len(action_seq)
+                
+                mi_i = {
+                "obs_sequence":   obs_seq.unsqueeze(0).to(self.device),        # [1, Li, obs_dim]
+                "action_sequence":action_seq.unsqueeze(0).to(self.device),     # [1, Li]
+                "agent_types":    agent_seq.unsqueeze(0).to(self.device),      # [1, Li]
+                "positions":      pos_seq.unsqueeze(0).to(self.device),        # [1, Li]
+                "action_masks":   action_masks.unsqueeze(0).to(self.device),   # [1, Li, A]
+                "padding_mask":   torch.zeros(1, Li, dtype=torch.bool, device=self.device),  # [1, Li]
+                "valid_lengths":  torch.tensor([Li], dtype=torch.long, device=self.device),  # [1]
+                }
+                # Store *detached* to avoid autograd references; CPU is fine (trainer moves to device)
+                self._last_model_input[(env_idx, my_seat)] = {
+                    k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v)
+                    for k, v in mi_i.items()
+                }
 
-        # 1) Build per-env sequences (includes per-step action_masks)
-        all_obs, all_actions, all_agents, all_pos, all_masks = [], [], [], [], []
-        valid_lengths = []
-        for i in range(batch_size):
-            env_idx = env_indices[i]
-            my_seat = seat_indices[i]
-            obs_seq, action_seq, agent_seq, pos_seq, action_masks = self._prepare_single_sequence(
-                arena.get_env(env_idx), my_seat
-            )
-            all_obs.append(obs_seq)            # [Li, obs_dim]
-            all_actions.append(action_seq)     # [Li]
-            all_agents.append(agent_seq)       # [Li]
-            all_pos.append(pos_seq)            # [Li]
-            all_masks.append(action_masks)     # [Li, A] (bool; our turns real, opponent turns zeros)
-            valid_lengths.append(len(action_seq))
-            Li = len(action_seq)
+            # 2) Pad to max L in batch (masks pad with False)
+            device = self.device
+            obs_padded     = torch.nn.utils.rnn.pad_sequence(all_obs,     batch_first=True, padding_value=0.0 ).to(device)
+            actions_padded = torch.nn.utils.rnn.pad_sequence(all_actions, batch_first=True, padding_value=0  ).to(device)
+            agents_padded  = torch.nn.utils.rnn.pad_sequence(all_agents,  batch_first=True, padding_value=0   ).to(device)
+            pos_padded     = torch.nn.utils.rnn.pad_sequence(all_pos,     batch_first=True, padding_value=0   ).to(device)
+
+            # (NEW) if you collected per-timestep masks:
+            if all_masks and all_masks[0] is not None:
+                masks_padded = torch.nn.utils.rnn.pad_sequence(all_masks, batch_first=True,
+                                                            padding_value=0).to(self.device)  # [B, Lmax, A]
+            else:
+                masks_padded = None
+
+            # 3) Create padding mask from ACTION length (critical: match model’s action_sequence length)
+            valid_lengths = torch.tensor(valid_lengths, dtype=torch.long, device=self.device)  # [B]
+            Lmax = actions_padded.size(1)
+            arangeL = torch.arange(Lmax, device=self.device).unsqueeze(0)                      # [1, Lmax]
+            padding_mask = arangeL >= valid_lengths.unsqueeze(1)                               # [B, Lmax]  True = PAD
             
-            mi_i = {
-            "obs_sequence":   obs_seq.unsqueeze(0).to(self.device),        # [1, Li, obs_dim]
-            "action_sequence":action_seq.unsqueeze(0).to(self.device),     # [1, Li]
-            "agent_types":    agent_seq.unsqueeze(0).to(self.device),      # [1, Li]
-            "positions":      pos_seq.unsqueeze(0).to(self.device),        # [1, Li]
-            "action_masks":   action_masks.unsqueeze(0).to(self.device),   # [1, Li, A]
-            "padding_mask":   torch.zeros(1, Li, dtype=torch.bool, device=self.device),  # [1, Li]
-            "valid_lengths":  torch.tensor([Li], dtype=torch.long, device=self.device),  # [1]
+            # 4) Single model forward pass (include valid_lengths and action_masks in the input)
+            model_input = {
+                'obs_sequence':   obs_padded,
+                'action_sequence':actions_padded,
+                'agent_types':    agents_padded,
+                'positions':      pos_padded,
+                'action_masks':   masks_padded,      # NEW
+                'padding_mask':   padding_mask,
+                'valid_lengths':  valid_lengths,   # mirrors pre-batch path
             }
-            # Store *detached* to avoid autograd references; CPU is fine (trainer moves to device)
-            self._last_model_input[(env_idx, my_seat)] = {
-                k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v)
-                for k, v in mi_i.items()
-            }
+            
 
-        # 2) Pad to max L in batch (masks pad with False)
-        device = self.device
-        obs_padded     = torch.nn.utils.rnn.pad_sequence(all_obs,     batch_first=True, padding_value=0.0 ).to(device)
-        actions_padded = torch.nn.utils.rnn.pad_sequence(all_actions, batch_first=True, padding_value=0  ).to(device)
-        agents_padded  = torch.nn.utils.rnn.pad_sequence(all_agents,  batch_first=True, padding_value=0   ).to(device)
-        pos_padded     = torch.nn.utils.rnn.pad_sequence(all_pos,     batch_first=True, padding_value=0   ).to(device)
+            action_logits, _, state_values, b0, b1, b2 = self.model(**model_input)
 
-        # (NEW) if you collected per-timestep masks:
-        if all_masks and all_masks[0] is not None:
-            masks_padded = torch.nn.utils.rnn.pad_sequence(all_masks, batch_first=True,
-                                                        padding_value=0).to(self.device)  # [B, Lmax, A]
-        else:
-            masks_padded = None
+            # 5) Per-item sampling at the last valid timestep, masked
+            actions_out, log_probs_out, values_out, beliefs_out = [], [], [], []
+            for i in range(batch_size):
+                last_step_idx = valid_lengths[i] - 1
+                logits_i = action_logits[i, last_step_idx]          # [A]
+                value_i  = state_values[i, last_step_idx].item()
 
-        # 3) Create padding mask from ACTION length (critical: match model’s action_sequence length)
-        valid_lengths = torch.tensor(valid_lengths, dtype=torch.long, device=self.device)  # [B]
-        Lmax = actions_padded.size(1)
-        arangeL = torch.arange(Lmax, device=self.device).unsqueeze(0)                      # [1, Lmax]
-        padding_mask = arangeL >= valid_lengths.unsqueeze(1)                               # [B, Lmax]  True = PAD
-        
-        # 4) Single model forward pass (include valid_lengths and action_masks in the input)
-        model_input = {
-            'obs_sequence':   obs_padded,
-            'action_sequence':actions_padded,
-            'agent_types':    agents_padded,
-            'positions':      pos_padded,
-            'action_masks':   masks_padded,      # NEW
-            'padding_mask':   padding_mask,
-            'valid_lengths':  valid_lengths,   # mirrors pre-batch path
-        }
-        
+                # Prefer our per-sequence mask at that exact step; fall back to provided mask_batch[i]
+                step_mask = masks_padded[i, last_step_idx]          # [A] bool
+                if not step_mask.any() and mask_batch is not None and len(mask_batch) > i:
+                    # Fallback (e.g., if older sequences didn’t populate masks)
+                    m = torch.as_tensor(mask_batch[i], dtype=torch.bool, device=device)
+                    if m.numel() == logits_i.numel():
+                        step_mask = m
 
-        action_logits, _, state_values, b0, b1, b2 = self.model(**model_input)
+                masked_logits = logits_i.masked_fill(~step_mask, float("-inf"))
+                dist = torch.distributions.Categorical(logits=masked_logits)
+                action = dist.sample()
 
-        # 5) Per-item sampling at the last valid timestep, masked
-        actions_out, log_probs_out, values_out, beliefs_out = [], [], [], []
-        for i in range(batch_size):
-            last_step_idx = valid_lengths[i] - 1
-            logits_i = action_logits[i, last_step_idx]          # [A]
-            value_i  = state_values[i, last_step_idx].item()
+                actions_out.append(int(action.item()))
+                log_probs_out.append(float(dist.log_prob(action).item()))
+                values_out.append(value_i)
 
-            # Prefer our per-sequence mask at that exact step; fall back to provided mask_batch[i]
-            step_mask = masks_padded[i, last_step_idx]          # [A] bool
-            if not step_mask.any() and mask_batch is not None and len(mask_batch) > i:
-                # Fallback (e.g., if older sequences didn’t populate masks)
-                m = torch.as_tensor(mask_batch[i], dtype=torch.bool, device=device)
-                if m.numel() == logits_i.numel():
-                    step_mask = m
-
-            masked_logits = logits_i.masked_fill(~step_mask, float("-inf"))
-            dist = torch.distributions.Categorical(logits=masked_logits)
-            action = dist.sample()
-
-            actions_out.append(int(action.item()))
-            log_probs_out.append(float(dist.log_prob(action).item()))
-            values_out.append(value_i)
-
-            belief_preds = []
-            if b0 is not None: belief_preds.append(int(torch.argmax(b0[i, last_step_idx]).item()))
-            if b1 is not None: belief_preds.append(int(torch.argmax(b1[i, last_step_idx]).item()))
-            if b2 is not None: belief_preds.append(int(torch.argmax(b2[i, last_step_idx]).item()))
-            beliefs_out.append(belief_preds)
+                belief_preds = []
+                if b0 is not None: belief_preds.append(int(torch.argmax(b0[i, last_step_idx]).item()))
+                if b1 is not None: belief_preds.append(int(torch.argmax(b1[i, last_step_idx]).item()))
+                if b2 is not None: belief_preds.append(int(torch.argmax(b2[i, last_step_idx]).item()))
+                beliefs_out.append(belief_preds)
 
         return (
             np.array(actions_out,   dtype=np.uint8),
