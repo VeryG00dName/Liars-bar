@@ -349,7 +349,7 @@ if __name__ == "__main__":
     ckpt_dir = os.path.join(getattr(config, "CHECKPOINT_DIR", "checkpoints"), run_name)
     train(
         num_updates=2000,
-        episodes_per_update=512,
+        episodes_per_update=config.EPISODES_PER_UPDATE,
         k_epochs=config.K_EPOCHS,
         checkpoint_dir=ckpt_dir,
         log_dir=log_dir,
