@@ -91,6 +91,7 @@ STRATEGY_DROPOUT = 0.1
 # Training Hyperparameters
 # ============================
 NUM_EPISODES = 40000
+EPISODES_PER_UPDATE = 512
 LEARNING_RATE = 0.00019
 GAMMA = 0.974
 GAE_LAMBDA = 0.98
