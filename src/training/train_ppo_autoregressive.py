@@ -386,8 +386,9 @@ def train(
     arena = lb.VecArena()
 
     # ----- SL init (keep your existing path; still works if not present) -----
-    CKPT_PATH = r"checkpoints\autoreg_20250823_224827\autoreg_model_final.pth"
+    CKPT_PATH = r"checkpoints\AR_220k__v4_4p_v3_IBFP\autoreg_model_final.pth"
     learner = BatchPPOAutoregressiveAgent(device, "TrainAgent_v1")
+    
     try:
         checkpoint_raw = torch.load(CKPT_PATH, map_location=device)
         # adapt to expected schema

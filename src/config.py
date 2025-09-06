@@ -21,7 +21,7 @@ TRANSFORMER_CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "transformer_classifi
 HISTORICAL_MODEL_DIR = PLAYERS_DIR
 
 # Optional: path to a supervised/teacher checkpoint used for warm start / teacher KL
-SL_TEACHER_CKPT = None  # e.g., os.path.join(CHECKPOINT_DIR, "autoreg_model_final.pth")
+SL_TEACHER_CKPT = r"checkpoints\AR_220k__v4_4p_v3_IBFP\autoreg_model_final.pth"
 
 # ============================
 # Directory Preparation
@@ -123,20 +123,20 @@ AUX_OPP_WEIGHT    = 1.0   # opponent action weight (1.0 to match SL)
 # ============================
 # Teacher KL / Behavior Cloning Leash
 # ============================
-BC_KL_WEIGHT = 0.02  # typical exploration range: 1e-4 .. 1e-2 (decay in code if desired)
+BC_KL_WEIGHT = 0.0002  # typical exploration range: 1e-4 .. 1e-2 (decay in code if desired)
 
 # ============================
 # Trinal-Clip PPO (Policy) — Optional
 # ============================
 # When True, use extra upper cap δ1 for A<0; must satisfy TRINAL_DELTA1 > 1 + EPS_CLIP
-USE_TRINAL_CLIP = False
+USE_TRINAL_CLIP = True
 TRINAL_DELTA1 = 2.5
 
 # ============================
 # Stakes-Based Value Target Clip (Public-Info) — Optional
 # ============================
 # Enable clipping of target returns by ± (EPS_V * Stakes * ReturnScale)
-USE_STAKES_VALUE_CLIP = False
+USE_STAKES_VALUE_CLIP = True
 EPS_V = 1.0                 # base epsilon for value clip (try 0.3–5.0 log-scale)
 RET_STD_EMA_DECAY = 0.99    # EMA smoothing for return std used as ReturnScale
 
