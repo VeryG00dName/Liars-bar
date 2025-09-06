@@ -6,7 +6,6 @@ from typing import Dict, Any, List, Tuple
 
 from src.agents.batch_autoregressive_ppo_agent import BatchPPOAutoregressiveAgent
 
-
 class PPOVecRolloutManager:
     """
     Manages batched rollouts using the C++ VecArena for high-throughput
@@ -19,8 +18,6 @@ class PPOVecRolloutManager:
         self.arena = arena
         self.policies = policies
         self.device = device
-        self._target_episodes = 0
-        self._completed_episodes = 0
 
     def _setup_roles(self,
                      batch_size: int,
@@ -60,8 +57,6 @@ class PPOVecRolloutManager:
         completed_episodes = []
         # --- [FIX] pending_data is now keyed only by env_idx ---
         pending_data: Dict[int, Dict] = {}
-        self._target_episodes = num_episodes
-        self._completed_episodes = 0
         while len(completed_episodes) < num_episodes:
             requests_by_policy = self.arena.collect_requests()
             if not requests_by_policy: break
@@ -170,17 +165,6 @@ class PPOVecRolloutManager:
             for k, v in mi_last.items()
         }
         
-        # --- NEW: print which episode finished and running count ---
-        self._completed_episodes += 1
-        steps = len(ep_data['reward'])
-        try:
-            hist_sz = env.game_history_size()  # cheap if you add the binding
-        except Exception:
-            hist_sz = len(env.game_history())  # fallback (expensive)
-        print(f"[ROLLOUT] finished env {env_idx}  "
-            f"({self._completed_episodes}/{self._target_episodes})  "
-            f"win={ep_data['win']}  steps={steps}")
-
     def _new_episode_tracker(self, env_idx: int, roles: List[lb.Role], training_policy_id: int) -> Dict:
         training_seats = [s for s, r in enumerate(roles) if r.policy_id == training_policy_id]
         is_training_episode = len(training_seats) > 0
