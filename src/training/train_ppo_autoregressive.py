@@ -69,7 +69,6 @@ def ppo_losses_for_episode(
     # Local (truncated) views in model space
     valid_len        = int(valid_lengths[0].item())
     agent_types_1d   = agent_types[0, :valid_len]               # [L]
-    actions_1d       = action_seq [0, :valid_len]               # [L]
     masks_2d         = action_masks[0, :valid_len] if action_masks is not None else None  # [L, A] or None
 
     # ---- Student forward on exactly the same input ----
@@ -138,7 +137,7 @@ def ppo_losses_for_episode(
     if has_next.any():
         next_values_full[has_next] = state_values.index_select(0, next_pos[has_next])
 
-    # Dones: terminal iff there is no next token within valid_len (true terminal → no bootstrap)
+    # Dones: terminal if there is no next token within valid_len (true terminal → no bootstrap)
     dones = (~has_next).tolist()
 
     # ---- 4) GAE ----
@@ -187,7 +186,7 @@ def ppo_losses_for_episode(
         "clip_fraction": float(clipfrac.cpu()),
     })
 
-    # ---- 7) Belief heads (optional) supervised on OUR steps with valid targets ----
+    # ---- 7) Belief heads supervised on OUR steps with valid targets ----
     def _belief_ce_and_acc(b_logits, key_tgt):
         if b_logits is None:
             return torch.zeros((), device=device), 0.0
@@ -246,7 +245,7 @@ def ppo_losses_for_episode(
 
 
 # --------------------------------------------------------------------------------------
-# Training loop (This function is correct and remains unchanged)
+# Training loop
 # --------------------------------------------------------------------------------------
 def train(
     num_updates: int = 1000,
@@ -291,7 +290,6 @@ def train(
         if not episodes:
             logging.warning(f"Update {update}/{num_updates}: No episodes collected. Skipping update.")
             continue
-        logging.info(f"Update {update}/{num_updates} | Collected {len(episodes)} episodes | Starting training...")
 
         # No precompute step
         model.train()
@@ -351,7 +349,7 @@ if __name__ == "__main__":
     ckpt_dir = os.path.join(getattr(config, "CHECKPOINT_DIR", "checkpoints"), run_name)
     train(
         num_updates=2000,
-        episodes_per_update=256,
+        episodes_per_update=512,
         k_epochs=config.K_EPOCHS,
         checkpoint_dir=ckpt_dir,
         log_dir=log_dir,
