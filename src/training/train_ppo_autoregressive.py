@@ -15,132 +15,38 @@ from torch.nn.utils import clip_grad_norm_
 from torch.utils.tensorboard import SummaryWriter
 import torch.amp as amp
 # Env & project imports
-from src.env.liars_deck_env_core import LiarsDeckEnv
+from src.misc import lb
 from src import config
 
 # Model & agent
 from src.model.ppo_autoregressive_model import PPOAutoregressiveModel
-from src.agents.autoregressive_ppo_agent import PPOAutoregressiveAgent
+from src.agents.batch_autoregressive_ppo_agent import BatchPPOAutoregressiveAgent
 
-# Hardcoded bots
-from src.model.hard_coded_agents import (
-    RandomAgent,
-    GreedyCardSpammer,
-    TableFirstConservativeChallenger,
-    SelectiveTableConservativeChallenger,
-    TableNonTableAgent,
-    StrategicChallenger,
-    Classic,
-)
-
-# Data generator (collector)
-from src.training.ppo_ar_data_gen import collect_training_sequences
+# High-performance vectorized data collector
+from src.training.vec_ppo_rollout import PPOVecRolloutManager
 
 # Utilities
 from src.training.train_extras import set_seed
-from src.training.train_utils import compute_gae  # (rewards, dones, values, next_values, gamma, lam)
-
-from src.agents.hardcoded_agent_wrapper import HardcodedAgentWrapper
-
+from src.training.train_utils import compute_gae
 
 # --------------------------------------------------------------------------------------
-# Belief mapping (extend this when adding frozen/historical models)
+# Belief mapping (maps BotKind enum value to belief index)
 # --------------------------------------------------------------------------------------
-BELIEF_LABELS: Dict[str, int] = {
-    "GreedyCardSpammer": 1,
-    "StrategicChallenger": 4,
-    "TableNonTableAgent": 6,
-    "Classic": 0,
-    "TableFirstConservativeChallenger": 5,
-    "SelectiveTableConservativeChallenger": 3,
-    "RandomAgent": 2,
+BELIEF_LABELS_FROM_KIND: Dict[int, int] = {
+    lb.BotKind.GreedyCardSpammer.value: 1, lb.BotKind.StrategicChallenger.value: 4,
+    lb.BotKind.TableNonTableAgent.value: 6, lb.BotKind.Classic.value: 0,
+    lb.BotKind.TableFirstConservativeChallenger.value: 5,
+    lb.BotKind.SelectiveTableConservativeChallenger.value: 3, lb.BotKind.RandomAgent.value: 2,
 }
 
-
 # --------------------------------------------------------------------------------------
-# Helpers to build opponents and the per-episode player map
+# Loss builders
 # --------------------------------------------------------------------------------------
-
-def _instantiate_hardcoded(hc_class, hc_name: str, env_id: str, device: torch.device):
-    """Instantiate a hardcoded opponent and wrap to BaseAgent via HardcodedAgentWrapper."""
-    # Try to provide context (name, num_players, agent_index); fallback to just name
-    try:
-        agent_index = int(env_id.split('_')[-1])
-    except Exception:
-        agent_index = 1
-
-    try:
-        inst = hc_class(hc_name, config.NUM_PLAYERS, agent_index)
-    except TypeError:
-        inst = hc_class(hc_name)
-
-    player_id = f"Hardcoded_{hc_name}"
-    return HardcodedAgentWrapper(inst, device, player_id)
-
-
-def build_players(
-    device: torch.device,
-    training_agent: PPOAutoregressiveAgent,
-    opponent_types: List[str],
-    opponent_configs: List[Dict[str, Any]],
-) -> Tuple[Dict[str, Any], Dict[str, int]]:
-    """
-    Build the env_id -> agent map for one game, with player_0 as the learner.
-    Returns (players_in_game, opponent_label_map) where opponent_label_map maps
-    **player_id -> belief class id** per BELIEF_LABELS.
-    """
-    assert len(opponent_types) == len(opponent_configs), "opponent_types and opponent_configs must align"
-
-    players: Dict[str, Any] = {"player_0": training_agent}
-    opponent_label_map: Dict[str, int] = {}
-
-    for i in range(1, config.NUM_PLAYERS):
-        env_id = f"player_{i}"
-        opp_type = opponent_types[i - 1]
-        opp_cfg = opponent_configs[i - 1]
-
-        if opp_type == "hardcoded":
-            hc_class = opp_cfg["class"]
-            hc_name = opp_cfg["name"]  # must match key in BELIEF_LABELS
-            agent = _instantiate_hardcoded(hc_class, hc_name, env_id, device)
-
-            # Map this opponent's player_id to the belief class id
-            if hc_name not in BELIEF_LABELS:
-                raise KeyError(f"Hardcoded agent '{hc_name}' missing from BELIEF_LABELS")
-            label = BELIEF_LABELS[hc_name]
-            pid = agent.get_player_id()  # e.g., "Hardcoded_GreedyCardSpammer"
-            opponent_label_map[pid] = label
-
-        elif opp_type == "historical":
-            # TODO: instantiate frozen PPO agent and add to BELIEF_LABELS when available
-            raise NotImplementedError("Historical agent loading not yet implemented.")
-
-        elif opp_type == "training":
-            # Self-play (rare): use learner; you must also assign a belief label
-            agent = training_agent
-            pid = agent.get_player_id() if hasattr(agent, "get_player_id") else "TrainAgent"
-            if pid not in opponent_label_map:
-                raise NotImplementedError("Belief label for training/self-play opponent is undefined. Add to BELIEF_LABELS and map here.")
-
-        else:
-            raise ValueError(f"Unknown opponent type: {opp_type}")
-
-        players[env_id] = agent
-
-    return players, opponent_label_map
-
-
-# --------------------------------------------------------------------------------------
-# Loss builders (+ PPO metrics/accuracies for TB)
-# --------------------------------------------------------------------------------------
-
 def _accuracy_from_logits(logits: torch.Tensor, targets: torch.Tensor) -> float:
-    if logits.numel() == 0 or targets.numel() == 0:
-        return 0.0
+    if logits.numel() == 0 or targets.numel() == 0: return 0.0
     with torch.no_grad():
         preds = logits.argmax(dim=-1)
         return float((preds == targets).float().mean().item())
-
 
 def ppo_losses_for_episode(
     model: PPOAutoregressiveModel,
@@ -148,162 +54,191 @@ def ppo_losses_for_episode(
     device: torch.device,
     sl_teacher: Optional[PPOAutoregressiveModel] = None,
     bc_kl_weight: float = 0.0,
-    t_action_logits_precomp: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """
-    Compute PPO+auxiliary losses for a single episode dict produced by collect_training_sequences.
-    Returns (total_loss, scalars)
-    """
-    # Move model inputs to device and forward once
-    mi = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in episode["model_input"].items()}
-    action_logits, opp_logits, state_values, b0_logits, b1_logits, b2_logits = model(**mi)
 
-    # Shapes: [1, T, ...]
-    T = action_logits.size(1)
-    agent_types = mi["agent_types"].squeeze(0)  # [T]
-    our_mask = (agent_types == 0)
-    opp_mask = ~our_mask
+    # ---- 0) Unpack model input exactly as fed to the network ----
+    mi = {k: (v.to(device) if torch.is_tensor(v) else v)
+          for k, v in episode["model_input"].items()}
 
-    our_idx = torch.nonzero(our_mask, as_tuple=False).squeeze(-1)
+    action_seq    = mi["action_sequence"]                       # [1, L]
+    agent_types   = mi["agent_types"]                           # [1, L]
+    valid_lengths = mi.get("valid_lengths",
+                           torch.tensor([action_seq.size(1)], device=device))  # [1]
+    action_masks  = mi.get("action_masks", None)                # [1, L, A] or None
+
+    # Local (truncated) views in model space
+    valid_len        = int(valid_lengths[0].item())
+    agent_types_1d   = agent_types[0, :valid_len]               # [L]
+    actions_1d       = action_seq [0, :valid_len]               # [L]
+    masks_2d         = action_masks[0, :valid_len] if action_masks is not None else None  # [L, A] or None
+
+    # ---- Student forward on exactly the same input ----
+    action_logits, opp_logits, state_values, b0, b1, b2 = model(**mi)  # [1, L, ...]
+    action_logits = action_logits[0, :valid_len, :]            # [L, A]
+    opp_logits    = opp_logits[0, :valid_len, :] if opp_logits is not None else None
+    state_values  = state_values[0, :valid_len].squeeze(-1)    # [L]
+
+    # ---- 1) Indices for OUR turns in local space (0..valid_len-1) ----
+    our_pos = (agent_types_1d == 0).nonzero(as_tuple=False).squeeze(-1).long()  # [K]
+    K = int(our_pos.numel())
 
     scalars = {
-        "n_our_steps": float(our_idx.numel()),
-        "n_total_steps": float(T),
-        "episode_return": float(sum(episode["reward"])),
-        "episode_len": float(len(episode["reward"])),
+        "n_our_steps": float(len(episode["our_action"]) - episode["our_action"].count(None)),
+        "n_total_steps": float(valid_len),
+        "episode_return": float(episode.get("episode_return", 0.0))
     }
 
-    total_loss = torch.zeros((), device=device)
-
-    # ---------------- Actor-Critic on our steps ----------------
-    if our_idx.numel() > 0:
-        actions = torch.tensor([episode["our_action"][i] for i in our_idx.tolist()], device=device, dtype=torch.long)
-        old_logp = torch.tensor([episode["log_prob"][i] for i in our_idx.tolist()], device=device, dtype=torch.float32)
-        rewards = [float(episode["reward"][i]) for i in our_idx.tolist()]
-        dones   = [bool(episode["done"][i])   for i in our_idx.tolist()]
-
-        logits_at = action_logits[0, our_idx, :]  # [N, A]
-        values_at = state_values[0, our_idx, 0]   # [N]
-
-        # Build next_values for GAE (shifted values, last = 0)
-        next_vals = values_at.detach().clone()
-        if next_vals.numel() > 1:
-            next_vals[:-1] = values_at.detach()[1:]
-        next_vals[-1] = 0.0
-
-        adv, ret = compute_gae(
-            rewards,
-            dones,
-            values_at.detach().cpu().tolist(),
-            next_vals.detach().cpu().tolist(),
-            config.GAMMA,
-            config.GAE_LAMBDA,
-        )
-        advantages = torch.tensor(adv, dtype=torch.float32, device=device)
-        returns    = torch.tensor(ret, dtype=torch.float32, device=device)
-        advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
-
-        # PPO objective
-        dist = torch.distributions.Categorical(logits=logits_at.float())
-        new_logp = dist.log_prob(actions)
-        ratio = (new_logp - old_logp).exp()
-
-        surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1 - config.EPS_CLIP, 1 + config.EPS_CLIP) * advantages
-        policy_loss = -torch.min(surr1, surr2).mean()
-        value_loss  = F.mse_loss(values_at, returns)
-        entropy_term = dist.entropy().mean()
-        entropy_loss = -entropy_term
-
-        total_loss = total_loss + policy_loss + 0.5 * value_loss + config.INIT_ENTROPY_COEF * entropy_loss
-
-        # ---- tiny KL leash to frozen SL policy (teacher) ----
-        if (bc_kl_weight > 0.0) and our_idx.numel() > 0:
-            if t_action_logits_precomp is None:
-                if sl_teacher is not None:
-                    with torch.no_grad():
-                        t_action_logits, *_ = sl_teacher(**mi)
-                else:
-                    t_action_logits = None
-            else:
-                t_action_logits = t_action_logits_precomp
-
-            if t_action_logits is not None:
-                t_logits_at = t_action_logits[0, our_idx, :].float()
-                dist_sl = torch.distributions.Categorical(logits=t_logits_at)
-                bc_kl = torch.distributions.kl_divergence(
-                    torch.distributions.Categorical(logits=logits_at.float()), dist_sl
-                ).mean()
-                total_loss = total_loss + bc_kl_weight * bc_kl
-                scalars["bc_kl"] = float(bc_kl.detach().cpu())
-
-        # PPO diagnostics
-        approx_kl = torch.mean(old_logp - new_logp).detach()
-        clipfrac = ((ratio - 1.0).abs() > config.EPS_CLIP).float().mean().detach()
-
+    # Graph-carrying zero (so backward() never breaks) in "no-learnable-steps" cases
+    if K == 0:
+        total_loss = next(model.parameters()).sum() * 0.0
         scalars.update({
-            "policy_loss": float(policy_loss.detach().cpu()),
-            "value_loss": float(value_loss.detach().cpu()),
-            "entropy": float(entropy_term.detach().cpu()),
-            "approx_kl": float(approx_kl.cpu()),
-            "clip_fraction": float(clipfrac.cpu()),
+            "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0,
+            "approx_kl": 0.0, "clip_fraction": 0.0,
+            "opp_loss": 0.0, "opp_action_acc": 0.0,
+            "belief_loss": 0.0, "belief_acc_0": 0.0, "belief_acc_1": 0.0, "belief_acc_2": 0.0,
         })
+        return total_loss, scalars
 
-        # Policy action accuracy on our steps (against taken action)
-        scalars["agent_action_acc"] = _accuracy_from_logits(logits_at.detach(), actions.detach())
+    # ---- 2) Build episode-aligned lists at OUR steps ----
+    our_steps_ep_idx = [i for i, seat in enumerate(episode["agent_id"])
+                        if seat == episode["training_agent_seat"]]
 
-        # ---------------- Belief loss on our steps ----------------
-        def _belief_ce_and_acc(b_logits, key):
-            targets, idxs = [], []
-            for i in our_idx.tolist():
-                tgt = episode[key][i]
-                if tgt is not None:
-                    targets.append(int(tgt))
-                    idxs.append(i)
-            if not targets:
-                return torch.zeros((), device=device), 0.0
-            t = torch.tensor(targets, dtype=torch.long, device=device)
-            l = b_logits[0, torch.tensor(idxs, dtype=torch.long, device=device), :]
-            acc = _accuracy_from_logits(l.detach(), t.detach())
-            return F.cross_entropy(l, t), acc
-
-        b0_loss, acc_b0 = _belief_ce_and_acc(b0_logits, "belief_tgt0")
-        b1_loss, acc_b1 = _belief_ce_and_acc(b1_logits, "belief_tgt1")
-        b2_loss, acc_b2 = _belief_ce_and_acc(b2_logits, "belief_tgt2")
-        belief_loss = b0_loss + b1_loss + b2_loss
-
-        belief_w = getattr(config, "AUX_BELIEF_WEIGHT", getattr(config, "AUX_LOSS_WEIGHT", 0.5))
-        total_loss = total_loss + belief_w * belief_loss
+    # Align counts; we’ll learn on min(K, len(ep rows))
+    K_ep = min(K, len(our_steps_ep_idx))
+    if K_ep == 0:
+        total_loss = next(model.parameters()).sum() * 0.0
         scalars.update({
-            "belief_loss": float(belief_loss.detach().cpu()),
-            "belief_acc_0": float(acc_b0),
-            "belief_acc_1": float(acc_b1),
-            "belief_acc_2": float(acc_b2),
+            "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0,
+            "approx_kl": 0.0, "clip_fraction": 0.0,
+            "opp_loss": 0.0, "opp_action_acc": 0.0,
+            "belief_loss": 0.0, "belief_acc_0": 0.0, "belief_acc_1": 0.0, "belief_acc_2": 0.0,
         })
+        return total_loss, scalars
 
-    # ---------------- Opponent action prediction loss & accuracy ----------------
-    opp_idxs, opp_targets = [], []
-    for i in range(T):
-        if not opp_mask[i]:
-            continue
-        tgt = episode["opp_target_action"][i]
-        if tgt is not None:
-            opp_idxs.append(i)
-            opp_targets.append(int(tgt))
+    # Slice model-side positions to K_ep
+    posK = our_pos[:K_ep]                           # [K_ep]
+    next_pos = posK + 1                             # candidate next indices
+    has_next = (next_pos < valid_len)               # [K_ep] bool
 
-    if len(opp_idxs) > 0:
-        idx_tensor = torch.tensor(opp_idxs, device=device)
-        opp_logits_sel = opp_logits[0, idx_tensor, :]
-        opp_targets_t = torch.tensor(opp_targets, dtype=torch.long, device=device)
-        opp_loss = F.cross_entropy(opp_logits_sel, opp_targets_t)
+    # Episode-side tensors
+    actions_t  = torch.tensor([episode["our_action"][i] for i in our_steps_ep_idx[:K_ep]],
+                              dtype=torch.long, device=device)                # [K_ep]
+    old_logp_t = torch.tensor([episode["log_prob"][i]  for i in our_steps_ep_idx[:K_ep]],
+                              dtype=torch.float32, device=device)             # [K_ep]
+    rewards    = [float(episode["reward"][i]) for i in our_steps_ep_idx[:K_ep]]
 
-        opp_w = getattr(config, "AUX_OPP_WEIGHT", getattr(config, "AUX_LOSS_WEIGHT", 0.5))
-        total_loss = total_loss + opp_w * opp_loss
-        scalars.update({
-            "opp_loss": float(opp_loss.detach().cpu()),
-            "n_opp_supervised": float(len(opp_idxs)),
-            "opp_action_acc": _accuracy_from_logits(opp_logits_sel.detach(), opp_targets_t.detach()),
-        })
+    # ---- 3) Gather logits/values at action states; legal-mask if provided ----
+    logits_at = action_logits.index_select(0, posK).float()                   # [K_ep, A]
+    if masks_2d is not None:
+        mask_at = masks_2d.index_select(0, posK)                              # [K_ep, A] bool
+        logits_at = logits_at.masked_fill(~mask_at, float("-inf"))
+
+    values_at = state_values.index_select(0, posK)                            # [K_ep]
+    next_values_full = torch.zeros_like(values_at)
+    if has_next.any():
+        next_values_full[has_next] = state_values.index_select(0, next_pos[has_next])
+
+    # Dones: terminal iff there is no next token within valid_len (true terminal → no bootstrap)
+    dones = (~has_next).tolist()
+
+    # ---- 4) GAE ----
+    adv, ret = compute_gae(
+        rewards, dones,
+        values_at.detach().cpu().tolist(),
+        next_values_full.detach().cpu().tolist(),
+        config.GAMMA, config.GAE_LAMBDA,
+    )
+    advantages = torch.tensor(adv, dtype=torch.float32, device=device)
+    returns    = torch.tensor(ret, dtype=torch.float32, device=device)
+    advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+
+    # ---- 5) PPO objective ----
+    dist     = torch.distributions.Categorical(logits=logits_at)
+    new_logp = dist.log_prob(actions_t)
+    ratio    = (new_logp - old_logp_t).exp()
+    surr1    = ratio * advantages
+    surr2    = torch.clamp(ratio, 1 - config.EPS_CLIP, 1 + config.EPS_CLIP) * advantages
+    policy_loss  = -torch.min(surr1, surr2).mean()
+    value_loss   = F.mse_loss(values_at, returns)
+    entropy_loss = -dist.entropy().mean()
+
+    total_loss = policy_loss + 0.5 * value_loss + config.INIT_ENTROPY_COEF * entropy_loss
+
+    # ---- 6) Teacher KL (run teacher here, same input/indices/masks) ----
+    if (bc_kl_weight > 0.0) and (sl_teacher is not None):
+        with torch.no_grad():
+            t_action_logits, *_ = sl_teacher(**mi)                            # [1, L, A]
+            t_action_logits = t_action_logits[0, :valid_len, :]               # [L, A]
+            t_logits_at = t_action_logits.index_select(0, posK).float()       # [K_ep, A]
+            if action_masks is not None:
+                t_logits_at = t_logits_at.masked_fill(~mask_at, float("-inf"))
+        dist_sl = torch.distributions.Categorical(logits=t_logits_at)
+        bc_kl   = torch.distributions.kl_divergence(dist, dist_sl).mean()
+        total_loss = total_loss + bc_kl_weight * bc_kl
+        scalars["bc_kl"] = float(bc_kl.detach().cpu())
+
+    approx_kl  = torch.mean(old_logp_t - new_logp).detach()
+    clipfrac   = ((ratio - 1.0).abs() > config.EPS_CLIP).float().mean().detach()
+    scalars.update({
+        "policy_loss": float(policy_loss.detach().cpu()),
+        "value_loss":  float(value_loss.detach().cpu()),
+        "entropy":     float((-entropy_loss).detach().cpu()),
+        "approx_kl":   float(approx_kl.cpu()),
+        "clip_fraction": float(clipfrac.cpu()),
+    })
+
+    # ---- 7) Belief heads (optional) supervised on OUR steps with valid targets ----
+    def _belief_ce_and_acc(b_logits, key_tgt):
+        if b_logits is None:
+            return torch.zeros((), device=device), 0.0
+        # Collect targets aligned to OUR step list, then truncate to K_ep
+        targets, keep_idx = [], []
+        for i_ep, step_idx in enumerate(our_steps_ep_idx[:K_ep]):
+            tgt = episode[key_tgt][step_idx]
+            if tgt is not None:
+                lab = BELIEF_LABELS_FROM_KIND.get(tgt)
+                if lab is not None:
+                    targets.append(lab); keep_idx.append(i_ep)
+        if not targets:
+            return torch.zeros((), device=device), 0.0
+        target_t  = torch.tensor(targets, dtype=torch.long, device=device)
+        keep_idx  = torch.as_tensor(keep_idx, dtype=torch.long, device=device)
+        logits_sel = b_logits[0, :valid_len, :].index_select(0, posK).index_select(0, keep_idx)
+        acc = _accuracy_from_logits(logits_sel.detach(), target_t.detach())
+        return F.cross_entropy(logits_sel, target_t), acc
+
+    b0_loss, acc_b0 = _belief_ce_and_acc(b0, "belief_tgt0")
+    b1_loss, acc_b1 = _belief_ce_and_acc(b1, "belief_tgt1")
+    b2_loss, acc_b2 = _belief_ce_and_acc(b2, "belief_tgt2")
+    belief_loss = b0_loss + b1_loss + b2_loss
+    total_loss  = total_loss + getattr(config, "AUX_BELIEF_WEIGHT", 0.5) * belief_loss
+    scalars.update({
+        "belief_loss": float(belief_loss.detach().cpu()),
+        "belief_acc_0": acc_b0,
+        "belief_acc_1": acc_b1,
+        "belief_acc_2": acc_b2,
+    })
+
+    # ---- 8) Opponent supervised auxiliary (keep within valid_len) ----
+    opp_idx = (agent_types_1d != 0).nonzero(as_tuple=False).squeeze(-1)   # [N_opp]
+    if opp_logits is not None and opp_idx.numel() > 0:
+        opp_ep_idx = [i for i, seat in enumerate(episode["agent_id"])
+                      if seat != episode["training_agent_seat"]]
+        opp_targets = [episode["opp_target_action"][i] for i in opp_ep_idx
+                       if episode["opp_target_action"][i] is not None]
+        M = min(len(opp_targets), opp_idx.numel())
+        if M > 0:
+            opp_logits_sel = opp_logits.index_select(0, opp_idx[:M])       # [M, A]
+            opp_targets_t  = torch.tensor(opp_targets[:M], dtype=torch.long, device=device)
+            opp_loss = F.cross_entropy(opp_logits_sel, opp_targets_t)
+            total_loss = total_loss + getattr(config, "AUX_OPP_WEIGHT", 0.5) * opp_loss
+            scalars.update({
+                "opp_loss": float(opp_loss.detach().cpu()),
+                "n_opp_supervised": float(M),
+                "opp_action_acc": _accuracy_from_logits(opp_logits_sel.detach(), opp_targets_t.detach()),
+            })
+        else:
+            scalars.update({"opp_loss": 0.0, "n_opp_supervised": 0.0, "opp_action_acc": 0.0})
     else:
         scalars.update({"opp_loss": 0.0, "n_opp_supervised": 0.0, "opp_action_acc": 0.0})
 
@@ -311,9 +246,8 @@ def ppo_losses_for_episode(
 
 
 # --------------------------------------------------------------------------------------
-# Training loop (with TensorBoard logging similar to supervised version)
+# Training loop (This function is correct and remains unchanged)
 # --------------------------------------------------------------------------------------
-
 def train(
     num_updates: int = 1000,
     episodes_per_update: int = 8,
@@ -322,104 +256,55 @@ def train(
     log_dir: Optional[str] = None,
 ):
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
     device = torch.device(getattr(config, "DEVICE", "cuda" if torch.cuda.is_available() else "cpu"))
     set_seed(getattr(config, "SEED", 42))
     scaler = amp.GradScaler(device=device, enabled=(device.type == 'cuda'))
-    # ---- Logging / TB ----
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=log_dir)
     logging.info(f"TensorBoard logdir: {log_dir}")
-
-    # ---- Env & model ----
-    env = LiarsDeckEnv(num_players=getattr(config, "NUM_PLAYERS", 4))
-    CKPT_PATH = r"checkpoints\autoreg_20250817_195858\autoreg_model_final.pth"
-    ckpt = torch.load(CKPT_PATH, map_location=device, weights_only=False)
-    sd   = ckpt["model_state_dict"]
-    obs_dim = 9
-    action_dim = 7
-
-    model = PPOAutoregressiveModel(
-        obs_dim=obs_dim,
-        action_dim=action_dim,
-        belief_dim=64,
-        hidden_dim=384,
-        num_heads=6,
-        max_seq_length=256,
-        num_agent_types=4,
-    ).to(device)
-    model.load_state_dict(sd, strict=True)
+    arena = lb.VecArena()
+    CKPT_PATH = r"checkpoints\autoreg_20250823_224827\autoreg_model_final.pth"
+    checkpoint = torch.load(CKPT_PATH, map_location=device)
+    learner = BatchPPOAutoregressiveAgent(device, "TrainAgent_v1")
+    checkpoint = {"policy_nets": {"agent_model": checkpoint["model_state_dict"]}}
+    agent_key = next(iter(checkpoint["policy_nets"]))
+    learner.load_models_from_checkpoint(checkpoint, agent_key)
+    model = learner.model
     sl_teacher = copy.deepcopy(model).eval()
     for p in sl_teacher.parameters(): p.requires_grad = False
     optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE, eps=1e-5)
     logging.info(f"Loaded SL checkpoint: {CKPT_PATH}")
-    learner = PPOAutoregressiveAgent(device, "TrainAgent_v1")
-    learner.set_model(model)
-
-    # ---- Opponent rotation (less confusing setup) ----
-    HC_POOL: List[Tuple[str, Any]] = [
-        ("Classic", Classic),
-        ("GreedyCardSpammer", GreedyCardSpammer),
-        ("RandomAgent", RandomAgent),
-        ("SelectiveTableConservativeChallenger", SelectiveTableConservativeChallenger),
-        ("StrategicChallenger", StrategicChallenger),
-        ("TableFirstConservativeChallenger", TableFirstConservativeChallenger),
-        ("TableNonTableAgent", TableNonTableAgent),
+    policies = {0: learner}
+    rollout_manager = PPOVecRolloutManager(arena, policies, device)
+    HC_POOL = [
+        lb.BotKind.Classic, lb.BotKind.GreedyCardSpammer, lb.BotKind.RandomAgent,
+        lb.BotKind.SelectiveTableConservativeChallenger, lb.BotKind.StrategicChallenger,
+        lb.BotKind.TableFirstConservativeChallenger, lb.BotKind.TableNonTableAgent,
     ]
-
-    def build_opponent_cfgs(start: int = 0) -> Tuple[List[str], List[Dict[str, Any]]]:
-        n = getattr(config, "NUM_PLAYERS", 4) - 1
-        # pick n opponents randomly from the pool (without replacement if possible)
-        picks = random.sample(HC_POOL, n)
-        opponent_types = ["hardcoded"] * n
-        opponent_configs = [{"class": cls, "name": name} for (name, cls) in picks]
-        return opponent_types, opponent_configs
-
-    global_step = 0
     for update in range(1, num_updates + 1):
         update_start = time.time()
+        model.eval()
+        episodes = rollout_manager.collect_episodes(
+            num_episodes=episodes_per_update, num_players=config.NUM_PLAYERS,
+            training_policy_id=0, opponent_pool=HC_POOL
+        )
+        if not episodes:
+            logging.warning(f"Update {update}/{num_updates}: No episodes collected. Skipping update.")
+            continue
+        logging.info(f"Update {update}/{num_updates} | Collected {len(episodes)} episodes | Starting training...")
 
-        episodes = []
-        #batches = 5
-        #eps_per_batch = max(1, episodes_per_update // batches)
-
-        for _ in range(episodes_per_update):
-            opponent_types, opponent_configs = build_opponent_cfgs()
-            players_in_game, opponent_label_map = build_players(device, learner, opponent_types, opponent_configs)
-
-            eps = collect_training_sequences(
-                env=env,
-                device=device,
-                players_in_this_game=players_in_game,
-                episodes=1,
-                training_agent_env_id="player_0",
-                opponent_label_map=opponent_label_map,
-            )
-            episodes.extend(eps)
-
-        # Precompute teacher logits for this update (if KL is enabled)
-        precomp_teacher = None
-        if getattr(config, "BC_KL_WEIGHT", 0.0) > 0:
-            precomp_teacher = []
-            for ep in episodes:
-                mi = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in ep["model_input"].items()}
-                with torch.no_grad():
-                    t_logits, *_ = sl_teacher(**mi)   # [1, T, A]
-                precomp_teacher.append(t_logits.detach().to(torch.float32))  # stable dtype
-
-        # ---- PPO update ----
+        # No precompute step
         model.train()
-        agg: Dict[str, float] = {}
-        n_loss_terms = 0
+        agg, n_loss_terms = {}, 0
 
         for _ in range(k_epochs):
-            for ep, t_logits in zip(episodes, precomp_teacher if precomp_teacher is not None else [None]*len(episodes)):
+            random.shuffle(episodes)
+            for ep in episodes:
                 with amp.autocast(device_type=device.type, dtype=torch.float16):
                     loss, scalars = ppo_losses_for_episode(
                         model, ep, device,
-                        sl_teacher=None,                             # <-- no longer used
+                        sl_teacher=sl_teacher,
                         bc_kl_weight=getattr(config, "BC_KL_WEIGHT", 0.0),
-                        t_action_logits_precomp=t_logits,            # <-- use precomputed
                     )
                 optimizer.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
@@ -427,35 +312,15 @@ def train(
                 clip_grad_norm_(model.parameters(), max_norm=getattr(config, "MAX_NORM", 0.5))
                 scaler.step(optimizer)
                 scaler.update()
-                # aggregate scalars
+
                 for k, v in scalars.items():
                     agg[k] = agg.get(k, 0.0) + float(v)
                 agg["total_loss"] = agg.get("total_loss", 0.0) + float(loss.detach().cpu())
                 n_loss_terms += 1
-                global_step += 1
-
-        model.eval()
-
-        # ---- Averaging over all loss terms (episodes * k_epochs) ----
-        def avg(name, default=0.0):
-            return (agg.get(name, 0.0) / max(1, n_loss_terms)) if name in agg else default
-
-        # ---- Logging ----
+        avg = lambda name: (agg.get(name, 0.0) / max(1, n_loss_terms))
         avg_total_loss = avg("total_loss")
-        logging.info(f"Update {update}/{num_updates} | episodes={episodes_per_update} | "
-                     f"avg_loss={avg_total_loss:.4f} | time={time.time()-update_start:.2f}s")
-
-        # Compute returns & lengths (you already do this)
-        ep_returns = [ep.get("episode_return", sum(ep["reward"])) for ep in episodes]
-        ep_lens    = [len(ep["reward"]) for ep in episodes]
-        mean_return = float(sum(ep_returns) / len(ep_returns)) if ep_returns else 0.0
-        mean_ep_len = float(sum(ep_lens) / len(ep_lens)) if ep_lens else 0.0
-
-        # NEW: WinRate
-        wins = sum(int(ep.get("win", 1 if sum(ep["reward"]) > 0.0 else 0)) for ep in episodes)
-        win_rate = wins / max(1, len(episodes))
-
-        # ---- TensorBoard scalars (mirroring supervised style + PPO-specific) ----
+        logging.info(f"Update {update}/{num_updates} training complete | avg_loss={avg_total_loss:.4f} | time={time.time()-update_start:.2f}s")
+        win_rate = sum(ep["win"] for ep in episodes) / len(episodes)
         writer.add_scalar("Loss/Total", avg_total_loss, update)
         writer.add_scalar("Loss/Policy", avg("policy_loss"), update)
         writer.add_scalar("Loss/Value", avg("value_loss"), update)
@@ -464,36 +329,20 @@ def train(
         writer.add_scalar("Policy/Entropy", avg("entropy"), update)
         writer.add_scalar("Policy/ApproxKL", avg("approx_kl"), update)
         writer.add_scalar("Policy/ClipFraction", avg("clip_fraction"), update)
-        writer.add_scalar("Policy/SL_KL", avg("bc_kl", 0.0), update)
-        
+        writer.add_scalar("Policy/SL_KL", avg("bc_kl"), update)
         writer.add_scalar("Acc/OpponentAction", avg("opp_action_acc"), update)
         writer.add_scalar("Acc/Belief0", avg("belief_acc_0"), update)
         writer.add_scalar("Acc/Belief1", avg("belief_acc_1"), update)
         writer.add_scalar("Acc/Belief2", avg("belief_acc_2"), update)
-        writer.add_scalar("Acc/AgentActionProxy", avg("agent_action_acc"), update)
-
-        writer.add_scalar("Rollout/EpisodeReturnMean", mean_return, update)
-        writer.add_scalar("Rollout/EpisodeLenMean", mean_ep_len, update)
-        writer.add_scalar("Rollout/OurStepsPerEpisodeMean", avg("n_our_steps"), update)
-        writer.add_scalar("Rollout/TotalStepsPerEpisodeMean", avg("n_total_steps"), update)
         writer.add_scalar("Rollout/WinRate", win_rate, update)
-        writer.add_scalar("Rollout/EpisodeReturnMean", mean_return, update)
-        writer.add_scalar("Rollout/EpisodeLenMean", mean_ep_len, update)
-        writer.add_scalar("Supervision/OppStepsWithTargets", avg("n_opp_supervised"), update)
-
-        # ---- Checkpoint ----
+        writer.add_scalar("Rollout/EpisodeReturnMean", sum(ep["episode_return"] for ep in episodes) / len(episodes), update)
+        writer.add_scalar("Rollout/EpisodeLenMean", sum(len(ep["reward"]) for ep in episodes) / len(episodes), update)
         if checkpoint_dir and (update % getattr(config, "CHECKPOINT_INTERVAL", 200) == 0):
             os.makedirs(checkpoint_dir, exist_ok=True)
             path = os.path.join(checkpoint_dir, f"arppo_update_{update}.pth")
-            torch.save({
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "update": update,
-            }, path)
+            torch.save({"model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(), "update": update}, path)
             logging.info(f"Saved checkpoint to {path}")
-
     writer.close()
-
 
 if __name__ == "__main__":
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -501,9 +350,9 @@ if __name__ == "__main__":
     log_dir = os.path.join("logs", run_name)
     ckpt_dir = os.path.join(getattr(config, "CHECKPOINT_DIR", "checkpoints"), run_name)
     train(
-        num_updates=100,
-        episodes_per_update=350,
-        k_epochs=getattr(config, "K_EPOCHS", 2),
+        num_updates=2000,
+        episodes_per_update=256,
+        k_epochs=config.K_EPOCHS,
         checkpoint_dir=ckpt_dir,
         log_dir=log_dir,
     )
