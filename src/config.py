@@ -130,23 +130,28 @@ BC_KL_WEIGHT = 0.0002  # typical exploration range: 1e-4 .. 1e-2 (decay in code 
 # ============================
 # When True, use extra upper cap δ1 for A<0; must satisfy TRINAL_DELTA1 > 1 + EPS_CLIP
 USE_TRINAL_CLIP = True
-TRINAL_DELTA1 = 2.5
+TRINAL_DELTA1 = 1.8
+
+# ============================
+# Off-Policy Data Buffering — Optional
+# ============================
+OFFPOLICY_EP_BUFFER_MULT = 4
 
 # ============================
 # Stakes-Based Value Target Clip (Public-Info) — Optional
 # ============================
 # Enable clipping of target returns by ± (EPS_V * Stakes * ReturnScale)
 USE_STAKES_VALUE_CLIP = True
-EPS_V = 1.0                 # base epsilon for value clip (try 0.3–5.0 log-scale)
+EPS_V = 0.9                 # base epsilon for value clip (try 0.3–5.0 log-scale)
 RET_STD_EMA_DECAY = 0.99    # EMA smoothing for return std used as ReturnScale
 
 # Stakes components (public-only)
 STAKES_CHALLENGE_BASE = 4.0  # base when action==6 (challenge)
 STAKES_BASE_EXP = 1.0        # curvature on base (cards played)
-STAKES_PEN_NORM = 3.0        # normalizer for penalties used
+STAKES_PEN_NORM = 4.0        # normalizer for penalties used
 STAKES_PEN_EXP = 1.0         # curvature for penalties factor
 STAKES_CLIP_MIN = 0.5        # clamp multiplier min
-STAKES_CLIP_MAX = 4.0        # clamp multiplier max
+STAKES_CLIP_MAX = 3.5        # clamp multiplier max
 
 # ============================
 # Logging and Checkpointing
