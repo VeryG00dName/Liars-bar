@@ -6,9 +6,6 @@ from typing import Dict, Any, List, Tuple
 
 from src.agents.batch_autoregressive_ppo_agent import BatchPPOAutoregressiveAgent
 
-# helper at top of file (cheap size if you add binding; else fallback)
-def _hist_size(env):
-    return len(env.game_history())  # slower fallback
 
 class PPOVecRolloutManager:
     """
