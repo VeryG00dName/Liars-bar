@@ -40,6 +40,95 @@ BELIEF_LABELS_FROM_KIND: Dict[int, int] = {
 }
 
 # --------------------------------------------------------------------------------------
+# Optional: Trinal-Clip PPO (policy) + Stakes-based value target clipping (public info)
+# --------------------------------------------------------------------------------------
+
+# ---- Config knobs with safe defaults (do not break existing runs) ----
+USE_TRINAL_CLIP        = bool(getattr(config, "USE_TRINAL_CLIP", False))
+TRINAL_DELTA1          = float(getattr(config, "TRINAL_DELTA1", 2.5))  # > 1 + EPS_CLIP
+
+USE_STAKES_VALUE_CLIP  = bool(getattr(config, "USE_STAKES_VALUE_CLIP", False))
+EPS_V                  = float(getattr(config, "EPS_V", 1.0))
+RET_STD_EMA_DECAY      = float(getattr(config, "RET_STD_EMA_DECAY", 0.99))
+STAKES_CHALLENGE_BASE  = float(getattr(config, "STAKES_CHALLENGE_BASE", 4.0))
+STAKES_BASE_EXP        = float(getattr(config, "STAKES_BASE_EXP", 1.0))
+STAKES_PEN_NORM        = float(getattr(config, "STAKES_PEN_NORM", 3.0))
+STAKES_PEN_EXP         = float(getattr(config, "STAKES_PEN_EXP", 1.0))
+STAKES_CLIP_MIN        = float(getattr(config, "STAKES_CLIP_MIN", 0.5))
+STAKES_CLIP_MAX        = float(getattr(config, "STAKES_CLIP_MAX", 4.0))
+
+# Running EMA of return std for scaling value clip (module-level, safe to share process-wide)
+if not hasattr(config, "_ret_std_ema"):
+    config._ret_std_ema = 1.0
+
+
+def _cards_base_from_action(action_ids: torch.Tensor) -> torch.Tensor:
+    """
+    action_ids: int tensor of action ids in {0..6}
+    Returns base stake per action: 1,2,3 for 0..5; STAKES_CHALLENGE_BASE for 6.
+    """
+    base = ((action_ids % 3) + 1).to(torch.float32)  # {1,2,3} for 0..5
+    base = torch.where(
+        action_ids == 6,
+        torch.full_like(base, STAKES_CHALLENGE_BASE, dtype=base.dtype),
+        base,
+    )
+    # curvature + bounds
+    hi = max(STAKES_CHALLENGE_BASE, 3.0)
+    return torch.clamp(base, 1.0, hi).pow(STAKES_BASE_EXP)
+
+
+def _stakes_multiplier_public(action_ids: torch.Tensor, penalties_used: torch.Tensor) -> torch.Tensor:
+    """
+    Public-only stakes multiplier:
+      Stakes = Base(cards played/challenge) * (1 + penalties_used / STAKES_PEN_NORM) ** STAKES_PEN_EXP
+    """
+    base = _cards_base_from_action(action_ids)
+    pen  = penalties_used.to(torch.float32).clamp_min(0.0)
+    pen_factor = (1.0 + pen / max(STAKES_PEN_NORM, 1.0)) ** STAKES_PEN_EXP
+    mult = base * pen_factor
+    return torch.clamp(mult, STAKES_CLIP_MIN, STAKES_CLIP_MAX)
+
+
+def _value_loss_with_stakes_clip_public(
+    v_pred: torch.Tensor,
+    returns: torch.Tensor,
+    action_ids: torch.Tensor,
+    penalties_used: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Clip target returns by ± (EPS_V * Stakes * ReturnScale),
+    where ReturnScale is an EMA of batch return std (unit-correct scaling).
+    """
+    with torch.no_grad():
+        batch_std = torch.clamp(returns.std(), min=1e-6).item()
+        config._ret_std_ema = RET_STD_EMA_DECAY * config._ret_std_ema + (1.0 - RET_STD_EMA_DECAY) * batch_std
+        ret_scale = float(config._ret_std_ema)
+
+    stakes = _stakes_multiplier_public(action_ids, penalties_used)  # [K]
+    delta = EPS_V * stakes * ret_scale
+    target = torch.clamp(returns, min=-delta, max=delta)
+    return F.mse_loss(v_pred, target)
+
+
+def _trinal_clip_policy_loss(new_logp, old_logp, adv, eps_clip, delta1: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    PPO with Trinal-Clip: when A<0, cap ratio by delta1 (instead of 1+eps).
+    Returns (loss, ratio) where loss is the neg-surr min like standard PPO.
+    """
+    ratio = (new_logp - old_logp).exp()
+    # Standard PPO clip band
+    clipped_std = torch.clamp(ratio, 1.0 - eps_clip, 1.0 + eps_clip)
+    # Extra cap only used when A < 0
+    clipped_neg = torch.clamp(ratio, 1.0 - eps_clip, delta1)
+    r_clipped = torch.where(adv < 0, clipped_neg, clipped_std)
+    surr1 = ratio * adv
+    surr2 = r_clipped * adv
+    loss = -torch.min(surr1, surr2).mean()
+    return loss, ratio
+
+
+# --------------------------------------------------------------------------------------
 # Loss builders
 # --------------------------------------------------------------------------------------
 def _accuracy_from_logits(logits: torch.Tensor, targets: torch.Tensor) -> float:
@@ -47,6 +136,7 @@ def _accuracy_from_logits(logits: torch.Tensor, targets: torch.Tensor) -> float:
     with torch.no_grad():
         preds = logits.argmax(dim=-1)
         return float((preds == targets).float().mean().item())
+
 
 def ppo_losses_for_episode(
     model: PPOAutoregressiveModel,
@@ -92,7 +182,7 @@ def ppo_losses_for_episode(
         total_loss = next(model.parameters()).sum() * 0.0
         scalars.update({
             "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0,
-            "approx_kl": 0.0, "clip_fraction": 0.0,
+            "approx_kl": 0.0, "clip_fraction": 0.0, "trinal_clip_neg_frac": 0.0,
             "opp_loss": 0.0, "opp_action_acc": 0.0,
             "belief_loss": 0.0, "belief_acc_0": 0.0, "belief_acc_1": 0.0, "belief_acc_2": 0.0,
         })
@@ -108,7 +198,7 @@ def ppo_losses_for_episode(
         total_loss = next(model.parameters()).sum() * 0.0
         scalars.update({
             "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0,
-            "approx_kl": 0.0, "clip_fraction": 0.0,
+            "approx_kl": 0.0, "clip_fraction": 0.0, "trinal_clip_neg_frac": 0.0,
             "opp_loss": 0.0, "opp_action_acc": 0.0,
             "belief_loss": 0.0, "belief_acc_0": 0.0, "belief_acc_1": 0.0, "belief_acc_2": 0.0,
         })
@@ -119,12 +209,18 @@ def ppo_losses_for_episode(
     next_pos = posK + 1                             # candidate next indices
     has_next = (next_pos < valid_len)               # [K_ep] bool
 
-    # Episode-side tensors
+    # Episode-side tensors (OUR steps)
     actions_t  = torch.tensor([episode["our_action"][i] for i in our_steps_ep_idx[:K_ep]],
                               dtype=torch.long, device=device)                # [K_ep]
     old_logp_t = torch.tensor([episode["log_prob"][i]  for i in our_steps_ep_idx[:K_ep]],
                               dtype=torch.float32, device=device)             # [K_ep]
     rewards    = [float(episode["reward"][i]) for i in our_steps_ep_idx[:K_ep]]
+
+    # PUBLIC penalties saved by the collector at decision time (no fallbacks)
+    penalties_used_t = torch.tensor(
+        [int(episode["penalties_used"][i]) for i in our_steps_ep_idx[:K_ep]],
+        dtype=torch.long, device=device
+    )
 
     # ---- 3) Gather logits/values at action states; legal-mask if provided ----
     logits_at = action_logits.index_select(0, posK).float()                   # [K_ep, A]
@@ -154,13 +250,29 @@ def ppo_losses_for_episode(
     # ---- 5) PPO objective ----
     dist     = torch.distributions.Categorical(logits=logits_at)
     new_logp = dist.log_prob(actions_t)
-    ratio    = (new_logp - old_logp_t).exp()
-    surr1    = ratio * advantages
-    surr2    = torch.clamp(ratio, 1 - config.EPS_CLIP, 1 + config.EPS_CLIP) * advantages
-    policy_loss  = -torch.min(surr1, surr2).mean()
-    value_loss   = F.mse_loss(values_at, returns)
-    entropy_loss = -dist.entropy().mean()
 
+    if USE_TRINAL_CLIP:
+        policy_loss, ratio = _trinal_clip_policy_loss(new_logp, old_logp_t, advantages, config.EPS_CLIP, TRINAL_DELTA1)
+        with torch.no_grad():
+            neg_mask = (advantages < 0)
+            trinal_clip_neg_frac = ((ratio > (1.0 + config.EPS_CLIP)) & neg_mask).float().mean()
+    else:
+        ratio    = (new_logp - old_logp_t).exp()
+        surr1    = ratio * advantages
+        surr2    = torch.clamp(ratio, 1 - config.EPS_CLIP, 1 + config.EPS_CLIP) * advantages
+        policy_loss  = -torch.min(surr1, surr2).mean()
+        trinal_clip_neg_frac = torch.tensor(0.0, device=device)
+
+    # Value loss: either classic MSE or public-stakes clipped target
+    if USE_STAKES_VALUE_CLIP:
+        value_loss = _value_loss_with_stakes_clip_public(
+            v_pred=values_at, returns=returns,
+            action_ids=actions_t, penalties_used=penalties_used_t
+        )
+    else:
+        value_loss = F.mse_loss(values_at, returns)
+
+    entropy_loss = -dist.entropy().mean()
     total_loss = policy_loss + 0.5 * value_loss + config.INIT_ENTROPY_COEF * entropy_loss
 
     # ---- 6) Teacher KL (run teacher here, same input/indices/masks) ----
@@ -174,23 +286,27 @@ def ppo_losses_for_episode(
         dist_sl = torch.distributions.Categorical(logits=t_logits_at)
         bc_kl   = torch.distributions.kl_divergence(dist, dist_sl).mean()
         total_loss = total_loss + bc_kl_weight * bc_kl
-        scalars["bc_kl"] = float(bc_kl.detach().cpu())
+        bc_kl_val = float(bc_kl.detach().cpu())
+    else:
+        bc_kl_val = 0.0
 
     approx_kl  = torch.mean(old_logp_t - new_logp).detach()
     clipfrac   = ((ratio - 1.0).abs() > config.EPS_CLIP).float().mean().detach()
+
     scalars.update({
         "policy_loss": float(policy_loss.detach().cpu()),
         "value_loss":  float(value_loss.detach().cpu()),
         "entropy":     float((-entropy_loss).detach().cpu()),
         "approx_kl":   float(approx_kl.cpu()),
         "clip_fraction": float(clipfrac.cpu()),
+        "trinal_clip_neg_frac": float(trinal_clip_neg_frac.detach().cpu()),
+        "bc_kl": bc_kl_val,
     })
 
     # ---- 7) Belief heads supervised on OUR steps with valid targets ----
     def _belief_ce_and_acc(b_logits, key_tgt):
         if b_logits is None:
             return torch.zeros((), device=device), 0.0
-        # Collect targets aligned to OUR step list, then truncate to K_ep
         targets, keep_idx = [], []
         for i_ep, step_idx in enumerate(our_steps_ep_idx[:K_ep]):
             tgt = episode[key_tgt][step_idx]
@@ -241,8 +357,10 @@ def ppo_losses_for_episode(
     else:
         scalars.update({"opp_loss": 0.0, "n_opp_supervised": 0.0, "opp_action_acc": 0.0})
 
-    return total_loss, scalars
+    if USE_STAKES_VALUE_CLIP:
+        scalars["ret_std_ema"] = float(config._ret_std_ema)
 
+    return total_loss, scalars
 
 # --------------------------------------------------------------------------------------
 # Training loop
@@ -258,28 +376,44 @@ def train(
     device = torch.device(getattr(config, "DEVICE", "cuda" if torch.cuda.is_available() else "cpu"))
     set_seed(getattr(config, "SEED", 42))
     scaler = amp.GradScaler(device=device, enabled=(device.type == 'cuda'))
+
+    if log_dir is None:
+        log_dir = os.path.join("logs", datetime.now().strftime("%Y%m%d_%H%M%S"))
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=log_dir)
     logging.info(f"TensorBoard logdir: {log_dir}")
+
     arena = lb.VecArena()
+
+    # ----- SL init (keep your existing path; still works if not present) -----
     CKPT_PATH = r"checkpoints\autoreg_20250823_224827\autoreg_model_final.pth"
-    checkpoint = torch.load(CKPT_PATH, map_location=device)
     learner = BatchPPOAutoregressiveAgent(device, "TrainAgent_v1")
-    checkpoint = {"policy_nets": {"agent_model": checkpoint["model_state_dict"]}}
-    agent_key = next(iter(checkpoint["policy_nets"]))
-    learner.load_models_from_checkpoint(checkpoint, agent_key)
+    try:
+        checkpoint_raw = torch.load(CKPT_PATH, map_location=device)
+        # adapt to expected schema
+        checkpoint = {"policy_nets": {"agent_model": checkpoint_raw.get("model_state_dict", checkpoint_raw)}}
+        agent_key = next(iter(checkpoint["policy_nets"]))
+        learner.load_models_from_checkpoint(checkpoint, agent_key)
+        logging.info(f"Loaded SL checkpoint: {CKPT_PATH}")
+    except Exception as e:
+        logging.warning(f"Could not load SL checkpoint at {CKPT_PATH}: {e}")
+
     model = learner.model
+    # Teacher: frozen copy of current model (works w/ or w/o SL init)
     sl_teacher = copy.deepcopy(model).eval()
     for p in sl_teacher.parameters(): p.requires_grad = False
+
     optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE, eps=1e-5)
-    logging.info(f"Loaded SL checkpoint: {CKPT_PATH}")
+
     policies = {0: learner}
     rollout_manager = PPOVecRolloutManager(arena, policies, device)
+
     HC_POOL = [
         lb.BotKind.Classic, lb.BotKind.GreedyCardSpammer, lb.BotKind.RandomAgent,
         lb.BotKind.SelectiveTableConservativeChallenger, lb.BotKind.StrategicChallenger,
         lb.BotKind.TableFirstConservativeChallenger, lb.BotKind.TableNonTableAgent,
     ]
+
     for update in range(1, num_updates + 1):
         update_start = time.time()
         model.eval()
@@ -291,7 +425,6 @@ def train(
             logging.warning(f"Update {update}/{num_updates}: No episodes collected. Skipping update.")
             continue
 
-        # No precompute step
         model.train()
         agg, n_loss_terms = {}, 0
 
@@ -315,10 +448,12 @@ def train(
                     agg[k] = agg.get(k, 0.0) + float(v)
                 agg["total_loss"] = agg.get("total_loss", 0.0) + float(loss.detach().cpu())
                 n_loss_terms += 1
+
         avg = lambda name: (agg.get(name, 0.0) / max(1, n_loss_terms))
         avg_total_loss = avg("total_loss")
         logging.info(f"Update {update}/{num_updates} training complete | avg_loss={avg_total_loss:.4f} | time={time.time()-update_start:.2f}s")
         win_rate = sum(ep["win"] for ep in episodes) / len(episodes)
+
         writer.add_scalar("Loss/Total", avg_total_loss, update)
         writer.add_scalar("Loss/Policy", avg("policy_loss"), update)
         writer.add_scalar("Loss/Value", avg("value_loss"), update)
@@ -327,6 +462,7 @@ def train(
         writer.add_scalar("Policy/Entropy", avg("entropy"), update)
         writer.add_scalar("Policy/ApproxKL", avg("approx_kl"), update)
         writer.add_scalar("Policy/ClipFraction", avg("clip_fraction"), update)
+        writer.add_scalar("Policy/TrinalClipNegFrac", avg("trinal_clip_neg_frac"), update)
         writer.add_scalar("Policy/SL_KL", avg("bc_kl"), update)
         writer.add_scalar("Acc/OpponentAction", avg("opp_action_acc"), update)
         writer.add_scalar("Acc/Belief0", avg("belief_acc_0"), update)
@@ -335,12 +471,17 @@ def train(
         writer.add_scalar("Rollout/WinRate", win_rate, update)
         writer.add_scalar("Rollout/EpisodeReturnMean", sum(ep["episode_return"] for ep in episodes) / len(episodes), update)
         writer.add_scalar("Rollout/EpisodeLenMean", sum(len(ep["reward"]) for ep in episodes) / len(episodes), update)
+        if USE_STAKES_VALUE_CLIP:
+            writer.add_scalar("Diag/ReturnStdEMA", getattr(config, "_ret_std_ema", 0.0), update)
+
         if checkpoint_dir and (update % getattr(config, "CHECKPOINT_INTERVAL", 200) == 0):
             os.makedirs(checkpoint_dir, exist_ok=True)
             path = os.path.join(checkpoint_dir, f"arppo_update_{update}.pth")
             torch.save({"model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(), "update": update}, path)
             logging.info(f"Saved checkpoint to {path}")
+
     writer.close()
+
 
 if __name__ == "__main__":
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -349,8 +490,8 @@ if __name__ == "__main__":
     ckpt_dir = os.path.join(getattr(config, "CHECKPOINT_DIR", "checkpoints"), run_name)
     train(
         num_updates=2000,
-        episodes_per_update=config.EPISODES_PER_UPDATE,
-        k_epochs=config.K_EPOCHS,
+        episodes_per_update=getattr(config, "EPISODES_PER_UPDATE", 512),
+        k_epochs=getattr(config, "K_EPOCHS", 2),
         checkpoint_dir=ckpt_dir,
         log_dir=log_dir,
     )
