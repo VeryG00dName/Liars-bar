@@ -20,6 +20,9 @@ TENSORBOARD_RUNS_DIR2 = os.path.join(LOG_DIR, "liars_deck_training2")
 TRANSFORMER_CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "transformer_classifier.pth")
 HISTORICAL_MODEL_DIR = PLAYERS_DIR
 
+# Optional: path to a supervised/teacher checkpoint used for warm start / teacher KL
+SL_TEACHER_CKPT = None  # e.g., os.path.join(CHECKPOINT_DIR, "autoreg_model_final.pth")
+
 # ============================
 # Directory Preparation
 # ============================
@@ -68,6 +71,7 @@ HIDDEN_DIM = 256
 INPUT_DIM = 26  # Will be dynamically set
 OUTPUT_DIM = 7  # Will be dynamically set
 NUM_OBS_STACK = 50
+
 # ============================
 # Opponent Model Configuration
 # ============================
@@ -76,6 +80,7 @@ OPPONENT_INPUT_DIM = 4
 OPPONENT_HIDDEN_DIM = 128
 OPPONENT_LEARNING_RATE = 1e-4
 MAX_SEQUENCE_LENGTH = 400
+
 # ============================
 # Transformer Configuration (Strategy Embedding)
 # ============================
@@ -88,7 +93,7 @@ STRATEGY_NUM_CLASSES = 10  # Unused
 STRATEGY_DROPOUT = 0.1
 
 # ============================
-# Training Hyperparameters
+# PPO / Training Hyperparameters
 # ============================
 NUM_EPISODES = 40000
 EPISODES_PER_UPDATE = 512
@@ -100,17 +105,48 @@ K_EPOCHS = 2
 UPDATE_STEPS = 3
 MAX_NORM = 0.3
 
+# Coefficients
+INIT_ENTROPY_COEF = 0.005
+# Optional: expose value coeff (trainer currently uses 0.5 inline; this is here for future use)
+VALUE_COEF = 0.5
+
+# ============================
+# Auxiliary Loss Weights
+# ============================
 # Old global aux weight (kept for backward-compat fallback)
 AUX_LOSS_WEIGHT = 1
 
-# NEW: split aux weights so you can match SL weighting and tune independently
+# Split aux weights (current PPO usage)
 AUX_BELIEF_WEIGHT = 0.5   # belief heads weight (was 0.5 in your PPO runs)
 AUX_OPP_WEIGHT    = 1.0   # opponent action weight (1.0 to match SL)
 
-# NEW: tiny KL leash to the SL teacher (set >0 to enable in PPO loss)
-BC_KL_WEIGHT = 0.02       # good first try: 0.01–0.05
+# ============================
+# Teacher KL / Behavior Cloning Leash
+# ============================
+BC_KL_WEIGHT = 0.02  # typical exploration range: 1e-4 .. 1e-2 (decay in code if desired)
 
-INIT_ENTROPY_COEF = 0.005
+# ============================
+# Trinal-Clip PPO (Policy) — Optional
+# ============================
+# When True, use extra upper cap δ1 for A<0; must satisfy TRINAL_DELTA1 > 1 + EPS_CLIP
+USE_TRINAL_CLIP = False
+TRINAL_DELTA1 = 2.5
+
+# ============================
+# Stakes-Based Value Target Clip (Public-Info) — Optional
+# ============================
+# Enable clipping of target returns by ± (EPS_V * Stakes * ReturnScale)
+USE_STAKES_VALUE_CLIP = False
+EPS_V = 1.0                 # base epsilon for value clip (try 0.3–5.0 log-scale)
+RET_STD_EMA_DECAY = 0.99    # EMA smoothing for return std used as ReturnScale
+
+# Stakes components (public-only)
+STAKES_CHALLENGE_BASE = 4.0  # base when action==6 (challenge)
+STAKES_BASE_EXP = 1.0        # curvature on base (cards played)
+STAKES_PEN_NORM = 3.0        # normalizer for penalties used
+STAKES_PEN_EXP = 1.0         # curvature for penalties factor
+STAKES_CLIP_MIN = 0.5        # clamp multiplier min
+STAKES_CLIP_MAX = 4.0        # clamp multiplier max
 
 # ============================
 # Logging and Checkpointing
