@@ -2,6 +2,8 @@
 
 import copy
 import os
+
+import numpy as np
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import logging
 import time
@@ -45,6 +47,7 @@ BELIEF_LABELS_FROM_KIND: Dict[int, int] = {
 
 # ---- Config knobs with safe defaults (do not break existing runs) ----
 USE_TRINAL_CLIP        = bool(getattr(config, "USE_TRINAL_CLIP", False))
+print("Using Trinal-Clip PPO:", USE_TRINAL_CLIP)
 TRINAL_DELTA1          = float(getattr(config, "TRINAL_DELTA1", 2.5))  # > 1 + EPS_CLIP
 
 USE_STAKES_VALUE_CLIP  = bool(getattr(config, "USE_STAKES_VALUE_CLIP", False))
@@ -95,20 +98,41 @@ def _value_loss_with_stakes_clip_public(
     returns: torch.Tensor,
     action_ids: torch.Tensor,
     penalties_used: torch.Tensor,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Clip target returns by ± (EPS_V * Stakes * ReturnScale),
-    where ReturnScale is an EMA of batch return std (unit-correct scaling).
+    Returns:
+      (value_mse_loss, clip_frac)
+      clip_frac = fraction of samples where |returns| > delta (i.e., target got clipped)
     """
     with torch.no_grad():
-        batch_std = torch.clamp(returns.std(), min=1e-6).item()
+        r = returns.to(torch.float32)
+        n = int(r.numel())
+        # Treat very small batches safely
+        if n < 2:
+            batch_std = 1.0  # fall back to ±1 scale when tiny
+        else:
+            # robust handling for sparse returns: compute std on non-zeros if enough
+            nz = (r.abs() > 1e-8)
+            if nz.float().mean().item() >= 0.2:  # at least 20% non-zero
+                batch_std = r[nz].std(unbiased=False).clamp(min=1e-3).item()
+            else:
+                batch_std = 1.0  # returns mostly zeros; use ±1 as natural game scale
+
+        # Smooth (still keep the EMA, but it's now well-behaved)
         config._ret_std_ema = RET_STD_EMA_DECAY * config._ret_std_ema + (1.0 - RET_STD_EMA_DECAY) * batch_std
         ret_scale = float(config._ret_std_ema)
 
     stakes = _stakes_multiplier_public(action_ids, penalties_used)  # [K]
     delta = EPS_V * stakes * ret_scale
-    target = torch.clamp(returns, min=-delta, max=delta)
-    return F.mse_loss(v_pred, target)
+    lower = -delta
+    upper =  delta
+    # fraction of samples that would be clipped
+    with torch.no_grad():
+        clip_mask = (returns < lower) | (returns > upper)
+        clip_frac = clip_mask.float().mean()
+
+    target = torch.clamp(returns, min=lower, max=upper)
+    return F.mse_loss(v_pred, target), clip_frac
 
 
 def _trinal_clip_policy_loss(new_logp, old_logp, adv, eps_clip, delta1: float) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -137,7 +161,7 @@ def _accuracy_from_logits(logits: torch.Tensor, targets: torch.Tensor) -> float:
         preds = logits.argmax(dim=-1)
         return float((preds == targets).float().mean().item())
 
-
+config.DEBUG_PPO = False
 def ppo_losses_for_episode(
     model: PPOAutoregressiveModel,
     episode: Dict[str, Any],
@@ -145,6 +169,28 @@ def ppo_losses_for_episode(
     sl_teacher: Optional[PPOAutoregressiveModel] = None,
     bc_kl_weight: float = 0.0,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    DEBUG = bool(getattr(config, "DEBUG_PPO", False))
+
+    def _tsum(x: torch.Tensor) -> Dict[str, Any]:
+        x = x.detach()
+        return {
+            "shape": tuple(x.shape),
+            "min": float(torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0).min().cpu()) if x.numel() > 0 else 0.0,
+            "max": float(torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0).max().cpu()) if x.numel() > 0 else 0.0,
+            "mean": float(torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0).mean().cpu()) if x.numel() > 0 else 0.0,
+            "nan": int(torch.isnan(x).sum().cpu()) if x.numel() > 0 else 0,
+            "inf": int(torch.isinf(x).sum().cpu()) if x.numel() > 0 else 0,
+        }
+
+    def _ensure_finite(name: str, x: torch.Tensor):
+        if not torch.isfinite(x).all():
+            print(f"[DEBUG][{name}] non-finite detected -> { _tsum(x) }")
+            raise RuntimeError(f"Non-finite in {name}")
+
+    def _ensure(cond: bool, msg: str):
+        if not cond:
+            print(f"[DEBUG] CHECK FAILED: {msg}")
+            raise RuntimeError(msg)
 
     # ---- 0) Unpack model input exactly as fed to the network ----
     mi = {k: (v.to(device) if torch.is_tensor(v) else v)
@@ -163,9 +209,19 @@ def ppo_losses_for_episode(
 
     # ---- Student forward on exactly the same input ----
     action_logits, opp_logits, state_values, b0, b1, b2 = model(**mi)  # [1, L, ...]
-    action_logits = action_logits[0, :valid_len, :]            # [L, A]
-    opp_logits    = opp_logits[0, :valid_len, :] if opp_logits is not None else None
-    state_values  = state_values[0, :valid_len].squeeze(-1)    # [L]
+    action_logits = action_logits[0, :valid_len, :].to(torch.float32)  # [L, A]
+    opp_logits    = opp_logits[0, :valid_len, :].to(torch.float32) if opp_logits is not None else None
+    state_values  = state_values[0, :valid_len].squeeze(-1).to(torch.float32)  # [L]
+
+    if DEBUG:
+        print("[DEBUG] forward:",
+              "action_logits", _tsum(action_logits),
+              "state_values", _tsum(state_values),
+              "opp_logits", _tsum(opp_logits) if opp_logits is not None else "None")
+
+    _ensure_finite("action_logits", action_logits)
+    _ensure_finite("state_values", state_values)
+    if opp_logits is not None: _ensure_finite("opp_logits", opp_logits)
 
     # ---- 1) Indices for OUR turns in local space (0..valid_len-1) ----
     our_pos = (agent_types_1d == 0).nonzero(as_tuple=False).squeeze(-1).long()  # [K]
@@ -177,7 +233,6 @@ def ppo_losses_for_episode(
         "episode_return": float(episode.get("episode_return", 0.0))
     }
 
-    # Graph-carrying zero (so backward() never breaks) in "no-learnable-steps" cases
     if K == 0:
         total_loss = next(model.parameters()).sum() * 0.0
         scalars.update({
@@ -185,14 +240,14 @@ def ppo_losses_for_episode(
             "approx_kl": 0.0, "clip_fraction": 0.0, "trinal_clip_neg_frac": 0.0,
             "opp_loss": 0.0, "opp_action_acc": 0.0,
             "belief_loss": 0.0, "belief_acc_0": 0.0, "belief_acc_1": 0.0, "belief_acc_2": 0.0,
+            "value_clip_frac": 0.0,
         })
+        if DEBUG: print("[DEBUG] K==0 (no our turns); returning zero loss")
         return total_loss, scalars
 
     # ---- 2) Build episode-aligned lists at OUR steps ----
     our_steps_ep_idx = [i for i, seat in enumerate(episode["agent_id"])
                         if seat == episode["training_agent_seat"]]
-
-    # Align counts; we’ll learn on min(K, len(ep rows))
     K_ep = min(K, len(our_steps_ep_idx))
     if K_ep == 0:
         total_loss = next(model.parameters()).sum() * 0.0
@@ -201,98 +256,182 @@ def ppo_losses_for_episode(
             "approx_kl": 0.0, "clip_fraction": 0.0, "trinal_clip_neg_frac": 0.0,
             "opp_loss": 0.0, "opp_action_acc": 0.0,
             "belief_loss": 0.0, "belief_acc_0": 0.0, "belief_acc_1": 0.0, "belief_acc_2": 0.0,
+            "value_clip_frac": 0.0,
         })
+        if DEBUG: print("[DEBUG] K_ep==0 (no aligned our-step rows); returning zero loss")
         return total_loss, scalars
 
-    # Slice model-side positions to K_ep
-    posK = our_pos[:K_ep]                           # [K_ep]
-    next_pos = posK + 1                             # candidate next indices
-    has_next = (next_pos < valid_len)               # [K_ep] bool
+    # ---- 2.5) OUR-turn indexing with correct multi-step gaps ----
+    posK = our_pos[:K_ep]  # [K_ep]
+    next_posK = torch.full_like(posK, fill_value=-1)
+    if K_ep > 1:
+        next_posK[:-1] = posK[1:]
+    has_next = next_posK.ge(0)  # [K_ep] bool
+    gaps = torch.where(has_next, (next_posK - posK).clamp(min=1), torch.ones_like(posK))
+
+    if DEBUG:
+        print("[DEBUG] posK:", posK.tolist(), "next_posK:", next_posK.tolist(),
+              "has_next:", has_next.tolist(), "gaps:", gaps.tolist())
+
+    # ---- 3) Gather logits/values at OUR decision states; legal-mask if provided ----
+    logits_at = action_logits.index_select(0, posK)                            # [K_ep, A]
+    if masks_2d is not None:
+        mask_at = masks_2d.index_select(0, posK).bool()                        # [K_ep, A]
+        invalid_rows = (~mask_at).all(dim=1)                                   # [K_ep]
+        if invalid_rows.any():
+            if DEBUG:
+                print(f"[DEBUG] mask invalid rows: {invalid_rows.nonzero(as_tuple=False).squeeze(-1).tolist()}")
+            # fallback: allow argmax column
+            fb_cols = logits_at[invalid_rows].argmax(dim=-1)
+            mask_at[invalid_rows] = False
+            mask_at[invalid_rows, fb_cols] = True
+        logits_at = logits_at.masked_fill(~mask_at, -1e9)
+    else:
+        mask_at = None
+
+    logits_at = torch.nan_to_num(logits_at, nan=0.0, posinf=0.0, neginf=-1e9)
+    _ensure_finite("logits_at", logits_at)
+
+    values_at = state_values.index_select(0, posK)
+    values_at = torch.nan_to_num(values_at, nan=0.0, posinf=0.0, neginf=0.0)
+    _ensure_finite("values_at", values_at)
+
+    next_values_full = torch.zeros_like(values_at)
+    if has_next.any():
+        next_values_full[has_next] = state_values.index_select(0, next_posK[has_next])
 
     # Episode-side tensors (OUR steps)
     actions_t  = torch.tensor([episode["our_action"][i] for i in our_steps_ep_idx[:K_ep]],
                               dtype=torch.long, device=device)                # [K_ep]
     old_logp_t = torch.tensor([episode["log_prob"][i]  for i in our_steps_ep_idx[:K_ep]],
                               dtype=torch.float32, device=device)             # [K_ep]
-    rewards    = [float(episode["reward"][i]) for i in our_steps_ep_idx[:K_ep]]
-
-    # PUBLIC penalties saved by the collector at decision time (no fallbacks)
+    rewards    = torch.tensor([float(episode["reward"][i]) for i in our_steps_ep_idx[:K_ep]],
+                              dtype=torch.float32, device=device)             # [K_ep]
     penalties_used_t = torch.tensor(
         [int(episode["penalties_used"][i]) for i in our_steps_ep_idx[:K_ep]],
         dtype=torch.long, device=device
     )
 
-    # ---- 3) Gather logits/values at action states; legal-mask if provided ----
-    logits_at = action_logits.index_select(0, posK).float()                   # [K_ep, A]
-    if masks_2d is not None:
-        mask_at = masks_2d.index_select(0, posK)                              # [K_ep, A] bool
-        logits_at = logits_at.masked_fill(~mask_at, float("-inf"))
+    _ensure((actions_t >= 0).all().item(), "actions_t has negative entries")
+    _ensure(actions_t.max().item() < logits_at.size(-1), "actions_t out of range of logits")
+    _ensure_finite("old_logp_t", old_logp_t)
+    _ensure_finite("rewards", rewards)
 
-    values_at = state_values.index_select(0, posK)                            # [K_ep]
-    next_values_full = torch.zeros_like(values_at)
-    if has_next.any():
-        next_values_full[has_next] = state_values.index_select(0, next_pos[has_next])
+    if DEBUG:
+        print("[DEBUG] actions_t[:10]:", actions_t[:10].tolist(),
+              "old_logp_t[:10]:", old_logp_t[:10].tolist(),
+              "rewards[:10]:", rewards[:10].tolist(),
+              "penalties_used_t[:10]:", penalties_used_t[:10].tolist())
 
-    # Dones: terminal if there is no next token within valid_len (true terminal → no bootstrap)
-    dones = (~has_next).tolist()
+    # ---- 4) Irregular-step GAE on OUR decision timeline ----
+    gamma = float(getattr(config, "GAMMA", 0.99))
+    lam   = float(getattr(config, "GAE_LAMBDA", 0.95))
+    gaps_f = gaps.to(torch.float32)
+    gamma_gap = torch.pow(torch.full_like(gaps_f, gamma), gaps_f)            # gamma**gap
+    lam_gap   = torch.pow(torch.full_like(gaps_f, lam),   gaps_f)            # lambda**gap
 
-    # ---- 4) GAE ----
-    adv, ret = compute_gae(
-        rewards, dones,
-        values_at.detach().cpu().tolist(),
-        next_values_full.detach().cpu().tolist(),
-        config.GAMMA, config.GAE_LAMBDA,
-    )
-    advantages = torch.tensor(adv, dtype=torch.float32, device=device)
-    returns    = torch.tensor(ret, dtype=torch.float32, device=device)
-    advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+    advantages = torch.zeros_like(values_at)
+    lastgaelam = torch.zeros((), device=device, dtype=torch.float32)
+    for t in reversed(range(K_ep)):
+        if bool(has_next[t]):
+            nv = next_values_full[t]
+            g  = gamma_gap[t]
+            gl = gamma_gap[t] * lam_gap[t]
+        else:
+            nv = torch.zeros((), device=device, dtype=torch.float32)
+            g  = torch.zeros((), device=device, dtype=torch.float32)
+            gl = torch.zeros((), device=device, dtype=torch.float32)
+        delta = rewards[t] + g * nv - values_at[t]
+        lastgaelam = delta + gl * lastgaelam
+        advantages[t] = lastgaelam
 
-    # ---- 5) PPO objective ----
-    dist     = torch.distributions.Categorical(logits=logits_at)
-    new_logp = dist.log_prob(actions_t)
+    returns = advantages + values_at
+    adv_mean = advantages.mean()
+    adv_std  = advantages.std(unbiased=False).clamp_min(1e-8)
+    advantages = (advantages - adv_mean) / adv_std
 
-    if USE_TRINAL_CLIP:
-        policy_loss, ratio = _trinal_clip_policy_loss(new_logp, old_logp_t, advantages, config.EPS_CLIP, TRINAL_DELTA1)
+    if DEBUG:
+        print("[DEBUG] advantages", _tsum(advantages),
+              "returns", _tsum(returns),
+              "values_at", _tsum(values_at))
+
+    _ensure_finite("advantages", advantages)
+    _ensure_finite("returns", returns)
+
+    # ---- 5) PPO objective (stable, fp32, clamped) ----
+    dist     = torch.distributions.Categorical(logits=logits_at.to(torch.float32))
+    new_logp = dist.log_prob(actions_t).to(torch.float32)
+    new_logp = torch.nan_to_num(new_logp, nan=0.0, neginf=-1e9, posinf=0.0)
+    old_logp_t = torch.nan_to_num(old_logp_t.to(torch.float32), nan=0.0, neginf=-1e9, posinf=0.0)
+
+    _ensure_finite("new_logp", new_logp)
+    _ensure_finite("old_logp_t(clean)", old_logp_t)
+
+    log_ratio = (new_logp - old_logp_t).clamp(min=-60.0, max=60.0)
+    ratio = log_ratio.exp()
+    ratio = torch.nan_to_num(ratio, nan=1.0, posinf=1e6, neginf=0.0)
+    _ensure_finite("ratio", ratio)
+
+    if DEBUG:
+        print("[DEBUG] ratio", _tsum(ratio), "new_logp", _tsum(new_logp))
+
+    use_trinal = bool(getattr(config, "USE_TRINAL_CLIP", False))
+    eps_clip = float(getattr(config, "EPS_CLIP", 0.2))
+    if use_trinal:
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1 - eps_clip, 1 + eps_clip) * advantages
+        policy_loss = -torch.min(surr1, surr2).mean()
         with torch.no_grad():
             neg_mask = (advantages < 0)
-            trinal_clip_neg_frac = ((ratio > (1.0 + config.EPS_CLIP)) & neg_mask).float().mean()
+            trinal_clip_neg_frac = ((ratio > (1.0 + eps_clip)) & neg_mask).float().mean()
     else:
-        ratio    = (new_logp - old_logp_t).exp()
-        surr1    = ratio * advantages
-        surr2    = torch.clamp(ratio, 1 - config.EPS_CLIP, 1 + config.EPS_CLIP) * advantages
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1 - eps_clip, 1 + eps_clip) * advantages
         policy_loss  = -torch.min(surr1, surr2).mean()
         trinal_clip_neg_frac = torch.tensor(0.0, device=device)
 
-    # Value loss: either classic MSE or public-stakes clipped target
-    if USE_STAKES_VALUE_CLIP:
-        value_loss = _value_loss_with_stakes_clip_public(
+    entropy = dist.entropy().to(torch.float32)
+    entropy = torch.nan_to_num(entropy, nan=0.0)
+    entropy_loss = -entropy.mean()
+
+    use_vclip = bool(getattr(config, "USE_STAKES_VALUE_CLIP", False))
+    if use_vclip:
+        value_loss, vclip_frac = _value_loss_with_stakes_clip_public(
             v_pred=values_at, returns=returns,
             action_ids=actions_t, penalties_used=penalties_used_t
         )
     else:
         value_loss = F.mse_loss(values_at, returns)
+        vclip_frac = torch.tensor(0.0, device=device)
 
-    entropy_loss = -dist.entropy().mean()
-    total_loss = policy_loss + 0.5 * value_loss + config.INIT_ENTROPY_COEF * entropy_loss
+    _ensure_finite("policy_loss", policy_loss)
+    _ensure_finite("value_loss", value_loss)
+    _ensure_finite("entropy_loss", entropy_loss)
+
+    total_loss = policy_loss + 0.5 * value_loss + float(getattr(config, "INIT_ENTROPY_COEF", 0.0)) * entropy_loss
+    _ensure_finite("total_loss", total_loss)
 
     # ---- 6) Teacher KL (run teacher here, same input/indices/masks) ----
     if (bc_kl_weight > 0.0) and (sl_teacher is not None):
         with torch.no_grad():
             t_action_logits, *_ = sl_teacher(**mi)                            # [1, L, A]
-            t_action_logits = t_action_logits[0, :valid_len, :]               # [L, A]
-            t_logits_at = t_action_logits.index_select(0, posK).float()       # [K_ep, A]
-            if action_masks is not None:
-                t_logits_at = t_logits_at.masked_fill(~mask_at, float("-inf"))
+            t_action_logits = t_action_logits[0, :valid_len, :].to(torch.float32)  # [L, A]
+            t_logits_at = t_action_logits.index_select(0, posK)               # [K_ep, A]
+            if mask_at is not None:
+                t_logits_at = t_logits_at.masked_fill(~mask_at, -1e9)
+            t_logits_at = torch.nan_to_num(t_logits_at, nan=0.0, posinf=0.0, neginf=-1e9)
         dist_sl = torch.distributions.Categorical(logits=t_logits_at)
         bc_kl   = torch.distributions.kl_divergence(dist, dist_sl).mean()
+        _ensure_finite("bc_kl", bc_kl)
         total_loss = total_loss + bc_kl_weight * bc_kl
         bc_kl_val = float(bc_kl.detach().cpu())
     else:
         bc_kl_val = 0.0
 
     approx_kl  = torch.mean(old_logp_t - new_logp).detach()
-    clipfrac   = ((ratio - 1.0).abs() > config.EPS_CLIP).float().mean().detach()
+    clipfrac   = ((ratio - 1.0).abs() > eps_clip).float().mean().detach()
 
+    # Diagnostics
     scalars.update({
         "policy_loss": float(policy_loss.detach().cpu()),
         "value_loss":  float(value_loss.detach().cpu()),
@@ -300,8 +439,22 @@ def ppo_losses_for_episode(
         "approx_kl":   float(approx_kl.cpu()),
         "clip_fraction": float(clipfrac.cpu()),
         "trinal_clip_neg_frac": float(trinal_clip_neg_frac.detach().cpu()),
+        "value_clip_frac": float(vclip_frac.detach().cpu()),
         "bc_kl": bc_kl_val,
+        "our_gap_mean": float(gaps.to(torch.float32).mean().cpu()),
+        "our_gap_max":  float(gaps.max().item()),
     })
+
+    # Optional: explained variance on UNCLIPPED returns (skip when n<2)
+    if values_at.numel() > 1:
+        with torch.no_grad():
+            r = returns.detach()
+            v = values_at.detach()
+            var_y = r.var(unbiased=False)
+            ev = 1.0 - (r - v).var(unbiased=False) / (var_y + 1e-8)
+            scalars["value_explained_var"] = float(ev.clamp(-1, 1).cpu())
+    else:
+        scalars["value_explained_var"] = 0.0
 
     # ---- 7) Belief heads supervised on OUR steps with valid targets ----
     def _belief_ce_and_acc(b_logits, key_tgt):
@@ -319,6 +472,7 @@ def ppo_losses_for_episode(
         target_t  = torch.tensor(targets, dtype=torch.long, device=device)
         keep_idx  = torch.as_tensor(keep_idx, dtype=torch.long, device=device)
         logits_sel = b_logits[0, :valid_len, :].index_select(0, posK).index_select(0, keep_idx)
+        _ensure_finite("belief_logits_sel", logits_sel)
         acc = _accuracy_from_logits(logits_sel.detach(), target_t.detach())
         return F.cross_entropy(logits_sel, target_t), acc
 
@@ -326,7 +480,9 @@ def ppo_losses_for_episode(
     b1_loss, acc_b1 = _belief_ce_and_acc(b1, "belief_tgt1")
     b2_loss, acc_b2 = _belief_ce_and_acc(b2, "belief_tgt2")
     belief_loss = b0_loss + b1_loss + b2_loss
-    total_loss  = total_loss + getattr(config, "AUX_BELIEF_WEIGHT", 0.5) * belief_loss
+    _ensure_finite("belief_loss", belief_loss)
+
+    total_loss  = total_loss + float(getattr(config, "AUX_BELIEF_WEIGHT", 0.5)) * belief_loss
     scalars.update({
         "belief_loss": float(belief_loss.detach().cpu()),
         "belief_acc_0": acc_b0,
@@ -345,8 +501,12 @@ def ppo_losses_for_episode(
         if M > 0:
             opp_logits_sel = opp_logits.index_select(0, opp_idx[:M])       # [M, A]
             opp_targets_t  = torch.tensor(opp_targets[:M], dtype=torch.long, device=device)
+            _ensure((opp_targets_t >= 0).all().item(), "opp_targets_t negative entry")
+            _ensure(opp_targets_t.max().item() < opp_logits_sel.size(-1), "opp_targets_t out of range")
+            _ensure_finite("opp_logits_sel", opp_logits_sel)
             opp_loss = F.cross_entropy(opp_logits_sel, opp_targets_t)
-            total_loss = total_loss + getattr(config, "AUX_OPP_WEIGHT", 0.5) * opp_loss
+            _ensure_finite("opp_loss", opp_loss)
+            total_loss = total_loss + float(getattr(config, "AUX_OPP_WEIGHT", 0.5)) * opp_loss
             scalars.update({
                 "opp_loss": float(opp_loss.detach().cpu()),
                 "n_opp_supervised": float(M),
@@ -357,8 +517,8 @@ def ppo_losses_for_episode(
     else:
         scalars.update({"opp_loss": 0.0, "n_opp_supervised": 0.0, "opp_action_acc": 0.0})
 
-    if USE_STAKES_VALUE_CLIP:
-        scalars["ret_std_ema"] = float(config._ret_std_ema)
+    if bool(getattr(config, "USE_STAKES_VALUE_CLIP", False)):
+        scalars["ret_std_ema"] = float(getattr(config, "_ret_std_ema", 0.0))
 
     return total_loss, scalars
 
@@ -385,13 +545,11 @@ def train(
 
     arena = lb.VecArena()
 
-    # ----- SL init (keep your existing path; still works if not present) -----
-    CKPT_PATH = r"checkpoints\AR_220k__v4_4p_v3_IBFP\autoreg_model_final.pth"
+    # ----- SL init (kept as-is; uses your path if present) -----
+    CKPT_PATH = config.SL_TEACHER_CKPT
     learner = BatchPPOAutoregressiveAgent(device, "TrainAgent_v1")
-    
     try:
         checkpoint_raw = torch.load(CKPT_PATH, map_location=device)
-        # adapt to expected schema
         checkpoint = {"policy_nets": {"agent_model": checkpoint_raw.get("model_state_dict", checkpoint_raw)}}
         agent_key = next(iter(checkpoint["policy_nets"]))
         learner.load_models_from_checkpoint(checkpoint, agent_key)
@@ -400,7 +558,6 @@ def train(
         logging.warning(f"Could not load SL checkpoint at {CKPT_PATH}: {e}")
 
     model = learner.model
-    # Teacher: frozen copy of current model (works w/ or w/o SL init)
     sl_teacher = copy.deepcopy(model).eval()
     for p in sl_teacher.parameters(): p.requires_grad = False
 
@@ -415,23 +572,37 @@ def train(
         lb.BotKind.TableFirstConservativeChallenger, lb.BotKind.TableNonTableAgent,
     ]
 
+    # ---- Rolling off-policy buffer ----
+    buffer_mult = int(getattr(config, "OFFPOLICY_EP_BUFFER_MULT", 4))
+    max_buffer_eps = max(episodes_per_update * buffer_mult, episodes_per_update)
+    ep_buffer: List[Dict[str, Any]] = []
+
     for update in range(1, num_updates + 1):
         update_start = time.time()
         model.eval()
-        episodes = rollout_manager.collect_episodes(
+
+        # Collect NEW episodes this update
+        new_eps = rollout_manager.collect_episodes(
             num_episodes=episodes_per_update, num_players=config.NUM_PLAYERS,
             training_policy_id=0, opponent_pool=HC_POOL
         )
-        if not episodes:
+        if not new_eps:
             logging.warning(f"Update {update}/{num_updates}: No episodes collected. Skipping update.")
             continue
+
+        # Extend buffer and trim oldest
+        ep_buffer.extend(new_eps)
+        if len(ep_buffer) > max_buffer_eps:
+            ep_buffer = ep_buffer[-max_buffer_eps:]
 
         model.train()
         agg, n_loss_terms = {}, 0
 
+        # Train on the WHOLE BUFFER (mild off-policy thanks to PPO clips + Trinal-Clip)
+        train_eps = list(ep_buffer)
         for _ in range(k_epochs):
-            random.shuffle(episodes)
-            for ep in episodes:
+            random.shuffle(train_eps)
+            for ep in train_eps:
                 with amp.autocast(device_type=device.type, dtype=torch.float16):
                     loss, scalars = ppo_losses_for_episode(
                         model, ep, device,
@@ -452,9 +623,15 @@ def train(
 
         avg = lambda name: (agg.get(name, 0.0) / max(1, n_loss_terms))
         avg_total_loss = avg("total_loss")
-        logging.info(f"Update {update}/{num_updates} training complete | avg_loss={avg_total_loss:.4f} | time={time.time()-update_start:.2f}s")
-        win_rate = sum(ep["win"] for ep in episodes) / len(episodes)
+        dur = time.time() - update_start
+        logging.info(
+            f"Update {update}/{num_updates} | buffer={len(ep_buffer)}/{max_buffer_eps} "
+            f"| avg_loss={avg_total_loss:.4f} | time={dur:.2f}s"
+        )
 
+        # Log scalars
+        # Use the *latest* batch for rollout stats (winrate, returns), buffer for training stats
+        win_rate = sum(ep["win"] for ep in new_eps) / len(new_eps)
         writer.add_scalar("Loss/Total", avg_total_loss, update)
         writer.add_scalar("Loss/Policy", avg("policy_loss"), update)
         writer.add_scalar("Loss/Value", avg("value_loss"), update)
@@ -465,14 +642,16 @@ def train(
         writer.add_scalar("Policy/ClipFraction", avg("clip_fraction"), update)
         writer.add_scalar("Policy/TrinalClipNegFrac", avg("trinal_clip_neg_frac"), update)
         writer.add_scalar("Policy/SL_KL", avg("bc_kl"), update)
+        writer.add_scalar("Value/ClipFrac", avg("value_clip_frac"), update)   # <--- NEW: value clipping visibility
         writer.add_scalar("Acc/OpponentAction", avg("opp_action_acc"), update)
         writer.add_scalar("Acc/Belief0", avg("belief_acc_0"), update)
         writer.add_scalar("Acc/Belief1", avg("belief_acc_1"), update)
         writer.add_scalar("Acc/Belief2", avg("belief_acc_2"), update)
         writer.add_scalar("Rollout/WinRate", win_rate, update)
-        writer.add_scalar("Rollout/EpisodeReturnMean", sum(ep["episode_return"] for ep in episodes) / len(episodes), update)
-        writer.add_scalar("Rollout/EpisodeLenMean", sum(len(ep["reward"]) for ep in episodes) / len(episodes), update)
-        if USE_STAKES_VALUE_CLIP:
+        writer.add_scalar("Rollout/EpisodeReturnMean", sum(ep["episode_return"] for ep in new_eps) / len(new_eps), update)
+        writer.add_scalar("Rollout/EpisodeLenMean", sum(len(ep["reward"]) for ep in new_eps) / len(new_eps), update)
+        writer.add_scalar("Buffer/Size", len(ep_buffer), update)
+        if getattr(config, "USE_STAKES_VALUE_CLIP", False):
             writer.add_scalar("Diag/ReturnStdEMA", getattr(config, "_ret_std_ema", 0.0), update)
 
         if checkpoint_dir and (update % getattr(config, "CHECKPOINT_INTERVAL", 200) == 0):
