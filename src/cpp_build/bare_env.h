@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 #include <string>
@@ -30,7 +31,7 @@ public:
   std::array<uint8_t, MAX_PLAYERS> terminations{};
   std::array<uint8_t, MAX_PLAYERS> round_eliminated{};
 
-  // ---- NEW: History ----
+  // ---- History ----
   int global_step = 0;
   std::vector<HistoryEntry> game_history;
 
@@ -63,7 +64,7 @@ private:
 
   // Helpers
   inline uint32_t rnd();
-  template<int N>
+  template<std::size_t N>
   inline void shuffle(std::array<uint8_t,N>& a);
   inline int  count_in_hand(int p, uint8_t v) const;
   inline void remove_k(int p, uint8_t v, int k);

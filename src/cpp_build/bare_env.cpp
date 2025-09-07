@@ -9,7 +9,7 @@ inline uint32_t Env::rnd() {
 }
 
 // ---------------- Fisher–Yates shuffle ----------------
-template<int N>
+template<std::size_t N>
 inline void Env::shuffle(std::array<uint8_t, N>& a) {
     for (int i = N - 1; i > 0; --i) {
         int j = static_cast<int>(rnd() % static_cast<uint32_t>(i + 1));
