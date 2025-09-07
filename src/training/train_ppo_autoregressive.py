@@ -1,39 +1,63 @@
 # src/training/train_ppo_autoregressive.py
 
-import copy
-import os
+import os, logging, warnings
 
-import numpy as np
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-import logging
+# Quiet Torch compile logs
+os.environ.pop("TORCH_LOGS", None)           # disable extra compile logs
+os.environ.setdefault("TORCHDYNAMO_VERBOSE", "0")
+os.environ.setdefault("TORCH_COMPILE_DEBUG", "0")
+
+# Hide symbolic_shapes warnings printed via warnings module (belt-and-suspenders)
+warnings.filterwarnings("ignore", message=".*symbolic_shapes.*")
 import time
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 import random
+import numpy as np
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 import torch
 import torch.nn.functional as F
-from torch.nn.utils import clip_grad_norm_
 from torch.utils.tensorboard import SummaryWriter
+from torch.nn.utils import clip_grad_norm_
 import torch.amp as amp
-# Env & project imports
 from src.misc import lb
 from src import config
-
-# Model & agent
 from src.model.ppo_autoregressive_model import PPOAutoregressiveModel
 from src.agents.batch_autoregressive_ppo_agent import BatchPPOAutoregressiveAgent
-
-# High-performance vectorized data collector
 from src.training.vec_ppo_rollout import PPOVecRolloutManager
 
-# Utilities
-from src.training.train_extras import set_seed
-from src.training.train_utils import compute_gae
+def _silence_torch_symbolic_logs():
+    for name in (
+        "torch.fx.experimental.symbolic_shapes",
+        "torch._dynamo.symbolic_shapes",
+        "torch._dynamo",
+        "torch._inductor",
+    ):
+        logging.getLogger(name).setLevel(logging.ERROR)
+_silence_torch_symbolic_logs()
+# ---------------------- Speed knobs (no determinism) -----------------------
 torch.backends.cudnn.benchmark = True
-# --------------------------------------------------------------------------------------
-# Belief mapping (maps BotKind enum value to belief index)
-# --------------------------------------------------------------------------------------
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+    try:
+        from torch.nn.attention import sdp_kernel
+        sdp_kernel.enable_flash(True)
+        sdp_kernel.enable_math(False)
+        sdp_kernel.enable_mem_efficient(True)
+    except Exception:
+        pass
+
+# Lightweight seeding (no deterministic kernels)
+SEED = int(getattr(config, "SEED", 42))
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+
+# ------------------------------ Belief labels ------------------------------
 BELIEF_LABELS_FROM_KIND: Dict[int, int] = {
     lb.BotKind.GreedyCardSpammer.value: 1, lb.BotKind.StrategicChallenger.value: 4,
     lb.BotKind.TableNonTableAgent.value: 6, lb.BotKind.Classic.value: 0,
@@ -41,16 +65,10 @@ BELIEF_LABELS_FROM_KIND: Dict[int, int] = {
     lb.BotKind.SelectiveTableConservativeChallenger.value: 3, lb.BotKind.RandomAgent.value: 2,
 }
 
-# --------------------------------------------------------------------------------------
-# Optional: Trinal-Clip PPO (policy) + Stakes-based value target clipping (public info)
-# --------------------------------------------------------------------------------------
-
-# ---- Config knobs with safe defaults (do not break existing runs) ----
-USE_TRINAL_CLIP        = bool(getattr(config, "USE_TRINAL_CLIP", False))
-print("Using Trinal-Clip PPO:", USE_TRINAL_CLIP)
-TRINAL_DELTA1          = float(getattr(config, "TRINAL_DELTA1", 2.5))  # > 1 + EPS_CLIP
-
-USE_STAKES_VALUE_CLIP  = bool(getattr(config, "USE_STAKES_VALUE_CLIP", False))
+# -------- Trinal-Clip & public-stakes value clip (config knobs) ------------
+USE_TRINAL_CLIP        = bool(getattr(config, "USE_TRINAL_CLIP", True))
+TRINAL_DELTA1          = float(getattr(config, "TRINAL_DELTA1", 2.5))
+USE_STAKES_VALUE_CLIP  = bool(getattr(config, "USE_STAKES_VALUE_CLIP", True))
 EPS_V                  = float(getattr(config, "EPS_V", 1.0))
 RET_STD_EMA_DECAY      = float(getattr(config, "RET_STD_EMA_DECAY", 0.99))
 STAKES_CHALLENGE_BASE  = float(getattr(config, "STAKES_CHALLENGE_BASE", 4.0))
@@ -59,385 +77,301 @@ STAKES_PEN_NORM        = float(getattr(config, "STAKES_PEN_NORM", 3.0))
 STAKES_PEN_EXP         = float(getattr(config, "STAKES_PEN_EXP", 1.0))
 STAKES_CLIP_MIN        = float(getattr(config, "STAKES_CLIP_MIN", 0.5))
 STAKES_CLIP_MAX        = float(getattr(config, "STAKES_CLIP_MAX", 4.0))
-
-# Running EMA of return std for scaling value clip (module-level, safe to share process-wide)
 if not hasattr(config, "_ret_std_ema"):
     config._ret_std_ema = 1.0
 
-
 def _cards_base_from_action(action_ids: torch.Tensor) -> torch.Tensor:
-    """
-    action_ids: int tensor of action ids in {0..6}
-    Returns base stake per action: 1,2,3 for 0..5; STAKES_CHALLENGE_BASE for 6.
-    """
-    base = ((action_ids % 3) + 1).to(torch.float32)  # {1,2,3} for 0..5
-    base = torch.where(
-        action_ids == 6,
-        torch.full_like(base, STAKES_CHALLENGE_BASE, dtype=base.dtype),
-        base,
-    )
-    # curvature + bounds
+    base = ((action_ids % 3) + 1).to(torch.float32)
+    base = torch.where(action_ids == 6,
+                       torch.full_like(base, STAKES_CHALLENGE_BASE, dtype=base.dtype),
+                       base)
     hi = max(STAKES_CHALLENGE_BASE, 3.0)
     return torch.clamp(base, 1.0, hi).pow(STAKES_BASE_EXP)
 
-
 def _stakes_multiplier_public(action_ids: torch.Tensor, penalties_used: torch.Tensor) -> torch.Tensor:
-    """
-    Public-only stakes multiplier:
-      Stakes = Base(cards played/challenge) * (1 + penalties_used / STAKES_PEN_NORM) ** STAKES_PEN_EXP
-    """
     base = _cards_base_from_action(action_ids)
     pen  = penalties_used.to(torch.float32).clamp_min(0.0)
     pen_factor = (1.0 + pen / max(STAKES_PEN_NORM, 1.0)) ** STAKES_PEN_EXP
     mult = base * pen_factor
     return torch.clamp(mult, STAKES_CLIP_MIN, STAKES_CLIP_MAX)
 
-
-def _value_loss_with_stakes_clip_public(
-    v_pred: torch.Tensor,
-    returns: torch.Tensor,
-    action_ids: torch.Tensor,
-    penalties_used: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+# ---------------------- Batched PPO loss (graph-safe) ----------------------
+def ppo_losses_batched(
+    model,
+    batch: Dict[str, Any],
+    eps_clip: float,
+    ent_coef: float,
+    use_trinal_clip: bool,
+    trinal_delta1: float,
+    use_stakes_value_clip: bool,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
-    Returns:
-      (value_mse_loss, clip_frac)
-      clip_frac = fraction of samples where |returns| > delta (i.e., target got clipped)
+    Expects `batch` to contain (all on same device as model params):
+      - mi: dict of model inputs with shapes [B, L, ...]
+      - our_idx: [B, T] long, indices of OUR decision tokens (clipped to [0, L-1])
+      - our_action_mask: optional [B, T, A] bool (legal actions at our steps)
+      - actions: [B, T] long (taken actions)
+      - old_logp: [B, T] float32
+      - advantages: [B, T] float32 (precomputed; we normalize here over valid mask)
+      - returns: [B, T] float32 (value targets on our steps)
+      - penalties_used: [B, T] long (public penalties at our steps)
+      - mask: [B, T] float32 (1 for valid our-step slots, 0 for pad)
     """
-    with torch.no_grad():
-        r = returns.to(torch.float32)
-        n = int(r.numel())
-        # Treat very small batches safely
-        if n < 2:
-            batch_std = 1.0  # fall back to ±1 scale when tiny
-        else:
-            # robust handling for sparse returns: compute std on non-zeros if enough
-            nz = (r.abs() > 1e-8)
-            if nz.float().mean().item() >= 0.2:  # at least 20% non-zero
-                batch_std = r[nz].std(unbiased=False).clamp(min=1e-3).item()
-            else:
-                batch_std = 1.0  # returns mostly zeros; use ±1 as natural game scale
+    mi = batch["mi"]
+    logits, opp_logits, values, *_ = model(**mi)   # [B, L, A], [B, L, 1]
+    values = values.squeeze(-1)                    # [B, L]
 
-        # Smooth (still keep the EMA, but it's now well-behaved)
-        config._ret_std_ema = RET_STD_EMA_DECAY * config._ret_std_ema + (1.0 - RET_STD_EMA_DECAY) * batch_std
-        ret_scale = float(config._ret_std_ema)
+    def _masked_mean(x: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+        mf = m.to(dtype=x.dtype)
+        num = (x * mf).sum()
+        den = mf.sum().clamp_min(1.0)
+        return num / den
 
-    stakes = _stakes_multiplier_public(action_ids, penalties_used)  # [K]
-    delta = EPS_V * stakes * ret_scale
-    lower = -delta
-    upper =  delta
-    # fraction of samples that would be clipped
-    with torch.no_grad():
-        clip_mask = (returns < lower) | (returns > upper)
-        clip_frac = clip_mask.float().mean()
+    B, L, A = logits.shape
+    idx = batch["our_idx"].clamp(min=0, max=L - 1)             # [B, T]
+    T = idx.size(1)
 
-    target = torch.clamp(returns, min=lower, max=upper)
-    return F.mse_loss(v_pred, target), clip_frac
+    idxA = idx.unsqueeze(-1).expand(-1, -1, A)                 # [B, T, A]
+    logits_at = logits.gather(1, idxA).to(torch.float32)       # [B, T, A]
+    v_at      = values.gather(1, idx).to(torch.float32)        # [B, T]
 
-
-def _trinal_clip_policy_loss(new_logp, old_logp, adv, eps_clip, delta1: float) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    PPO with Trinal-Clip: when A<0, cap ratio by delta1 (instead of 1+eps).
-    Returns (loss, ratio) where loss is the neg-surr min like standard PPO.
-    """
-    ratio = (new_logp - old_logp).exp()
-    # Standard PPO clip band
-    clipped_std = torch.clamp(ratio, 1.0 - eps_clip, 1.0 + eps_clip)
-    # Extra cap only used when A < 0
-    clipped_neg = torch.clamp(ratio, 1.0 - eps_clip, delta1)
-    r_clipped = torch.where(adv < 0, clipped_neg, clipped_std)
-    surr1 = ratio * adv
-    surr2 = r_clipped * adv
-    loss = -torch.min(surr1, surr2).mean()
-    return loss, ratio
-
-
-# --------------------------------------------------------------------------------------
-# Loss builders
-# --------------------------------------------------------------------------------------
-def _accuracy_from_logits(logits: torch.Tensor, targets: torch.Tensor) -> float:
-    if logits.numel() == 0 or targets.numel() == 0: return 0.0
-    with torch.no_grad():
-        preds = logits.argmax(dim=-1)
-        return float((preds == targets).float().mean().item())
-
-def ppo_losses_for_episode(
-    model: PPOAutoregressiveModel,
-    episode: Dict[str, Any],
-    device: torch.device,
-    sl_teacher: Optional[PPOAutoregressiveModel] = None,
-    bc_kl_weight: float = 0.0,
-) -> Tuple[torch.Tensor, Dict[str, float]]:
-    # ---- 0) Unpack model input exactly as fed to the network ----
-    mi = {k: (v.to(device) if torch.is_tensor(v) else v)
-          for k, v in episode["model_input"].items()}
-
-    action_seq    = mi["action_sequence"]                       # [1, L]
-    agent_types   = mi["agent_types"]                           # [1, L]
-    valid_lengths = mi.get("valid_lengths",
-                           torch.tensor([action_seq.size(1)], device=device))  # [1]
-    action_masks  = mi.get("action_masks", None)                # [1, L, A] or None
-
-    # Local (truncated) views in model space
-    valid_len        = int(valid_lengths[0].item())
-    agent_types_1d   = agent_types[0, :valid_len]               # [L]
-    masks_2d         = action_masks[0, :valid_len] if action_masks is not None else None  # [L, A] or None
-
-    # ---- Student forward on exactly the same input ----
-    action_logits, opp_logits, state_values, b0, b1, b2 = model(**mi)  # [1, L, ...]
-    action_logits = action_logits[0, :valid_len, :].to(torch.float32)  # [L, A]
-    opp_logits    = opp_logits[0, :valid_len, :].to(torch.float32) if opp_logits is not None else None
-    state_values  = state_values[0, :valid_len].squeeze(-1).to(torch.float32)  # [L]
-
-    # ---- 1) Indices for OUR turns in local space (0..valid_len-1) ----
-    our_pos = (agent_types_1d == 0).nonzero(as_tuple=False).squeeze(-1).long()  # [K]
-    K = int(our_pos.numel())
-
-    scalars = {
-        "n_our_steps": float(len(episode["our_action"]) - episode["our_action"].count(None)),
-        "n_total_steps": float(valid_len),
-        "episode_return": float(episode.get("episode_return", 0.0))
-    }
-    if K == 0:
-        total_loss = next(model.parameters()).sum() * 0.0
-        scalars.update({
-            "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0,
-            "approx_kl": 0.0, "clip_fraction": 0.0, "trinal_clip_neg_frac": 0.0,
-            "opp_loss": 0.0, "opp_action_acc": 0.0,
-            "belief_loss": 0.0, "belief_acc_0": 0.0, "belief_acc_1": 0.0, "belief_acc_2": 0.0,
-            "value_clip_frac": 0.0,
-        })
-        return total_loss, scalars
-
-    # ---- 2) Episode-aligned lists at OUR steps ----
-    our_steps_ep_idx = [i for i, seat in enumerate(episode["agent_id"])
-                        if seat == episode["training_agent_seat"]]
-    K_ep = min(K, len(our_steps_ep_idx))
-    if K_ep == 0:
-        total_loss = next(model.parameters()).sum() * 0.0
-        scalars.update({
-            "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0,
-            "approx_kl": 0.0, "clip_fraction": 0.0, "trinal_clip_neg_frac": 0.0,
-            "opp_loss": 0.0, "opp_action_acc": 0.0,
-            "belief_loss": 0.0, "belief_acc_0": 0.0, "belief_acc_1": 0.0, "belief_acc_2": 0.0,
-            "value_clip_frac": 0.0,
-        })
-        return total_loss, scalars
-
-    # ---- 2.5) OUR-turn indexing with correct multi-step gaps ----
-    posK = our_pos[:K_ep]  # [K_ep]
-    next_posK = torch.full_like(posK, fill_value=-1)
-    if K_ep > 1:
-        next_posK[:-1] = posK[1:]
-    has_next = next_posK.ge(0)  # [K_ep] bool
-    gaps = torch.where(has_next, (next_posK - posK).clamp(min=1), torch.ones_like(posK))
-
-    # ---- 3) Gather logits/values at OUR decision states; legal-mask if provided ----
-    logits_at = action_logits.index_select(0, posK)                            # [K_ep, A]
-    if masks_2d is not None:
-        mask_at = masks_2d.index_select(0, posK).bool()                        # [K_ep, A]
-        # Ensure at least one legal action per row
-        invalid_rows = (~mask_at).all(dim=1)
-        if invalid_rows.any():
-            fb_cols = logits_at[invalid_rows].argmax(dim=-1)
-            mask_at[invalid_rows] = False
-            mask_at[invalid_rows, fb_cols] = True
+    # Ensure at least one legal action per row
+    if "our_action_mask" in batch and batch["our_action_mask"] is not None:
+        mask_at = batch["our_action_mask"].to(dtype=torch.bool)          # [B, T, A]
+        invalid = (~mask_at).all(dim=2)                                  # [B, T]
+        fb_cols = logits_at.argmax(dim=-1)                               # [B, T]
+        fallback = F.one_hot(fb_cols, num_classes=A).to(torch.bool)      # [B, T, A]
+        mask_at = torch.where(invalid.unsqueeze(-1), fallback, mask_at)  # [B, T, A]
         logits_at = logits_at.masked_fill(~mask_at, -1e9)
+
+    logp_all = torch.log_softmax(logits_at, dim=-1)                      # [B, T, A]
+    actions  = batch["actions"]
+    new_logp = logp_all.gather(-1, actions.unsqueeze(-1)).squeeze(-1)    # [B, T]
+
+    mask = batch["mask"].to(torch.float32)                                # [B, T]
+    adv  = batch["advantages"].to(torch.float32)                          # [B, T]
+    adv_mean = _masked_mean(adv, mask)
+    adv_std  = _masked_mean((adv - adv_mean) ** 2, mask).sqrt().clamp_min(1e-8)
+    adv_norm = (adv - adv_mean) / adv_std
+
+    old_logp = batch["old_logp"].to(torch.float32)                        # [B, T]
+    log_ratio = (new_logp - old_logp).clamp(-60.0, 60.0)
+    ratio     = log_ratio.exp()
+
+    if use_trinal_clip:
+        clipped_std = ratio.clamp(1.0 - eps_clip, 1.0 + eps_clip)
+        clipped_neg = ratio.clamp(1.0 - eps_clip, trinal_delta1)
+        r_clip = torch.where(adv_norm < 0, clipped_neg, clipped_std)
+        surr1 = ratio * adv_norm
+        surr2 = r_clip * adv_norm
+        pol_loss_el = -torch.min(surr1, surr2)
+        trinal_clip_neg_frac = _masked_mean(((ratio > (1.0 + eps_clip)) & (adv_norm < 0)).to(ratio.dtype), mask)
     else:
-        mask_at = None
-    logits_at = torch.nan_to_num(logits_at, nan=0.0, posinf=0.0, neginf=-1e9)
+        surr1 = ratio * adv_norm
+        surr2 = ratio.clamp(1.0 - eps_clip, 1.0 + eps_clip) * adv_norm
+        pol_loss_el = -torch.min(surr1, surr2)
+        trinal_clip_neg_frac = torch.zeros((), device=logits.device, dtype=logits.dtype)
 
-    values_at = state_values.index_select(0, posK)
-    values_at = torch.nan_to_num(values_at, nan=0.0, posinf=0.0, neginf=0.0)
+    policy_loss = _masked_mean(pol_loss_el, mask)
 
-    next_values_full = torch.zeros_like(values_at)
-    if has_next.any():
-        next_values_full[has_next] = state_values.index_select(0, next_posK[has_next])
+    probs = logp_all.exp()
+    entropy_el = -(probs * logp_all).sum(dim=-1)                           # [B, T]
+    ent_mean   = _masked_mean(entropy_el, mask)
 
-    # Episode-side tensors (OUR steps)
-    actions_t  = torch.tensor([episode["our_action"][i] for i in our_steps_ep_idx[:K_ep]],
-                              dtype=torch.long, device=device)                # [K_ep]
-    old_logp_t = torch.tensor([episode["log_prob"][i]  for i in our_steps_ep_idx[:K_ep]],
-                              dtype=torch.float32, device=device)             # [K_ep]
-    rewards    = torch.tensor([float(episode["reward"][i]) for i in our_steps_ep_idx[:K_ep]],
-                              dtype=torch.float32, device=device)             # [K_ep]
-    penalties_used_t = torch.tensor(
-        [int(episode["penalties_used"][i]) for i in our_steps_ep_idx[:K_ep]],
-        dtype=torch.long, device=device
-    )
+    returns = batch["returns"].to(torch.float32)                            # [B, T]
+    if use_stakes_value_clip:
+        pen_used = batch["penalties_used"]                                  # [B, T] long
+        stakes = _stakes_multiplier_public(actions, pen_used).to(returns.dtype)  # [B, T]
 
-    # ---- 4) Irregular-step GAE on OUR decision timeline ----
+        valid_m = (mask > 0.5)
+        nz_m    = valid_m & (returns.abs() > 1e-8)
+        den_nz  = nz_m.sum().clamp_min(1)
+        mean_nz = (returns * nz_m.to(returns.dtype)).sum() / den_nz
+        var_nz  = (((returns - mean_nz) ** 2) * nz_m.to(returns.dtype)).sum() / den_nz
+        std_nz  = var_nz.sqrt().clamp_min(1e-3)
+        frac_nz = (nz_m.sum().to(returns.dtype)) / (valid_m.sum().clamp_min(1).to(returns.dtype))
+        ret_scale = torch.where(frac_nz >= 0.2, std_nz, torch.ones_like(std_nz))
+
+        delta = EPS_V * stakes * ret_scale
+        lower = -delta
+        upper =  delta
+        target = torch.minimum(torch.maximum(returns, lower), upper)
+        v_loss_el = 0.5 * (v_at - target) ** 2
+        value_clip_frac = _masked_mean(((returns < lower) | (returns > upper)).to(returns.dtype), mask)
+    else:
+        v_loss_el = 0.5 * (v_at - returns) ** 2
+        value_clip_frac = torch.zeros((), device=logits.device, dtype=logits.dtype)
+
+    value_loss = _masked_mean(v_loss_el, mask)
+
+    total = policy_loss + 0.5 * value_loss - ent_coef * ent_mean
+
+    approx_kl = _masked_mean((old_logp - new_logp), mask)
+    clipfrac  = _masked_mean(((ratio - 1.0).abs() > eps_clip).to(ratio.dtype), mask)
+
+    metrics = {
+        "policy_loss": policy_loss.detach(),
+        "value_loss":  value_loss.detach(),
+        "entropy":     ent_mean.detach(),
+        "approx_kl":   approx_kl.detach(),
+        "clip_fraction": clipfrac.detach(),
+        "trinal_clip_neg_frac": trinal_clip_neg_frac.detach(),
+        "value_clip_frac": value_clip_frac.detach(),
+    }
+    return total, metrics
+
+# --------- Episode → batched tensors (mirror model_input keys) -------------
+def _compute_adv_ret_for_episode(ep: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
+    seat = ep["training_agent_seat"]
+    our_idx = [i for i, s in enumerate(ep["agent_id"]) if s == seat]
+    K = len(our_idx)
+    if K == 0:
+        return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.float32)
+    rewards = np.array([float(ep["reward"][i]) for i in our_idx], dtype=np.float32)
+    values  = np.array([float(ep["value"][i])  for i in our_idx], dtype=np.float32)
+    next_values = np.zeros_like(values)
+    if K > 1:
+        next_values[:-1] = values[1:]
+    dones = np.zeros((K,), dtype=np.float32); dones[-1] = 1.0
     gamma = float(getattr(config, "GAMMA", 0.99))
     lam   = float(getattr(config, "GAE_LAMBDA", 0.95))
-    gaps_f = gaps.to(torch.float32)
-    gamma_gap = torch.pow(torch.full_like(gaps_f, gamma), gaps_f)            # gamma**gap
-    lam_gap   = torch.pow(torch.full_like(gaps_f, lam),   gaps_f)            # lambda**gap
+    adv = np.zeros_like(values, dtype=np.float32)
+    last = 0.0
+    for t in range(K - 1, -1, -1):
+        delta = rewards[t] + gamma * next_values[t] * (1.0 - dones[t]) - values[t]
+        last = delta + gamma * lam * (1.0 - dones[t]) * last
+        adv[t] = last
+    ret = adv + values
+    return adv, ret
 
-    advantages = torch.zeros_like(values_at)
-    lastgaelam = torch.zeros((), device=device, dtype=torch.float32)
-    for t in reversed(range(K_ep)):
-        if bool(has_next[t]):
-            nv = next_values_full[t]
-            g  = gamma_gap[t]
-            gl = gamma_gap[t] * lam_gap[t]
+def _alloc_like_batch(shape, dtype, device, pin):
+    return torch.empty(*shape, dtype=dtype, device="cpu", pin_memory=pin)
+
+def _collate_batch(
+    eps: List[Dict[str, Any]],
+    B: int,
+    L_tok_max: int,
+    T_max: int,
+    A: int,
+    device: torch.device,
+) -> Dict[str, Any]:
+    """Generic collation that mirrors *all* keys in episode['model_input'] (tensor keys only)."""
+    pin = torch.cuda.is_available()
+
+    mi0: Dict[str, Any] = eps[0]["model_input"]
+    mi_keys = [k for k, v in mi0.items() if torch.is_tensor(v)]
+
+    mi_batch: Dict[str, torch.Tensor] = {}
+    for k in mi_keys:
+        v = mi0[k]
+        if v.dim() >= 2 and v.size(0) == 1:
+            rest = v.shape[2:]
+            mi_batch[k] = _alloc_like_batch((B, L_tok_max, *rest), v.dtype, device, pin)
         else:
-            nv = torch.zeros((), device=device, dtype=torch.float32)
-            g  = torch.zeros((), device=device, dtype=torch.float32)
-            gl = torch.zeros((), device=device, dtype=torch.float32)
-        delta = rewards[t] + g * nv - values_at[t]
-        lastgaelam = delta + gl * lastgaelam
-        advantages[t] = lastgaelam
+            if v.numel() == 1 or (v.dim() == 1 and v.size(0) == 1):
+                mi_batch[k] = _alloc_like_batch((B,), v.dtype, device, pin)
+            else:
+                rest = v.shape[1:]
+                mi_batch[k] = _alloc_like_batch((B, *rest), v.dtype, device, pin)
 
-    returns = advantages + values_at
-    adv_mean = advantages.mean()
-    adv_std  = advantages.std(unbiased=False).clamp_min(1e-8)
-    advantages = (advantages - adv_mean) / adv_std
+    our_idx   = torch.empty(B, T_max, dtype=torch.long, device="cpu", pin_memory=pin)
+    our_mask  = torch.zeros(B, T_max, dtype=torch.bool, device="cpu", pin_memory=pin)
+    actions   = torch.zeros(B, T_max, dtype=torch.long, device="cpu", pin_memory=pin)
+    old_logp  = torch.zeros(B, T_max, dtype=torch.float32, device="cpu", pin_memory=pin)
+    returns   = torch.zeros(B, T_max, dtype=torch.float32, device="cpu", pin_memory=pin)
+    adv       = torch.zeros(B, T_max, dtype=torch.float32, device="cpu", pin_memory=pin)
+    pen_used  = torch.zeros(B, T_max, dtype=torch.long, device="cpu", pin_memory=pin)
+    our_act_mask = torch.ones(B, T_max, A, dtype=torch.bool, device="cpu", pin_memory=pin)
 
-    # ---- 5) PPO objective (stable, fp32, clamped) ----
-    dist     = torch.distributions.Categorical(logits=logits_at.to(torch.float32))
-    new_logp = dist.log_prob(actions_t).to(torch.float32)
-    new_logp = torch.nan_to_num(new_logp, nan=0.0, neginf=-1e9, posinf=0.0)
-    old_logp_t = torch.nan_to_num(old_logp_t.to(torch.float32), nan=0.0, neginf=-1e9, posinf=0.0)
+    for b in range(B):
+        ep = eps[b]
+        mi: Dict[str, torch.Tensor] = ep["model_input"]
+        for k in mi_keys:
+            v = mi[k]
+            if v.dim() >= 2 and v.size(0) == 1:
+                L = int(v.size(1)); L_pad = min(L, L_tok_max)
+                if L_pad > 0:
+                    mi_batch[k][b, :L_pad] = v[0, :L_pad].to("cpu")
+            else:
+                if mi_batch[k][b].numel() == 1:
+                    mi_batch[k][b] = v.reshape(()).to("cpu")
+                else:
+                    mi_batch[k][b] = v.to("cpu").expand_as(mi_batch[k][b])
 
-    log_ratio = (new_logp - old_logp_t).clamp(min=-60.0, max=60.0)
-    ratio = log_ratio.exp()
-    ratio = torch.nan_to_num(ratio, nan=1.0, posinf=1e6, neginf=0.0)
+        if "valid_lengths" in mi_batch:
+            L_guess = None
+            if "action_sequence" in mi:
+                L_guess = int(mi["action_sequence"].size(1))
+            else:
+                for kk in mi_keys:
+                    vv = mi[kk]
+                    if vv.dim() >= 2 and vv.size(0) == 1:
+                        L_guess = int(vv.size(1)); break
+            if L_guess is None: L_guess = 0
+            mi_batch["valid_lengths"][b] = min(L_guess, L_tok_max)
 
-    if getattr(config, "USE_TRINAL_CLIP", False):
-        surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1 - config.EPS_CLIP, 1 + config.EPS_CLIP) * advantages
-        policy_loss = -torch.min(surr1, surr2).mean()
-        with torch.no_grad():
-            neg_mask = (advantages < 0)
-            trinal_clip_neg_frac = ((ratio > (1.0 + config.EPS_CLIP)) & neg_mask).float().mean()
-    else:
-        surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1 - config.EPS_CLIP, 1 + config.EPS_CLIP) * advantages
-        policy_loss  = -torch.min(surr1, surr2).mean()
-        trinal_clip_neg_frac = torch.tensor(0.0, device=device)
-
-    entropy = dist.entropy().to(torch.float32)
-    entropy = torch.nan_to_num(entropy, nan=0.0)
-    entropy_loss = -entropy.mean()
-
-    # ---- 6) Value loss (optionally stakes-clipped) ----
-    if getattr(config, "USE_STAKES_VALUE_CLIP", False):
-        value_loss, vclip_frac = _value_loss_with_stakes_clip_public(
-            v_pred=values_at, returns=returns,
-            action_ids=actions_t, penalties_used=penalties_used_t
-        )
-    else:
-        value_loss = F.mse_loss(values_at, returns)
-        vclip_frac = torch.tensor(0.0, device=device)
-
-    total_loss = policy_loss + 0.5 * value_loss + float(getattr(config, "INIT_ENTROPY_COEF", 0.0)) * entropy_loss
-
-    # ---- 7) Teacher KL (optional) ----
-    if (bc_kl_weight > 0.0) and (sl_teacher is not None):
-        with torch.no_grad():
-            t_action_logits, *_ = sl_teacher(**mi)                            # [1, L, A]
-            t_action_logits = t_action_logits[0, :valid_len, :].to(torch.float32)  # [L, A]
-            t_logits_at = t_action_logits.index_select(0, posK)               # [K_ep, A]
-            if mask_at is not None:
-                t_logits_at = t_logits_at.masked_fill(~mask_at, -1e9)
-            t_logits_at = torch.nan_to_num(t_logits_at, nan=0.0, posinf=0.0, neginf=-1e9)
-        dist_sl = torch.distributions.Categorical(logits=t_logits_at)
-        bc_kl   = torch.distributions.kl_divergence(dist, dist_sl).mean()
-        total_loss = total_loss + bc_kl_weight * bc_kl
-        bc_kl_val = float(bc_kl.detach().cpu())
-    else:
-        bc_kl_val = 0.0
-
-    approx_kl  = torch.mean(old_logp_t - new_logp).detach()
-    clipfrac   = ((ratio - 1.0).abs() > config.EPS_CLIP).float().mean().detach()
-
-    # ---- 8) Scalars
-    scalars.update({
-        "policy_loss": float(policy_loss.detach().cpu()),
-        "value_loss":  float(value_loss.detach().cpu()),
-        "entropy":     float((-entropy_loss).detach().cpu()),
-        "approx_kl":   float(approx_kl.cpu()),
-        "clip_fraction": float(clipfrac.cpu()),
-        "trinal_clip_neg_frac": float(trinal_clip_neg_frac.detach().cpu()),
-        "value_clip_frac": float(vclip_frac.detach().cpu()),
-        "bc_kl": bc_kl_val,
-        "our_gap_mean": float(gaps.to(torch.float32).mean().cpu()),
-        "our_gap_max":  float(gaps.max().item()),
-    })
-
-    # Optional: explained variance (skip when n<2)
-    if values_at.numel() > 1:
-        with torch.no_grad():
-            r = returns.detach()
-            v = values_at.detach()
-            var_y = r.var(unbiased=False)
-            ev = 1.0 - (r - v).var(unbiased=False) / (var_y + 1e-8)
-            scalars["value_explained_var"] = float(ev.clamp(-1, 1).cpu())
-    else:
-        scalars["value_explained_var"] = 0.0
-
-    # ---- 9) Belief heads (aux)
-    def _belief_ce_and_acc(b_logits, key_tgt):
-        if b_logits is None:
-            return torch.zeros((), device=device), 0.0
-        targets, keep_idx = [], []
-        for i_ep, step_idx in enumerate(our_steps_ep_idx[:K_ep]):
-            tgt = episode[key_tgt][step_idx]
-            if tgt is not None:
-                lab = BELIEF_LABELS_FROM_KIND.get(tgt)
-                if lab is not None:
-                    targets.append(lab); keep_idx.append(i_ep)
-        if not targets:
-            return torch.zeros((), device=device), 0.0
-        target_t  = torch.tensor(targets, dtype=torch.long, device=device)
-        keep_idx  = torch.as_tensor(keep_idx, dtype=torch.long, device=device)
-        logits_sel = b_logits[0, :valid_len, :].index_select(0, posK).index_select(0, keep_idx)
-        acc = _accuracy_from_logits(logits_sel.detach(), target_t.detach())
-        return F.cross_entropy(logits_sel, target_t), acc
-
-    b0_loss, acc_b0 = _belief_ce_and_acc(b0, "belief_tgt0")
-    b1_loss, acc_b1 = _belief_ce_and_acc(b1, "belief_tgt1")
-    b2_loss, acc_b2 = _belief_ce_and_acc(b2, "belief_tgt2")
-    belief_loss = b0_loss + b1_loss + b2_loss
-    total_loss  = total_loss + float(getattr(config, "AUX_BELIEF_WEIGHT", 0.5)) * belief_loss
-    scalars.update({
-        "belief_loss": float(belief_loss.detach().cpu()),
-        "belief_acc_0": acc_b0,
-        "belief_acc_1": acc_b1,
-        "belief_acc_2": acc_b2,
-    })
-
-    # ---- 10) Opponent aux
-    opp_idx = (agent_types_1d != 0).nonzero(as_tuple=False).squeeze(-1)   # [N_opp]
-    if opp_logits is not None and opp_idx.numel() > 0:
-        opp_ep_idx = [i for i, seat in enumerate(episode["agent_id"])
-                      if seat != episode["training_agent_seat"]]
-        opp_targets = [episode["opp_target_action"][i] for i in opp_ep_idx
-                       if episode["opp_target_action"][i] is not None]
-        M = min(len(opp_targets), opp_idx.numel())
-        if M > 0:
-            opp_logits_sel = opp_logits.index_select(0, opp_idx[:M])       # [M, A]
-            opp_targets_t  = torch.tensor(opp_targets[:M], dtype=torch.long, device=device)
-            opp_loss = F.cross_entropy(opp_logits_sel, opp_targets_t)
-            total_loss = total_loss + float(getattr(config, "AUX_OPP_WEIGHT", 0.5)) * opp_loss
-            scalars.update({
-                "opp_loss": float(opp_loss.detach().cpu()),
-                "n_opp_supervised": float(M),
-                "opp_action_acc": _accuracy_from_logits(opp_logits_sel.detach(), opp_targets_t.detach()),
-            })
+        if "agent_types" in mi:
+            at = mi["agent_types"][0, :int(mi["agent_types"].size(1))].to("cpu").numpy()
+            our_pos = np.where(at == 0)[0].astype(np.int64)
         else:
-            scalars.update({"opp_loss": 0.0, "n_opp_supervised": 0.0, "opp_action_acc": 0.0})
-    else:
-        scalars.update({"opp_loss": 0.0, "n_opp_supervised": 0.0, "opp_action_acc": 0.0})
+            L_any = int(next(v.size(1) for v in mi.values() if v.dim() >= 2))
+            our_pos = np.arange(L_any, dtype=np.int64)
 
-    if getattr(config, "USE_STAKES_VALUE_CLIP", False):
-        scalars["ret_std_ema"] = float(getattr(config, "_ret_std_ema", 0.0))
+        our_ep_idx = [i for i, s in enumerate(ep["agent_id"]) if s == ep["training_agent_seat"]]
+        K = min(len(our_pos), len(our_ep_idx), T_max)
+        if K > 0:
+            our_idx[b, :K] = torch.from_numpy(our_pos[:K])
+            our_mask[b, :K] = True
+            actions_b  = [int(ep["our_action"][i]) for i in our_ep_idx[:K]]
+            old_logp_b = [float(ep["log_prob"][i]) for i in our_ep_idx[:K]]
+            pen_b      = [int(ep["penalties_used"][i]) for i in our_ep_idx[:K]]
+            actions[b, :K]  = torch.tensor(actions_b, dtype=torch.long)
+            old_logp[b, :K] = torch.tensor(old_logp_b, dtype=torch.float32)
+            pen_used[b, :K] = torch.tensor(pen_b, dtype=torch.long)
 
-    return total_loss, scalars
+            if "action_masks" in mi:
+                full_mask = mi["action_masks"][0].to("cpu")   # [L, A]
+                idxs = our_idx[b, :K]
+                mask_sel = full_mask.index_select(0, idxs)
+                if mask_sel.dtype is not torch.bool:
+                    mask_sel = mask_sel != 0
+                our_act_mask[b, :K, :] = mask_sel
 
-# --------------------------------------------------------------------------------------
-# Training loop
-# --------------------------------------------------------------------------------------
+            adv_b, ret_b = _compute_adv_ret_for_episode(ep)
+            KK = min(K, len(adv_b))
+            if KK > 0:
+                adv[b, :KK]     = torch.from_numpy(adv_b[:KK])
+                returns[b, :KK] = torch.from_numpy(ret_b[:KK])
+
+    return {
+        "mi": mi_batch,
+        "our_idx": our_idx,
+        "mask": our_mask,
+        "actions": actions,
+        "old_logp": old_logp,
+        "returns": returns,
+        "advantages": adv,
+        "penalties_used": pen_used,
+        "our_action_mask": our_act_mask,
+    }
+
+def _to_device_batch(batch_cpu: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
+    """Move a collated CPU batch (with nested 'mi' dict) to device."""
+    mi_dev = {k: v.to(device, non_blocking=True) for k, v in batch_cpu["mi"].items()}
+    out = {
+        "mi": mi_dev,
+        "our_idx":        batch_cpu["our_idx"].to(device, non_blocking=True),
+        "mask":           batch_cpu["mask"].to(device, non_blocking=True),
+        "actions":        batch_cpu["actions"].to(device, non_blocking=True),
+        "old_logp":       batch_cpu["old_logp"].to(device, non_blocking=True),
+        "returns":        batch_cpu["returns"].to(device, non_blocking=True),
+        "advantages":     batch_cpu["advantages"].to(device, non_blocking=True),
+        "penalties_used": batch_cpu["penalties_used"].to(device, non_blocking=True),
+        "our_action_mask":batch_cpu["our_action_mask"].to(device, non_blocking=True),
+    }
+    return out
+
+# --------------------------------- Train -----------------------------------
 def train(
     num_updates: int = 1000,
     episodes_per_update: int = 8,
@@ -447,8 +381,6 @@ def train(
 ):
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     device = torch.device(getattr(config, "DEVICE", "cuda" if torch.cuda.is_available() else "cpu"))
-    #set_seed(getattr(config, "SEED", 42))
-    scaler = amp.GradScaler(device=device, enabled=(device.type == 'cuda'))
 
     if log_dir is None:
         log_dir = os.path.join("logs", datetime.now().strftime("%Y%m%d_%H%M%S"))
@@ -458,174 +390,194 @@ def train(
 
     arena = lb.VecArena()
 
-    # ----- SL init (kept as-is; uses your path if present) -----
-    CKPT_PATH = config.SL_TEACHER_CKPT
+    # ----- SL init -----
+    CKPT_PATH = getattr(config, "SL_TEACHER_CKPT", "")
     learner = BatchPPOAutoregressiveAgent(device, "TrainAgent_v1")
     try:
-        checkpoint_raw = torch.load(CKPT_PATH, map_location=device, weights_only=False)
-        checkpoint = {"policy_nets": {"agent_model": checkpoint_raw.get("model_state_dict", checkpoint_raw)}}
-        agent_key = next(iter(checkpoint["policy_nets"]))
-        learner.load_models_from_checkpoint(checkpoint, agent_key)
-        logging.info(f"Loaded SL checkpoint: {CKPT_PATH}")
+        if CKPT_PATH:
+            checkpoint_raw = torch.load(CKPT_PATH, map_location=device, weights_only=False)
+            checkpoint = {"policy_nets": {"agent_model": checkpoint_raw.get("model_state_dict", checkpoint_raw)}}
+            agent_key = next(iter(checkpoint["policy_nets"]))
+            learner.load_models_from_checkpoint(checkpoint, agent_key)
+            logging.info(f"Loaded SL checkpoint: {CKPT_PATH}")
+        else:
+            logging.info("No SL teacher checkpoint specified.")
     except Exception as e:
         logging.warning(f"Could not load SL checkpoint at {CKPT_PATH}: {e}")
 
-    model = learner.model
-    sl_teacher = copy.deepcopy(model).eval()
-    for p in sl_teacher.parameters(): p.requires_grad = False
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.set_float32_matmul_precision("high")
-    model = torch.compile(
-                model,
-                mode="reduce-overhead",
-                fullgraph=False,
-                dynamic=True,
-            )
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, eps=1e-5,fused=True)
+    model: PPOAutoregressiveModel = learner.model
+    # ensure precomputed causal mask is on the right device (your model uses it)
+    with torch.no_grad():
+        if hasattr(model, "causal_bool_mask_full"):
+            model.causal_bool_mask_full = model.causal_bool_mask_full.to(device)
+
+    # ---- torch.compile back on (works fine without CUDA graphs) ----
+    try:
+        model = torch.compile(model, mode="reduce-overhead", fullgraph=False, dynamic=False)
+        logging.info("torch.compile enabled (reduce-overhead).")
+    except Exception as e:
+        logging.warning(f"torch.compile failed, running eager. Reason: {e}")
+
+    # Optimizer: standard AMP path; no fused/capturable (no graphs)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(getattr(config, "LEARNING_RATE", 1.9e-4)),
+        eps=1e-5,
+        foreach=True,
+        fused=False,
+        capturable=False,
+    )
+    scaler = amp.GradScaler(enabled=(device.type == "cuda"))
 
     policies = {0: learner}
     rollout_manager = PPOVecRolloutManager(arena, policies, device)
-
     HC_POOL = [
         lb.BotKind.Classic, lb.BotKind.GreedyCardSpammer, lb.BotKind.RandomAgent,
         lb.BotKind.SelectiveTableConservativeChallenger, lb.BotKind.StrategicChallenger,
         lb.BotKind.TableFirstConservativeChallenger, lb.BotKind.TableNonTableAgent,
     ]
 
-    # ---- Rolling off-policy buffer ----
+    # Off-policy rolling buffer
     buffer_mult = int(getattr(config, "OFFPOLICY_EP_BUFFER_MULT", 4))
     max_buffer_eps = max(episodes_per_update * buffer_mult, episodes_per_update)
     ep_buffer: List[Dict[str, Any]] = []
 
-    for update in range(1, num_updates + 1):
-        model.eval()
+    # Fixed shapes for batching
+    B_train   = int(getattr(config, "TRAIN_EPISODES_PER_EPOCH", episodes_per_update))
+    L_tok_max = int(getattr(config, "L_TOK_MAX", 160))
+    T_max     = int(getattr(config, "T_MAX", 50))
+    A         = int(getattr(config, "OUTPUT_DIM", 7))
 
-        # -------- Timing: rollout --------
+    # ------------------------------ Main loop ------------------------------
+    for update in range(1, num_updates + 1):
+        # -------- Rollout --------
         t0 = time.time()
+        model.eval()
         new_eps = rollout_manager.collect_episodes(
-            num_episodes=episodes_per_update, num_players=config.NUM_PLAYERS,
-            training_policy_id=0, opponent_pool=HC_POOL
+            num_episodes=episodes_per_update,
+            num_players=getattr(config, "NUM_PLAYERS", 4),
+            training_policy_id=0,
+            opponent_pool=HC_POOL
         )
-        # sync to make rollout timing accurate if any GPU work overlapped
         if device.type == "cuda":
             torch.cuda.synchronize()
         t_roll = time.time()
 
         if not new_eps:
-            logging.warning(f"Update {update}/{num_updates}: No episodes collected. Skipping update.")
+            logging.warning(f"Update {update}/{num_updates}: No episodes collected. Skipping.")
             continue
 
-        # Extend buffer and trim oldest
         ep_buffer.extend(new_eps)
         if len(ep_buffer) > max_buffer_eps:
             ep_buffer = ep_buffer[-max_buffer_eps:]
 
+        # -------- Optimize (standard AMP step) --------
         model.train()
-        agg, n_loss_terms = {}, 0
+        t_opt_start = time.time()
+        agg = {"total_loss": 0.0}
+        n_batches = 0
 
-        # Train on the WHOLE BUFFER (mild off-policy thanks to PPO clips + Trinal-Clip)
-        train_eps = list(ep_buffer)
         for _ in range(k_epochs):
-            random.shuffle(train_eps)
-            for ep in train_eps:
-                with amp.autocast(device_type=device.type, dtype=torch.float16):
-                    loss, scalars = ppo_losses_for_episode(
-                        model, ep, device,
-                        sl_teacher=sl_teacher,
-                        bc_kl_weight=getattr(config, "BC_KL_WEIGHT", 0.0),
-                    )
-                optimizer.zero_grad(set_to_none=True)
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                clip_grad_norm_(model.parameters(), max_norm=getattr(config, "MAX_NORM", 0.5))
-                scaler.step(optimizer)
-                scaler.update()
+            if len(ep_buffer) >= B_train:
+                batch_eps = random.sample(ep_buffer, B_train)
+            else:
+                reps = (B_train + len(ep_buffer) - 1) // len(ep_buffer)
+                batch_eps = (ep_buffer * reps)[:B_train]
 
-                for k, v in scalars.items():
-                    agg[k] = agg.get(k, 0.0) + float(v)
-                agg["total_loss"] = agg.get("total_loss", 0.0) + float(loss.detach().cpu())
-                n_loss_terms += 1
+            batch_cpu = _collate_batch(batch_eps, B_train, L_tok_max, T_max, A, device)
+            batch_gpu = _to_device_batch(batch_cpu, device)
 
-        # sync to measure optimize time precisely
+            optimizer.zero_grad(set_to_none=True)
+            with amp.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == "cuda")):
+                total_loss, metrics = ppo_losses_batched(
+                    model,
+                    batch_gpu,
+                    eps_clip=float(getattr(config, "EPS_CLIP", 0.2)),
+                    ent_coef=float(getattr(config, "INIT_ENTROPY_COEF", 0.005)),
+                    use_trinal_clip=USE_TRINAL_CLIP,
+                    trinal_delta1=TRINAL_DELTA1,
+                    use_stakes_value_clip=USE_STAKES_VALUE_CLIP,
+                )
+            scaler.scale(total_loss).backward()
+            scaler.unscale_(optimizer)
+            clip_grad_norm_(model.parameters(), max_norm=float(getattr(config, "MAX_NORM", 0.5)))
+            scaler.step(optimizer)
+            scaler.update()
+
+            # Accumulate metrics
+            agg["total_loss"] += float(total_loss.detach().cpu())
+            for k, v in metrics.items():
+                agg[k] = agg.get(k, 0.0) + float(v.detach().cpu())
+            n_batches += 1
+
         if device.type == "cuda":
             torch.cuda.synchronize()
-        t_opt = time.time()
+        t_opt_end = time.time()
 
-        # Averages & timings
-        avg = lambda name: (agg.get(name, 0.0) / max(1, n_loss_terms))
-        avg_total_loss = avg("total_loss")
+        # Timings
         dur_roll = t_roll - t0
-        dur_opt  = t_opt - t_roll
-        dur_tot  = t_opt - t0
+        dur_opt  = t_opt_end - t_roll
+        dur_tot  = t_opt_end - t0
+        eps_per_s = (n_batches * B_train) / max(dur_opt, 1e-6)
 
+        # Averages
+        avg = {k: (v / max(n_batches, 1)) for k, v in agg.items()}
         logging.info(
             f"Update {update}/{num_updates} | buffer={len(ep_buffer)}/{max_buffer_eps} "
-            f"| avg_loss={avg_total_loss:.4f} | rollout={dur_roll:.2f}s | optimize={dur_opt:.2f}s | total={dur_tot:.2f}s"
+            f"| batches={n_batches} | avg_loss={avg['total_loss']:.4f} "
+            f"| rollout={dur_roll:.2f}s | optimize={dur_opt:.2f}s ({eps_per_s:.1f} ep/s) | total={dur_tot:.2f}s"
         )
 
-        # Log scalars
+        # Win rate for the *new* episodes
         win_rate = sum(ep["win"] for ep in new_eps) / len(new_eps)
+
+        # TensorBoard
         writer.add_scalar("Time/Rollout", dur_roll, update)
         writer.add_scalar("Time/Optimize", dur_opt, update)
         writer.add_scalar("Time/Total", dur_tot, update)
+        writer.add_scalar("Throughput/episodes_per_s", eps_per_s, update)
 
-        writer.add_scalar("Loss/Total", avg_total_loss, update)
-        writer.add_scalar("Loss/Policy", avg("policy_loss"), update)
-        writer.add_scalar("Loss/Value", avg("value_loss"), update)
-        writer.add_scalar("Loss/Aux/Opponent", avg("opp_loss"), update)
-        writer.add_scalar("Loss/Aux/Belief", avg("belief_loss"), update)
-        writer.add_scalar("Policy/Entropy", avg("entropy"), update)
-        writer.add_scalar("Policy/ApproxKL", avg("approx_kl"), update)
-        writer.add_scalar("Policy/ClipFraction", avg("clip_fraction"), update)
-        writer.add_scalar("Policy/TrinalClipNegFrac", avg("trinal_clip_neg_frac"), update)
-        writer.add_scalar("Policy/SL_KL", avg("bc_kl"), update)
-        writer.add_scalar("Value/ClipFrac", avg("value_clip_frac"), update)
-        writer.add_scalar("Acc/OpponentAction", avg("opp_action_acc"), update)
-        writer.add_scalar("Acc/Belief0", avg("belief_acc_0"), update)
-        writer.add_scalar("Acc/Belief1", avg("belief_acc_1"), update)
-        writer.add_scalar("Acc/Belief2", avg("belief_acc_2"), update)
-        writer.add_scalar("Rollout/WinRate", win_rate, update)
-        writer.add_scalar("Rollout/EpisodeReturnMean", sum(ep["episode_return"] for ep in new_eps) / len(new_eps), update)
-        writer.add_scalar("Rollout/EpisodeLenMean", sum(len(ep["reward"]) for ep in new_eps) / len(new_eps), update)
-        writer.add_scalar("Buffer/Size", len(ep_buffer), update)
+        writer.add_scalar("Loss/Total", avg["total_loss"], update)
+        writer.add_scalar("Loss/Policy", avg.get("policy_loss", 0.0), update)
+        writer.add_scalar("Loss/Value", avg.get("value_loss", 0.0), update)
+        writer.add_scalar("Policy/Entropy", avg.get("entropy", 0.0), update)
+        writer.add_scalar("Policy/ApproxKL", avg.get("approx_kl", 0.0), update)
+        writer.add_scalar("Policy/ClipFraction", avg.get("clip_fraction", 0.0), update)
+        writer.add_scalar("Policy/TrinalClipNegFrac", avg.get("trinal_clip_neg_frac", 0.0), update)
+        writer.add_scalar("Value/ClipFrac", avg.get("value_clip_frac", 0.0), update)
         if getattr(config, "USE_STAKES_VALUE_CLIP", False):
             writer.add_scalar("Diag/ReturnStdEMA", getattr(config, "_ret_std_ema", 0.0), update)
 
-        if checkpoint_dir and (update % getattr(config, "CHECKPOINT_INTERVAL", 200) == 0):
+        writer.add_scalar("Rollout/WinRate", win_rate, update)
+        writer.add_scalar("Buffer/Size", len(ep_buffer), update)
+
+        # Checkpoint
+        if checkpoint_dir and (update % int(getattr(config, "CHECKPOINT_INTERVAL", 200)) == 0):
             os.makedirs(checkpoint_dir, exist_ok=True)
             path = os.path.join(checkpoint_dir, f"arppo_update_{update}.pth")
-            torch.save({"model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(), "update": update}, path)
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "update": update
+            }, path)
             logging.info(f"Saved checkpoint to {path}")
 
     writer.close()
 
-
+# ---------------------------------- CLI ------------------------------------
 if __name__ == "__main__":
     import argparse
-    from datetime import datetime
-
-    parser = argparse.ArgumentParser(description="Train PPO Autoregressive")
-    parser.add_argument("--num-updates", type=int, default=2000,
-                        help="Number of PPO updates (default: 2000)")
-    parser.add_argument("--episodes-per-update", type=int,
-                        default=getattr(config, "EPISODES_PER_UPDATE", 512),
-                        help="Episodes collected per update")
-    parser.add_argument("--k-epochs", type=int,
-                        default=getattr(config, "K_EPOCHS", 2),
-                        help="Optimization epochs over the collected episodes")
-    parser.add_argument("--log-dir", type=str, default=None,
-                        help='TensorBoard log dir. Default: "logs/<run_name>"')
-    parser.add_argument("--checkpoint-dir", type=str, default=None,
-                        help='Checkpoint dir. Default: "<config.CHECKPOINT_DIR>/<run_name>"')
-    parser.add_argument("--run-name", type=str, default=None,
-                        help="Optional run name. Default: ppo_autoreg_<timestamp>")
-
+    parser = argparse.ArgumentParser(description="Train PPO Autoregressive (batched, no CUDA graphs)")
+    parser.add_argument("--num-updates", type=int, default=2000)
+    parser.add_argument("--episodes-per-update", type=int, default=getattr(config, "EPISODES_PER_UPDATE", 512))
+    parser.add_argument("--k-epochs", type=int, default=getattr(config, "K_EPOCHS", 2))
+    parser.add_argument("--log-dir", type=str, default=None)
+    parser.add_argument("--checkpoint-dir", type=str, default=None)
+    parser.add_argument("--run-name", type=str, default=None)
     args = parser.parse_args()
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = args.run_name or f"ppo_autoreg_{timestamp}"
-
-    # keep previous defaults for backwards-compat
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = args.run_name or f"ppo_autoreg_{ts}"
     log_dir = args.log_dir or os.path.join("logs", run_name)
     ckpt_dir = args.checkpoint_dir or os.path.join(getattr(config, "CHECKPOINT_DIR", "checkpoints"), run_name)
 

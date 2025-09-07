@@ -165,13 +165,29 @@ class PPOAutoregressiveModel(nn.Module):
             padding_mask=padding_mask,
         )
 
-        T = encoded_inputs.size(1)
-        causal_mask = self.causal_bool_mask_full[:T, :T]
+        # encoded_inputs: [B, T, D] or [T, B, D]; padding_mask: [B, T] (True = pad)
+        T = encoded_inputs.size(1) if encoded_inputs.dim() == 3 else encoded_inputs.size(0)
 
+        # ensure pad mask is boolean and on the same device
+        if padding_mask is not None:
+            if padding_mask.dtype is not torch.bool:
+                padding_mask = padding_mask.bool()
+            # padding_mask should already be on the same device as inputs; assert to catch mistakes early
+            assert padding_mask.device == encoded_inputs.device, \
+                f"padding_mask on {padding_mask.device}, inputs on {encoded_inputs.device}"
+
+        # slice the preallocated GPU boolean causal mask
+        causal_mask = self.causal_bool_mask_full[:T, :T]
+        # assert same device to avoid surprises
+        assert causal_mask.device == encoded_inputs.device, \
+            f"causal_mask on {causal_mask.device}, inputs on {encoded_inputs.device}"
+
+        # pass BOTH mask and is_causal=True (PyTorch’s MHA expects a mask when is_causal=True)
         transformer_output = self.transformer(
             encoded_inputs,
-            mask=causal_mask,
-            src_key_padding_mask=padding_mask
+            mask=causal_mask,                 # bool, on CUDA
+            src_key_padding_mask=padding_mask,
+            is_causal=True,
         )
 
         # ---- beliefs ----
