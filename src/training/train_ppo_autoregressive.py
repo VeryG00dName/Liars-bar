@@ -30,7 +30,7 @@ from src.training.vec_ppo_rollout import PPOVecRolloutManager
 # Utilities
 from src.training.train_extras import set_seed
 from src.training.train_utils import compute_gae
-
+torch.backends.cudnn.benchmark = True
 # --------------------------------------------------------------------------------------
 # Belief mapping (maps BotKind enum value to belief index)
 # --------------------------------------------------------------------------------------
@@ -447,7 +447,7 @@ def train(
 ):
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     device = torch.device(getattr(config, "DEVICE", "cuda" if torch.cuda.is_available() else "cpu"))
-    set_seed(getattr(config, "SEED", 42))
+    #set_seed(getattr(config, "SEED", 42))
     scaler = amp.GradScaler(device=device, enabled=(device.type == 'cuda'))
 
     if log_dir is None:
@@ -462,7 +462,7 @@ def train(
     CKPT_PATH = config.SL_TEACHER_CKPT
     learner = BatchPPOAutoregressiveAgent(device, "TrainAgent_v1")
     try:
-        checkpoint_raw = torch.load(CKPT_PATH, map_location=device)
+        checkpoint_raw = torch.load(CKPT_PATH, map_location=device, weights_only=False)
         checkpoint = {"policy_nets": {"agent_model": checkpoint_raw.get("model_state_dict", checkpoint_raw)}}
         agent_key = next(iter(checkpoint["policy_nets"]))
         learner.load_models_from_checkpoint(checkpoint, agent_key)
@@ -473,8 +473,15 @@ def train(
     model = learner.model
     sl_teacher = copy.deepcopy(model).eval()
     for p in sl_teacher.parameters(): p.requires_grad = False
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE, eps=1e-5)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+    model = torch.compile(
+                model,
+                mode="reduce-overhead",
+                fullgraph=False,
+                dynamic=True,
+            )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, eps=1e-5,fused=True)
 
     policies = {0: learner}
     rollout_manager = PPOVecRolloutManager(arena, policies, device)
@@ -491,14 +498,19 @@ def train(
     ep_buffer: List[Dict[str, Any]] = []
 
     for update in range(1, num_updates + 1):
-        update_start = time.time()
         model.eval()
 
-        # Collect NEW episodes this update
+        # -------- Timing: rollout --------
+        t0 = time.time()
         new_eps = rollout_manager.collect_episodes(
             num_episodes=episodes_per_update, num_players=config.NUM_PLAYERS,
             training_policy_id=0, opponent_pool=HC_POOL
         )
+        # sync to make rollout timing accurate if any GPU work overlapped
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t_roll = time.time()
+
         if not new_eps:
             logging.warning(f"Update {update}/{num_updates}: No episodes collected. Skipping update.")
             continue
@@ -534,17 +546,29 @@ def train(
                 agg["total_loss"] = agg.get("total_loss", 0.0) + float(loss.detach().cpu())
                 n_loss_terms += 1
 
+        # sync to measure optimize time precisely
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t_opt = time.time()
+
+        # Averages & timings
         avg = lambda name: (agg.get(name, 0.0) / max(1, n_loss_terms))
         avg_total_loss = avg("total_loss")
-        dur = time.time() - update_start
+        dur_roll = t_roll - t0
+        dur_opt  = t_opt - t_roll
+        dur_tot  = t_opt - t0
+
         logging.info(
             f"Update {update}/{num_updates} | buffer={len(ep_buffer)}/{max_buffer_eps} "
-            f"| avg_loss={avg_total_loss:.4f} | time={dur:.2f}s"
+            f"| avg_loss={avg_total_loss:.4f} | rollout={dur_roll:.2f}s | optimize={dur_opt:.2f}s | total={dur_tot:.2f}s"
         )
 
         # Log scalars
-        # Use the *latest* batch for rollout stats (winrate, returns), buffer for training stats
         win_rate = sum(ep["win"] for ep in new_eps) / len(new_eps)
+        writer.add_scalar("Time/Rollout", dur_roll, update)
+        writer.add_scalar("Time/Optimize", dur_opt, update)
+        writer.add_scalar("Time/Total", dur_tot, update)
+
         writer.add_scalar("Loss/Total", avg_total_loss, update)
         writer.add_scalar("Loss/Policy", avg("policy_loss"), update)
         writer.add_scalar("Loss/Value", avg("value_loss"), update)
@@ -555,7 +579,7 @@ def train(
         writer.add_scalar("Policy/ClipFraction", avg("clip_fraction"), update)
         writer.add_scalar("Policy/TrinalClipNegFrac", avg("trinal_clip_neg_frac"), update)
         writer.add_scalar("Policy/SL_KL", avg("bc_kl"), update)
-        writer.add_scalar("Value/ClipFrac", avg("value_clip_frac"), update)   # <--- NEW: value clipping visibility
+        writer.add_scalar("Value/ClipFrac", avg("value_clip_frac"), update)
         writer.add_scalar("Acc/OpponentAction", avg("opp_action_acc"), update)
         writer.add_scalar("Acc/Belief0", avg("belief_acc_0"), update)
         writer.add_scalar("Acc/Belief1", avg("belief_acc_1"), update)
@@ -577,14 +601,38 @@ def train(
 
 
 if __name__ == "__main__":
+    import argparse
+    from datetime import datetime
+
+    parser = argparse.ArgumentParser(description="Train PPO Autoregressive")
+    parser.add_argument("--num-updates", type=int, default=2000,
+                        help="Number of PPO updates (default: 2000)")
+    parser.add_argument("--episodes-per-update", type=int,
+                        default=getattr(config, "EPISODES_PER_UPDATE", 512),
+                        help="Episodes collected per update")
+    parser.add_argument("--k-epochs", type=int,
+                        default=getattr(config, "K_EPOCHS", 2),
+                        help="Optimization epochs over the collected episodes")
+    parser.add_argument("--log-dir", type=str, default=None,
+                        help='TensorBoard log dir. Default: "logs/<run_name>"')
+    parser.add_argument("--checkpoint-dir", type=str, default=None,
+                        help='Checkpoint dir. Default: "<config.CHECKPOINT_DIR>/<run_name>"')
+    parser.add_argument("--run-name", type=str, default=None,
+                        help="Optional run name. Default: ppo_autoreg_<timestamp>")
+
+    args = parser.parse_args()
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = f"ppo_autoreg_{timestamp}"
-    log_dir = os.path.join("logs", run_name)
-    ckpt_dir = os.path.join(getattr(config, "CHECKPOINT_DIR", "checkpoints"), run_name)
+    run_name = args.run_name or f"ppo_autoreg_{timestamp}"
+
+    # keep previous defaults for backwards-compat
+    log_dir = args.log_dir or os.path.join("logs", run_name)
+    ckpt_dir = args.checkpoint_dir or os.path.join(getattr(config, "CHECKPOINT_DIR", "checkpoints"), run_name)
+
     train(
-        num_updates=2000,
-        episodes_per_update=getattr(config, "EPISODES_PER_UPDATE", 512),
-        k_epochs=getattr(config, "K_EPOCHS", 2),
+        num_updates=args.num_updates,
+        episodes_per_update=args.episodes_per_update,
+        k_epochs=args.k_epochs,
         checkpoint_dir=ckpt_dir,
         log_dir=log_dir,
     )
