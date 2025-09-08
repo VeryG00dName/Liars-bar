@@ -157,6 +157,7 @@ def ppo_losses_batched(
     use_trinal_clip: bool = False,
     trinal_delta1: float = 2.5,
     use_stakes_value_clip: bool = False,
+    value_weight: float = 1.0,
     aux_belief_weight: float = 0.5,
     aux_opp_weight: float = 0.5,
     bc_kl_weight: float = 0.0,
@@ -309,7 +310,7 @@ def ppo_losses_batched(
         value_loss = torch.nn.functional.mse_loss(values_at[our_mask], returns[our_mask])
         vclip_frac = torch.zeros((), device=logits_at.device)
 
-    total = policy_loss + 0.5 * value_loss + entropy_loss
+    total = policy_loss + value_weight * value_loss + entropy_loss
 
     metrics: Dict[str, torch.Tensor] = {
         "policy_loss": policy_loss.detach(),
@@ -341,48 +342,68 @@ def ppo_losses_batched(
 
     # ---- Aux: belief heads (batched, masked; -100 ignored) ----
     def _belief_aux(b_logits: Optional[torch.Tensor],
-                    tgt: Optional[torch.Tensor],
-                    msk: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+                tgt: Optional[torch.Tensor],
+                msk: Optional[torch.Tensor],
+                name: str):
+        device = values_full.device
+        zero = torch.zeros((), device=device)
         if b_logits is None or tgt is None or msk is None:
-            z = torch.zeros((), device=values_full.device)
-            return z, z
+            metrics[f"{name}_loss"] = zero
+            metrics[f"{name}_correct"] = zero
+            metrics[f"{name}_total"] = zero
+            metrics[f"{name}_acc"] = zero
+            return zero
+
         C = b_logits.size(-1)
+        # sanity: targets must be in [0..C-1] or -100
+        with torch.no_grad():
+            tmax = tgt.max()
+            # If you ever see this fire, your label space and head size disagree
+            if (tmax >= C) and (tmax != -100):
+                print(f"[WARN] {name} target out of range: max={int(tmax)} >= C={C}")
+
         b_sel = b_logits.gather(1, our_idx.unsqueeze(-1).expand(-1, -1, C))  # [B,T,C]
-        ce = torch.nn.functional.cross_entropy(
+        ce = F.cross_entropy(
             b_sel.flatten(0,1), tgt.view(-1),
             ignore_index=-100, reduction="none"
         ).view(B, T)
+
         valid = (tgt != -100) & msk & our_mask
         w = valid.to(ce.dtype)
         loss = (ce * w).sum() / w.sum().clamp_min(1.0)
+
         with torch.no_grad():
             pred = b_sel.argmax(dim=-1)
-            acc = ( ((pred == tgt) & valid).sum().to(torch.float32) /
-                    valid.sum().clamp_min(1) )
-        return loss, acc
+            corr = ((pred == tgt) & valid).sum()
+            tot  = valid.sum()
+            acc = (corr.to(torch.float32) / tot.clamp_min(1)).to(device)
 
-    b0_loss, acc0 = _belief_aux(b0, batch.get("belief_tgt0"), batch.get("belief0_mask"))
-    b1_loss, acc1 = _belief_aux(b1, batch.get("belief_tgt1"), batch.get("belief1_mask"))
-    b2_loss, acc2 = _belief_aux(b2, batch.get("belief_tgt2"), batch.get("belief2_mask"))
+        metrics[f"{name}_loss"] = loss.detach()
+        metrics[f"{name}_correct"] = corr.detach()
+        metrics[f"{name}_total"] = tot.detach()
+        metrics[f"{name}_acc"] = acc.detach()
+        return loss
+
+    b0_loss = _belief_aux(b0, batch.get("belief_tgt0"), batch.get("belief0_mask"), "belief0")
+    b1_loss = _belief_aux(b1, batch.get("belief_tgt1"), batch.get("belief1_mask"), "belief1")
+    b2_loss = _belief_aux(b2, batch.get("belief_tgt2"), batch.get("belief2_mask"), "belief2")
     belief_loss = b0_loss + b1_loss + b2_loss
     if aux_belief_weight > 0.0:
         total = total + aux_belief_weight * belief_loss
     metrics["belief_loss"] = belief_loss.detach()
-    metrics["belief_acc_0"] = acc0.detach()
-    metrics["belief_acc_1"] = acc1.detach()
-    metrics["belief_acc_2"] = acc2.detach()
 
     # ---- Aux: opponent action supervision (NO masking; -100 ignored) ----
     opp_loss = torch.zeros((), device=values_full.device)
+    opp_corr = torch.zeros((), device=values_full.device, dtype=torch.long)
+    opp_tot  = torch.zeros((), device=values_full.device, dtype=torch.long)
     opp_acc  = torch.zeros((), device=values_full.device)
+
     if aux_opp_weight > 0.0 and (opp_logits is not None) and ("opp_idx" in batch):
         if batch["opp_idx"].numel() > 0:
             To = batch["opp_idx"].size(1)
             A_opp = opp_logits.size(-1)
-            opp_sel = opp_logits.gather(
-                1, batch["opp_idx"].unsqueeze(-1).expand(-1, -1, A_opp)
-            )  # [B,To,A]
-            ce_opp = torch.nn.functional.cross_entropy(
+            opp_sel = opp_logits.gather(1, batch["opp_idx"].unsqueeze(-1).expand(-1, -1, A_opp))  # [B,To,A]
+            ce_opp = F.cross_entropy(
                 opp_sel.flatten(0,1), batch["opp_targets"].view(-1),
                 ignore_index=-100, reduction="none"
             ).view(B, To)
@@ -391,12 +412,19 @@ def ppo_losses_batched(
                 opp_loss = (ce_opp * w).sum() / w.sum().clamp_min(1.0)
                 with torch.no_grad():
                     pred = opp_sel.argmax(dim=-1)
-                    corr = ((pred == batch["opp_targets"]) & batch["opp_have_label"]).sum().to(torch.float32)
-                    opp_acc = corr / batch["opp_have_label"].sum().clamp_min(1)
+                    corr = ((pred == batch["opp_targets"]) & batch["opp_have_label"]).sum()
+                    tot  = batch["opp_have_label"].sum()
+                    opp_corr = corr.detach()
+                    opp_tot  = tot.detach()
+                    opp_acc  = (corr.to(torch.float32) / tot.clamp_min(1)).to(values_full.device)
+
     if aux_opp_weight > 0.0:
         total = total + aux_opp_weight * opp_loss
+
     metrics["opp_loss"] = opp_loss.detach()
     metrics["opp_action_acc"] = opp_acc.detach()
+    metrics["opp_correct"] = opp_corr
+    metrics["opp_total"]   = opp_tot
 
     return total, metrics
 
@@ -410,20 +438,23 @@ def _collate_batch(
     CPU-side collation. Returns tensors on CPU so _to_device_batch(...) moves them.
 
     Outputs:
-      mi: dict with only time-major tensors (dim>=2) padded to L_max, plus 'valid_lengths' [B]
+      mi: dict with only time-major tensors (dim>=2) padded to L_pad, plus 'valid_lengths' [B]
       our_idx [B,T], mask [B,T], actions [B,T], old_logp [B,T], rewards [B,T],
-      penalties_used [B,T], our_action_mask [B,L,A] or None,
+      penalties_used [B,T], our_action_mask [B,L_pad,A] or None,
       belief_tgt{0,1,2} [B,T], belief{0,1,2}_mask [B,T],
       opp_idx [B,To], opp_targets [B,To], opp_have_label [B,To]
     """
     IGN = int(ignore_index)
+    B = len(episodes)
+    if B == 0:
+        raise ValueError("Empty batch.")
 
-    # -------- discover sequence lengths per episode --------
-    lens: List[int] = []
+    # -------- discover per-episode raw sequence lengths --------
+    raw_lens: List[int] = []
     for ep in episodes:
         mi = ep["model_input"]
         if "action_sequence" in mi and torch.is_tensor(mi["action_sequence"]) and mi["action_sequence"].dim() >= 2:
-            lens.append(int(mi["action_sequence"].size(1)))
+            raw_lens.append(int(mi["action_sequence"].size(1)))
         else:
             # fallback: first [1, L, ...] tensor
             L_found = None
@@ -432,11 +463,15 @@ def _collate_batch(
                     L_found = int(v.size(1)); break
             if L_found is None:
                 raise ValueError("Cannot infer sequence length for an episode: no [1, L, ...] tensors in model_input.")
-            lens.append(L_found)
+            raw_lens.append(L_found)
 
-    B = len(episodes)
+    # Choose padding length (fixed if L_max provided → friendlier to dynamic=False)
+    L_batch_max = max(raw_lens) if raw_lens else 0
+    L_pad = int(L_max) if (L_max is not None) else L_batch_max
+    if L_pad <= 0:
+        L_pad = L_batch_max
 
-    # -------- pad/trim only tensors with a time dimension (dim >= 2) --------
+    # -------- helper: pad/trim only tensors with a time dimension (dim >= 2) --------
     def _pad_trim(v: torch.Tensor, L_tgt: int) -> torch.Tensor:
         # v: [1, L, ...] → pad or trim along dim=1
         L = v.size(1)
@@ -449,88 +484,100 @@ def _collate_batch(
         z = torch.zeros(pad_shape, dtype=v.dtype, device=v.device)
         return torch.cat([v, z], dim=1)
 
-    # Build mi with only dim>=2 tensors padded to L_max
-    # 1-D items (like original 'valid_lengths') are handled separately below.
-    # Also, require that each kept key exists in all episodes and has dim>=2.
+    # -------- build batched model inputs (time-major tensors only) --------
     common_keys = set(episodes[0]["model_input"].keys())
     for ep in episodes[1:]:
         common_keys &= set(ep["model_input"].keys())
+
     mi_batch: Dict[str, torch.Tensor] = {}
     for k in sorted(common_keys):
         vs = [ep["model_input"][k] for ep in episodes]
         if not all(torch.is_tensor(v) for v in vs):
             continue
         if not all(v.dim() >= 2 for v in vs):
-            continue  # skip 1-D/0-D keys here; we may add a batched replacement below
+            continue  # skip 1-D/0-D keys here; we rebuild valid_lengths below
 
-        padded = [_pad_trim(v, L_max) for v in vs]  # each [1, L_max, ...]
-        cat = torch.cat(padded, dim=0).contiguous()  # [B, L_max, ...] on CPU
+        padded = [_pad_trim(v, L_pad) for v in vs]   # each [1, L_pad, ...]
+        cat = torch.cat(padded, dim=0).contiguous()  # [B, L_pad, ...] on CPU
         if pin_memory:
             cat = cat.pin_memory()
         mi_batch[k] = cat
 
-    # Rebuild valid_lengths as [B] Long (clamped to L_max)
-    valid_lengths = torch.tensor([min(l, L_max) for l in lens], dtype=torch.long)
+    # Rebuild valid_lengths as [B] long, clamped to L_pad
+    valid_lengths = torch.tensor([min(l, L_pad) for l in raw_lens], dtype=torch.long)
     if pin_memory:
         valid_lengths = valid_lengths.pin_memory()
     mi_batch["valid_lengths"] = valid_lengths  # [B]
 
     # Require agent_types for actor/opp selection
     if "agent_types" not in mi_batch:
-        raise ValueError("model_input must include 'agent_types' with dim>=2 (batched [B, L])")
-    agent_types = mi_batch["agent_types"].long()  # [B, L_max]
+        raise ValueError("model_input must include 'agent_types' with dim>=2 (batched [B, L]).")
+    agent_types = mi_batch["agent_types"].long()  # [B, L_pad]
 
-    # Optional legality mask for OUR steps (full timeline; gathered per our_idx later)
+    # Optional legality mask for OUR steps; we'll zero it past each valid length
     our_action_mask = None
     if "action_masks" in mi_batch:
-        our_action_mask = mi_batch["action_masks"].bool()  # [B, L_max, A]
+        m = mi_batch["action_masks"].bool()  # [B, L_pad, A]
+        # trim mask beyond valid lengths so padding is never considered legal
+        for b in range(B):
+            Lb = int(valid_lengths[b].item())
+            if Lb < m.size(1):
+                m[b, Lb:, :].fill_(False)
+        our_action_mask = m
 
-    # -------- build OUR/OPP timestep indices --------
+    # -------- build OUR/OPP timestep indices using ONLY valid tokens --------
     our_pos_lists: List[torch.Tensor] = []
     opp_pos_lists: List[torch.Tensor] = []
     for b in range(B):
-        at = agent_types[b, :L_max].detach().cpu().numpy()
+        Lb = int(valid_lengths[b].item())
+        at = agent_types[b, :Lb].detach().cpu().numpy()  # slice to true length
         our_pos_lists.append(torch.from_numpy((at == 0).nonzero()[0]).long())
         opp_pos_lists.append(torch.from_numpy((at != 0).nonzero()[0]).long())
 
     T  = max((int(x.numel()) for x in our_pos_lists), default=0)
+    To = max((int(x.numel()) for x in opp_pos_lists), default=0)
 
     # -------- allocate supervision tensors (CPU) --------
-    our_idx    = torch.zeros((B, T), dtype=torch.long,    pin_memory=pin_memory)
-    our_mask   = torch.zeros((B, T), dtype=torch.bool,    pin_memory=pin_memory)
-    actions    = torch.zeros((B, T), dtype=torch.long,    pin_memory=pin_memory)
-    old_logp   = torch.zeros((B, T), dtype=torch.float32, pin_memory=pin_memory)
-    rewards    = torch.zeros((B, T), dtype=torch.float32, pin_memory=pin_memory)
-    pen_used   = torch.zeros((B, T), dtype=torch.long,    pin_memory=pin_memory)
+    def _pm(x: torch.Tensor) -> torch.Tensor:
+        return x.pin_memory() if pin_memory else x
 
-    belief_tgt0 = torch.full((B, T), IGN, dtype=torch.long,  pin_memory=pin_memory)
-    belief_tgt1 = torch.full((B, T), IGN, dtype=torch.long,  pin_memory=pin_memory)
-    belief_tgt2 = torch.full((B, T), IGN, dtype=torch.long,  pin_memory=pin_memory)
-    belief0_mask = torch.zeros((B, T), dtype=torch.bool, pin_memory=pin_memory)
-    belief1_mask = torch.zeros((B, T), dtype=torch.bool, pin_memory=pin_memory)
-    belief2_mask = torch.zeros((B, T), dtype=torch.bool, pin_memory=pin_memory)
+    our_idx    = _pm(torch.zeros((B, T),  dtype=torch.long))
+    our_mask   = _pm(torch.zeros((B, T),  dtype=torch.bool))
+    actions    = _pm(torch.zeros((B, T),  dtype=torch.long))
+    old_logp   = _pm(torch.zeros((B, T),  dtype=torch.float32))
+    rewards    = _pm(torch.zeros((B, T),  dtype=torch.float32))
+    pen_used   = _pm(torch.zeros((B, T),  dtype=torch.long))
 
-    opp_idx        = torch.zeros((B, T), dtype=torch.long,  pin_memory=pin_memory)
-    opp_targets    = torch.full((B, T), IGN, dtype=torch.long, pin_memory=pin_memory)
-    opp_have_label = torch.zeros((B, T), dtype=torch.bool,  pin_memory=pin_memory)
+    belief_tgt0 = _pm(torch.full((B, T), IGN, dtype=torch.long))
+    belief_tgt1 = _pm(torch.full((B, T), IGN, dtype=torch.long))
+    belief_tgt2 = _pm(torch.full((B, T), IGN, dtype=torch.long))
+    belief0_mask = _pm(torch.zeros((B, T), dtype=torch.bool))
+    belief1_mask = _pm(torch.zeros((B, T), dtype=torch.bool))
+    belief2_mask = _pm(torch.zeros((B, T), dtype=torch.bool))
+
+    opp_idx        = _pm(torch.zeros((B, To),  dtype=torch.long))
+    opp_targets    = _pm(torch.full((B, To), IGN, dtype=torch.long))
+    opp_have_label = _pm(torch.zeros((B, To),  dtype=torch.bool))
 
     def _map_kind(x):
-        if x is None: return None
+        if x is None:
+            return None
         return BELIEF_LABELS_FROM_KIND.get(x, None)
 
-    # -------- fill from episodes --------
+    # -------- fill from episodes (only real steps) --------
     for b, ep in enumerate(episodes):
         # OUR timeline
         our_pos = our_pos_lists[b]
-        if T > 0 and our_pos.numel() > 0:
-            K = min(T, int(our_pos.numel()))
-            if K > 0:
-                our_idx[b, :K] = our_pos[:K]
-                our_mask[b, :K] = True
+        K = int(our_pos.numel())
+        K_fill = min(T, K)
+        if K_fill > 0:
+            our_idx[b, :K_fill] = our_pos[:K_fill]
+            our_mask[b, :K_fill] = True
 
             our_ep_idx = [i for i, seat in enumerate(ep["agent_id"]) if seat == ep["training_agent_seat"]]
-            for t_local in range(K):
-                if t_local >= len(our_ep_idx): break
+            for t_local in range(K_fill):
+                if t_local >= len(our_ep_idx):
+                    break
                 step_ep = our_ep_idx[t_local]
 
                 a  = ep["our_action"][step_ep] if step_ep < len(ep["our_action"]) else None
@@ -550,20 +597,21 @@ def _collate_batch(
                 if lb1 is not None: belief_tgt1[b, t_local] = int(lb1); belief1_mask[b, t_local] = True
                 if lb2 is not None: belief_tgt2[b, t_local] = int(lb2); belief2_mask[b, t_local] = True
 
-        # OPP timeline (no action mask; labels optional)
+        # OPP timeline (labels optional)
         opp_pos = opp_pos_lists[b]
-        if T > 0 and opp_pos.numel() > 0:
-            M = min(T, int(opp_pos.numel()))
-            if M > 0:
-                opp_idx[b, :M] = opp_pos[:M]
-                opp_ep_idx = [i for i, seat in enumerate(ep["agent_id"]) if seat != ep["training_agent_seat"]]
-                for t_local in range(M):
-                    if t_local >= len(opp_ep_idx): break
-                    step_ep = opp_ep_idx[t_local]
-                    tgt = ep.get("opp_target_action", [None]*len(ep["agent_id"]))[step_ep]
-                    if tgt is not None:
-                        opp_targets[b, t_local] = int(tgt)
-                        opp_have_label[b, t_local] = True
+        M = int(opp_pos.numel())
+        M_fill = min(To, M)
+        if M_fill > 0:
+            opp_idx[b, :M_fill] = opp_pos[:M_fill]
+            opp_ep_idx = [i for i, seat in enumerate(ep["agent_id"]) if seat != ep["training_agent_seat"]]
+            for t_local in range(M_fill):
+                if t_local >= len(opp_ep_idx):
+                    break
+                step_ep = opp_ep_idx[t_local]
+                tgt = ep.get("opp_target_action", [None]*len(ep["agent_id"]))[step_ep]
+                if tgt is not None:
+                    opp_targets[b, t_local] = int(tgt)
+                    opp_have_label[b, t_local] = True
 
     return {
         "mi": mi_batch,
@@ -573,7 +621,7 @@ def _collate_batch(
         "old_logp": old_logp,
         "rewards": rewards,
         "penalties_used": pen_used,
-        "our_action_mask": our_action_mask,
+        "our_action_mask": our_action_mask,  # may be None
 
         "belief_tgt0": belief_tgt0, "belief_tgt1": belief_tgt1, "belief_tgt2": belief_tgt2,
         "belief0_mask": belief0_mask, "belief1_mask": belief1_mask, "belief2_mask": belief2_mask,
@@ -658,8 +706,8 @@ def train(
         model.parameters(),
         lr=float(getattr(config, "LEARNING_RATE", 1.9e-4)),
         eps=1e-5,
-        foreach=True,
-        fused=False,
+        foreach=False,
+        fused=True,
         capturable=False,
     )
     scaler = amp.GradScaler(enabled=(device.type == "cuda"))
@@ -727,6 +775,7 @@ def train(
                     use_trinal_clip=USE_TRINAL_CLIP,
                     trinal_delta1=TRINAL_DELTA1,
                     use_stakes_value_clip=USE_STAKES_VALUE_CLIP,
+                    value_weight=float(getattr(config, "VALUE_WEIGHT", 0.5)),
                     aux_belief_weight=float(getattr(config, "AUX_BELIEF_WEIGHT", 0.5)),
                     aux_opp_weight=float(getattr(config, "AUX_OPP_WEIGHT", 0.5)),
                     bc_kl_weight=float(getattr(config, "BC_KL_WEIGHT", 0.0)),
@@ -759,7 +808,7 @@ def train(
         avg = {k: (v / max(n_batches, 1)) for k, v in agg.items()}
         logging.info(
             f"Update {update}/{num_updates} | buffer={len(ep_buffer)}/{max_buffer_eps} "
-            f"| batches={n_batches} | avg_loss={avg['total_loss']:.4f} "
+            f"| avg_loss={avg['total_loss']:.4f} "
             f"| rollout={dur_roll:.2f}s | optimize={dur_opt:.2f}s ({eps_per_s:.1f} ep/s) | total={dur_tot:.2f}s"
         )
 

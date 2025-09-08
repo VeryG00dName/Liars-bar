@@ -97,6 +97,7 @@ STRATEGY_DROPOUT = 0.1
 # ============================
 NUM_EPISODES = 40000
 EPISODES_PER_UPDATE = 512
+FIXED_L_TOK = 200
 LEARNING_RATE = 0.00019
 GAMMA = 0.974
 GAE_LAMBDA = 0.98
@@ -119,7 +120,7 @@ AUX_LOSS_WEIGHT = 1
 # Split aux weights (current PPO usage)
 AUX_BELIEF_WEIGHT = 0.3   # belief heads weight (was 0.5 in your PPO runs)
 AUX_OPP_WEIGHT    = 0.5   # opponent action weight (1.0 to match SL)
-
+VALUE_WEIGHT      = 1     # value loss weight 
 # ============================
 # Teacher KL / Behavior Cloning Leash
 # ============================
