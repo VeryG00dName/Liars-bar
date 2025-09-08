@@ -235,7 +235,6 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
                 "agent_types":     agent_seq.unsqueeze(0).cpu(),
                 "positions":       pos_seq.unsqueeze(0).cpu(),
                 "action_masks":    (action_masks.unsqueeze(0).cpu() if action_masks is not None else None),
-                # These can be recomputed, but keeping them is cheap:
                 "padding_mask":    torch.zeros(1, Li, dtype=torch.bool),
                 "valid_lengths":   torch.tensor([Li], dtype=torch.long),
             }

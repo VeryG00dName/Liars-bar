@@ -1,5 +1,6 @@
 # src/training/train_ppo_autoregressive.py
 
+import copy
 import os, logging, warnings
 
 # Quiet Torch compile logs
@@ -342,68 +343,48 @@ def ppo_losses_batched(
 
     # ---- Aux: belief heads (batched, masked; -100 ignored) ----
     def _belief_aux(b_logits: Optional[torch.Tensor],
-                tgt: Optional[torch.Tensor],
-                msk: Optional[torch.Tensor],
-                name: str):
-        device = values_full.device
-        zero = torch.zeros((), device=device)
+                    tgt: Optional[torch.Tensor],
+                    msk: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         if b_logits is None or tgt is None or msk is None:
-            metrics[f"{name}_loss"] = zero
-            metrics[f"{name}_correct"] = zero
-            metrics[f"{name}_total"] = zero
-            metrics[f"{name}_acc"] = zero
-            return zero
-
+            z = torch.zeros((), device=values_full.device)
+            return z, z
         C = b_logits.size(-1)
-        # sanity: targets must be in [0..C-1] or -100
-        with torch.no_grad():
-            tmax = tgt.max()
-            # If you ever see this fire, your label space and head size disagree
-            if (tmax >= C) and (tmax != -100):
-                print(f"[WARN] {name} target out of range: max={int(tmax)} >= C={C}")
-
         b_sel = b_logits.gather(1, our_idx.unsqueeze(-1).expand(-1, -1, C))  # [B,T,C]
-        ce = F.cross_entropy(
+        ce = torch.nn.functional.cross_entropy(
             b_sel.flatten(0,1), tgt.view(-1),
             ignore_index=-100, reduction="none"
         ).view(B, T)
-
         valid = (tgt != -100) & msk & our_mask
         w = valid.to(ce.dtype)
         loss = (ce * w).sum() / w.sum().clamp_min(1.0)
-
         with torch.no_grad():
             pred = b_sel.argmax(dim=-1)
-            corr = ((pred == tgt) & valid).sum()
-            tot  = valid.sum()
-            acc = (corr.to(torch.float32) / tot.clamp_min(1)).to(device)
+            acc = ( ((pred == tgt) & valid).sum().to(torch.float32) /
+                    valid.sum().clamp_min(1) )
+        return loss, acc
 
-        metrics[f"{name}_loss"] = loss.detach()
-        metrics[f"{name}_correct"] = corr.detach()
-        metrics[f"{name}_total"] = tot.detach()
-        metrics[f"{name}_acc"] = acc.detach()
-        return loss
-
-    b0_loss = _belief_aux(b0, batch.get("belief_tgt0"), batch.get("belief0_mask"), "belief0")
-    b1_loss = _belief_aux(b1, batch.get("belief_tgt1"), batch.get("belief1_mask"), "belief1")
-    b2_loss = _belief_aux(b2, batch.get("belief_tgt2"), batch.get("belief2_mask"), "belief2")
+    b0_loss, acc0 = _belief_aux(b0, batch.get("belief_tgt0"), batch.get("belief0_mask"))
+    b1_loss, acc1 = _belief_aux(b1, batch.get("belief_tgt1"), batch.get("belief1_mask"))
+    b2_loss, acc2 = _belief_aux(b2, batch.get("belief_tgt2"), batch.get("belief2_mask"))
     belief_loss = b0_loss + b1_loss + b2_loss
     if aux_belief_weight > 0.0:
         total = total + aux_belief_weight * belief_loss
     metrics["belief_loss"] = belief_loss.detach()
+    metrics["belief_acc_0"] = acc0.detach()
+    metrics["belief_acc_1"] = acc1.detach()
+    metrics["belief_acc_2"] = acc2.detach()
 
     # ---- Aux: opponent action supervision (NO masking; -100 ignored) ----
     opp_loss = torch.zeros((), device=values_full.device)
-    opp_corr = torch.zeros((), device=values_full.device, dtype=torch.long)
-    opp_tot  = torch.zeros((), device=values_full.device, dtype=torch.long)
     opp_acc  = torch.zeros((), device=values_full.device)
-
     if aux_opp_weight > 0.0 and (opp_logits is not None) and ("opp_idx" in batch):
         if batch["opp_idx"].numel() > 0:
             To = batch["opp_idx"].size(1)
             A_opp = opp_logits.size(-1)
-            opp_sel = opp_logits.gather(1, batch["opp_idx"].unsqueeze(-1).expand(-1, -1, A_opp))  # [B,To,A]
-            ce_opp = F.cross_entropy(
+            opp_sel = opp_logits.gather(
+                1, batch["opp_idx"].unsqueeze(-1).expand(-1, -1, A_opp)
+            )  # [B,To,A]
+            ce_opp = torch.nn.functional.cross_entropy(
                 opp_sel.flatten(0,1), batch["opp_targets"].view(-1),
                 ignore_index=-100, reduction="none"
             ).view(B, To)
@@ -412,19 +393,12 @@ def ppo_losses_batched(
                 opp_loss = (ce_opp * w).sum() / w.sum().clamp_min(1.0)
                 with torch.no_grad():
                     pred = opp_sel.argmax(dim=-1)
-                    corr = ((pred == batch["opp_targets"]) & batch["opp_have_label"]).sum()
-                    tot  = batch["opp_have_label"].sum()
-                    opp_corr = corr.detach()
-                    opp_tot  = tot.detach()
-                    opp_acc  = (corr.to(torch.float32) / tot.clamp_min(1)).to(values_full.device)
-
+                    corr = ((pred == batch["opp_targets"]) & batch["opp_have_label"]).sum().to(torch.float32)
+                    opp_acc = corr / batch["opp_have_label"].sum().clamp_min(1)
     if aux_opp_weight > 0.0:
         total = total + aux_opp_weight * opp_loss
-
     metrics["opp_loss"] = opp_loss.detach()
     metrics["opp_action_acc"] = opp_acc.detach()
-    metrics["opp_correct"] = opp_corr
-    metrics["opp_total"]   = opp_tot
 
     return total, metrics
 
@@ -443,29 +417,33 @@ def _collate_batch(
       penalties_used [B,T], our_action_mask [B,L_pad,A] or None,
       belief_tgt{0,1,2} [B,T], belief{0,1,2}_mask [B,T],
       opp_idx [B,To], opp_targets [B,To], opp_have_label [B,To]
+      padding_mask [B,L_pad] (True where padded)
     """
     IGN = int(ignore_index)
     B = len(episodes)
     if B == 0:
         raise ValueError("Empty batch.")
 
-    # -------- discover per-episode raw sequence lengths --------
+    # -------- discover per-episode true sequence lengths --------
     raw_lens: List[int] = []
     for ep in episodes:
         mi = ep["model_input"]
-        if "action_sequence" in mi and torch.is_tensor(mi["action_sequence"]) and mi["action_sequence"].dim() >= 2:
-            raw_lens.append(int(mi["action_sequence"].size(1)))
+        # prefer the length saved during acting (correct per-episode length)
+        if "valid_lengths" in mi and torch.is_tensor(mi["valid_lengths"]):
+            # acting stored [B] but here B==1 per-episode snapshot
+            L_true = int(mi["valid_lengths"].view(-1)[0].item())
+            raw_lens.append(L_true)
         else:
-            # fallback: first [1, L, ...] tensor
+            # fallback: infer from the longest [1, L, ...] tensor
             L_found = None
             for v in mi.values():
                 if torch.is_tensor(v) and v.dim() >= 2 and v.size(0) == 1:
                     L_found = int(v.size(1)); break
             if L_found is None:
-                raise ValueError("Cannot infer sequence length for an episode: no [1, L, ...] tensors in model_input.")
+                raise ValueError("Cannot infer sequence length for an episode.")
             raw_lens.append(L_found)
 
-    # Choose padding length (fixed if L_max provided → friendlier to dynamic=False)
+    # Choose padding length
     L_batch_max = max(raw_lens) if raw_lens else 0
     L_pad = int(L_max) if (L_max is not None) else L_batch_max
     if L_pad <= 0:
@@ -473,12 +451,9 @@ def _collate_batch(
 
     # -------- helper: pad/trim only tensors with a time dimension (dim >= 2) --------
     def _pad_trim(v: torch.Tensor, L_tgt: int) -> torch.Tensor:
-        # v: [1, L, ...] → pad or trim along dim=1
         L = v.size(1)
-        if L == L_tgt:
-            return v
-        if L > L_tgt:
-            return v[:, :L_tgt, ...]
+        if L == L_tgt: return v
+        if L > L_tgt:  return v[:, :L_tgt, ...]
         pad_len = L_tgt - L
         pad_shape = list(v.shape); pad_shape[1] = pad_len
         z = torch.zeros(pad_shape, dtype=v.dtype, device=v.device)
@@ -489,25 +464,31 @@ def _collate_batch(
     for ep in episodes[1:]:
         common_keys &= set(ep["model_input"].keys())
 
+    # we will REBUILD both 'valid_lengths' and 'padding_mask' — exclude the cached mask
+    skip_keys = {"padding_mask", "valid_lengths"}
     mi_batch: Dict[str, torch.Tensor] = {}
-    for k in sorted(common_keys):
+    for k in sorted(common_keys - skip_keys):
         vs = [ep["model_input"][k] for ep in episodes]
-        if not all(torch.is_tensor(v) for v in vs):
+        if not all(torch.is_tensor(v) for v in vs):  # only tensors
             continue
-        if not all(v.dim() >= 2 for v in vs):
-            continue  # skip 1-D/0-D keys here; we rebuild valid_lengths below
-
+        if not all(v.dim() >= 2 for v in vs):       # only time-major tensors
+            continue
         padded = [_pad_trim(v, L_pad) for v in vs]   # each [1, L_pad, ...]
-        cat = torch.cat(padded, dim=0).contiguous()  # [B, L_pad, ...] on CPU
-        if pin_memory:
-            cat = cat.pin_memory()
+        cat = torch.cat(padded, dim=0).contiguous()  # [B, L_pad, ...]
+        if pin_memory: cat = cat.pin_memory()
         mi_batch[k] = cat
 
-    # Rebuild valid_lengths as [B] long, clamped to L_pad
+    # ---- REBUILD valid_lengths and padding_mask from the true lengths ----
     valid_lengths = torch.tensor([min(l, L_pad) for l in raw_lens], dtype=torch.long)
-    if pin_memory:
-        valid_lengths = valid_lengths.pin_memory()
+    if pin_memory: valid_lengths = valid_lengths.pin_memory()
     mi_batch["valid_lengths"] = valid_lengths  # [B]
+
+    padding_mask = torch.zeros((B, L_pad), dtype=torch.bool)
+    for b, Lb in enumerate(valid_lengths.tolist()):
+        if Lb < L_pad:
+            padding_mask[b, Lb:] = True          # True = PAD
+    if pin_memory: padding_mask = padding_mask.pin_memory()
+    mi_batch["padding_mask"] = padding_mask     # [B, L_pad]
 
     # Require agent_types for actor/opp selection
     if "agent_types" not in mi_batch:
@@ -621,7 +602,7 @@ def _collate_batch(
         "old_logp": old_logp,
         "rewards": rewards,
         "penalties_used": pen_used,
-        "our_action_mask": our_action_mask,  # may be None
+        "our_action_mask": our_action_mask,
 
         "belief_tgt0": belief_tgt0, "belief_tgt1": belief_tgt1, "belief_tgt2": belief_tgt2,
         "belief0_mask": belief0_mask, "belief1_mask": belief1_mask, "belief2_mask": belief2_mask,
@@ -692,15 +673,15 @@ def train(
     with torch.no_grad():
         if hasattr(model, "causal_bool_mask_full"):
             model.causal_bool_mask_full = model.causal_bool_mask_full.to(device)
-
+    sl_teacher = copy.deepcopy(learner.model).eval()
+    for p in sl_teacher.parameters():
+        p.requires_grad = False
     # ---- torch.compile back on (works fine without CUDA graphs) ----
     try:
         model = torch.compile(model, mode="reduce-overhead", fullgraph=False, dynamic=False)
         logging.info("torch.compile enabled (reduce-overhead).")
     except Exception as e:
         logging.warning(f"torch.compile failed, running eager. Reason: {e}")
-    sl_teacher = learner.model
-    sl_teacher.eval()
     # Optimizer: standard AMP path; no fused/capturable (no graphs)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -802,14 +783,13 @@ def train(
         dur_roll = t_roll - t0
         dur_opt  = t_opt_end - t_roll
         dur_tot  = t_opt_end - t0
-        eps_per_s = (n_batches * B_train) / max(dur_opt, 1e-6)
 
         # Averages
         avg = {k: (v / max(n_batches, 1)) for k, v in agg.items()}
         logging.info(
             f"Update {update}/{num_updates} | buffer={len(ep_buffer)}/{max_buffer_eps} "
             f"| avg_loss={avg['total_loss']:.4f} "
-            f"| rollout={dur_roll:.2f}s | optimize={dur_opt:.2f}s ({eps_per_s:.1f} ep/s) | total={dur_tot:.2f}s"
+            f"| rollout={dur_roll:.2f}s | optimize={dur_opt:.2f}s | total={dur_tot:.2f}s"
         )
 
         # Win rate for the *new* episodes
@@ -819,7 +799,6 @@ def train(
         writer.add_scalar("Time/Rollout", dur_roll, update)
         writer.add_scalar("Time/Optimize", dur_opt, update)
         writer.add_scalar("Time/Total", dur_tot, update)
-        writer.add_scalar("Throughput/episodes_per_s", eps_per_s, update)
 
         writer.add_scalar("Loss/Total", avg["total_loss"], update)
         writer.add_scalar("Loss/Policy", avg.get("policy_loss", 0.0), update)
