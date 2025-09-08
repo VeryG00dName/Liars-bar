@@ -82,7 +82,7 @@ class PPOVecRolloutManager:
                     penalties_snapshot.append(int(env.penalties[int(seat)]))
 
                 actions, log_probs, values, beliefs = agent.get_actions_batch(
-                    self.arena, env_indices, seat_indices, obs, mask
+                    self.arena, env_indices, seat_indices, mask
                 )
 
                 # Step envs
