@@ -77,10 +77,8 @@ STAKES_PEN_NORM        = float(getattr(config, "STAKES_PEN_NORM", 3.0))
 STAKES_PEN_EXP         = float(getattr(config, "STAKES_PEN_EXP", 1.0))
 STAKES_CLIP_MIN        = float(getattr(config, "STAKES_CLIP_MIN", 0.5))
 STAKES_CLIP_MAX        = float(getattr(config, "STAKES_CLIP_MAX", 4.0))
-GAMMA = float(getattr(config, "GAMMA", 0.99))
-GAE_LAMBDA   = float(getattr(config, "GAE_LAMBDA", 0.95))
-if not hasattr(config, "_ret_std_ema"):
-    config._ret_std_ema = 1.0
+GAMMA                  = float(getattr(config, "GAMMA", 0.99))
+GAE_LAMBDA             = float(getattr(config, "GAE_LAMBDA", 0.95))
 
 def _cards_base_from_action(action_ids: torch.Tensor) -> torch.Tensor:
     base = ((action_ids % 3) + 1).to(torch.float32)
@@ -97,251 +95,475 @@ def _stakes_multiplier_public(action_ids: torch.Tensor, penalties_used: torch.Te
     mult = base * pen_factor
     return torch.clamp(mult, STAKES_CLIP_MIN, STAKES_CLIP_MAX)
 
+def _value_loss_with_stakes_clip_public(
+    v_pred: torch.Tensor,
+    returns: torch.Tensor,
+    action_ids: torch.Tensor,
+    penalties_used: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Batched-safe stakes-aware value loss with clipping of the *target*.
+    Accepts matching shapes (e.g., [N] or [B, T]) for all tensors.
+
+    Uses an EMA of the return std stored on `config.RET_STD_EMA` to scale the clip range.
+    Returns:
+      (mse_loss, clip_frac) where clip_frac is the fraction of samples whose targets were clipped.
+    """
+    # Ensure fp32 for the math; shapes propagate
+    v_pred  = v_pred.to(torch.float32)
+    returns = returns.to(torch.float32)
+
+    with torch.no_grad():
+        r_flat = returns.reshape(-1)
+        n = int(r_flat.numel())
+        if n < 2:
+            batch_std = 1.0
+        else:
+            nz = (r_flat.abs() > 1e-8)
+            if nz.float().mean().item() >= 0.2:  # enough non-zeros → robust std
+                batch_std = r_flat[nz].std(unbiased=False).clamp(min=1e-3).item()
+            else:
+                batch_std = 1.0
+
+        # Smooth std via EMA (module-level state in config)
+        prev_ema = config.RET_STD_EMA
+        new_ema  = RET_STD_EMA_DECAY * prev_ema + (1.0 - RET_STD_EMA_DECAY) * batch_std
+        config.RET_STD_EMA = float(new_ema)
+        ret_scale = config.RET_STD_EMA
+
+    # Stakes multiplier derived from public info (same shape as inputs)
+    stakes = _stakes_multiplier_public(action_ids, penalties_used).to(torch.float32)
+
+    # Per-sample clip band scaled by stakes and EMA’d return std
+    delta = EPS_V * stakes * ret_scale
+    lower = -delta
+    upper =  delta
+
+    with torch.no_grad():
+        clip_mask = (returns < lower) | (returns > upper)
+        clip_frac = clip_mask.float().mean()
+
+    target = torch.clamp(returns, min=lower, max=upper)
+    loss = torch.nn.functional.mse_loss(v_pred, target)
+    return loss, clip_frac
+
 # ---------------------- Batched PPO loss (graph-safe) ----------------------
 def ppo_losses_batched(
-    model,
-    batch: Dict[str, Any],
+    model: torch.nn.Module,
+    batch: Dict[str, torch.Tensor],
     eps_clip: float,
     ent_coef: float,
-    use_trinal_clip: bool,
-    trinal_delta1: float,
-    use_stakes_value_clip: bool,
+    *,
+    use_trinal_clip: bool = False,
+    trinal_delta1: float = 2.5,
+    use_stakes_value_clip: bool = False,
+    aux_belief_weight: float = 0.5,
+    aux_opp_weight: float = 0.5,
+    bc_kl_weight: float = 0.0,
+    sl_teacher: Optional[torch.nn.Module] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
-    Expects `batch` to contain (all on same device as model params):
-      - mi: dict of model inputs with shapes [B, L, ...]
-      - our_idx: [B, T] long, indices of OUR decision tokens (clipped to [0, L-1])
-      - our_action_mask: optional [B, T, A] bool (legal actions at our steps)
-      - actions: [B, T] long (taken actions)
-      - old_logp: [B, T] float32
-      - advantages: [B, T] float32 (precomputed; we normalize here over valid mask)
-      - returns: [B, T] float32 (value targets on our steps)
-      - penalties_used: [B, T] long (public penalties at our steps)
-      - mask: [B, T] float32 (1 for valid our-step slots, 0 for pad)
+    Fully batched PPO objective with:
+      • irregular-step GAE computed inside (from batch['rewards'] & model values)
+      • stakes-based value target clipping (optional)
+      • belief-head CE (batched, masked; -100 ignored)
+      • opponent action CE (batched; NO action masking; -100 ignored)
+      • optional teacher KL at OUR steps
+
+    Requires in batch:
+      mi, our_idx [B,T], mask [B,T], actions [B,T], old_logp [B,T],
+      rewards [B,T], penalties_used [B,T],
+      our_action_mask [B,L,A] or None,
+      belief_tgt{0,1,2}, belief{0,1,2}_mask,
+      opp_idx [B,To], opp_targets [B,To], opp_have_label [B,To]
     """
     mi = batch["mi"]
-    logits, opp_logits, values, *_ = model(**mi)   # [B, L, A], [B, L, 1]
-    values = values.squeeze(-1)                    # [B, L]
+    our_idx = batch["our_idx"].long()     # [B, T]
+    our_mask = batch["mask"].bool()       # [B, T]
+    actions = batch["actions"].long()     # [B, T]
+    old_logp = batch["old_logp"].float()  # [B, T]
+    rewards = batch["rewards"].float()    # [B, T]
 
-    def _masked_mean(x: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
-        mf = m.to(dtype=x.dtype)
-        num = (x * mf).sum()
-        den = mf.sum().clamp_min(1.0)
-        return num / den
+    outs = model(**mi)
+    action_logits = outs[0]                                # [B, L, A]
+    opp_logits    = outs[1] if len(outs) > 1 else None     # [B, L, A] or None
+    values_full   = outs[2].squeeze(-1).to(torch.float32)  # [B, L]
+    b0 = outs[3] if len(outs) > 3 else None                # [B, L, C0] or None
+    b1 = outs[4] if len(outs) > 4 else None
+    b2 = outs[5] if len(outs) > 5 else None
 
-    B, L, A = logits.shape
-    idx = batch["our_idx"].clamp(min=0, max=L - 1)             # [B, T]
-    T = idx.size(1)
+    B, T = our_idx.shape
+    A = action_logits.size(-1)
 
-    idxA = idx.unsqueeze(-1).expand(-1, -1, A)                 # [B, T, A]
-    logits_at = logits.gather(1, idxA).to(torch.float32)       # [B, T, A]
-    v_at      = values.gather(1, idx).to(torch.float32)        # [B, T]
+    # ---- Gather OUR-step logits ----
+    logits_at = action_logits.gather(1, our_idx.unsqueeze(-1).expand(-1, -1, A))  # [B,T,A]
 
-    # Ensure at least one legal action per row
-    if "our_action_mask" in batch and batch["our_action_mask"] is not None:
-        mask_at = batch["our_action_mask"].to(dtype=torch.bool)          # [B, T, A]
-        invalid = (~mask_at).all(dim=2)                                  # [B, T]
-        fb_cols = logits_at.argmax(dim=-1)                               # [B, T]
-        fallback = F.one_hot(fb_cols, num_classes=A).to(torch.bool)      # [B, T, A]
-        mask_at = torch.where(invalid.unsqueeze(-1), fallback, mask_at)  # [B, T, A]
-        logits_at = logits_at.masked_fill(~mask_at, -1e9)
+    def _neg_inf_like(x: torch.Tensor) -> torch.Tensor:
+        # returns scalar tensor on same device/dtype with the most negative finite value
+        return torch.tensor(torch.finfo(x.dtype).min, dtype=x.dtype, device=x.device)
+    
+    # Apply legality mask for OUR steps only (if provided)
+    if batch.get("our_action_mask", None) is not None:
+        step_mask = batch["our_action_mask"].gather(  # [B,T,A]
+            1, our_idx.unsqueeze(-1).expand(-1, -1, A)
+        )
+        invalid_rows = (~step_mask).all(dim=-1)  # [B,T]
+        if invalid_rows.any():
+            fb_cols = logits_at[invalid_rows].argmax(dim=-1)
+            step_mask[invalid_rows] = False
+            step_mask[invalid_rows, fb_cols] = True
+        logits_at = logits_at.masked_fill(~step_mask, _neg_inf_like(logits_at))
 
-    logp_all = torch.log_softmax(logits_at, dim=-1)                      # [B, T, A]
-    actions  = batch["actions"]
-    new_logp = logp_all.gather(-1, actions.unsqueeze(-1)).squeeze(-1)    # [B, T]
+    logits_at = torch.nan_to_num(logits_at, nan=0.0, posinf=0.0, neginf=float(torch.finfo(logits_at.dtype).min))
+    values_at = values_full.gather(1, our_idx)  # [B,T]
+    values_at = torch.nan_to_num(values_at, nan=0.0, posinf=0.0, neginf=0.0)
 
-    mask = batch["mask"].to(torch.float32)                                # [B, T]
-    adv  = batch["advantages"].to(torch.float32)                          # [B, T]
-    adv_mean = _masked_mean(adv, mask)
-    adv_std  = _masked_mean((adv - adv_mean) ** 2, mask).sqrt().clamp_min(1e-8)
-    adv_norm = (adv - adv_mean) / adv_std
+    # ---- Build "next" indices & gaps for irregular-step GAE ----
+    # next_idx[b,t] = our_idx[b,t+1], except last where no next
+    next_idx = torch.full_like(our_idx, -1)
+    if T > 1:
+        next_idx[:, :-1] = our_idx[:, 1:]
+    has_next = next_idx.ge(0) & our_mask  # [B,T]
 
-    old_logp = batch["old_logp"].to(torch.float32)                        # [B, T]
-    log_ratio = (new_logp - old_logp).clamp(-60.0, 60.0)
-    ratio     = log_ratio.exp()
+    # gaps = (next - current), clamped >= 1; zero where no next
+    gaps = torch.zeros_like(our_idx, dtype=torch.long)
+    valid_gap = has_next & our_mask
+    gaps[valid_gap] = (next_idx[valid_gap] - our_idx[valid_gap]).clamp_min(1)
+
+
+    gamma_gap = (GAMMA ** gaps.to(torch.float32))   # [B,T]
+    lam_gap   = (GAE_LAMBDA   ** gaps.to(torch.float32))   # [B,T]
+
+    # ---- Irregular-step GAE (vectorized backward over T) ----
+    advantages = torch.zeros_like(values_at)
+    lastgaelam = torch.zeros((B,), device=values_at.device, dtype=torch.float32)
+
+    for t in reversed(range(T)):
+        g  = torch.where(has_next[:, t], gamma_gap[:, t], torch.zeros_like(gamma_gap[:, t]))
+        gl = torch.where(has_next[:, t], gamma_gap[:, t] * lam_gap[:, t], torch.zeros_like(gamma_gap[:, t]))
+        L = values_full.size(1)
+        idx_safe = next_idx[:, t].clamp(0, L - 1)  # <-- clamp_max added
+        nv = torch.where(
+            has_next[:, t],
+            values_full.gather(1, idx_safe.unsqueeze(-1)).squeeze(-1),
+            torch.zeros_like(values_at[:, t]),
+        )
+        delta = rewards[:, t] + g * nv - values_at[:, t]
+        lastgaelam = delta + gl * lastgaelam
+        advantages[:, t] = lastgaelam
+
+        # reset the accumulator where this time-step is invalid (keeps masked mean clean)
+        lastgaelam = torch.where(our_mask[:, t], lastgaelam, lastgaelam * 0.0)
+
+    returns = (advantages + values_at)
+    # Normalize advantages using only valid positions
+    m = our_mask.to(torch.float32)
+    adv_mean = (advantages * m).sum() / m.sum().clamp_min(1.0)
+    adv_var  = ((advantages - adv_mean) ** 2 * m).sum() / m.sum().clamp_min(1.0)
+    adv_std  = adv_var.clamp_min(1e-8).sqrt()
+    advantages = (advantages - adv_mean) / adv_std
+
+    # ---- PPO objective (masked) ----
+    dist = torch.distributions.Categorical(logits=logits_at)
+    new_logp = dist.log_prob(actions).to(torch.float32)  # [B,T]
+    entropy  = dist.entropy().to(torch.float32)          # [B,T]
+
+    def masked_mean(x: torch.Tensor) -> torch.Tensor:
+        w = our_mask.to(x.dtype)
+        return (x * w).sum() / w.sum().clamp_min(1.0)
+
+    log_ratio = (new_logp - old_logp).clamp(min=-60.0, max=60.0)
+    ratio = log_ratio.exp()
 
     if use_trinal_clip:
-        clipped_std = ratio.clamp(1.0 - eps_clip, 1.0 + eps_clip)
-        clipped_neg = ratio.clamp(1.0 - eps_clip, trinal_delta1)
-        r_clip = torch.where(adv_norm < 0, clipped_neg, clipped_std)
-        surr1 = ratio * adv_norm
-        surr2 = r_clip * adv_norm
-        pol_loss_el = -torch.min(surr1, surr2)
-        trinal_clip_neg_frac = _masked_mean(((ratio > (1.0 + eps_clip)) & (adv_norm < 0)).to(ratio.dtype), mask)
+        clipped_std = torch.clamp(ratio, 1.0 - eps_clip, 1.0 + eps_clip)
+        clipped_neg = torch.clamp(ratio, 1.0 - eps_clip, trinal_delta1)
+        r_clipped = torch.where(advantages < 0, clipped_neg, clipped_std)
+        surr1 = ratio * advantages
+        surr2 = r_clipped * advantages
+        policy_loss = -masked_mean(torch.min(surr1, surr2))
+        with torch.no_grad():
+            neg_mask = (advantages < 0) & our_mask
+            trinal_clip_neg_frac = ((ratio > (1.0 + eps_clip)) & neg_mask).float()
+            trinal_clip_neg_frac = trinal_clip_neg_frac.sum() / neg_mask.float().sum().clamp_min(1.0)
     else:
-        surr1 = ratio * adv_norm
-        surr2 = ratio.clamp(1.0 - eps_clip, 1.0 + eps_clip) * adv_norm
-        pol_loss_el = -torch.min(surr1, surr2)
-        trinal_clip_neg_frac = torch.zeros((), device=logits.device, dtype=logits.dtype)
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1.0 - eps_clip, 1.0 + eps_clip) * advantages
+        policy_loss = -masked_mean(torch.min(surr1, surr2))
+        trinal_clip_neg_frac = torch.zeros((), device=logits_at.device)
 
-    policy_loss = _masked_mean(pol_loss_el, mask)
+    ent_mean = masked_mean(entropy)
+    entropy_loss = -ent_mean * ent_coef
+    approx_kl = masked_mean(old_logp - new_logp)
+    clipfrac  = masked_mean(((ratio - 1.0).abs() > eps_clip).float())
 
-    probs = logp_all.exp()
-    entropy_el = -(probs * logp_all).sum(dim=-1)                           # [B, T]
-    ent_mean   = _masked_mean(entropy_el, mask)
-
-    returns = batch["returns"].to(torch.float32)                            # [B, T]
+    # ---- Value loss ----
     if use_stakes_value_clip:
-        pen_used = batch["penalties_used"]                                  # [B, T] long
-        stakes = _stakes_multiplier_public(actions, pen_used).to(returns.dtype)  # [B, T]
-
-        valid_m = (mask > 0.5)
-        nz_m    = valid_m & (returns.abs() > 1e-8)
-        den_nz  = nz_m.sum().clamp_min(1)
-        mean_nz = (returns * nz_m.to(returns.dtype)).sum() / den_nz
-        var_nz  = (((returns - mean_nz) ** 2) * nz_m.to(returns.dtype)).sum() / den_nz
-        std_nz  = var_nz.sqrt().clamp_min(1e-3)
-        frac_nz = (nz_m.sum().to(returns.dtype)) / (valid_m.sum().clamp_min(1).to(returns.dtype))
-        ret_scale = torch.where(frac_nz >= 0.2, std_nz, torch.ones_like(std_nz))
-
-        delta = EPS_V * stakes * ret_scale
-        lower = -delta
-        upper =  delta
-        target = torch.minimum(torch.maximum(returns, lower), upper)
-        v_loss_el = 0.5 * (v_at - target) ** 2
-        value_clip_frac = _masked_mean(((returns < lower) | (returns > upper)).to(returns.dtype), mask)
+        value_loss, vclip_frac = _value_loss_with_stakes_clip_public(
+            v_pred=values_at[our_mask],
+            returns=returns[our_mask],
+            action_ids=actions[our_mask],
+            penalties_used=batch["penalties_used"][our_mask].long(),
+        )
     else:
-        v_loss_el = 0.5 * (v_at - returns) ** 2
-        value_clip_frac = torch.zeros((), device=logits.device, dtype=logits.dtype)
+        value_loss = torch.nn.functional.mse_loss(values_at[our_mask], returns[our_mask])
+        vclip_frac = torch.zeros((), device=logits_at.device)
 
-    value_loss = _masked_mean(v_loss_el, mask)
+    total = policy_loss + 0.5 * value_loss + entropy_loss
 
-    total = policy_loss + 0.5 * value_loss - ent_coef * ent_mean
-
-    approx_kl = _masked_mean((old_logp - new_logp), mask)
-    clipfrac  = _masked_mean(((ratio - 1.0).abs() > eps_clip).to(ratio.dtype), mask)
-
-    metrics = {
+    metrics: Dict[str, torch.Tensor] = {
         "policy_loss": policy_loss.detach(),
-        "value_loss":  value_loss.detach(),
-        "entropy":     ent_mean.detach(),
-        "approx_kl":   approx_kl.detach(),
+        "value_loss": value_loss.detach(),
+        "entropy": ent_mean.detach(),
+        "approx_kl": approx_kl.detach(),
         "clip_fraction": clipfrac.detach(),
         "trinal_clip_neg_frac": trinal_clip_neg_frac.detach(),
-        "value_clip_frac": value_clip_frac.detach(),
+        "value_clip_frac": vclip_frac.detach(),
     }
+
+    # ---- Teacher KL (optional) ----
+    if (bc_kl_weight > 0.0) and (sl_teacher is not None):
+        with torch.no_grad():
+            t_outs = sl_teacher(**mi)
+            t_logits = t_outs[0]  # [B, L, A]
+            t_logits_at = t_logits.gather(1, our_idx.unsqueeze(-1).expand(-1, -1, A))
+            if batch.get("our_action_mask", None) is not None:
+                step_mask = batch["our_action_mask"].gather(1, our_idx.unsqueeze(-1).expand(-1, -1, A))
+                t_logits_at = t_logits_at.masked_fill(~step_mask, _neg_inf_like(t_logits_at))
+            t_logits_at = torch.nan_to_num(t_logits_at, nan=0.0, posinf=0.0, neginf=float(torch.finfo(t_logits_at.dtype).min))
+        dist_sl = torch.distributions.Categorical(logits=t_logits_at)
+        bc_kl = torch.distributions.kl_divergence(dist, dist_sl)  # [B,T]
+        bc_kl = masked_mean(bc_kl)
+        total = total + bc_kl_weight * bc_kl
+        metrics["bc_kl"] = bc_kl.detach()
+    else:
+        metrics["bc_kl"] = torch.zeros((), device=logits_at.device)
+
+    # ---- Aux: belief heads (batched, masked; -100 ignored) ----
+    def _belief_aux(b_logits: Optional[torch.Tensor],
+                    tgt: Optional[torch.Tensor],
+                    msk: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        if b_logits is None or tgt is None or msk is None:
+            z = torch.zeros((), device=values_full.device)
+            return z, z
+        C = b_logits.size(-1)
+        b_sel = b_logits.gather(1, our_idx.unsqueeze(-1).expand(-1, -1, C))  # [B,T,C]
+        ce = torch.nn.functional.cross_entropy(
+            b_sel.flatten(0,1), tgt.view(-1),
+            ignore_index=-100, reduction="none"
+        ).view(B, T)
+        valid = (tgt != -100) & msk & our_mask
+        w = valid.to(ce.dtype)
+        loss = (ce * w).sum() / w.sum().clamp_min(1.0)
+        with torch.no_grad():
+            pred = b_sel.argmax(dim=-1)
+            acc = ( ((pred == tgt) & valid).sum().to(torch.float32) /
+                    valid.sum().clamp_min(1) )
+        return loss, acc
+
+    b0_loss, acc0 = _belief_aux(b0, batch.get("belief_tgt0"), batch.get("belief0_mask"))
+    b1_loss, acc1 = _belief_aux(b1, batch.get("belief_tgt1"), batch.get("belief1_mask"))
+    b2_loss, acc2 = _belief_aux(b2, batch.get("belief_tgt2"), batch.get("belief2_mask"))
+    belief_loss = b0_loss + b1_loss + b2_loss
+    if aux_belief_weight > 0.0:
+        total = total + aux_belief_weight * belief_loss
+    metrics["belief_loss"] = belief_loss.detach()
+    metrics["belief_acc_0"] = acc0.detach()
+    metrics["belief_acc_1"] = acc1.detach()
+    metrics["belief_acc_2"] = acc2.detach()
+
+    # ---- Aux: opponent action supervision (NO masking; -100 ignored) ----
+    opp_loss = torch.zeros((), device=values_full.device)
+    opp_acc  = torch.zeros((), device=values_full.device)
+    if aux_opp_weight > 0.0 and (opp_logits is not None) and ("opp_idx" in batch):
+        if batch["opp_idx"].numel() > 0:
+            To = batch["opp_idx"].size(1)
+            A_opp = opp_logits.size(-1)
+            opp_sel = opp_logits.gather(
+                1, batch["opp_idx"].unsqueeze(-1).expand(-1, -1, A_opp)
+            )  # [B,To,A]
+            ce_opp = torch.nn.functional.cross_entropy(
+                opp_sel.flatten(0,1), batch["opp_targets"].view(-1),
+                ignore_index=-100, reduction="none"
+            ).view(B, To)
+            w = batch["opp_have_label"].to(ce_opp.dtype)
+            if w.sum() > 0:
+                opp_loss = (ce_opp * w).sum() / w.sum().clamp_min(1.0)
+                with torch.no_grad():
+                    pred = opp_sel.argmax(dim=-1)
+                    corr = ((pred == batch["opp_targets"]) & batch["opp_have_label"]).sum().to(torch.float32)
+                    opp_acc = corr / batch["opp_have_label"].sum().clamp_min(1)
+    if aux_opp_weight > 0.0:
+        total = total + aux_opp_weight * opp_loss
+    metrics["opp_loss"] = opp_loss.detach()
+    metrics["opp_action_acc"] = opp_acc.detach()
+
     return total, metrics
 
-# --------- Episode → batched tensors (mirror model_input keys) -------------
-def _compute_adv_ret_for_episode(ep: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
-    seat = ep["training_agent_seat"]
-    our_idx = [i for i, s in enumerate(ep["agent_id"]) if s == seat]
-    K = len(our_idx)
-    if K == 0:
-        return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.float32)
-    rewards = np.array([float(ep["reward"][i]) for i in our_idx], dtype=np.float32)
-    values  = np.array([float(ep["value"][i])  for i in our_idx], dtype=np.float32)
-    next_values = np.zeros_like(values)
-    if K > 1:
-        next_values[:-1] = values[1:]
-    dones = np.zeros((K,), dtype=np.float32); dones[-1] = 1.0
-    adv = np.zeros_like(values, dtype=np.float32)
-    last = 0.0
-    for t in range(K - 1, -1, -1):
-        delta = rewards[t] + GAMMA * next_values[t] * (1.0 - dones[t]) - values[t]
-        last = delta + GAMMA * GAE_LAMBDA * (1.0 - dones[t]) * last
-        adv[t] = last
-    ret = adv + values
-    return adv, ret
-
-def _alloc_like_batch(shape, dtype, device, pin):
-    return torch.empty(*shape, dtype=dtype, device="cpu", pin_memory=pin)
-
 def _collate_batch(
-    eps: List[Dict[str, Any]],
-    B: int,
-    L_tok_max: int,
-    T_max: int,
-    A: int,
-    device: torch.device,
-) -> Dict[str, Any]:
-    """Generic collation that mirrors *all* keys in episode['model_input'] (tensor keys only)."""
-    pin = torch.cuda.is_available()
+    episodes: List[Dict[str, Any]],
+    L_max: Optional[int] = None,
+    pin_memory: bool = False,
+    ignore_index: int = -100,
+) -> Dict[str, torch.Tensor]:
+    """
+    CPU-side collation. Returns tensors on CPU so _to_device_batch(...) moves them.
 
-    mi0: Dict[str, Any] = eps[0]["model_input"]
-    mi_keys = [k for k, v in mi0.items() if torch.is_tensor(v)]
+    Outputs:
+      mi: dict with only time-major tensors (dim>=2) padded to L_max, plus 'valid_lengths' [B]
+      our_idx [B,T], mask [B,T], actions [B,T], old_logp [B,T], rewards [B,T],
+      penalties_used [B,T], our_action_mask [B,L,A] or None,
+      belief_tgt{0,1,2} [B,T], belief{0,1,2}_mask [B,T],
+      opp_idx [B,To], opp_targets [B,To], opp_have_label [B,To]
+    """
+    IGN = int(ignore_index)
 
+    # -------- discover sequence lengths per episode --------
+    lens: List[int] = []
+    for ep in episodes:
+        mi = ep["model_input"]
+        if "action_sequence" in mi and torch.is_tensor(mi["action_sequence"]) and mi["action_sequence"].dim() >= 2:
+            lens.append(int(mi["action_sequence"].size(1)))
+        else:
+            # fallback: first [1, L, ...] tensor
+            L_found = None
+            for v in mi.values():
+                if torch.is_tensor(v) and v.dim() >= 2 and v.size(0) == 1:
+                    L_found = int(v.size(1)); break
+            if L_found is None:
+                raise ValueError("Cannot infer sequence length for an episode: no [1, L, ...] tensors in model_input.")
+            lens.append(L_found)
+
+    B = len(episodes)
+
+    # -------- pad/trim only tensors with a time dimension (dim >= 2) --------
+    def _pad_trim(v: torch.Tensor, L_tgt: int) -> torch.Tensor:
+        # v: [1, L, ...] → pad or trim along dim=1
+        L = v.size(1)
+        if L == L_tgt:
+            return v
+        if L > L_tgt:
+            return v[:, :L_tgt, ...]
+        pad_len = L_tgt - L
+        pad_shape = list(v.shape); pad_shape[1] = pad_len
+        z = torch.zeros(pad_shape, dtype=v.dtype, device=v.device)
+        return torch.cat([v, z], dim=1)
+
+    # Build mi with only dim>=2 tensors padded to L_max
+    # 1-D items (like original 'valid_lengths') are handled separately below.
+    # Also, require that each kept key exists in all episodes and has dim>=2.
+    common_keys = set(episodes[0]["model_input"].keys())
+    for ep in episodes[1:]:
+        common_keys &= set(ep["model_input"].keys())
     mi_batch: Dict[str, torch.Tensor] = {}
-    for k in mi_keys:
-        v = mi0[k]
-        if v.dim() >= 2 and v.size(0) == 1:
-            rest = v.shape[2:]
-            mi_batch[k] = _alloc_like_batch((B, L_tok_max, *rest), v.dtype, device, pin)
-        else:
-            if v.numel() == 1 or (v.dim() == 1 and v.size(0) == 1):
-                mi_batch[k] = _alloc_like_batch((B,), v.dtype, device, pin)
-            else:
-                rest = v.shape[1:]
-                mi_batch[k] = _alloc_like_batch((B, *rest), v.dtype, device, pin)
+    for k in sorted(common_keys):
+        vs = [ep["model_input"][k] for ep in episodes]
+        if not all(torch.is_tensor(v) for v in vs):
+            continue
+        if not all(v.dim() >= 2 for v in vs):
+            continue  # skip 1-D/0-D keys here; we may add a batched replacement below
 
-    our_idx   = torch.empty(B, T_max, dtype=torch.long, device="cpu", pin_memory=pin)
-    our_mask  = torch.zeros(B, T_max, dtype=torch.bool, device="cpu", pin_memory=pin)
-    actions   = torch.zeros(B, T_max, dtype=torch.long, device="cpu", pin_memory=pin)
-    old_logp  = torch.zeros(B, T_max, dtype=torch.float32, device="cpu", pin_memory=pin)
-    returns   = torch.zeros(B, T_max, dtype=torch.float32, device="cpu", pin_memory=pin)
-    adv       = torch.zeros(B, T_max, dtype=torch.float32, device="cpu", pin_memory=pin)
-    pen_used  = torch.zeros(B, T_max, dtype=torch.long, device="cpu", pin_memory=pin)
-    our_act_mask = torch.ones(B, T_max, A, dtype=torch.bool, device="cpu", pin_memory=pin)
+        padded = [_pad_trim(v, L_max) for v in vs]  # each [1, L_max, ...]
+        cat = torch.cat(padded, dim=0).contiguous()  # [B, L_max, ...] on CPU
+        if pin_memory:
+            cat = cat.pin_memory()
+        mi_batch[k] = cat
 
+    # Rebuild valid_lengths as [B] Long (clamped to L_max)
+    valid_lengths = torch.tensor([min(l, L_max) for l in lens], dtype=torch.long)
+    if pin_memory:
+        valid_lengths = valid_lengths.pin_memory()
+    mi_batch["valid_lengths"] = valid_lengths  # [B]
+
+    # Require agent_types for actor/opp selection
+    if "agent_types" not in mi_batch:
+        raise ValueError("model_input must include 'agent_types' with dim>=2 (batched [B, L])")
+    agent_types = mi_batch["agent_types"].long()  # [B, L_max]
+
+    # Optional legality mask for OUR steps (full timeline; gathered per our_idx later)
+    our_action_mask = None
+    if "action_masks" in mi_batch:
+        our_action_mask = mi_batch["action_masks"].bool()  # [B, L_max, A]
+
+    # -------- build OUR/OPP timestep indices --------
+    our_pos_lists: List[torch.Tensor] = []
+    opp_pos_lists: List[torch.Tensor] = []
     for b in range(B):
-        ep = eps[b]
-        mi: Dict[str, torch.Tensor] = ep["model_input"]
-        for k in mi_keys:
-            v = mi[k]
-            if v.dim() >= 2 and v.size(0) == 1:
-                L = int(v.size(1)); L_pad = min(L, L_tok_max)
-                if L_pad > 0:
-                    mi_batch[k][b, :L_pad] = v[0, :L_pad].to("cpu")
-            else:
-                if mi_batch[k][b].numel() == 1:
-                    mi_batch[k][b] = v.reshape(()).to("cpu")
-                else:
-                    mi_batch[k][b] = v.to("cpu").expand_as(mi_batch[k][b])
+        at = agent_types[b, :L_max].detach().cpu().numpy()
+        our_pos_lists.append(torch.from_numpy((at == 0).nonzero()[0]).long())
+        opp_pos_lists.append(torch.from_numpy((at != 0).nonzero()[0]).long())
 
-        if "valid_lengths" in mi_batch:
-            L_guess = None
-            if "action_sequence" in mi:
-                L_guess = int(mi["action_sequence"].size(1))
-            else:
-                for kk in mi_keys:
-                    vv = mi[kk]
-                    if vv.dim() >= 2 and vv.size(0) == 1:
-                        L_guess = int(vv.size(1)); break
-            if L_guess is None: L_guess = 0
-            mi_batch["valid_lengths"][b] = min(L_guess, L_tok_max)
+    T  = max((int(x.numel()) for x in our_pos_lists), default=0)
 
-        if "agent_types" in mi:
-            at = mi["agent_types"][0, :int(mi["agent_types"].size(1))].to("cpu").numpy()
-            our_pos = np.where(at == 0)[0].astype(np.int64)
-        else:
-            L_any = int(next(v.size(1) for v in mi.values() if v.dim() >= 2))
-            our_pos = np.arange(L_any, dtype=np.int64)
+    # -------- allocate supervision tensors (CPU) --------
+    our_idx    = torch.zeros((B, T), dtype=torch.long,    pin_memory=pin_memory)
+    our_mask   = torch.zeros((B, T), dtype=torch.bool,    pin_memory=pin_memory)
+    actions    = torch.zeros((B, T), dtype=torch.long,    pin_memory=pin_memory)
+    old_logp   = torch.zeros((B, T), dtype=torch.float32, pin_memory=pin_memory)
+    rewards    = torch.zeros((B, T), dtype=torch.float32, pin_memory=pin_memory)
+    pen_used   = torch.zeros((B, T), dtype=torch.long,    pin_memory=pin_memory)
 
-        our_ep_idx = [i for i, s in enumerate(ep["agent_id"]) if s == ep["training_agent_seat"]]
-        K = min(len(our_pos), len(our_ep_idx), T_max)
-        if K > 0:
-            our_idx[b, :K] = torch.from_numpy(our_pos[:K])
-            our_mask[b, :K] = True
-            actions_b  = [int(ep["our_action"][i]) for i in our_ep_idx[:K]]
-            old_logp_b = [float(ep["log_prob"][i]) for i in our_ep_idx[:K]]
-            pen_b      = [int(ep["penalties_used"][i]) for i in our_ep_idx[:K]]
-            actions[b, :K]  = torch.tensor(actions_b, dtype=torch.long)
-            old_logp[b, :K] = torch.tensor(old_logp_b, dtype=torch.float32)
-            pen_used[b, :K] = torch.tensor(pen_b, dtype=torch.long)
+    belief_tgt0 = torch.full((B, T), IGN, dtype=torch.long,  pin_memory=pin_memory)
+    belief_tgt1 = torch.full((B, T), IGN, dtype=torch.long,  pin_memory=pin_memory)
+    belief_tgt2 = torch.full((B, T), IGN, dtype=torch.long,  pin_memory=pin_memory)
+    belief0_mask = torch.zeros((B, T), dtype=torch.bool, pin_memory=pin_memory)
+    belief1_mask = torch.zeros((B, T), dtype=torch.bool, pin_memory=pin_memory)
+    belief2_mask = torch.zeros((B, T), dtype=torch.bool, pin_memory=pin_memory)
 
-            if "action_masks" in mi:
-                full_mask = mi["action_masks"][0].to("cpu")   # [L, A]
-                idxs = our_idx[b, :K]
-                mask_sel = full_mask.index_select(0, idxs)
-                if mask_sel.dtype is not torch.bool:
-                    mask_sel = mask_sel != 0
-                our_act_mask[b, :K, :] = mask_sel
+    opp_idx        = torch.zeros((B, T), dtype=torch.long,  pin_memory=pin_memory)
+    opp_targets    = torch.full((B, T), IGN, dtype=torch.long, pin_memory=pin_memory)
+    opp_have_label = torch.zeros((B, T), dtype=torch.bool,  pin_memory=pin_memory)
 
-            adv_b, ret_b = _compute_adv_ret_for_episode(ep)
-            KK = min(K, len(adv_b))
-            if KK > 0:
-                adv[b, :KK]     = torch.from_numpy(adv_b[:KK])
-                returns[b, :KK] = torch.from_numpy(ret_b[:KK])
+    def _map_kind(x):
+        if x is None: return None
+        return BELIEF_LABELS_FROM_KIND.get(x, None)
+
+    # -------- fill from episodes --------
+    for b, ep in enumerate(episodes):
+        # OUR timeline
+        our_pos = our_pos_lists[b]
+        if T > 0 and our_pos.numel() > 0:
+            K = min(T, int(our_pos.numel()))
+            if K > 0:
+                our_idx[b, :K] = our_pos[:K]
+                our_mask[b, :K] = True
+
+            our_ep_idx = [i for i, seat in enumerate(ep["agent_id"]) if seat == ep["training_agent_seat"]]
+            for t_local in range(K):
+                if t_local >= len(our_ep_idx): break
+                step_ep = our_ep_idx[t_local]
+
+                a  = ep["our_action"][step_ep] if step_ep < len(ep["our_action"]) else None
+                lp = ep["log_prob"][step_ep]   if step_ep < len(ep["log_prob"])   else None
+                rw = ep["reward"][step_ep]     if step_ep < len(ep["reward"])     else 0.0
+                pu = ep["penalties_used"][step_ep] if step_ep < len(ep["penalties_used"]) else 0
+
+                if a is not None:  actions[b, t_local] = int(a)
+                if lp is not None: old_logp[b, t_local] = float(lp)
+                rewards[b, t_local]  = float(rw)
+                pen_used[b, t_local] = int(pu)
+
+                lb0 = _map_kind(ep.get("belief_tgt0", [None]*len(ep["agent_id"]))[step_ep])
+                lb1 = _map_kind(ep.get("belief_tgt1", [None]*len(ep["agent_id"]))[step_ep])
+                lb2 = _map_kind(ep.get("belief_tgt2", [None]*len(ep["agent_id"]))[step_ep])
+                if lb0 is not None: belief_tgt0[b, t_local] = int(lb0); belief0_mask[b, t_local] = True
+                if lb1 is not None: belief_tgt1[b, t_local] = int(lb1); belief1_mask[b, t_local] = True
+                if lb2 is not None: belief_tgt2[b, t_local] = int(lb2); belief2_mask[b, t_local] = True
+
+        # OPP timeline (no action mask; labels optional)
+        opp_pos = opp_pos_lists[b]
+        if T > 0 and opp_pos.numel() > 0:
+            M = min(T, int(opp_pos.numel()))
+            if M > 0:
+                opp_idx[b, :M] = opp_pos[:M]
+                opp_ep_idx = [i for i, seat in enumerate(ep["agent_id"]) if seat != ep["training_agent_seat"]]
+                for t_local in range(M):
+                    if t_local >= len(opp_ep_idx): break
+                    step_ep = opp_ep_idx[t_local]
+                    tgt = ep.get("opp_target_action", [None]*len(ep["agent_id"]))[step_ep]
+                    if tgt is not None:
+                        opp_targets[b, t_local] = int(tgt)
+                        opp_have_label[b, t_local] = True
 
     return {
         "mi": mi_batch,
@@ -349,10 +571,14 @@ def _collate_batch(
         "mask": our_mask,
         "actions": actions,
         "old_logp": old_logp,
-        "returns": returns,
-        "advantages": adv,
+        "rewards": rewards,
         "penalties_used": pen_used,
-        "our_action_mask": our_act_mask,
+        "our_action_mask": our_action_mask,
+
+        "belief_tgt0": belief_tgt0, "belief_tgt1": belief_tgt1, "belief_tgt2": belief_tgt2,
+        "belief0_mask": belief0_mask, "belief1_mask": belief1_mask, "belief2_mask": belief2_mask,
+
+        "opp_idx": opp_idx, "opp_targets": opp_targets, "opp_have_label": opp_have_label,
     }
 
 def _to_device_batch(batch_cpu: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
@@ -364,10 +590,18 @@ def _to_device_batch(batch_cpu: Dict[str, Any], device: torch.device) -> Dict[st
         "mask":           batch_cpu["mask"].to(device, non_blocking=True),
         "actions":        batch_cpu["actions"].to(device, non_blocking=True),
         "old_logp":       batch_cpu["old_logp"].to(device, non_blocking=True),
-        "returns":        batch_cpu["returns"].to(device, non_blocking=True),
-        "advantages":     batch_cpu["advantages"].to(device, non_blocking=True),
+        "rewards":        batch_cpu["rewards"].to(device, non_blocking=True),
         "penalties_used": batch_cpu["penalties_used"].to(device, non_blocking=True),
         "our_action_mask":batch_cpu["our_action_mask"].to(device, non_blocking=True),
+        "belief_tgt0":    batch_cpu["belief_tgt0"].to(device, non_blocking=True),
+        "belief_tgt1":    batch_cpu["belief_tgt1"].to(device, non_blocking=True),
+        "belief_tgt2":    batch_cpu["belief_tgt2"].to(device, non_blocking=True),
+        "belief0_mask":   batch_cpu["belief0_mask"].to(device, non_blocking=True),
+        "belief1_mask":   batch_cpu["belief1_mask"].to(device, non_blocking=True),
+        "belief2_mask":   batch_cpu["belief2_mask"].to(device, non_blocking=True),
+        "opp_idx":        batch_cpu["opp_idx"].to(device, non_blocking=True),
+        "opp_targets":    batch_cpu["opp_targets"].to(device, non_blocking=True),
+        "opp_have_label": batch_cpu["opp_have_label"].to(device, non_blocking=True),
     }
     return out
 
@@ -417,7 +651,8 @@ def train(
         logging.info("torch.compile enabled (reduce-overhead).")
     except Exception as e:
         logging.warning(f"torch.compile failed, running eager. Reason: {e}")
-
+    sl_teacher = learner.model
+    sl_teacher.eval()
     # Optimizer: standard AMP path; no fused/capturable (no graphs)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -444,9 +679,6 @@ def train(
 
     # Fixed shapes for batching
     B_train   = int(getattr(config, "TRAIN_EPISODES_PER_EPOCH", episodes_per_update))
-    L_tok_max = int(getattr(config, "L_TOK_MAX", 160))
-    T_max     = int(getattr(config, "T_MAX", 50))
-    A         = int(getattr(config, "OUTPUT_DIM", 7))
 
     # ------------------------------ Main loop ------------------------------
     for update in range(1, num_updates + 1):
@@ -473,7 +705,6 @@ def train(
 
         # -------- Optimize (standard AMP step) --------
         model.train()
-        t_opt_start = time.time()
         agg = {"total_loss": 0.0}
         n_batches = 0
 
@@ -484,10 +715,9 @@ def train(
                 reps = (B_train + len(ep_buffer) - 1) // len(ep_buffer)
                 batch_eps = (ep_buffer * reps)[:B_train]
 
-            batch_cpu = _collate_batch(batch_eps, B_train, L_tok_max, T_max, A, device)
+            batch_cpu = _collate_batch(batch_eps, L_max=200)
             batch_gpu = _to_device_batch(batch_cpu, device)
 
-            optimizer.zero_grad(set_to_none=True)
             with amp.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == "cuda")):
                 total_loss, metrics = ppo_losses_batched(
                     model,
@@ -497,7 +727,12 @@ def train(
                     use_trinal_clip=USE_TRINAL_CLIP,
                     trinal_delta1=TRINAL_DELTA1,
                     use_stakes_value_clip=USE_STAKES_VALUE_CLIP,
+                    aux_belief_weight=float(getattr(config, "AUX_BELIEF_WEIGHT", 0.5)),
+                    aux_opp_weight=float(getattr(config, "AUX_OPP_WEIGHT", 0.5)),
+                    bc_kl_weight=float(getattr(config, "BC_KL_WEIGHT", 0.0)),
+                    sl_teacher=sl_teacher,
                 )
+
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
             clip_grad_norm_(model.parameters(), max_norm=float(getattr(config, "MAX_NORM", 0.5)))
@@ -540,17 +775,22 @@ def train(
         writer.add_scalar("Loss/Total", avg["total_loss"], update)
         writer.add_scalar("Loss/Policy", avg.get("policy_loss", 0.0), update)
         writer.add_scalar("Loss/Value", avg.get("value_loss", 0.0), update)
+        writer.add_scalar("Loss/Belief", avg.get("belief_loss", 0.0), update)
+        writer.add_scalar("Loss/Opponent", avg.get("opp_loss", 0.0), update)
         writer.add_scalar("Policy/Entropy", avg.get("entropy", 0.0), update)
         writer.add_scalar("Policy/ApproxKL", avg.get("approx_kl", 0.0), update)
         writer.add_scalar("Policy/ClipFraction", avg.get("clip_fraction", 0.0), update)
         writer.add_scalar("Policy/TrinalClipNegFrac", avg.get("trinal_clip_neg_frac", 0.0), update)
         writer.add_scalar("Value/ClipFrac", avg.get("value_clip_frac", 0.0), update)
         if getattr(config, "USE_STAKES_VALUE_CLIP", False):
-            writer.add_scalar("Diag/ReturnStdEMA", getattr(config, "_ret_std_ema", 0.0), update)
+            writer.add_scalar("Diag/ReturnStdEMA", config.RET_STD_EMA, update)
 
         writer.add_scalar("Rollout/WinRate", win_rate, update)
         writer.add_scalar("Buffer/Size", len(ep_buffer), update)
-
+        writer.add_scalar("Acc/OpponentAction", avg.get("opp_action_acc", 0.0), update)
+        writer.add_scalar("Acc/Belief0", avg.get("belief_acc_0", 0.0), update)
+        writer.add_scalar("Acc/Belief1", avg.get("belief_acc_1", 0.0), update)
+        writer.add_scalar("Acc/Belief2", avg.get("belief_acc_2", 0.0), update)
         # Checkpoint
         if checkpoint_dir and (update % int(getattr(config, "CHECKPOINT_INTERVAL", 200)) == 0):
             os.makedirs(checkpoint_dir, exist_ok=True)

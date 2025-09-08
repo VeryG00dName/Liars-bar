@@ -117,13 +117,13 @@ VALUE_COEF = 0.5
 AUX_LOSS_WEIGHT = 1
 
 # Split aux weights (current PPO usage)
-AUX_BELIEF_WEIGHT = 0.5   # belief heads weight (was 0.5 in your PPO runs)
-AUX_OPP_WEIGHT    = 1.0   # opponent action weight (1.0 to match SL)
+AUX_BELIEF_WEIGHT = 0.3   # belief heads weight (was 0.5 in your PPO runs)
+AUX_OPP_WEIGHT    = 0.5   # opponent action weight (1.0 to match SL)
 
 # ============================
 # Teacher KL / Behavior Cloning Leash
 # ============================
-BC_KL_WEIGHT = 0.0002  # typical exploration range: 1e-4 .. 1e-2 (decay in code if desired)
+BC_KL_WEIGHT = 0.002  # typical exploration range: 1e-4 .. 1e-2 (decay in code if desired)
 
 # ============================
 # Trinal-Clip PPO (Policy) — Optional
@@ -131,7 +131,7 @@ BC_KL_WEIGHT = 0.0002  # typical exploration range: 1e-4 .. 1e-2 (decay in code 
 # When True, use extra upper cap δ1 for A<0; must satisfy TRINAL_DELTA1 > 1 + EPS_CLIP
 USE_TRINAL_CLIP = True
 TRINAL_DELTA1 = 1.8
-
+RET_STD_EMA = 1.0  # initial value for return std EMA (for stakes value clip)
 # ============================
 # Off-Policy Data Buffering — Optional
 # ============================
