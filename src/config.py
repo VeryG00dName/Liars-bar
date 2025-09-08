@@ -129,8 +129,7 @@ BC_KL_WEIGHT = 0.002  # typical exploration range: 1e-4 .. 1e-2 (decay in code i
 # ============================
 # Trinal-Clip PPO (Policy) — Optional
 # ============================
-# When True, use extra upper cap δ1 for A<0; must satisfy TRINAL_DELTA1 > 1 + EPS_CLIP
-USE_TRINAL_CLIP = True
+# Use extra upper cap δ1 for A<0; must satisfy TRINAL_DELTA1 > 1 + EPS_CLIP
 TRINAL_DELTA1 = 1.8
 RET_STD_EMA = 1.0  # initial value for return std EMA (for stakes value clip)
 # ============================
@@ -141,8 +140,7 @@ OFFPOLICY_EP_BUFFER_MULT = 4
 # ============================
 # Stakes-Based Value Target Clip (Public-Info) — Optional
 # ============================
-# Enable clipping of target returns by ± (EPS_V * Stakes * ReturnScale)
-USE_STAKES_VALUE_CLIP = True
+# Clipping of target returns by ± (EPS_V * Stakes * ReturnScale)
 EPS_V = 0.9                 # base epsilon for value clip (try 0.3–5.0 log-scale)
 RET_STD_EMA_DECAY = 0.99    # EMA smoothing for return std used as ReturnScale
 

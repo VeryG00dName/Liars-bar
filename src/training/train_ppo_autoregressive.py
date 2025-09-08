@@ -67,9 +67,7 @@ BELIEF_LABELS_FROM_KIND: Dict[int, int] = {
 }
 
 # -------- Trinal-Clip & public-stakes value clip (config knobs) ------------
-USE_TRINAL_CLIP        = bool(getattr(config, "USE_TRINAL_CLIP", True))
 TRINAL_DELTA1          = float(getattr(config, "TRINAL_DELTA1", 2.5))
-USE_STAKES_VALUE_CLIP  = bool(getattr(config, "USE_STAKES_VALUE_CLIP", True))
 EPS_V                  = float(getattr(config, "EPS_V", 1.0))
 RET_STD_EMA_DECAY      = float(getattr(config, "RET_STD_EMA_DECAY", 0.99))
 STAKES_CHALLENGE_BASE  = float(getattr(config, "STAKES_CHALLENGE_BASE", 4.0))
@@ -154,10 +152,7 @@ def ppo_losses_batched(
     batch: Dict[str, torch.Tensor],
     eps_clip: float,
     ent_coef: float,
-    *,
-    use_trinal_clip: bool = False,
     trinal_delta1: float = 2.5,
-    use_stakes_value_clip: bool = False,
     value_weight: float = 1.0,
     aux_belief_weight: float = 0.5,
     aux_opp_weight: float = 0.5,
@@ -277,22 +272,16 @@ def ppo_losses_batched(
     log_ratio = (new_logp - old_logp).clamp(min=-60.0, max=60.0)
     ratio = log_ratio.exp()
 
-    if use_trinal_clip:
-        clipped_std = torch.clamp(ratio, 1.0 - eps_clip, 1.0 + eps_clip)
-        clipped_neg = torch.clamp(ratio, 1.0 - eps_clip, trinal_delta1)
-        r_clipped = torch.where(advantages < 0, clipped_neg, clipped_std)
-        surr1 = ratio * advantages
-        surr2 = r_clipped * advantages
-        policy_loss = -masked_mean(torch.min(surr1, surr2))
-        with torch.no_grad():
-            neg_mask = (advantages < 0) & our_mask
-            trinal_clip_neg_frac = ((ratio > (1.0 + eps_clip)) & neg_mask).float()
-            trinal_clip_neg_frac = trinal_clip_neg_frac.sum() / neg_mask.float().sum().clamp_min(1.0)
-    else:
-        surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1.0 - eps_clip, 1.0 + eps_clip) * advantages
-        policy_loss = -masked_mean(torch.min(surr1, surr2))
-        trinal_clip_neg_frac = torch.zeros((), device=logits_at.device)
+    clipped_std = torch.clamp(ratio, 1.0 - eps_clip, 1.0 + eps_clip)
+    clipped_neg = torch.clamp(ratio, 1.0 - eps_clip, trinal_delta1)
+    r_clipped = torch.where(advantages < 0, clipped_neg, clipped_std)
+    surr1 = ratio * advantages
+    surr2 = r_clipped * advantages
+    policy_loss = -masked_mean(torch.min(surr1, surr2))
+    with torch.no_grad():
+        neg_mask = (advantages < 0) & our_mask
+        trinal_clip_neg_frac = ((ratio > (1.0 + eps_clip)) & neg_mask).float()
+        trinal_clip_neg_frac = trinal_clip_neg_frac.sum() / neg_mask.float().sum().clamp_min(1.0)
 
     ent_mean = masked_mean(entropy)
     entropy_loss = -ent_mean * ent_coef
@@ -300,17 +289,13 @@ def ppo_losses_batched(
     clipfrac  = masked_mean(((ratio - 1.0).abs() > eps_clip).float())
 
     # ---- Value loss ----
-    if use_stakes_value_clip:
-        value_loss, vclip_frac = _value_loss_with_stakes_clip_public(
-            v_pred=values_at[our_mask],
-            returns=returns[our_mask],
-            action_ids=actions[our_mask],
-            penalties_used=batch["penalties_used"][our_mask].long(),
-        )
-    else:
-        value_loss = torch.nn.functional.mse_loss(values_at[our_mask], returns[our_mask])
-        vclip_frac = torch.zeros((), device=logits_at.device)
-
+    value_loss, vclip_frac = _value_loss_with_stakes_clip_public(
+        v_pred=values_at[our_mask],
+        returns=returns[our_mask],
+        action_ids=actions[our_mask],
+        penalties_used=batch["penalties_used"][our_mask].long(),
+    )
+    
     total = policy_loss + value_weight * value_loss + entropy_loss
 
     metrics: Dict[str, torch.Tensor] = {
@@ -682,6 +667,7 @@ def train(
         logging.info("torch.compile enabled (reduce-overhead).")
     except Exception as e:
         logging.warning(f"torch.compile failed, running eager. Reason: {e}")
+    learner.model = model
     # Optimizer: standard AMP path; no fused/capturable (no graphs)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -747,28 +733,30 @@ def train(
             batch_cpu = _collate_batch(batch_eps, L_max=200)
             batch_gpu = _to_device_batch(batch_cpu, device)
 
+            optimizer.zero_grad()
+            
             with amp.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == "cuda")):
                 total_loss, metrics = ppo_losses_batched(
                     model,
                     batch_gpu,
                     eps_clip=float(getattr(config, "EPS_CLIP", 0.2)),
                     ent_coef=float(getattr(config, "INIT_ENTROPY_COEF", 0.005)),
-                    use_trinal_clip=USE_TRINAL_CLIP,
                     trinal_delta1=TRINAL_DELTA1,
-                    use_stakes_value_clip=USE_STAKES_VALUE_CLIP,
                     value_weight=float(getattr(config, "VALUE_WEIGHT", 0.5)),
                     aux_belief_weight=float(getattr(config, "AUX_BELIEF_WEIGHT", 0.5)),
                     aux_opp_weight=float(getattr(config, "AUX_OPP_WEIGHT", 0.5)),
                     bc_kl_weight=float(getattr(config, "BC_KL_WEIGHT", 0.0)),
                     sl_teacher=sl_teacher,
                 )
-
+            flat_before = torch.cat([p.detach().float().flatten() for p in model.parameters() if p.requires_grad])[:10000].clone()
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
             clip_grad_norm_(model.parameters(), max_norm=float(getattr(config, "MAX_NORM", 0.5)))
             scaler.step(optimizer)
             scaler.update()
-
+            with torch.no_grad():
+                flat_after = torch.cat([p.detach().float().flatten() for p in model.parameters() if p.requires_grad])[:10000]
+                print("[STEP] L2 param delta (head):", torch.norm(flat_after - flat_before).item())
             # Accumulate metrics
             agg["total_loss"] += float(total_loss.detach().cpu())
             for k, v in metrics.items():
@@ -810,8 +798,7 @@ def train(
         writer.add_scalar("Policy/ClipFraction", avg.get("clip_fraction", 0.0), update)
         writer.add_scalar("Policy/TrinalClipNegFrac", avg.get("trinal_clip_neg_frac", 0.0), update)
         writer.add_scalar("Value/ClipFrac", avg.get("value_clip_frac", 0.0), update)
-        if getattr(config, "USE_STAKES_VALUE_CLIP", False):
-            writer.add_scalar("Diag/ReturnStdEMA", config.RET_STD_EMA, update)
+        writer.add_scalar("Diag/ReturnStdEMA", config.RET_STD_EMA, update)
 
         writer.add_scalar("Rollout/WinRate", win_rate, update)
         writer.add_scalar("Buffer/Size", len(ep_buffer), update)
