@@ -77,6 +77,8 @@ STAKES_PEN_NORM        = float(getattr(config, "STAKES_PEN_NORM", 3.0))
 STAKES_PEN_EXP         = float(getattr(config, "STAKES_PEN_EXP", 1.0))
 STAKES_CLIP_MIN        = float(getattr(config, "STAKES_CLIP_MIN", 0.5))
 STAKES_CLIP_MAX        = float(getattr(config, "STAKES_CLIP_MAX", 4.0))
+GAMMA = float(getattr(config, "GAMMA", 0.99))
+GAE_LAMBDA   = float(getattr(config, "GAE_LAMBDA", 0.95))
 if not hasattr(config, "_ret_std_ema"):
     config._ret_std_ema = 1.0
 
@@ -233,13 +235,11 @@ def _compute_adv_ret_for_episode(ep: Dict[str, Any]) -> Tuple[np.ndarray, np.nda
     if K > 1:
         next_values[:-1] = values[1:]
     dones = np.zeros((K,), dtype=np.float32); dones[-1] = 1.0
-    gamma = float(getattr(config, "GAMMA", 0.99))
-    lam   = float(getattr(config, "GAE_LAMBDA", 0.95))
     adv = np.zeros_like(values, dtype=np.float32)
     last = 0.0
     for t in range(K - 1, -1, -1):
-        delta = rewards[t] + gamma * next_values[t] * (1.0 - dones[t]) - values[t]
-        last = delta + gamma * lam * (1.0 - dones[t]) * last
+        delta = rewards[t] + GAMMA * next_values[t] * (1.0 - dones[t]) - values[t]
+        last = delta + GAMMA * GAE_LAMBDA * (1.0 - dones[t]) * last
         adv[t] = last
     ret = adv + values
     return adv, ret
