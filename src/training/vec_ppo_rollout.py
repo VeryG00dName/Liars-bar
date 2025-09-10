@@ -223,7 +223,6 @@ class PPOVecRolloutManager:
             "belief_pred0": [], "belief_pred1": [], "belief_pred2": [],
             "belief_tgt0": [], "belief_tgt1": [], "belief_tgt2": [],
 
-            # NEW: public penalties snapshot at our steps (decision-time)
             "penalties_used": [],
 
             "model_input": None,
