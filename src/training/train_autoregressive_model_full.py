@@ -771,7 +771,7 @@ def train_autoregressive_model(
         hidden_dim=hidden_dim,
         belief_dim=64,
         num_heads=4,
-        num_layers=3,
+        num_layers=2,
         dropout_rate=0.1,
         max_seq_length=max_seq_length,
         num_agent_types=4, # 0: Agent, 1: Opponent 0, 2: Opponent 1
