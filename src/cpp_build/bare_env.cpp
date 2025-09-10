@@ -45,8 +45,14 @@ inline bool Env::advance_to_next_active() {
 }
 
 inline void Env::penalize(int p) {
-    if (p < 0) return;
-    if (++penalties[p] >= penalty_limits[p]) terminations[p] = 1;
+    if (p < 0) {
+        std::fprintf(stderr,
+            "[BUG] penalize called with p=%d (pending_claimant may be unset)\n", p);
+        return;
+    }
+    if (++penalties[p] >= penalty_limits[p]) {
+        terminations[p] = 1;
+    }
 }
 
 // ---------------- Round lifecycle ----------------
@@ -71,7 +77,7 @@ void Env::start_round() {
     int start_from = (starter_hint >= 0 ? starter_hint : 0);
     cur = start_from;
     for (int t = 0; t < n_players; ++t) {
-        if (!terminations[cur] && !round_eliminated[cur]) break;
+        if (!terminations[cur]) break;
         cur = (cur + 1) % n_players;
     }
     starter_hint = -1;
@@ -158,15 +164,11 @@ int Env::observe_vector_newerest(int agent_index, float* out) const {
 
 // ---------------- Round / Game checks ----------------
 bool Env::round_and_game_checks() {
-    int active = 0;
+    // Game over iff ≤1 non-terminated players remain.
+    int alive = 0;
     for (int p = 0; p < n_players; ++p)
-        if (!terminations[p] && !round_eliminated[p]) ++active;
-    if (active <= 1) {
-        int alive = 0; for (int p = 0; p < n_players; ++p) if (!terminations[p]) ++alive;
-        if (alive <= 1) return true;
-        start_round();
-    }
-    return false;
+        if (!terminations[p]) ++alive;
+    return (alive <= 1);
 }
 
 // ---------------- Step ----------------
@@ -206,7 +208,7 @@ bool Env::step(uint8_t a) {
             else { round_eliminated[player] = 1; }
         }
         if (!advance_to_next_active()) start_round();
-        game_is_over = round_and_game_checks();
+        game_is_over = false;
     }
     else { // a == 6: Challenge
         if (!pending_exists) { // Invalid challenge
@@ -218,20 +220,18 @@ bool Env::step(uint8_t a) {
             starter_hint = player;
             if (pending_bluff) {
                 penalize(pending_claimant);
-                round_eliminated[pending_claimant] = 1;
             }
             else {
                 penalize(player);
-                round_eliminated[player] = 1;
             }
-            pending_exists = 0; last_action_count = 0;
-            if (force_challenge_mode) {
 
-                force_claimant = -1;
-                force_challenge_mode = 0;
+            if (round_and_game_checks()) {
+                game_is_over = true;
             }
-            start_round(); // A resolved challenge ends the round
-            game_is_over = round_and_game_checks();
+            else {
+                start_round();
+                game_is_over = false;
+            }
         }
     }
 
