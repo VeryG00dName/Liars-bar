@@ -182,3 +182,4 @@ opponent_training_data.pkl
 *.json
 .qodo
 /old logs
+*.db
