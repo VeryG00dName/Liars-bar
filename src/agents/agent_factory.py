@@ -9,7 +9,6 @@ from src.agents.belief_agent import BeliefAgent
 from src.agents.moe_agent import MoEAgent
 from src.agents.stacked_obs_agent import StackedObsAgent
 from src.agents.standard_agent import StandardAgent
-from src.agents.hardcoded_agent_wrapper import HardcodedAgentWrapper
 from src.agents.autoregressive_agent import AutoregressiveAgent
 from src.agents.autoregressive_agent_full import AutoregressiveAgentFull
 from src.agents.autoregressive_ppo_agent import PPOAutoregressiveAgent
