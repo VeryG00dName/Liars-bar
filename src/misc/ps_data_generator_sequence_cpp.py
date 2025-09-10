@@ -75,7 +75,6 @@ def generate_data(
     verbose=False,
     seed=42,
     num_players=DEFAULT_NUM_PLAYERS,
-    ### NEW ###
     ps_config=None
 ):
     """
@@ -96,7 +95,6 @@ def generate_data(
         "ps_config": ps_config, "episodes": 0, "steps": 0, "wins": 0, "losses": 0, "win_rate": 0.0,
         "total_saved_sequences": 0, "opponent_combinations": defaultdict(int),
         "action_distribution": defaultdict(int), "avg_sequence_length": 0.0,
-        ### NEW ###
         "min_sequence_length": float('inf'), "max_sequence_length": 0,
         "avg_search_time": 0.0, "simulation_count": 0,
         "failed_searches": 0, "start_time": time.time()
@@ -123,7 +121,6 @@ def generate_data(
                 current_opponents[name] = {"instance": bot, "name": tag, "type": "hardcoded"}
 
         ps = cpp.PerfectSearch(0, bot_objs)
-        ### NEW ###
         # Apply the PS configuration from the arguments
         if ps_config:
             ps.set_sim_order(ps_config['sim_order'])
@@ -133,7 +130,6 @@ def generate_data(
         seq = []
         step_no = 0
         game_over = False
-        ### NEW ###
         # Add a hard cap to prevent infinite loops from buggy logic
         MAX_GAME_STEPS = 500
         while not game_over and step_no < MAX_GAME_STEPS:
@@ -142,8 +138,6 @@ def generate_data(
             mask = env.valid_actions()
             obs_legacy = env.observe_vector()
             
-            # Assuming C++ env has observe_newerest() method for player 0
-            # If not, this needs to be added to the pybind wrapper
             obs_train = env.observe_newerest(0) if hasattr(env, 'observe_newerest') else obs_legacy
 
             step = {
@@ -187,7 +181,6 @@ def generate_data(
             seq.append(step)
             stats["steps"] += 1
         
-        ### NEW ###
         if step_no >= MAX_GAME_STEPS:
             logger.warning(f"Game {episode} exceeded MAX_GAME_STEPS ({MAX_GAME_STEPS}). Game truncated.")
 
@@ -203,7 +196,6 @@ def generate_data(
         stats["win_rate"] = stats["wins"] / max(1, stats["episodes"])
         
         seq_len = len(seq)
-        ### NEW ###
         stats["min_sequence_length"] = min(stats["min_sequence_length"], seq_len)
         stats["max_sequence_length"] = max(stats["max_sequence_length"], seq_len)
         stats["avg_sequence_length"] = ((stats["avg_sequence_length"] * (stats["episodes"] - 1)) + seq_len) / stats["episodes"]
@@ -241,7 +233,6 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--players", type=int, default=DEFAULT_NUM_PLAYERS)
     
-    ### NEW ###
     # Arguments for controlling PS configuration
     ap.add_argument("--ps-version", type=str, default="v4", choices=["v3", "v4", "v5", "v5_last", "custom"],
                         help="Use a preset configuration for the Perfect Search expert.")
@@ -254,7 +245,6 @@ def main():
 
     args = ap.parse_args()
 
-    ### NEW ###
     # --- Configure the Perfect Search based on arguments ---
     ps_presets = {
         "v3":      {'sim_order': [0, 1, 2, 3, 4, 5, 6], 'swap_heuristic': False, 'v5_penalty': False},
