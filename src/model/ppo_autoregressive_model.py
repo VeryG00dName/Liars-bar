@@ -137,7 +137,7 @@ class PPOAutoregressiveModel(nn.Module):
           - factorized action embeddings (act_kind + count + table_flag)
           - agent embedding
           - position embedding
-          - obs encoder output (only on our turns: agent_types==0)
+          - obs encoder output
         """
         batch_size, seq_len = action_sequence.shape
         device = action_sequence.device
@@ -250,7 +250,7 @@ class PPOAutoregressiveModel(nn.Module):
             gate = has_any_legal.unsqueeze(-1)                       # [B,T,1]
             invalid = (~action_masks) & our_turns.unsqueeze(-1)      # [B,T,7]
 
-            LARGE_NEG = -1e4
+            LARGE_NEG = torch.finfo(action_logits.dtype).min / 4
             action_logits = torch.where(
                 gate,
                 action_logits.masked_fill(invalid, LARGE_NEG),
