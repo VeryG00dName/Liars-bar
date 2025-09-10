@@ -770,7 +770,7 @@ def train_autoregressive_model(
         action_dim=action_dim,
         hidden_dim=hidden_dim,
         belief_dim=64,
-        num_heads=8,
+        num_heads=4,
         num_layers=3,
         dropout_rate=0.1,
         max_seq_length=max_seq_length,
