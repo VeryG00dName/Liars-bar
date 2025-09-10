@@ -136,59 +136,57 @@ class ModelFactory:
     @staticmethod
     def is_ppo_autoregressive_model(state_dict: dict) -> bool:
         """
-        Detects the PPOAutoregressiveModel.
-        Heuristic: Checks for the presence of specific factorized action embeddings,
-        belief heads, and the causal mask buffer, which are characteristic of this architecture.
+        Detects the PPOAutoregressiveModel, supporting both legacy and shared-head versions.
+        Heuristic: Checks for factorized action embeddings, the causal mask, and specific
+        PPO heads. It then checks for EITHER the legacy belief heads OR the new shared head.
         """
         has_factor_embeddings = all(k in state_dict for k in [
             'act_kind_embedding.weight', 'count_embedding.weight', 'table_flag_embedding.weight'
         ])
-        has_belief_heads = all(k in state_dict for k in [
-            'belief_head_op0.weight', 'belief_head_op1.weight', 'belief_head_op2.weight'
-        ])
         has_causal_mask = 'causal_bool_mask_full' in state_dict
         has_specific_heads = 'action_head.weight' in state_dict and 'opp_action_head.weight' in state_dict
 
-        return has_factor_embeddings and has_belief_heads and has_causal_mask and has_specific_heads
+        # Check for either of the two belief head architectures
+        has_legacy_belief_heads = all(k in state_dict for k in [
+            'belief_head_op0.weight', 'belief_head_op1.weight', 'belief_head_op2.weight'
+        ])
+        has_shared_belief_head = 'belief_head_shared.weight' in state_dict
+
+        # A valid model must have the base components and AT LEAST ONE of the belief architectures
+        return (has_factor_embeddings and has_causal_mask and has_specific_heads and
+                (has_legacy_belief_heads or has_shared_belief_head))
 
     @staticmethod
     def get_belief_dimensions(state_dict):
-        """ Extracts dimensions from a BeliefSpacePolicy state dictionary. """
+        """
+        Extracts dimensions from a PPOAutoregressiveModel state dictionary.
+        This function is now largely superseded by direct inference in the agent's
+        load_models_from_checkpoint method, but is kept for compatibility or other uses.
+        It has been simplified to reflect the more direct inference.
+        """
         logger = logging.getLogger(__name__)
-        total_input_dim = None
-        if 'network.0.weight' in state_dict: total_input_dim = state_dict['network.0.weight'].shape[1]
-        if total_input_dim is None:
-            for key, tensor in state_dict.items():
-                if hasattr(tensor, "ndim") and tensor.ndim == 2 and 'network' in key and 'weight' in key:
-                    total_input_dim = tensor.shape[1]; break
-        if total_input_dim is None: return (None, 7, 10) # Default obs=7, belief_per_opp=10
+        try:
+            # For PPOAutoregressiveModel, obs_dim is inferred from the obs_encoder
+            obs_dim = state_dict['obs_encoder.0.weight'].shape[1]
+            logger.debug(f"Inferred obs_dim={obs_dim} from obs_encoder.")
 
-        # --- MODIFIED HEURISTIC ---
-        # Prioritize known observation sizes if total input dim matches known combinations
-        known_belief_dim_per_opp = 10 # Common value
-        known_total_belief_dim = known_belief_dim_per_opp * 2 # Assume 2 opponents
+            # Infer belief_dim from whichever belief head exists
+            if 'belief_head_shared.weight' in state_dict:
+                belief_dim = state_dict['belief_head_shared.weight'].shape[0]
+                logger.debug(f"Inferred belief_dim={belief_dim} from shared belief head.")
+            elif 'belief_head_op0.weight' in state_dict:
+                belief_dim = state_dict['belief_head_op0.weight'].shape[0]
+                logger.debug(f"Inferred belief_dim={belief_dim} from legacy belief head op0.")
+            else:
+                raise ValueError("Could not find a valid belief head in the state_dict.")
 
-        if total_input_dim == 7 + known_total_belief_dim: # Check for obs=7 + belief=20
-             suggested_obs_dim = 7
-             suggested_belief_per_opp = known_belief_dim_per_opp
-             logger.debug(f"Belief Dim Heuristic: Matched total_input={total_input_dim} to obs=7 + belief=20")
-        elif total_input_dim == 9 + known_total_belief_dim: # Check for obs=9 + belief=20 (newer format?)
-             suggested_obs_dim = 9
-             suggested_belief_per_opp = known_belief_dim_per_opp
-             logger.debug(f"Belief Dim Heuristic: Matched total_input={total_input_dim} to obs=9 + belief=20")
-        elif total_input_dim > known_total_belief_dim and (total_input_dim - known_total_belief_dim) > 0:
-             # If total dim implies some obs dim + known belief dim
-             suggested_obs_dim = total_input_dim - known_total_belief_dim
-             suggested_belief_per_opp = known_belief_dim_per_opp
-             logger.debug(f"Belief Dim Heuristic: Deduced obs={suggested_obs_dim} based on total={total_input_dim} and belief_types={known_belief_dim_per_opp}")
-        else:
-             # Fallback generic split (less reliable)
-             suggested_obs_dim = 7 # Default to known correct size
-             suggested_belief_per_opp = (total_input_dim - suggested_obs_dim)//2 if (total_input_dim > suggested_obs_dim and (total_input_dim - suggested_obs_dim)%2==0) else 10
-             logger.debug(f"Belief Dim Heuristic: Using fallback split for total_input={total_input_dim} -> obs={suggested_obs_dim}, belief_per_opp={suggested_belief_per_opp}")
+            # total_input_dim is not a concept for this model as inputs are separate
+            # We return obs_dim and belief_dim per opponent
+            return (None, obs_dim, belief_dim)
 
-
-        return (total_input_dim, suggested_obs_dim, suggested_belief_per_opp)
+        except (KeyError, ValueError) as e:
+            logger.error(f"Failed to get belief dimensions: {e}. Returning defaults.")
+            return (None, 7, 10) # Fallback defaults
 
     @staticmethod
     def is_stacked_observation_model(state_dict):

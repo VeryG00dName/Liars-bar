@@ -25,14 +25,15 @@ class PPOAutoregressiveModel(nn.Module):
                  num_layers=2,
                  dropout_rate=0.1,
                  max_seq_length=256,
-                 num_agent_types=4):
+                 num_agent_types=4,
+                 use_shared_belief_head: bool = False):
         super().__init__()
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         self.belief_dim = belief_dim
         self.hidden_dim = hidden_dim
         self.max_seq_length = max_seq_length
-
+        self.use_shared_belief_head = use_shared_belief_head
         self.count_pad = 4
         self.tflag_pad = 3
         
@@ -89,9 +90,18 @@ class PPOAutoregressiveModel(nn.Module):
 
         # Belief heads
         self.belief_fc      = nn.Linear(hidden_dim, hidden_dim)
-        self.belief_head_op0 = nn.Linear(hidden_dim, belief_dim)
-        self.belief_head_op1 = nn.Linear(hidden_dim, belief_dim)
-        self.belief_head_op2 = nn.Linear(hidden_dim, belief_dim)
+        if self.use_shared_belief_head:
+            self.opponent_position_embedding = nn.Embedding(3, 16) # 3 opponents, 16-dim embedding
+
+            # 2. The FiLM layer that will be conditioned by the position embedding
+            self.belief_film_layer = FiLMLayer(input_dim=hidden_dim, cond_dim=16)
+            # New: shared head conditioned on one-hot position
+            self.belief_head_shared = nn.Linear(hidden_dim, belief_dim)
+        else:
+            # Legacy: three separate heads
+            self.belief_head_op0 = nn.Linear(hidden_dim, belief_dim)
+            self.belief_head_op1 = nn.Linear(hidden_dim, belief_dim)
+            self.belief_head_op2 = nn.Linear(hidden_dim, belief_dim)
     # -------------------------- utils --------------------------
 
     @torch.no_grad()
@@ -189,12 +199,39 @@ class PPOAutoregressiveModel(nn.Module):
             src_key_padding_mask=padding_mask,
             is_causal=True,
         )
-
         # ---- beliefs ----
         belief_hidden  = F.relu(self.belief_fc(transformer_output))
-        belief_logits_0 = self.belief_head_op0(belief_hidden)
-        belief_logits_1 = self.belief_head_op1(belief_hidden)
-        belief_logits_2 = self.belief_head_op2(belief_hidden)
+        B, T, D = belief_hidden.shape
+        device = belief_hidden.device
+        if self.use_shared_belief_head:
+            # --- New FiLM Logic ---
+            # 1. Prepare inputs for all 3 opponent slots
+            #    - Tiled belief_hidden: [B, T, 3, D]
+            #    - Position embeddings: [B, T, 3, 16]
+
+            opp_indices = torch.arange(3, device=device).view(1, 1, 3).expand(B, T, 3)
+            pos_embeds = self.opponent_position_embedding(opp_indices)
+            bh_tiled = belief_hidden.unsqueeze(2).expand(B, T, 3, D)
+
+            # 2. Apply FiLM. The layer expects [N, D_input] and [N, D_cond], so we flatten.
+            bh_flat = bh_tiled.flatten(0, 2)       # Shape: [B*T*3, D]
+            pos_embeds_flat = pos_embeds.flatten(0, 2) # Shape: [B*T*3, 16]
+
+            modulated_hidden_flat = self.belief_film_layer(bh_flat, pos_embeds_flat)
+
+            # 3. Apply the final output layer and reshape
+            logits_flat = self.belief_head_shared(F.relu(modulated_hidden_flat))
+            out = logits_flat.view(B, T, 3, self.belief_dim) # Reshape back to [B, T, 3, belief_dim]
+
+            # 4. Split for the loss function, as before
+            belief_logits_0 = out[:, :, 0, :]
+            belief_logits_1 = out[:, :, 1, :]
+            belief_logits_2 = out[:, :, 2, :]
+        else:
+            # Legacy path (exactly as before)
+            belief_logits_0 = self.belief_head_op0(belief_hidden)
+            belief_logits_1 = self.belief_head_op1(belief_hidden)
+            belief_logits_2 = self.belief_head_op2(belief_hidden)
         # ---- fuse & heads ----
         fused_output = torch.cat([transformer_output, belief_hidden], dim=-1)
 
@@ -221,3 +258,29 @@ class PPOAutoregressiveModel(nn.Module):
             )
 
         return action_logits, opp_logits, state_values, belief_logits_0, belief_logits_1, belief_logits_2
+    
+
+
+class FiLMLayer(nn.Module):
+    """
+    Feature-wise Linear Modulation Layer.
+    Conditions a main input tensor with a conditioning tensor.
+    """
+    def __init__(self, input_dim, cond_dim):
+        super().__init__()
+        # This layer will predict the scale (gamma) and shift (beta)
+        self.cond_projection = nn.Linear(cond_dim, input_dim * 2)
+
+    def forward(self, main_input, cond_input):
+        # main_input: [B, T, D_input] (e.g., belief_hidden)
+        # cond_input: [B, T, D_cond] (e.g., position embedding)
+        
+        # Project the conditioning input to get gamma and beta
+        # Shape: [B, T, D_input * 2]
+        gamma_beta = self.cond_projection(cond_input)
+        
+        # Split into two parts
+        gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)
+        
+        # Modulate the main input
+        return gamma * main_input + beta

@@ -774,7 +774,8 @@ def train_autoregressive_model(
         num_layers=3,
         dropout_rate=0.1,
         max_seq_length=max_seq_length,
-        num_agent_types=4 # 0: Agent, 1: Opponent 0, 2: Opponent 1
+        num_agent_types=4, # 0: Agent, 1: Opponent 0, 2: Opponent 1
+        use_shared_belief_head=True
     ).to(device)
 
     pt_dtype = torch.float16 if device.type == 'cuda' else torch.bfloat16

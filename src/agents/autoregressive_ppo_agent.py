@@ -50,8 +50,8 @@ class PPOAutoregressiveAgent(BaseAgent):
 
     def load_models_from_checkpoint(self, checkpoint: Dict[str, Any], agent_key: str):
         """
-        Load model state dict and re-instantiate AutoregressiveGameModelFull
-        using inferred dimensions.
+        Load model state dict, automatically detect the belief head architecture,
+        and re-instantiate PPOAutoregressiveModel using inferred dimensions.
         """
         if "policy_nets" not in checkpoint or agent_key not in checkpoint["policy_nets"]:
             raise ValueError(f"Checkpoint missing model state for agent '{agent_key}' in 'policy_nets'.")
@@ -61,15 +61,30 @@ class PPOAutoregressiveAgent(BaseAgent):
         if not MFactoryUtil.is_ppo_autoregressive_model(model_state_dict):
             raise ValueError(f"The model state for '{agent_key}' is not a valid PPO autoregressive model.")
         
+        # --- 1. Detect Architecture Version ---
+        # Check for the existence of the new shared head's weight tensor.
+        use_shared_head = 'belief_head_shared.weight' in model_state_dict
+        if use_shared_head:
+            logger.debug(f"[{self.player_id}] Detected new shared belief head architecture.")
+        else:
+            logger.debug(f"[{self.player_id}] Detected legacy per-seat belief head architecture.")
+
         logger.debug(f"[{self.player_id}] Model state dict extracted. Inferring dimensions...")
 
         try:
+            # --- 2. Infer Dimensions (with conditional belief_dim key) ---
             inferred_obs_dim = MFactoryUtil.get_input_dim_from_state_dict(model_state_dict, 'obs_encoder.0')
             inferred_action_dim = MFactoryUtil.get_output_dim_from_state_dict(model_state_dict, 'action_head')
             inferred_hidden_dim = MFactoryUtil.get_hidden_dim_from_state_dict(model_state_dict, 'obs_encoder.0')
-            inferred_belief_dim = MFactoryUtil.get_output_dim_from_state_dict(model_state_dict, 'belief_head_op0')
+            
+            # Use the correct key to get belief_dim based on the detected architecture
+            belief_dim_key = 'belief_head_shared' if use_shared_head else 'belief_head_op0'
+            inferred_belief_dim = MFactoryUtil.get_output_dim_from_state_dict(model_state_dict, belief_dim_key)
+            
             inferred_max_seq = model_state_dict.get('position_embedding.weight', torch.zeros(320)).shape[0]
-            self.max_seq_length = inferred_max_seq
+            # self.max_seq_length is used by other methods, so set it here.
+            # It's one less than the embedding size because of how it's used in sequence prep.
+            self.max_seq_length = inferred_max_seq - 1 
             
             num_heads = 4  # Assuming this is fixed, common practice.
             
@@ -82,8 +97,9 @@ class PPOAutoregressiveAgent(BaseAgent):
 
         logger.info(f"Instantiating PPOAutoregressiveModel for {self.player_id} with dims: "
                     f"obs={inferred_obs_dim}, action={inferred_action_dim}, belief={inferred_belief_dim}, "
-                    f"hidden={inferred_hidden_dim}, max_seq={inferred_max_seq}")
+                    f"hidden={inferred_hidden_dim}, max_seq={inferred_max_seq}, shared_head={use_shared_head}")
 
+        # --- 3. Instantiate Model with the Correct Flag ---
         self.model = PPOAutoregressiveModel(
             obs_dim=inferred_obs_dim,
             action_dim=inferred_action_dim,
@@ -91,6 +107,7 @@ class PPOAutoregressiveAgent(BaseAgent):
             hidden_dim=inferred_hidden_dim,
             num_heads=num_heads,
             max_seq_length=inferred_max_seq,
+            use_shared_belief_head=use_shared_head
         ).to(self.device)
 
         try:
