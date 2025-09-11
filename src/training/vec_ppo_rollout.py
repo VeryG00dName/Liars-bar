@@ -24,23 +24,20 @@ class PPOVecRolloutManager:
                      batch_size: int,
                      num_players: int,
                      training_policy_id: int = 0,
-                     opponent_pool: List[lb.BotKind] = None) -> List[List[lb.Role]]:
+                     opponent_pool: List[int] = None) -> List[List[int]]:
         if opponent_pool is None:
-            opponent_pool = [lb.BotKind.Classic]
+            opponent_pool = [0]
         all_env_roles = []
         for b in range(batch_size):
-            env_roles = [lb.Role() for _ in range(num_players)]
+            env_roles = [0 for _ in range(num_players)]
             num_opponents = num_players - 1
-            chosen_opponents = np.random.choice(opponent_pool, size=num_opponents).tolist()
+            chosen = np.random.choice(opponent_pool, size=num_opponents).tolist()
             seats = list(range(num_players))
             np.random.shuffle(seats)
             training_seat = seats.pop()
-            env_roles[training_seat].type = lb.RoleType.Policy
-            env_roles[training_seat].policy_id = training_policy_id
+            env_roles[training_seat] = training_policy_id
             for i in range(num_opponents):
-                opp_seat = seats[i]
-                env_roles[opp_seat].type = lb.RoleType.BotCpp
-                env_roles[opp_seat].bot_kind = chosen_opponents[i]
+                env_roles[seats[i]] = chosen[i]
             all_env_roles.append(env_roles)
         return all_env_roles
 
@@ -68,41 +65,35 @@ class PPOVecRolloutManager:
 
             self._log_rewards_and_dones(episodes, pending_data)
 
-            for policy_id, (obs, mask, env_indices, seat_indices, dones) in requests_by_policy.items():
+            for policy_id, reqs in requests_by_policy.items():
                 if policy_id not in self.policies:
                     continue
                 agent = self.policies[policy_id]
 
-                # --- snapshot penalties BEFORE stepping (pre-step, decision-time)
+                env_indices = np.array([r.env for r in reqs], dtype=int)
+                seat_indices = np.array([r.seat for r in reqs], dtype=int)
+
                 penalties_snapshot: List[int] = []
-                for i in range(len(env_indices)):
-                    env_idx = env_indices[i]
-                    seat = seat_indices[i]
+                for env_idx, seat in zip(env_indices, seat_indices):
                     env = self.arena.get_env(int(env_idx))
                     penalties_snapshot.append(int(env.penalties[int(seat)]))
 
-                actions, log_probs, values, beliefs = agent.get_actions_batch(
-                    self.arena, env_indices, seat_indices, mask
-                )
+                actions, log_probs, values, beliefs = agent.get_actions_batch(reqs)
 
-                # Step envs
                 self.arena.submit_actions(policy_id, actions)
 
-                # Record "our step" row now; detailed fields (logp/value/beliefs/penalties) filled when history advances
-                for i in range(len(env_indices)):
-                    env_idx = env_indices[i]
+                for i, req in enumerate(reqs):
+                    env_idx = req.env
                     ep = episodes[env_idx]
                     if ep['done']:
                         continue
                     step_idx = self._append_step_row(ep, ep['training_agent_seat'])
                     ep['data']['our_action'][step_idx] = actions[i]
-
-                    # save action-time data pending until history confirms this step
                     pending_data[env_idx] = {
                         "log_prob": log_probs[i],
                         "value": values[i],
                         "belief_preds": beliefs[i],
-                        "penalties_used": penalties_snapshot[i],  # <--- pre-step penalties for training seat
+                        "penalties_used": penalties_snapshot[i],
                     }
 
         # flush last chunk
@@ -202,12 +193,16 @@ class PPOVecRolloutManager:
             for k, v in mi_last.items()
         }
 
-    def _new_episode_tracker(self, env_idx: int, roles: List[lb.Role], training_policy_id: int) -> Dict[str, Any]:
-        training_seats = [s for s, r in enumerate(roles) if r.policy_id == training_policy_id]
+    def _new_episode_tracker(self, env_idx: int, roles: List[int], training_policy_id: int) -> Dict[str, Any]:
+        training_seats = [s for s, pid in enumerate(roles) if pid == training_policy_id]
         is_training_episode = len(training_seats) > 0
         training_agent_seat = training_seats[0] if is_training_episode else -1
-        opp_seats = sorted([s for s, r in enumerate(roles) if s != training_agent_seat])
-        true_opp_labels = [roles[s].bot_kind.value for s in opp_seats]
+        opp_seats = sorted([s for s in range(len(roles)) if s != training_agent_seat])
+        true_opp_labels = []
+        for s in opp_seats:
+            pid = roles[s]
+            agent = self.policies.get(pid)
+            true_opp_labels.append(getattr(agent, 'label', pid))
         ep_data = {
             "training_agent_seat": training_agent_seat,
             "true_opponent_labels": tuple(true_opp_labels),

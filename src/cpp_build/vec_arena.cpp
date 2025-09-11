@@ -13,30 +13,29 @@ void VecArena::fill_mask_for_current(const Env& e, uint8_t m[7]) {
     e.valid_actions(m);
 }
 
-void VecArena::newerest_obs_for_seat(const Env& e, int seat, std::vector<float>& out_obs) const {
-    const int D = obs_dim();
-    out_obs.resize(D);
-    // Env::observe_vector_newerest(agent_index, float* out) returns exactly D entries:
-    //   [2 hand comps] + [n_players-1 opponent sizes] + [n_players penalties]
-    e.observe_vector_newerest(seat, out_obs.data());
-}
-
-uint8_t VecArena::run_bot_turn(Env& e, const BotFn& fn) {
-    uint8_t mask[7]; e.valid_actions(mask);
-
-    // Use the classic layout (includes last_action_count at obs[2])
-    float obs_buf[3 + Env::MAX_PLAYERS];
-    int len = e.observe_vector(obs_buf);
-
-    uint8_t a = 6;
-    if (fn) a = fn(obs_buf, len, mask);
-    if (a > 6 || !mask[a]) a = first_valid(mask);
-    e.step(a);
-    return a;
-}
-
-static uint32_t simple_mix(uint32_t base, int env, int seat) {
-    return base ^ (0x9e3779b9u * (uint32_t)(env + 1)) ^ (0x7f4a7c15u * (uint32_t)(seat + 1));
+void VecArena::prepare_ai_sequence(const Env& e, int ai_seat, PolicyRequest& out) const {
+    int total = (int)e.game_history.size();
+    int start = std::max(0, total - MAX_LEN);
+    int idx = 0;
+    for (int i = start; i < total && idx < MAX_LEN; ++i) {
+        const HistoryEntry& h = e.game_history[i];
+        const auto& obs = h.observations[ai_seat];
+        for (int j = 0; j < OBS_DIM && j < (int)obs.size(); ++j) {
+            out.obs_sequence[idx][j] = obs[j];
+        }
+        out.action_sequence[idx] = h.action;
+        out.agent_type_sequence[idx] = h.player;
+        out.position_sequence[idx] = idx;
+        ++idx;
+    }
+    // Current step observation
+    float cur_obs[OBS_DIM];
+    e.observe_vector_newerest(ai_seat, cur_obs);
+    for (int j = 0; j < OBS_DIM; ++j) out.obs_sequence[idx][j] = cur_obs[j];
+    out.action_sequence[idx] = 10; // PAD token
+    out.agent_type_sequence[idx] = 0;
+    out.position_sequence[idx] = idx;
+    out.valid_len = idx + 1;
 }
 
 // ---------- API ----------
@@ -47,82 +46,16 @@ void VecArena::reset(int B_, int n_players_, uint32_t seed0) {
     envs.assign(B, Env{});
     done.assign(B, 0);
     roles.assign(B, std::vector<Role>(n_players));
-    bot_fns.assign(B, std::vector<BotFn>(n_players));
     pending.clear();
 
     for (int b = 0; b < B; ++b) envs[b].reset(n_players, seed0 + (uint32_t)b);
 }
 
-VecArena::BotFn VecArena::make_bot_fn(BotKind kind, int env_index, int seat) {
-    // Construct a C++ bot object captured by value inside the lambda.
-    // For stateful bots (Random, TNT), the lambda MUST be mutable.
-    // Signature: uint8_t(const float*, int, const uint8_t[7])
-    switch (kind) {
-    case BotKind::Classic: {
-        bots::Classic bot("Classic");
-        return [bot](const float* obs, int len, const uint8_t m[7]) mutable -> uint8_t {
-            return bot.act(obs, len, m);
-            };
-    }
-    case BotKind::GreedyCardSpammer: {
-        bots::GreedyCardSpammer bot("Greedy");
-        return [bot](const float* obs, int len, const uint8_t m[7]) mutable -> uint8_t {
-            return bot.act(obs, len, m);
-            };
-    }
-    case BotKind::TableFirstConservativeChallenger: {
-        bots::TableFirstConservativeChallenger bot("TFCC");
-        return [bot](const float* obs, int len, const uint8_t m[7]) mutable -> uint8_t {
-            return bot.act(obs, len, m);
-            };
-    }
-    case BotKind::SelectiveTableConservativeChallenger: {
-        bots::SelectiveTableConservativeChallenger bot("STCC");
-        return [bot](const float* obs, int len, const uint8_t m[7]) mutable -> uint8_t {
-            return bot.act(obs, len, m);
-            };
-    }
-    case BotKind::TableNonTableAgent: {
-        bots::TableNonTableAgent bot("TNT");
-        return [bot](const float* obs, int len, const uint8_t m[7]) mutable -> uint8_t {
-            return bot.act(obs, len, m);
-            };
-    }
-    case BotKind::StrategicChallenger: {
-        // Needs num_players + agent_index
-        bots::StrategicChallenger bot("Strat", n_players, seat);
-        return [bot](const float* obs, int len, const uint8_t m[7]) mutable -> uint8_t {
-            return bot.act(obs, len, m);
-            };
-    }
-    case BotKind::RandomAgent: {
-        bots::RandomAgent bot("Rand");
-        bot.set_seed(simple_mix(base_seed, env_index, seat));
-        return [bot](const float* obs, int len, const uint8_t m[7]) mutable -> uint8_t {
-            return bot.act(obs, len, m);
-            };
-    }
-    default: {
-        bots::Classic bot("Classic");
-        return [bot](const float* obs, int len, const uint8_t m[7]) mutable -> uint8_t {
-            return bot.act(obs, len, m);
-            };
-    }
-    }
-}
-
-void VecArena::set_roles(const std::vector<std::vector<Role>>& roles_per_env) {
-    roles = roles_per_env;
-    bot_fns.assign(B, std::vector<BotFn>(n_players));
-
+void VecArena::set_roles(const std::vector<std::vector<int>>& policy_ids_per_env) {
+    roles.assign(B, std::vector<Role>(n_players));
     for (int b = 0; b < B; ++b) {
         for (int s = 0; s < n_players; ++s) {
-            if (roles[b][s].type == RoleType::BotCpp) {
-                bot_fns[b][s] = make_bot_fn(roles[b][s].bot_kind, b, s);
-            }
-            else {
-                bot_fns[b][s] = BotFn(); // empty; controlled by Python
-            }
+            roles[b][s].policy_id = policy_ids_per_env[b][s];
         }
     }
     pending.clear();
@@ -165,18 +98,18 @@ void VecArena::advance_env_until_policy_or_done(
     if (alive <= 1) { done[env_index] = 1; return; }
 
     int cur = e.current_player();
-    const Role& r = roles[env_index][cur];
-    if (r.type == RoleType::Policy) {
-      PolicyRequest req;
-      req.env = env_index; req.seat = cur;
-      newerest_obs_for_seat(e, cur, req.obs);
-      fill_mask_for_current(e, req.mask);
-      req.done = 0;
-      out[r.policy_id].push_back(std::move(req));
-      return; // hand control to Python
-    } else {
-      (void)run_bot_turn(e, bot_fns[env_index][cur]);
-    }
+        int policy_id = roles[env_index][cur].policy_id;
+        PolicyRequest req;
+        req.env = env_index; req.seat = cur; req.done = 0;
+        fill_mask_for_current(e, req.mask);
+        if (policy_id < 7) {
+            // classic obs for C++ bots
+            e.observe_vector(req.classic_obs);
+        } else {
+            prepare_ai_sequence(e, cur, req);
+        }
+        out[policy_id].push_back(std::move(req));
+        return;
   }
 }
 

@@ -200,19 +200,18 @@ PYBIND11_MODULE(lb, m) {
         .def("set_swap_heuristic", &PerfectSearch::set_swap_heuristic)
         .def("set_v5_penalty", &PerfectSearch::set_v5_penalty);
 
-    // ---- Roles, VecArena ----
-    py::enum_<RoleType>(m, "RoleType")
-        .value("BotCpp", RoleType::BotCpp).value("Policy", RoleType::Policy);
-    py::enum_<BotKind>(m, "BotKind")
-        .value("Classic", BotKind::Classic).value("GreedyCardSpammer", BotKind::GreedyCardSpammer)
-        .value("TableFirstConservativeChallenger", BotKind::TableFirstConservativeChallenger)
-        .value("SelectiveTableConservativeChallenger", BotKind::SelectiveTableConservativeChallenger)
-        .value("TableNonTableAgent", BotKind::TableNonTableAgent)
-        .value("StrategicChallenger", BotKind::StrategicChallenger)
-        .value("RandomAgent", BotKind::RandomAgent);
-    py::class_<Role>(m, "Role")
-        .def(py::init<>()).def_readwrite("type", &Role::type)
-        .def_readwrite("bot_kind", &Role::bot_kind).def_readwrite("policy_id", &Role::policy_id);
+    // ---- PolicyRequest ----
+    py::class_<PolicyRequest>(m, "PolicyRequest")
+        .def_readonly("env", &PolicyRequest::env)
+        .def_readonly("seat", &PolicyRequest::seat)
+        .def_property_readonly("mask", [](PolicyRequest& r){return py::array_t<uint8_t>({7}, r.mask);})
+        .def_readonly("done", &PolicyRequest::done)
+        .def_property_readonly("classic_obs", [](PolicyRequest& r){return py::array_t<float>({3 + Env::MAX_PLAYERS}, r.classic_obs);})
+        .def_property_readonly("obs_sequence", [](PolicyRequest& r){return py::array_t<float>({r.valid_len, OBS_DIM}, r.obs_sequence[0]);})
+        .def_property_readonly("action_sequence", [](PolicyRequest& r){return py::array_t<int64_t>({r.valid_len}, r.action_sequence);})
+        .def_property_readonly("agent_type_sequence", [](PolicyRequest& r){return py::array_t<int64_t>({r.valid_len}, r.agent_type_sequence);})
+        .def_property_readonly("position_sequence", [](PolicyRequest& r){return py::array_t<int64_t>({r.valid_len}, r.position_sequence);})
+        .def_readonly("valid_len", &PolicyRequest::valid_len);
 
     py::class_<VecArena>(m, "VecArena")
         .def(py::init<>())
@@ -233,29 +232,19 @@ PYBIND11_MODULE(lb, m) {
             }, py::return_value_policy::reference_internal, "Get a reference to an environment by index.")
 
         .def("set_roles", [](VecArena& A, const py::list& roles_list) {
-        std::vector<std::vector<Role>> R; R.resize(py::len(roles_list));
+        std::vector<std::vector<int>> R; R.resize(py::len(roles_list));
         for (size_t b = 0; b < R.size(); ++b) {
             auto row = roles_list[b].cast<py::list>(); R[b].resize(py::len(row));
-            for (size_t s = 0; s < py::len(row); ++s) { R[b][s] = row[s].cast<Role>(); }
+            for (size_t s = 0; s < py::len(row); ++s) { R[b][s] = py::cast<int>(row[s]); }
         }
         A.set_roles(R);
             }, py::arg("roles"))
 
         .def("collect_requests", [](VecArena& A) {
-        py::dict out; auto grouped = A.collect_requests(); const int D = A.obs_dim();
+        py::dict out; auto grouped = A.collect_requests();
         for (auto& kv : grouped) {
-            int pid = kv.first; auto& reqs = kv.second; const int K = (int)reqs.size();
-            if (K == 0) continue;
-            py::array_t<float> obs({ K, D }); py::array_t<uint8_t> mask({ K, 7 });
-            py::array_t<int> envs({ K }); py::array_t<int> seats({ K }); py::array_t<uint8_t> dones({ K });
-            auto O = obs.mutable_unchecked<2>(); auto M = mask.mutable_unchecked<2>();
-            auto E = envs.mutable_unchecked<1>(); auto S = seats.mutable_unchecked<1>(); auto Dn = dones.mutable_unchecked<1>();
-            for (int i = 0; i < K; ++i) {
-                E(i) = reqs[i].env; S(i) = reqs[i].seat; Dn(i) = reqs[i].done;
-                for (int j = 0; j < D; ++j) O(i, j) = reqs[i].obs[j];
-                for (int j = 0; j < 7; ++j) M(i, j) = reqs[i].mask[j];
-            }
-            out[py::int_(pid)] = py::make_tuple(obs, mask, envs, seats, dones);
+            py::list lst; for (auto& r : kv.second) lst.append(r);
+            out[py::int_(kv.first)] = lst;
         }
         return out;
             })

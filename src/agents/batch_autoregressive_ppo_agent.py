@@ -2,7 +2,7 @@
 import torch
 import numpy as np
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from src.agents.base_agent import BaseAgent
 from src.model.ppo_autoregressive_model import PPOAutoregressiveModel
@@ -28,6 +28,7 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
         self.max_seq_length: Optional[int] = 255
         self.num_players: int = 4
         self._last_model_input = {}
+        self.label: int = -1
     def reset(self):
         self._last_model_input = {}
         pass
@@ -213,105 +214,72 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
         }
     
     @torch.inference_mode()
-    def get_actions_batch(
-        self,
-        arena: lb.VecArena,
-        env_indices: np.ndarray,
-        seat_indices: np.ndarray,
-        mask_batch: np.ndarray,   # Fallback: env-provided current-step masks
-    ):
-        B = len(env_indices)
+    def get_actions_batch(self, requests: List[lb.PolicyRequest]):
+        B = len(requests)
         if B == 0:
-            return np.array([]), np.array([]), np.array([]), np.array([])
+            return np.array([]), np.array([]), np.array([]), []
 
         device = self.device
+        all_obs, all_actions, all_agents, all_pos = [], [], [], []
+        valid_lengths = []
+        mask_batch = []
 
-        all_obs, all_actions, all_agents, all_pos, all_masks = [], [], [], [], []
-        valid_lengths_py = []
+        for req in requests:
+            L = int(req.valid_len)
+            obs = torch.from_numpy(np.array(req.obs_sequence[:L], dtype=np.float32))
+            act = torch.from_numpy(np.array(req.action_sequence[:L], dtype=np.int64))
+            ag  = torch.from_numpy(np.array(req.agent_type_sequence[:L], dtype=np.int64))
+            pos = torch.from_numpy(np.array(req.position_sequence[:L], dtype=np.int64))
+            all_obs.append(obs)
+            all_actions.append(act)
+            all_agents.append(ag)
+            all_pos.append(pos)
+            valid_lengths.append(L)
+            mask_batch.append(np.array(req.mask, dtype=np.uint8))
 
-        # -------- 1) per-env sequence prep (CPU) --------
-        for i in range(B):
-            env_idx = env_indices[i]
-            my_seat = seat_indices[i]
-            obs_seq, action_seq, agent_seq, pos_seq, action_masks = self._prepare_single_sequence(
-                arena.get_env(env_idx), my_seat
-            )
-
-            all_obs.append(obs_seq)
-            all_actions.append(action_seq)
-            all_agents.append(agent_seq)
-            all_pos.append(pos_seq)
-            all_masks.append(action_masks)
-            valid_lengths_py.append(len(action_seq))
-
-            # Always snapshot last model_input for finalize(); keep on CPU
-            Li = len(action_seq)
-            self._last_model_input[(env_idx, my_seat)] = {
-                "obs_sequence":    obs_seq.unsqueeze(0).cpu(),
-                "action_sequence": action_seq.unsqueeze(0).cpu(),
-                "agent_types":     agent_seq.unsqueeze(0).cpu(),
-                "positions":       pos_seq.unsqueeze(0).cpu(),
-                "action_masks":    (action_masks.unsqueeze(0).cpu() if action_masks is not None else None),
-                "padding_mask":    torch.zeros(1, Li, dtype=torch.bool),
-                "valid_lengths":   torch.tensor([Li], dtype=torch.long),
+            self._last_model_input[(req.env, req.seat)] = {
+                "obs_sequence":    obs.unsqueeze(0).cpu(),
+                "action_sequence": act.unsqueeze(0).cpu(),
+                "agent_types":     ag.unsqueeze(0).cpu(),
+                "positions":       pos.unsqueeze(0).cpu(),
+                "action_masks":    None,
+                "padding_mask":    torch.zeros(1, L, dtype=torch.bool),
+                "valid_lengths":   torch.tensor([L], dtype=torch.long),
             }
 
-        # -------- 2) pad and move to device --------
         obs_padded     = torch.nn.utils.rnn.pad_sequence(all_obs,     batch_first=True, padding_value=0.0).to(device)
         actions_padded = torch.nn.utils.rnn.pad_sequence(all_actions, batch_first=True, padding_value=0  ).to(device)
         agents_padded  = torch.nn.utils.rnn.pad_sequence(all_agents,  batch_first=True, padding_value=0  ).to(device)
         pos_padded     = torch.nn.utils.rnn.pad_sequence(all_pos,     batch_first=True, padding_value=0  ).to(device)
         Lmax = actions_padded.size(1)
 
-        # -------- 3) build masks / valid lengths --------
-        if all_masks and all_masks[0] is not None:
-            masks_padded = torch.nn.utils.rnn.pad_sequence(all_masks, batch_first=True, padding_value=0).to(device)
-        else:
-            masks_padded = None
+        valid_lengths_t = torch.tensor(valid_lengths, dtype=torch.long, device=device)
+        arangeL = torch.arange(Lmax, device=device).unsqueeze(0)
+        padding_mask = arangeL >= valid_lengths_t.unsqueeze(1)
 
-        valid_lengths = torch.tensor(valid_lengths_py, dtype=torch.long, device=device)   # [B]
-        arangeL = torch.arange(Lmax, device=device).unsqueeze(0)                          # [1, Lmax]
-        padding_mask = arangeL >= valid_lengths.unsqueeze(1)                               # [B, Lmax] True=PAD
-
-        # -------- 4) single model forward --------
         model_input = {
             'obs_sequence':    obs_padded,
             'action_sequence': actions_padded,
             'agent_types':     agents_padded,
             'positions':       pos_padded,
-            'action_masks':    masks_padded,
+            'action_masks':    None,
             'padding_mask':    padding_mask,
-            'valid_lengths':   valid_lengths,
+            'valid_lengths':   valid_lengths_t,
         }
-        action_logits, _, state_values, b0, b1, b2 = self.model(**model_input)            # [B, L, A], [B, L, 1], ...
+        action_logits, _, state_values, b0, b1, b2 = self.model(**model_input)
 
-        # -------- 5) batched sampling & packing (vectorized) --------
         rows = torch.arange(B, device=device)
-        last_idx = (valid_lengths - 1).clamp_min(0)                                       # [B]
-        logits_last = action_logits[rows, last_idx, :]                                    # [B, A]
-        values_last = state_values[rows, last_idx].squeeze(-1)                            # [B]
+        last_idx = (valid_lengths_t - 1).clamp_min(0)
+        logits_last = action_logits[rows, last_idx, :]
+        values_last = state_values[rows, last_idx].squeeze(-1)
 
-        # prefer per-seq masks; fallback to current-step mask_batch row-wise
-        if masks_padded is not None:
-            step_mask = masks_padded[rows, last_idx, :]                                   # [B, A] bool
-        else:
-            step_mask = None
+        step_mask = torch.as_tensor(np.array(mask_batch), dtype=torch.bool, device=device)
+        logits_last = logits_last.masked_fill(~step_mask, float("-inf"))
 
-        if step_mask is None and mask_batch is not None:
-            step_mask = torch.as_tensor(mask_batch, dtype=torch.bool, device=device)      # [B, A]
-        elif step_mask is not None and mask_batch is not None:
-            fallback = torch.as_tensor(mask_batch, dtype=torch.bool, device=device)
-            no_valid = ~step_mask.any(dim=1, keepdim=True)                                # [B,1]
-            step_mask = torch.where(no_valid, fallback, step_mask)
+        dist = torch.distributions.Categorical(logits=logits_last)
+        actions_t   = dist.sample()
+        log_probs_t = dist.log_prob(actions_t).to(torch.float32)
 
-        if step_mask is not None:
-            logits_last = logits_last.masked_fill(~step_mask, float("-inf"))
-
-        dist = torch.distributions.Categorical(logits=logits_last)                        # batch-wise
-        actions_t   = dist.sample()                                                       # [B]
-        log_probs_t = dist.log_prob(actions_t).to(torch.float32)                          # [B]
-
-        # batched belief argmaxes (if present)
         beliefs_out = []
         if b0 is not None:
             b0_last = torch.argmax(b0[rows, last_idx, :], dim=-1)
@@ -319,15 +287,16 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
             b1_last = torch.argmax(b1[rows, last_idx, :], dim=-1)
         if b2 is not None:
             b2_last = torch.argmax(b2[rows, last_idx, :], dim=-1)
-
         for i in range(B):
-            bi = []
-            if b0 is not None: bi.append(int(b0_last[i].item()))
-            if b1 is not None: bi.append(int(b1_last[i].item()))
-            if b2 is not None: bi.append(int(b2_last[i].item()))
-            beliefs_out.append(bi)
+            preds = []
+            if b0 is not None:
+                preds.append(b0_last[i].item())
+            if b1 is not None:
+                preds.append(b1_last[i].item())
+            if b2 is not None:
+                preds.append(b2_last[i].item())
+            beliefs_out.append(preds)
 
-        # numpy outputs
         return (
             actions_t.detach().cpu().numpy().astype(np.uint8),
             log_probs_t.detach().cpu().numpy().astype(np.float32),
