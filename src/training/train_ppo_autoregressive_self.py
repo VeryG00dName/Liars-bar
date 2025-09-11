@@ -314,7 +314,7 @@ def train_generation(
             num_players=4,
             training_policy_id=training_policy_id,
             opponent_pool=[int(a['label']) for a in pool_manager.pool if a['type'] == 'cpp_bot' or a['type'] == 'historical'],
-            max_batch_envs=int(getattr(config, "VEC_BATCH_ENVS", 256))
+            max_batch_envs=int(getattr(config, "EPISODES_PER_UPDATE", 512))
         )
         t_roll = time.time()
         if not new_eps:
