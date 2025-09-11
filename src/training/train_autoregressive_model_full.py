@@ -17,10 +17,18 @@ from torch.utils.data import Dataset, DataLoader, Sampler
 from tqdm import tqdm
 from typing import List
 from torch.utils.tensorboard import SummaryWriter
-from src.training.train_extras import set_seed
-from src.model.ppo_autoregressive_model import PPOAutoregressiveModel
+from src.model.ppo_embedding_model import PPOEmbeddingModel
 from src import config
+
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
+
+try:
+    from torch.nn.attention import sdp_kernel
+    sdp_kernel.enable_flash(True); sdp_kernel.enable_math(False); sdp_kernel.enable_mem_efficient(True)
+except Exception: pass
+
 # Define hardcoded opponent labels consistent with other training scripts
 HARD_CODED_LABELS = {
     "GreedyCardSpammer": 1,
@@ -54,23 +62,6 @@ def setup_logging(log_file=None, level=logging.INFO):
         logger.addHandler(file_handler)
     
     return logger
-
-def train_val_split(data, validation_split=0.1, max_val_samples=50000):
-    """Split data into training and validation sets with a cap on validation samples.
-    
-    Args:
-        data: List of all data samples (sequences)
-        validation_split: Fraction of data to use for validation
-        max_val_samples: Maximum number of validation samples
-        
-    Returns:
-        tuple: (train_data, val_data)
-    """
-    np.random.shuffle(data)
-    val_size = min(int(len(data) * validation_split), max_val_samples)
-    val_data = data[:val_size]
-    train_data = data[val_size:]
-    return train_data, val_data
 
 def create_opponent_mapping(data_dir, use_cache=True, cache_file="opponent_mapping_cache.pkl"):
     """Create mapping of opponent names to indices.
@@ -695,7 +686,6 @@ def train_autoregressive_model(
     learning_rate=1e-4,
     batch_size=512,
     num_epochs=100,
-    validation_split=0.1,
     checkpoint_dir=None,
     log_dir=None,
     device=None,
@@ -733,13 +723,9 @@ def train_autoregressive_model(
 
     indices = list(range(len(full_dataset)))
     np.random.shuffle(indices)
-    val_size = int(len(indices) * validation_split)
-    val_indices = indices[:val_size]
-    train_indices = indices[val_size:]
 
-    train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
-    val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
-    train_lengths = [full_dataset.lengths[i] for i in train_indices]
+    train_dataset = torch.utils.data.Subset(full_dataset, indices)
+    train_lengths = [full_dataset.lengths[i] for i in indices]
 
     train_sampler = BucketSampler(train_lengths, batch_size=batch_size, shuffle=True)
     train_loader = DataLoader(
@@ -750,22 +736,14 @@ def train_autoregressive_model(
         pin_memory=True,
         persistent_workers=True,
     )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=2,
-        collate_fn=collate_variable_length_sequences,
-        pin_memory=True,
-        persistent_workers=True,
-    )
 
     sample = next(iter(train_loader))
     obs_dim = sample['obs'].shape[2]
     action_dim = 7
     logger.info(f"Model dimensions: obs_dim={obs_dim}, action_dim={action_dim}")
 
-    model = PPOAutoregressiveModel(
+    # Main autoregressive model that outputs embeddings
+    model = PPOEmbeddingModel(
         obs_dim=obs_dim,
         action_dim=action_dim,
         hidden_dim=hidden_dim,
@@ -774,8 +752,7 @@ def train_autoregressive_model(
         num_layers=2,
         dropout_rate=0.1,
         max_seq_length=max_seq_length,
-        num_agent_types=4, # 0: Agent, 1: Opponent 0, 2: Opponent 1
-        use_shared_belief_head=True
+        num_agent_types=4
     ).to(device)
 
     pt_dtype = torch.float16 if device.type == 'cuda' else torch.bfloat16
@@ -788,14 +765,14 @@ def train_autoregressive_model(
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5, fused=False)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
-    start_epoch, best_val_loss = 0, float('inf')
+    start_epoch, best_train_loss = 0, float('inf')
     if resume_from and os.path.exists(resume_from):
         checkpoint = torch.load(resume_from, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        best_val_loss = checkpoint.get('val_loss', best_val_loss)
-        logger.info(f"Resuming from epoch {start_epoch} with validation loss {best_val_loss}")
+        start_epoch = checkpoint.get('epoch', -1) + 1
+        best_train_loss = checkpoint.get('train_loss', best_train_loss)
+        logger.info(f"Resuming from epoch {start_epoch} with train loss {best_train_loss}")
 
     for epoch in range(start_epoch, num_epochs):
         epoch_start = time.time()
@@ -818,28 +795,15 @@ def train_autoregressive_model(
         for batch in train_progress:
             batch = move_batch_to_device(batch, device)
             with amp.autocast(device_type=device.type, dtype=pt_dtype):
-                # Support models with or without the 3rd head during transition
-                try:
-                    (self_logits, opp_logits, value_pred,
-                    belief_logits_0, belief_logits_1, belief_logits_2) = model(
-                        obs_sequence=batch['obs'],
-                        action_sequence=batch['action'],
-                        agent_types=batch['agent_type'],
-                        positions=batch['position'],
-                        action_masks=batch['action_mask'],
-                        padding_mask=batch['padding_mask']
-                    )
-                except ValueError:
-                    (self_logits, opp_logits, value_pred,
-                    belief_logits_0, belief_logits_1) = model(
-                        obs_sequence=batch['obs'],
-                        action_sequence=batch['action'],
-                        agent_types=batch['agent_type'],
-                        positions=batch['position'],
-                        action_masks=batch['action_mask'],
-                        padding_mask=batch['padding_mask']
-                    )
-                    belief_logits_2 = None
+                (self_logits, opp_logits, value_pred,
+                belief_logits_0, belief_logits_1, belief_logits_2) = model(
+                    obs_sequence=batch['obs'],
+                    action_sequence=batch['action'],
+                    agent_types=batch['agent_type'],
+                    positions=batch['position'],
+                    action_masks=batch['action_mask'],
+                    padding_mask=batch['padding_mask']
+                )
 
                 belief_targets = batch['belief']
 
@@ -914,124 +878,16 @@ def train_autoregressive_model(
         train_belief_acc_1 /= train_batches
         train_belief_acc_2 /= train_batches
 
-        # --- validation ---
-        model.eval()
-        val_total_loss   = 0.0
-        val_self_loss    = 0.0
-        val_opp_loss     = 0.0
-        val_value_loss   = 0.0
-        val_belief_loss  = 0.0
-        val_batches      = 0
-        val_agent_acc    = 0.0
-        val_opponent_acc = 0.0
-        val_belief_acc_0 = 0.0
-        val_belief_acc_1 = 0.0
-        val_belief_acc_2 = 0.0
-
-        val_progress = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Val)", leave=False)
-        with torch.no_grad():
-            for batch in val_progress:
-                batch = move_batch_to_device(batch, device)
-                with amp.autocast(device_type=device.type, dtype=pt_dtype):
-                    try:
-                        (self_logits, opp_logits, value_pred,
-                        belief_logits_0, belief_logits_1, belief_logits_2) = model(
-                            obs_sequence=batch['obs'],
-                            action_sequence=batch['action'],
-                            agent_types=batch['agent_type'],
-                            positions=batch['position'],
-                            action_masks=batch['action_mask'],
-                            padding_mask=batch['padding_mask']
-                        )
-                    except ValueError:
-                        (self_logits, opp_logits, value_pred,
-                        belief_logits_0, belief_logits_1) = model(
-                            obs_sequence=batch['obs'],
-                            action_sequence=batch['action'],
-                            agent_types=batch['agent_type'],
-                            positions=batch['position'],
-                            action_masks=batch['action_mask'],
-                            padding_mask=batch['padding_mask']
-                        )
-                        belief_logits_2 = None
-
-                    belief_targets = batch['belief']
-
-                    total_loss, self_loss, opp_loss, value_loss, belief_loss = calculate_autoregressive_loss(
-                        self_logits=self_logits,
-                        opp_logits=opp_logits,
-                        target_actions=batch['target_action'],
-                        agent_types=batch['agent_type'],
-                        padding_mask=batch['padding_mask'],
-                        belief_logits_0=belief_logits_0,
-                        belief_logits_1=belief_logits_1,
-                        belief_logits_2=belief_logits_2,
-                        belief_targets=belief_targets,
-                        value_pred=value_pred,
-                        value_target=None
-                    )
-
-                our_mask = (batch['agent_type'] == 0) & (~batch['padding_mask'])
-                opp_mask = ((batch['agent_type'] == 1) | (batch['agent_type'] == 2) | (batch['agent_type'] == 3)) & (~batch['padding_mask'])
-
-                agent_acc    = compute_accuracy(self_logits, batch['target_action'], our_mask)
-                opponent_acc = compute_accuracy(opp_logits,  batch['target_action'], opp_mask)
-                val_agent_acc    += agent_acc
-                val_opponent_acc += opponent_acc
-
-                val_total_loss   += total_loss.item()
-                val_self_loss    += self_loss.item()
-                val_opp_loss     += opp_loss.item()
-                val_value_loss   += value_loss.item()
-                val_belief_loss  += belief_loss.item()
-                val_batches      += 1
-
-                if belief_logits_0 is not None and belief_targets is not None:
-                    belief_targets_0 = belief_targets[:, :, 0]
-                    belief_targets_1 = belief_targets[:, :, 1]
-                    belief_eval_mask = our_mask
-
-                    acc_0 = compute_accuracy(belief_logits_0, belief_targets_0, belief_eval_mask)
-                    acc_1 = compute_accuracy(belief_logits_1, belief_targets_1, belief_eval_mask)
-                    val_belief_acc_0 += acc_0
-                    val_belief_acc_1 += acc_1
-
-                    if belief_logits_2 is not None and belief_targets.size(-1) >= 3:
-                        belief_targets_2 = belief_targets[:, :, 2]
-                        acc_2 = compute_accuracy(belief_logits_2, belief_targets_2, belief_eval_mask)
-                        val_belief_acc_2 += acc_2
-
-                val_progress.set_postfix({
-                    'tot': total_loss.item(),
-                    'self': self_loss.item(),
-                    'opp': opp_loss.item(),
-                    'belief': belief_loss.item()
-                })
-
-        # average val metrics
-        val_total_loss   /= val_batches
-        val_self_loss    /= val_batches
-        val_opp_loss     /= val_batches
-        val_value_loss   /= val_batches
-        val_agent_acc    /= val_batches
-        val_opponent_acc /= val_batches
-        val_belief_acc_0 /= val_batches
-        val_belief_acc_1 /= val_batches
-        val_belief_acc_2 /= val_batches
-
         # scheduler step
-        scheduler.step(val_total_loss)
+        scheduler.step(train_total_loss)
         epoch_time = time.time() - epoch_start
 
         # print summary
         logger.info(
             f"Epoch {epoch+1}/{num_epochs} (Time: {epoch_time:.2f}s)\n"
             f"  Train - Loss: {train_total_loss:.6f}, Self: {train_self_loss:.6f}, Opp: {train_opp_loss:.6f}, "
-            f"Value: {train_value_loss:.6f}, Agent Acc: {train_agent_acc:.4f}, Opp Acc: {train_opponent_acc:.4f}, "
-            f"Belief0 Acc: {train_belief_acc_0:.4f}, Belief1 Acc: {train_belief_acc_1:.4f}, Belief2 Acc: {train_belief_acc_2:.4f}\n"
-            f"  Val   - Loss: {val_total_loss:.6f}, Self: {val_self_loss:.6f}, Opp: {val_opp_loss:.6f}, "
-            f"Value: {val_value_loss:.6f}, Agent Acc: {val_agent_acc:.4f}, Opp Acc: {val_opponent_acc:.4f}, "
-            f"Belief0 Acc: {val_belief_acc_0:.4f}, Belief1 Acc: {val_belief_acc_1:.4f}, Belief2 Acc: {val_belief_acc_2:.4f}"
+            f"Agent Acc: {train_agent_acc:.4f}, Opp Acc: {train_opponent_acc:.4f}, "
+            f"Belief0 Acc: {train_belief_acc_0:.4f}, Belief1 Acc: {train_belief_acc_1:.4f}, Belief2 Acc: {train_belief_acc_2:.4f}"
         )
 
         # log to TensorBoard
@@ -1046,27 +902,14 @@ def train_autoregressive_model(
         writer.add_scalar("Acc/Train/Belief1", train_belief_acc_1, epoch)
         writer.add_scalar("Acc/Train/Belief2", train_belief_acc_2, epoch)
 
-        writer.add_scalar("Loss/Val/Total",  val_total_loss, epoch)
-        writer.add_scalar("Loss/Val/Self",   val_self_loss, epoch)
-        writer.add_scalar("Loss/Val/Opp",    val_opp_loss, epoch)
-        writer.add_scalar("Loss/Val/Value",  val_value_loss, epoch)
-        writer.add_scalar("Loss/Val/Belief", val_belief_loss / val_batches, epoch)
-        writer.add_scalar("Acc/Val/Agent",   val_agent_acc, epoch)
-        writer.add_scalar("Acc/Val/Opponent",val_opponent_acc, epoch)
-        writer.add_scalar("Acc/Val/Belief0", val_belief_acc_0, epoch)
-        writer.add_scalar("Acc/Val/Belief1", val_belief_acc_1, epoch)
-        writer.add_scalar("Acc/Val/Belief2", val_belief_acc_2, epoch)
-
-        
-        # Save model if validation loss improved
-        if val_total_loss < best_val_loss:
-            best_val_loss = val_total_loss
+        # Save model if train loss improved
+        if train_total_loss < best_train_loss:
+            best_train_loss = train_total_loss
             checkpoint_path = os.path.join(checkpoint_dir, f"autoreg_model_best.pth")
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': val_total_loss,
                 'train_loss': train_total_loss,
                 'opponent_mapping': opponent_mapping,
                 'num_opponent_types': num_opponent_types,
@@ -1075,7 +918,7 @@ def train_autoregressive_model(
                 'action_dim': action_dim,
                 'hidden_dim': hidden_dim
             }, checkpoint_path)
-            logger.info(f"  Saved new best model with validation loss: {val_total_loss:.6f}")
+            logger.info(f"  Saved new best model with train loss: {train_total_loss:.6f}")
         
         # Save periodic checkpoint
         if (epoch + 1) % 10 == 0 or epoch == num_epochs - 1:
@@ -1084,7 +927,6 @@ def train_autoregressive_model(
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': val_total_loss,
                 'train_loss': train_total_loss,
                 'opponent_mapping': opponent_mapping,
                 'num_opponent_types': num_opponent_types,
@@ -1101,7 +943,6 @@ def train_autoregressive_model(
         'epoch': num_epochs - 1,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'val_loss': val_total_loss,
         'train_loss': train_total_loss,
         'opponent_mapping': opponent_mapping,
         'num_opponent_types': num_opponent_types,
@@ -1124,7 +965,6 @@ def main():
     parser.add_argument("--learning-rate", type=float, default=5e-5, help="Learning rate")
     parser.add_argument("--batch-size", type=int, default=512, help="Batch size")
     parser.add_argument("--num-epochs", type=int, default=100, help="Number of epochs")
-    parser.add_argument("--validation-split", type=float, default=0.1, help="Validation split ratio")
     parser.add_argument("--checkpoint-dir", type=str, default=None, help="Checkpoint directory")
     parser.add_argument("--log-dir", type=str, default=None, help="Log directory for TensorBoard")
     parser.add_argument("--device", type=str, default='cuda', help="Device to use (cuda/cpu)")
@@ -1134,7 +974,8 @@ def main():
     parser.add_argument("--resume-from", type=str, default=None, help="Path to checkpoint to resume from")
     
     args = parser.parse_args()
-    set_seed(config.SEED)
+    SEED = int(getattr(config, "SEED", 42))
+    random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
     
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -1146,7 +987,6 @@ def main():
         learning_rate=args.learning_rate,
         batch_size=args.batch_size,
         num_epochs=args.num_epochs,
-        validation_split=args.validation_split,
         checkpoint_dir=args.checkpoint_dir,
         log_dir=args.log_dir,
         device=device,
