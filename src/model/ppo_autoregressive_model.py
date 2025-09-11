@@ -85,7 +85,7 @@ class PPOAutoregressiveModel(nn.Module):
 
         # === Output heads ===
         self.action_head     = nn.Linear(hidden_dim * 2, action_dim)  # self (agent 0)
-        self.opp_action_head = nn.Linear(hidden_dim * 2, action_dim)  # opponents (agent 1/2)
+        self.opp_action_head = nn.Linear(hidden_dim * 2, action_dim)  # opponents (agent 1,2,3)
         self.value_head      = nn.Linear(hidden_dim * 2, 1)
 
         # Belief heads
@@ -107,7 +107,7 @@ class PPOAutoregressiveModel(nn.Module):
     @torch.no_grad()
     def _decompose_actions(self, action_sequence, agent_types=None, padding_mask=None):
         """
-        action_sequence: LongTensor [B,T] with values in {0..9}
+        action_sequence: LongTensor [B,T] with values in {0..10}
         Returns (act_kind_ids, count_ids, table_flag_ids) as Long [B,T]
         """
         a = action_sequence.long()
