@@ -119,13 +119,56 @@ def _create_new_agent(agent_type: str, device: torch.device) -> BatchPPOAutoregr
     agent.model = model.to(device)
     return agent
 
-def _load_agent_from_checkpoint(path: str, model_type: str, device: torch.device) -> BatchPPOAutoregressiveAgent:
-    """Loads an agent's state from a checkpoint path."""
-    agent = _create_new_agent(model_type, device)
+def _load_agent_from_checkpoint(path: str, model_type: str, device: torch.device, compile_model: bool = False) -> BatchPPOAutoregressiveAgent:
+    """Loads an agent's state from a checkpoint path. Optionally compiles its model."""
+    agent = BatchPPOAutoregressiveAgent(device, f"loaded_{model_type}")
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     state_dict = checkpoint.get('model_state_dict', checkpoint)
     agent.load_models_from_checkpoint({"policy_nets": {"agent_model": state_dict}}, "agent_model")
     return agent
+
+def _clone_agent_from_agent(src_agent: BatchPPOAutoregressiveAgent, device: torch.device, compile_model: bool = False) -> BatchPPOAutoregressiveAgent:
+    """Create a new agent with the same architecture/weights as src_agent without disk I/O.
+    Avoids heuristic detection by reading dimensions directly from the source model.
+    Safely unwraps compiled models via '._orig_mod' when present.
+    """
+    if src_agent is None or src_agent.model is None:
+        raise ValueError("Source agent/model is None; cannot clone.")
+
+    src_model = getattr(src_agent.model, "_orig_mod", src_agent.model)
+
+    # Read construction args from the source model
+    obs_dim = getattr(src_model, "obs_dim")
+    action_dim = getattr(src_model, "action_dim", 7)
+    belief_dim = getattr(src_model, "belief_dim", 64)
+    hidden_dim = getattr(src_model, "hidden_dim", 256)
+    max_seq_length = getattr(src_model, "max_seq_length", 256)
+    use_shared_belief_head = getattr(src_model, "use_shared_belief_head", False)
+
+    # num_heads is not stored publicly; infer from transformer layer
+    encoder_layer = src_model.transformer.layers[0]
+    num_heads = encoder_layer.self_attn.num_heads if hasattr(encoder_layer.self_attn, 'num_heads') else 4
+
+    # Instantiate a fresh model with identical shape
+    new_model = PPOAutoregressiveModel(
+        obs_dim=obs_dim,
+        action_dim=action_dim,
+        belief_dim=belief_dim,
+        hidden_dim=hidden_dim,
+        num_heads=num_heads,
+        max_seq_length=max_seq_length,
+        use_shared_belief_head=use_shared_belief_head,
+    ).to(device)
+
+    # Load weights from the original (unwrapped) model
+    new_model.load_state_dict(src_model.state_dict(), strict=True)
+
+    new_agent = BatchPPOAutoregressiveAgent(device, f"clone_of_{src_agent.player_id}")
+    new_agent.model = new_model
+    # keep agent bookkeeping aligned
+    new_agent.max_seq_length = max_seq_length - 1 if isinstance(max_seq_length, int) else new_agent.max_seq_length
+    new_agent.label = getattr(src_agent, 'label', -1)
+    return new_agent
 
 class PlateauDetector:
     """Simple detector for training plateaus based on win rate improvement."""
@@ -155,9 +198,13 @@ class PlateauDetector:
 def train_generation(
     run_name: str,
     master_run_name: str,
-    warm_start_path: str,
     pool_manager: OpponentPoolManager,
-    max_updates: int = 5000
+    max_updates: int = 5000,
+    # New: pass a preloaded/compiled learner or a warm_start_path for backward-compat
+    learner: Optional[BatchPPOAutoregressiveAgent] = None,
+    warm_start_path: Optional[str] = None,
+    # New: cache for already loaded opponents/agents to avoid reloading
+    agent_cache: Optional[Dict[str, BatchPPOAutoregressiveAgent]] = None,
 ):
     """
     Trains a single generation of an agent until it plateaus.
@@ -175,7 +222,21 @@ def train_generation(
     logging.info(f"    TensorBoard Log Dir: {run_log_dir}")
     
     # 2. INITIALIZE LEARNER AND OPPONENTS
-    learner = _load_agent_from_checkpoint(warm_start_path, 'main', device)
+    if learner is None:
+        if not warm_start_path:
+            raise ValueError("Either 'learner' or 'warm_start_path' must be provided to train_generation.")
+        cache_key = f"ckpt:{os.path.abspath(warm_start_path)}"
+        if agent_cache is not None and cache_key in agent_cache:
+            learner = _clone_agent_from_agent(agent_cache[cache_key], device, compile_model=False)
+        else:
+            base_agent = _load_agent_from_checkpoint(warm_start_path, 'main', device, compile_model=False)
+            if agent_cache is not None:
+                agent_cache[cache_key] = base_agent  # keep a copy of the base
+            learner = _clone_agent_from_agent(base_agent, device, compile_model=False)
+    else:
+        # Ensure learner is on the correct device and compiled
+        learner.model = learner.model.to(device)
+        
     learner.model.train()
     
     optimizer = torch.optim.AdamW(learner.model.parameters(), lr=float(config.LEARNING_RATE))
@@ -211,7 +272,14 @@ def train_generation(
     for agent_def in pool_manager.pool:
         if agent_def['type'] != 'cpp_bot' and agent_def.get('path'):
             policy_id = int(agent_def['label'])
-            agent = _load_agent_from_checkpoint(agent_def['path'], agent_def.get('model_type', 'main'), device)
+            ckpt_path = agent_def['path']
+            cache_key = f"ckpt:{os.path.abspath(ckpt_path)}"
+            if agent_cache is not None and cache_key in agent_cache:
+                agent = agent_cache[cache_key]
+            else:
+                agent = _load_agent_from_checkpoint(ckpt_path, agent_def.get('model_type', 'main'), device, compile_model=False)
+                if agent_cache is not None:
+                    agent_cache[cache_key] = agent
             agent.model.eval()
             for p in agent.model.parameters():
                 p.requires_grad = False
@@ -324,11 +392,13 @@ def train_generation(
 
         if update % int(config.CHECKPOINT_INTERVAL) == 0:
             path = os.path.join(run_ckpt_dir, f"update_{update}.pth")
-            torch.save({'model_state_dict': learner.model.state_dict()}, path)
+            to_save = getattr(learner.model, "_orig_mod", learner.model)
+            torch.save({'model_state_dict': to_save.state_dict()}, path)
 
     # 5. FINALIZE AND SAVE
     final_path = os.path.join(run_ckpt_dir, "final.pth")
-    torch.save({'model_state_dict': learner.model.state_dict()}, final_path)
+    to_save = getattr(learner.model, "_orig_mod", learner.model)
+    torch.save({'model_state_dict': to_save.state_dict()}, final_path)
     pool_manager.add_agent(name=run_name, model_type='main', path=final_path)
     writer.close()
     logging.info(f"Saved final model for '{run_name}' to {final_path}")
@@ -353,6 +423,8 @@ if __name__ == "__main__":
     logging.info(f"Starting master self-play run: {master_run_name}")
     
     pool_manager = OpponentPoolManager(args.pool_file)
+    # Keep agents/models in memory across generations
+    agent_cache: Dict[str, BatchPPOAutoregressiveAgent] = {}
     initial_sl_path = args.sl_path
 
     # --- Step 1: Bootstrap Generation 1 (if it doesn't exist) ---
@@ -362,8 +434,9 @@ if __name__ == "__main__":
         train_generation(
             run_name=gen1_name,
             master_run_name=master_run_name,
+            pool_manager=pool_manager,
             warm_start_path=initial_sl_path,
-            pool_manager=pool_manager
+            agent_cache=agent_cache,
         )
 
     # --- Step 2: The Main Generational Loop ---
@@ -382,8 +455,9 @@ if __name__ == "__main__":
                 train_generation(
                     run_name=challenger_name,
                     master_run_name=master_run_name,
+                    pool_manager=pool_manager,
                     warm_start_path=initial_sl_path,
-                    pool_manager=pool_manager
+                    agent_cache=agent_cache,
                 )
         
         # The new generation is a clone of the previous one
@@ -392,10 +466,21 @@ if __name__ == "__main__":
         if not prev_gen_def:
             logging.error(f"Could not find previous generation champion '{prev_gen_name}' in pool. Exiting.")
             break
-        
+
+        # Reuse compiled previous-gen model from cache if available, to avoid disk I/O
+        prev_ckpt_key = f"ckpt:{os.path.abspath(prev_gen_def['path'])}"
+        if prev_ckpt_key not in agent_cache:
+            # Load once into cache (no compile)
+            agent_cache[prev_ckpt_key] = _load_agent_from_checkpoint(prev_gen_def['path'], 'main', torch.device(getattr(config, "DEVICE", "cuda" if torch.cuda.is_available() else "cpu")), compile_model=False)
+
+        # Clone from cached prev champion for the new learner
+        device = torch.device(getattr(config, "DEVICE", "cuda" if torch.cuda.is_available() else "cpu"))
+        new_learner = _clone_agent_from_agent(agent_cache[prev_ckpt_key], device, compile_model=False)
+
         train_generation(
             run_name=f"gen_{gen}",
             master_run_name=master_run_name,
-            warm_start_path=prev_gen_def['path'],
-            pool_manager=pool_manager
+            pool_manager=pool_manager,
+            learner=new_learner,
+            agent_cache=agent_cache,
         )
