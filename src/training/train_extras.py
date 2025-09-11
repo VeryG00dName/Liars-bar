@@ -398,15 +398,14 @@ def ppo_losses_batched(
     logits_at = action_logits.gather(1, our_idx.unsqueeze(-1).expand(-1, -1, A))  # [B,T,A]
 
     def _neg_inf_like(x: torch.Tensor) -> torch.Tensor:
-        # returns scalar tensor on same device/dtype with the most negative finite value
         return torch.tensor(torch.finfo(x.dtype).min, dtype=x.dtype, device=x.device)
     
     # Apply legality mask for OUR steps only (if provided)
     if batch.get("our_action_mask", None) is not None:
-        step_mask = batch["our_action_mask"].gather(  # [B,T,A]
+        step_mask = batch["our_action_mask"].gather(
             1, our_idx.unsqueeze(-1).expand(-1, -1, A)
         )
-        invalid_rows = (~step_mask).all(dim=-1)  # [B,T]
+        invalid_rows = (~step_mask).all(dim=-1)
         if invalid_rows.any():
             fb_cols = logits_at[invalid_rows].argmax(dim=-1)
             step_mask[invalid_rows] = False
@@ -414,63 +413,73 @@ def ppo_losses_batched(
         logits_at = logits_at.masked_fill(~step_mask, _neg_inf_like(logits_at))
 
     logits_at = torch.nan_to_num(logits_at, nan=0.0, posinf=0.0, neginf=float(torch.finfo(logits_at.dtype).min))
-    values_at = values_full.gather(1, our_idx)  # [B,T]
+    values_at = values_full.gather(1, our_idx)
     values_at = torch.nan_to_num(values_at, nan=0.0, posinf=0.0, neginf=0.0)
 
     # ---- Build "next" indices & gaps for irregular-step GAE ----
-    # next_idx[b,t] = our_idx[b,t+1], except last where no next
     next_idx = torch.full_like(our_idx, -1)
     if T > 1:
         next_idx[:, :-1] = our_idx[:, 1:]
-    has_next = next_idx.ge(0) & our_mask  # [B,T]
 
-    # gaps = (next - current), clamped >= 1; zero where no next
+    has_next = torch.zeros_like(our_mask)
+    if T > 1:
+        has_next[:, :-1] = our_mask[:, 1:]
+
     gaps = torch.zeros_like(our_idx, dtype=torch.long)
     valid_gap = has_next & our_mask
     gaps[valid_gap] = (next_idx[valid_gap] - our_idx[valid_gap]).clamp_min(1)
-
-
-    gamma_gap = (GAMMA ** gaps.to(torch.float32))   # [B,T]
-    lam_gap   = (GAE_LAMBDA   ** gaps.to(torch.float32))   # [B,T]
+    gamma_gap = (GAMMA ** gaps.to(torch.float32))
+    lam_gap   = (GAE_LAMBDA ** gaps.to(torch.float32))
 
     # ---- Irregular-step GAE (vectorized backward over T) ----
-    advantages = torch.zeros_like(values_at)
-    lastgaelam = torch.zeros((B,), device=values_at.device, dtype=torch.float32)
+    with torch.no_grad():
+        advantages = torch.zeros_like(values_at)
+        lastgaelam = torch.zeros((B,), device=values_at.device, dtype=torch.float32)
+        for t in reversed(range(T)):
+            g  = torch.where(has_next[:, t], gamma_gap[:, t], torch.zeros_like(gamma_gap[:, t]))
+            gl = torch.where(has_next[:, t], gamma_gap[:, t] * lam_gap[:, t], torch.zeros_like(gamma_gap[:, t]))
+            L = values_full.size(1)
+            idx_safe = next_idx[:, t].clamp(0, L - 1)
+            nv = torch.where(
+                has_next[:, t],
+                values_full.gather(1, idx_safe.unsqueeze(-1)).squeeze(-1),
+                torch.zeros_like(values_at[:, t]),
+            )
+            delta = rewards[:, t] + g * nv - values_at[:, t]
+            lastgaelam = delta + gl * lastgaelam
+            advantages[:, t] = lastgaelam
+            lastgaelam = torch.where(our_mask[:, t], lastgaelam, lastgaelam * 0.0)
+        returns = advantages + values_at
 
-    for t in reversed(range(T)):
-        g  = torch.where(has_next[:, t], gamma_gap[:, t], torch.zeros_like(gamma_gap[:, t]))
-        gl = torch.where(has_next[:, t], gamma_gap[:, t] * lam_gap[:, t], torch.zeros_like(gamma_gap[:, t]))
-        L = values_full.size(1)
-        idx_safe = next_idx[:, t].clamp(0, L - 1)  # <-- clamp_max added
-        nv = torch.where(
-            has_next[:, t],
-            values_full.gather(1, idx_safe.unsqueeze(-1)).squeeze(-1),
-            torch.zeros_like(values_at[:, t]),
-        )
-        delta = rewards[:, t] + g * nv - values_at[:, t]
-        lastgaelam = delta + gl * lastgaelam
-        advantages[:, t] = lastgaelam
-
-        # reset the accumulator where this time-step is invalid (keeps masked mean clean)
-        lastgaelam = torch.where(our_mask[:, t], lastgaelam, lastgaelam * 0.0)
-
-    returns = (advantages + values_at)
     # Normalize advantages using only valid positions
     m = our_mask.to(torch.float32)
-    adv_mean = (advantages * m).sum() / m.sum().clamp_min(1.0)
-    adv_var  = ((advantages - adv_mean) ** 2 * m).sum() / m.sum().clamp_min(1.0)
-    adv_std  = adv_var.clamp_min(1e-8).sqrt()
-    advantages = (advantages - adv_mean) / adv_std
+    adv_sum = (advantages * m).sum()
+    m_sum = m.sum().clamp_min(1.0)
+    adv_mean = adv_sum / m_sum
+    adv_var  = ((advantages - adv_mean).pow(2) * m).sum() / m_sum
+    adv_std  = torch.sqrt(adv_var)
+    advantages = (advantages - adv_mean) / (adv_std + 1e-8)
 
     # ---- PPO objective (masked) ----
     dist = torch.distributions.Categorical(logits=logits_at)
-    new_logp = dist.log_prob(actions).to(torch.float32)  # [B,T]
-    entropy  = dist.entropy().to(torch.float32)          # [B,T]
+    
+    # Replace padded actions (-100) with a valid placeholder (0) to prevent crash.
+    actions_for_log_prob = actions.masked_fill(~our_mask, 0)
+    
+    # Calculate log_prob and entropy. The results for padded steps are garbage.
+    new_logp = dist.log_prob(actions_for_log_prob).to(torch.float32)
+    entropy  = dist.entropy().to(torch.float32)
+
+    # CRITICAL FIX: Zero out the garbage values for padded steps.
+    new_logp = new_logp.where(our_mask, 0.0)
+    entropy = entropy.where(our_mask, 0.0)
+    # old_logp is already correctly zero for padded steps from the collate function.
 
     def masked_mean(x: torch.Tensor) -> torch.Tensor:
         w = our_mask.to(x.dtype)
         return (x * w).sum() / w.sum().clamp_min(1.0)
 
+    # The rest of the calculation is now safe.
     log_ratio = (new_logp - old_logp).clamp(min=-60.0, max=60.0)
     ratio = log_ratio.exp()
 
@@ -480,6 +489,7 @@ def ppo_losses_batched(
     surr1 = ratio * advantages
     surr2 = r_clipped * advantages
     policy_loss = -masked_mean(torch.min(surr1, surr2))
+    
     with torch.no_grad():
         neg_mask = (advantages < 0) & our_mask
         trinal_clip_neg_frac = ((ratio > (1.0 + EPS_CLIP)) & neg_mask).float()
@@ -491,12 +501,17 @@ def ppo_losses_batched(
     clipfrac  = masked_mean(((ratio - 1.0).abs() > EPS_CLIP).float())
 
     # ---- Value loss ----
-    value_loss, vclip_frac = _value_loss_with_stakes_clip_public(
-        v_pred=values_at[our_mask],
-        returns=returns[our_mask],
-        action_ids=actions[our_mask],
-        penalties_used=batch["penalties_used"][our_mask].long(),
-    )
+    # Ensure we only compute value loss on valid, unpadded steps
+    if our_mask.any():
+        value_loss, vclip_frac = _value_loss_with_stakes_clip_public(
+            v_pred=values_at[our_mask],
+            returns=returns[our_mask],
+            action_ids=actions[our_mask],
+            penalties_used=batch["penalties_used"][our_mask].long(),
+        )
+    else: # Handle empty batch case
+        value_loss = torch.tensor(0.0, device=values_at.device)
+        vclip_frac = torch.tensor(0.0, device=values_at.device)
     
     total = policy_loss + VALUE_WEIGHT * value_loss + entropy_loss
 
@@ -514,14 +529,14 @@ def ppo_losses_batched(
     if (BC_KL_WEIGHT > 0.0) and (sl_teacher is not None):
         with torch.no_grad():
             t_outs = sl_teacher(**mi)
-            t_logits = t_outs[0]  # [B, L, A]
+            t_logits = t_outs[0]
             t_logits_at = t_logits.gather(1, our_idx.unsqueeze(-1).expand(-1, -1, A))
             if batch.get("our_action_mask", None) is not None:
                 step_mask = batch["our_action_mask"].gather(1, our_idx.unsqueeze(-1).expand(-1, -1, A))
                 t_logits_at = t_logits_at.masked_fill(~step_mask, _neg_inf_like(t_logits_at))
             t_logits_at = torch.nan_to_num(t_logits_at, nan=0.0, posinf=0.0, neginf=float(torch.finfo(t_logits_at.dtype).min))
         dist_sl = torch.distributions.Categorical(logits=t_logits_at)
-        bc_kl = torch.distributions.kl_divergence(dist, dist_sl)  # [B,T]
+        bc_kl = torch.distributions.kl_divergence(dist, dist_sl)
         bc_kl = masked_mean(bc_kl)
         total = total + BC_KL_WEIGHT * bc_kl
         metrics["bc_kl"] = bc_kl.detach()
@@ -532,11 +547,11 @@ def ppo_losses_batched(
     def _belief_aux(b_logits: Optional[torch.Tensor],
                     tgt: Optional[torch.Tensor],
                     msk: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        if b_logits is None or tgt is None or msk is None:
+        if b_logits is None or tgt is None or msk is None or not msk.any():
             z = torch.zeros((), device=values_full.device)
             return z, z
         C = b_logits.size(-1)
-        b_sel = b_logits.gather(1, our_idx.unsqueeze(-1).expand(-1, -1, C))  # [B,T,C]
+        b_sel = b_logits.gather(1, our_idx.unsqueeze(-1).expand(-1, -1, C))
         ce = torch.nn.functional.cross_entropy(
             b_sel.flatten(0,1), tgt.view(-1),
             ignore_index=-100, reduction="none"
@@ -570,7 +585,7 @@ def ppo_losses_batched(
             A_opp = opp_logits.size(-1)
             opp_sel = opp_logits.gather(
                 1, batch["opp_idx"].unsqueeze(-1).expand(-1, -1, A_opp)
-            )  # [B,To,A]
+            )
             ce_opp = torch.nn.functional.cross_entropy(
                 opp_sel.flatten(0,1), batch["opp_targets"].view(-1),
                 ignore_index=-100, reduction="none"
@@ -648,23 +663,30 @@ def _collate_batch(
         return torch.cat([v, z], dim=1)
 
     # -------- build batched model inputs (time-major tensors only) --------
-    common_keys = set(episodes[0]["model_input"].keys())
-    for ep in episodes[1:]:
-        common_keys &= set(ep["model_input"].keys())
+    # --- FIX: ROBUST KEY HANDLING ---
+    EXPECTED_MI_KEYS = {
+        "obs_sequence", "action_sequence", "agent_types",
+        "positions", "action_masks"
+    }
 
-    # we will REBUILD both 'valid_lengths' and 'padding_mask' — exclude the cached mask
-    skip_keys = {"padding_mask", "valid_lengths"}
     mi_batch: Dict[str, torch.Tensor] = {}
-    for k in sorted(common_keys - skip_keys):
-        vs = [ep["model_input"][k] for ep in episodes]
-        if not all(torch.is_tensor(v) for v in vs):  # only tensors
+    for k in sorted(list(EXPECTED_MI_KEYS)):
+        vs = [ep["model_input"].get(k) for ep in episodes]
+
+        valid_vs = [v for v in vs if v is not None and torch.is_tensor(v) and v.dim() >= 2]
+        if not valid_vs:
             continue
-        if not all(v.dim() >= 2 for v in vs):       # only time-major tensors
+
+        if len(valid_vs) != len(vs):
+            print(f"Warning: Key '{k}' missing in some episodes, skipping for this batch.")
             continue
-        padded = [_pad_trim(v, L_pad) for v in vs]   # each [1, L_pad, ...]
-        cat = torch.cat(padded, dim=0).contiguous()  # [B, L_pad, ...]
-        if pin_memory: cat = cat.pin_memory()
+
+        padded = [_pad_trim(v, L_pad) for v in vs]
+        cat = torch.cat(padded, dim=0).contiguous()
+        if pin_memory:
+            cat = cat.pin_memory()
         mi_batch[k] = cat
+    # --- END FIX ---
 
     # ---- REBUILD valid_lengths and padding_mask from the true lengths ----
     valid_lengths = torch.tensor([min(l, L_pad) for l in raw_lens], dtype=torch.long)
@@ -711,8 +733,9 @@ def _collate_batch(
         return x.pin_memory() if pin_memory else x
 
     our_idx    = _pm(torch.zeros((B, T),  dtype=torch.long))
+    # --- FIX: PRECISE MASKING BASED ON LOGGED DATA ---
     our_mask   = _pm(torch.zeros((B, T),  dtype=torch.bool))
-    actions    = _pm(torch.zeros((B, T),  dtype=torch.long))
+    actions    = _pm(torch.full((B, T), IGN, dtype=torch.long))
     old_logp   = _pm(torch.zeros((B, T),  dtype=torch.float32))
     rewards    = _pm(torch.zeros((B, T),  dtype=torch.float32))
     pen_used   = _pm(torch.zeros((B, T),  dtype=torch.long))
@@ -733,33 +756,37 @@ def _collate_batch(
         # OUR timeline
         our_pos = our_pos_lists[b]
         K = int(our_pos.numel())
-        K_fill = min(T, K)
-        if K_fill > 0:
-            our_idx[b, :K_fill] = our_pos[:K_fill]
-            our_mask[b, :K_fill] = True
 
-            our_ep_idx = [i for i, seat in enumerate(ep["agent_id"]) if seat == ep["training_agent_seat"]]
-            for t_local in range(K_fill):
-                if t_local >= len(our_ep_idx):
-                    break
-                step_ep = our_ep_idx[t_local]
+        our_ep_idx = [i for i, seat in enumerate(ep["agent_id"]) if seat == ep["training_agent_seat"]]
 
-                a  = ep["our_action"][step_ep] if step_ep < len(ep["our_action"]) else None
-                lp = ep["log_prob"][step_ep]   if step_ep < len(ep["log_prob"])   else None
-                rw = ep["reward"][step_ep]     if step_ep < len(ep["reward"])     else 0.0
-                pu = ep["penalties_used"][step_ep] if step_ep < len(ep["penalties_used"]) else 0
+        for t_local in range(min(T, K)):
+            if t_local >= len(our_ep_idx):
+                break
+            step_ep = our_ep_idx[t_local]
 
-                if a is not None:  actions[b, t_local] = int(a)
-                if lp is not None: old_logp[b, t_local] = float(lp)
-                rewards[b, t_local]  = float(rw)
-                pen_used[b, t_local] = int(pu)
+            lp = ep["log_prob"][step_ep] if step_ep < len(ep["log_prob"]) else None
+            if lp is None:
+                continue  # Do not mark this step as valid for training.
 
-                lb0 = ep.get("belief_tgt0", [None]*len(ep["agent_id"]))[step_ep]
-                lb1 = ep.get("belief_tgt1", [None]*len(ep["agent_id"]))[step_ep]
-                lb2 = ep.get("belief_tgt2", [None]*len(ep["agent_id"]))[step_ep]
-                if lb0 is not None: belief_tgt0[b, t_local] = int(lb0); belief0_mask[b, t_local] = True
-                if lb1 is not None: belief_tgt1[b, t_local] = int(lb1); belief1_mask[b, t_local] = True
-                if lb2 is not None: belief_tgt2[b, t_local] = int(lb2); belief2_mask[b, t_local] = True
+            our_mask[b, t_local] = True
+            our_idx[b, t_local] = our_pos[t_local]
+
+            a  = ep["our_action"][step_ep] if step_ep < len(ep["our_action"]) else None
+            rw = ep["reward"][step_ep]     if step_ep < len(ep["reward"])     else 0.0
+            pu = ep["penalties_used"][step_ep] if step_ep < len(ep["penalties_used"]) else 0
+
+            if a is not None:
+                actions[b, t_local] = int(a)
+            old_logp[b, t_local] = float(lp)
+            rewards[b, t_local]  = float(rw)
+            pen_used[b, t_local] = int(pu)
+
+            lb0 = ep.get("belief_tgt0", [None]*len(ep["agent_id"]))[step_ep]
+            lb1 = ep.get("belief_tgt1", [None]*len(ep["agent_id"]))[step_ep]
+            lb2 = ep.get("belief_tgt2", [None]*len(ep["agent_id"]))[step_ep]
+            if lb0 is not None: belief_tgt0[b, t_local] = int(lb0); belief0_mask[b, t_local] = True
+            if lb1 is not None: belief_tgt1[b, t_local] = int(lb1); belief1_mask[b, t_local] = True
+            if lb2 is not None: belief_tgt2[b, t_local] = int(lb2); belief2_mask[b, t_local] = True
 
         # OPP timeline (labels optional)
         opp_pos = opp_pos_lists[b]

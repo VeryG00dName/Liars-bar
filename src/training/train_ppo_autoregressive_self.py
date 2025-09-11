@@ -119,7 +119,7 @@ def _create_new_agent(agent_type: str, device: torch.device) -> BatchPPOAutoregr
     agent.model = model.to(device)
     return agent
 
-def _load_agent_from_checkpoint(path: str, model_type: str, device: torch.device, compile_model: bool = False) -> BatchPPOAutoregressiveAgent:
+def _load_agent_from_checkpoint(path: str, model_type: str, device: torch.device) -> BatchPPOAutoregressiveAgent:
     """Loads an agent's state from a checkpoint path. Optionally compiles its model."""
     agent = BatchPPOAutoregressiveAgent(device, f"loaded_{model_type}")
     checkpoint = torch.load(path, map_location=device, weights_only=False)
@@ -127,7 +127,7 @@ def _load_agent_from_checkpoint(path: str, model_type: str, device: torch.device
     agent.load_models_from_checkpoint({"policy_nets": {"agent_model": state_dict}}, "agent_model")
     return agent
 
-def _clone_agent_from_agent(src_agent: BatchPPOAutoregressiveAgent, device: torch.device, compile_model: bool = False) -> BatchPPOAutoregressiveAgent:
+def _clone_agent_from_agent(src_agent: BatchPPOAutoregressiveAgent, device: torch.device) -> BatchPPOAutoregressiveAgent:
     """Create a new agent with the same architecture/weights as src_agent without disk I/O.
     Avoids heuristic detection by reading dimensions directly from the source model.
     Safely unwraps compiled models via '._orig_mod' when present.
@@ -143,7 +143,7 @@ def _clone_agent_from_agent(src_agent: BatchPPOAutoregressiveAgent, device: torc
     belief_dim = getattr(src_model, "belief_dim", 64)
     hidden_dim = getattr(src_model, "hidden_dim", 256)
     max_seq_length = getattr(src_model, "max_seq_length", 256)
-    use_shared_belief_head = getattr(src_model, "use_shared_belief_head", False)
+    use_shared_belief_head = getattr(src_model, "use_shared_belief_head", True)
 
     # num_heads is not stored publicly; infer from transformer layer
     encoder_layer = src_model.transformer.layers[0]
@@ -227,12 +227,12 @@ def train_generation(
             raise ValueError("Either 'learner' or 'warm_start_path' must be provided to train_generation.")
         cache_key = f"ckpt:{os.path.abspath(warm_start_path)}"
         if agent_cache is not None and cache_key in agent_cache:
-            learner = _clone_agent_from_agent(agent_cache[cache_key], device, compile_model=False)
+            learner = _clone_agent_from_agent(agent_cache[cache_key], device)
         else:
-            base_agent = _load_agent_from_checkpoint(warm_start_path, 'main', device, compile_model=False)
+            base_agent = _load_agent_from_checkpoint(warm_start_path, 'main', device)
             if agent_cache is not None:
                 agent_cache[cache_key] = base_agent  # keep a copy of the base
-            learner = _clone_agent_from_agent(base_agent, device, compile_model=False)
+            learner = _clone_agent_from_agent(base_agent, device)
     else:
         # Ensure learner is on the correct device and compiled
         learner.model = learner.model.to(device)
@@ -277,7 +277,7 @@ def train_generation(
             if agent_cache is not None and cache_key in agent_cache:
                 agent = agent_cache[cache_key]
             else:
-                agent = _load_agent_from_checkpoint(ckpt_path, agent_def.get('model_type', 'main'), device, compile_model=False)
+                agent = _load_agent_from_checkpoint(ckpt_path, agent_def.get('model_type', 'main'), device)
                 if agent_cache is not None:
                     agent_cache[cache_key] = agent
             agent.model.eval()
@@ -471,11 +471,11 @@ if __name__ == "__main__":
         prev_ckpt_key = f"ckpt:{os.path.abspath(prev_gen_def['path'])}"
         if prev_ckpt_key not in agent_cache:
             # Load once into cache (no compile)
-            agent_cache[prev_ckpt_key] = _load_agent_from_checkpoint(prev_gen_def['path'], 'main', torch.device(getattr(config, "DEVICE", "cuda" if torch.cuda.is_available() else "cpu")), compile_model=False)
+            agent_cache[prev_ckpt_key] = _load_agent_from_checkpoint(prev_gen_def['path'], 'main', torch.device(getattr(config, "DEVICE", "cuda" if torch.cuda.is_available() else "cpu")))
 
         # Clone from cached prev champion for the new learner
         device = torch.device(getattr(config, "DEVICE", "cuda" if torch.cuda.is_available() else "cpu"))
-        new_learner = _clone_agent_from_agent(agent_cache[prev_ckpt_key], device, compile_model=False)
+        new_learner = _clone_agent_from_agent(agent_cache[prev_ckpt_key], device)
 
         train_generation(
             run_name=f"gen_{gen}",

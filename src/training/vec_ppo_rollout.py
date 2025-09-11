@@ -170,13 +170,7 @@ class PPOVecRolloutManager:
                             ep_tracker['data']['belief_pred2'][step_idx] = beliefs[2]
                         # save the penalties we snapped pre-step
                         ep_tracker['data']['penalties_used'][step_idx] = int(data['penalties_used'])
-
-                        # assign terminal reward if episode ended on our action
-                        if done_statuses[env_idx]:
-                            if env.terminations[ep_tracker['training_agent_seat']]:
-                                ep_tracker['data']['reward'][step_idx] = -1.0
                 else:
-                    # opponent step (we still add a row for alignment, but don't need penalties)
                     step_idx = self._append_step_row(ep_tracker, entry['player'])
                     ep_tracker['data']['opp_target_action'][step_idx] = entry['action']
 
@@ -207,11 +201,27 @@ class PPOVecRolloutManager:
             if beliefs and len(beliefs) > 2: ep_data['belief_pred2'][step_idx] = beliefs[2]
             ep_data['penalties_used'][step_idx] = int(data['penalties_used'])
 
+        # --- FIX: ROBUST TERMINAL REWARD ASSIGNMENT ---
+        # Find our last step in the episode to assign the terminal reward,
+        # regardless of who made the final move.
+        our_last_step_idx = -1
+        try:
+            our_last_step_idx = (
+                len(ep_data['agent_id']) - 1 - ep_data['agent_id'][::-1].index(seat)
+            )
+        except ValueError:
+            # Our agent never acted in this episode.
+            pass
+
         # Win/lose bookkeeping
         is_winner = (not env.terminations[seat]) and (sum(env.terminations) == env.num_players() - 1)
         ep_data['win'] = 1 if is_winner else 0
-        if ep_data['agent_id'] and ep_data['agent_id'][-1] == seat:
-            ep_data['reward'][-1] = 1.0 if is_winner else -1.0
+
+        # If we actually took an action, assign the final reward to our last step.
+        if our_last_step_idx != -1:
+            ep_data['reward'][our_last_step_idx] = 1.0 if is_winner else -1.0
+        # --- END FIX ---
+
         ep_data['episode_return'] = float(sum(ep_data['reward']))
 
         # Persist the exact model_input used for the final forward on this env/seat
