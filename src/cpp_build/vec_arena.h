@@ -17,12 +17,14 @@ struct PolicyRequest {
 
         // For classic C++ bots
         float classic_obs[3 + Env::MAX_PLAYERS]{};
+        int   classic_obs_len = 0;
 
         // For AI models (pre-built sequence)
         float   obs_sequence[MAX_LEN][OBS_DIM]{};
         int64_t action_sequence[MAX_LEN]{};
         int64_t agent_type_sequence[MAX_LEN]{};
         int64_t position_sequence[MAX_LEN]{};
+        uint8_t action_mask_sequence[MAX_LEN][7]{};
         int     valid_len = 0;
 };
 

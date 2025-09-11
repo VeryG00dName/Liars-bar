@@ -206,11 +206,13 @@ PYBIND11_MODULE(lb, m) {
         .def_readonly("seat", &PolicyRequest::seat)
         .def_property_readonly("mask", [](PolicyRequest& r){return py::array_t<uint8_t>({7}, r.mask);})
         .def_readonly("done", &PolicyRequest::done)
-        .def_property_readonly("classic_obs", [](PolicyRequest& r){return py::array_t<float>({3 + Env::MAX_PLAYERS}, r.classic_obs);})
+        .def_property_readonly("classic_obs", [](PolicyRequest& r){return py::array_t<float>({(size_t)std::max(0, r.classic_obs_len)}, r.classic_obs);})
+        .def_readonly("classic_obs_len", &PolicyRequest::classic_obs_len)
         .def_property_readonly("obs_sequence", [](PolicyRequest& r){return py::array_t<float>({r.valid_len, OBS_DIM}, r.obs_sequence[0]);})
         .def_property_readonly("action_sequence", [](PolicyRequest& r){return py::array_t<int64_t>({r.valid_len}, r.action_sequence);})
         .def_property_readonly("agent_type_sequence", [](PolicyRequest& r){return py::array_t<int64_t>({r.valid_len}, r.agent_type_sequence);})
         .def_property_readonly("position_sequence", [](PolicyRequest& r){return py::array_t<int64_t>({r.valid_len}, r.position_sequence);})
+        .def_property_readonly("action_mask_sequence", [](PolicyRequest& r){return py::array_t<uint8_t>({r.valid_len, 7}, r.action_mask_sequence[0]);})
         .def_readonly("valid_len", &PolicyRequest::valid_len);
 
     py::class_<VecArena>(m, "VecArena")

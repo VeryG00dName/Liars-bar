@@ -124,7 +124,7 @@ VALUE_WEIGHT      = 1     # value loss weight
 # ============================
 # Teacher KL / Behavior Cloning Leash
 # ============================
-BC_KL_WEIGHT = 0.002  # typical exploration range: 1e-4 .. 1e-2 (decay in code if desired)
+BC_KL_WEIGHT = 0  # typical exploration range: 1e-4 .. 1e-2 (decay in code if desired)
 
 # ============================
 # Trinal-Clip PPO (Policy) — Optional

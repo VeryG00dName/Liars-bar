@@ -796,6 +796,8 @@ def _collate_batch(
 def _to_device_batch(batch_cpu: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
     """Move a collated CPU batch (with nested 'mi' dict) to device."""
     mi_dev = {k: v.to(device, non_blocking=True) for k, v in batch_cpu["mi"].items()}
+    oam = batch_cpu.get("our_action_mask", None)
+    oam_dev = oam.to(device, non_blocking=True) if (oam is not None) else None
     out = {
         "mi": mi_dev,
         "our_idx":        batch_cpu["our_idx"].to(device, non_blocking=True),
@@ -804,7 +806,7 @@ def _to_device_batch(batch_cpu: Dict[str, Any], device: torch.device) -> Dict[st
         "old_logp":       batch_cpu["old_logp"].to(device, non_blocking=True),
         "rewards":        batch_cpu["rewards"].to(device, non_blocking=True),
         "penalties_used": batch_cpu["penalties_used"].to(device, non_blocking=True),
-        "our_action_mask":batch_cpu["our_action_mask"].to(device, non_blocking=True),
+        "our_action_mask": oam_dev,
         "belief_tgt0":    batch_cpu["belief_tgt0"].to(device, non_blocking=True),
         "belief_tgt1":    batch_cpu["belief_tgt1"].to(device, non_blocking=True),
         "belief_tgt2":    batch_cpu["belief_tgt2"].to(device, non_blocking=True),

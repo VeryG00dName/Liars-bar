@@ -221,8 +221,8 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
 
         device = self.device
         all_obs, all_actions, all_agents, all_pos = [], [], [], []
+        all_masks = []
         valid_lengths = []
-        mask_batch = []
 
         for req in requests:
             L = int(req.valid_len)
@@ -235,14 +235,16 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
             all_agents.append(ag)
             all_pos.append(pos)
             valid_lengths.append(L)
-            mask_batch.append(np.array(req.mask, dtype=np.uint8))
+            # full sequence action masks [L,7]
+            mseq = torch.from_numpy(np.array(req.action_mask_sequence[:L], dtype=np.uint8)).to(torch.bool)
+            all_masks.append(mseq)
 
             self._last_model_input[(req.env, req.seat)] = {
                 "obs_sequence":    obs.unsqueeze(0).cpu(),
                 "action_sequence": act.unsqueeze(0).cpu(),
                 "agent_types":     ag.unsqueeze(0).cpu(),
                 "positions":       pos.unsqueeze(0).cpu(),
-                "action_masks":    None,
+                "action_masks":    mseq.unsqueeze(0).cpu(),
                 "padding_mask":    torch.zeros(1, L, dtype=torch.bool),
                 "valid_lengths":   torch.tensor([L], dtype=torch.long),
             }
@@ -251,6 +253,7 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
         actions_padded = torch.nn.utils.rnn.pad_sequence(all_actions, batch_first=True, padding_value=0  ).to(device)
         agents_padded  = torch.nn.utils.rnn.pad_sequence(all_agents,  batch_first=True, padding_value=0  ).to(device)
         pos_padded     = torch.nn.utils.rnn.pad_sequence(all_pos,     batch_first=True, padding_value=0  ).to(device)
+        masks_padded   = torch.nn.utils.rnn.pad_sequence(all_masks,   batch_first=True, padding_value=0  ).to(device)
         Lmax = actions_padded.size(1)
 
         valid_lengths_t = torch.tensor(valid_lengths, dtype=torch.long, device=device)
@@ -262,7 +265,7 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
             'action_sequence': actions_padded,
             'agent_types':     agents_padded,
             'positions':       pos_padded,
-            'action_masks':    None,
+            'action_masks':    masks_padded,
             'padding_mask':    padding_mask,
             'valid_lengths':   valid_lengths_t,
         }
@@ -273,7 +276,8 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
         logits_last = action_logits[rows, last_idx, :]
         values_last = state_values[rows, last_idx].squeeze(-1)
 
-        step_mask = torch.as_tensor(np.array(mask_batch), dtype=torch.bool, device=device)
+        # Use the current-step legality mask from sequence masks
+        step_mask = masks_padded[rows, last_idx, :]
         logits_last = logits_last.masked_fill(~step_mask, float("-inf"))
 
         dist = torch.distributions.Categorical(logits=logits_last)

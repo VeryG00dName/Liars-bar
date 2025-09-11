@@ -1,6 +1,8 @@
 # src/training/vec_ppo_rollout.py
 
 from typing import Dict, Any, List
+import logging
+import time
 import numpy as np
 import torch
 from src.misc import lb
@@ -45,8 +47,13 @@ class PPOVecRolloutManager:
                          num_episodes: int,
                          num_players: int,
                          training_policy_id: int = 0,
-                         opponent_pool: List[lb.BotKind] = None) -> List[Dict[str, Any]]:
-        batch_size = self.arena.B if self.arena.B > 0 else num_episodes
+                         opponent_pool: List[int] = None,
+                         max_batch_envs: int = None) -> List[Dict[str, Any]]:
+        batch_guess = self.arena.B if self.arena.B > 0 else num_episodes
+        if max_batch_envs is not None:
+            batch_size = int(min(batch_guess, max_batch_envs))
+        else:
+            batch_size = int(batch_guess)
         self.arena.reset(batch=batch_size, players=num_players, seed=np.random.randint(0, 2**31))
 
         roles = self._setup_roles(batch_size, num_players, training_policy_id, opponent_pool)
@@ -58,12 +65,34 @@ class PPOVecRolloutManager:
         # keyed by env_idx only
         pending_data: Dict[int, Dict[str, Any]] = {}
 
+        iter_count = 0
+        last_done_count = 0
         while len(completed_episodes) < num_episodes:
+            t0 = time.time() if 'time' in globals() else None
             requests_by_policy = self.arena.collect_requests()
+            if t0 is not None:
+                dt = time.time() - t0
+                if dt > 2.0:
+                    logging.warning(f"collect_requests took {dt:.2f}s (batch={batch_size})")
             if not requests_by_policy:
                 break
 
             self._log_rewards_and_dones(episodes, pending_data)
+
+            # Safety: ensure every returned policy id has a handler
+            missing = [pid for pid in requests_by_policy.keys() if pid not in self.policies]
+            if missing:
+                logging.error(f"Missing policy handlers for ids: {missing}. Available: {list(self.policies.keys())}")
+                raise RuntimeError(f"No policy object for ids: {missing}")
+
+            # Progress watchdog
+            iter_count += 1
+            done_now = sum(1 for ep in episodes if ep['done'])
+            if iter_count % 500 == 0:
+                logging.info(f"[rollout] iter={iter_count} done={done_now}/{batch_size}")
+            if iter_count % 5000 == 0 and done_now == last_done_count:
+                logging.warning(f"[rollout] no progress for 5000 iters; still {done_now} done. Keys: {list(requests_by_policy.keys())}")
+            last_done_count = done_now
 
             for policy_id, reqs in requests_by_policy.items():
                 if policy_id not in self.policies:
@@ -82,19 +111,21 @@ class PPOVecRolloutManager:
 
                 self.arena.submit_actions(policy_id, actions)
 
-                for i, req in enumerate(reqs):
-                    env_idx = req.env
-                    ep = episodes[env_idx]
-                    if ep['done']:
-                        continue
-                    step_idx = self._append_step_row(ep, ep['training_agent_seat'])
-                    ep['data']['our_action'][step_idx] = actions[i]
-                    pending_data[env_idx] = {
-                        "log_prob": log_probs[i],
-                        "value": values[i],
-                        "belief_preds": beliefs[i],
-                        "penalties_used": penalties_snapshot[i],
-                    }
+                # Only log our action rows when the training policy acted
+                if policy_id == training_policy_id:
+                    for i, req in enumerate(reqs):
+                        env_idx = req.env
+                        ep = episodes[env_idx]
+                        if ep['done']:
+                            continue
+                        step_idx = self._append_step_row(ep, ep['training_agent_seat'])
+                        ep['data']['our_action'][step_idx] = actions[i]
+                        pending_data[env_idx] = {
+                            "log_prob": log_probs[i],
+                            "value": values[i],
+                            "belief_preds": beliefs[i],
+                            "penalties_used": penalties_snapshot[i],
+                        }
 
         # flush last chunk
         self._log_rewards_and_dones(episodes, pending_data)

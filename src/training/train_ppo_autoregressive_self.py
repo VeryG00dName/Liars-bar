@@ -30,6 +30,7 @@ from src.misc import lb
 from src import config
 from src.model.ppo_autoregressive_model import PPOAutoregressiveModel
 from src.agents.batch_autoregressive_ppo_agent import BatchPPOAutoregressiveAgent
+from src.agents.cpp_bot_wrapper import CppBotWrapper
 from src.training.vec_ppo_rollout import PPOVecRolloutManager
 from src.training.train_extras import _collate_batch, _to_device_batch, ppo_losses_batched
 
@@ -70,29 +71,17 @@ class OpponentPoolManager:
         except FileNotFoundError:
             print(f"Pool file '{self.filepath}' not found. Initializing with base C++ bots.")
 
-            # --- CORRECTED PART ---
-            # Manually list the members of the pybind11-bound enum
-            all_bot_kinds = [
-                lb.BotKind.Classic,
-                lb.BotKind.GreedyCardSpammer,
-                lb.BotKind.RandomAgent,
-                lb.BotKind.SelectiveTableConservativeChallenger,
-                lb.BotKind.StrategicChallenger,
-                lb.BotKind.TableFirstConservativeChallenger,
-                lb.BotKind.TableNonTableAgent
-            ]
-
+            # Initialize with base C++ bots using fixed labels 0..6
+            # Labels < 7 are treated by C++ as classic C++ bots (classic_obs path)
             base_bots = [
-                {
-                    "name": kind.name,
-                    "type": "cpp_bot",
-                    "model_type": "cpp_bot",
-                    "label": kind.value,
-                    "path": None
-                }
-                for kind in all_bot_kinds
+                {"name": "Classic",                             "type": "cpp_bot", "model_type": "cpp_bot", "label": 0, "path": None},
+                {"name": "GreedyCardSpammer",                   "type": "cpp_bot", "model_type": "cpp_bot", "label": 1, "path": None},
+                {"name": "RandomAgent",                        "type": "cpp_bot", "model_type": "cpp_bot", "label": 2, "path": None},
+                {"name": "SelectiveTableConservativeChallenger","type": "cpp_bot", "model_type": "cpp_bot", "label": 3, "path": None},
+                {"name": "StrategicChallenger",                "type": "cpp_bot", "model_type": "cpp_bot", "label": 4, "path": None},
+                {"name": "TableFirstConservativeChallenger",   "type": "cpp_bot", "model_type": "cpp_bot", "label": 5, "path": None},
+                {"name": "TableNonTableAgent",                 "type": "cpp_bot", "model_type": "cpp_bot", "label": 6, "path": None},
             ]
-            # --- END OF CORRECTION ---
             
             self._save(base_bots)
             return base_bots
@@ -191,18 +180,52 @@ def train_generation(
     
     optimizer = torch.optim.AdamW(learner.model.parameters(), lr=float(config.LEARNING_RATE))
     scaler = amp.GradScaler(enabled=(device.type == "cuda"))
-    sl_teacher = copy.deepcopy(learner.model).eval()
-    for p in sl_teacher.parameters(): p.requires_grad = False
     
-    policy_map = {0: learner}
+    # Build unified policy map: include C++ bot wrappers for labels 0..6,
+    # historical AI agents at their stored labels (>=7), and the current learner.
+    policy_map: Dict[int, Any] = {}
+
+    # Map labels to C++ bot classes from lb (check existence explicitly)
+    cpp_bot_names = {
+        0: "Classic",
+        1: "GreedyCardSpammer",
+        2: "RandomAgent",
+        3: "SelectiveTableConservativeChallenger",
+        4: "StrategicChallenger",
+        5: "TableFirstConservativeChallenger",
+        6: "TableNonTableAgent",
+    }
+    for label, name in cpp_bot_names.items():
+        if not hasattr(lb, name):
+            logging.error(f"lb missing C++ bot class '{name}' — cannot register wrapper for label {label}")
+            continue
+        cls = getattr(lb, name)
+        try:
+            wrapper = CppBotWrapper(cls, label=label, device=device, player_id=f"cpp_{label}")
+            policy_map[label] = wrapper
+        except Exception as e:
+            logging.exception(f"Failed to create CppBotWrapper for '{name}' (label {label}): {e}")
+
+    # Add historical AI agents using their stored labels (>=7)
+    used_labels = set([a['label'] for a in pool_manager.pool if a['type'] != 'cpp_bot' and 'label' in a])
     for agent_def in pool_manager.pool:
-        if agent_def['type'] != 'cpp_bot':
-            policy_id = len(policy_map)
+        if agent_def['type'] != 'cpp_bot' and agent_def.get('path'):
+            policy_id = int(agent_def['label'])
             agent = _load_agent_from_checkpoint(agent_def['path'], agent_def.get('model_type', 'main'), device)
             agent.model.eval()
-            for p in agent.model.parameters(): p.requires_grad = False
+            for p in agent.model.parameters():
+                p.requires_grad = False
+            agent.label = policy_id
             policy_map[policy_id] = agent
-            agent_def['policy_id'] = policy_id
+
+    # Assign a training policy id >= 7 that doesn't collide with existing labels
+    training_policy_id = 7
+    while training_policy_id in policy_map:
+        training_policy_id += 1
+    learner.label = training_policy_id
+    policy_map[training_policy_id] = learner
+
+    logging.info(f"Registered policies: {sorted(list(policy_map.keys()))}")
 
     # 3. INITIALIZE ARENA, ROLLOUT MANAGER, AND PLATEAU DETECTOR
     arena = lb.VecArena()
@@ -219,8 +242,9 @@ def train_generation(
         new_eps = rollout_manager.collect_episodes(
             num_episodes=episodes_per_update,
             num_players=4,
-            training_policy_id=0,
-            full_pool_def=pool_manager.pool
+            training_policy_id=training_policy_id,
+            opponent_pool=[int(a['label']) for a in pool_manager.pool if a['type'] == 'cpp_bot' or a['type'] == 'historical'],
+            max_batch_envs=int(getattr(config, "EPISODES_PER_UPDATE", 256))
         )
         if not new_eps:
             logging.warning(f"Update {update}: No episodes collected. Skipping.")
@@ -240,7 +264,7 @@ def train_generation(
             
             optimizer.zero_grad()
             with amp.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == "cuda")):
-                total_loss, metrics = ppo_losses_batched(learner.model, batch_gpu, sl_teacher=sl_teacher)
+                total_loss, metrics = ppo_losses_batched(learner.model, batch_gpu, sl_teacher=None)
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
             clip_grad_norm_(learner.model.parameters(), max_norm=float(config.MAX_NORM))
@@ -275,7 +299,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Master Self-Play Loop for PPO Autoregressive Agent")
     parser.add_argument("--pool-file", type=str, default="opponent_pool.json", help="Path to the opponent pool JSON file.")
     parser.add_argument("--sl-path", type=str, default=config.SL_TEACHER_CKPT, help="Path to the initial supervised learning checkpoint.")
-    parser.add_argument("--max-gens", type=int, default=50, help="Total number of generations to train.")
+    parser.add_argument("--max-gens", type=int, default=10, help="Total number of generations to train.")
     parser.add_argument("--challenger-freq", type=int, default=0, help="Inject a challenger from SL every N generations. Set to 0 to disable.")
     parser.add_argument("--master-run-name", type=str, default=None, help="Overall name for the self-play experiment folder.")
     

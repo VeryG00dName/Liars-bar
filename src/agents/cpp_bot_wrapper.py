@@ -19,12 +19,21 @@ class CppBotWrapper(BaseAgent):
     def reset(self):
         pass
 
+    def get_action(self, env, agent_id_env: str, observation, info, cheat_expert_index=None) -> int:
+        # Not used in VecArena training; implemented to satisfy BaseAgent.
+        raise NotImplementedError("CppBotWrapper is only supported in batched VecArena via get_actions_batch().")
+
     def get_actions_batch(self, requests: List[lb.PolicyRequest]):
         actions = []
         for req in requests:
-            bot = self.bot_cls("bot")
+            # StrategicChallenger requires (name, num_players, agent_index)
+            if getattr(self.bot_cls, "__name__", None) == getattr(getattr(lb, "StrategicChallenger", object), "__name__", ""):
+                bot = self.bot_cls("bot", 4, int(req.seat))
+            else:
+                bot = self.bot_cls("bot")
             obs = np.array(req.classic_obs, dtype=np.float32)
+            L = int(getattr(req, 'classic_obs_len', len(obs)))
             mask = np.array(req.mask, dtype=np.uint8)
-            a = bot.act(obs, len(obs), mask)
+            a = bot.act(obs, L, mask)
             actions.append(int(a))
         return np.array(actions, dtype=np.uint8), None, None, []

@@ -3,6 +3,8 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <cstdio>
+#include <ctime>
 // ---------- small helpers ----------
 uint8_t VecArena::first_valid(const uint8_t mask[7]) {
     for (int i = 0; i < 7; ++i) if (mask[i]) return (uint8_t)i;
@@ -14,28 +16,68 @@ void VecArena::fill_mask_for_current(const Env& e, uint8_t m[7]) {
 }
 
 void VecArena::prepare_ai_sequence(const Env& e, int ai_seat, PolicyRequest& out) const {
-    int total = (int)e.game_history.size();
-    int start = std::max(0, total - MAX_LEN);
+    const int n_players = e.num_players();
+    const int total = (int)e.game_history.size();
+    const int start = std::max(0, total - (MAX_LEN - 1));
     int idx = 0;
+    // DEBUG (limited): print history info on first few calls overall
+    static int dbg_ai_prep = 0;
+    if (dbg_ai_prep < 64) {
+        fprintf(stderr, "[prepare_ai_sequence] seat=%d total_hist=%d start=%d\n", ai_seat, total, start);
+        dbg_ai_prep++;
+    }
+
+    auto transform_action = [&](int actor_seat, uint8_t action) -> int64_t {
+        int relative_agent_id = (actor_seat - ai_seat + n_players) % n_players;
+        if (relative_agent_id == 0) {
+            return (int64_t)action;
+        } else {
+            if (action <= 5) return (int64_t)(7 + (action % 3));
+            return (int64_t)action;
+        }
+    };
+
     for (int i = start; i < total && idx < MAX_LEN; ++i) {
         const HistoryEntry& h = e.game_history[i];
         const auto& obs = h.observations[ai_seat];
         for (int j = 0; j < OBS_DIM && j < (int)obs.size(); ++j) {
             out.obs_sequence[idx][j] = obs[j];
         }
-        out.action_sequence[idx] = h.action;
-        out.agent_type_sequence[idx] = h.player;
+        int rel = (h.player - ai_seat + n_players) % n_players;
+        out.agent_type_sequence[idx] = rel;
+        if (idx == 0) {
+            out.action_sequence[idx] = 10; // PAD first token
+        } else {
+            const HistoryEntry& prev_h = e.game_history[i - 1];
+            out.action_sequence[idx] = transform_action(prev_h.player, prev_h.action);
+        }
+        // For opponent rows, store zeros; trainer will only use our rows' masks
+        if (rel == 0) {
+            for (int j = 0; j < 7; ++j) out.action_mask_sequence[idx][j] = h.mask[j];
+        } else {
+            for (int j = 0; j < 7; ++j) out.action_mask_sequence[idx][j] = 0;
+        }
         out.position_sequence[idx] = idx;
         ++idx;
     }
     // Current step observation
-    float cur_obs[OBS_DIM];
-    e.observe_vector_newerest(ai_seat, cur_obs);
-    for (int j = 0; j < OBS_DIM; ++j) out.obs_sequence[idx][j] = cur_obs[j];
-    out.action_sequence[idx] = 10; // PAD token
-    out.agent_type_sequence[idx] = 0;
-    out.position_sequence[idx] = idx;
-    out.valid_len = idx + 1;
+    if (idx < MAX_LEN) {
+        float cur_obs[OBS_DIM];
+        e.observe_vector_newerest(ai_seat, cur_obs);
+        for (int j = 0; j < OBS_DIM; ++j) out.obs_sequence[idx][j] = cur_obs[j];
+        out.agent_type_sequence[idx] = 0; // me
+        if (total > 0) {
+            const HistoryEntry& last_h = e.game_history[total - 1];
+            out.action_sequence[idx] = transform_action(last_h.player, last_h.action);
+        } else {
+            out.action_sequence[idx] = 10;
+        }
+        e.valid_actions(out.action_mask_sequence[idx]);
+        out.position_sequence[idx] = idx;
+        out.valid_len = idx + 1;
+    } else {
+        out.valid_len = MAX_LEN;
+    }
 }
 
 // ---------- API ----------
@@ -98,18 +140,28 @@ void VecArena::advance_env_until_policy_or_done(
     if (alive <= 1) { done[env_index] = 1; return; }
 
     int cur = e.current_player();
-        int policy_id = roles[env_index][cur].policy_id;
-        PolicyRequest req;
-        req.env = env_index; req.seat = cur; req.done = 0;
-        fill_mask_for_current(e, req.mask);
-        if (policy_id < 7) {
-            // classic obs for C++ bots
-            e.observe_vector(req.classic_obs);
-        } else {
-            prepare_ai_sequence(e, cur, req);
-        }
-        out[policy_id].push_back(std::move(req));
-        return;
+    int policy_id = roles[env_index][cur].policy_id;
+
+    // DEBUG: log a few times only
+    static int dbg_env_logs = 0;
+    if (dbg_env_logs < 64) {
+      fprintf(stderr, "[advance] env=%d cur=%d pid=%d\n", env_index, cur, policy_id);
+      dbg_env_logs++;
+    }
+
+    PolicyRequest req;
+    req.env = env_index; req.seat = cur; req.done = 0;
+    fill_mask_for_current(e, req.mask);
+    if (policy_id < 7) {
+        // classic obs for C++ bots
+        req.classic_obs_len = e.observe_vector(req.classic_obs);
+        if (dbg_env_logs < 64) fprintf(stderr, "[advance] env=%d classic_obs prepared\n", env_index);
+    } else {
+        prepare_ai_sequence(e, cur, req);
+        if (dbg_env_logs < 64) fprintf(stderr, "[advance] env=%d ai_sequence L=%d prepared\n", env_index, req.valid_len);
+    }
+    out[policy_id].push_back(std::move(req));
+    return;
   }
 }
 
@@ -117,13 +169,30 @@ std::unordered_map<int, std::vector<PolicyRequest>> VecArena::collect_requests()
     pending.clear();
     std::unordered_map<int, std::vector<PolicyRequest>> grouped;
 
+    // DEBUG timing/logging (limited)
+    static int dbg_calls = 0;
+    const bool do_log = (dbg_calls < 8);
+    clock_t t0 = clock();
+    if (do_log) {
+        fprintf(stderr, "[collect_requests] call=%d B=%d n_players=%d\n", dbg_calls, B, n_players);
+    }
+
     for (int b = 0; b < B; ++b) {
         if (done[b]) continue;
+        if (do_log && b < 8) fprintf(stderr, "[collect_requests] processing env %d\n", b);
         advance_env_until_policy_or_done(b, grouped);
     }
 
     // Keep a copy for submit_actions matching
     pending = grouped;
+
+    if (do_log) {
+        int total = 0; for (auto& kv : grouped) total += (int)kv.second.size();
+        double dt = double(clock() - t0) / CLOCKS_PER_SEC;
+        fprintf(stderr, "[collect_requests] groups=%zu total_reqs=%d dt=%.4fs\n", grouped.size(), total, dt);
+        fflush(stderr);
+        dbg_calls++;
+    }
     return grouped;
 }
 
