@@ -80,9 +80,9 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
             logger.error(f"Failed to infer dimensions for PPOAutoregressiveAgent {self.player_id}: {e}", exc_info=True)
             raise
 
-        logger.info(f"Instantiating PPOAutoregressiveModel for {self.player_id} with dims: "
-                    f"obs={inferred_obs_dim}, action={inferred_action_dim}, belief={inferred_belief_dim}, "
-                    f"hidden={inferred_hidden_dim}, max_seq={inferred_max_seq}, shared_head={use_shared_head}")
+        #logger.info(f"Instantiating PPOAutoregressiveModel for {self.player_id} with dims: "
+                    #f"obs={inferred_obs_dim}, action={inferred_action_dim}, belief={inferred_belief_dim}, "
+                    #f"hidden={inferred_hidden_dim}, max_seq={inferred_max_seq}, shared_head={use_shared_head}")
 
         # --- 3. Instantiate Model with the Correct Flag ---
         self.model = PPOAutoregressiveModel(
@@ -103,7 +103,7 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
 
         self.model.eval()
         self.reset()
-        logger.info(f"Successfully loaded PPOAutoregressiveModel for agent {self.player_id}.")
+        #logger.info(f"Successfully loaded PPOAutoregressiveModel for agent {self.player_id}.")
 
     def pop_last_model_input(self, env_idx: int, my_seat: int):
         return self._last_model_input.pop((env_idx, my_seat), None)

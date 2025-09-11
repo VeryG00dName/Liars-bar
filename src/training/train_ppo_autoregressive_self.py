@@ -238,14 +238,17 @@ def train_generation(
     ep_buffer: List[Dict[str, Any]] = []
     
     for update in range(1, max_updates + 1):
+        # -------- Rollout --------
+        t0 = time.time()
         learner.model.eval()
         new_eps = rollout_manager.collect_episodes(
             num_episodes=episodes_per_update,
             num_players=4,
             training_policy_id=training_policy_id,
             opponent_pool=[int(a['label']) for a in pool_manager.pool if a['type'] == 'cpp_bot' or a['type'] == 'historical'],
-            max_batch_envs=int(getattr(config, "EPISODES_PER_UPDATE", 256))
+            max_batch_envs=int(getattr(config, "VEC_BATCH_ENVS", 256))
         )
+        t_roll = time.time()
         if not new_eps:
             logging.warning(f"Update {update}: No episodes collected. Skipping.")
             continue
@@ -254,7 +257,10 @@ def train_generation(
         buffer_size = int(getattr(config, "OFFPOLICY_EP_BUFFER_MULT", 4)) * episodes_per_update
         if len(ep_buffer) > buffer_size: ep_buffer = ep_buffer[-buffer_size:]
         
+        # -------- Optimize (aggregate metrics) --------
         learner.model.train()
+        agg = {"total_loss": 0.0}
+        n_batches = 0
         for _ in range(k_epochs):
             batch_eps = random.sample(ep_buffer, min(len(ep_buffer), episodes_per_update))
             if not batch_eps: continue
@@ -270,9 +276,47 @@ def train_generation(
             clip_grad_norm_(learner.model.parameters(), max_norm=float(config.MAX_NORM))
             scaler.step(optimizer)
             scaler.update()
+            # Aggregate metrics
+            agg["total_loss"] += float(total_loss.detach().cpu())
+            for k, v in metrics.items():
+                try:
+                    agg[k] = agg.get(k, 0.0) + float(v.detach().cpu())
+                except Exception:
+                    pass
+            n_batches += 1
 
+        t_opt_end = time.time()
+        # Timings
+        dur_roll = t_roll - t0
+        dur_opt  = t_opt_end - t_roll
+        dur_tot  = t_opt_end - t0
+
+        # -------- Log metrics --------
+        avg = {k: (v / max(n_batches, 1)) for k, v in agg.items()}
         win_rate = sum(ep["win"] for ep in new_eps) / len(new_eps)
+        # Timings
+        writer.add_scalar("Time/Rollout", dur_roll, update)
+        writer.add_scalar("Time/Optimize", dur_opt, update)
+        writer.add_scalar("Time/Total", dur_tot, update)
+        # Losses & diagnostics
+        writer.add_scalar("Loss/Total", avg.get("total_loss", 0.0), update)
+        writer.add_scalar("Loss/Policy", avg.get("policy_loss", 0.0), update)
+        writer.add_scalar("Loss/Value", avg.get("value_loss", 0.0), update)
+        writer.add_scalar("Loss/Belief", avg.get("belief_loss", 0.0), update)
+        writer.add_scalar("Loss/Opponent", avg.get("opp_loss", 0.0), update)
+        writer.add_scalar("Policy/Entropy", avg.get("entropy", 0.0), update)
+        writer.add_scalar("Policy/ApproxKL", avg.get("approx_kl", 0.0), update)
+        writer.add_scalar("Policy/ClipFraction", avg.get("clip_fraction", 0.0), update)
+        writer.add_scalar("Policy/TrinalClipNegFrac", avg.get("trinal_clip_neg_frac", 0.0), update)
+        writer.add_scalar("Value/ClipFrac", avg.get("value_clip_frac", 0.0), update)
+        writer.add_scalar("Diag/ReturnStdEMA", getattr(config, "RET_STD_EMA", 1.0), update)
+        # Rollout stats
         writer.add_scalar("Rollout/WinRate", win_rate, update)
+        writer.add_scalar("Buffer/Size", len(ep_buffer), update)
+        writer.add_scalar("Acc/OpponentAction", avg.get("opp_action_acc", 0.0), update)
+        writer.add_scalar("Acc/Belief0", avg.get("belief_acc_0", 0.0), update)
+        writer.add_scalar("Acc/Belief1", avg.get("belief_acc_1", 0.0), update)
+        writer.add_scalar("Acc/Belief2", avg.get("belief_acc_2", 0.0), update)
         
         if plateau_detector.step(win_rate) and update > 50:
             logging.info(f"Plateau detected at update {update}. Stopping training for '{run_name}'.")

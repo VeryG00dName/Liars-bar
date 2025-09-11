@@ -4,7 +4,6 @@
 #include <limits>
 #include <stdexcept>
 #include <cstdio>
-#include <ctime>
 // ---------- small helpers ----------
 uint8_t VecArena::first_valid(const uint8_t mask[7]) {
     for (int i = 0; i < 7; ++i) if (mask[i]) return (uint8_t)i;
@@ -20,12 +19,6 @@ void VecArena::prepare_ai_sequence(const Env& e, int ai_seat, PolicyRequest& out
     const int total = (int)e.game_history.size();
     const int start = std::max(0, total - (MAX_LEN - 1));
     int idx = 0;
-    // DEBUG (limited): print history info on first few calls overall
-    static int dbg_ai_prep = 0;
-    if (dbg_ai_prep < 64) {
-        fprintf(stderr, "[prepare_ai_sequence] seat=%d total_hist=%d start=%d\n", ai_seat, total, start);
-        dbg_ai_prep++;
-    }
 
     auto transform_action = [&](int actor_seat, uint8_t action) -> int64_t {
         int relative_agent_id = (actor_seat - ai_seat + n_players) % n_players;
@@ -142,23 +135,14 @@ void VecArena::advance_env_until_policy_or_done(
     int cur = e.current_player();
     int policy_id = roles[env_index][cur].policy_id;
 
-    // DEBUG: log a few times only
-    static int dbg_env_logs = 0;
-    if (dbg_env_logs < 64) {
-      fprintf(stderr, "[advance] env=%d cur=%d pid=%d\n", env_index, cur, policy_id);
-      dbg_env_logs++;
-    }
-
     PolicyRequest req;
     req.env = env_index; req.seat = cur; req.done = 0;
     fill_mask_for_current(e, req.mask);
     if (policy_id < 7) {
         // classic obs for C++ bots
         req.classic_obs_len = e.observe_vector(req.classic_obs);
-        if (dbg_env_logs < 64) fprintf(stderr, "[advance] env=%d classic_obs prepared\n", env_index);
     } else {
         prepare_ai_sequence(e, cur, req);
-        if (dbg_env_logs < 64) fprintf(stderr, "[advance] env=%d ai_sequence L=%d prepared\n", env_index, req.valid_len);
     }
     out[policy_id].push_back(std::move(req));
     return;
@@ -169,30 +153,13 @@ std::unordered_map<int, std::vector<PolicyRequest>> VecArena::collect_requests()
     pending.clear();
     std::unordered_map<int, std::vector<PolicyRequest>> grouped;
 
-    // DEBUG timing/logging (limited)
-    static int dbg_calls = 0;
-    const bool do_log = (dbg_calls < 8);
-    clock_t t0 = clock();
-    if (do_log) {
-        fprintf(stderr, "[collect_requests] call=%d B=%d n_players=%d\n", dbg_calls, B, n_players);
-    }
-
     for (int b = 0; b < B; ++b) {
         if (done[b]) continue;
-        if (do_log && b < 8) fprintf(stderr, "[collect_requests] processing env %d\n", b);
         advance_env_until_policy_or_done(b, grouped);
     }
 
     // Keep a copy for submit_actions matching
     pending = grouped;
-
-    if (do_log) {
-        int total = 0; for (auto& kv : grouped) total += (int)kv.second.size();
-        double dt = double(clock() - t0) / CLOCKS_PER_SEC;
-        fprintf(stderr, "[collect_requests] groups=%zu total_reqs=%d dt=%.4fs\n", grouped.size(), total, dt);
-        fflush(stderr);
-        dbg_calls++;
-    }
     return grouped;
 }
 
