@@ -31,16 +31,33 @@ class PPOVecRolloutManager:
             opponent_pool = [0]
         all_env_roles = []
         for b in range(batch_size):
-            env_roles = [0 for _ in range(num_players)]
+            # --- Step 1: Initialize roles for this environment ---
+            # Create a list for the policy IDs of each seat
+            env_roles = [-1] * num_players 
+            
+            # --- Step 2: Assign the learner to seat 0 ---
+            env_roles[0] = training_policy_id
+            
+            # --- Step 3: Sample opponents for the remaining seats ---
             num_opponents = num_players - 1
-            chosen = np.random.choice(opponent_pool, size=num_opponents).tolist()
-            seats = list(range(num_players))
-            np.random.shuffle(seats)
-            training_seat = seats.pop()
-            env_roles[training_seat] = training_policy_id
+            # np.random.choice is perfect for this
+            chosen_opponent_pids = np.random.choice(
+                opponent_pool, 
+                size=num_opponents, 
+                replace=True # Allow the same opponent to appear multiple times
+            ).tolist()
+            
+            # --- Step 4: Assign the sampled opponents to the remaining seats ---
+            opponent_seats = list(range(1, num_players))
+            # The order of opponents is already random from the choice,
+            # so we can just assign them directly.
             for i in range(num_opponents):
-                env_roles[seats[i]] = chosen[i]
+                seat = opponent_seats[i]
+                policy_id = chosen_opponent_pids[i]
+                env_roles[seat] = policy_id
+
             all_env_roles.append(env_roles)
+            
         return all_env_roles
 
     def collect_episodes(self,
@@ -210,8 +227,20 @@ class PPOVecRolloutManager:
         # Win/lose bookkeeping
         is_winner = (not env.terminations[seat]) and (sum(env.terminations) == env.num_players() - 1)
         ep_data['win'] = 1 if is_winner else 0
-        if ep_data['agent_id'] and ep_data['agent_id'][-1] == seat:
-            ep_data['reward'][-1] = 1.0 if is_winner else -1.0
+
+        # Assign terminal reward to the most recent action taken by the training
+        # agent, even if the final action in the episode was by an opponent.
+        if ep_data['agent_id']:
+            # Walk backward to find the last index where our agent acted.
+            last_idx = None
+            for i in range(len(ep_data['agent_id']) - 1, -1, -1):
+                if ep_data['agent_id'][i] == seat:
+                    last_idx = i
+                    break
+            if last_idx is not None:
+                ep_data['reward'][last_idx] = 1.0 if is_winner else -1.0
+
+        # Recompute the episode return after updating the reward array.
         ep_data['episode_return'] = float(sum(ep_data['reward']))
 
         # Persist the exact model_input used for the final forward on this env/seat
