@@ -58,9 +58,7 @@ void VecArena::prepare_ai_sequence(const Env& e, int ai_seat, PolicyRequest& out
         float cur_obs[OBS_DIM];
         e.observe_vector_newerest(ai_seat, cur_obs);
         for (int j = 0; j < OBS_DIM; ++j) out.obs_sequence[idx][j] = cur_obs[j];
-        // Mark the final observation with a distinct agent_type so downstream code
-        // can easily identify and discard this sentinel step.
-        out.agent_type_sequence[idx] = 3;
+        out.agent_type_sequence[idx] = 0; // me
         if (total > 0) {
             const HistoryEntry& last_h = e.game_history[total - 1];
             out.action_sequence[idx] = transform_action(last_h.player, last_h.action);

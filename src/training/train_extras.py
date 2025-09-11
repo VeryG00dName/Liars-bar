@@ -641,40 +641,26 @@ def _collate_batch(
     def _pad_trim(v: torch.Tensor, L_tgt: int) -> torch.Tensor:
         L = v.size(1)
         if L == L_tgt: return v
-        if L > L_tgt:  return v[:, -L_tgt:, ...]
+        if L > L_tgt:  return v[:, :L_tgt, ...]
         pad_len = L_tgt - L
         pad_shape = list(v.shape); pad_shape[1] = pad_len
         z = torch.zeros(pad_shape, dtype=v.dtype, device=v.device)
         return torch.cat([v, z], dim=1)
 
     # -------- build batched model inputs (time-major tensors only) --------
-    all_keys = set()
-    for ep in episodes:
-        all_keys |= set(ep["model_input"].keys())
+    common_keys = set(episodes[0]["model_input"].keys())
+    for ep in episodes[1:]:
+        common_keys &= set(ep["model_input"].keys())
 
     # we will REBUILD both 'valid_lengths' and 'padding_mask' — exclude the cached mask
     skip_keys = {"padding_mask", "valid_lengths"}
     mi_batch: Dict[str, torch.Tensor] = {}
-    for k in sorted(all_keys - skip_keys):
-        proto = next((ep["model_input"][k] for ep in episodes
-                      if k in ep["model_input"]
-                      and torch.is_tensor(ep["model_input"][k])
-                      and ep["model_input"][k].dim() >= 2), None)
-        if proto is None:
+    for k in sorted(common_keys - skip_keys):
+        vs = [ep["model_input"][k] for ep in episodes]
+        if not all(torch.is_tensor(v) for v in vs):  # only tensors
             continue
-
-        vs = []
-        for b, ep in enumerate(episodes):
-            if k in ep["model_input"]:
-                v = ep["model_input"][k]
-            else:
-                Lb = raw_lens[b]
-                shape = list(proto.shape)
-                shape[0] = 1
-                shape[1] = Lb
-                v = proto.new_zeros(shape)
-            vs.append(v)
-
+        if not all(v.dim() >= 2 for v in vs):       # only time-major tensors
+            continue
         padded = [_pad_trim(v, L_pad) for v in vs]   # each [1, L_pad, ...]
         cat = torch.cat(padded, dim=0).contiguous()  # [B, L_pad, ...]
         if pin_memory: cat = cat.pin_memory()
@@ -709,40 +695,13 @@ def _collate_batch(
         our_action_mask = m
 
     # -------- build OUR/OPP timestep indices using ONLY valid tokens --------
-    #
-    # `agent_types` is expected to mark the training agent with 0 and opponents
-    # with non-zero values.  This mapping should align with `ep["agent_id"]`
-    # which records the acting seat at each step.  If these sources disagree
-    # the downstream indexing will be incorrect.
     our_pos_lists: List[torch.Tensor] = []
     opp_pos_lists: List[torch.Tensor] = []
     for b in range(B):
         Lb = int(valid_lengths[b].item())
-        slice_end = max(Lb - 1, 0)
-        at = agent_types[b, :slice_end].detach().cpu().numpy()
-        our_pos = torch.from_numpy((at == 0).nonzero()[0]).long()
-        opp_pos = torch.from_numpy((at != 0).nonzero()[0]).long()
-
-        # Sanity check: align with the same trimmed window from episode metadata
-        ep = episodes[b]
-        seat = ep.get("training_agent_seat")
-        if seat is None:
-            raise ValueError("Episode is missing 'training_agent_seat'.")
-        # Compute how many steps were trimmed from the left by _pad_trim
-        raw_Lb = raw_lens[b]
-        offset_b = max(raw_Lb - Lb, 0)
-        agent_ids_full = ep.get("agent_id", [])
-        agent_ids_sliced = agent_ids_full[offset_b: offset_b + slice_end]
-        expected_count = sum(1 for sid in agent_ids_sliced if sid == seat)
-        if expected_count != int(our_pos.numel()):
-            raise ValueError(
-                "agent_types mismatch with agent_id: got "
-                f"{int(our_pos.numel())} our steps but found "
-                f"{expected_count} occurrences of training_agent_seat {seat}"
-            )
-
-        our_pos_lists.append(our_pos)
-        opp_pos_lists.append(opp_pos)
+        at = agent_types[b, :Lb].detach().cpu().numpy()  # slice to true length
+        our_pos_lists.append(torch.from_numpy((at == 0).nonzero()[0]).long())
+        opp_pos_lists.append(torch.from_numpy((at != 0).nonzero()[0]).long())
 
     T  = max((int(x.numel()) for x in our_pos_lists), default=0)
     To = max((int(x.numel()) for x in opp_pos_lists), default=0)
@@ -771,24 +730,18 @@ def _collate_batch(
 
     # -------- fill from episodes (only real steps) --------
     for b, ep in enumerate(episodes):
-        Lb = int(valid_lengths[b].item())
-        slice_end = max(Lb - 1, 0)
-        offset = max(raw_lens[b] - Lb, 0)
-
         # OUR timeline
         our_pos = our_pos_lists[b]
-        # Build absolute episode indices for our steps within the trimmed window
-        seat = ep["training_agent_seat"]
-        agent_ids_full = ep.get("agent_id", [])
-        agent_ids_sliced = agent_ids_full[offset: offset + slice_end]
-        our_ep_idx = [offset + t for t, sid in enumerate(agent_ids_sliced) if sid == seat]
-        K_true = len(our_ep_idx)
-        K_pos = int(our_pos.numel())
-        K_fill = min(T, K_true, K_pos)
+        K = int(our_pos.numel())
+        K_fill = min(T, K)
         if K_fill > 0:
             our_idx[b, :K_fill] = our_pos[:K_fill]
             our_mask[b, :K_fill] = True
+
+            our_ep_idx = [i for i, seat in enumerate(ep["agent_id"]) if seat == ep["training_agent_seat"]]
             for t_local in range(K_fill):
+                if t_local >= len(our_ep_idx):
+                    break
                 step_ep = our_ep_idx[t_local]
 
                 a  = ep["our_action"][step_ep] if step_ep < len(ep["our_action"]) else None
@@ -810,14 +763,14 @@ def _collate_batch(
 
         # OPP timeline (labels optional)
         opp_pos = opp_pos_lists[b]
-        # Build absolute episode indices for opponent steps within the trimmed window
-        opp_ep_idx = [offset + t for t, sid in enumerate(agent_ids_sliced) if sid != seat]
         M = int(opp_pos.numel())
-        M_true = len(opp_ep_idx)
-        M_fill = min(To, M_true, M)
+        M_fill = min(To, M)
         if M_fill > 0:
             opp_idx[b, :M_fill] = opp_pos[:M_fill]
+            opp_ep_idx = [i for i, seat in enumerate(ep["agent_id"]) if seat != ep["training_agent_seat"]]
             for t_local in range(M_fill):
+                if t_local >= len(opp_ep_idx):
+                    break
                 step_ep = opp_ep_idx[t_local]
                 tgt = ep.get("opp_target_action", [None]*len(ep["agent_id"]))[step_ep]
                 if tgt is not None:
