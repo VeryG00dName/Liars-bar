@@ -41,14 +41,13 @@ _silence_torch_symbolic_logs()
 
 # ---------------------- Speed knobs (no determinism) -----------------------
 torch.backends.cudnn.benchmark = True
-if torch.cuda.is_available():
-    torch.backends.cuda.matmul.allow_tf32 = True
-    try: torch.set_float32_matmul_precision("high")
-    except Exception: pass
-    try:
-        from torch.nn.attention import sdp_kernel
-        sdp_kernel.enable_flash(True); sdp_kernel.enable_math(False); sdp_kernel.enable_mem_efficient(True)
-    except Exception: pass
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
+
+try:
+    from torch.nn.attention import sdp_kernel
+    sdp_kernel.enable_flash(True); sdp_kernel.enable_math(False); sdp_kernel.enable_mem_efficient(True)
+except Exception: pass
 
 # Lightweight seeding (no determinism)
 SEED = int(getattr(config, "SEED", 42))
