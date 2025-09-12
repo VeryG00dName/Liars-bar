@@ -58,7 +58,7 @@ class PPOEmbeddingModel(nn.Module):
         # === Transformer Backbone ===
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim, nhead=num_heads, dim_feedforward=hidden_dim * 4,
-            dropout=dropout_rate, activation='silu', batch_first=True
+            dropout=dropout_rate, activation='gelu', batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer=encoder_layer, num_layers=num_layers)
 
