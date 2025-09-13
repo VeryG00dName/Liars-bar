@@ -17,7 +17,7 @@ from torch.utils.data import Dataset, DataLoader, Sampler
 from tqdm import tqdm
 from typing import List
 from torch.utils.tensorboard import SummaryWriter
-from src.model.ppo_embedding_model import PPOEmbeddingModel
+from src.model.ppo_fused_model import PPOFusedModel
 from src import config
 
 torch.backends.cudnn.benchmark = True
@@ -743,7 +743,7 @@ def train_autoregressive_model(
     logger.info(f"Model dimensions: obs_dim={obs_dim}, action_dim={action_dim}")
 
     # Main autoregressive model that outputs embeddings
-    model = PPOEmbeddingModel(
+    model = PPOFusedModel(
         obs_dim=obs_dim,
         action_dim=action_dim,
         hidden_dim=hidden_dim,

@@ -157,6 +157,20 @@ class ModelFactory:
                 (has_legacy_belief_heads or has_shared_belief_head))
 
     @staticmethod
+    def is_fused_model(state_dict: dict) -> bool:
+        """
+        Detects the new PPOFusedModel by checking for the unique fusion layer.
+        """
+        # The presence of this layer is the unique signature of the new architecture.
+        has_fusion_layer = 'policy_value_feature_extractor.0.weight' in state_dict
+        
+        # Add a sanity check for other expected components
+        has_belief_fc = 'belief_fc.0.weight' in state_dict
+        has_action_head = 'action_head.weight' in state_dict
+        
+        return has_fusion_layer and has_belief_fc and has_action_head
+
+    @staticmethod
     def get_belief_dimensions(state_dict):
         """
         Extracts dimensions from a PPOAutoregressiveModel state dictionary.

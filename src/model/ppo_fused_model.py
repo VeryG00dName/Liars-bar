@@ -1,10 +1,10 @@
-# src/model/ppo_embedding_model.py
+# src/model/ppo_fused_model.py
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class PPOEmbeddingModel(nn.Module):
+class PPOFusedModel(nn.Module):
     """
     A unified, monolithic autoregressive model for PPO.
     

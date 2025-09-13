@@ -6,6 +6,7 @@ from typing import Optional, Dict, Any, List
 
 from src.agents.base_agent import BaseAgent
 from src.model.ppo_autoregressive_model import PPOAutoregressiveModel
+from src.model.ppo_fused_model import PPOFusedModel
 from src.model.model_factory import ModelFactory as MFactoryUtil
 from src.misc import lb
 logger = logging.getLogger(__name__)
@@ -35,70 +36,56 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
 
     def load_models_from_checkpoint(self, checkpoint: Dict[str, Any], agent_key: str):
         """
-        Load model state dict, automatically detect the belief head architecture,
-        and re-instantiate PPOAutoregressiveModel using inferred dimensions.
+        Load model state dict, automatically detect the architecture (legacy, fused),
+        and re-instantiate the correct model class using inferred dimensions.
         """
         if "policy_nets" not in checkpoint or agent_key not in checkpoint["policy_nets"]:
             raise ValueError(f"Checkpoint missing model state for agent '{agent_key}' in 'policy_nets'.")
 
         model_state_dict = checkpoint["policy_nets"][agent_key]
 
-        if not MFactoryUtil.is_ppo_autoregressive_model(model_state_dict):
-            raise ValueError(f"The model state for '{agent_key}' is not a valid PPO autoregressive model.")
-        
-        # --- 1. Detect Architecture Version ---
-        # Check for the existence of the new shared head's weight tensor.
-        use_shared_head = 'belief_head_shared.weight' in model_state_dict
-        if use_shared_head:
-            logger.debug(f"[{self.player_id}] Detected new shared belief head architecture.")
+        # --- ARCHITECTURE DETECTION ---
+        ModelClass = None
+        if MFactoryUtil.is_fused_model(model_state_dict):
+            logger.debug(f"[{self.player_id}] Detected PPOFusedModel architecture.")
+            ModelClass = PPOFusedModel
+        elif MFactoryUtil.is_ppo_autoregressive_model(model_state_dict):
+            logger.debug(f"[{self.player_id}] Detected legacy PPOAutoregressiveModel architecture.")
+            ModelClass = PPOAutoregressiveModel
         else:
-            logger.debug(f"[{self.player_id}] Detected legacy per-seat belief head architecture.")
-
-        logger.debug(f"[{self.player_id}] Model state dict extracted. Inferring dimensions...")
-
+            raise ValueError(f"The model state for '{agent_key}' is not a valid PPO model.")
+        
         try:
-            # --- 2. Infer Dimensions (with conditional belief_dim key) ---
+            # Infer dimensions that are common to both architectures
             inferred_obs_dim = MFactoryUtil.get_input_dim_from_state_dict(model_state_dict, 'obs_encoder.0')
             inferred_action_dim = MFactoryUtil.get_output_dim_from_state_dict(model_state_dict, 'action_head')
             inferred_hidden_dim = MFactoryUtil.get_hidden_dim_from_state_dict(model_state_dict, 'obs_encoder.0')
-            
-            # Use the correct key to get belief_dim based on the detected architecture
-            belief_dim_key = 'belief_head_shared' if use_shared_head else 'belief_head_op0'
-            inferred_belief_dim = MFactoryUtil.get_output_dim_from_state_dict(model_state_dict, belief_dim_key)
-            
-            inferred_max_seq = model_state_dict.get('position_embedding.weight', torch.zeros(320)).shape[0]
-            # self.max_seq_length is used by other methods, so set it here.
-            # It's one less than the embedding size because of how it's used in sequence prep.
-            self.max_seq_length = inferred_max_seq - 1 
-            
-            num_heads = 4  # Assuming this is fixed, common practice.
-            
-            if inferred_hidden_dim % num_heads != 0:
-                logger.warning(f"Inferred hidden_dim ({inferred_hidden_dim}) not divisible by num_heads ({num_heads}). Check model architecture.")
-        
-        except ValueError as e:
-            logger.error(f"Failed to infer dimensions for PPOAutoregressiveAgent {self.player_id}: {e}", exc_info=True)
+            inferred_belief_dim = MFactoryUtil.get_output_dim_from_state_dict(model_state_dict, 'belief_head_shared')
+            inferred_max_seq = model_state_dict.get('position_embedding.weight').shape[0]
+
+            num_heads = 4 # Assume fixed for now, can add inference logic if needed
+        except Exception as e:
+            logger.error(f"Failed to infer dimensions for {self.player_id}: {e}", exc_info=True)
             raise
 
-        #logger.info(f"Instantiating PPOAutoregressiveModel for {self.player_id} with dims: "
-                    #f"obs={inferred_obs_dim}, action={inferred_action_dim}, belief={inferred_belief_dim}, "
-                    #f"hidden={inferred_hidden_dim}, max_seq={inferred_max_seq}, shared_head={use_shared_head}")
-
-        # --- 3. Instantiate Model with the Correct Flag ---
-        self.model = PPOAutoregressiveModel(
+        self.max_seq_length = inferred_max_seq - 1 
+        
+        # Instantiate the CORRECT ModelClass with all inferred parameters
+        self.model = ModelClass(
             obs_dim=inferred_obs_dim,
             action_dim=inferred_action_dim,
             belief_dim=inferred_belief_dim,
             hidden_dim=inferred_hidden_dim,
             num_heads=num_heads,
             max_seq_length=inferred_max_seq,
-            use_shared_belief_head=use_shared_head  # <-- Pass the detected flag
         ).to(self.device)
 
         try:
             self.model.load_state_dict(model_state_dict, strict=True)
         except RuntimeError as e:
-            logger.error(f"Failed to load state dict for {self.player_id}: {e}", exc_info=True)
+            # Provide helpful error message for shape mismatches
+            logger.error(f"Failed to load state dict for {self.player_id}. This often means the inferred "
+                         f"architecture params (layers, heads, etc.) don't match the checkpoint. Error: {e}", exc_info=True)
             raise
 
         self.model.eval()

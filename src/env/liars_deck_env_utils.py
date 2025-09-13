@@ -599,43 +599,48 @@ def get_newerest_observations(env, agent_specific=None):
     Layout: [ self_hand(2),
               opp_hand_sizes(n_players-1) in rotated order (self excluded),
               penalties(n_players) in same rotated order (self included first) ]
+    This version is robust to player eliminations by safely accessing player hands.
     """
-    agents = list(env.possible_agents) if hasattr(env, "possible_agents") else list(env.agents)
-    n_players = len(agents)
-    agent_to_idx = {ag: i for i, ag in enumerate(agents)}
+    # Use possible_agents as the canonical list of all players.
+    all_players = list(env.possible_agents)
+    n_players = len(all_players)
+    agent_to_idx = {agent: i for i, agent in enumerate(all_players)}
 
     observations = {}
-    agents_to_observe = [agent_specific] if agent_specific is not None else agents
+    agents_to_observe = [agent_specific] if agent_specific is not None else all_players
 
     for agent in agents_to_observe:
         if agent not in agent_to_idx:
             continue
         self_idx = agent_to_idx[agent]
 
-        # 0) Self hand features (encode_hand expected to normalize like C++)
+        # 0) Self hand features (SAFE ACCESS for hands)
         current_hand = env.players_hands[agent]
         hand_vec = encode_hand(current_hand, env.table_card).astype(np.float32)
 
-        # 1) Opponent hand sizes in rotated order (exclude self)
+        # 1) Opponent hand sizes in rotated order (SAFE ACCESS for hands)
         opp_sizes = np.empty(n_players - 1, dtype=np.float32)
         k = 0
         for i in range(1, n_players):
             p_idx = (self_idx + i) % n_players
-            p = agents[p_idx]
+            p = all_players[p_idx]
+            
             alive = (not env.terminations[p]) and (not env.round_eliminated[p])
-            sz = len(env.players_hands[p]) if alive else 0
+            
+            # Use .get() for the opponent's hand as well.
+            sz = len(env.players_hands.get(p, [])) if alive else 0
             opp_sizes[k] = sz / 5.0
             k += 1
 
-        # 2) Penalties in rotated order including self
+        # 2) Penalties in rotated order including self (DIRECT ACCESS)
         pen_vec = np.empty(n_players, dtype=np.float32)
         for i in range(n_players):
             p_idx = (self_idx + i) % n_players
-            p = agents[p_idx]
+            p = all_players[p_idx]
             pen_vec[i] = float(env.penalties[p]) / 6.0
 
         obs = np.concatenate([hand_vec, opp_sizes, pen_vec], axis=0).astype(np.float32)
-        obs = np.round(obs, 2)   # round at the very end
+        obs = np.round(obs, 2)
         observations[agent] = obs
 
     return observations

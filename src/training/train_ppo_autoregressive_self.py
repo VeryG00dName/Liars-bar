@@ -28,7 +28,7 @@ import torch.amp as amp
 
 from src.misc import lb
 from src import config
-from src.model.ppo_autoregressive_model import PPOAutoregressiveModel
+from src.model.ppo_fused_model import PPOFusedModel
 from src.agents.batch_autoregressive_ppo_agent import BatchPPOAutoregressiveAgent
 from src.agents.cpp_bot_wrapper import CppBotWrapper
 from src.training.vec_ppo_rollout import PPOVecRolloutManager
@@ -112,7 +112,7 @@ def _create_new_agent(agent_type: str, device: torch.device) -> BatchPPOAutoregr
     """Creates a new agent and its corresponding model."""
     agent = BatchPPOAutoregressiveAgent(device, f"learner_{agent_type}")
     if agent_type == 'main':
-        model = PPOAutoregressiveModel(obs_dim=9, belief_dim=64)
+        model = PPOFusedModel(obs_dim=9, belief_dim=64)
     else: # In the future, you can add 'exploiter' logic here
         raise ValueError(f"Unknown agent type for creation: {agent_type}")
     agent.model = model.to(device)
@@ -142,21 +142,19 @@ def _clone_agent_from_agent(src_agent: BatchPPOAutoregressiveAgent, device: torc
     belief_dim = getattr(src_model, "belief_dim", 64)
     hidden_dim = getattr(src_model, "hidden_dim", 256)
     max_seq_length = getattr(src_model, "max_seq_length", 256)
-    use_shared_belief_head = getattr(src_model, "use_shared_belief_head", True)
 
     # num_heads is not stored publicly; infer from transformer layer
     encoder_layer = src_model.transformer.layers[0]
     num_heads = encoder_layer.self_attn.num_heads if hasattr(encoder_layer.self_attn, 'num_heads') else 4
 
     # Instantiate a fresh model with identical shape
-    new_model = PPOAutoregressiveModel(
+    new_model = PPOFusedModel(
         obs_dim=obs_dim,
         action_dim=action_dim,
         belief_dim=belief_dim,
         hidden_dim=hidden_dim,
         num_heads=num_heads,
         max_seq_length=max_seq_length,
-        use_shared_belief_head=use_shared_belief_head,
     ).to(device)
 
     # Load weights from the original (unwrapped) model

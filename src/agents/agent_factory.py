@@ -52,8 +52,8 @@ class AgentFactory:
             is_direct_player_key_format = True
             logger.debug(f"Found direct key '{agent_key}'. Checking structure...")
 
-            if MFactoryUtil.is_ppo_autoregressive_model(potential_policy_sd):
-                logger.debug(f"Identifying as PPO Autoregressive Model for {agent_key}")
+            if MFactoryUtil.is_ppo_autoregressive_model(potential_policy_sd) or MFactoryUtil.is_fused_model(policy_state_dict):
+                logger.debug(f"Identifying as PPO Autoregressive Model or Fused Model for {agent_key}")
                 agent_class = PPOAutoregressiveAgent
             
             if MFactoryUtil.is_autoregressive_model(potential_policy_sd):
@@ -82,8 +82,8 @@ class AgentFactory:
             obp_state_dict = checkpoint.get("obp_model") or checkpoint.get("obp_models", {}).get(agent_key)
             logger.debug(f"Detected 'policy_nets' structure for key '{agent_key}'.")
             
-            if MFactoryUtil.is_ppo_autoregressive_model(policy_state_dict):
-                logger.debug(f"Identifying as PPO Autoregressive Model for {agent_key}")
+            if MFactoryUtil.is_ppo_autoregressive_model(policy_state_dict) or MFactoryUtil.is_fused_model(policy_state_dict):
+                logger.debug(f"Identifying as PPO Autoregressive Model or Fused Model for {agent_key}")
                 agent_class = PPOAutoregressiveAgent
 
             elif MFactoryUtil.is_autoregressive_model(policy_state_dict):
@@ -109,8 +109,8 @@ class AgentFactory:
             obp_state_dict = checkpoint.get("obp_model")
             logger.debug(f"Detected single 'model' structure.")
 
-            if MFactoryUtil.is_ppo_autoregressive_model(policy_state_dict):
-                logger.debug(f"Identifying as PPO Autoregressive Model for {agent_key}")
+            if MFactoryUtil.is_ppo_autoregressive_model(policy_state_dict) or MFactoryUtil.is_fused_model(policy_state_dict):
+                logger.debug(f"Identifying as PPO Autoregressive Model or for{agent_key}")
                 agent_class = PPOAutoregressiveAgent
             
             if MFactoryUtil.is_autoregressive_model(policy_state_dict):
