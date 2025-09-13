@@ -21,7 +21,7 @@ TRANSFORMER_CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "transformer_classifi
 HISTORICAL_MODEL_DIR = PLAYERS_DIR
 
 # Optional: path to a supervised/teacher checkpoint used for warm start / teacher KL
-SL_TEACHER_CKPT = r"/mnt/l/Coding_Projects/Liars_bar_2/Liars-bar/checkpoints/autoreg_20250910_034341/autoreg_model_final.pth"
+SL_TEACHER_CKPT = r"/mnt/l/Coding_Projects/Liars_bar_2/Liars-bar/checkpoints/autoreg_20250911_150002/autoreg_model_final.pth"
 
 # ============================
 # Directory Preparation
