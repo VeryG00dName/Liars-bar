@@ -490,6 +490,11 @@ def train_generation(
             logging.warning(f"Update {update}: No episodes collected. Skipping.")
             continue
         
+        _train_belief_oracle(
+            belief_oracle, optimizer_oracle, scaler_oracle,
+            new_eps, device, writer, update
+        )
+        
         ep_buffer.extend(new_eps)
         buffer_size = int(getattr(config, "OFFPOLICY_EP_BUFFER_MULT", 4)) * episodes_per_update
         if len(ep_buffer) > buffer_size: ep_buffer = ep_buffer[-buffer_size:]
@@ -498,14 +503,11 @@ def train_generation(
         learner.model.train()
         agg = {"total_loss": 0.0}
         n_batches = 0
-        _train_belief_oracle(
-            belief_oracle, optimizer_oracle, scaler_oracle,
-            new_eps, device, writer, update
-        )
+
         for _ in range(k_epochs):
             batch_eps = random.sample(ep_buffer, min(len(ep_buffer), episodes_per_update))
             if not batch_eps: continue
-            batch_cpu = _collate_batch(ep_buffer, L_max=200)
+            batch_cpu = _collate_batch(batch_eps, L_max=200)
             batch_gpu = _to_device_batch(batch_cpu, device)
             
             optimizer.zero_grad()
