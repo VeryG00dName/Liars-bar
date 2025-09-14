@@ -498,13 +498,13 @@ def train_generation(
         learner.model.train()
         agg = {"total_loss": 0.0}
         n_batches = 0
-        if ep_buffer:
-            _train_belief_oracle(
-                belief_oracle, optimizer_oracle, scaler_oracle,
-                ep_buffer, device, writer, update
-            )
+        _train_belief_oracle(
+            belief_oracle, optimizer_oracle, scaler_oracle,
+            new_eps, device, writer, update
+        )
         for _ in range(k_epochs):
-            
+            batch_eps = random.sample(ep_buffer, min(len(ep_buffer), episodes_per_update))
+            if not batch_eps: continue
             batch_cpu = _collate_batch(ep_buffer, L_max=200)
             batch_gpu = _to_device_batch(batch_cpu, device)
             
