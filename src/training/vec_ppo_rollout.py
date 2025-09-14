@@ -5,6 +5,7 @@ import logging
 import time
 import numpy as np
 import torch
+from src.agents.cpp_bot_wrapper import CppBotWrapper
 from src.misc import lb
 
 from src.agents.batch_autoregressive_ppo_agent import BatchPPOAutoregressiveAgent
@@ -54,6 +55,7 @@ class PPOVecRolloutManager:
             batch_size = int(min(batch_guess, max_batch_envs))
         else:
             batch_size = int(batch_guess)
+        if batch_size <= 0: return []
         self.arena.reset(batch=batch_size, players=num_players, seed=np.random.randint(0, 2**31))
 
         roles = self._setup_roles(batch_size, num_players, training_policy_id, opponent_pool)
@@ -62,74 +64,88 @@ class PPOVecRolloutManager:
         episodes = [self._new_episode_tracker(b, roles[b], training_policy_id) for b in range(batch_size)]
         completed_episodes = []
 
-        # keyed by env_idx only
-        pending_data: Dict[int, Dict[str, Any]] = {}
+        # Keyed by (env_idx, seat) tuple for uniqueness
+        pending_data: Dict[tuple, Dict[str, Any]] = {}
 
         iter_count = 0
         last_done_count = 0
         while len(completed_episodes) < num_episodes:
-            t0 = time.time() if 'time' in globals() else None
             requests_by_policy = self.arena.collect_requests()
-            if t0 is not None:
-                dt = time.time() - t0
-                if dt > 2.0:
-                    logging.warning(f"collect_requests took {dt:.2f}s (batch={batch_size})")
             if not requests_by_policy:
+                # This can happen if all environments are done
                 break
 
+            # Process completed steps from the previous iteration
             self._log_rewards_and_dones(episodes, pending_data)
 
-            # Safety: ensure every returned policy id has a handler
-            missing = [pid for pid in requests_by_policy.keys() if pid not in self.policies]
+            # Safety check
+            missing = [pid for pid in requests_by_policy if pid not in self.policies]
             if missing:
-                logging.error(f"Missing policy handlers for ids: {missing}. Available: {list(self.policies.keys())}")
-                raise RuntimeError(f"No policy object for ids: {missing}")
+                raise RuntimeError(f"Missing policy handlers for ids: {missing}")
 
-            # Progress watchdog
+            # Watchdog
             iter_count += 1
             done_now = sum(1 for ep in episodes if ep['done'])
-            if iter_count % 500 == 0:
-                logging.info(f"[rollout] iter={iter_count} done={done_now}/{batch_size}")
-            if iter_count % 5000 == 0 and done_now == last_done_count:
-                logging.warning(f"[rollout] no progress for 5000 iters; still {done_now} done. Keys: {list(requests_by_policy.keys())}")
-            last_done_count = done_now
+            if iter_count > 0 and iter_count % 5000 == 0:
+                if done_now == last_done_count:
+                    logging.warning(f"[rollout] no progress for 5000 iters; still {done_now} done.")
+                last_done_count = done_now
 
             for policy_id, reqs in requests_by_policy.items():
-                if policy_id not in self.policies:
-                    continue
                 agent = self.policies[policy_id]
-
-                env_indices = np.array([r.env for r in reqs], dtype=int)
-                seat_indices = np.array([r.seat for r in reqs], dtype=int)
-
-                penalties_snapshot: List[int] = []
-                for env_idx, seat in zip(env_indices, seat_indices):
-                    env = self.arena.get_env(int(env_idx))
-                    penalties_snapshot.append(int(env.penalties[int(seat)]))
-
+                
+                # CppBotWrappers don't have belief predictions, handle them separately.
+                is_ai_agent = not isinstance(agent, CppBotWrapper)
+                
+                # Get actions from the agent (this will be a mix of AI and bot policies)
                 actions, log_probs, values, beliefs = agent.get_actions_batch(reqs)
-
+                
+                # Submit actions to the arena
                 self.arena.submit_actions(policy_id, actions)
 
-                # Only log our action rows when the training policy acted
-                if policy_id == training_policy_id:
-                    for i, req in enumerate(reqs):
-                        env_idx = req.env
-                        ep = episodes[env_idx]
-                        if ep['done']:
-                            continue
-                        step_idx = self._append_step_row(ep, ep['training_agent_seat'])
-                        ep['data']['our_action'][step_idx] = actions[i]
-                        pending_data[env_idx] = {
-                            "log_prob": log_probs[i],
-                            "value": values[i],
-                            "belief_preds": beliefs[i],
-                            "penalties_used": penalties_snapshot[i],
-                        }
+                # Now, log the data from this batch of requests
+                for i, req in enumerate(reqs):
+                    env_idx, seat = req.env, req.seat
+                    
+                    # Skip if the episode for this env is already marked as done
+                    if episodes[env_idx]['done']:
+                        continue
+                        
+                    pending_key = (env_idx, seat)
+                    
+                    # Initialize a dictionary for this pending step
+                    pending_data[pending_key] = {}
+                    
+                    # If it was an AI agent, we have belief predictions to store
+                    if is_ai_agent:
+                        # For AI agents, log their actual belief prediction
+                        if beliefs and i < len(beliefs):
+                            pending_data[pending_key]["belief_preds"] = beliefs[i]
+                    else:
+                        # For C++ bots, create a "ground truth" belief vector
+                        # The bot's belief is its own label, and it has no beliefs about others.
+                        # We use 0 as a placeholder for the other two slots.
+                        bot_label = agent.label
+                        pending_data[pending_key]["belief_preds"] = [bot_label, 0, 0]
+                    # If this agent is the LEARNER, we also need to store PPO-specific data
+                    if policy_id == training_policy_id:
+                        # Append a new row to our learner-centric data structure
+                        step_idx = self._append_step_row(episodes[env_idx], seat)
+                        episodes[env_idx]['data']['our_action'][step_idx] = actions[i]
+                        
+                        # Add the PPO data to the pending dict
+                        if log_probs is not None and i < len(log_probs):
+                            pending_data[pending_key]["log_prob"] = log_probs[i]
+                        if values is not None and i < len(values):
+                            pending_data[pending_key]["value"] = values[i]
+                        
+                        # Get penalties at the moment of decision
+                        penalties_snapshot = int(self.arena.get_env(env_idx).penalties[seat])
+                        pending_data[pending_key]["penalties_used"] = penalties_snapshot
 
-        # flush last chunk
+
+        # Final flush of any remaining data and finalization of episodes
         self._log_rewards_and_dones(episodes, pending_data)
-
         for ep_tracker in episodes:
             if not ep_tracker['done']:
                 self._finalize_episode(ep_tracker, pending_data)
@@ -147,32 +163,44 @@ class PPOVecRolloutManager:
             env = self.arena.get_env(env_idx)
             history = env.game_history()
 
-            # consume new history entries
             while ep_tracker['last_history_len'] < len(history):
                 entry_idx = ep_tracker['last_history_len']
                 entry = history[entry_idx]
+                actor_seat = entry['player']
                 ep_tracker['last_history_len'] += 1
 
-                is_our_turn = (entry['player'] == ep_tracker['training_agent_seat'])
-
-                if is_our_turn:
-                    data = pending_data.pop(env_idx, None)
-                    if data:
-                        step_idx = len(ep_tracker['data']['our_action']) - 1
-                        ep_tracker['data']['log_prob'][step_idx] = data['log_prob']
-                        ep_tracker['data']['value'][step_idx] = data['value']
-                        beliefs = data['belief_preds']
-                        if beliefs and len(beliefs) > 0:
+                # --- Process pending data for ANY actor ---
+                pending_key = (env_idx, actor_seat)
+                data = pending_data.pop(pending_key, None)
+                
+                if data:
+                    # This was an AI agent's turn. Log its beliefs as ground truth.
+                    beliefs = data.get('belief_preds')
+                    step_idx = self._append_step_row(ep_tracker, actor_seat)
+                    
+                    if beliefs and len(beliefs) > 0:
+                        # Pad the list to length 3 with a placeholder if it's short
+                        padded_beliefs = list(beliefs) + [-100] * (3 - len(beliefs))
+                        
+                        ep_tracker['data']['opp_belief_tgt0'][step_idx] = padded_beliefs[0]
+                        ep_tracker['data']['opp_belief_tgt1'][step_idx] = padded_beliefs[1]
+                        ep_tracker['data']['opp_belief_tgt2'][step_idx] = padded_beliefs[2]
+                        
+                    # If this was also the learner's turn, log its specific data
+                    if actor_seat == ep_tracker['training_agent_seat']:
+                        ep_tracker['data']['our_action'][step_idx] = entry['action']
+                        ep_tracker['data']['log_prob'][step_idx] = data.get('log_prob')
+                        ep_tracker['data']['value'][step_idx] = data.get('value')
+                        ep_tracker['data']['penalties_used'][step_idx] = data.get('penalties_used')
+                        
+                        # Also log the learner's own predictions
+                        if beliefs and len(beliefs) >= 3:
                             ep_tracker['data']['belief_pred0'][step_idx] = beliefs[0]
-                        if beliefs and len(beliefs) > 1:
                             ep_tracker['data']['belief_pred1'][step_idx] = beliefs[1]
-                        if beliefs and len(beliefs) > 2:
                             ep_tracker['data']['belief_pred2'][step_idx] = beliefs[2]
-                        # save the penalties we snapped pre-step
-                        ep_tracker['data']['penalties_used'][step_idx] = int(data['penalties_used'])
-                else:
-                    step_idx = self._append_step_row(ep_tracker, entry['player'])
-                    ep_tracker['data']['opp_target_action'][step_idx] = entry['action']
+                    else:
+                        # This was an opponent's turn
+                        ep_tracker['data']['opp_target_action'][step_idx] = entry['action']
 
             if done_statuses[env_idx]:
                 self._finalize_episode(ep_tracker, pending_data)
@@ -190,7 +218,9 @@ class PPOVecRolloutManager:
         ep_data = ep_tracker['data']
 
         # If our action ended the game and pending data still exists, flush it
-        data = pending_data.pop(env_idx, None)
+        seat = ep_tracker['training_agent_seat']
+        pending_key = (ep_tracker['env_idx'], seat)
+        data = pending_data.pop(pending_key, None)
         if data and ep_data['agent_id'] and ep_data['agent_id'][-1] == seat:
             step_idx = len(ep_data['our_action']) - 1
             ep_data['log_prob'][step_idx] = data['log_prob']
@@ -201,7 +231,7 @@ class PPOVecRolloutManager:
             if beliefs and len(beliefs) > 2: ep_data['belief_pred2'][step_idx] = beliefs[2]
             ep_data['penalties_used'][step_idx] = int(data['penalties_used'])
 
-        # --- FIX: ROBUST TERMINAL REWARD ASSIGNMENT ---
+        # --- ROBUST TERMINAL REWARD ASSIGNMENT ---
         # Find our last step in the episode to assign the terminal reward,
         # regardless of who made the final move.
         our_last_step_idx = -1
@@ -220,7 +250,6 @@ class PPOVecRolloutManager:
         # If we actually took an action, assign the final reward to our last step.
         if our_last_step_idx != -1:
             ep_data['reward'][our_last_step_idx] = 1.0 if is_winner else -1.0
-        # --- END FIX ---
 
         ep_data['episode_return'] = float(sum(ep_data['reward']))
 
@@ -258,7 +287,9 @@ class PPOVecRolloutManager:
 
             "belief_pred0": [], "belief_pred1": [], "belief_pred2": [],
             "belief_tgt0": [], "belief_tgt1": [], "belief_tgt2": [],
-
+            
+            "opp_belief_tgt0": [], "opp_belief_tgt1": [], "opp_belief_tgt2": [],
+            
             "penalties_used": [],
 
             "model_input": None,
@@ -300,6 +331,10 @@ class PPOVecRolloutManager:
             ep['belief_tgt0'].append(None)
             ep['belief_tgt1'].append(None)
             ep['belief_tgt2'].append(None)
+
+        ep['opp_belief_tgt0'].append(None)
+        ep['opp_belief_tgt1'].append(None)
+        ep['opp_belief_tgt2'].append(None)
 
         # align penalties_used length with rows; will be filled on our steps
         ep['penalties_used'].append(None)

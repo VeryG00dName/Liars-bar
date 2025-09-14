@@ -20,6 +20,13 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 # Hide symbolic_shapes warnings printed via warnings module (belt-and-suspenders)
 warnings.filterwarnings("ignore", message=".*symbolic_shapes.*")
 
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
+import pandas as pd
+import seaborn as sns
+import io
+from PIL import Image
+    
 import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
@@ -29,6 +36,7 @@ import torch.amp as amp
 from src.misc import lb
 from src import config
 from src.model.ppo_fused_model import PPOFusedModel
+from src.model.belief_oracle import BeliefOracle
 from src.agents.batch_autoregressive_ppo_agent import BatchPPOAutoregressiveAgent
 from src.agents.cpp_bot_wrapper import CppBotWrapper
 from src.training.vec_ppo_rollout import PPOVecRolloutManager
@@ -188,6 +196,169 @@ class PlateauDetector:
         return abs(improvement) < self.threshold
 
 
+def _train_belief_oracle(
+    belief_oracle: BeliefOracle,
+    optimizer_oracle: torch.optim.Optimizer,
+    scaler_oracle: amp.GradScaler,
+    ep_buffer: List[Dict[str, Any]],
+    device: torch.device,
+    writer: SummaryWriter,
+    global_update: int
+):
+    """Trains the BeliefOracle on a buffer of recent episodes."""
+    belief_oracle.train()
+    
+    # Create a batch with oracle-specific targets
+    oracle_batch_cpu = _collate_batch(ep_buffer, L_max=200, oracle_mode=True)
+    if not oracle_batch_cpu:
+        logging.warning("Skipping oracle training: no valid data in buffer.")
+        return
+        
+    oracle_batch_gpu = _to_device_batch(oracle_batch_cpu, device)
+
+    optimizer_oracle.zero_grad()
+    with amp.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == "cuda")):
+        # Get predictions from the oracle
+        oracle_preds = belief_oracle(**oracle_batch_gpu["mi"])
+        
+        # Get targets from the batch
+        b0_tgt = oracle_batch_gpu["opp_belief_tgt0"]
+        b1_tgt = oracle_batch_gpu["opp_belief_tgt1"]
+        b2_tgt = oracle_batch_gpu["opp_belief_tgt2"]
+        mask = oracle_batch_gpu["opp_belief_mask"] # Mask for valid opponent turns
+        if not mask.any():
+            logging.warning("Skipping oracle training: no valid belief targets in this batch.")
+            return
+        logits0, logits1, logits2 = oracle_preds["logits_opp0"], oracle_preds["logits_opp1"], oracle_preds["logits_opp2"]
+
+        # Compute loss for each head, masked by valid opponent turns
+        loss0 = F.cross_entropy(logits0[mask], b0_tgt[mask], ignore_index=-100)
+        loss1 = F.cross_entropy(logits1[mask], b1_tgt[mask], ignore_index=-100)
+        loss2 = F.cross_entropy(logits2[mask], b2_tgt[mask], ignore_index=-100)
+        
+        total_oracle_loss = loss0 + loss1 + loss2
+
+    if torch.isnan(total_oracle_loss):
+        logging.warning("NaN loss detected in BeliefOracle training. Skipping update.")
+        return
+
+    scaler_oracle.scale(total_oracle_loss).backward()
+    scaler_oracle.unscale_(optimizer_oracle)
+    clip_grad_norm_(belief_oracle.parameters(), max_norm=1.0)
+    scaler_oracle.step(optimizer_oracle)
+    scaler_oracle.update()
+    
+    # Log metrics
+    with torch.no_grad():
+        acc0 = (logits0[mask].argmax(dim=-1) == b0_tgt[mask]).float().mean()
+        acc1 = (logits1[mask].argmax(dim=-1) == b1_tgt[mask]).float().mean()
+        acc2 = (logits2[mask].argmax(dim=-1) == b2_tgt[mask]).float().mean()
+        
+    writer.add_scalar("Oracle/Loss", total_oracle_loss.item(), global_update)
+    writer.add_scalar("Oracle/Acc0", acc0.item(), global_update)
+    writer.add_scalar("Oracle/Acc1", acc1.item(), global_update)
+    writer.add_scalar("Oracle/Acc2", acc2.item(), global_update)
+    
+    belief_oracle.eval()
+
+def _generate_and_log_tsne_plot(
+    belief_oracle: BeliefOracle,
+    ep_buffer: List[Dict[str, Any]],
+    policy_map: Dict[int, Any],
+    device: torch.device,
+    writer: SummaryWriter,
+    global_update: int
+):
+    """Generates strategy embeddings and logs a t-SNE plot to TensorBoard."""
+    logging.info("Generating t-SNE plot of strategy embeddings...")
+    belief_oracle.eval()
+
+    # Create a reverse map from label to name for plotting
+    label_to_name = {p.label: p.player_id for p in policy_map.values()}
+    cpp_bot_labels = {l for l, p in policy_map.items() if isinstance(p, CppBotWrapper)}
+
+    all_embeddings = []
+    all_labels = []
+
+    # Process a sample of the buffer to get embeddings
+    sample_eps = random.sample(ep_buffer, min(len(ep_buffer), 1024))
+    if not sample_eps: return
+    
+    batch_cpu = _collate_batch(sample_eps, L_max=200, oracle_mode=True)
+    if not batch_cpu: return
+    batch_gpu = _to_device_batch(batch_cpu, device)
+
+    with torch.no_grad(), amp.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == "cuda")):
+        oracle_preds = belief_oracle(**batch_gpu["mi"])
+        embeddings = oracle_preds["embedding"] # Shape: [B, L, D_emb]
+    
+    # Collect embeddings only from valid, non-padded steps for AI players
+    agent_types = batch_gpu["mi"]["agent_types"]
+    padding_mask = batch_gpu["mi"]["padding_mask"]
+    
+    for b in range(embeddings.shape[0]):
+        for t in range(embeddings.shape[1]):
+            if padding_mask[b, t]: continue
+            
+            label = int(agent_types[b, t].item())
+            if label not in cpp_bot_labels: # Only plot embeddings for AI agents
+                all_embeddings.append(embeddings[b, t].cpu().numpy())
+                all_labels.append(label_to_name.get(label, f"Unknown_{label}"))
+
+    if len(all_embeddings) < 50:
+        logging.warning(f"Not enough embeddings to plot t-SNE ({len(all_embeddings)} found).")
+        return
+
+    # Perform t-SNE
+    tsne = TSNE(n_components=2, perplexity=min(30, len(all_embeddings) - 1), n_iter=1000, random_state=SEED)
+    embeddings_2d = tsne.fit_transform(np.array(all_embeddings))
+
+    # Create a DataFrame for plotting
+    df = pd.DataFrame(embeddings_2d, columns=['dim1', 'dim2'])
+    df['strategy'] = all_labels
+    
+    # Separate bots and AI agents
+    df_bots = df[df['strategy'].str.startswith('cpp_')]
+    df_ai = df[~df['strategy'].str.startswith('cpp_')]
+    
+    # Plotting
+    plt.figure(figsize=(12, 10))
+    
+    # Plot AI agents with a color gradient based on their position
+    sns.scatterplot(
+        data=df_ai,
+        x='dim1', y='dim2', hue='dim2', # Color by y-position for a gradient effect
+        palette='viridis',
+        legend=False,
+        s=50, alpha=0.7
+    )
+
+    # Plot C++ bots with distinct colors and markers
+    bot_names = sorted(df_bots['strategy'].unique())
+    palette = sns.color_palette("hls", len(bot_names))
+    sns.scatterplot(
+        data=df_bots,
+        x='dim1', y='dim2', style='strategy', hue='strategy',
+        palette=palette,
+        s=150, alpha=0.9
+    )
+
+    plt.title(f'Strategy Embeddings t-SNE at Update {global_update}')
+    plt.xlabel('Dimension 1')
+    plt.ylabel('Dimension 2')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    image = np.array(Image.open(buf))
+    
+    writer.add_image('Strategy_Embeddings/t-SNE', image, global_update, dataformats='HWC')
+    plt.close()
+    logging.info("t-SNE plot logged to TensorBoard.")
+
 # ==============================================================================
 # SECTION 2: THE CORE TRAIN FUNCTION
 # ==============================================================================
@@ -197,10 +368,8 @@ def train_generation(
     master_run_name: str,
     pool_manager: OpponentPoolManager,
     max_updates: int = 5000,
-    # New: pass a preloaded/compiled learner or a warm_start_path for backward-compat
     learner: Optional[BatchPPOAutoregressiveAgent] = None,
     warm_start_path: Optional[str] = None,
-    # New: cache for already loaded opponents/agents to avoid reloading
     agent_cache: Optional[Dict[str, BatchPPOAutoregressiveAgent]] = None,
 ):
     """
@@ -235,7 +404,10 @@ def train_generation(
         learner.model = learner.model.to(device)
         
     learner.model.train()
-    
+    belief_oracle = BeliefOracle(obs_dim=9, belief_dim=64).to(device)
+    optimizer_oracle = torch.optim.AdamW(belief_oracle.parameters(), lr=1e-4, fused=(device.type=='cuda'))
+    scaler_oracle = amp.GradScaler(enabled=(device.type == "cuda"))
+    belief_oracle.train()
     optimizer = torch.optim.AdamW(learner.model.parameters(), lr=float(config.LEARNING_RATE))
     scaler = amp.GradScaler(enabled=(device.type == "cuda"))
     
@@ -301,7 +473,7 @@ def train_generation(
     episodes_per_update = int(config.EPISODES_PER_UPDATE)
     k_epochs = int(config.K_EPOCHS)
     ep_buffer: List[Dict[str, Any]] = []
-    
+    plot_interval = 25
     for update in range(1, max_updates + 1):
         # -------- Rollout --------
         t0 = time.time()
@@ -326,11 +498,14 @@ def train_generation(
         learner.model.train()
         agg = {"total_loss": 0.0}
         n_batches = 0
+        if ep_buffer:
+            _train_belief_oracle(
+                belief_oracle, optimizer_oracle, scaler_oracle,
+                ep_buffer, device, writer, update
+            )
         for _ in range(k_epochs):
-            batch_eps = random.sample(ep_buffer, min(len(ep_buffer), episodes_per_update))
-            if not batch_eps: continue
             
-            batch_cpu = _collate_batch(batch_eps, L_max=200)
+            batch_cpu = _collate_batch(ep_buffer, L_max=200)
             batch_gpu = _to_device_batch(batch_cpu, device)
             
             optimizer.zero_grad()
@@ -391,7 +566,17 @@ def train_generation(
             path = os.path.join(run_ckpt_dir, f"update_{update}.pth")
             to_save = getattr(learner.model, "_orig_mod", learner.model)
             torch.save({'model_state_dict': to_save.state_dict()}, path)
+            torch.save({
+                'model_state_dict': to_save.state_dict(),
+                'oracle_state_dict': belief_oracle.state_dict()
+            }, path)
 
+        if update % plot_interval == 0 and ep_buffer:
+            _generate_and_log_tsne_plot(
+                belief_oracle, ep_buffer, policy_map,
+                device, writer, update
+            )
+        
     # 5. FINALIZE AND SAVE
     final_path = os.path.join(run_ckpt_dir, "final.pth")
     to_save = getattr(learner.model, "_orig_mod", learner.model)
