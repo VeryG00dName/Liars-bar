@@ -197,8 +197,10 @@ def train_generation(
     master_run_name: str,
     pool_manager: OpponentPoolManager,
     max_updates: int = 5000,
+    # New: pass a preloaded/compiled learner or a warm_start_path for backward-compat
     learner: Optional[BatchPPOAutoregressiveAgent] = None,
     warm_start_path: Optional[str] = None,
+    # New: cache for already loaded opponents/agents to avoid reloading
     agent_cache: Optional[Dict[str, BatchPPOAutoregressiveAgent]] = None,
 ):
     """
@@ -237,62 +239,58 @@ def train_generation(
     optimizer = torch.optim.AdamW(learner.model.parameters(), lr=float(config.LEARNING_RATE))
     scaler = amp.GradScaler(enabled=(device.type == "cuda"))
     
-    # Define special labels
-    CHAMPION_LABEL = 7
-    TRAINING_LABEL = 8
-
+    # Build unified policy map: include C++ bot wrappers for labels 0..6,
+    # historical AI agents at their stored labels (>=7), and the current learner.
     policy_map: Dict[int, Any] = {}
 
-    # 2a. Add C++ bots with their fixed labels (0-6)
+    # Map labels to C++ bot classes from lb (check existence explicitly)
     cpp_bot_names = {
-        0: "Classic", 1: "GreedyCardSpammer", 2: "RandomAgent",
-        3: "SelectiveTableConservativeChallenger", 4: "StrategicChallenger",
-        5: "TableFirstConservativeChallenger", 6: "TableNonTableAgent",
+        0: "Classic",
+        1: "GreedyCardSpammer",
+        2: "RandomAgent",
+        3: "SelectiveTableConservativeChallenger",
+        4: "StrategicChallenger",
+        5: "TableFirstConservativeChallenger",
+        6: "TableNonTableAgent",
     }
     for label, name in cpp_bot_names.items():
-        if hasattr(lb, name):
-            cls = getattr(lb, name)
-            policy_map[label] = CppBotWrapper(cls, label=label, device=device, player_id=f"cpp_{label}")
+        if not hasattr(lb, name):
+            logging.error(f"lb missing C++ bot class '{name}' — cannot register wrapper for label {label}")
+            continue
+        cls = getattr(lb, name)
+        try:
+            wrapper = CppBotWrapper(cls, label=label, device=device, player_id=f"cpp_{label}")
+            policy_map[label] = wrapper
+        except Exception as e:
+            logging.exception(f"Failed to create CppBotWrapper for '{name}' (label {label}): {e}")
 
-    # 2b. Identify and load the current champion (most recent historical model)
-    historical_agents = [a for a in pool_manager.pool if a['type'] == 'historical']
-    champion_agent_def = None
-    if historical_agents:
-        # The champion is the one with the highest original label in the JSON file
-        champion_agent_def = max(historical_agents, key=lambda x: x['label'])
-        
-        logging.info(f"Identified Champion: {champion_agent_def['name']} (original label {champion_agent_def['label']})")
-        
-        # Load the champion agent from cache or disk
-        ckpt_path = champion_agent_def['path']
-        cache_key = f"ckpt:{os.path.abspath(ckpt_path)}"
-        if agent_cache is not None and cache_key in agent_cache:
-            champion_agent = agent_cache[cache_key]
-        else:
-            champion_agent = _load_agent_from_checkpoint(ckpt_path, 'main', device)
-            if agent_cache is not None:
-                agent_cache[cache_key] = champion_agent
-        
-        champion_agent.model.eval()
-        for p in champion_agent.model.parameters():
-            p.requires_grad = False
-        
-        # CRITICAL: Assign the champion to the special, reused CHAMPION_LABEL
-        champion_agent.label = CHAMPION_LABEL
-        policy_map[CHAMPION_LABEL] = champion_agent
+    # Add historical AI agents using their stored labels (>=7)
+    used_labels = set([a['label'] for a in pool_manager.pool if a['type'] != 'cpp_bot' and 'label' in a])
+    for agent_def in pool_manager.pool:
+        if agent_def['type'] != 'cpp_bot' and agent_def.get('path'):
+            policy_id = int(agent_def['label'])
+            ckpt_path = agent_def['path']
+            cache_key = f"ckpt:{os.path.abspath(ckpt_path)}"
+            if agent_cache is not None and cache_key in agent_cache:
+                agent = agent_cache[cache_key]
+            else:
+                agent = _load_agent_from_checkpoint(ckpt_path, agent_def.get('model_type', 'main'), device)
+                if agent_cache is not None:
+                    agent_cache[cache_key] = agent
+            agent.model.eval()
+            for p in agent.model.parameters():
+                p.requires_grad = False
+            agent.label = policy_id
+            policy_map[policy_id] = agent
 
-    # 2c. Add the current learner with its special label
-    learner.label = TRAINING_LABEL
-    policy_map[TRAINING_LABEL] = learner
+    # Assign a training policy id >= 7 that doesn't collide with existing labels
+    training_policy_id = 7
+    while training_policy_id in policy_map:
+        training_policy_id += 1
+    learner.label = training_policy_id
+    policy_map[training_policy_id] = learner
 
     logging.info(f"Registered policies: {sorted(list(policy_map.keys()))}")
-
-    # 2d. Construct the opponent pool for rollouts
-    opponent_pool = [label for label in cpp_bot_names.keys()]
-    if champion_agent_def is not None:
-        opponent_pool.append(CHAMPION_LABEL)
-    
-    logging.info(f"Opponent pool for rollouts: {opponent_pool}")
 
     # 3. INITIALIZE ARENA, ROLLOUT MANAGER, AND PLATEAU DETECTOR
     arena = lb.VecArena()
@@ -311,8 +309,8 @@ def train_generation(
         new_eps = rollout_manager.collect_episodes(
             num_episodes=episodes_per_update,
             num_players=4,
-            training_policy_id=TRAINING_LABEL,
-            opponent_pool=opponent_pool,
+            training_policy_id=training_policy_id,
+            opponent_pool=[int(a['label']) for a in pool_manager.pool if a['type'] == 'cpp_bot' or a['type'] == 'historical'],
             max_batch_envs=int(getattr(config, "EPISODES_PER_UPDATE", 512))
         )
         t_roll = time.time()
