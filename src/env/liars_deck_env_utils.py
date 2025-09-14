@@ -615,7 +615,8 @@ def get_newerest_observations(env, agent_specific=None):
         self_idx = agent_to_idx[agent]
 
         # 0) Self hand features (SAFE ACCESS for hands)
-        current_hand = env.players_hands[agent]
+        # Use .get() only for players_hands, as it's the dict most likely to have keys removed.
+        current_hand = env.players_hands.get(agent, [])
         hand_vec = encode_hand(current_hand, env.table_card).astype(np.float32)
 
         # 1) Opponent hand sizes in rotated order (SAFE ACCESS for hands)
