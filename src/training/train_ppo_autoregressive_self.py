@@ -205,36 +205,50 @@ def _train_belief_oracle(
     writer: SummaryWriter,
     global_update: int
 ):
-    """Trains the BeliefOracle on a buffer of recent episodes."""
+    """Trains the BeliefOracle on a buffer of recent episodes using index-based logic."""
     belief_oracle.train()
     
-    # Create a batch with oracle-specific targets
+    # Collate the batch in oracle_mode to get the necessary targets and indices
     oracle_batch_cpu = _collate_batch(ep_buffer, L_max=200, oracle_mode=True)
-    if not oracle_batch_cpu:
-        logging.warning("Skipping oracle training: no valid data in buffer.")
+    if not oracle_batch_cpu or "opp_idx" not in oracle_batch_cpu or oracle_batch_cpu["opp_idx"].numel() == 0:
+        logging.warning("Skipping oracle training: no valid opponent data in buffer.")
         return
         
     oracle_batch_gpu = _to_device_batch(oracle_batch_cpu, device)
 
+    # --- NEW: INDEX-BASED LOGIC ---
+    # Unpack the relevant tensors
+    mi = oracle_batch_gpu["mi"]
+    opp_idx = oracle_batch_gpu["opp_idx"].long()         # [B, To] - Indices of opponent turns in the full sequence
+    mask = oracle_batch_gpu["opp_belief_have_target"].bool()   # [B, To] - Mask for which of those turns have a valid target
+    
+    b0_tgt = oracle_batch_gpu["opp_belief_tgt0"][mask]
+    b1_tgt = oracle_batch_gpu["opp_belief_tgt1"][mask]
+    b2_tgt = oracle_batch_gpu["opp_belief_tgt2"][mask]
+
+    # Guard against batches with no valid targets after masking
+    if b0_tgt.numel() == 0:
+        logging.warning("Skipping oracle training: no valid belief targets after masking.")
+        return
+    # --- END NEW ---
+
     optimizer_oracle.zero_grad()
     with amp.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == "cuda")):
         # Get predictions from the oracle
-        oracle_preds = belief_oracle(**oracle_batch_gpu["mi"])
+        oracle_preds = belief_oracle(**mi)
         
-        # Get targets from the batch
-        b0_tgt = oracle_batch_gpu["opp_belief_tgt0"]
-        b1_tgt = oracle_batch_gpu["opp_belief_tgt1"]
-        b2_tgt = oracle_batch_gpu["opp_belief_tgt2"]
-        mask = oracle_batch_gpu["opp_belief_mask"] # Mask for valid opponent turns
-        if not mask.any():
-            logging.warning("Skipping oracle training: no valid belief targets in this batch.")
-            return
-        logits0, logits1, logits2 = oracle_preds["logits_opp0"], oracle_preds["logits_opp1"], oracle_preds["logits_opp2"]
-
-        # Compute loss for each head, masked by valid opponent turns
-        loss0 = F.cross_entropy(logits0[mask], b0_tgt[mask], ignore_index=-100)
-        loss1 = F.cross_entropy(logits1[mask], b1_tgt[mask], ignore_index=-100)
-        loss2 = F.cross_entropy(logits2[mask], b2_tgt[mask], ignore_index=-100)
+        # Gather the logits from the full sequence using the opponent indices
+        logits0_full, logits1_full, logits2_full = oracle_preds["logits_opp0"], oracle_preds["logits_opp1"], oracle_preds["logits_opp2"]
+        
+        # Select the logits only for the valid opponent turns that have a target
+        logits0 = logits0_full.gather(1, opp_idx.unsqueeze(-1).expand(-1, -1, logits0_full.size(-1)))[mask]
+        logits1 = logits1_full.gather(1, opp_idx.unsqueeze(-1).expand(-1, -1, logits1_full.size(-1)))[mask]
+        logits2 = logits2_full.gather(1, opp_idx.unsqueeze(-1).expand(-1, -1, logits2_full.size(-1)))[mask]
+        
+        # Compute loss for each head
+        loss0 = F.cross_entropy(logits0, b0_tgt, ignore_index=-100)
+        loss1 = F.cross_entropy(logits1, b1_tgt, ignore_index=-100)
+        loss2 = F.cross_entropy(logits2, b2_tgt, ignore_index=-100)
         
         total_oracle_loss = loss0 + loss1 + loss2
 
@@ -250,9 +264,9 @@ def _train_belief_oracle(
     
     # Log metrics
     with torch.no_grad():
-        acc0 = (logits0[mask].argmax(dim=-1) == b0_tgt[mask]).float().mean()
-        acc1 = (logits1[mask].argmax(dim=-1) == b1_tgt[mask]).float().mean()
-        acc2 = (logits2[mask].argmax(dim=-1) == b2_tgt[mask]).float().mean()
+        acc0 = (logits0.argmax(dim=-1) == b0_tgt).float().mean()
+        acc1 = (logits1.argmax(dim=-1) == b1_tgt).float().mean()
+        acc2 = (logits2.argmax(dim=-1) == b2_tgt).float().mean()
         
     writer.add_scalar("Oracle/Loss", total_oracle_loss.item(), global_update)
     writer.add_scalar("Oracle/Acc0", acc0.item(), global_update)
