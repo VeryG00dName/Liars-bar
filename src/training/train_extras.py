@@ -363,297 +363,196 @@ def ppo_losses_batched(
     sl_teacher: Optional[torch.nn.Module] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
-    Fully batched PPO objective with:
-      • irregular-step GAE computed inside (from batch['rewards'] & model values)
-      • stakes-based value target clipping (optional)
-      • belief-head CE (batched, masked; -100 ignored)
-      • opponent action CE (batched; NO action masking; -100 ignored)
-      • optional teacher KL at OUR steps
-
-    Requires in batch:
-      mi, our_idx [B,T], mask [B,T], actions [B,T], old_logp [B,T],
-      rewards [B,T], penalties_used [B,T],
-      our_action_mask [B,L,A] or None,
-      belief_tgt{0,1,2}, belief{0,1,2}_mask,
-      opp_idx [B,To], opp_targets [B,To], opp_have_label [B,To]
+    Fully batched PPO objective, updated to use boolean masks and a 
+    correct, efficient advantage calculation for sparse terminal rewards.
     """
+    # --- Step 1: Unpack batch (unchanged) ---
     mi = batch["mi"]
-    our_idx = batch["our_idx"].long()     # [B, T]
-    our_mask = batch["mask"].bool()       # [B, T]
-    actions = batch["actions"].long()     # [B, T]
-    old_logp = batch["old_logp"].float()  # [B, T]
-    rewards = batch["rewards"].float()    # [B, T]
+    our_mask = batch["our_mask"].bool()         # [B, L_pad] - For our agent's steps
+    opp_mask = batch["opp_mask"].bool()         # [B, L_pad] - For opponent's steps
+    actions = batch["actions"].long()           # [B, L_pad]
+    old_logp = batch["old_logp"].float()        # [B, L_pad]
+    rewards = batch["rewards"].float()          # [B, L_pad]
+    penalties_used = batch["penalties_used"]    # [B, L_pad]
+    padding_mask = mi["padding_mask"].bool()    # [B, L_pad]
 
+    # --- Step 2: Model Forward Pass (unchanged) ---
     outs = model(**mi)
-    action_logits = outs[0]                                # [B, L, A]
-    opp_logits    = outs[1] if len(outs) > 1 else None     # [B, L, A] or None
-    values_full   = outs[2].squeeze(-1).to(torch.float32)  # [B, L]
-    b0 = outs[3] if len(outs) > 3 else None                # [B, L, C0] or None
+    action_logits = outs[0]
+    opp_logits = outs[1]
+    values_full = outs[2].squeeze(-1).to(torch.float32)
+    b0 = outs[3] if len(outs) > 3 else None
     b1 = outs[4] if len(outs) > 4 else None
     b2 = outs[5] if len(outs) > 5 else None
-
-    B, T = our_idx.shape
-    A = action_logits.size(-1)
-
-    # ---- Gather OUR-step logits ----
-    logits_at = action_logits.gather(1, our_idx.unsqueeze(-1).expand(-1, -1, A))  # [B,T,A]
-
-    def _neg_inf_like(x: torch.Tensor) -> torch.Tensor:
-        return torch.tensor(torch.finfo(x.dtype).min, dtype=x.dtype, device=x.device)
     
-    # Apply legality mask for OUR steps only (if provided)
-    if batch.get("our_action_mask", None) is not None:
-        step_mask = batch["our_action_mask"].gather(
-            1, our_idx.unsqueeze(-1).expand(-1, -1, A)
-        )
-        invalid_rows = (~step_mask).all(dim=-1)
-        if invalid_rows.any():
-            fb_cols = logits_at[invalid_rows].argmax(dim=-1)
-            step_mask[invalid_rows] = False
-            step_mask[invalid_rows, fb_cols] = True
-        logits_at = logits_at.masked_fill(~step_mask, _neg_inf_like(logits_at))
+    B, L_pad = our_mask.shape
 
-    logits_at = torch.nan_to_num(logits_at, nan=0.0, posinf=0.0, neginf=float(torch.finfo(logits_at.dtype).min))
-    values_at = values_full.gather(1, our_idx)
-    values_at = torch.nan_to_num(values_at, nan=0.0, posinf=0.0, neginf=0.0)
-
-    # ---- Build "next" indices & gaps for irregular-step GAE ----
-    next_idx = torch.full_like(our_idx, -1)
-    if T > 1:
-        next_idx[:, :-1] = our_idx[:, 1:]
-
-    has_next = torch.zeros_like(our_mask)
-    if T > 1:
-        has_next[:, :-1] = our_mask[:, 1:]
-
-    gaps = torch.zeros_like(our_idx, dtype=torch.long)
-    valid_gap = has_next & our_mask
-    gaps[valid_gap] = (next_idx[valid_gap] - our_idx[valid_gap]).clamp_min(1)
-    gamma_gap = (GAMMA ** gaps.to(torch.float32))
-    lam_gap   = (GAE_LAMBDA ** gaps.to(torch.float32))
-
-    # ---- Irregular-step GAE (vectorized backward over T) ----
+    # --- Step 3: Advantage & Return Calculation for Terminal Rewards ---
     with torch.no_grad():
-        advantages = torch.zeros_like(values_at)
-        lastgaelam = torch.zeros((B,), device=values_at.device, dtype=torch.float32)
-        for t in reversed(range(T)):
-            g  = torch.where(has_next[:, t], gamma_gap[:, t], torch.zeros_like(gamma_gap[:, t]))
-            gl = torch.where(has_next[:, t], gamma_gap[:, t] * lam_gap[:, t], torch.zeros_like(gamma_gap[:, t]))
-            L = values_full.size(1)
-            idx_safe = next_idx[:, t].clamp(0, L - 1)
-            nv = torch.where(
-                has_next[:, t],
-                values_full.gather(1, idx_safe.unsqueeze(-1)).squeeze(-1),
-                torch.zeros_like(values_at[:, t]),
-            )
-            delta = rewards[:, t] + g * nv - values_at[:, t]
-            lastgaelam = delta + gl * lastgaelam
-            advantages[:, t] = lastgaelam
-            lastgaelam = torch.where(our_mask[:, t], lastgaelam, lastgaelam * 0.0)
-        returns = advantages + values_at
+        # The reward tensor 'rewards' is sparse. It's 0 everywhere except for one step
+        # (our last action) which has +1.0 or -1.0.
+        
+        # We need to find the discounted returns (G_t) for all steps.
+        # We can do this with a single backward pass (dynamic programming).
+        returns = torch.zeros_like(rewards)
+        next_return = torch.zeros(B, device=rewards.device)
+        
+        for t in reversed(range(L_pad)):
+            # If this step is padded, it's not part of the episode. Reset and continue.
+            is_padded = padding_mask[:, t]
+            
+            # The return at this step is its own reward + discounted next return
+            # This works because all r_t are 0 until the final step.
+            current_return = rewards[:, t] + GAMMA * next_return
+            
+            # Update next_return for the step *before* this one
+            next_return = torch.where(is_padded, 0.0, current_return)
+            
+            # Store the return
+            returns[:, t] = current_return
 
-    # Normalize advantages using only valid positions
-    m = our_mask.to(torch.float32)
-    adv_sum = (advantages * m).sum()
-    m_sum = m.sum().clamp_min(1.0)
-    adv_mean = adv_sum / m_sum
-    adv_var  = ((advantages - adv_mean).pow(2) * m).sum() / m_sum
-    adv_std  = torch.sqrt(adv_var)
-    advantages = (advantages - adv_mean) / (adv_std + 1e-8)
+        # Advantages are now simple: A(t) = G(t) - V(s_t)
+        # We only care about advantages at the steps we took action.
+        advantages = returns - values_full
+        advantages = advantages.where(~padding_mask, 0.0) # Zero out pad advantages
 
-    # ---- PPO objective (masked) ----
-    dist = torch.distributions.Categorical(logits=logits_at)
-    
-    # Replace padded actions (-100) with a valid placeholder (0) to prevent crash.
-    actions_for_log_prob = actions.masked_fill(~our_mask, 0)
-    
-    # Calculate log_prob and entropy. The results for padded steps are garbage.
-    new_logp = dist.log_prob(actions_for_log_prob).to(torch.float32)
-    entropy  = dist.entropy().to(torch.float32)
-
-    # CRITICAL FIX: Zero out the garbage values for padded steps.
-    new_logp = new_logp.where(our_mask, 0.0)
-    entropy = entropy.where(our_mask, 0.0)
-    # old_logp is already correctly zero for padded steps from the collate function.
-
-    def masked_mean(x: torch.Tensor) -> torch.Tensor:
-        w = our_mask.to(x.dtype)
-        return (x * w).sum() / w.sum().clamp_min(1.0)
-
-    # The rest of the calculation is now safe.
-    log_ratio = (new_logp - old_logp).clamp(min=-60.0, max=60.0)
-    ratio = log_ratio.exp()
-
-    clipped_std = torch.clamp(ratio, 1.0 - EPS_CLIP, 1.0 + EPS_CLIP)
-    clipped_neg = torch.clamp(ratio, 1.0 - EPS_CLIP, TRINAL_DELTA1)
-    r_clipped = torch.where(advantages < 0, clipped_neg, clipped_std)
-    surr1 = ratio * advantages
-    surr2 = r_clipped * advantages
-    policy_loss = -masked_mean(torch.min(surr1, surr2))
-    
-    with torch.no_grad():
-        neg_mask = (advantages < 0) & our_mask
-        trinal_clip_neg_frac = ((ratio > (1.0 + EPS_CLIP)) & neg_mask).float()
-        trinal_clip_neg_frac = trinal_clip_neg_frac.sum() / neg_mask.float().sum().clamp_min(1.0)
-
-    ent_mean = masked_mean(entropy)
-    entropy_loss = -ent_mean * ENT_COEF
-    approx_kl = masked_mean(old_logp - new_logp)
-    clipfrac  = masked_mean(((ratio - 1.0).abs() > EPS_CLIP).float())
-
-    # ---- Value loss ----
-    # Ensure we only compute value loss on valid, unpadded steps
+    # Normalize advantages over valid 'our' steps
     if our_mask.any():
-        value_loss, vclip_frac = _value_loss_with_stakes_clip_public(
-            v_pred=values_at[our_mask],
-            returns=returns[our_mask],
-            action_ids=actions[our_mask],
-            penalties_used=batch["penalties_used"][our_mask].long(),
-        )
-    else: # Handle empty batch case
-        value_loss = torch.tensor(0.0, device=values_at.device)
-        vclip_frac = torch.tensor(0.0, device=values_at.device)
+        adv_masked = advantages[our_mask]
+        adv_mean = adv_masked.mean()
+        adv_std = adv_masked.std().clamp_min(1e-8)
+        advantages = (advantages - adv_mean) / adv_std
     
-    total = policy_loss + VALUE_WEIGHT * value_loss + entropy_loss
-
-    metrics: Dict[str, torch.Tensor] = {
-        "policy_loss": policy_loss.detach(),
-        "value_loss": value_loss.detach(),
-        "entropy": ent_mean.detach(),
-        "approx_kl": approx_kl.detach(),
-        "clip_fraction": clipfrac.detach(),
-        "trinal_clip_neg_frac": trinal_clip_neg_frac.detach(),
-        "value_clip_frac": vclip_frac.detach(),
-    }
-
-    # ---- Teacher KL (optional) ----
-    if (BC_KL_WEIGHT > 0.0) and (sl_teacher is not None):
-        with torch.no_grad():
-            t_outs = sl_teacher(**mi)
-            t_logits = t_outs[0]
-            t_logits_at = t_logits.gather(1, our_idx.unsqueeze(-1).expand(-1, -1, A))
-            if batch.get("our_action_mask", None) is not None:
-                step_mask = batch["our_action_mask"].gather(1, our_idx.unsqueeze(-1).expand(-1, -1, A))
-                t_logits_at = t_logits_at.masked_fill(~step_mask, _neg_inf_like(t_logits_at))
-            t_logits_at = torch.nan_to_num(t_logits_at, nan=0.0, posinf=0.0, neginf=float(torch.finfo(t_logits_at.dtype).min))
-        dist_sl = torch.distributions.Categorical(logits=t_logits_at)
-        bc_kl = torch.distributions.kl_divergence(dist, dist_sl)
-        bc_kl = masked_mean(bc_kl)
-        total = total + BC_KL_WEIGHT * bc_kl
-        metrics["bc_kl"] = bc_kl.detach()
+    # --- Step 4: PPO Objective using Masks ---
+    valid_logits = action_logits[our_mask]
+    valid_actions = actions[our_mask]
+    valid_old_logp = old_logp[our_mask]
+    valid_advantages = advantages[our_mask]
+    
+    dist = torch.distributions.Categorical(logits=valid_logits)
+    valid_entropy = dist.entropy()
+    new_logp = dist.log_prob(valid_actions)
+    
+    ratio = (new_logp - valid_old_logp).exp()
+    
+    surr1 = ratio * valid_advantages
+    surr2 = torch.clamp(ratio, 1.0 - EPS_CLIP, 1.0 + EPS_CLIP) * valid_advantages
+    
+    # Check for empty batch to prevent .mean() on empty tensor
+    if valid_advantages.numel() > 0:
+        policy_loss = -torch.min(surr1, surr2).mean()
+        entropy_loss = -valid_entropy.mean() * ENT_COEF
     else:
-        metrics["bc_kl"] = torch.zeros((), device=logits_at.device)
+        policy_loss = torch.tensor(0.0, device=values_full.device)
+        entropy_loss = torch.tensor(0.0, device=values_full.device)
 
-    # ---- Aux: belief heads (batched, masked; -100 ignored) ----
-    def _belief_aux(b_logits: Optional[torch.Tensor],
-                    tgt: Optional[torch.Tensor],
-                    msk: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        if b_logits is None or tgt is None or msk is None or not msk.any():
-            z = torch.zeros((), device=values_full.device)
-            return z, z
-        C = b_logits.size(-1)
-        b_sel = b_logits.gather(1, our_idx.unsqueeze(-1).expand(-1, -1, C))
-        ce = torch.nn.functional.cross_entropy(
-            b_sel.flatten(0,1), tgt.view(-1),
-            ignore_index=-100, reduction="none"
-        ).view(B, T)
-        valid = (tgt != -100) & msk & our_mask
-        w = valid.to(ce.dtype)
-        loss = (ce * w).sum() / w.sum().clamp_min(1.0)
+    # --- Step 5: Value Loss using Masks ---
+    valid_returns = returns[our_mask]
+    valid_values = values_full[our_mask]
+    
+    if valid_values.numel() > 0:
+        value_loss, vclip_frac = _value_loss_with_stakes_clip_public(
+            v_pred=valid_values,
+            returns=valid_returns,
+            action_ids=valid_actions,
+            penalties_used=penalties_used[our_mask].long(),
+        )
+    else:
+        value_loss = torch.tensor(0.0, device=values_full.device)
+        vclip_frac = torch.tensor(0.0, device=values_full.device)
+    
+    # --- Step 6: Auxiliary Losses using Masks (Filled in) ---
+    belief_loss_total = torch.tensor(0.0, device=values_full.device)
+    acc0, acc1, acc2 = [torch.tensor(0.0, device=values_full.device) for _ in range(3)]
+
+    # Helper for calculating aux loss & acc safely
+    def _compute_aux(logits, targets, mask):
+        if logits is None:
+            return torch.tensor(0.0), torch.tensor(0.0) # Return dummy tensors with no device needed
+        if not mask.any():
+            return torch.tensor(0.0, device=logits.device), torch.tensor(0.0, device=logits.device)
+        
+        valid_logits = logits[mask]
+        valid_targets = targets[mask]
+        
+        if valid_targets.numel() == 0:
+            return torch.tensor(0.0, device=logits.device), torch.tensor(0.0, device=logits.device)
+            
+        loss = F.cross_entropy(valid_logits, valid_targets, ignore_index=-100)
+        
         with torch.no_grad():
-            pred = b_sel.argmax(dim=-1)
-            acc = ( ((pred == tgt) & valid).sum().to(torch.float32) /
-                    valid.sum().clamp_min(1) )
+            valid_preds = valid_logits.argmax(dim=-1)
+            valid_mask = valid_targets != -100
+            if valid_mask.any():
+                acc = (valid_preds[valid_mask] == valid_targets[valid_mask]).float().mean()
+            else:
+                acc = torch.tensor(0.0, device=logits.device)
+                
         return loss, acc
 
-    b0_loss, acc0 = _belief_aux(b0, batch.get("belief_tgt0"), batch.get("belief0_mask"))
-    b1_loss, acc1 = _belief_aux(b1, batch.get("belief_tgt1"), batch.get("belief1_mask"))
-    b2_loss, acc2 = _belief_aux(b2, batch.get("belief_tgt2"), batch.get("belief2_mask"))
-    belief_loss = b0_loss + b1_loss + b2_loss
-    if AUX_BELIEF_WEIGHT > 0.0:
-        total = total + AUX_BELIEF_WEIGHT * belief_loss
-    metrics["belief_loss"] = belief_loss.detach()
-    metrics["belief_acc_0"] = acc0.detach()
-    metrics["belief_acc_1"] = acc1.detach()
-    metrics["belief_acc_2"] = acc2.detach()
+    # Belief Loss
+    b0_loss, acc0 = _compute_aux(b0, batch.get("belief_tgt0"), our_mask)
+    b1_loss, acc1 = _compute_aux(b1, batch.get("belief_tgt1"), our_mask)
+    b2_loss, acc2 = _compute_aux(b2, batch.get("belief_tgt2"), our_mask)
+    belief_loss_total = b0_loss + b1_loss + b2_loss # Sum the losses
 
-    # ---- Aux: opponent action supervision (NO masking; -100 ignored) ----
-    opp_loss = torch.zeros((), device=values_full.device)
-    opp_acc  = torch.zeros((), device=values_full.device)
-    if AUX_OPP_WEIGHT > 0.0 and (opp_logits is not None) and ("opp_idx" in batch):
-        if batch["opp_idx"].numel() > 0:
-            To = batch["opp_idx"].size(1)
-            A_opp = opp_logits.size(-1)
-            opp_sel = opp_logits.gather(
-                1, batch["opp_idx"].unsqueeze(-1).expand(-1, -1, A_opp)
-            )
-            ce_opp = torch.nn.functional.cross_entropy(
-                opp_sel.flatten(0,1), batch["opp_targets"].view(-1),
-                ignore_index=-100, reduction="none"
-            ).view(B, To)
-            w = batch["opp_have_label"].to(ce_opp.dtype)
-            if w.sum() > 0:
-                opp_loss = (ce_opp * w).sum() / w.sum().clamp_min(1.0)
-                with torch.no_grad():
-                    pred = opp_sel.argmax(dim=-1)
-                    corr = ((pred == batch["opp_targets"]) & batch["opp_have_label"]).sum().to(torch.float32)
-                    opp_acc = corr / batch["opp_have_label"].sum().clamp_min(1)
-    if AUX_OPP_WEIGHT > 0.0:
-        total = total + AUX_OPP_WEIGHT * opp_loss
-    metrics["opp_loss"] = opp_loss.detach()
-    metrics["opp_action_acc"] = opp_acc.detach()
+    # Opponent Action Loss
+    opp_loss, opp_acc = _compute_aux(opp_logits, batch.get("opp_targets"), opp_mask)
 
+    # --- Final Combination ---
+    total = policy_loss + VALUE_WEIGHT * value_loss + entropy_loss \
+            + AUX_BELIEF_WEIGHT * belief_loss_total + AUX_OPP_WEIGHT * opp_loss
+            
+    # --- Metrics (calculated on valid data) ---
+    with torch.no_grad():
+        if new_logp.numel() > 0:
+            clipfrac = ((ratio - 1.0).abs() > EPS_CLIP).float().mean()
+            approx_kl = (valid_old_logp - new_logp).mean()
+            ent_mean = valid_entropy.mean()
+        else:
+            clipfrac = approx_kl = ent_mean = torch.tensor(0.0, device=values_full.device)
+
+        metrics = {
+            "policy_loss": policy_loss.detach(),
+            "value_loss": value_loss.detach(),
+            "entropy": ent_mean.detach(),
+            "approx_kl": approx_kl.detach(),
+            "clip_fraction": clipfrac.detach(),
+            "value_clip_frac": vclip_frac.detach(),
+            "belief_loss": (belief_loss_total / 3.0).detach(), # Average loss per head
+            "opp_loss": opp_loss.detach(),
+            "belief_acc_0": acc0.detach(),
+            "belief_acc_1": acc1.detach(),
+            "belief_acc_2": acc2.detach(),
+            "opp_action_acc": opp_acc.detach(),
+        }
+    
     return total, metrics
+
 
 def _collate_batch(
     episodes: List[Dict[str, Any]],
     L_max: Optional[int] = None,
     pin_memory: bool = False,
     ignore_index: int = -100,
+    oracle_mode: bool = False
 ) -> Dict[str, torch.Tensor]:
     """
     CPU-side collation. Returns tensors on CPU so _to_device_batch(...) moves them.
-
-    Outputs:
-      mi: dict with only time-major tensors (dim>=2) padded to L_pad, plus 'valid_lengths' [B]
-      our_idx [B,T], mask [B,T], actions [B,T], old_logp [B,T], rewards [B,T],
-      penalties_used [B,T], our_action_mask [B,L_pad,A] or None,
-      belief_tgt{0,1,2} [B,T], belief{0,1,2}_mask [B,T],
-      opp_idx [B,To], opp_targets [B,To], opp_have_label [B,To]
-      padding_mask [B,L_pad] (True where padded)
+    Correctly handles indexing on a single, unified timeline.
     """
     IGN = int(ignore_index)
-    B = len(episodes)
+    
+    valid_episodes = [ep for ep in episodes if ep.get("model_input") and ep["model_input"].get("valid_lengths") is not None]
+    B = len(valid_episodes)
     if B == 0:
-        raise ValueError("Empty batch.")
+        return {}
 
-    # -------- discover per-episode true sequence lengths --------
-    raw_lens: List[int] = []
-    for ep in episodes:
-        mi = ep["model_input"]
-        # prefer the length saved during acting (correct per-episode length)
-        if "valid_lengths" in mi and torch.is_tensor(mi["valid_lengths"]):
-            # acting stored [B] but here B==1 per-episode snapshot
-            L_true = int(mi["valid_lengths"].view(-1)[0].item())
-            raw_lens.append(L_true)
-        else:
-            # fallback: infer from the longest [1, L, ...] tensor
-            L_found = None
-            for v in mi.values():
-                if torch.is_tensor(v) and v.dim() >= 2 and v.size(0) == 1:
-                    L_found = int(v.size(1)); break
-            if L_found is None:
-                raise ValueError("Cannot infer sequence length for an episode.")
-            raw_lens.append(L_found)
+    raw_lens = [int(ep["model_input"]["valid_lengths"].item()) for ep in valid_episodes]
+    L_pad = L_max if L_max is not None else max(raw_lens)
+    if L_pad == 0: return {}
 
-    # Choose padding length
-    L_batch_max = max(raw_lens) if raw_lens else 0
-    L_pad = int(L_max) if (L_max is not None) else L_batch_max
-    if L_pad <= 0:
-        L_pad = L_batch_max
-
-    # -------- helper: pad/trim only tensors with a time dimension (dim >= 2) --------
-    def _pad_trim(v: torch.Tensor, L_tgt: int) -> torch.Tensor:
+    def _pad_trim(v: torch.Tensor, L_tgt: int):
         L = v.size(1)
         if L == L_tgt: return v
         if L > L_tgt:  return v[:, :L_tgt, ...]
@@ -661,187 +560,114 @@ def _collate_batch(
         pad_shape = list(v.shape); pad_shape[1] = pad_len
         z = torch.zeros(pad_shape, dtype=v.dtype, device=v.device)
         return torch.cat([v, z], dim=1)
-
-    # -------- build batched model inputs (time-major tensors only) --------
-    # --- FIX: ROBUST KEY HANDLING ---
-    EXPECTED_MI_KEYS = {
-        "obs_sequence", "action_sequence", "agent_types",
-        "positions", "action_masks"
-    }
-
+    
+    EXPECTED_MI_KEYS = {"obs_sequence", "action_sequence", "agent_types", "positions", "action_masks"}
     mi_batch: Dict[str, torch.Tensor] = {}
     for k in sorted(list(EXPECTED_MI_KEYS)):
-        vs = [ep["model_input"].get(k) for ep in episodes]
-
-        valid_vs = [v for v in vs if v is not None and torch.is_tensor(v) and v.dim() >= 2]
-        if not valid_vs:
-            continue
-
-        if len(valid_vs) != len(vs):
-            print(f"Warning: Key '{k}' missing in some episodes, skipping for this batch.")
-            continue
-
+        vs = [ep["model_input"].get(k) for ep in valid_episodes]
+        if any(v is None for v in vs): continue
         padded = [_pad_trim(v, L_pad) for v in vs]
-        cat = torch.cat(padded, dim=0).contiguous()
-        if pin_memory:
-            cat = cat.pin_memory()
-        mi_batch[k] = cat
-    # --- END FIX ---
-
-    # ---- REBUILD valid_lengths and padding_mask from the true lengths ----
+        mi_batch[k] = torch.cat(padded, dim=0).contiguous()
+    
     valid_lengths = torch.tensor([min(l, L_pad) for l in raw_lens], dtype=torch.long)
-    if pin_memory: valid_lengths = valid_lengths.pin_memory()
-    mi_batch["valid_lengths"] = valid_lengths  # [B]
+    padding_mask = torch.arange(L_pad)[None, :] >= valid_lengths[:, None]
+    mi_batch["padding_mask"] = padding_mask
+    mi_batch["valid_lengths"] = valid_lengths
+    
+    agent_types = mi_batch["agent_types"].long()
+    
+    T_full = L_pad
+    def _pm(x: torch.Tensor): return x.pin_memory() if pin_memory else x
 
-    padding_mask = torch.zeros((B, L_pad), dtype=torch.bool)
-    for b, Lb in enumerate(valid_lengths.tolist()):
-        if Lb < L_pad:
-            padding_mask[b, Lb:] = True          # True = PAD
-    if pin_memory: padding_mask = padding_mask.pin_memory()
-    mi_batch["padding_mask"] = padding_mask     # [B, L_pad]
+    our_mask, actions, old_logp, rewards, pen_used = [_pm(t) for t in [
+        torch.zeros((B, T_full), dtype=torch.bool), torch.full((B, T_full), IGN, dtype=torch.long),
+        torch.zeros((B, T_full), dtype=torch.float32), torch.zeros((B, T_full), dtype=torch.float32),
+        torch.zeros((B, T_full), dtype=torch.long)]]
+    belief_tgt0, belief_tgt1, belief_tgt2 = [_pm(torch.full((B, T_full), IGN, dtype=torch.long)) for _ in range(3)]
+    opp_mask, opp_targets = _pm(torch.zeros((B, T_full), dtype=torch.bool)), _pm(torch.full((B, T_full), IGN, dtype=torch.long))
+    opp_belief_mask, opp_belief_tgt0, opp_belief_tgt1, opp_belief_tgt2 = [_pm(t) for t in [
+        torch.zeros((B, T_full), dtype=torch.bool), torch.full((B, T_full), IGN, dtype=torch.long),
+        torch.full((B, T_full), IGN, dtype=torch.long), torch.full((B, T_full), IGN, dtype=torch.long)]]
+    
+    for b, ep in enumerate(valid_episodes):
+        true_len_mi = raw_lens[b]
+        true_len_ep = len(ep["agent_id"]) # The number of completed steps
+        
+        # We iterate over the COMPLETED steps. The final observation token in mi_batch is ignored.
+        for t_ep in range(true_len_ep):
+            agent_seat_in_ep = ep["agent_id"][t_ep]
+            is_our_turn = (agent_seat_in_ep == ep["training_agent_seat"])
+            
+            # The position 't_ep' is also the index in the unpadded model_input sequence
+            pos_in_mi = t_ep
 
-    # Require agent_types for actor/opp selection
-    if "agent_types" not in mi_batch:
-        raise ValueError("model_input must include 'agent_types' with dim>=2 (batched [B, L]).")
-    agent_types = mi_batch["agent_types"].long()  # [B, L_pad]
+            if pos_in_mi >= T_full: continue # Should not happen if L_max is large enough
 
-    # Optional legality mask for OUR steps; we'll zero it past each valid length
-    our_action_mask = None
-    if "action_masks" in mi_batch:
-        m = mi_batch["action_masks"].bool()  # [B, L_pad, A]
-        # trim mask beyond valid lengths so padding is never considered legal
-        for b in range(B):
-            Lb = int(valid_lengths[b].item())
-            if Lb < m.size(1):
-                m[b, Lb:, :].fill_(False)
-        our_action_mask = m
+            # Check if this step corresponds to the correct agent type in the model input
+            # This is a critical sanity check
+            mi_agent_type = agent_types[b, pos_in_mi].item()
+            is_our_turn_in_mi = (mi_agent_type == 0)
 
-    # -------- build OUR/OPP timestep indices using ONLY valid tokens --------
-    our_pos_lists: List[torch.Tensor] = []
-    opp_pos_lists: List[torch.Tensor] = []
-    for b in range(B):
-        Lb = int(valid_lengths[b].item())
-        at = agent_types[b, :Lb].detach().cpu().numpy()  # slice to true length
-        our_pos_lists.append(torch.from_numpy((at == 0).nonzero()[0]).long())
-        opp_pos_lists.append(torch.from_numpy((at != 0).nonzero()[0]).long())
+            if is_our_turn != is_our_turn_in_mi:
+                # This would indicate a major desync between rollout and C++ data prep
+                continue
 
-    T  = max((int(x.numel()) for x in our_pos_lists), default=0)
-    To = max((int(x.numel()) for x in opp_pos_lists), default=0)
-
-    # -------- allocate supervision tensors (CPU) --------
-    def _pm(x: torch.Tensor) -> torch.Tensor:
-        return x.pin_memory() if pin_memory else x
-
-    our_idx    = _pm(torch.zeros((B, T),  dtype=torch.long))
-    # --- FIX: PRECISE MASKING BASED ON LOGGED DATA ---
-    our_mask   = _pm(torch.zeros((B, T),  dtype=torch.bool))
-    actions    = _pm(torch.full((B, T), IGN, dtype=torch.long))
-    old_logp   = _pm(torch.zeros((B, T),  dtype=torch.float32))
-    rewards    = _pm(torch.zeros((B, T),  dtype=torch.float32))
-    pen_used   = _pm(torch.zeros((B, T),  dtype=torch.long))
-
-    belief_tgt0 = _pm(torch.full((B, T), IGN, dtype=torch.long))
-    belief_tgt1 = _pm(torch.full((B, T), IGN, dtype=torch.long))
-    belief_tgt2 = _pm(torch.full((B, T), IGN, dtype=torch.long))
-    belief0_mask = _pm(torch.zeros((B, T), dtype=torch.bool))
-    belief1_mask = _pm(torch.zeros((B, T), dtype=torch.bool))
-    belief2_mask = _pm(torch.zeros((B, T), dtype=torch.bool))
-
-    opp_idx        = _pm(torch.zeros((B, To),  dtype=torch.long))
-    opp_targets    = _pm(torch.full((B, To), IGN, dtype=torch.long))
-    opp_have_label = _pm(torch.zeros((B, To),  dtype=torch.bool))
-
-    # -------- fill from episodes (only real steps) --------
-    for b, ep in enumerate(episodes):
-        # OUR timeline
-        our_pos = our_pos_lists[b]
-        K = int(our_pos.numel())
-
-        our_ep_idx = [i for i, seat in enumerate(ep["agent_id"]) if seat == ep["training_agent_seat"]]
-
-        for t_local in range(min(T, K)):
-            if t_local >= len(our_ep_idx):
-                break
-            step_ep = our_ep_idx[t_local]
-
-            lp = ep["log_prob"][step_ep] if step_ep < len(ep["log_prob"]) else None
-            if lp is None:
-                continue  # Do not mark this step as valid for training.
-
-            our_mask[b, t_local] = True
-            our_idx[b, t_local] = our_pos[t_local]
-
-            a  = ep["our_action"][step_ep] if step_ep < len(ep["our_action"]) else None
-            rw = ep["reward"][step_ep]     if step_ep < len(ep["reward"])     else 0.0
-            pu = ep["penalties_used"][step_ep] if step_ep < len(ep["penalties_used"]) else 0
-
-            if a is not None:
-                actions[b, t_local] = int(a)
-            old_logp[b, t_local] = float(lp)
-            rewards[b, t_local]  = float(rw)
-            pen_used[b, t_local] = int(pu)
-
-            lb0 = ep.get("belief_tgt0", [None]*len(ep["agent_id"]))[step_ep]
-            lb1 = ep.get("belief_tgt1", [None]*len(ep["agent_id"]))[step_ep]
-            lb2 = ep.get("belief_tgt2", [None]*len(ep["agent_id"]))[step_ep]
-            if lb0 is not None: belief_tgt0[b, t_local] = int(lb0); belief0_mask[b, t_local] = True
-            if lb1 is not None: belief_tgt1[b, t_local] = int(lb1); belief1_mask[b, t_local] = True
-            if lb2 is not None: belief_tgt2[b, t_local] = int(lb2); belief2_mask[b, t_local] = True
-
-        # OPP timeline (labels optional)
-        opp_pos = opp_pos_lists[b]
-        M = int(opp_pos.numel())
-        M_fill = min(To, M)
-        if M_fill > 0:
-            opp_idx[b, :M_fill] = opp_pos[:M_fill]
-            opp_ep_idx = [i for i, seat in enumerate(ep["agent_id"]) if seat != ep["training_agent_seat"]]
-            for t_local in range(M_fill):
-                if t_local >= len(opp_ep_idx):
-                    break
-                step_ep = opp_ep_idx[t_local]
-                tgt = ep.get("opp_target_action", [None]*len(ep["agent_id"]))[step_ep]
-                if tgt is not None:
-                    opp_targets[b, t_local] = int(tgt)
-                    opp_have_label[b, t_local] = True
-
-    return {
-        "mi": mi_batch,
-        "our_idx": our_idx,
-        "mask": our_mask,
-        "actions": actions,
-        "old_logp": old_logp,
-        "rewards": rewards,
-        "penalties_used": pen_used,
-        "our_action_mask": our_action_mask,
-
+            if is_our_turn:
+                if ep["log_prob"][t_ep] is not None:
+                    our_mask[b, pos_in_mi] = True
+                    actions[b, pos_in_mi] = int(ep["our_action"][t_ep])
+                    old_logp[b, pos_in_mi] = float(ep["log_prob"][t_ep])
+                    rewards[b, pos_in_mi] = float(ep["reward"][t_ep])
+                    pen_used[b, pos_in_mi] = int(ep["penalties_used"][t_ep])
+                    b0, b1, b2 = ep["belief_tgt0"][t_ep], ep["belief_tgt1"][t_ep], ep["belief_tgt2"][t_ep]
+                    if b0 is not None: belief_tgt0[b, pos_in_mi] = int(b0)
+                    if b1 is not None: belief_tgt1[b, pos_in_mi] = int(b1)
+                    if b2 is not None: belief_tgt2[b, pos_in_mi] = int(b2)
+            else: # Opponent turn
+                if ep["opp_target_action"][t_ep] is not None:
+                    opp_mask[b, pos_in_mi] = True
+                    opp_targets[b, pos_in_mi] = int(ep["opp_target_action"][t_ep])
+                
+                if oracle_mode:
+                    b0, b1, b2 = ep["opp_belief_tgt0"][t_ep], ep["opp_belief_tgt1"][t_ep], ep["opp_belief_tgt2"][t_ep]
+                    if all(x is not None for x in [b0, b1, b2]):
+                        opp_belief_mask[b, pos_in_mi] = True
+                        opp_belief_tgt0[b, pos_in_mi] = int(b0)
+                        opp_belief_tgt1[b, pos_in_mi] = int(b1)
+                        opp_belief_tgt2[b, pos_in_mi] = int(b2)
+    
+    final_dict = {
+        "mi": mi_batch, "our_mask": our_mask, "actions": actions,
+        "old_logp": old_logp, "rewards": rewards, "penalties_used": pen_used,
+        "our_action_mask": mi_batch.get("action_masks"),
         "belief_tgt0": belief_tgt0, "belief_tgt1": belief_tgt1, "belief_tgt2": belief_tgt2,
-        "belief0_mask": belief0_mask, "belief1_mask": belief1_mask, "belief2_mask": belief2_mask,
-
-        "opp_idx": opp_idx, "opp_targets": opp_targets, "opp_have_label": opp_have_label,
+        "opp_mask": opp_mask, "opp_targets": opp_targets,
     }
+
+    if oracle_mode:
+        final_dict["opp_belief_tgt0"] = opp_belief_tgt0
+        final_dict["opp_belief_tgt1"] = opp_belief_tgt1
+        final_dict["opp_belief_tgt2"] = opp_belief_tgt2
+        final_dict["opp_belief_mask"] = opp_belief_mask
+        
+    return final_dict
+
 
 def _to_device_batch(batch_cpu: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
     """Move a collated CPU batch (with nested 'mi' dict) to device."""
-    mi_dev = {k: v.to(device, non_blocking=True) for k, v in batch_cpu["mi"].items()}
-    oam = batch_cpu.get("our_action_mask", None)
-    oam_dev = oam.to(device, non_blocking=True) if (oam is not None) else None
-    out = {
-        "mi": mi_dev,
-        "our_idx":        batch_cpu["our_idx"].to(device, non_blocking=True),
-        "mask":           batch_cpu["mask"].to(device, non_blocking=True),
-        "actions":        batch_cpu["actions"].to(device, non_blocking=True),
-        "old_logp":       batch_cpu["old_logp"].to(device, non_blocking=True),
-        "rewards":        batch_cpu["rewards"].to(device, non_blocking=True),
-        "penalties_used": batch_cpu["penalties_used"].to(device, non_blocking=True),
-        "our_action_mask": oam_dev,
-        "belief_tgt0":    batch_cpu["belief_tgt0"].to(device, non_blocking=True),
-        "belief_tgt1":    batch_cpu["belief_tgt1"].to(device, non_blocking=True),
-        "belief_tgt2":    batch_cpu["belief_tgt2"].to(device, non_blocking=True),
-        "belief0_mask":   batch_cpu["belief0_mask"].to(device, non_blocking=True),
-        "belief1_mask":   batch_cpu["belief1_mask"].to(device, non_blocking=True),
-        "belief2_mask":   batch_cpu["belief2_mask"].to(device, non_blocking=True),
-        "opp_idx":        batch_cpu["opp_idx"].to(device, non_blocking=True),
-        "opp_targets":    batch_cpu["opp_targets"].to(device, non_blocking=True),
-        "opp_have_label": batch_cpu["opp_have_label"].to(device, non_blocking=True),
-    }
+    if not batch_cpu:
+        return {}
+        
+    out = {}
+    # Move main MI dict
+    out["mi"] = {k: v.to(device, non_blocking=True) for k, v in batch_cpu["mi"].items()}
+
+    # Move all other tensors
+    for key, tensor in batch_cpu.items():
+        if key != "mi":
+            if torch.is_tensor(tensor):
+                out[key] = tensor.to(device, non_blocking=True)
+            else:
+                out[key] = tensor # Handle non-tensor data like our_action_mask=None
+                
     return out
