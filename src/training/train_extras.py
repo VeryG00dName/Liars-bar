@@ -610,153 +610,238 @@ def _collate_batch(
     L_max: Optional[int] = None,
     pin_memory: bool = False,
     ignore_index: int = -100,
-    oracle_mode: bool = False # <-- Flag is still used
 ) -> Dict[str, torch.Tensor]:
     """
-    CPU-side collation. This version is restored to be fully compatible with the
-    original index-based ppo_losses_batched function, while also adding support
-    for BeliefOracle training targets.
+    CPU-side collation. Returns tensors on CPU so _to_device_batch(...) moves them.
+
+    Outputs:
+      mi: dict with only time-major tensors (dim>=2) padded to L_pad, plus 'valid_lengths' [B]
+      our_idx [B,T], mask [B,T], actions [B,T], old_logp [B,T], rewards [B,T],
+      penalties_used [B,T], our_action_mask [B,L_pad,A] or None,
+      belief_tgt{0,1,2} [B,T], belief{0,1,2}_mask [B,T],
+      opp_idx [B,To], opp_targets [B,To], opp_have_label [B,To]
+      padding_mask [B,L_pad] (True where padded)
     """
     IGN = int(ignore_index)
-    
-    valid_episodes = [ep for ep in episodes if ep.get("model_input") and ep["model_input"].get("valid_lengths")]
-    B = len(valid_episodes)
+    B = len(episodes)
     if B == 0:
-        return {}
+        raise ValueError("Empty batch.")
 
-    raw_lens = [int(ep["model_input"]["valid_lengths"].item()) for ep in valid_episodes]
-    L_pad = L_max if L_max is not None else max(raw_lens)
-    if L_pad == 0: return {}
+    # -------- discover per-episode true sequence lengths --------
+    raw_lens: List[int] = []
+    for ep in episodes:
+        mi = ep["model_input"]
+        # prefer the length saved during acting (correct per-episode length)
+        if "valid_lengths" in mi and torch.is_tensor(mi["valid_lengths"]):
+            # acting stored [B] but here B==1 per-episode snapshot
+            L_true = int(mi["valid_lengths"].view(-1)[0].item())
+            raw_lens.append(L_true)
+        else:
+            # fallback: infer from the longest [1, L, ...] tensor
+            L_found = None
+            for v in mi.values():
+                if torch.is_tensor(v) and v.dim() >= 2 and v.size(0) == 1:
+                    L_found = int(v.size(1)); break
+            if L_found is None:
+                raise ValueError("Cannot infer sequence length for an episode.")
+            raw_lens.append(L_found)
 
+    # Choose padding length
+    L_batch_max = max(raw_lens) if raw_lens else 0
+    L_pad = int(L_max) if (L_max is not None) else L_batch_max
+    if L_pad <= 0:
+        L_pad = L_batch_max
+
+    # -------- helper: pad/trim only tensors with a time dimension (dim >= 2) --------
     def _pad_trim(v: torch.Tensor, L_tgt: int) -> torch.Tensor:
         L = v.size(1)
         if L == L_tgt: return v
-        if L > L_tgt: return v[:, :L_tgt, ...]
-        
-        # Create a padding shape that works for any number of dimensions
-        pad_shape = list(v.shape)
-        pad_shape[1] = L_tgt - L
-        
-        # Create the padding tensor
-        pad = torch.zeros(pad_shape, dtype=v.dtype, device=v.device)
-        return torch.cat([v, pad], dim=1)
+        if L > L_tgt:  return v[:, :L_tgt, ...]
+        pad_len = L_tgt - L
+        pad_shape = list(v.shape); pad_shape[1] = pad_len
+        z = torch.zeros(pad_shape, dtype=v.dtype, device=v.device)
+        return torch.cat([v, z], dim=1)
 
-    EXPECTED_MI_KEYS = {"obs_sequence", "action_sequence", "agent_types", "positions", "action_masks"}
-    mi_batch = {}
+    # -------- build batched model inputs (time-major tensors only) --------
+    # --- FIX: ROBUST KEY HANDLING ---
+    EXPECTED_MI_KEYS = {
+        "obs_sequence", "action_sequence", "agent_types",
+        "positions", "action_masks"
+    }
+
+    mi_batch: Dict[str, torch.Tensor] = {}
     for k in sorted(list(EXPECTED_MI_KEYS)):
-        vs = [ep["model_input"].get(k) for ep in valid_episodes]
-        if any(v is None for v in vs): continue
+        vs = [ep["model_input"].get(k) for ep in episodes]
+
+        valid_vs = [v for v in vs if v is not None and torch.is_tensor(v) and v.dim() >= 2]
+        if not valid_vs:
+            continue
+
+        if len(valid_vs) != len(vs):
+            print(f"Warning: Key '{k}' missing in some episodes, skipping for this batch.")
+            continue
+
         padded = [_pad_trim(v, L_pad) for v in vs]
-        mi_batch[k] = torch.cat(padded, dim=0).contiguous()
+        cat = torch.cat(padded, dim=0).contiguous()
+        if pin_memory:
+            cat = cat.pin_memory()
+        mi_batch[k] = cat
+    # --- END FIX ---
 
+    # ---- REBUILD valid_lengths and padding_mask from the true lengths ----
     valid_lengths = torch.tensor([min(l, L_pad) for l in raw_lens], dtype=torch.long)
-    padding_mask = torch.arange(L_pad)[None, :] >= valid_lengths[:, None]
-    mi_batch["padding_mask"] = padding_mask
-    mi_batch["valid_lengths"] = valid_lengths
-    agent_types = mi_batch["agent_types"].long()
-    our_action_mask = mi_batch.get("action_masks")
+    if pin_memory: valid_lengths = valid_lengths.pin_memory()
+    mi_batch["valid_lengths"] = valid_lengths  # [B]
 
-    # --- RESTORED LOGIC FOR INDEX TENSORS ---
+    padding_mask = torch.zeros((B, L_pad), dtype=torch.bool)
+    for b, Lb in enumerate(valid_lengths.tolist()):
+        if Lb < L_pad:
+            padding_mask[b, Lb:] = True          # True = PAD
+    if pin_memory: padding_mask = padding_mask.pin_memory()
+    mi_batch["padding_mask"] = padding_mask     # [B, L_pad]
+
+    # Require agent_types for actor/opp selection
+    if "agent_types" not in mi_batch:
+        raise ValueError("model_input must include 'agent_types' with dim>=2 (batched [B, L]).")
+    agent_types = mi_batch["agent_types"].long()  # [B, L_pad]
+
+    # Optional legality mask for OUR steps; we'll zero it past each valid length
+    our_action_mask = None
+    if "action_masks" in mi_batch:
+        m = mi_batch["action_masks"].bool()  # [B, L_pad, A]
+        # trim mask beyond valid lengths so padding is never considered legal
+        for b in range(B):
+            Lb = int(valid_lengths[b].item())
+            if Lb < m.size(1):
+                m[b, Lb:, :].fill_(False)
+        our_action_mask = m
+
+    # -------- build OUR/OPP timestep indices using ONLY valid tokens --------
     our_pos_lists: List[torch.Tensor] = []
     opp_pos_lists: List[torch.Tensor] = []
     for b in range(B):
         Lb = int(valid_lengths[b].item())
-        at = agent_types[b, :Lb].cpu().numpy()
+        at = agent_types[b, :Lb].detach().cpu().numpy()  # slice to true length
         our_pos_lists.append(torch.from_numpy((at == 0).nonzero()[0]).long())
         opp_pos_lists.append(torch.from_numpy((at != 0).nonzero()[0]).long())
 
-    T  = max((len(x) for x in our_pos_lists), default=0)
-    To = max((len(x) for x in opp_pos_lists), default=0)
+    T  = max((int(x.numel()) for x in our_pos_lists), default=0)
+    To = max((int(x.numel()) for x in opp_pos_lists), default=0)
 
     # -------- allocate supervision tensors (CPU) --------
-    def _pm(x): return x.pin_memory() if pin_memory else x
+    def _pm(x: torch.Tensor) -> torch.Tensor:
+        return x.pin_memory() if pin_memory else x
 
-    our_idx, our_mask = _pm(torch.zeros((B, T), dtype=torch.long)), _pm(torch.zeros((B, T), dtype=torch.bool))
-    actions, old_logp = _pm(torch.full((B, T), IGN, dtype=torch.long)), _pm(torch.zeros((B, T), dtype=torch.float32))
-    rewards, pen_used = _pm(torch.zeros((B, T), dtype=torch.float32)), _pm(torch.zeros((B, T), dtype=torch.long))
-    belief_tgt0, belief_tgt1, belief_tgt2 = [_pm(torch.full((B, T), IGN, dtype=torch.long)) for _ in range(3)]
-    belief0_mask, belief1_mask, belief2_mask = [_pm(torch.zeros((B, T), dtype=torch.bool)) for _ in range(3)]
-    
-    opp_idx, opp_targets = _pm(torch.zeros((B, To), dtype=torch.long)), _pm(torch.full((B, To), IGN, dtype=torch.long))
-    opp_have_label = _pm(torch.zeros((B, To), dtype=torch.bool))
+    our_idx    = _pm(torch.zeros((B, T),  dtype=torch.long))
+    # --- FIX: PRECISE MASKING BASED ON LOGGED DATA ---
+    our_mask   = _pm(torch.zeros((B, T),  dtype=torch.bool))
+    actions    = _pm(torch.full((B, T), IGN, dtype=torch.long))
+    old_logp   = _pm(torch.zeros((B, T),  dtype=torch.float32))
+    rewards    = _pm(torch.zeros((B, T),  dtype=torch.float32))
+    pen_used   = _pm(torch.zeros((B, T),  dtype=torch.long))
 
-    # --- NEW: ALLOCATE ORACLE TENSORS (with correct 'To' length) ---
-    if oracle_mode:
-        opp_belief_tgt0, opp_belief_tgt1, opp_belief_tgt2 = [_pm(torch.full((B, To), IGN, dtype=torch.long)) for _ in range(3)]
-        opp_belief_have_target = _pm(torch.zeros((B, To), dtype=torch.bool))
-    # --- END NEW ---
+    belief_tgt0 = _pm(torch.full((B, T), IGN, dtype=torch.long))
+    belief_tgt1 = _pm(torch.full((B, T), IGN, dtype=torch.long))
+    belief_tgt2 = _pm(torch.full((B, T), IGN, dtype=torch.long))
+    belief0_mask = _pm(torch.zeros((B, T), dtype=torch.bool))
+    belief1_mask = _pm(torch.zeros((B, T), dtype=torch.bool))
+    belief2_mask = _pm(torch.zeros((B, T), dtype=torch.bool))
+
+    opp_idx        = _pm(torch.zeros((B, To),  dtype=torch.long))
+    opp_targets    = _pm(torch.full((B, To), IGN, dtype=torch.long))
+    opp_have_label = _pm(torch.zeros((B, To),  dtype=torch.bool))
 
     # -------- fill from episodes (only real steps) --------
-    for b, ep in enumerate(valid_episodes):
-        # OUR timeline (PPO targets)
+    for b, ep in enumerate(episodes):
+        # OUR timeline
         our_pos = our_pos_lists[b]
-        our_ep_idx = [i for i, seat in enumerate(ep["agent_id"]) if seat == ep["training_agent_seat"]]
-        K_fill = min(T, len(our_pos), len(our_ep_idx))
-        if K_fill > 0:
-            our_idx[b, :K_fill] = our_pos[:K_fill]
-            our_mask[b, :K_fill] = True
-            for t_local in range(K_fill):
-                step_ep = our_ep_idx[t_local]
-                if ep["log_prob"][step_ep] is None:
-                    our_mask[b, t_local] = False # Should not happen with new rollout logic, but safe
-                    continue
-                actions[b, t_local] = int(ep["our_action"][step_ep])
-                old_logp[b, t_local] = float(ep["log_prob"][step_ep])
-                rewards[b, t_local] = float(ep["reward"][step_ep])
-                pen_used[b, t_local] = int(ep["penalties_used"][step_ep])
-                
-                b0, b1, b2 = ep["belief_tgt0"][step_ep], ep["belief_tgt1"][step_ep], ep["belief_tgt2"][step_ep]
-                if b0 is not None: belief_tgt0[b, t_local] = int(b0); belief0_mask[b, t_local] = True
-                if b1 is not None: belief_tgt1[b, t_local] = int(b1); belief1_mask[b, t_local] = True
-                if b2 is not None: belief_tgt2[b, t_local] = int(b2); belief2_mask[b, t_local] = True
+        K = int(our_pos.numel())
 
-        # OPP timeline (Opponent action and Oracle targets)
+        our_ep_idx = [i for i, seat in enumerate(ep["agent_id"]) if seat == ep["training_agent_seat"]]
+
+        for t_local in range(min(T, K)):
+            if t_local >= len(our_ep_idx):
+                break
+            step_ep = our_ep_idx[t_local]
+
+            lp = ep["log_prob"][step_ep] if step_ep < len(ep["log_prob"]) else None
+            if lp is None:
+                continue  # Do not mark this step as valid for training.
+
+            our_mask[b, t_local] = True
+            our_idx[b, t_local] = our_pos[t_local]
+
+            a  = ep["our_action"][step_ep] if step_ep < len(ep["our_action"]) else None
+            rw = ep["reward"][step_ep]     if step_ep < len(ep["reward"])     else 0.0
+            pu = ep["penalties_used"][step_ep] if step_ep < len(ep["penalties_used"]) else 0
+
+            if a is not None:
+                actions[b, t_local] = int(a)
+            old_logp[b, t_local] = float(lp)
+            rewards[b, t_local]  = float(rw)
+            pen_used[b, t_local] = int(pu)
+
+            lb0 = ep.get("belief_tgt0", [None]*len(ep["agent_id"]))[step_ep]
+            lb1 = ep.get("belief_tgt1", [None]*len(ep["agent_id"]))[step_ep]
+            lb2 = ep.get("belief_tgt2", [None]*len(ep["agent_id"]))[step_ep]
+            if lb0 is not None: belief_tgt0[b, t_local] = int(lb0); belief0_mask[b, t_local] = True
+            if lb1 is not None: belief_tgt1[b, t_local] = int(lb1); belief1_mask[b, t_local] = True
+            if lb2 is not None: belief_tgt2[b, t_local] = int(lb2); belief2_mask[b, t_local] = True
+
+        # OPP timeline (labels optional)
         opp_pos = opp_pos_lists[b]
-        opp_ep_idx = [i for i, seat in enumerate(ep["agent_id"]) if seat != ep["training_agent_seat"]]
-        M_fill = min(To, len(opp_pos), len(opp_ep_idx))
+        M = int(opp_pos.numel())
+        M_fill = min(To, M)
         if M_fill > 0:
             opp_idx[b, :M_fill] = opp_pos[:M_fill]
+            opp_ep_idx = [i for i, seat in enumerate(ep["agent_id"]) if seat != ep["training_agent_seat"]]
             for t_local in range(M_fill):
+                if t_local >= len(opp_ep_idx):
+                    break
                 step_ep = opp_ep_idx[t_local]
-                
-                tgt = ep["opp_target_action"][step_ep]
+                tgt = ep.get("opp_target_action", [None]*len(ep["agent_id"]))[step_ep]
                 if tgt is not None:
                     opp_targets[b, t_local] = int(tgt)
                     opp_have_label[b, t_local] = True
-                
-                if oracle_mode:
-                    b0_tgt, b1_tgt, b2_tgt = ep["opp_belief_tgt0"][step_ep], ep["opp_belief_tgt1"][step_ep], ep["opp_belief_tgt2"][step_ep]
-                    if all(x is not None for x in [b0_tgt, b1_tgt, b2_tgt]):
-                        opp_belief_have_target[b, t_local] = True
-                        opp_belief_tgt0[b, t_local] = int(b0_tgt)
-                        opp_belief_tgt1[b, t_local] = int(b1_tgt)
-                        opp_belief_tgt2[b, t_local] = int(b2_tgt)
 
-    final_dict = {
-        "mi": mi_batch, "our_idx": our_idx, "mask": our_mask,
-        "actions": actions, "old_logp": old_logp, "rewards": rewards,
-        "penalties_used": pen_used, "our_action_mask": our_action_mask,
+    return {
+        "mi": mi_batch,
+        "our_idx": our_idx,
+        "mask": our_mask,
+        "actions": actions,
+        "old_logp": old_logp,
+        "rewards": rewards,
+        "penalties_used": pen_used,
+        "our_action_mask": our_action_mask,
+
         "belief_tgt0": belief_tgt0, "belief_tgt1": belief_tgt1, "belief_tgt2": belief_tgt2,
         "belief0_mask": belief0_mask, "belief1_mask": belief1_mask, "belief2_mask": belief2_mask,
+
         "opp_idx": opp_idx, "opp_targets": opp_targets, "opp_have_label": opp_have_label,
     }
 
-    if oracle_mode:
-        final_dict["opp_belief_tgt0"] = opp_belief_tgt0
-        final_dict["opp_belief_tgt1"] = opp_belief_tgt1
-        final_dict["opp_belief_tgt2"] = opp_belief_tgt2
-        final_dict["opp_belief_have_target"] = opp_belief_have_target
-        
-    return final_dict
-
 def _to_device_batch(batch_cpu: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
     """Move a collated CPU batch (with nested 'mi' dict) to device."""
-    if not batch_cpu: return {}
-    out = {"mi": {k: v.to(device, non_blocking=True) for k, v in batch_cpu["mi"].items()}}
-    for key, tensor in batch_cpu.items():
-        if key != "mi":
-            if torch.is_tensor(tensor):
-                out[key] = tensor.to(device, non_blocking=True)
-            else:
-                out[key] = tensor
+    mi_dev = {k: v.to(device, non_blocking=True) for k, v in batch_cpu["mi"].items()}
+    oam = batch_cpu.get("our_action_mask", None)
+    oam_dev = oam.to(device, non_blocking=True) if (oam is not None) else None
+    out = {
+        "mi": mi_dev,
+        "our_idx":        batch_cpu["our_idx"].to(device, non_blocking=True),
+        "mask":           batch_cpu["mask"].to(device, non_blocking=True),
+        "actions":        batch_cpu["actions"].to(device, non_blocking=True),
+        "old_logp":       batch_cpu["old_logp"].to(device, non_blocking=True),
+        "rewards":        batch_cpu["rewards"].to(device, non_blocking=True),
+        "penalties_used": batch_cpu["penalties_used"].to(device, non_blocking=True),
+        "our_action_mask": oam_dev,
+        "belief_tgt0":    batch_cpu["belief_tgt0"].to(device, non_blocking=True),
+        "belief_tgt1":    batch_cpu["belief_tgt1"].to(device, non_blocking=True),
+        "belief_tgt2":    batch_cpu["belief_tgt2"].to(device, non_blocking=True),
+        "belief0_mask":   batch_cpu["belief0_mask"].to(device, non_blocking=True),
+        "belief1_mask":   batch_cpu["belief1_mask"].to(device, non_blocking=True),
+        "belief2_mask":   batch_cpu["belief2_mask"].to(device, non_blocking=True),
+        "opp_idx":        batch_cpu["opp_idx"].to(device, non_blocking=True),
+        "opp_targets":    batch_cpu["opp_targets"].to(device, non_blocking=True),
+        "opp_have_label": batch_cpu["opp_have_label"].to(device, non_blocking=True),
+    }
     return out
