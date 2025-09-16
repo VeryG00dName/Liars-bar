@@ -39,6 +39,8 @@ class PPOFusedModel(nn.Module):
             torch.triu(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool), 1)
         )
 
+        self.register_buffer("opp_slot_ids", torch.arange(3, dtype=torch.long))
+
         # === Input Encoders ===
         self.obs_encoder = nn.Sequential(
             nn.Linear(obs_dim, hidden_dim), nn.LayerNorm(hidden_dim),
@@ -121,13 +123,12 @@ class PPOFusedModel(nn.Module):
 
         # --- Step 1: Compute Belief Logits ---
         B, _, _ = transformer_output.shape
-        device = transformer_output.device
         
         # The intermediate representation used for both belief and fusion
         belief_hidden = self.belief_fc(transformer_output) # Shape: [B, T, D_hidden]
 
         # Use FiLM to create opponent-specific belief features
-        opp_indices = torch.arange(3, device=device).view(1, 1, 3).expand(B, T, -1)
+        opp_indices   = self.opp_slot_ids.view(1,1,3).expand(B,T,-1)
         pos_embeds = self.opponent_position_embedding(opp_indices)
         belief_hidden_tiled = belief_hidden.unsqueeze(2).expand(-1, -1, 3, -1)
         modulated_hidden = self.belief_film_layer(belief_hidden_tiled, pos_embeds)
