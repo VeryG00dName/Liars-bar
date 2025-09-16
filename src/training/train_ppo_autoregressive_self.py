@@ -9,7 +9,7 @@ from typing import Dict, Any, List, Optional
 import random
 import numpy as np
 import argparse
-from collections import deque
+from collections import deque, defaultdict
 
 # Quiet Torch compile logs
 os.environ.pop("TORCH_LOGS", None)           # disable extra compile logs
@@ -359,6 +359,21 @@ def train_generation(
         # -------- Log metrics --------
         avg = {k: (v / max(n_batches, 1)) for k, v in agg.items()}
         win_rate = sum(ep["win"] for ep in new_eps) / len(new_eps)
+        per_opponent_totals: Dict[Any, List[float]] = {}
+        for ep in new_eps:
+            opp_labels = ep.get("true_opponent_labels", ())
+            if not opp_labels:
+                continue
+            training_label = ep.get("training_agent_label")
+            winner_label = ep.get("winner_label")
+            training_won = bool(ep.get("win", 0))
+            if training_label is not None and winner_label is not None:
+                training_won = winner_label == training_label
+            for label in set(l for l in opp_labels if l is not None):
+                totals = per_opponent_totals.setdefault(label, [0.0, 0.0])
+                if training_won:
+                    totals[0] += 1.0
+                totals[1] += 1.0
         # Timings
         writer.add_scalar("Time/Rollout", dur_roll, update)
         writer.add_scalar("Time/Optimize", dur_opt, update)
@@ -377,14 +392,20 @@ def train_generation(
         writer.add_scalar("Diag/ReturnStdEMA", getattr(config, "RET_STD_EMA", 1.0), update)
         # Rollout stats
         writer.add_scalar("Rollout/WinRate", win_rate, update)
+        for label, (wins_vs, total) in sorted(per_opponent_totals.items(), key=lambda item: str(item[0])):
+            if total > 0:
+                writer.add_scalar(f"PerOpponent/win_rate_vs_{label}", wins_vs / total, update)
+                writer.add_scalar(f"PerOpponent/episodes_vs_{label}", total, update)
+        bots_only_count = sum(1 for ep in new_eps if (lbls := {l for l in ep.get("true_opponent_labels", ()) if l is not None}) and all(l <= 6 for l in lbls))
+        writer.add_scalar("PerOpponent/BotsOnlyEpisodes", bots_only_count, update)
         writer.add_scalar("Buffer/Size", len(ep_buffer), update)
         writer.add_scalar("Acc/OpponentAction", avg.get("opp_action_acc", 0.0), update)
         writer.add_scalar("Acc/Belief0", avg.get("belief_acc_0", 0.0), update)
         writer.add_scalar("Acc/Belief1", avg.get("belief_acc_1", 0.0), update)
         writer.add_scalar("Acc/Belief2", avg.get("belief_acc_2", 0.0), update)
         
-        if plateau_detector.step(win_rate) and update > 50:
-            logging.info(f"Plateau detected at update {update}. Stopping training for '{run_name}'.")
+        if update >= 100:
+            logging.info(f"{update}. Stopping training for '{run_name} current win_rate: {win_rate:.3f}.")
             break
 
         if update % int(config.CHECKPOINT_INTERVAL) == 0:

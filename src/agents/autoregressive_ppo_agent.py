@@ -80,7 +80,7 @@ class PPOAutoregressiveAgent(BaseAgent):
             logger.debug(f"[{self.player_id}] Inferred use_shared_belief_head={use_shared}")
         else:
             raise ValueError(f"The model state for '{agent_key}' is not a valid PPO model.")
-        
+        inferred_belief_dim = None
         # --- INFERENCE LOGIC (Common to both) ---
         try:
             inferred_obs_dim = MFactoryUtil.get_input_dim_from_state_dict(model_state_dict, 'obs_encoder.0')
@@ -92,9 +92,6 @@ class PPOAutoregressiveAgent(BaseAgent):
                 inferred_belief_dim = MFactoryUtil.get_output_dim_from_state_dict(model_state_dict, 'belief_head_shared')
             elif 'belief_head_op0.weight' in model_state_dict:
                  inferred_belief_dim = MFactoryUtil.get_output_dim_from_state_dict(model_state_dict, 'belief_head_op0')
-            else:
-                # This should not happen if is_ppo_autoregressive_model passed
-                raise ValueError("Could not find a valid belief head in state_dict.")
 
             inferred_max_seq = model_state_dict.get('position_embedding.weight').shape[0]
         except Exception as e:
@@ -291,9 +288,9 @@ class PPOAutoregressiveAgent(BaseAgent):
         value = state_values[0, last_step_idx]
 
         # Get belief predictions for each opponent
-        b0 = belief0[0, last_step_idx]
-        b1 = belief1[0, last_step_idx]
-        b2 = belief2[0, last_step_idx]
+        #b0 = belief0[0, last_step_idx]
+        #b1 = belief1[0, last_step_idx]
+        #b2 = belief2[0, last_step_idx]
         
         mask_t = torch.tensor(info["action_mask"], dtype=torch.bool, device=self.device)
         masked_logits = logits.masked_fill(~mask_t, float("-inf"))
@@ -305,7 +302,7 @@ class PPOAutoregressiveAgent(BaseAgent):
             log_prob = dist.log_prob(action)
             self.sequence_history[-1]["action"] = int(action.item())
             # Return all 7 values
-            return action.item(), log_prob.item(), value.item(), b0, b1, b2
+            return action.item(), log_prob.item(), value.item()
         else: # Evaluation mode
             action = torch.argmax(masked_logits).item()
             if belief0 is not None and belief1 is not None:

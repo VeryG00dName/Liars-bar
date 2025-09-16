@@ -214,6 +214,14 @@ class PPOVecRolloutManager:
             pass
 
         # Win/lose bookkeeping
+        player_labels = ep_data.get('player_labels')
+        winner_label = None
+        if player_labels:
+            active_players = [idx for idx, terminated in enumerate(env.terminations) if not terminated]
+            if active_players:
+                winner_label = player_labels[active_players[0]]
+        ep_data['winner_label'] = winner_label
+
         is_winner = (not env.terminations[seat]) and (sum(env.terminations) == env.num_players() - 1)
         ep_data['win'] = 1 if is_winner else 0
 
@@ -239,14 +247,17 @@ class PPOVecRolloutManager:
         is_training_episode = len(training_seats) > 0
         training_agent_seat = training_seats[0] if is_training_episode else -1
         opp_seats = sorted([s for s in range(len(roles)) if s != training_agent_seat])
-        true_opp_labels = []
-        for s in opp_seats:
-            pid = roles[s]
+        player_labels = []
+        for seat_idx, pid in enumerate(roles):
             agent = self.policies.get(pid)
-            true_opp_labels.append(getattr(agent, 'label', pid))
+            player_labels.append(getattr(agent, 'label', pid))
+        training_agent_label = player_labels[training_agent_seat] if training_agent_seat != -1 else None
+        true_opp_labels = tuple(player_labels[s] for s in opp_seats)
         ep_data = {
             "training_agent_seat": training_agent_seat,
-            "true_opponent_labels": tuple(true_opp_labels),
+            "training_agent_label": training_agent_label,
+            "player_labels": tuple(player_labels),
+            "true_opponent_labels": true_opp_labels,
 
             "agent_id": [],
             "our_action": [],
@@ -264,6 +275,7 @@ class PPOVecRolloutManager:
             "model_input": None,
             "episode_return": 0.0,
             "win": 0,
+            "winner_label": None,
         }
         return {
             "env_idx": env_idx,

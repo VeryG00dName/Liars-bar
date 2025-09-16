@@ -39,8 +39,6 @@ class PPOFusedModel(nn.Module):
             torch.triu(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool), 1)
         )
 
-        self.register_buffer("opp_slot_ids", torch.arange(3, dtype=torch.long))
-
         # === Input Encoders ===
         self.obs_encoder = nn.Sequential(
             nn.Linear(obs_dim, hidden_dim), nn.LayerNorm(hidden_dim),
@@ -71,9 +69,6 @@ class PPOFusedModel(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
-        self.opponent_position_embedding = nn.Embedding(3, 16) # Conditioning for 3 opponent slots
-        self.belief_film_layer = FiLMLayer(input_dim=hidden_dim, cond_dim=16)
-        self.belief_head_shared = nn.Linear(hidden_dim, self.belief_dim)
 
         # === Fused Policy and Value Heads ===
         # The input is the main hidden_dim PLUS the intermediate belief_hidden dim.
@@ -120,21 +115,9 @@ class PPOFusedModel(nn.Module):
             src_key_padding_mask=padding_mask.bool() if padding_mask is not None else None,
             is_causal=True,
         )
-
-        # --- Step 1: Compute Belief Logits ---
-        B, _, _ = transformer_output.shape
         
         # The intermediate representation used for both belief and fusion
         belief_hidden = self.belief_fc(transformer_output) # Shape: [B, T, D_hidden]
-
-        # Use FiLM to create opponent-specific belief features
-        opp_indices   = self.opp_slot_ids.view(1,1,3).expand(B,T,-1)
-        pos_embeds = self.opponent_position_embedding(opp_indices)
-        belief_hidden_tiled = belief_hidden.unsqueeze(2).expand(-1, -1, 3, -1)
-        modulated_hidden = self.belief_film_layer(belief_hidden_tiled, pos_embeds)
-        
-        # Project to final belief logits
-        out_logits = self.belief_head_shared(F.relu(modulated_hidden)) # Shape: [B, T, 3, D_belief]
 
         # --- Step 2: Fuse Belief Information with Transformer Output ---
         fused_representation = torch.cat([transformer_output, belief_hidden], dim=-1) # Shape: [B, T, 2 * D_hidden]
@@ -142,7 +125,7 @@ class PPOFusedModel(nn.Module):
         # --- Step 3: Policy and Value Heads on Fused Representation ---
         pv_features = self.policy_value_feature_extractor(fused_representation)
         action_logits = self.action_head(pv_features)
-        opp_logits = self.opp_action_head(pv_features)
+        opp_logits = self.opp_action_head(belief_hidden)
         state_values = self.value_head(pv_features)
 
         # --- Step 4: Apply Action Mask ---
@@ -154,13 +137,78 @@ class PPOFusedModel(nn.Module):
 
         # Return belief logits for the 3 opponents, split for the loss function
         return (action_logits, opp_logits, state_values,
-                out_logits[:, :, 0, :],
-                out_logits[:, :, 1, :],
-                out_logits[:, :, 2, :])
+                None,
+                None,
+                None)
+
+    # ===== Convenience helpers for planning & challenge evaluation =====
+
+    @staticmethod
+    def _last_nonself_index(agent_types: torch.Tensor, padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        agent_types: [B, T] with {0=self, 1/2/3=opponents}
+        padding_mask: [B, T] True for PAD (optional). If provided, pads are ignored.
+
+        Returns:
+            idx: [B] int64, index of the last timestep t' < T where an opponent acted.
+                 If none exists (edge case), returns T-1 clamped to valid (so you can guard on a mask).
+        """
+        B, T = agent_types.shape
+        nonself = (agent_types != 0)
+        if padding_mask is not None:
+            nonself &= ~padding_mask.bool()
+
+        # Find last True along time: reverse, argmax of first True, then convert back
+        rev = torch.flip(nonself.to(torch.int32), dims=[1])
+        pos_from_end = rev.argmax(dim=1)  # [B], 0 if last element is True, else distance
+        # If a row has no True at all, argmax is 0 but nonself is all False. Detect that:
+        has_any = nonself.any(dim=1)
+        # Convert back to forward index
+        idx = (T - 1) - pos_from_end
+        # For rows with no opponent, just point at 0 to stay in-bounds (caller should check has_any)
+        idx = torch.where(has_any, idx, torch.zeros_like(idx))
+        return idx  # [B]
+
+    @staticmethod
+    def _batch_gather_last_step(tensorBTD: torch.Tensor, idxB: torch.Tensor) -> torch.Tensor:
+        """
+        tensorBTD: [B, T, D]  (e.g., opp_logits)
+        idxB:      [B] indices to gather along T
+        Returns:   [B, D]
+        """
+        B, T, D = tensorBTD.shape
+        gather_idx = idxB.view(B, 1, 1).expand(B, 1, D)
+        out = torch.gather(tensorBTD, dim=1, index=gather_idx).squeeze(1)
+        return out  # [B, D]
+
+    def last_opponent_logits_before_us(
+        self,
+        opp_logits: torch.Tensor,
+        agent_types: torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Get opponent logits for the *immediately previous* opponent timestep (per batch row).
+
+        Args:
+            opp_logits:   [B, T, A]
+            agent_types:  [B, T] with {0=self, 1/2/3=opponents}
+            padding_mask: [B, T] True for PAD (optional)
+
+        Returns:
+            prev_opp_logits: [B, A]
+            has_prev_opp:    [B] bool  (False if no opponent step exists before our current step)
+        """
+        idx = self._last_nonself_index(agent_types, padding_mask)      # [B]
+        prev_opp_logits = self._batch_gather_last_step(opp_logits, idx)  # [B, A]
+        has_prev_opp = (agent_types.gather(dim=1, index=idx.view(-1,1)).squeeze(1) != 0)
+        return prev_opp_logits, has_prev_opp
+
 
 class FiLMLayer(nn.Module):
     """
-    Feature-wise Linear Modulation Layer.
+    (Unused now) Feature-wise Linear Modulation Layer.
+    Kept here in case you want to reintroduce conditioning later.
     """
     def __init__(self, input_dim, cond_dim):
         super().__init__()
