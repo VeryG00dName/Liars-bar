@@ -430,8 +430,33 @@ def train_generation(
         if (update % 50) == 0 and opp_rows_X:
             X = np.concatenate(opp_rows_X, axis=0)            # [N, D]
             labels = opp_rows_L                               # [N] (may contain None)
-            visualize_opponent_embeddings_all(writer, (X, labels), step=update,
-                                  title_prefix="Per-Opponent belief_fc")
+            visualize_opponent_embeddings_all(
+                writer, (X, labels), step=update,
+                title_prefix="Per-Opponent belief_fc"
+            )
+
+            metrics = train_extras.embedding_quality_metrics(X, labels, k=10)
+            if metrics:
+                evr = metrics.get("pca_evr")
+                for key, value in metrics.items():
+                    if isinstance(value, np.ndarray):
+                        for i, s in enumerate(value[:8]):
+                            writer.add_scalar(f"Emb/PCA_EVR_{i+1}", float(s), update)
+                    else:
+                        writer.add_scalar(f"Emb/{key}", float(value), update)
+                if (
+                    isinstance(evr, np.ndarray)
+                    and evr.size >= 3
+                    and np.isfinite(evr[:3]).all()
+                ):
+                    ratio = float(evr[2] / max(evr[0] + evr[1], 1e-9))
+                    writer.add_scalar("Emb/PC3_vs_PC12_ratio", ratio, update)
+
+            html_path = os.path.join(run_ckpt_dir, f"embeddings_step_{update}.html")
+            try:
+                train_extras.save_interactive_3d(X, labels, html_path)
+            except Exception as exc:
+                print(f"[viz][3d] failed: {exc}")
 
         if update % int(config.CHECKPOINT_INTERVAL) == 0:
             path = os.path.join(run_ckpt_dir, f"update_{update}.pth")

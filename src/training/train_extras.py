@@ -1,20 +1,33 @@
 # src/training/train_extras.py
 
 import random
+from collections import Counter
+from io import BytesIO
+from typing import Dict, Any, List, Optional, Tuple, Iterable, Union
+
 import numpy as np
 import torch
 from src import config
 import os
+
 os.environ.setdefault("MPLBACKEND", "Agg")
 import matplotlib
+
 matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Ellipse
+from PIL import Image
+import plotly.graph_objects as go
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
+from sklearn.metrics import (
+    calinski_harabasz_score,
+    davies_bouldin_score,
+    silhouette_score,
+)
+from sklearn.neighbors import NearestNeighbors
 import umap.umap_ as umap
-import matplotlib.pyplot as plt
-from io import BytesIO
-from PIL import Image
-from typing import Dict, Any, List, Optional, Tuple, Iterable, Union
 
 # =============================================================================
 # Opponent relabel configuration & prototype bank (module scope)
@@ -382,6 +395,306 @@ def _coerce_opponent_input(
         return np.asarray(X, dtype=np.float32), list(labels)
     raise TypeError("Pass a dict {opponent_id: embedding} OR a tuple (X, opponent_labels).")
 
+
+def _balanced_subsample_indices(
+    labels: np.ndarray,
+    per_label_cap: int,
+    max_points: Optional[int] = None,
+    seed: int = 0,
+) -> np.ndarray:
+    """Return balanced subsample indices for labels."""
+    if labels.size == 0:
+        return np.empty((0,), dtype=np.int64)
+
+    rng = np.random.default_rng(seed)
+    take = []
+    for lab in np.unique(labels):
+        idx = np.where(labels == lab)[0]
+        if per_label_cap and idx.size > per_label_cap:
+            idx = rng.choice(idx, size=per_label_cap, replace=False)
+        take.append(idx)
+    idxs = np.concatenate(take) if take else np.empty((0,), dtype=np.int64)
+    if max_points and idxs.size > max_points:
+        idxs = rng.choice(idxs, size=max_points, replace=False)
+    return np.sort(idxs)
+
+
+def _ellipse_from_cov(
+    center: np.ndarray,
+    cov: np.ndarray,
+    color,
+    alpha: float = 0.2,
+) -> Optional[Ellipse]:
+    if not np.isfinite(cov).all():
+        return None
+    try:
+        vals, vecs = np.linalg.eigh(cov)
+    except np.linalg.LinAlgError:
+        return None
+    vals = np.maximum(vals, 1e-9)
+    order = np.argsort(vals)[::-1]
+    vals, vecs = vals[order], vecs[:, order]
+    theta = np.degrees(np.arctan2(vecs[1, 0], vecs[0, 0]))
+    width, height = 2.0 * np.sqrt(vals)
+    ell = Ellipse(xy=center, width=width, height=height, angle=theta,
+                  edgecolor=color, facecolor=color, alpha=alpha, linewidth=2.0)
+    return ell
+
+
+def save_interactive_3d(
+    X: np.ndarray,
+    labels: np.ndarray,
+    path_html: str,
+    method: str = "pca",
+    per_label_cap: int = 600,
+) -> Optional[str]:
+    """Save an interactive 3D PCA HTML scatter plot of embeddings."""
+    X = np.asarray(X)
+    labels = np.asarray([str(l) for l in labels])
+    if X.ndim != 2 or X.shape[0] == 0:
+        return None
+
+    idxs = _balanced_subsample_indices(labels, per_label_cap=per_label_cap)
+    if idxs.size == 0:
+        return None
+    Xs = X[idxs]
+    Ls = labels[idxs]
+
+    pca = PCA(n_components=min(3, Xs.shape[1]), random_state=0)
+    X3 = pca.fit_transform(Xs)
+
+    fig = go.Figure()
+    uniq = sorted(set(Ls.tolist()), key=lambda x: str(x))
+    for lab in uniq:
+        mask = Ls == lab
+        fig.add_trace(go.Scatter3d(
+            x=X3[mask, 0], y=X3[mask, 1], z=X3[mask, 2],
+            mode="markers",
+            marker=dict(size=3, opacity=0.8),
+            name=f"Opp {lab}",
+            hovertext=[f"Opp {lab}"] * int(mask.sum()),
+            hoverinfo="text",
+        ))
+
+    evr = pca.explained_variance_ratio_
+    ttl = (
+        f"3D PCA (EVR: {evr[0]:.2f}, {evr[1]:.2f}, {evr[2]:.2f})"
+        if evr.size >= 3 else f"3D PCA — N={Xs.shape[0]}"
+    )
+    fig.update_layout(
+        title=ttl + f" — N={Xs.shape[0]}",
+        showlegend=True,
+        scene=dict(
+            xaxis_title="PC1",
+            yaxis_title="PC2",
+            zaxis_title="PC3",
+            aspectmode="data",
+        ),
+        margin=dict(l=0, r=0, t=40, b=0),
+    )
+    fig.write_html(path_html, include_plotlyjs="cdn")
+    return path_html
+
+
+def embedding_quality_metrics(
+    X: np.ndarray,
+    labels: np.ndarray,
+    k: int = 10,
+    max_points: int = 20000,
+    per_label_cap: int = 2000,
+) -> dict:
+    """Compute label-aware quality metrics in the original embedding space."""
+    X = np.asarray(X, dtype=np.float32)
+    y = np.asarray([str(l) for l in labels])
+    if X.ndim != 2 or X.shape[0] == 0:
+        return {}
+
+    sel = _balanced_subsample_indices(y, per_label_cap=per_label_cap, max_points=max_points)
+    if sel.size == 0:
+        return {}
+    Xs, ys = X[sel], y[sel]
+
+    norms = np.linalg.norm(Xs, axis=1, keepdims=True) + 1e-9
+    Xn = Xs / norms
+
+    nn = NearestNeighbors(n_neighbors=min(k + 1, Xn.shape[0]), metric="cosine", algorithm="brute")
+    nn.fit(Xn)
+    _, idxs = nn.kneighbors(Xn, return_distance=True)
+    idxs = idxs[:, 1:]
+    nbr_labels = ys[idxs]
+    preds = []
+    for row in nbr_labels:
+        most_common = Counter(row).most_common(1)[0][0]
+        preds.append(most_common)
+    knn_acc = float(np.mean(np.asarray(preds, dtype=ys.dtype) == ys))
+
+    s_sel = min(5000, Xn.shape[0])
+    rng = np.random.default_rng(0)
+    pick = rng.choice(np.arange(Xn.shape[0]), size=s_sel, replace=False)
+    sil = float(silhouette_score(Xn[pick], ys[pick], metric="cosine")) if s_sel >= 30 else float("nan")
+
+    ch = float(calinski_harabasz_score(Xn, ys))
+    db = float(davies_bouldin_score(Xn, ys))
+
+    labs = np.unique(ys)
+    cents = []
+    intra = []
+    for lab in labs:
+        Xi = Xn[ys == lab]
+        if Xi.size == 0:
+            continue
+        c = Xi.mean(axis=0)
+        norm = np.linalg.norm(c)
+        if norm > 0:
+            c = c / norm
+        cents.append(c)
+        intra.append(1.0 - float((Xi @ c).mean()))
+    C = np.stack(cents) if cents else np.zeros((1, Xn.shape[1]), np.float32)
+    if C.shape[0] > 1:
+        sim = C @ C.T
+        iu = np.triu_indices(C.shape[0], k=1)
+        between = float(np.mean(1.0 - sim[iu]))
+    else:
+        between = float("nan")
+    within = float(np.mean(intra)) if intra else float("nan")
+    bw_ratio = (between / (within + 1e-9)) if np.isfinite(between) and np.isfinite(within) else float("nan")
+
+    pca = PCA(n_components=min(16, Xn.shape[1]), random_state=0).fit(Xn)
+    evr = pca.explained_variance_ratio_
+    cum_evr_4 = float(evr[:4].sum()) if evr.size >= 4 else float(evr.sum())
+    cum_evr_8 = float(evr[:8].sum()) if evr.size >= 8 else float(evr.sum())
+    cum_evr_16 = float(evr[:16].sum()) if evr.size >= 16 else float(evr.sum())
+
+    return {
+        f"knn_acc@{k}": knn_acc,
+        "silhouette_cosine": sil,
+        "calinski_harabasz": ch,
+        "davies_bouldin": db,
+        "centroid_within_cos": within,
+        "centroid_between_cos": between,
+        "between_over_within": bw_ratio,
+        "pca_evr": evr,
+        "pca_cum_evr_4": cum_evr_4,
+        "pca_cum_evr_8": cum_evr_8,
+        "pca_cum_evr_16": cum_evr_16,
+        "N_eval": int(Xn.shape[0]),
+        "n_labels": int(labs.size),
+    }
+
+
+def _visualize_pca_panels(
+    writer,
+    X: np.ndarray,
+    opp_labels: list,
+    step: int,
+    title_prefix: str,
+) -> dict:
+    label_list = [str(l) for l in opp_labels]
+    labels_arr = np.asarray(label_list)
+    N, D = X.shape
+    n_comp = int(max(2, min(4, D, N)))
+    pca = PCA(n_components=n_comp, random_state=0)
+    Xp = pca.fit_transform(X)
+    evr = pca.explained_variance_ratio_
+
+    pairs = [(0, 1), (1, 2), (2, 3)]
+    valid_pairs = [pair for pair in pairs if pair[1] < n_comp]
+    if not valid_pairs:
+        return {"pca_evr": evr}
+
+    fig, axes = plt.subplots(1, len(valid_pairs), figsize=(6 * len(valid_pairs), 5))
+    if not isinstance(axes, np.ndarray):
+        axes = np.array([axes])
+
+    uniq = sorted(set(label_list))
+    cmap = plt.cm.get_cmap("tab20", max(1, len(uniq)))
+    scatter_cap = 400
+    rng = np.random.default_rng(0)
+    legend_handles: List[Line2D] = []
+
+    for ax, (i, j) in zip(axes, valid_pairs):
+        ax.set_title(f"PC{i+1} vs PC{j+1}")
+        xi = evr[i] if i < len(evr) else float("nan")
+        xlbl = f"PC{i+1} ({xi*100:.1f}% var)" if np.isfinite(xi) else f"PC{i+1}"
+        yj = evr[j] if j < len(evr) else float("nan")
+        ylbl = f"PC{j+1} ({yj*100:.1f}% var)" if np.isfinite(yj) else f"PC{j+1}"
+        ax.set_xlabel(xlbl)
+        ax.set_ylabel(ylbl)
+        ax.grid(True, linestyle="--", alpha=0.25)
+
+        for idx, lab in enumerate(uniq):
+            mask = labels_arr == lab
+            if not np.any(mask):
+                continue
+            pts = Xp[mask][:, [i, j]]
+            if pts.shape[0] == 0:
+                continue
+            color = cmap(idx % cmap.N)
+
+            show_pts = pts
+            if pts.shape[0] > scatter_cap:
+                take = rng.choice(pts.shape[0], size=scatter_cap, replace=False)
+                show_pts = pts[take]
+            ax.scatter(show_pts[:, 0], show_pts[:, 1], color=color, s=8, alpha=0.25, linewidths=0)
+
+            centroid = pts.mean(axis=0)
+            ax.scatter(
+                centroid[0],
+                centroid[1],
+                marker="X",
+                s=80,
+                color=color,
+                edgecolor="black",
+                linewidths=0.8,
+            )
+            if i == valid_pairs[0][0] and j == valid_pairs[0][1]:
+                legend_handles.append(Line2D([0], [0], marker="X", color="w",
+                                             markerfacecolor=color, markeredgecolor="black",
+                                             linewidth=0, markersize=9, label=f"Opp {lab}"))
+
+            if pts.shape[0] >= 3:
+                cov = np.cov(pts, rowvar=False)
+                ell = _ellipse_from_cov(centroid, cov, color)
+                if ell is not None:
+                    ax.add_patch(ell)
+
+        ax.set_aspect("equal", adjustable="box")
+
+    if legend_handles:
+        axes[0].legend(handles=legend_handles, bbox_to_anchor=(1.02, 1), loc="upper left",
+                       borderaxespad=0.0, title="Opponents")
+
+    evr_pad = np.pad(evr, (0, max(0, 4 - evr.size)), constant_values=np.nan)
+    evr_text = ", ".join(
+        [
+            f"PC{k+1}: {val:.2f}" if np.isfinite(val) else f"PC{k+1}: n/a"
+            for k, val in enumerate(evr_pad[:4])
+        ]
+    )
+    fig.suptitle(f"{title_prefix} — PCA multi-view — step {step}\n{evr_text}")
+
+    if evr.size >= 3 and np.isfinite(evr[:3]).all():
+        pc3_ratio = float(evr[2] / max(evr[0] + evr[1], 1e-9))
+        fig.text(0.5, 0.02, f"PC3 vs PC1-2 EVR ratio: {pc3_ratio:.3f}", ha="center")
+    else:
+        pc3_ratio = float("nan")
+
+    fig.tight_layout(rect=[0, 0.05, 1, 0.92])
+
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    buf.seek(0)
+    image = Image.open(buf)
+    writer.add_image("Embeddings/PCA multi-view", np.array(image), step, dataformats="HWC")
+    plt.close(fig)
+
+    return {
+        "pca_evr": evr,
+        "pc3_vs_pc12": pc3_ratio,
+        "n_components": n_comp,
+        "pairs": valid_pairs,
+    }
+
 def visualize_opponent_embeddings_all(
     writer,
     data,                      # dict {opp: emb} OR (X, opp_labels)
@@ -395,11 +708,12 @@ def visualize_opponent_embeddings_all(
     Default set is chosen based on whether UMAP is available.
     """
     if methods is None:
-        methods = ["pca_tsne","pca","pca_umap"]
+        methods = ["pca_panels"]
 
+    results = {}
     for m in methods:
         try:
-            visualize_opponent_embeddings(
+            out = visualize_opponent_embeddings(
                 writer,
                 data=data,
                 step=step,
@@ -407,24 +721,29 @@ def visualize_opponent_embeddings_all(
                 pca_dim=pca_dim,
                 title_prefix=title_prefix,
             )
+            if out is not None:
+                results[m] = out
         except Exception as e:
             # keep training going even if a reducer fails
             print(f"[viz][{m}] failed: {e}")
+    return results
 
 def visualize_opponent_embeddings(
     writer,
     data,                       # dict {opp: emb} OR (X, opp_labels)
     step: int,
-    method: str = "pca_tsne",   # 'pca_tsne' | 'pca_umap' | 'pca' | 'tsne' | 'umap'
+    method: str = "pca_panels",  # 'pca_panels' | 'pca_tsne' | 'pca_umap' | 'pca' | 'tsne' | 'umap'
     pca_dim: int = 50,
     title_prefix: str = "Opponent Embeddings"
 ):
     # ---- coerce input ----
     X, opp_labels = _coerce_opponent_input(data)
     if X.shape[0] < 2:
-        return  # need ≥2 points
+        return None  # need ≥2 points
 
     N, D = X.shape
+    if method == "pca_panels":
+        return _visualize_pca_panels(writer, X, opp_labels, step, title_prefix)
 
     # ---- optional PCA pre-step for mixed methods ----
     use_pca_prefix = method in ("pca_tsne", "pca_umap")

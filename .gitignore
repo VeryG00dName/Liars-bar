@@ -184,3 +184,4 @@ opponent_training_data.pkl
 /old logs
 *.db
 CODING_GUIDELINES.md
+*.html
