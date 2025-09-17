@@ -368,13 +368,17 @@ def train_generation(
             # --- ADD: collect per-opponent embeddings from this batch, if present ---
             emb = metrics.get("opp_embeds_batch", None)
             if emb is not None:
-                E_np, L_np = emb                      # E_np: [B,3,D], L_np: [B,3] or None
-                B3, D = (E_np.shape[0] * E_np.shape[1], E_np.shape[2])
-                Xb = E_np.reshape(B3, D)              # [B*3, D]
-                good = ~np.isnan(Xb).any(axis=1)      # drop seats with no valid tokens
+                # metrics returns (embeddings [B,3,D], labels [B,3], counts [B,3])
+                E_np, L_np, C_np = emb
+                B, seats, D = E_np.shape
+                Xb = E_np.reshape(B * seats, D)
+                counts = C_np.reshape(B * seats)
+                good = (~np.isnan(Xb).any(axis=1)) & (counts > 0)
+                if not np.any(good):
+                    continue
                 Xb = Xb[good]
                 if L_np is not None:
-                    Lb = L_np.reshape(B3)[good].tolist()
+                    Lb = L_np.reshape(B * seats)[good].tolist()
                 else:
                     Lb = [None] * int(good.sum())
                 opp_rows_X.append(Xb)

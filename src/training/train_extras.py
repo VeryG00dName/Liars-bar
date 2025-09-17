@@ -828,40 +828,40 @@ def _collate_batch(
             pen_used[b, t_local] = int(pu)
 
         # ===== OPP timeline =====
-    opp_pos = opp_pos_lists[b]
-    M = int(opp_pos.numel())
-    M_fill = min(To, M)
-    if M_fill > 0:
-        opp_idx[b, :M_fill] = opp_pos[:M_fill]
+        opp_pos = opp_pos_lists[b]
+        M = int(opp_pos.numel())
+        M_fill = min(To, M)
+        if M_fill > 0:
+            opp_idx[b, :M_fill] = opp_pos[:M_fill]
 
-        # Episode metadata we already saved
-        player_labels = tuple(ep.get("player_labels", ()))  # absolute seat -> label
-        agent_id_seq  = ep["agent_id"]                      # per-step absolute seat index
+            # Episode metadata we already saved
+            player_labels = tuple(ep.get("player_labels", ()))  # absolute seat -> label
+            agent_id_seq  = ep["agent_id"]                      # per-step absolute seat index
 
-        # Indices of opponent steps in episode timeline
-        opp_ep_idx = [i for i, seat in enumerate(agent_id_seq) if seat != ep.get("training_agent_seat", -1)]
+            # Indices of opponent steps in episode timeline
+            opp_ep_idx = [i for i, seat in enumerate(agent_id_seq) if seat != ep.get("training_agent_seat", -1)]
 
-        for t_local in range(M_fill):
-            if t_local >= len(opp_ep_idx):
-                break
-            step_ep = opp_ep_idx[t_local]
+            for t_local in range(M_fill):
+                if t_local >= len(opp_ep_idx):
+                    break
+                step_ep = opp_ep_idx[t_local]
 
-            # Opponent action supervision (unchanged)
-            tgt = ep.get("opp_target_action", [None]*len(agent_id_seq))[step_ep]
-            if tgt is not None:
-                opp_targets[b, t_local] = int(tgt)
-                opp_have_label[b, t_local] = True
+                # Opponent action supervision (unchanged)
+                tgt = ep.get("opp_target_action", [None]*len(agent_id_seq))[step_ep]
+                if tgt is not None:
+                    opp_targets[b, t_local] = int(tgt)
+                    opp_have_label[b, t_local] = True
 
-            # ---- Belief supervision ON THE SAME OPPONENT TOKEN ----
-            t_global = int(opp_pos[t_local].item())
-            belief_idx[b, t_local] = t_global
+                # ---- Belief supervision ON THE SAME OPPONENT TOKEN ----
+                t_global = int(opp_pos[t_local].item())
+                belief_idx[b, t_local] = t_global
 
-            seat_acting = int(agent_id_seq[step_ep])  # absolute seat at this step
-            if 0 <= seat_acting < len(player_labels):
-                lbl = player_labels[seat_acting]
-                if lbl is not None:
-                    belief_tgt[b, t_local]  = int(lbl)
-                    belief_have[b, t_local] = True
+                seat_acting = int(agent_id_seq[step_ep])  # absolute seat at this step
+                if 0 <= seat_acting < len(player_labels):
+                    lbl = player_labels[seat_acting]
+                    if lbl is not None:
+                        belief_tgt[b, t_local]  = int(lbl)
+                        belief_have[b, t_local] = True
 
     return {
         "mi": mi_batch,
