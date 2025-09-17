@@ -184,6 +184,34 @@ def _coerce_opponent_input(
         return np.asarray(X, dtype=np.float32), list(labels)
     raise TypeError("Pass a dict {opponent_id: embedding} OR a tuple (X, opponent_labels).")
 
+def visualize_opponent_embeddings_all(
+    writer,
+    data,                      # dict {opp: emb} OR (X, opp_labels)
+    step: int,
+    methods: list | tuple | None = None,
+    pca_dim: int = 50,
+    title_prefix: str = "Opponent Embeddings",
+):
+    """
+    Call visualize_opponent_embeddings() for a list of methods.
+    Default set is chosen based on whether UMAP is available.
+    """
+    if methods is None:
+        methods = ["pca_tsne","pca","pca_umap"]
+
+    for m in methods:
+        try:
+            visualize_opponent_embeddings(
+                writer,
+                data=data,
+                step=step,
+                method=m,
+                pca_dim=pca_dim,
+                title_prefix=title_prefix,
+            )
+        except Exception as e:
+            # keep training going even if a reducer fails
+            print(f"[viz][{m}] failed: {e}")
 
 def visualize_opponent_embeddings(
     writer,

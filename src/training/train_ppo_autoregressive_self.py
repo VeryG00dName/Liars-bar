@@ -32,7 +32,7 @@ from src.model.ppo_fused_model import PPOFusedModel
 from src.agents.batch_autoregressive_ppo_agent import BatchPPOAutoregressiveAgent
 from src.agents.cpp_bot_wrapper import CppBotWrapper
 from src.training.vec_ppo_rollout import PPOVecRolloutManager
-from src.training.train_extras import _collate_batch, _to_device_batch, ppo_losses_batched, visualize_opponent_embeddings
+from src.training.train_extras import _collate_batch, _to_device_batch, ppo_losses_batched, visualize_opponent_embeddings_all
 
 def _silence_torch_symbolic_logs():
     for name in ("torch.fx.experimental.symbolic_shapes", "torch._dynamo.symbolic_shapes", "torch._dynamo", "torch._inductor"):
@@ -126,46 +126,34 @@ def _load_agent_from_checkpoint(path: str, model_type: str, device: torch.device
     agent.load_models_from_checkpoint({"policy_nets": {"agent_model": state_dict}}, "agent_model")
     return agent
 
-def _clone_agent_from_agent(src_agent: BatchPPOAutoregressiveAgent, device: torch.device) -> BatchPPOAutoregressiveAgent:
-    """Create a new agent with the same architecture/weights as src_agent without disk I/O.
-    Avoids heuristic detection by reading dimensions directly from the source model.
-    Safely unwraps compiled models via '._orig_mod' when present.
-    """
+def _clone_agent_from_agent(src_agent: BatchPPOAutoregressiveAgent,
+                            device: torch.device) -> BatchPPOAutoregressiveAgent:
+    """Clone an agent using the exact same path as checkpoint loading:
+    build a fresh agent and load via load_models_from_checkpoint with an
+    in-memory state_dict. This avoids architecture inference and stays
+    robust to naming/wrapping changes (e.g., _orig_mod, compile)."""
     if src_agent is None or src_agent.model is None:
         raise ValueError("Source agent/model is None; cannot clone.")
 
+    # get the unwrapped model for a clean state_dict (handles torch.compile)
     src_model = getattr(src_agent.model, "_orig_mod", src_agent.model)
+    # take a CPU copy of the tensors to be device-agnostic
+    src_state = {k: v.detach().cpu() for k, v in src_model.state_dict().items()}
 
-    # Read construction args from the source model
-    obs_dim = getattr(src_model, "obs_dim")
-    action_dim = getattr(src_model, "action_dim", 7)
-    #belief_dim = getattr(src_model, "belief_dim", 64)
-    hidden_dim = getattr(src_model, "hidden_dim", 256)
-    max_seq_length = getattr(src_model, "max_seq_length", 256)
+    # make a fresh agent and load exactly like _load_agent_from_checkpoint
+    clone = BatchPPOAutoregressiveAgent(device, f"clone_of_{src_agent.player_id}")
+    clone.load_models_from_checkpoint({"policy_nets": {"agent_model": src_state}}, "agent_model")
 
-    # num_heads is not stored publicly; infer from transformer layer
-    encoder_layer = src_model.transformer.layers[0]
-    num_heads = encoder_layer.self_attn.num_heads if hasattr(encoder_layer.self_attn, 'num_heads') else hidden_dim//64
+    # bookkeeping to mirror the source
+    clone.label = getattr(src_agent, "label", -1)
+    clone.max_seq_length = getattr(src_agent, "max_seq_length", getattr(clone, "max_seq_length", None))
 
-    # Instantiate a fresh model with identical shape
-    new_model = PPOFusedModel(
-        obs_dim=obs_dim,
-        action_dim=action_dim,
-        belief_dim=64,
-        hidden_dim=hidden_dim,
-        num_heads=num_heads,
-        max_seq_length=max_seq_length,
-    ).to(device)
+    # ensure correct device/mode
+    if hasattr(clone, "model") and clone.model is not None:
+        clone.model.to(device)
+        clone.model.eval()   # rollouts should be in eval mode by default
 
-    # Load weights from the original (unwrapped) model
-    new_model.load_state_dict(src_model.state_dict(), strict=True)
-
-    new_agent = BatchPPOAutoregressiveAgent(device, f"clone_of_{src_agent.player_id}")
-    new_agent.model = new_model
-    # keep agent bookkeeping aligned
-    new_agent.max_seq_length = max_seq_length - 1 if isinstance(max_seq_length, int) else new_agent.max_seq_length
-    new_agent.label = getattr(src_agent, 'label', -1)
-    return new_agent
+    return clone
 
 class PlateauDetector:
     """Simple detector for training plateaus based on win rate improvement."""
@@ -437,22 +425,12 @@ def train_generation(
         if (update % 25) == 0 and opp_rows_X:
             X = np.concatenate(opp_rows_X, axis=0)            # [N, D]
             labels = opp_rows_L                               # [N] (may contain None)
-            visualize_opponent_embeddings(
-                writer,
-                data=(X, labels),
-                step=update,
-                method="pca_umap",                            # or "pca_tsne" if UMAP not installed
-                title_prefix="Per-Opponent belief_fc"
-            )
-        
-        if run_name == "gen_1":
-            if update >= 300:
-                logging.info(f"{update}. Stopping training for '{run_name} current win_rate: {win_rate:.3f}.")
-                break
-        else:
-            if update >= 100:
-                logging.info(f"{update}. Stopping training for '{run_name} current win_rate: {win_rate:.3f}.")
-                break
+            visualize_opponent_embeddings_all(writer, (X, labels), step=update,
+                                  title_prefix="Per-Opponent belief_fc")
+            
+        if update >= 100:
+            logging.info(f"{update}. Stopping training for '{run_name} current win_rate: {win_rate:.3f}.")
+            break
 
         if update % int(config.CHECKPOINT_INTERVAL) == 0:
             path = os.path.join(run_ckpt_dir, f"update_{update}.pth")
