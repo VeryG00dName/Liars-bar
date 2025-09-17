@@ -32,7 +32,13 @@ from src.model.ppo_fused_model import PPOFusedModel
 from src.agents.batch_autoregressive_ppo_agent import BatchPPOAutoregressiveAgent
 from src.agents.cpp_bot_wrapper import CppBotWrapper
 from src.training.vec_ppo_rollout import PPOVecRolloutManager
-from src.training.train_extras import _collate_batch, _to_device_batch, ppo_losses_batched, visualize_opponent_embeddings_all
+from src.training.train_extras import (
+    _collate_batch,
+    _to_device_batch,
+    ppo_losses_batched,
+    visualize_opponent_embeddings_all,
+)
+import src.training.train_extras as train_extras
 
 def _silence_torch_symbolic_logs():
     for name in ("torch.fx.experimental.symbolic_shapes", "torch._dynamo.symbolic_shapes", "torch._dynamo", "torch._inductor"):
@@ -118,12 +124,22 @@ def _create_new_agent(agent_type: str, device: torch.device) -> BatchPPOAutoregr
     agent.model = model.to(device)
     return agent
 
-def _load_agent_from_checkpoint(path: str, model_type: str, device: torch.device) -> BatchPPOAutoregressiveAgent:
+def _load_agent_from_checkpoint(
+    path: str,
+    model_type: str,
+    device: torch.device,
+    restore_proto: bool = False,
+) -> BatchPPOAutoregressiveAgent:
     """Loads an agent's state from a checkpoint path. Optionally compiles its model."""
     agent = BatchPPOAutoregressiveAgent(device, f"loaded_{model_type}")
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     state_dict = checkpoint.get('model_state_dict', checkpoint)
     agent.load_models_from_checkpoint({"policy_nets": {"agent_model": state_dict}}, "agent_model")
+    if restore_proto and isinstance(checkpoint, dict) and ("proto_bank" in checkpoint):
+        try:
+            train_extras._GLOB = train_extras._GlobalProtoBank.load(checkpoint["proto_bank"])
+        except Exception:
+            pass
     return agent
 
 def _clone_agent_from_agent(src_agent: BatchPPOAutoregressiveAgent,
@@ -193,7 +209,7 @@ def train_generation(
         if agent_cache is not None and cache_key in agent_cache:
             learner = _clone_agent_from_agent(agent_cache[cache_key], device)
         else:
-            base_agent = _load_agent_from_checkpoint(warm_start_path, 'main', device)
+            base_agent = _load_agent_from_checkpoint(warm_start_path, 'main', device, restore_proto=True)
             if agent_cache is not None:
                 agent_cache[cache_key] = base_agent  # keep a copy of the base
             learner = _clone_agent_from_agent(base_agent, device)
@@ -332,23 +348,34 @@ def train_generation(
                     pass
             n_batches += 1
             # --- ADD: collect per-opponent embeddings from this batch, if present ---
-            emb = metrics.get("opp_embeds_batch", None)
-            if emb is not None:
-                # metrics returns (embeddings [B,3,D], labels [B,3], counts [B,3])
-                E_np, L_np, C_np = emb
-                B, seats, D = E_np.shape
-                Xb = E_np.reshape(B * seats, D)
-                counts = C_np.reshape(B * seats)
-                good = (~np.isnan(Xb).any(axis=1)) & (counts > 0)
-                if not np.any(good):
-                    continue
-                Xb = Xb[good]
-                if L_np is not None:
-                    Lb = L_np.reshape(B * seats)[good].tolist()
-                else:
-                    Lb = [None] * int(good.sum())
-                opp_rows_X.append(Xb)
-                opp_rows_L.extend(Lb)
+            X_flat = metrics.get("opp_embeds_flat", None)
+            L_flat = metrics.get("opp_labels_flat", None)
+            if X_flat is not None and L_flat is not None:
+                Xb = np.asarray(X_flat, dtype=np.float32)
+                if Xb.ndim == 1:
+                    if Xb.size == 0:
+                        continue
+                    Xb = Xb.reshape(1, -1)
+                if Xb.size > 0:
+                    opp_rows_X.append(Xb)
+                    opp_rows_L.extend(list(L_flat))
+            else:
+                emb = metrics.get("opp_embeds_batch", None)
+                if emb is not None:
+                    E_np, L_np, C_np = emb
+                    B, seats, D = E_np.shape
+                    Xb = E_np.reshape(B * seats, D)
+                    counts = C_np.reshape(B * seats)
+                    good = (~np.isnan(Xb).any(axis=1)) & (counts > 0)
+                    if not np.any(good):
+                        continue
+                    Xb = Xb[good]
+                    if L_np is not None:
+                        Lb = L_np.reshape(B * seats)[good].tolist()
+                    else:
+                        Lb = [None] * int(good.sum())
+                    opp_rows_X.append(Xb)
+                    opp_rows_L.extend(Lb)
 
         t_opt_end = time.time()
         # Timings
@@ -400,7 +427,7 @@ def train_generation(
         writer.add_scalar("Acc/OpponentAction", avg.get("opp_action_acc", 0.0), update)
         writer.add_scalar("Acc/Belief", avg.get("belief_acc", 0.0), update)
         
-        if (update % 25) == 0 and opp_rows_X:
+        if (update % 50) == 0 and opp_rows_X:
             X = np.concatenate(opp_rows_X, axis=0)            # [N, D]
             labels = opp_rows_L                               # [N] (may contain None)
             visualize_opponent_embeddings_all(writer, (X, labels), step=update,
@@ -409,12 +436,24 @@ def train_generation(
         if update % int(config.CHECKPOINT_INTERVAL) == 0:
             path = os.path.join(run_ckpt_dir, f"update_{update}.pth")
             to_save = getattr(learner.model, "_orig_mod", learner.model)
-            torch.save({'model_state_dict': to_save.state_dict()}, path)
+            extra = {}
+            if (train_extras._GLOB is not None) and (getattr(train_extras._GLOB, 'C', None) is not None):
+                try:
+                    extra["proto_bank"] = train_extras._GLOB.state_dict()
+                except Exception:
+                    pass
+            torch.save({"model_state_dict": to_save.state_dict(), **extra}, path)
 
     # 5. FINALIZE AND SAVE
     final_path = os.path.join(run_ckpt_dir, "final.pth")
     to_save = getattr(learner.model, "_orig_mod", learner.model)
-    torch.save({'model_state_dict': to_save.state_dict()}, final_path)
+    extra = {}
+    if (train_extras._GLOB is not None) and (getattr(train_extras._GLOB, 'C', None) is not None):
+        try:
+            extra["proto_bank"] = train_extras._GLOB.state_dict()
+        except Exception:
+            pass
+    torch.save({"model_state_dict": to_save.state_dict(), **extra}, final_path)
     pool_manager.add_agent(name=run_name, model_type='main', path=final_path)
     writer.close()
     logging.info(f"Saved final model for '{run_name}' to {final_path}")

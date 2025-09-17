@@ -193,7 +193,10 @@ def train(
             # Accumulate metrics
             agg["total_loss"] += float(total_loss.detach().cpu())
             for k, v in metrics.items():
-                agg[k] = agg.get(k, 0.0) + float(v.detach().cpu())
+                try:
+                    agg[k] = agg.get(k, 0.0) + float(v.detach().cpu())
+                except Exception:
+                    continue
             n_batches += 1
 
         if device.type == "cuda":
