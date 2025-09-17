@@ -36,4 +36,4 @@ class CppBotWrapper(BaseAgent):
             mask = np.array(req.mask, dtype=np.uint8)
             a = bot.act(obs, L, mask)
             actions.append(int(a))
-        return np.array(actions, dtype=np.uint8), None, None, []
+        return np.array(actions, dtype=np.uint8), None, None

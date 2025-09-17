@@ -23,24 +23,57 @@ class PPOVecRolloutManager:
         self.device = device
 
     def _setup_roles(self,
-                     batch_size: int,
-                     num_players: int,
-                     training_policy_id: int = 0,
-                     opponent_pool: List[int] = None) -> List[List[int]]:
+                 batch_size: int,
+                 num_players: int,
+                 training_policy_id: int = 0,
+                 opponent_pool: List[int] = None) -> List[List[int]]:
         if opponent_pool is None:
             opponent_pool = [0]
+
+        BOT_MAX_ID   = 6
+        LATEST_K     = 4
+        MIX_P_BOTS   = 0.40
+        MIX_P_LATEST = 0.50  # remainder goes to shadow
+
+        # Partition pool
+        bots    = [i for i in opponent_pool if i <= BOT_MAX_ID]
+        frozens = sorted([i for i in opponent_pool if i > BOT_MAX_ID])
+        latest  = frozens[-LATEST_K:] if LATEST_K > 0 else []
+        shadow  = [i for i in frozens if i not in latest]
+
+        # Bucket masses (renormalize if some buckets are empty)
+        masses = {
+            "bots":   MIX_P_BOTS   if bots   else 0.0,
+            "latest": MIX_P_LATEST if latest else 0.0,
+            "shadow": max(0.0, 1.0 - MIX_P_BOTS - MIX_P_LATEST) if shadow else 0.0,
+        }
+        s = masses["bots"] + masses["latest"] + masses["shadow"]
+        if s <= 0.0:
+            probs = np.full(len(opponent_pool), 1.0 / max(1, len(opponent_pool)))
+        else:
+            for k in masses: masses[k] /= s
+            def bucket(x):
+                if x in bots:   return "bots"
+                if x in latest: return "latest"
+                return "shadow"
+            sizes = {"bots": max(1, len(bots)), "latest": max(1, len(latest)), "shadow": max(1, len(shadow))}
+            probs = np.array([masses[bucket(x)] / sizes[bucket(x)] for x in opponent_pool], dtype=np.float64)
+            probs /= probs.sum()
+
         all_env_roles = []
-        for b in range(batch_size):
+        for _ in range(batch_size):
             env_roles = [0 for _ in range(num_players)]
-            num_opponents = num_players - 1
-            chosen = np.random.choice(opponent_pool, size=num_opponents).tolist()
             seats = list(range(num_players))
             np.random.shuffle(seats)
             training_seat = seats.pop()
             env_roles[training_seat] = training_policy_id
+
+            num_opponents = num_players - 1
+            chosen = np.random.choice(opponent_pool, size=num_opponents, replace=True, p=probs).tolist()
             for i in range(num_opponents):
-                env_roles[seats[i]] = chosen[i]
+                env_roles[seats[i]] = int(chosen[i])
             all_env_roles.append(env_roles)
+
         return all_env_roles
 
     def collect_episodes(self,
@@ -107,7 +140,7 @@ class PPOVecRolloutManager:
                     env = self.arena.get_env(int(env_idx))
                     penalties_snapshot.append(int(env.penalties[int(seat)]))
 
-                actions, log_probs, values, beliefs = agent.get_actions_batch(reqs)
+                actions, log_probs, values = agent.get_actions_batch(reqs)
 
                 self.arena.submit_actions(policy_id, actions)
 
@@ -123,7 +156,6 @@ class PPOVecRolloutManager:
                         pending_data[env_idx] = {
                             "log_prob": log_probs[i],
                             "value": values[i],
-                            "belief_preds": beliefs[i],
                             "penalties_used": penalties_snapshot[i],
                         }
 
@@ -161,13 +193,6 @@ class PPOVecRolloutManager:
                         step_idx = len(ep_tracker['data']['our_action']) - 1
                         ep_tracker['data']['log_prob'][step_idx] = data['log_prob']
                         ep_tracker['data']['value'][step_idx] = data['value']
-                        beliefs = data['belief_preds']
-                        if beliefs and len(beliefs) > 0:
-                            ep_tracker['data']['belief_pred0'][step_idx] = beliefs[0]
-                        if beliefs and len(beliefs) > 1:
-                            ep_tracker['data']['belief_pred1'][step_idx] = beliefs[1]
-                        if beliefs and len(beliefs) > 2:
-                            ep_tracker['data']['belief_pred2'][step_idx] = beliefs[2]
                         # save the penalties we snapped pre-step
                         ep_tracker['data']['penalties_used'][step_idx] = int(data['penalties_used'])
                 else:
@@ -195,10 +220,6 @@ class PPOVecRolloutManager:
             step_idx = len(ep_data['our_action']) - 1
             ep_data['log_prob'][step_idx] = data['log_prob']
             ep_data['value'][step_idx]    = data['value']
-            beliefs = data['belief_preds']
-            if beliefs and len(beliefs) > 0: ep_data['belief_pred0'][step_idx] = beliefs[0]
-            if beliefs and len(beliefs) > 1: ep_data['belief_pred1'][step_idx] = beliefs[1]
-            if beliefs and len(beliefs) > 2: ep_data['belief_pred2'][step_idx] = beliefs[2]
             ep_data['penalties_used'][step_idx] = int(data['penalties_used'])
 
         # --- FIX: ROBUST TERMINAL REWARD ASSIGNMENT ---
@@ -246,13 +267,22 @@ class PPOVecRolloutManager:
         training_seats = [s for s, pid in enumerate(roles) if pid == training_policy_id]
         is_training_episode = len(training_seats) > 0
         training_agent_seat = training_seats[0] if is_training_episode else -1
-        opp_seats = sorted([s for s in range(len(roles)) if s != training_agent_seat])
+
+        n_players = len(roles)
+        # Opponent seats in **relative turn order**: next, next+1, next+2
+        if is_training_episode:
+            opp_seats = [ (training_agent_seat + r) % n_players for r in range(1, n_players) ]
+        else:
+            # no training seat this episode — keep all seats in table order
+            opp_seats = list(range(n_players))
+
         player_labels = []
         for seat_idx, pid in enumerate(roles):
             agent = self.policies.get(pid)
             player_labels.append(getattr(agent, 'label', pid))
+
         training_agent_label = player_labels[training_agent_seat] if training_agent_seat != -1 else None
-        true_opp_labels = tuple(player_labels[s] for s in opp_seats)
+        true_opp_labels = tuple(player_labels[s] for s in opp_seats if s != training_agent_seat)
         ep_data = {
             "training_agent_seat": training_agent_seat,
             "training_agent_label": training_agent_label,
@@ -266,9 +296,6 @@ class PPOVecRolloutManager:
             "reward": [],
             "done": [],
             "opp_target_action": [],
-
-            "belief_pred0": [], "belief_pred1": [], "belief_pred2": [],
-            "belief_tgt0": [], "belief_tgt1": [], "belief_tgt2": [],
 
             "penalties_used": [],
 
@@ -297,21 +324,6 @@ class PPOVecRolloutManager:
         ep['reward'].append(0.0)
         ep['done'].append(False)
         ep['opp_target_action'].append(None)
-
-        ep['belief_pred0'].append(None)
-        ep['belief_pred1'].append(None)
-        ep['belief_pred2'].append(None)
-
-        # belief targets only on our steps
-        if agent_seat == ep['training_agent_seat']:
-            tl = ep["true_opponent_labels"]
-            ep['belief_tgt0'].append(tl[0] if len(tl) > 0 else None)
-            ep['belief_tgt1'].append(tl[1] if len(tl) > 1 else None)
-            ep['belief_tgt2'].append(tl[2] if len(tl) > 2 else None)
-        else:
-            ep['belief_tgt0'].append(None)
-            ep['belief_tgt1'].append(None)
-            ep['belief_tgt2'].append(None)
 
         # align penalties_used length with rows; will be filled on our steps
         ep['penalties_used'].append(None)

@@ -64,10 +64,6 @@ def build_opponent_pool(n_players: int):
         "StrategicChallenger":       lambda name, **kw: cpp.StrategicChallenger(name, n_players, kw.get("agent_index", 0)),
     }
     return pool
-
-def create_belief_vector(opponent_types, current_opponents):
-    return [info["name"] for _, info in current_opponents.items()]
-
 def generate_data(
     num_episodes=1000,
     output_dir="./ps_autoreg_data",
@@ -143,7 +139,6 @@ def generate_data(
             step = {
                 "agent_id": AGENT_ID_MAP[player_names[p]],
                 "step": step_no,
-                "belief": create_belief_vector(chosen, current_opponents),
                 "observation": [round(x, 2) for x in obs_train],
             }
 
@@ -188,7 +183,13 @@ def generate_data(
         penalties = {player_names[i]: int(env.penalties[i]) for i in range(num_players)}
         result = 100.0 if win_idx == 0 else (-100.0 if win_idx != -1 else 0.0)
 
-        game_data = {"game_id": episode, "sequence": seq, "game_outcome": {"winner": (player_names[win_idx] if win_idx != -1 else None), "penalties": penalties, "result": result}}
+        opponent_labels = {AGENT_ID_MAP[name]: info["name"] for name, info in current_opponents.items()}
+        game_data = {
+            "game_id": episode,
+            "sequence": seq,
+            "opponent_labels": opponent_labels,
+            "game_outcome": {"winner": (player_names[win_idx] if win_idx != -1 else None), "penalties": penalties, "result": result}
+        }
 
         if win_idx == 0: stats["wins"] += 1
         elif win_idx != -1: stats["losses"] += 1

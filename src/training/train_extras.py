@@ -5,12 +5,16 @@ import numpy as np
 import torch
 from src import config
 import os
+os.environ.setdefault("MPLBACKEND", "Agg")
+import matplotlib
+matplotlib.use("Agg")
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
+import umap.umap_ as umap
 import matplotlib.pyplot as plt
 from io import BytesIO
 from PIL import Image
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Iterable, Union
 
 def set_seed(seed=42):
     """
@@ -160,112 +164,98 @@ def run_obp_inference(obp_model, obs_array, device, num_players, memory_embeddin
         obp_probs.append(bluff_prob)
     return obp_probs
 
-def collect_strategy_embeddings(agents, opponents, embeddings_dict):
-    """
-    Collect strategy embeddings for visualization.
+def _coerce_opponent_input(
+    data: Union[
+        Dict[Any, np.ndarray],                           # {opponent_id: embedding_vec}
+        Tuple[Iterable[Iterable[float]], Iterable[Any]]  # (X, opponent_labels)
+    ]
+) -> Tuple[np.ndarray, list]:
+    """Return (X [N,D], opp_labels [N])."""
+    if isinstance(data, dict):
+        labels, rows = [], []
+        for opp, emb in data.items():
+            labels.append(opp)
+            rows.append(np.asarray(emb, dtype=np.float32))
+        if not rows:
+            return np.empty((0, 2), dtype=np.float32), []
+        return np.stack(rows, axis=0), labels
+    if isinstance(data, tuple) and len(data) == 2:
+        X, labels = data
+        return np.asarray(X, dtype=np.float32), list(labels)
+    raise TypeError("Pass a dict {opponent_id: embedding} OR a tuple (X, opponent_labels).")
 
-    Args:
-        agents: List of agent IDs.
-        opponents: List of opponent IDs/types.
-        embeddings_dict: Dictionary mapping (agent, opponent) tuples to embeddings.
 
-    Returns:
-        X: Array of embeddings.
-        labels: List of (agent, opponent) pairs corresponding to each embedding.
-    """
-    X = []
-    labels = []
-    
-    for agent in agents:
-        for opponent in opponents:
-            if (agent, opponent) in embeddings_dict:
-                X.append(embeddings_dict[(agent, opponent)])
-                labels.append((agent, opponent))
-    
-    return np.array(X), labels
+def visualize_opponent_embeddings(
+    writer,
+    data,                       # dict {opp: emb} OR (X, opp_labels)
+    step: int,
+    method: str = "pca_tsne",   # 'pca_tsne' | 'pca_umap' | 'pca' | 'tsne' | 'umap'
+    pca_dim: int = 50,
+    title_prefix: str = "Opponent Embeddings"
+):
+    # ---- coerce input ----
+    X, opp_labels = _coerce_opponent_input(data)
+    if X.shape[0] < 2:
+        return  # need ≥2 points
 
-REFERENCE_PCA = None
+    N, D = X.shape
 
-def initialize_reference_pca(reference_embeddings):
-    """
-    Initialize the global reference PCA using the provided reference embeddings.
-
-    Args:
-        reference_embeddings (numpy.ndarray): A 2D array of reference embeddings.
-    """
-    global REFERENCE_PCA
-    if REFERENCE_PCA is None:
-        REFERENCE_PCA = PCA(n_components=2)
-        REFERENCE_PCA.fit(reference_embeddings)
-
-def visualize_strategy_embeddings(writer, embeddings_dict, agents, opponents, episode, method='tsne', reference_embeddings=None):
-    """
-    Visualize strategy embeddings using dimensionality reduction.
-    If method is 'pca', a fixed PCA transform is computed from reference_embeddings.
-    The legend is placed outside the plot.
-
-    Args:
-        writer: TensorBoard writer.
-        embeddings_dict (dict): Mapping (agent, opponent) -> embedding (numpy array).
-        agents (list): List of agent IDs.
-        opponents (list): List of opponent IDs/types.
-        episode (int): Current episode number.
-        method (str): 'pca' or 'tsne'.
-        reference_embeddings (numpy.ndarray): 2D array of embeddings for initializing PCA.
-    """
-    X, labels = collect_strategy_embeddings(agents, opponents, embeddings_dict)
-    if len(X) < 2:
-        return  # Need at least 2 points
-
-    if method == 'pca':
-        if reference_embeddings is None:
-            raise ValueError("Reference embeddings must be provided for PCA.")
-        initialize_reference_pca(reference_embeddings)
-        X_2d = REFERENCE_PCA.transform(X)
+    # ---- optional PCA pre-step for mixed methods ----
+    use_pca_prefix = method in ("pca_tsne", "pca_umap")
+    if use_pca_prefix:
+        d = int(max(2, min(pca_dim, D, N - 1)))  # safe for small N
+        X_low = PCA(n_components=d, random_state=0).fit_transform(X)
     else:
-        reducer = TSNE(n_components=2, perplexity=min(30, len(X)-1) if len(X) > 1 else 1)
-        X_2d = reducer.fit_transform(X)
+        X_low = X
+
+    # ---- final 2D reducer ----
+    if method in ("pca_tsne", "tsne"):
+        perplexity = max(5, min(30, N - 1))
+        reducer = TSNE(n_components=2, perplexity=perplexity, init="pca",
+                       learning_rate="auto", random_state=0)
+        X_2d = reducer.fit_transform(X_low)
+        method_name = "PCA→t-SNE" if method == "pca_tsne" else "t-SNE"
+
+    elif method in ("pca_umap", "umap"):
+        reducer = umap.UMAP(n_components=2, n_neighbors=min(15, N-1), min_dist=0.1,
+                            metric="cosine", random_state=0, n_jobs=1)
+        X_2d = reducer.fit_transform(X_low)
+        method_name = "PCA→UMAP" if method == "pca_umap" else "UMAP"
+
+    elif method == "pca":
+        X_2d = PCA(n_components=2, random_state=0).fit_transform(X)
+        method_name = "PCA"
+
+    else:
+        raise ValueError(f"Unknown method '{method}'. Use 'pca_tsne', 'pca_umap', 'pca', 'tsne', or 'umap'.")
+
+    # ---- styling: color per opponent ----
+    uniq_opps = sorted(set(opp_labels), key=lambda x: str(x))
+    colors = plt.cm.rainbow(np.linspace(0, 1, max(1, len(uniq_opps))))
+    color_map = {o: colors[i % len(colors)] for i, o in enumerate(uniq_opps)}
 
     plt.figure(figsize=(10, 8))
-    # Instead of unsorted sets, we use sorted lists so the ordering is consistent.
-    unique_agents = sorted(set(label[0] for label in labels))
-    unique_opponents = sorted(set(label[1] for label in labels))
-    
-    colors = plt.cm.rainbow(np.linspace(0, 1, len(unique_agents)))
-    markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'h', 'H', '+', 'x', '|', '_']
-    agent_to_color = {agent: colors[i] for i, agent in enumerate(unique_agents)}
-    opponent_to_marker = {opponent: markers[i % len(markers)] for i, opponent in enumerate(unique_opponents)}
+    for (x, y), opp in zip(X_2d, opp_labels):
+        plt.scatter(x, y, color=color_map.get(opp, "black"), s=60, alpha=0.9)
 
-    for (agent, opponent), point in zip(labels, X_2d):
-        plt.scatter(point[0], point[1], color=agent_to_color[agent],
-                    marker=opponent_to_marker[opponent], s=100)
+    legend_handles = [plt.Line2D([0],[0], marker='o', color='w',
+                          markerfacecolor=color_map[o], markersize=8,
+                          label=f'Opp {o}') for o in uniq_opps]
+    plt.legend(handles=legend_handles, bbox_to_anchor=(1.02, 1),
+               loc='upper left', borderaxespad=0.)
+    plt.subplots_adjust(right=0.78)
 
-    agent_patches = [plt.Line2D([0], [0], marker='o', color='w',
-                      markerfacecolor=agent_to_color[agent], markersize=10,
-                      label=f'Agent {agent}') for agent in unique_agents]
-    opponent_patches = [plt.Line2D([0], [0], marker=opponent_to_marker[opponent],
-                         color='black', markersize=10,
-                         label=f'Opponent {opponent}') for opponent in unique_opponents]
-    
-    plt.legend(handles=agent_patches + opponent_patches,
-               bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
-    plt.subplots_adjust(right=0.7)
-    
-    plt.title(f'Strategy Embeddings ({method.upper()}) - Episode {episode}')
-    plt.xlabel('Component 1')
-    plt.ylabel('Component 2')
-    plt.grid(True, linestyle='--', alpha=0.7)
-    
-    from io import BytesIO
-    from PIL import Image
+    plt.title(f'{title_prefix} — {method_name} — step {step}')
+    plt.xlabel('Dim 1'); plt.ylabel('Dim 2')
+    plt.grid(True, linestyle='--', alpha=0.35)
+
+    # ---- to TensorBoard ----
     buf = BytesIO()
-    plt.savefig(buf, format='png')
+    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
     buf.seek(0)
     image = Image.open(buf)
-    image_array = np.array(image)
-    writer.add_image(f'Strategy_Embeddings_{method.upper()}', image_array, episode, dataformats='HWC')
+    writer.add_image(f'Embeddings/{method_name}', np.array(image), step, dataformats='HWC')
     plt.close()
-
 
 EPS_CLIP          = float(getattr(config, "EPS_CLIP", 0.2))
 ENT_COEF          = float(getattr(config, "INIT_ENTROPY_COEF", 0.005))
@@ -383,13 +373,12 @@ def ppo_losses_batched(
     old_logp = batch["old_logp"].float()  # [B, T]
     rewards = batch["rewards"].float()    # [B, T]
 
-    outs = model(**mi)
+    outs = model(**{**mi, "return_embeddings": True})
     action_logits = outs[0]                                # [B, L, A]
     opp_logits    = outs[1] if len(outs) > 1 else None     # [B, L, A] or None
     values_full   = outs[2].squeeze(-1).to(torch.float32)  # [B, L]
-    b0 = outs[3] if len(outs) > 3 else None                # [B, L, C0] or None
-    b1 = outs[4] if len(outs) > 4 else None
-    b2 = outs[5] if len(outs) > 5 else None
+    b0            = outs[3]                                # [B, L, D]
+    belief_tokens = outs[4] if len(outs) > 4 else None     # [B, L, D]
 
     B, T = our_idx.shape
     A = action_logits.size(-1)
@@ -543,64 +532,125 @@ def ppo_losses_batched(
     else:
         metrics["bc_kl"] = torch.zeros((), device=logits_at.device)
 
-    # ---- Aux: belief heads (batched, masked; -100 ignored) ----
-    def _belief_aux(b_logits: Optional[torch.Tensor],
-                    tgt: Optional[torch.Tensor],
-                    msk: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        if b_logits is None or tgt is None or msk is None or not msk.any():
-            z = torch.zeros((), device=values_full.device)
-            return z, z
-        C = b_logits.size(-1)
-        b_sel = b_logits.gather(1, our_idx.unsqueeze(-1).expand(-1, -1, C))
+    # =========================
+    # Shared opponent timeline
+    # =========================
+    opp_idx        = batch.get("opp_idx", None)            # [B, To]
+    opp_targets    = batch.get("opp_targets", None)        # [B, To]
+    opp_have_label = batch.get("opp_have_label", None)     # [B, To]
+    device = values_full.device
+
+    # ---- Aux: single detached belief head on OPPONENT tokens ----
+    belief_idx  = batch.get("belief_idx", None)   # [B, To]
+    belief_tgt  = batch.get("belief_tgt", None)   # [B, To], -100 ignored
+    belief_have = batch.get("belief_have", None)  # [B, To] bool
+
+    belief_loss = torch.zeros((), device=device)
+    belief_acc  = torch.zeros((), device=device)
+
+    # 'b0' is the single belief head logits tensor returned in outputs[3] (shape [B, L, C])
+    if (AUX_BELIEF_WEIGHT > 0.0) and ("belief_idx" in batch) and (b0 is not None):
+        B_, L_, C_ = b0.shape
+        # gather logits at belief_idx -> [B, To, C]
+        b_sel = b0.gather(1, belief_idx.unsqueeze(-1).expand(-1, -1, C_))
+
         ce = torch.nn.functional.cross_entropy(
-            b_sel.flatten(0,1), tgt.view(-1),
+            b_sel.reshape(-1, C_), belief_tgt.reshape(-1),
             ignore_index=-100, reduction="none"
-        ).view(B, T)
-        valid = (tgt != -100) & msk & our_mask
-        w = valid.to(ce.dtype)
-        loss = (ce * w).sum() / w.sum().clamp_min(1.0)
-        with torch.no_grad():
-            pred = b_sel.argmax(dim=-1)
-            acc = ( ((pred == tgt) & valid).sum().to(torch.float32) /
-                    valid.sum().clamp_min(1) )
-        return loss, acc
+        ).view_as(belief_tgt)
 
-    b0_loss, acc0 = _belief_aux(b0, batch.get("belief_tgt0"), batch.get("belief0_mask"))
-    b1_loss, acc1 = _belief_aux(b1, batch.get("belief_tgt1"), batch.get("belief1_mask"))
-    b2_loss, acc2 = _belief_aux(b2, batch.get("belief_tgt2"), batch.get("belief2_mask"))
-    belief_loss = b0_loss + b1_loss + b2_loss
-    if AUX_BELIEF_WEIGHT > 0.0:
+        w = belief_have.to(ce.dtype)  # weight by availability
+        if w.sum() > 0:
+            belief_loss = (ce * w).sum() / w.sum().clamp_min(1.0)
+            with torch.no_grad():
+                pred = b_sel.argmax(dim=-1)
+                belief_acc = (((pred == belief_tgt) & belief_have).sum().to(torch.float32)
+                            / belief_have.sum().clamp_min(1))
+
         total = total + AUX_BELIEF_WEIGHT * belief_loss
-    metrics["belief_loss"] = belief_loss.detach()
-    metrics["belief_acc_0"] = acc0.detach()
-    metrics["belief_acc_1"] = acc1.detach()
-    metrics["belief_acc_2"] = acc2.detach()
 
-    # ---- Aux: opponent action supervision (NO masking; -100 ignored) ----
-    opp_loss = torch.zeros((), device=values_full.device)
-    opp_acc  = torch.zeros((), device=values_full.device)
-    if AUX_OPP_WEIGHT > 0.0 and (opp_logits is not None) and ("opp_idx" in batch):
-        if batch["opp_idx"].numel() > 0:
-            To = batch["opp_idx"].size(1)
-            A_opp = opp_logits.size(-1)
-            opp_sel = opp_logits.gather(
-                1, batch["opp_idx"].unsqueeze(-1).expand(-1, -1, A_opp)
-            )
+    metrics["belief_loss"] = belief_loss.detach()
+    metrics["belief_acc"]  = belief_acc.detach()
+
+    # ---- Aux: opponent action supervision (re-use opp_idx/targets/mask) ----
+    opp_loss = torch.zeros((), device=device)
+    opp_acc  = torch.zeros((), device=device)
+    if AUX_OPP_WEIGHT > 0.0 and (opp_logits is not None) and (opp_idx is not None):
+        if opp_idx.numel() > 0:
+            B, L, A_opp = opp_logits.shape
+            To = opp_idx.size(1)
+            opp_sel = opp_logits.gather(1, opp_idx.unsqueeze(-1).expand(-1, -1, A_opp))  # [B, To, A]
             ce_opp = torch.nn.functional.cross_entropy(
-                opp_sel.flatten(0,1), batch["opp_targets"].view(-1),
+                opp_sel.reshape(-1, A_opp),
+                opp_targets.view(-1) if opp_targets is not None else torch.full((B*To,), -100, device=device, dtype=torch.long),
                 ignore_index=-100, reduction="none"
             ).view(B, To)
-            w = batch["opp_have_label"].to(ce_opp.dtype)
-            if w.sum() > 0:
-                opp_loss = (ce_opp * w).sum() / w.sum().clamp_min(1.0)
-                with torch.no_grad():
-                    pred = opp_sel.argmax(dim=-1)
-                    corr = ((pred == batch["opp_targets"]) & batch["opp_have_label"]).sum().to(torch.float32)
-                    opp_acc = corr / batch["opp_have_label"].sum().clamp_min(1)
+
+            if opp_have_label is not None:
+                w = opp_have_label.to(ce_opp.dtype)
+                if w.sum() > 0:
+                    opp_loss = (ce_opp * w).sum() / w.sum().clamp_min(1.0)
+                    with torch.no_grad():
+                        pred = opp_sel.argmax(dim=-1)
+                        corr = ((pred == opp_targets) & opp_have_label).sum().to(torch.float32)
+                        opp_acc = corr / opp_have_label.sum().clamp_min(1).to(torch.float32)
+
     if AUX_OPP_WEIGHT > 0.0:
         total = total + AUX_OPP_WEIGHT * opp_loss
-    metrics["opp_loss"] = opp_loss.detach()
-    metrics["opp_action_acc"] = opp_acc.detach()
+    metrics["opp_loss"]        = opp_loss.detach()
+    metrics["opp_action_acc"]  = opp_acc.detach()
+
+    # ---- Per-opponent embeddings using belief_tgt (one vector per opponent per episode) ----
+    # Add this block AFTER the opponent action supervision section, before `return total, metrics`.
+    if (belief_tokens is not None) and (belief_idx is not None) and (belief_tgt is not None):
+        with torch.no_grad():
+            device = belief_tokens.device
+            B, L, D = belief_tokens.shape
+
+            idx   = batch["belief_idx"].to(device).long().clamp_min(0)        # [B, To]
+            lbl   = batch["belief_tgt"].to(device).long()                      # [B, To]  (opponent id on their turn)
+            have  = batch.get("belief_have", torch.ones_like(idx, dtype=torch.bool)).to(device)
+
+            # token-level belief features at those opponent steps
+            tok = belief_tokens.gather(1, idx.unsqueeze(-1).expand(-1, -1, D))  # [B, To, D]
+
+            # which seat acted at those steps? (1/2/3 = opponents, 0 = self)
+            seats = mi["agent_types"].to(device).long().gather(1, idx)         # [B, To]
+
+            # valid opponent tokens
+            valid = have & (seats > 0) & (batch["belief_idx"].to(device) >= 0)
+
+            E_list, L_list, C_list = [], [], []
+            for s in (1, 2, 3):
+                m = (seats == s) & valid                                       # [B, To]
+                w = m.float().unsqueeze(-1)                                     # [B, To, 1]
+
+                # mean embedding over this opponent's tokens
+                Es = (tok * w).sum(1) / w.sum(1).clamp_min(1e-6)                # [B, D]
+
+                # label per opponent: since lbl is constant per seat, average then round
+                Ls = ((lbl.float() * m.float()).sum(1) / m.float().sum(1).clamp_min(1)).round().long()  # [B]
+                counts = m.float().sum(1)                                      # opponent steps contributing to the mean
+
+                # mark empty seats
+                empty = (counts == 0)
+                Es[empty] = float('nan')
+                Ls[empty] = -1
+
+                E_list.append(Es)
+                L_list.append(Ls)
+                C_list.append(counts)
+
+            E = torch.stack(E_list, dim=1)                                      # [B, 3, D]
+            L = torch.stack(L_list, dim=1)                                      # [B, 3]
+            C = torch.stack(C_list, dim=1)                                      # [B, 3]
+
+            # hand back to caller for logging/visualization
+            metrics["opp_embeds_batch"] = (
+                E.detach().cpu().float().numpy(),   # [B,3,D]
+                L.detach().cpu().numpy(),           # [B,3]
+                C.detach().cpu().float().numpy(),   # [B,3]
+            )
 
     return total, metrics
 
@@ -728,48 +778,44 @@ def _collate_batch(
     T  = max((int(x.numel()) for x in our_pos_lists), default=0)
     To = max((int(x.numel()) for x in opp_pos_lists), default=0)
 
-    # -------- allocate supervision tensors (CPU) --------
+    # -------- allocate supervision tensors (CPU) -------- 
     def _pm(x: torch.Tensor) -> torch.Tensor:
         return x.pin_memory() if pin_memory else x
 
     our_idx    = _pm(torch.zeros((B, T),  dtype=torch.long))
-    # --- FIX: PRECISE MASKING BASED ON LOGGED DATA ---
     our_mask   = _pm(torch.zeros((B, T),  dtype=torch.bool))
     actions    = _pm(torch.full((B, T), IGN, dtype=torch.long))
     old_logp   = _pm(torch.zeros((B, T),  dtype=torch.float32))
     rewards    = _pm(torch.zeros((B, T),  dtype=torch.float32))
     pen_used   = _pm(torch.zeros((B, T),  dtype=torch.long))
 
-    belief_tgt0 = _pm(torch.full((B, T), IGN, dtype=torch.long))
-    belief_tgt1 = _pm(torch.full((B, T), IGN, dtype=torch.long))
-    belief_tgt2 = _pm(torch.full((B, T), IGN, dtype=torch.long))
-    belief0_mask = _pm(torch.zeros((B, T), dtype=torch.bool))
-    belief1_mask = _pm(torch.zeros((B, T), dtype=torch.bool))
-    belief2_mask = _pm(torch.zeros((B, T), dtype=torch.bool))
+    # Belief targets at opponent tokens (filled on opponent turns)
+    belief_idx   = _pm(torch.zeros((B, To), dtype=torch.long))
+    belief_tgt   = _pm(torch.full((B, To), IGN, dtype=torch.long))
+    belief_have  = _pm(torch.zeros((B, To), dtype=torch.bool))
 
+    # Opponent action supervision (unchanged)
     opp_idx        = _pm(torch.zeros((B, To),  dtype=torch.long))
     opp_targets    = _pm(torch.full((B, To), IGN, dtype=torch.long))
     opp_have_label = _pm(torch.zeros((B, To),  dtype=torch.bool))
 
     # -------- fill from episodes (only real steps) --------
     for b, ep in enumerate(episodes):
-        # OUR timeline
+        # ===== OUR timeline (unchanged) =====
         our_pos = our_pos_lists[b]
         K = int(our_pos.numel())
-
         our_ep_idx = [i for i, seat in enumerate(ep["agent_id"]) if seat == ep["training_agent_seat"]]
 
         for t_local in range(min(T, K)):
             if t_local >= len(our_ep_idx):
                 break
             step_ep = our_ep_idx[t_local]
-
             lp = ep["log_prob"][step_ep] if step_ep < len(ep["log_prob"]) else None
             if lp is None:
-                continue  # Do not mark this step as valid for training.
+                continue
 
             our_mask[b, t_local] = True
-            our_idx[b, t_local] = our_pos[t_local]
+            our_idx[b, t_local]  = our_pos[t_local]
 
             a  = ep["our_action"][step_ep] if step_ep < len(ep["our_action"]) else None
             rw = ep["reward"][step_ep]     if step_ep < len(ep["reward"])     else 0.0
@@ -781,28 +827,41 @@ def _collate_batch(
             rewards[b, t_local]  = float(rw)
             pen_used[b, t_local] = int(pu)
 
-            lb0 = ep.get("belief_tgt0", [None]*len(ep["agent_id"]))[step_ep]
-            lb1 = ep.get("belief_tgt1", [None]*len(ep["agent_id"]))[step_ep]
-            lb2 = ep.get("belief_tgt2", [None]*len(ep["agent_id"]))[step_ep]
-            if lb0 is not None: belief_tgt0[b, t_local] = int(lb0); belief0_mask[b, t_local] = True
-            if lb1 is not None: belief_tgt1[b, t_local] = int(lb1); belief1_mask[b, t_local] = True
-            if lb2 is not None: belief_tgt2[b, t_local] = int(lb2); belief2_mask[b, t_local] = True
+        # ===== OPP timeline =====
+    opp_pos = opp_pos_lists[b]
+    M = int(opp_pos.numel())
+    M_fill = min(To, M)
+    if M_fill > 0:
+        opp_idx[b, :M_fill] = opp_pos[:M_fill]
 
-        # OPP timeline (labels optional)
-        opp_pos = opp_pos_lists[b]
-        M = int(opp_pos.numel())
-        M_fill = min(To, M)
-        if M_fill > 0:
-            opp_idx[b, :M_fill] = opp_pos[:M_fill]
-            opp_ep_idx = [i for i, seat in enumerate(ep["agent_id"]) if seat != ep["training_agent_seat"]]
-            for t_local in range(M_fill):
-                if t_local >= len(opp_ep_idx):
-                    break
-                step_ep = opp_ep_idx[t_local]
-                tgt = ep.get("opp_target_action", [None]*len(ep["agent_id"]))[step_ep]
-                if tgt is not None:
-                    opp_targets[b, t_local] = int(tgt)
-                    opp_have_label[b, t_local] = True
+        # Episode metadata we already saved
+        player_labels = tuple(ep.get("player_labels", ()))  # absolute seat -> label
+        agent_id_seq  = ep["agent_id"]                      # per-step absolute seat index
+
+        # Indices of opponent steps in episode timeline
+        opp_ep_idx = [i for i, seat in enumerate(agent_id_seq) if seat != ep.get("training_agent_seat", -1)]
+
+        for t_local in range(M_fill):
+            if t_local >= len(opp_ep_idx):
+                break
+            step_ep = opp_ep_idx[t_local]
+
+            # Opponent action supervision (unchanged)
+            tgt = ep.get("opp_target_action", [None]*len(agent_id_seq))[step_ep]
+            if tgt is not None:
+                opp_targets[b, t_local] = int(tgt)
+                opp_have_label[b, t_local] = True
+
+            # ---- Belief supervision ON THE SAME OPPONENT TOKEN ----
+            t_global = int(opp_pos[t_local].item())
+            belief_idx[b, t_local] = t_global
+
+            seat_acting = int(agent_id_seq[step_ep])  # absolute seat at this step
+            if 0 <= seat_acting < len(player_labels):
+                lbl = player_labels[seat_acting]
+                if lbl is not None:
+                    belief_tgt[b, t_local]  = int(lbl)
+                    belief_have[b, t_local] = True
 
     return {
         "mi": mi_batch,
@@ -814,10 +873,13 @@ def _collate_batch(
         "penalties_used": pen_used,
         "our_action_mask": our_action_mask,
 
-        "belief_tgt0": belief_tgt0, "belief_tgt1": belief_tgt1, "belief_tgt2": belief_tgt2,
-        "belief0_mask": belief0_mask, "belief1_mask": belief1_mask, "belief2_mask": belief2_mask,
+        "belief_idx":  belief_idx,
+        "belief_tgt":  belief_tgt,
+        "belief_have": belief_have,
 
-        "opp_idx": opp_idx, "opp_targets": opp_targets, "opp_have_label": opp_have_label,
+        "opp_idx":        opp_idx,
+        "opp_targets":    opp_targets,
+        "opp_have_label": opp_have_label,
     }
 
 def _to_device_batch(batch_cpu: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
@@ -826,20 +888,21 @@ def _to_device_batch(batch_cpu: Dict[str, Any], device: torch.device) -> Dict[st
     oam = batch_cpu.get("our_action_mask", None)
     oam_dev = oam.to(device, non_blocking=True) if (oam is not None) else None
     out = {
-        "mi": mi_dev,
-        "our_idx":        batch_cpu["our_idx"].to(device, non_blocking=True),
-        "mask":           batch_cpu["mask"].to(device, non_blocking=True),
-        "actions":        batch_cpu["actions"].to(device, non_blocking=True),
-        "old_logp":       batch_cpu["old_logp"].to(device, non_blocking=True),
-        "rewards":        batch_cpu["rewards"].to(device, non_blocking=True),
-        "penalties_used": batch_cpu["penalties_used"].to(device, non_blocking=True),
+        "mi":              mi_dev,
+        "our_idx":         batch_cpu["our_idx"].to(device, non_blocking=True),
+        "mask":            batch_cpu["mask"].to(device, non_blocking=True),
+        "actions":         batch_cpu["actions"].to(device, non_blocking=True),
+        "old_logp":        batch_cpu["old_logp"].to(device, non_blocking=True),
+        "rewards":         batch_cpu["rewards"].to(device, non_blocking=True),
+        "penalties_used":  batch_cpu["penalties_used"].to(device, non_blocking=True),
         "our_action_mask": oam_dev,
-        "belief_tgt0":    batch_cpu["belief_tgt0"].to(device, non_blocking=True),
-        "belief_tgt1":    batch_cpu["belief_tgt1"].to(device, non_blocking=True),
-        "belief_tgt2":    batch_cpu["belief_tgt2"].to(device, non_blocking=True),
-        "belief0_mask":   batch_cpu["belief0_mask"].to(device, non_blocking=True),
-        "belief1_mask":   batch_cpu["belief1_mask"].to(device, non_blocking=True),
-        "belief2_mask":   batch_cpu["belief2_mask"].to(device, non_blocking=True),
+
+        # NEW single-head belief supervision
+        "belief_idx":  batch_cpu["belief_idx"].to(device, non_blocking=True),
+        "belief_tgt":  batch_cpu["belief_tgt"].to(device, non_blocking=True),
+        "belief_have": batch_cpu["belief_have"].to(device, non_blocking=True),
+
+        # Opponent action supervision
         "opp_idx":        batch_cpu["opp_idx"].to(device, non_blocking=True),
         "opp_targets":    batch_cpu["opp_targets"].to(device, non_blocking=True),
         "opp_have_label": batch_cpu["opp_have_label"].to(device, non_blocking=True),

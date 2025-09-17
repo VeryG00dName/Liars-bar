@@ -70,6 +70,7 @@ class PPOFusedModel(nn.Module):
             nn.Linear(hidden_dim, hidden_dim)
         )
 
+        self.belief_head = nn.Linear(hidden_dim, belief_dim)
         # === Fused Policy and Value Heads ===
         # The input is the main hidden_dim PLUS the intermediate belief_hidden dim.
         fused_input_dim = hidden_dim + hidden_dim
@@ -105,41 +106,41 @@ class PPOFusedModel(nn.Module):
                     self.position_embedding(positions))
         return combined
 
-    def forward(self, obs_sequence, action_sequence, agent_types, positions, action_masks, padding_mask, **kwargs):
+    def forward(
+        self,
+        obs_sequence, action_sequence, agent_types, positions,
+        action_masks, padding_mask,
+        *,                               # make extra args keyword-only
+        return_embeddings: bool = False,
+        **kwargs
+    ):
         encoded_inputs = self._encode_inputs(obs_sequence, action_sequence, agent_types, positions, padding_mask)
         T = encoded_inputs.size(1)
         causal_mask = self.causal_bool_mask_full[:T, :T]
-        
         transformer_output = self.transformer(
             encoded_inputs, mask=causal_mask,
             src_key_padding_mask=padding_mask.bool() if padding_mask is not None else None,
             is_causal=True,
         )
-        
-        # The intermediate representation used for both belief and fusion
-        belief_hidden = self.belief_fc(transformer_output) # Shape: [B, T, D_hidden]
 
-        # --- Step 2: Fuse Belief Information with Transformer Output ---
-        fused_representation = torch.cat([transformer_output, belief_hidden], dim=-1) # Shape: [B, T, 2 * D_hidden]
-
-        # --- Step 3: Policy and Value Heads on Fused Representation ---
+        # belief_hidden drives opponent head
+        belief_hidden = self.belief_fc(transformer_output)            # [B,T,D]
+        fused_representation = torch.cat([transformer_output, belief_hidden], dim=-1)
         pv_features = self.policy_value_feature_extractor(fused_representation)
-        action_logits = self.action_head(pv_features)
-        opp_logits = self.opp_action_head(belief_hidden)
-        state_values = self.value_head(pv_features)
-
-        # --- Step 4: Apply Action Mask ---
+        action_logits = self.action_head(pv_features)                  # [B,T,7]
+        opp_logits    = self.opp_action_head(belief_hidden)           # [B,T,7]
+        state_values  = self.value_head(pv_features)                  # [B,T,1]
+        belief_logits = self.belief_head(belief_hidden.detach())   # [B,T,belief_dim]
         LARGE_NEG = torch.finfo(action_logits.dtype).min / 4.0
         if action_masks is not None:
-            our_turns = (agent_types == 0).unsqueeze(-1)
+            our_turns = (agent_types == 0).unsqueeze(-1)              # [B,T,1]
             invalid = (~action_masks.bool()) & our_turns
             action_logits = action_logits.masked_fill(invalid, LARGE_NEG)
 
-        # Return belief logits for the 3 opponents, split for the loss function
-        return (action_logits, opp_logits, state_values,
-                None,
-                None,
-                None)
+        if return_embeddings:
+            return (action_logits, opp_logits, state_values, belief_logits, belief_hidden.detach())
+        else:
+            return (action_logits, opp_logits, state_values, belief_logits)
 
     # ===== Convenience helpers for planning & challenge evaluation =====
 

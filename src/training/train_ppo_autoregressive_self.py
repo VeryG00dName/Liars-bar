@@ -10,7 +10,7 @@ import random
 import numpy as np
 import argparse
 from collections import deque, defaultdict
-
+import math
 # Quiet Torch compile logs
 os.environ.pop("TORCH_LOGS", None)           # disable extra compile logs
 os.environ.setdefault("TORCHDYNAMO_VERBOSE", "0")
@@ -32,7 +32,7 @@ from src.model.ppo_fused_model import PPOFusedModel
 from src.agents.batch_autoregressive_ppo_agent import BatchPPOAutoregressiveAgent
 from src.agents.cpp_bot_wrapper import CppBotWrapper
 from src.training.vec_ppo_rollout import PPOVecRolloutManager
-from src.training.train_extras import _collate_batch, _to_device_batch, ppo_losses_batched
+from src.training.train_extras import _collate_batch, _to_device_batch, ppo_losses_batched, visualize_opponent_embeddings
 
 def _silence_torch_symbolic_logs():
     for name in ("torch.fx.experimental.symbolic_shapes", "torch._dynamo.symbolic_shapes", "torch._dynamo", "torch._inductor"):
@@ -139,19 +139,19 @@ def _clone_agent_from_agent(src_agent: BatchPPOAutoregressiveAgent, device: torc
     # Read construction args from the source model
     obs_dim = getattr(src_model, "obs_dim")
     action_dim = getattr(src_model, "action_dim", 7)
-    belief_dim = getattr(src_model, "belief_dim", 64)
+    #belief_dim = getattr(src_model, "belief_dim", 64)
     hidden_dim = getattr(src_model, "hidden_dim", 256)
     max_seq_length = getattr(src_model, "max_seq_length", 256)
 
     # num_heads is not stored publicly; infer from transformer layer
     encoder_layer = src_model.transformer.layers[0]
-    num_heads = encoder_layer.self_attn.num_heads if hasattr(encoder_layer.self_attn, 'num_heads') else 4
+    num_heads = encoder_layer.self_attn.num_heads if hasattr(encoder_layer.self_attn, 'num_heads') else hidden_dim//64
 
     # Instantiate a fresh model with identical shape
     new_model = PPOFusedModel(
         obs_dim=obs_dim,
         action_dim=action_dim,
-        belief_dim=belief_dim,
+        belief_dim=64,
         hidden_dim=hidden_dim,
         num_heads=num_heads,
         max_seq_length=max_seq_length,
@@ -231,13 +231,23 @@ def train_generation(
                 agent_cache[cache_key] = base_agent  # keep a copy of the base
             learner = _clone_agent_from_agent(base_agent, device)
     else:
-        # Ensure learner is on the correct device and compiled
+        # Ensure learner is on the correct device
         learner.model = learner.model.to(device)
         
     learner.model.train()
-    
-    optimizer = torch.optim.AdamW(learner.model.parameters(), lr=float(config.LEARNING_RATE))
+
+    all_params = list(learner.model.parameters())
+    optimizer = torch.optim.AdamW(all_params, lr=float(config.LEARNING_RATE))
     scaler = amp.GradScaler(enabled=(device.type == "cuda"))
+
+    if hasattr(learner.model, "belief_head"):
+        belief_head_params = list(learner.model.belief_head.parameters())
+    else:
+        belief_head_params = []
+    belief_param_ids = {id(p) for p in belief_head_params}
+    # Keep belief-head gradients isolated so the probe loss never triggers clipping on the main policy/value stack.
+    non_belief_params = [p for p in all_params if id(p) not in belief_param_ids]
+    belief_max_norm = float(getattr(config, "BELIEF_MAX_NORM", config.MAX_NORM))
     
     # Build unified policy map: include C++ bot wrappers for labels 0..6,
     # historical AI agents at their stored labels (>=7), and the current learner.
@@ -326,6 +336,8 @@ def train_generation(
         learner.model.train()
         agg = {"total_loss": 0.0}
         n_batches = 0
+        opp_rows_X = []  # list of np.ndarray chunks, each [N_i, D]
+        opp_rows_L = []  # flat list of labels aligned with rows in opp_rows_X
         for _ in range(k_epochs):
             batch_eps = random.sample(ep_buffer, min(len(ep_buffer), episodes_per_update))
             if not batch_eps: continue
@@ -338,7 +350,11 @@ def train_generation(
                 total_loss, metrics = ppo_losses_batched(learner.model, batch_gpu, sl_teacher=None)
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
-            clip_grad_norm_(learner.model.parameters(), max_norm=float(config.MAX_NORM))
+            # Clip the core model separately so belief-head spikes cannot shrink its update.
+            if non_belief_params:
+                clip_grad_norm_(non_belief_params, max_norm=float(config.MAX_NORM))
+            if belief_head_params:
+                clip_grad_norm_(belief_head_params, max_norm=belief_max_norm)
             scaler.step(optimizer)
             scaler.update()
             # Aggregate metrics
@@ -349,6 +365,20 @@ def train_generation(
                 except Exception:
                     pass
             n_batches += 1
+            # --- ADD: collect per-opponent embeddings from this batch, if present ---
+            emb = metrics.get("opp_embeds_batch", None)
+            if emb is not None:
+                E_np, L_np = emb                      # E_np: [B,3,D], L_np: [B,3] or None
+                B3, D = (E_np.shape[0] * E_np.shape[1], E_np.shape[2])
+                Xb = E_np.reshape(B3, D)              # [B*3, D]
+                good = ~np.isnan(Xb).any(axis=1)      # drop seats with no valid tokens
+                Xb = Xb[good]
+                if L_np is not None:
+                    Lb = L_np.reshape(B3)[good].tolist()
+                else:
+                    Lb = [None] * int(good.sum())
+                opp_rows_X.append(Xb)
+                opp_rows_L.extend(Lb)
 
         t_opt_end = time.time()
         # Timings
@@ -396,17 +426,29 @@ def train_generation(
             if total > 0:
                 writer.add_scalar(f"PerOpponent/win_rate_vs_{label}", wins_vs / total, update)
                 writer.add_scalar(f"PerOpponent/episodes_vs_{label}", total, update)
-        bots_only_count = sum(1 for ep in new_eps if (lbls := {l for l in ep.get("true_opponent_labels", ()) if l is not None}) and all(l <= 6 for l in lbls))
-        writer.add_scalar("PerOpponent/BotsOnlyEpisodes", bots_only_count, update)
         writer.add_scalar("Buffer/Size", len(ep_buffer), update)
         writer.add_scalar("Acc/OpponentAction", avg.get("opp_action_acc", 0.0), update)
-        writer.add_scalar("Acc/Belief0", avg.get("belief_acc_0", 0.0), update)
-        writer.add_scalar("Acc/Belief1", avg.get("belief_acc_1", 0.0), update)
-        writer.add_scalar("Acc/Belief2", avg.get("belief_acc_2", 0.0), update)
+        writer.add_scalar("Acc/Belief", avg.get("belief_acc", 0.0), update)
         
-        if update >= 100:
-            logging.info(f"{update}. Stopping training for '{run_name} current win_rate: {win_rate:.3f}.")
-            break
+        if (update % 25) == 0 and opp_rows_X:
+            X = np.concatenate(opp_rows_X, axis=0)            # [N, D]
+            labels = opp_rows_L                               # [N] (may contain None)
+            visualize_opponent_embeddings(
+                writer,
+                data=(X, labels),
+                step=update,
+                method="pca_umap",                            # or "pca_tsne" if UMAP not installed
+                title_prefix="Per-Opponent belief_fc"
+            )
+        
+        if run_name == "gen_1":
+            if update >= 300:
+                logging.info(f"{update}. Stopping training for '{run_name} current win_rate: {win_rate:.3f}.")
+                break
+        else:
+            if update >= 100:
+                logging.info(f"{update}. Stopping training for '{run_name} current win_rate: {win_rate:.3f}.")
+                break
 
         if update % int(config.CHECKPOINT_INTERVAL) == 0:
             path = os.path.join(run_ckpt_dir, f"update_{update}.pth")

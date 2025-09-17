@@ -60,10 +60,10 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
             inferred_obs_dim = MFactoryUtil.get_input_dim_from_state_dict(model_state_dict, 'obs_encoder.0')
             inferred_action_dim = MFactoryUtil.get_output_dim_from_state_dict(model_state_dict, 'action_head')
             inferred_hidden_dim = MFactoryUtil.get_hidden_dim_from_state_dict(model_state_dict, 'obs_encoder.0')
-            inferred_belief_dim = MFactoryUtil.get_output_dim_from_state_dict(model_state_dict, 'belief_head_shared')
+            #inferred_belief_dim = MFactoryUtil.get_output_dim_from_state_dict(model_state_dict, 'belief_head_shared')
             inferred_max_seq = model_state_dict.get('position_embedding.weight').shape[0]
 
-            num_heads = 4 # Assume fixed for now, can add inference logic if needed
+            num_heads = inferred_hidden_dim//64
         except Exception as e:
             logger.error(f"Failed to infer dimensions for {self.player_id}: {e}", exc_info=True)
             raise
@@ -74,7 +74,7 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
         self.model = ModelClass(
             obs_dim=inferred_obs_dim,
             action_dim=inferred_action_dim,
-            belief_dim=inferred_belief_dim,
+            belief_dim=64,
             hidden_dim=inferred_hidden_dim,
             num_heads=num_heads,
             max_seq_length=inferred_max_seq,
@@ -204,7 +204,7 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
     def get_actions_batch(self, requests: List[lb.PolicyRequest]):
         B = len(requests)
         if B == 0:
-            return np.array([]), np.array([]), np.array([]), []
+            return np.array([]), np.array([]), np.array([])
 
         device = self.device
         all_obs, all_actions, all_agents, all_pos = [], [], [], []
@@ -256,7 +256,7 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
             'padding_mask':    padding_mask,
             'valid_lengths':   valid_lengths_t,
         }
-        action_logits, _, state_values, b0, b1, b2 = self.model(**model_input)
+        action_logits, _, state_values, _ = self.model(**model_input)
 
         rows = torch.arange(B, device=device)
         last_idx = (valid_lengths_t - 1).clamp_min(0)
@@ -271,28 +271,10 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
         actions_t   = dist.sample()
         log_probs_t = dist.log_prob(actions_t).to(torch.float32)
 
-        beliefs_out = []
-        if b0 is not None:
-            b0_last = torch.argmax(b0[rows, last_idx, :], dim=-1)
-        if b1 is not None:
-            b1_last = torch.argmax(b1[rows, last_idx, :], dim=-1)
-        if b2 is not None:
-            b2_last = torch.argmax(b2[rows, last_idx, :], dim=-1)
-        for i in range(B):
-            preds = []
-            if b0 is not None:
-                preds.append(b0_last[i].item())
-            if b1 is not None:
-                preds.append(b1_last[i].item())
-            if b2 is not None:
-                preds.append(b2_last[i].item())
-            beliefs_out.append(preds)
-
         return (
             actions_t.detach().cpu().numpy().astype(np.uint8),
             log_probs_t.detach().cpu().numpy().astype(np.float32),
-            values_last.detach().cpu().numpy().astype(np.float32),
-            beliefs_out,
+            values_last.detach().cpu().numpy().astype(np.float32)
         )
 
     # This agent is not for the Python env, so these methods are not used.

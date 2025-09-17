@@ -21,7 +21,7 @@ TRANSFORMER_CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "transformer_classifi
 HISTORICAL_MODEL_DIR = PLAYERS_DIR
 
 # Optional: path to a supervised/teacher checkpoint used for warm start / teacher KL
-SL_TEACHER_CKPT = r"/mnt/l/Coding_Projects/Liars_bar_2/Liars-bar/checkpoints/autoreg_20250915_195720/autoreg_model_final.pth"
+SL_TEACHER_CKPT = r"/mnt/l/Coding_Projects/Liars_bar_2/Liars-bar/checkpoints/autoreg_20250916_163244/autoreg_model_final.pth"
 
 # ============================
 # Directory Preparation
@@ -118,7 +118,7 @@ VALUE_COEF = 0.5
 AUX_LOSS_WEIGHT = 1
 
 # Split aux weights (current PPO usage)
-AUX_BELIEF_WEIGHT = 0   # belief heads weight (was 0.5 in your PPO runs)
+AUX_BELIEF_WEIGHT = 1   # belief heads weight (was 0.5 in your PPO runs)
 AUX_OPP_WEIGHT    = 1   # opponent action weight (1.0 to match SL)
 VALUE_WEIGHT      = 1     # value loss weight 
 # ============================
