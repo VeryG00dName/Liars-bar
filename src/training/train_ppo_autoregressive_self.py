@@ -155,27 +155,6 @@ def _clone_agent_from_agent(src_agent: BatchPPOAutoregressiveAgent,
 
     return clone
 
-class PlateauDetector:
-    """Simple detector for training plateaus based on win rate improvement."""
-    def __init__(self, window_size: int = 20, threshold: float = 0.01):
-        self.window_size = window_size
-        self.threshold = threshold
-        self.win_rates = deque(maxlen=window_size)
-    
-    def step(self, win_rate: float) -> bool:
-        """Returns True if a plateau is detected."""
-        self.win_rates.append(win_rate)
-        if len(self.win_rates) < self.window_size:
-            return False
-        
-        first_half_avg = np.mean(list(self.win_rates)[:self.window_size//2])
-        second_half_avg = np.mean(list(self.win_rates)[self.window_size//2:])
-        improvement = second_half_avg - first_half_avg
-        
-        logging.info(f"[PlateauDetector] Window: {len(self.win_rates)}/{self.window_size}. Improvement: {improvement:.4f}. Threshold: {self.threshold}")
-        return abs(improvement) < self.threshold
-
-
 # ==============================================================================
 # SECTION 2: THE CORE TRAIN FUNCTION
 # ==============================================================================
@@ -184,7 +163,7 @@ def train_generation(
     run_name: str,
     master_run_name: str,
     pool_manager: OpponentPoolManager,
-    max_updates: int = 5000,
+    max_updates: int = 100,
     # New: pass a preloaded/compiled learner or a warm_start_path for backward-compat
     learner: Optional[BatchPPOAutoregressiveAgent] = None,
     warm_start_path: Optional[str] = None,
@@ -293,7 +272,6 @@ def train_generation(
     # 3. INITIALIZE ARENA, ROLLOUT MANAGER, AND PLATEAU DETECTOR
     arena = lb.VecArena()
     rollout_manager = PPOVecRolloutManager(arena, policy_map, device)
-    plateau_detector = PlateauDetector(window_size=20, threshold=0.01)
 
     # 4. MAIN TRAINING LOOP
     episodes_per_update = int(config.EPISODES_PER_UPDATE)
@@ -427,10 +405,6 @@ def train_generation(
             labels = opp_rows_L                               # [N] (may contain None)
             visualize_opponent_embeddings_all(writer, (X, labels), step=update,
                                   title_prefix="Per-Opponent belief_fc")
-            
-        if update >= 100:
-            logging.info(f"{update}. Stopping training for '{run_name} current win_rate: {win_rate:.3f}.")
-            break
 
         if update % int(config.CHECKPOINT_INTERVAL) == 0:
             path = os.path.join(run_ckpt_dir, f"update_{update}.pth")
