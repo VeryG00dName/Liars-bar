@@ -28,7 +28,7 @@ class PPOVecRolloutManager:
                  training_policy_id: int = 0,
                  opponent_pool: List[int] = None) -> List[List[int]]:
         if opponent_pool is None:
-            opponent_pool = []
+            opponent_pool = [0]
 
         BOT_MAX_ID = 6
         LATEST_K   = 4
@@ -36,38 +36,12 @@ class PPOVecRolloutManager:
         FRONT_P   = 0.95  # bots ∪ latest
         SHADOW_P  = 0.05  # shadow
 
-        # Build the sampling pool (preserving any weighting duplicates) and always
-        # include the current learner.
-        pool: List[int] = [int(pid) for pid in opponent_pool]
-        if training_policy_id not in pool:
-            pool.append(training_policy_id)
-
-        if not pool:
-            pool = [training_policy_id]
-
-        # Partition pool (excluding learner for historical buckets)
-        pool_without_learner = [pid for pid in pool if pid != training_policy_id]
-
-        bots    = [i for i in pool_without_learner if i <= BOT_MAX_ID]
-        frozens = sorted([i for i in pool_without_learner if i > BOT_MAX_ID])
+        # Partition pool
+        bots    = [i for i in opponent_pool if i <= BOT_MAX_ID]
+        frozens = sorted([i for i in opponent_pool if i > BOT_MAX_ID])
         latest  = frozens[-LATEST_K:] if LATEST_K > 0 else []
         shadow  = [i for i in frozens if i not in latest]
-
-        # Build the front bucket, always placing the learner first without
-        # shrinking the historical "latest" window.
-        front: List[int] = []
-
-        def _add_front(pid: int):
-            if pid not in front:
-                front.append(pid)
-
-        _add_front(training_policy_id)
-        for pid in bots + latest:
-            if pid != training_policy_id:
-                _add_front(pid)
-
-        front_set = set(front)
-        shadow_set = set(shadow)
+        front   = sorted(set(bots + latest))
 
         # Bucket masses (renormalize if some buckets are empty)
         masses = {
@@ -78,19 +52,17 @@ class PPOVecRolloutManager:
 
         if s <= 0.0:
             # Fallback: uniform over entire pool
-            probs = np.full(len(pool), 1.0 / max(1, len(pool)))
+            probs = np.full(len(opponent_pool), 1.0 / max(1, len(opponent_pool)))
         else:
             # Renormalize to 1.0 if a bucket was empty
             masses["front"]  /= s
             masses["shadow"] /= s
 
             def bucket(x: int) -> str:
-                return "front" if x in front_set else "shadow"
+                return "front" if x in front else "shadow"
 
-            front_count = sum(1 for x in pool if x in front_set)
-            shadow_count = sum(1 for x in pool if x in shadow_set)
-            sizes = {"front": max(1, front_count), "shadow": max(1, shadow_count)}
-            probs = np.array([masses[bucket(x)] / sizes[bucket(x)] for x in pool], dtype=np.float64)
+            sizes = {"front": max(1, len(front)), "shadow": max(1, len(shadow))}
+            probs = np.array([masses[bucket(x)] / sizes[bucket(x)] for x in opponent_pool], dtype=np.float64)
             probs /= probs.sum()
 
         all_env_roles = []
@@ -98,27 +70,28 @@ class PPOVecRolloutManager:
             env_roles = [0 for _ in range(num_players)]
             seats = list(range(num_players))
             np.random.shuffle(seats)
-            # Guarantee at least one learner seat per game.
-            primary_seat = seats.pop()
-            env_roles[primary_seat] = training_policy_id
+            training_seat = seats.pop()
+            env_roles[training_seat] = training_policy_id
 
-            num_remaining = len(seats)
-            if num_remaining > 0:
-                chosen = np.random.choice(pool, size=num_remaining, replace=True, p=probs).tolist()
-                for idx, seat in enumerate(seats):
-                    env_roles[seat] = int(chosen[idx])
+            num_opponents = num_players - 1
+            chosen = np.random.choice(opponent_pool, size=num_opponents, replace=True, p=probs).tolist()
+            for i in range(num_opponents):
+                env_roles[seats[i]] = int(chosen[i])
             all_env_roles.append(env_roles)
 
         return all_env_roles
 
     def collect_episodes(self,
-                     num_episodes: int,
-                     num_players: int,
-                     training_policy_id: int = 0,
-                     opponent_pool: List[int] = None,
-                     max_batch_envs: int = None) -> List[Dict[str, Any]]:
+                         num_episodes: int,
+                         num_players: int,
+                         training_policy_id: int = 0,
+                         opponent_pool: List[int] = None,
+                         max_batch_envs: int = None) -> List[Dict[str, Any]]:
         batch_guess = self.arena.B if self.arena.B > 0 else num_episodes
-        batch_size = int(min(batch_guess, max_batch_envs)) if max_batch_envs is not None else int(batch_guess)
+        if max_batch_envs is not None:
+            batch_size = int(min(batch_guess, max_batch_envs))
+        else:
+            batch_size = int(batch_guess)
         self.arena.reset(batch=batch_size, players=num_players, seed=np.random.randint(0, 2**31))
 
         roles = self._setup_roles(batch_size, num_players, training_policy_id, opponent_pool)
@@ -127,8 +100,8 @@ class PPOVecRolloutManager:
         episodes = [self._new_episode_tracker(b, roles[b], training_policy_id) for b in range(batch_size)]
         completed_episodes = []
 
-        # pending_data[env_idx][seat] -> {"step_idx", "log_prob", "value", "penalties_used"}
-        pending_data: Dict[int, Dict[int, Dict[str, Any]]] = {}
+        # keyed by env_idx only
+        pending_data: Dict[int, Dict[str, Any]] = {}
 
         iter_count = 0
         last_done_count = 0
@@ -183,16 +156,9 @@ class PPOVecRolloutManager:
                         ep = episodes[env_idx]
                         if ep['done']:
                             continue
-                        seat = req.seat
-                        step_idx = self._append_step_row(ep, seat)  # append row now; remember its index
-                        seat_data = ep['seat_data'].get(seat)
-                        if seat_data is None:
-                            continue
-                        seat_data['our_action'][step_idx] = actions[i]
-
-                        env_pending = pending_data.setdefault(env_idx, {})
-                        env_pending[seat] = {
-                            "step_idx": step_idx,                     # store exact row index
+                        step_idx = self._append_step_row(ep, ep['training_agent_seat'])
+                        ep['data']['our_action'][step_idx] = actions[i]
+                        pending_data[env_idx] = {
                             "log_prob": log_probs[i],
                             "value": values[i],
                             "penalties_used": penalties_snapshot[i],
@@ -204,16 +170,12 @@ class PPOVecRolloutManager:
         for ep_tracker in episodes:
             if not ep_tracker['done']:
                 self._finalize_episode(ep_tracker, pending_data)
-            for seat in ep_tracker['training_agent_seats']:
-                data = ep_tracker['seat_data'].get(seat)
-                if data is not None:
-                    completed_episodes.append(data)
+            if ep_tracker['is_training_episode']:
+                completed_episodes.append(ep_tracker['data'])
 
         return completed_episodes[:num_episodes]
 
-    def _log_rewards_and_dones(self,
-                           episodes: List[Dict],
-                           pending_data: Dict[int, Dict[int, Dict[str, Any]]]):
+    def _log_rewards_and_dones(self, episodes: List[Dict], pending_data: Dict[int, Dict[str, Any]]):
         done_statuses = self.arena.done
         for env_idx, ep_tracker in enumerate(episodes):
             if ep_tracker['done']:
@@ -228,163 +190,147 @@ class PPOVecRolloutManager:
                 entry = history[entry_idx]
                 ep_tracker['last_history_len'] += 1
 
-                seat_played = int(entry['player'])
-                is_training_turn = seat_played in ep_tracker['seat_data']
+                is_our_turn = (entry['player'] == ep_tracker['training_agent_seat'])
 
-                if is_training_turn:
-                    # Fill from pending using the exact step_idx we stored at action time.
-                    env_pending = pending_data.get(env_idx, {})
-                    data = env_pending.pop(seat_played, None)
-                    if not env_pending:
-                        pending_data.pop(env_idx, None)
+                if is_our_turn:
+                    data = pending_data.pop(env_idx, None)
                     if data:
-                        step_idx = int(data.get("step_idx", -1))
-                        seat_data = ep_tracker['seat_data'].get(seat_played)
-                        if seat_data is not None and 0 <= step_idx < len(seat_data['our_action']):
-                            seat_data['log_prob'][step_idx] = data['log_prob']
-                            seat_data['value'][step_idx]    = data['value']
-                            seat_data['penalties_used'][step_idx] = int(data['penalties_used'])
-                            # Everyone else sees this as an opponent action at the same row.
-                            if 'action' in entry:
-                                ep_tracker['common']['opp_target_action'][step_idx] = entry['action']
+                        step_idx = len(ep_tracker['data']['our_action']) - 1
+                        ep_tracker['data']['log_prob'][step_idx] = data['log_prob']
+                        ep_tracker['data']['value'][step_idx] = data['value']
+                        # save the penalties we snapped pre-step
+                        ep_tracker['data']['penalties_used'][step_idx] = int(data['penalties_used'])
                 else:
-                    # Opponent (non-learner) turn: create a new row and write that action into the shared stream.
-                    step_idx = self._append_step_row(ep_tracker, seat_played)
-                    if 'action' in entry:
-                        ep_tracker['common']['opp_target_action'][step_idx] = entry['action']
+                    step_idx = self._append_step_row(ep_tracker, entry['player'])
+                    ep_tracker['data']['opp_target_action'][step_idx] = entry['action']
 
             if done_statuses[env_idx]:
                 self._finalize_episode(ep_tracker, pending_data)
 
-    def _finalize_episode(self,
-                      ep_tracker: Dict,
-                      pending_data: Dict[int, Dict[int, Dict[str, Any]]]):
+    def _finalize_episode(self, ep_tracker: Dict, pending_data: Dict[int, Dict[str, Any]]):
         if ep_tracker['done']:
             return
         ep_tracker['done'] = True
 
         env_idx = ep_tracker['env_idx']
+        seat    = ep_tracker['training_agent_seat']
         pol_id  = ep_tracker['training_policy_id']
 
-        env = self.arena.get_env(env_idx)
-        env_pending = pending_data.pop(env_idx, {})
+        env     = self.arena.get_env(env_idx)
+        ep_data = ep_tracker['data']
 
-        for seat, seat_data in ep_tracker['seat_data'].items():
-            # Flush any leftover pending row to the correct step index
-            data = env_pending.pop(seat, None)
-            if data:
-                step_idx = int(data.get("step_idx", len(seat_data['our_action']) - 1))
-                if 0 <= step_idx < len(seat_data['our_action']):
-                    seat_data['log_prob'][step_idx] = data['log_prob']
-                    seat_data['value'][step_idx]    = data['value']
-                    seat_data['penalties_used'][step_idx] = int(data['penalties_used'])
+        # If our action ended the game and pending data still exists, flush it
+        data = pending_data.pop(env_idx, None)
+        if data and ep_data['agent_id'] and ep_data['agent_id'][-1] == seat:
+            step_idx = len(ep_data['our_action']) - 1
+            ep_data['log_prob'][step_idx] = data['log_prob']
+            ep_data['value'][step_idx]    = data['value']
+            ep_data['penalties_used'][step_idx] = int(data['penalties_used'])
 
-            # --- Terminal reward per learner seat ---
-            our_last_step_idx = -1
-            try:
-                our_last_step_idx = (
-                    len(seat_data['agent_id']) - 1 - seat_data['agent_id'][::-1].index(seat)
-                )
-            except ValueError:
-                pass  # learner never acted
+        # --- FIX: ROBUST TERMINAL REWARD ASSIGNMENT ---
+        # Find our last step in the episode to assign the terminal reward,
+        # regardless of who made the final move.
+        our_last_step_idx = -1
+        try:
+            our_last_step_idx = (
+                len(ep_data['agent_id']) - 1 - ep_data['agent_id'][::-1].index(seat)
+            )
+        except ValueError:
+            # Our agent never acted in this episode.
+            pass
 
-            # Winner/loser bookkeeping (independent per seat)
-            player_labels = seat_data.get('player_labels')
-            winner_label = None
-            if player_labels:
-                active_players = [idx for idx, terminated in enumerate(env.terminations) if not terminated]
-                if active_players:
-                    winner_label = player_labels[active_players[0]]
-            seat_data['winner_label'] = winner_label
+        # Win/lose bookkeeping
+        player_labels = ep_data.get('player_labels')
+        winner_label = None
+        if player_labels:
+            active_players = [idx for idx, terminated in enumerate(env.terminations) if not terminated]
+            if active_players:
+                winner_label = player_labels[active_players[0]]
+        ep_data['winner_label'] = winner_label
 
-            is_winner = (not env.terminations[seat]) and (sum(env.terminations) == env.num_players() - 1)
-            seat_data['win'] = 1 if is_winner else 0
+        is_winner = (not env.terminations[seat]) and (sum(env.terminations) == env.num_players() - 1)
+        ep_data['win'] = 1 if is_winner else 0
 
-            if our_last_step_idx != -1:
-                seat_data['reward'][our_last_step_idx] = 1.0 if is_winner else -1.0
+        # If we actually took an action, assign the final reward to our last step.
+        if our_last_step_idx != -1:
+            ep_data['reward'][our_last_step_idx] = 1.0 if is_winner else -1.0
+        # --- END FIX ---
 
-            seat_data['episode_return'] = float(sum(seat_data['reward']))
+        ep_data['episode_return'] = float(sum(ep_data['reward']))
 
-            # Persist the exact model_input used for the final forward on this env/seat
-            agent  = self.policies[pol_id]
-            mi_last = agent.pop_last_model_input(env_idx, seat)
-            if mi_last is None:
-                raise RuntimeError(f"Missing final model input for env {env_idx}, seat {seat}")
-            seat_data['model_input'] = {
-                k: (v.detach().cpu() if torch.is_tensor(v) else v)
-                for k, v in mi_last.items()
-            }
+        # Persist the exact model_input used for the final forward on this env/seat
+        agent  = self.policies[pol_id]
+        mi_last = agent.pop_last_model_input(env_idx, seat)
+        if mi_last is None:
+            raise RuntimeError(f"Missing final model input for env {env_idx}, seat {seat}")
+        ep_data['model_input'] = {
+            k: (v.detach().cpu() if torch.is_tensor(v) else v)
+            for k, v in mi_last.items()
+        }
 
     def _new_episode_tracker(self, env_idx: int, roles: List[int], training_policy_id: int) -> Dict[str, Any]:
         training_seats = [s for s, pid in enumerate(roles) if pid == training_policy_id]
         is_training_episode = len(training_seats) > 0
+        training_agent_seat = training_seats[0] if is_training_episode else -1
 
         n_players = len(roles)
+        # Opponent seats in **relative turn order**: next, next+1, next+2
+        if is_training_episode:
+            opp_seats = [ (training_agent_seat + r) % n_players for r in range(1, n_players) ]
+        else:
+            # no training seat this episode — keep all seats in table order
+            opp_seats = list(range(n_players))
+
         player_labels = []
         for seat_idx, pid in enumerate(roles):
             agent = self.policies.get(pid)
             player_labels.append(getattr(agent, 'label', pid))
 
-        common = {
+        training_agent_label = player_labels[training_agent_seat] if training_agent_seat != -1 else None
+        true_opp_labels = tuple(player_labels[s] for s in opp_seats if s != training_agent_seat)
+        ep_data = {
+            "training_agent_seat": training_agent_seat,
+            "training_agent_label": training_agent_label,
+            "player_labels": tuple(player_labels),
+            "true_opponent_labels": true_opp_labels,
+
             "agent_id": [],
-            "opp_target_action": [],
+            "our_action": [],
+            "log_prob": [],
+            "value": [],
+            "reward": [],
             "done": [],
+            "opp_target_action": [],
+
+            "penalties_used": [],
+
+            "model_input": None,
+            "episode_return": 0.0,
+            "win": 0,
+            "winner_label": None,
         }
-
-        seat_data: Dict[int, Dict[str, Any]] = {}
-        if is_training_episode:
-            for seat in training_seats:
-                opp_seats = [ (seat + r) % n_players for r in range(1, n_players) ]
-                true_opp_labels = tuple(player_labels[s] for s in opp_seats if s != seat)
-                seat_data[seat] = {
-                    "training_agent_seat": seat,
-                    "training_agent_label": player_labels[seat],
-                    "player_labels": tuple(player_labels),
-                    "true_opponent_labels": true_opp_labels,
-
-                    "agent_id": common["agent_id"],
-                    "our_action": [],
-                    "log_prob": [],
-                    "value": [],
-                    "reward": [],
-                    "done": common["done"],
-                    "opp_target_action": common["opp_target_action"],
-
-                    "penalties_used": [],
-
-                    "model_input": None,
-                    "episode_return": 0.0,
-                    "win": 0,
-                    "winner_label": None,
-                }
-
         return {
             "env_idx": env_idx,
             "done": False,
             "is_training_episode": is_training_episode,
-            "training_agent_seats": training_seats,
+            "training_agent_seat": training_agent_seat,
             "training_policy_id": training_policy_id,
             "last_history_len": 0,
             "global_step": -1,
-            "seat_data": seat_data,
-            "common": common,
-            "player_labels": tuple(player_labels),
+            "data": ep_data
         }
 
     def _append_step_row(self, ep_tracker: Dict[str, Any], agent_seat: int) -> int:
-        common = ep_tracker['common']
-        common['agent_id'].append(agent_seat)
-        common['opp_target_action'].append(None)
-        common['done'].append(False)
+        ep = ep_tracker['data']
+        ep['agent_id'].append(agent_seat)
+        ep['our_action'].append(None)
+        ep['log_prob'].append(None)
+        ep['value'].append(None)
+        ep['reward'].append(0.0)
+        ep['done'].append(False)
+        ep['opp_target_action'].append(None)
 
-        step_idx = len(common['agent_id']) - 1
+        # align penalties_used length with rows; will be filled on our steps
+        ep['penalties_used'].append(None)
 
-        # Grow all per-seat arrays to the same length
-        for seat_data in ep_tracker['seat_data'].values():
-            seat_data['our_action'].append(None)
-            seat_data['log_prob'].append(None)
-            seat_data['value'].append(None)
-            seat_data['reward'].append(0.0)
-            seat_data['penalties_used'].append(None)
-
-        return step_idx
+        return len(ep['agent_id']) - 1
