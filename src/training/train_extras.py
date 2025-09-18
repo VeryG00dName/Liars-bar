@@ -43,54 +43,36 @@ visible only after it has accrued MIN_SUPPORT_TO_SHOW support.
 HARD_BOT_MAX_ID   = 6
 LEARNED_LABEL_MIN = 20
 LEARNED_LABEL_MAX = 64
+_MAX_SUB = LEARNED_LABEL_MAX - LEARNED_LABEL_MIN + 1  # hard cap (internal bank)
 
-# Visible label capacity is strictly the ID space 20..64
-_MAX_SUB = LEARNED_LABEL_MAX - LEARNED_LABEL_MIN + 1  # == 45
-
-# Internal prototype buffer: larger and unrelated to visible capacity
-# 5 opponents × ~10–12 clusters each + headroom -> 128 is a solid default.
-INTERNAL_MAX_PROTOS = 128
-
-# Promotion uses a mass-coverage target: promote highest-support protos
-# until visible set covers >= this fraction of total support (or capacity reached).
-COVERAGE_TARGET   = 0.92
-
-# Small absolute floor to avoid promoting extremely flimsy clusters
-MIN_SUPPORT_ABS   = 5
+# how many sublabels you actually want to SEE/use (choose 8–16)
+MAX_VISIBLE_SUB = 30
+# A prototype becomes visible once its share of total support >= this pct (e.g., 0.10 == 10%)
+MIN_SUPPORT_PCT_TO_SHOW = 0.10
 
 
 class _GlobalProtoBank:
     """
-    Keeps a large pool of prototypes but exposes at most `_MAX_SUB` visible clusters
-    (due to label-id space 20..64). Non-visible clusters are mapped to nearest visible.
+    Keeps a large(ish) pool of prototypes but exposes at most MAX_VISIBLE_SUB
+    'visible' clusters. Non-visible clusters are mapped to their nearest visible one.
 
-    Promotion rule: after updates, promote the highest-support *non-visible* prototypes
-    until cumulative coverage of the visible set >= COVERAGE_TARGET, or we run out of
-    label IDs. Already-visible labels are sticky (no demotion).
+    Promotion rule: a proto becomes visible when (n_j / sum_k n_k) >= MIN_SUPPORT_PCT_TO_SHOW,
+    subject to available visible budget and label space.
     """
     def __init__(self, dim: int, sim_th: float = 0.85, ema: float = 0.05,
-                 max_k: int = INTERNAL_MAX_PROTOS,
-                 coverage_target: float = COVERAGE_TARGET,
-                 min_support_abs: int = MIN_SUPPORT_ABS):
+                 max_k: int = _MAX_SUB, max_visible: int = MAX_VISIBLE_SUB,
+                 min_support_pct_to_show: float = MIN_SUPPORT_PCT_TO_SHOW):
         self.dim = int(dim)
         self.sim_th = float(sim_th)
         self.ema = float(ema)
-
-        # Internal capacity (unrelated to visible capacity)
         self.max_k = int(max_k)
-
-        # Visible capacity is strictly the ID space
-        self.max_visible = _MAX_SUB
-
-        # Coverage-based promotion
-        self.coverage_target = float(coverage_target)
-        self.min_support_abs = int(min_support_abs)
+        self.max_visible = int(max_visible)
+        self.min_support_pct_to_show = float(min_support_pct_to_show)
 
         self.C = None      # [k, D] prototypes (unit-norm)
         self.n = None      # [k]   support counts
-
         # visible mapping: proto_idx -> visible_label (20..)
-        self._vis_map: dict[int, int] = {}
+        self._vis_map = {}           # {proto_idx: visible_label}
         self._next_vis_label = LEARNED_LABEL_MIN
 
     @staticmethod
@@ -98,66 +80,23 @@ class _GlobalProtoBank:
         n = np.linalg.norm(x, axis=-1, keepdims=True) + 1e-9
         return x / n
 
-    def _visible_capacity_left(self) -> int:
-        return max(0, self.max_visible - len(self._vis_map))
-
-    def _bulk_promote_to_coverage(self):
-        """Greedily promote highest-support non-visible protos until:
-           - cumulative coverage of visible set >= target, or
-           - we run out of visible IDs, or
-           - there are no qualifying candidates (support >= min_support_abs).
-        """
-        if self.n is None or self.n.size == 0:
+    def _maybe_make_visible(self, j: int):
+        """Promote proto j to a visible label if we have budget and support share."""
+        if j in self._vis_map:
             return
-        if self._visible_capacity_left() <= 0:
+        if len(self._vis_map) >= self.max_visible:
             return
-
-        # Total mass
-        total = float(self.n.sum())
+        total = float(self.n.sum()) if (self.n is not None and self.n.size > 0) else 0.0
         if total <= 0.0:
             return
-
-        # Support mass currently covered by visible set
-        vis_idx = np.array(list(self._vis_map.keys()), dtype=np.int64)
-        covered = float(self.n[vis_idx].sum()) if vis_idx.size else 0.0
-        coverage = covered / total
-
-        if coverage >= self.coverage_target:
+        share = float(self.n[j]) / total
+        if share < self.min_support_pct_to_show:
             return
-
-        # Candidates: non-visible, with enough absolute support
-        k = int(self.n.size)
-        all_idx = np.arange(k, dtype=np.int64)
-        mask_nonvis = np.ones(k, dtype=bool)
-        if vis_idx.size:
-            mask_nonvis[vis_idx] = False
-        cand_idx = all_idx[mask_nonvis]
-        if cand_idx.size == 0:
+        lbl = self._next_vis_label
+        if lbl > LEARNED_LABEL_MAX:
             return
-
-        # Filter by absolute floor
-        cand_idx = cand_idx[self.n[cand_idx] >= float(self.min_support_abs)]
-        if cand_idx.size == 0:
-            return
-
-        # Sort candidates by support desc
-        order = cand_idx[np.argsort(-self.n[cand_idx])]
-
-        # Promote until coverage target or capacity
-        for j in order:
-            if self._visible_capacity_left() <= 0:
-                break
-            # assign next visible label
-            lbl = self._next_vis_label
-            if lbl > LEARNED_LABEL_MAX:
-                break
-            self._vis_map[int(j)] = int(lbl)
-            self._next_vis_label += 1
-
-            covered += float(self.n[int(j)])
-            coverage = covered / total
-            if coverage >= self.coverage_target:
-                break
+        self._vis_map[j] = lbl
+        self._next_vis_label += 1
 
     def _nearest_visible_label(self, Xn: np.ndarray) -> np.ndarray:
         """Return visible labels for Xn [N,D] by NN to visible prototypes.
@@ -201,6 +140,7 @@ class _GlobalProtoBank:
         for i in range(N):
             xi = Xn[i]
             j  = int(best[i])
+            # Only update EMA if we 'trust' this point
             ok_tokens = (0 if tokens_per_row is None else int(tokens_per_row[i]))
             if take[i] and ok_tokens >= 6:
                 w = self.ema
@@ -216,14 +156,16 @@ class _GlobalProtoBank:
                     self.C[j] = self._norm((1.0 - w) * self.C[j] + w * xi)
                     self.n[j] += 1.0
 
-        # recompute final assignments after updates
+        # final internal assignments after updates
         Cn = self._norm(self.C)
         sims2 = Xn @ Cn.T
         sub_id = sims2.argmax(1).astype(np.int64)
         conf2  = sims2.max(1).astype(np.float32)
 
-        # NEW: bulk promotion to reach coverage (and fill unused visible slots)
-        self._bulk_promote_to_coverage()
+        # maybe promote heavily used prototypes to visible
+        uniq = np.unique(sub_id)
+        for j in uniq:
+            self._maybe_make_visible(int(j))
 
         # map to visible labels (or -1 if we have zero visible yet)
         vis_lbl = self._nearest_visible_label(Xn)
@@ -236,27 +178,30 @@ class _GlobalProtoBank:
             "vis_map": self._vis_map,
             "next_vis_label": self._next_vis_label,
             "sim_th": self.sim_th, "ema": self.ema,
-            "max_k": self.max_k,
-            "max_visible": self.max_visible,  # derived from ID space; persisted for debug
-            "coverage_target": self.coverage_target,
-            "min_support_abs": self.min_support_abs,
+            "max_k": self.max_k, "max_visible": self.max_visible,
+            "min_support_pct_to_show": self.min_support_pct_to_show,  # <-- updated key
             "dim": self.dim
         }
 
     @classmethod
     def load(cls, state: dict):
+        # Fallback for older checkpoints that used an absolute MIN_SUPPORT_TO_SHOW:
+        pct = state.get("min_support_pct_to_show", None)
+        if pct is None:
+            # If only the old absolute threshold exists, we can't know the historic total support.
+            # Default to global constant as a sensible baseline.
+            pct = MIN_SUPPORT_PCT_TO_SHOW
+
         obj = cls(dim=int(state.get("dim", 0)),
                   sim_th=float(state.get("sim_th", 0.85)),
                   ema=float(state.get("ema", 0.05)),
-                  max_k=int(state.get("max_k", INTERNAL_MAX_PROTOS)),
-                  coverage_target=float(state.get("coverage_target", COVERAGE_TARGET)),
-                  min_support_abs=int(state.get("min_support_abs", MIN_SUPPORT_ABS)))
+                  max_k=int(state.get("max_k", _MAX_SUB)),
+                  max_visible=int(state.get("max_visible", MAX_VISIBLE_SUB)),
+                  min_support_pct_to_show=float(pct))
         obj.C = state["C"].astype(np.float32)
         obj.n = state["n"].astype(np.float32)
         obj._vis_map = {int(k): int(v) for k, v in state["vis_map"].items()}
         obj._next_vis_label = int(state["next_vis_label"])
-        # Align derived visible cap to current ID space
-        obj.max_visible = _MAX_SUB
         return obj
 
 
@@ -1279,7 +1224,8 @@ def ppo_losses_batched(
 
                 global _GLOB
                 if _GLOB is None:
-                    _GLOB = _GlobalProtoBank()
+                    _GLOB = _GlobalProtoBank(dim=D_, sim_th=0.85, ema=0.05,
+                                             max_k=_MAX_SUB, max_visible=MAX_VISIBLE_SUB)
 
                 # tokens_per_row optional: you can pass seat token counts here for extra gating
                 sub_id, conf, vis_lbl = _GLOB.assign(X_learned)             # each length N

@@ -39,8 +39,8 @@ class PPOVecRolloutManager:
         # Build the sampling pool (preserving any weighting duplicates) and always
         # include the current learner.
         pool: List[int] = [int(pid) for pid in opponent_pool]
-        #if training_policy_id not in pool:
-            #pool.append(training_policy_id)
+        if training_policy_id not in pool:
+            pool.append(training_policy_id)
 
         if not pool:
             pool = [training_policy_id]

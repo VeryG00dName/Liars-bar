@@ -390,63 +390,22 @@ def train_generation(
 
         # -------- Log metrics --------
         avg = {k: (v / max(n_batches, 1)) for k, v in agg.items()}
-
-        # Helpers for learner-count aware metrics (works without env grouping)
-        def _num_learners_in_game(ep: Dict[str, Any]) -> int:
-            pls = ep.get("player_labels") or ()
-            tlabel = ep.get("training_agent_label")
-            return sum(1 for l in pls if l == tlabel)
-
-        # 1) Rollout/WinRate comparable to past: only episodes with exactly 1 learner in game
-        single_eps = []
-        for ep in new_eps:
-            try:
-                if _num_learners_in_game(ep) == 1:
-                    single_eps.append(ep)
-            except Exception:
-                pass
-        win_rate_single = (sum(ep.get("win", 0) for ep in single_eps) / max(len(single_eps), 1)) if single_eps else 0.0
-
-        # 2) Rollout/WinRate normalized by number of learners per game
-        weighted_total = 0.0
-        weighted_wins = 0.0
-        for ep in new_eps:
-            nl = _num_learners_in_game(ep)
-            if nl <= 0:
-                continue
-            w = 1.0 / float(nl)
-            weighted_total += w
-            weighted_wins  += (float(ep.get("win", 0)) * w)
-        win_rate_norm = (weighted_wins / weighted_total) if weighted_total > 0 else 0.0
-
-        # 3) Per-opponent metrics with filtering rules:
-        #    - For non-learner opponents: only count episodes where there is exactly 1 learner in the game
-        #    - For learner-vs-learner: include episodes with >= 2 learners and count both sides
+        win_rate = sum(ep["win"] for ep in new_eps) / len(new_eps)
         per_opponent_totals: Dict[Any, List[float]] = {}
         for ep in new_eps:
-            opp_labels = ep.get("true_opponent_labels", ()) or ()
+            opp_labels = ep.get("true_opponent_labels", ())
             if not opp_labels:
                 continue
             training_label = ep.get("training_agent_label")
+            winner_label = ep.get("winner_label")
             training_won = bool(ep.get("win", 0))
-            nl = _num_learners_in_game(ep)
-
-            # Unique labels this seat faced
+            if training_label is not None and winner_label is not None:
+                training_won = winner_label == training_label
             for label in set(l for l in opp_labels if l is not None):
-                # Self-play bucket: include only when multiple learners are seated
-                if (training_label is not None) and (label == training_label):
-                    if nl >= 2:
-                        totals = per_opponent_totals.setdefault(label, [0.0, 0.0])
-                        if training_won:
-                            totals[0] += 1.0
-                        totals[1] += 1.0
-                else:
-                    # Non-learner opponents: only from single-learner episodes
-                    if nl == 1:
-                        totals = per_opponent_totals.setdefault(label, [0.0, 0.0])
-                        if training_won:
-                            totals[0] += 1.0
-                        totals[1] += 1.0
+                totals = per_opponent_totals.setdefault(label, [0.0, 0.0])
+                if training_won:
+                    totals[0] += 1.0
+                totals[1] += 1.0
         # Timings
         writer.add_scalar("Time/Rollout", dur_roll, update)
         writer.add_scalar("Time/Optimize", dur_opt, update)
@@ -464,9 +423,7 @@ def train_generation(
         writer.add_scalar("Value/ClipFrac", avg.get("value_clip_frac", 0.0), update)
         writer.add_scalar("Diag/ReturnStdEMA", getattr(config, "RET_STD_EMA", 1.0), update)
         # Rollout stats
-        # Rollout stats
-        writer.add_scalar("Rollout/WinRate", win_rate_single, update)
-        writer.add_scalar("Rollout/WinRate_NormalizedByLearners", win_rate_norm, update)
+        writer.add_scalar("Rollout/WinRate", win_rate, update)
         for label, (wins_vs, total) in sorted(per_opponent_totals.items(), key=lambda item: str(item[0])):
             if total > 0:
                 writer.add_scalar(f"PerOpponent/win_rate_vs_{label}", wins_vs / total, update)
