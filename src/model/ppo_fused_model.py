@@ -71,14 +71,10 @@ class PPOFusedModel(nn.Module):
         )
 
         self.belief_head = nn.Linear(hidden_dim, belief_dim)
-        # === Fused Policy and Value Heads ===
-        # The input is the main hidden_dim PLUS the intermediate belief_hidden dim.
-        fused_input_dim = hidden_dim + hidden_dim
         
         # This layer processes the FUSED representation
-        self.policy_value_feature_extractor = nn.Sequential(
-            nn.Linear(fused_input_dim, hidden_dim), nn.SiLU(),
-        )
+        self.pv_film = StrategyFiLM(feat_dim=hidden_dim, cond_dim=hidden_dim, use_ln=True)
+
         self.action_head     = nn.Linear(hidden_dim, action_dim)
         self.opp_action_head = nn.Linear(hidden_dim, action_dim)
         self.value_head      = nn.Linear(hidden_dim, 1)
@@ -125,8 +121,7 @@ class PPOFusedModel(nn.Module):
 
         # belief_hidden drives opponent head
         belief_hidden = self.belief_fc(transformer_output)            # [B,T,D]
-        fused_representation = torch.cat([transformer_output, belief_hidden], dim=-1)
-        pv_features = self.policy_value_feature_extractor(fused_representation)
+        pv_features = self.pv_film(transformer_output, belief_hidden)
         action_logits = self.action_head(pv_features)                  # [B,T,7]
         opp_logits    = self.opp_action_head(belief_hidden)           # [B,T,7]
         state_values  = self.value_head(pv_features)                  # [B,T,1]
@@ -206,16 +201,44 @@ class PPOFusedModel(nn.Module):
         return prev_opp_logits, has_prev_opp
 
 
-class FiLMLayer(nn.Module):
+class StrategyFiLM(nn.Module):
     """
-    (Unused now) Feature-wise Linear Modulation Layer.
-    Kept here in case you want to reintroduce conditioning later.
+    Feature-wise Linear Modulation with safe initialization.
+    - Starts as identity: gamma≈0, beta≈0
+    - Optional LayerNorm on the modulated stream
+    - Works token-wise (z: [B,T,D]) or sequence-wise (z: [B,D])
     """
-    def __init__(self, input_dim, cond_dim):
+    def __init__(self, feat_dim: int, cond_dim: int, use_ln: bool = True):
         super().__init__()
-        self.cond_projection = nn.Linear(cond_dim, input_dim * 2)
+        hidden = max(64, cond_dim // 2)
+        self.to_gamma = nn.Sequential(
+            nn.Linear(cond_dim, hidden), nn.SiLU(),
+            nn.Linear(hidden, feat_dim)
+        )
+        self.to_beta  = nn.Sequential(
+            nn.Linear(cond_dim, hidden), nn.SiLU(),
+            nn.Linear(hidden, feat_dim)
+        )
+        if use_ln:
+            self.ln = nn.LayerNorm(feat_dim)
+        else:
+            self.ln = nn.Identity()
 
-    def forward(self, main_input, cond_input):
-        gamma_beta = self.cond_projection(cond_input)
-        gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)
-        return gamma * main_input + beta
+        # --- Safe init: identity at start (gamma≈0, beta=0) ---
+        # Zero the last layers so gamma,beta start near 0
+        nn.init.zeros_(self.to_gamma[-1].weight); nn.init.zeros_(self.to_gamma[-1].bias)
+        nn.init.zeros_(self.to_beta[-1].weight);  nn.init.zeros_(self.to_beta[-1].bias)
+
+    def forward(self, h: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        """
+        h: [B,T,D] main features to be modulated (from the trunk)
+        z: [B,T,D] (token-wise) or [B,D] (sequence-wise) conditioning
+        """
+        if z.dim() == 2:  # sequence-wise → broadcast along T
+            z = z[:, None, :]  # [B,1,D] → broadcast to [B,T,D]
+
+        gamma = torch.tanh(self.to_gamma(z))   # bound scale in [-1,1]
+        beta  = self.to_beta(z)
+        # Identity + small, bounded scaling
+        h_mod = h * (1.0 + gamma) + beta
+        return self.ln(h_mod)

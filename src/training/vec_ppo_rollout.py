@@ -30,33 +30,38 @@ class PPOVecRolloutManager:
         if opponent_pool is None:
             opponent_pool = [0]
 
-        BOT_MAX_ID   = 6
-        LATEST_K     = 4
-        MIX_P_BOTS   = 0.40
-        MIX_P_LATEST = 0.50  # remainder goes to shadow
+        BOT_MAX_ID = 6
+        LATEST_K   = 4
+
+        FRONT_P   = 0.95  # bots ∪ latest
+        SHADOW_P  = 0.05  # shadow
 
         # Partition pool
         bots    = [i for i in opponent_pool if i <= BOT_MAX_ID]
         frozens = sorted([i for i in opponent_pool if i > BOT_MAX_ID])
         latest  = frozens[-LATEST_K:] if LATEST_K > 0 else []
         shadow  = [i for i in frozens if i not in latest]
+        front   = sorted(set(bots + latest))
 
         # Bucket masses (renormalize if some buckets are empty)
         masses = {
-            "bots":   MIX_P_BOTS   if bots   else 0.0,
-            "latest": MIX_P_LATEST if latest else 0.0,
-            "shadow": max(0.0, 1.0 - MIX_P_BOTS - MIX_P_LATEST) if shadow else 0.0,
+            "front":  FRONT_P  if front  else 0.0,
+            "shadow": SHADOW_P if shadow else 0.0,
         }
-        s = masses["bots"] + masses["latest"] + masses["shadow"]
+        s = masses["front"] + masses["shadow"]
+
         if s <= 0.0:
+            # Fallback: uniform over entire pool
             probs = np.full(len(opponent_pool), 1.0 / max(1, len(opponent_pool)))
         else:
-            for k in masses: masses[k] /= s
-            def bucket(x):
-                if x in bots:   return "bots"
-                if x in latest: return "latest"
-                return "shadow"
-            sizes = {"bots": max(1, len(bots)), "latest": max(1, len(latest)), "shadow": max(1, len(shadow))}
+            # Renormalize to 1.0 if a bucket was empty
+            masses["front"]  /= s
+            masses["shadow"] /= s
+
+            def bucket(x: int) -> str:
+                return "front" if x in front else "shadow"
+
+            sizes = {"front": max(1, len(front)), "shadow": max(1, len(shadow))}
             probs = np.array([masses[bucket(x)] / sizes[bucket(x)] for x in opponent_pool], dtype=np.float64)
             probs /= probs.sum()
 

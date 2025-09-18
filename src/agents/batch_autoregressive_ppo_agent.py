@@ -53,7 +53,7 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
             logger.debug(f"[{self.player_id}] Detected legacy PPOAutoregressiveModel architecture.")
             ModelClass = PPOAutoregressiveModel
         else:
-            raise ValueError(f"The model state for '{agent_key}' is not a valid PPO model.")
+            ModelClass = PPOFusedModel
         
         try:
             # Infer dimensions that are common to both architectures

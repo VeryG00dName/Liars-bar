@@ -12,7 +12,7 @@ import os
 
 os.environ.setdefault("MPLBACKEND", "Agg")
 import matplotlib
-
+import torch.nn.functional as F
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
@@ -210,22 +210,6 @@ def class_index_for(visible_label: int) -> int:
     _CLASSMAP[v] = nxt
     _INVCLASS[nxt] = v
     return nxt
-
-
-def get_proto_bank_state() -> Optional[Dict[str, Any]]:
-    """Deprecated: use _GLOB.state_dict() externally. Kept for backward compat."""
-    if (_GLOB is None) or (_GLOB.C is None):
-        return None
-    return _GLOB.state_dict()
-
-
-def load_proto_bank_state(state: Optional[Dict[str, Any]]) -> None:
-    """Deprecated: use _GlobalProtoBank.load(...) externally. Wrapper for compat."""
-    global _GLOB
-    if not state:
-        _GLOB = None
-        return
-    _GLOB = _GlobalProtoBank.load(state)
 
 def set_seed(seed=42):
     """
@@ -581,6 +565,58 @@ def embedding_quality_metrics(
         "n_labels": int(labs.size),
     }
 
+def _analyze_consistency_in_batch(
+    belief_tokens: torch.Tensor,    # Shape: [B, T, D]
+    agent_types: torch.Tensor,      # Shape: [B, T]
+    padding_mask: torch.Tensor,     # Shape: [B, T]
+    min_turns: int = 4              # Min opponent turns to be included
+) -> List[float]:
+    """
+    Analyzes opponent strategy consistency within a batch.
+    This is called from within the loss function, before embeddings are averaged.
+    It expects agent_types where self=0 and opponents are > 0.
+    """
+    B, T, D = belief_tokens.shape
+    consistency_scores = []
+
+    # Iterate through each episode in the batch
+    for i in range(B):
+        # Create a mask for all valid opponent turns in this episode
+        # The model receives relative agent types, so opponents are > 0
+        is_opponent_turn = (agent_types[i] > 0) & (~padding_mask[i])
+        
+        if not is_opponent_turn.any():
+            continue
+
+        # Find which unique opponent seats were active (e.g., 1, 2, 3)
+        acting_opp_seats = torch.unique(agent_types[i, is_opponent_turn])
+
+        for seat in acting_opp_seats:
+            # Get all embeddings for this specific opponent in this episode
+            is_this_opp_turn = (agent_types[i] == seat) & (~padding_mask[i])
+            
+            if is_this_opp_turn.sum() < min_turns:
+                continue
+
+            this_opp_embeds = belief_tokens[i, is_this_opp_turn] # [num_turns, D]
+            
+            # --- Splitting Logic ---
+            num_turns = this_opp_embeds.shape[0]
+            split_idx = num_turns // 2
+            first_half = this_opp_embeds[:split_idx]
+            second_half = this_opp_embeds[split_idx:]
+            
+            if first_half.shape[0] == 0 or second_half.shape[0] == 0:
+                continue
+
+            # Calculate the cosine similarity between the average of the two halves
+            avg_first_half = F.normalize(first_half.mean(dim=0), p=2, dim=0)
+            avg_second_half = F.normalize(second_half.mean(dim=0), p=2, dim=0)
+            
+            similarity = F.cosine_similarity(avg_first_half.unsqueeze(0), avg_second_half.unsqueeze(0)).item()
+            consistency_scores.append(similarity)
+            
+    return consistency_scores
 
 def _visualize_pca_panels(
     writer,
@@ -1255,6 +1291,15 @@ def ppo_losses_batched(
         total = total + AUX_OPP_WEIGHT * opp_loss
     metrics["opp_loss"]        = opp_loss.detach()
     metrics["opp_action_acc"]  = opp_acc.detach()
+
+    if belief_tokens is not None:
+        consistency_scores = _analyze_consistency_in_batch(
+            belief_tokens=belief_tokens.detach(),
+            agent_types=mi['agent_types'],
+            padding_mask=mi['padding_mask']
+        )
+        if consistency_scores:
+            metrics["strategy_consistency_scores"] = consistency_scores
 
     return total, metrics
 

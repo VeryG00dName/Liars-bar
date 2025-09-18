@@ -203,16 +203,20 @@ def train_generation(
     
     # 2. INITIALIZE LEARNER AND OPPONENTS
     if learner is None:
-        if not warm_start_path:
-            raise ValueError("Either 'learner' or 'warm_start_path' must be provided to train_generation.")
-        cache_key = f"ckpt:{os.path.abspath(warm_start_path)}"
-        if agent_cache is not None and cache_key in agent_cache:
-            learner = _clone_agent_from_agent(agent_cache[cache_key], device)
+        if warm_start_path:
+            # If a path IS provided, load/clone
+            logging.info(f"Loading learner from warm_start_path: {warm_start_path}")
+            cache_key = f"ckpt:{os.path.abspath(warm_start_path)}"
+            if agent_cache is not None and cache_key in agent_cache:
+                learner = _clone_agent_from_agent(agent_cache[cache_key], device)
+            else:
+                base_agent = _load_agent_from_checkpoint(warm_start_path, 'main', device, restore_proto=True)
+                if agent_cache is not None:
+                    agent_cache[cache_key] = base_agent  # keep a copy of the base
+                learner = _clone_agent_from_agent(base_agent, device)
         else:
-            base_agent = _load_agent_from_checkpoint(warm_start_path, 'main', device, restore_proto=True)
-            if agent_cache is not None:
-                agent_cache[cache_key] = base_agent  # keep a copy of the base
-            learner = _clone_agent_from_agent(base_agent, device)
+            # If no path is provided, create a new agent from scratch
+            learner = _create_new_agent('main', device)
     else:
         # Ensure learner is on the correct device
         learner.model = learner.model.to(device)
@@ -320,6 +324,7 @@ def train_generation(
         n_batches = 0
         opp_rows_X = []  # list of np.ndarray chunks, each [N_i, D]
         opp_rows_L = []  # flat list of labels aligned with rows in opp_rows_X
+        all_consistency_scores = []
         for _ in range(k_epochs):
             batch_eps = random.sample(ep_buffer, min(len(ep_buffer), episodes_per_update))
             if not batch_eps: continue
@@ -346,6 +351,8 @@ def train_generation(
                     agg[k] = agg.get(k, 0.0) + float(v.detach().cpu())
                 except Exception:
                     pass
+            if "strategy_consistency_scores" in metrics:
+                all_consistency_scores.extend(metrics["strategy_consistency_scores"])
             n_batches += 1
             # --- ADD: collect per-opponent embeddings from this batch, if present ---
             X_flat = metrics.get("opp_embeds_flat", None)
@@ -451,7 +458,12 @@ def train_generation(
                 ):
                     ratio = float(evr[2] / max(evr[0] + evr[1], 1e-9))
                     writer.add_scalar("Emb/PC3_vs_PC12_ratio", ratio, update)
-
+            if all_consistency_scores:
+                writer.add_histogram(
+                "Diag/OpponentStrategyConsistency",
+                np.array(all_consistency_scores),
+                update
+            )
             html_path = os.path.join(run_ckpt_dir, f"embeddings_step_{update}.html")
             try:
                 train_extras.save_interactive_3d(X, labels, html_path)
@@ -496,7 +508,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-gens", type=int, default=10, help="Total number of generations to train.")
     parser.add_argument("--challenger-freq", type=int, default=0, help="Inject a challenger from SL every N generations. Set to 0 to disable.")
     parser.add_argument("--master-run-name", type=str, default=None, help="Overall name for the self-play experiment folder.")
-    
+    parser.add_argument("--no-sl", action="store_true", help="Start generation 1 from scratch, without SL warm-start.")
     args = parser.parse_args()
     
     master_run_name = args.master_run_name or f"selfplay_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -505,8 +517,7 @@ if __name__ == "__main__":
     pool_manager = OpponentPoolManager(args.pool_file)
     # Keep agents/models in memory across generations
     agent_cache: Dict[str, BatchPPOAutoregressiveAgent] = {}
-    initial_sl_path = args.sl_path
-
+    initial_sl_path = None if args.no_sl else args.sl_path
     # --- Step 1: Bootstrap Generation 1 (if it doesn't exist) ---
     gen1_name = "gen_1"
     if not any(gen1_name in agent['name'] for agent in pool_manager.pool):
