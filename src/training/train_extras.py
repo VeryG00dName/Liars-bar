@@ -47,23 +47,27 @@ _MAX_SUB = LEARNED_LABEL_MAX - LEARNED_LABEL_MIN + 1  # hard cap (internal bank)
 
 # how many sublabels you actually want to SEE/use (choose 8–16)
 MAX_VISIBLE_SUB = 12
-MIN_SUPPORT_TO_SHOW = 40   # seats assigned to a proto before it becomes visible
+# A prototype becomes visible once its share of total support >= this pct (e.g., 0.10 == 10%)
+MIN_SUPPORT_PCT_TO_SHOW = 0.10
 
 
 class _GlobalProtoBank:
     """
     Keeps a large(ish) pool of prototypes but exposes at most MAX_VISIBLE_SUB
     'visible' clusters. Non-visible clusters are mapped to their nearest visible one.
+
+    Promotion rule: a proto becomes visible when (n_j / sum_k n_k) >= MIN_SUPPORT_PCT_TO_SHOW,
+    subject to available visible budget and label space.
     """
     def __init__(self, dim: int, sim_th: float = 0.85, ema: float = 0.05,
                  max_k: int = _MAX_SUB, max_visible: int = MAX_VISIBLE_SUB,
-                 min_support_to_show: int = MIN_SUPPORT_TO_SHOW):
+                 min_support_pct_to_show: float = MIN_SUPPORT_PCT_TO_SHOW):
         self.dim = int(dim)
         self.sim_th = float(sim_th)
         self.ema = float(ema)
         self.max_k = int(max_k)
         self.max_visible = int(max_visible)
-        self.min_support_to_show = int(min_support_to_show)
+        self.min_support_pct_to_show = float(min_support_pct_to_show)
 
         self.C = None      # [k, D] prototypes (unit-norm)
         self.n = None      # [k]   support counts
@@ -77,12 +81,16 @@ class _GlobalProtoBank:
         return x / n
 
     def _maybe_make_visible(self, j: int):
-        """Promote proto j to a visible label if we have budget and support."""
+        """Promote proto j to a visible label if we have budget and support share."""
         if j in self._vis_map:
             return
         if len(self._vis_map) >= self.max_visible:
             return
-        if self.n[j] < self.min_support_to_show:
+        total = float(self.n.sum()) if (self.n is not None and self.n.size > 0) else 0.0
+        if total <= 0.0:
+            return
+        share = float(self.n[j]) / total
+        if share < self.min_support_pct_to_show:
             return
         lbl = self._next_vis_label
         if lbl > LEARNED_LABEL_MAX:
@@ -171,18 +179,25 @@ class _GlobalProtoBank:
             "next_vis_label": self._next_vis_label,
             "sim_th": self.sim_th, "ema": self.ema,
             "max_k": self.max_k, "max_visible": self.max_visible,
-            "min_support_to_show": self.min_support_to_show,
+            "min_support_pct_to_show": self.min_support_pct_to_show,  # <-- updated key
             "dim": self.dim
         }
 
     @classmethod
     def load(cls, state: dict):
+        # Fallback for older checkpoints that used an absolute MIN_SUPPORT_TO_SHOW:
+        pct = state.get("min_support_pct_to_show", None)
+        if pct is None:
+            # If only the old absolute threshold exists, we can't know the historic total support.
+            # Default to global constant as a sensible baseline.
+            pct = MIN_SUPPORT_PCT_TO_SHOW
+
         obj = cls(dim=int(state.get("dim", 0)),
                   sim_th=float(state.get("sim_th", 0.85)),
                   ema=float(state.get("ema", 0.05)),
                   max_k=int(state.get("max_k", _MAX_SUB)),
                   max_visible=int(state.get("max_visible", MAX_VISIBLE_SUB)),
-                  min_support_to_show=int(state.get("min_support_to_show", MIN_SUPPORT_TO_SHOW)))
+                  min_support_pct_to_show=float(pct))
         obj.C = state["C"].astype(np.float32)
         obj.n = state["n"].astype(np.float32)
         obj._vis_map = {int(k): int(v) for k, v in state["vis_map"].items()}
