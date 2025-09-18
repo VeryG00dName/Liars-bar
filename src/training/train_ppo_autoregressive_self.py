@@ -297,7 +297,7 @@ def train_generation(
     episodes_per_update = int(config.EPISODES_PER_UPDATE)
     k_epochs = int(config.K_EPOCHS)
     ep_buffer: List[Dict[str, Any]] = []
-    
+
     for update in range(1, max_updates + 1):
         # -------- Rollout --------
         t0 = time.time()
@@ -307,7 +307,7 @@ def train_generation(
             num_players=4,
             training_policy_id=training_policy_id,
             opponent_pool=[int(a['label']) for a in pool_manager.pool if a['type'] == 'cpp_bot' or a['type'] == 'historical'],
-            max_batch_envs=int(getattr(config, "EPISODES_PER_UPDATE", 512))
+            max_batch_envs=int(getattr(config, "EPISODES_PER_UPDATE", 512)),
         )
         t_roll = time.time()
         if not new_eps:

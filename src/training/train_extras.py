@@ -46,7 +46,7 @@ LEARNED_LABEL_MAX = 64
 _MAX_SUB = LEARNED_LABEL_MAX - LEARNED_LABEL_MIN + 1  # hard cap (internal bank)
 
 # how many sublabels you actually want to SEE/use (choose 8–16)
-MAX_VISIBLE_SUB = 12
+MAX_VISIBLE_SUB = 30
 # A prototype becomes visible once its share of total support >= this pct (e.g., 0.10 == 10%)
 MIN_SUPPORT_PCT_TO_SHOW = 0.10
 
