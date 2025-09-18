@@ -4,16 +4,52 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class StrategyDictionary(nn.Module):
+    """
+    Learns a shared dictionary of strategy "bricks" and produces a sparse,
+    compositional strategy code for a given history.
+    """
+    def __init__(self, input_dim: int, hidden_dim: int, num_bricks: int, brick_dim: int):
+        super().__init__()
+        self.num_bricks = num_bricks
+        self.brick_dim = brick_dim
+
+        # The shared dictionary of "bricks" (learnable parameters)
+        self.bricks = nn.Parameter(torch.randn(num_bricks, brick_dim))
+        # Initialize bricks to be orthogonal to encourage diversity from the start
+        nn.init.orthogonal_(self.bricks)
+
+        # Encoder to produce activations from the transformer's output
+        self.activation_encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, num_bricks)
+        )
+
+    def forward(self, transformer_output: torch.Tensor):
+        # transformer_output shape: [B, T, D_transformer]
+        
+        # 1. Produce raw activations for each brick
+        raw_activations = self.activation_encoder(transformer_output)
+        
+        # 2. Ensure activations are non-negative to act as weights
+        # Softplus is a smooth version of ReLU, which is good here.
+        activations = F.softplus(raw_activations)  # Shape: [B, T, num_bricks]
+        
+        # 3. Combine bricks using activations to form the strategy code
+        # Matmul: (B, T, num_bricks) @ (num_bricks, brick_dim) -> (B, T, brick_dim)
+        strategy_code = torch.matmul(activations, self.bricks)
+        
+        return strategy_code, activations, self.bricks
+
+
 class PPOFusedModel(nn.Module):
     """
-    A unified, monolithic autoregressive model for PPO.
+    A unified, monolithic autoregressive model for PPO, updated with a
+    Sparse Dictionary representation for opponent strategy.
     
-    This version combines the best features discussed:
-    - A fixed-size belief head for up to `belief_dim` opponent types.
-    - An improved, non-linear belief feature extractor (`belief_fc`).
-    - A robust "Projected Fusion" mechanism that integrates belief context
-      before making policy and value decisions.
-    - Maintained backward compatibility with original naming conventions.
+    This version replaces the dense `belief_fc` with a compositional
+    strategy mechanism designed to learn "building blocks" of behavior.
     """
     def __init__(self,
                  obs_dim,
@@ -24,11 +60,14 @@ class PPOFusedModel(nn.Module):
                  num_layers=2,
                  dropout_rate=0.1,
                  max_seq_length=256,
-                 num_agent_types=4):
+                 num_agent_types=4,
+                 # --- New args for the Strategy Dictionary ---
+                 num_bricks=32,
+                 brick_dim=32):
         super().__init__()
         self.obs_dim = obs_dim
         self.action_dim = action_dim
-        self.belief_dim = belief_dim
+        self.belief_dim = belief_dim # Kept for belief_head probe compatibility
         self.hidden_dim = hidden_dim
         self.max_seq_length = max_seq_length
         self.count_pad = 4
@@ -62,22 +101,28 @@ class PPOFusedModel(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer=encoder_layer, num_layers=num_layers)
 
-        # === Belief Heads (Integrated) ===
-        # Upgraded belief feature extractor before FiLM and final projection
-        self.belief_fc = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim)
+        # === NEW: Strategy Dictionary (Replaces belief_fc) ===
+        self.strategy_dictionary = StrategyDictionary(
+            input_dim=hidden_dim,
+            hidden_dim=hidden_dim,
+            num_bricks=num_bricks,
+            brick_dim=brick_dim
         )
 
-        self.belief_head = nn.Linear(hidden_dim, belief_dim)
+        # === Heads (Updated to use the new strategy code) ===
+        # Probe for backward-compatible belief analysis
+        self.belief_head = nn.Linear(brick_dim, belief_dim)
         
-        # This layer processes the FUSED representation
-        self.pv_film = StrategyFiLM(feat_dim=hidden_dim, cond_dim=hidden_dim, use_ln=True)
+        # FiLM layer now conditioned on the strategy code's dimension
+        self.pv_film = StrategyFiLM(feat_dim=hidden_dim, cond_dim=brick_dim, use_ln=True)
 
+        # Policy and Value heads operate on the FiLM-modulated features
         self.action_head     = nn.Linear(hidden_dim, action_dim)
-        self.opp_action_head = nn.Linear(hidden_dim, action_dim)
         self.value_head      = nn.Linear(hidden_dim, 1)
+
+        # Opponent action head operates directly on the strategy code
+        self.opp_action_head = nn.Linear(brick_dim, action_dim)
+
 
     @torch.no_grad()
     def _decompose_actions(self, action_sequence, padding_mask=None):
@@ -108,6 +153,7 @@ class PPOFusedModel(nn.Module):
         action_masks, padding_mask,
         *,                               # make extra args keyword-only
         return_embeddings: bool = False,
+        dropout_p: float = 0.25,         # Add dropout probability as an argument
         **kwargs
     ):
         encoded_inputs = self._encode_inputs(obs_sequence, action_sequence, agent_types, positions, padding_mask)
@@ -119,63 +165,67 @@ class PPOFusedModel(nn.Module):
             is_causal=True,
         )
 
-        # belief_hidden drives opponent head
-        belief_hidden = self.belief_fc(transformer_output)            # [B,T,D]
-        pv_features = self.pv_film(transformer_output, belief_hidden)
-        action_logits = self.action_head(pv_features)                  # [B,T,7]
-        opp_logits    = self.opp_action_head(belief_hidden)           # [B,T,7]
-        state_values  = self.value_head(pv_features)                  # [B,T,1]
-        belief_logits = self.belief_head(belief_hidden.detach())   # [B,T,belief_dim]
+        # Get the raw activations from the dictionary
+        # Note: We don't use the strategy_code from here directly
+        _, activations, bricks = self.strategy_dictionary(transformer_output)
+
+        # --- APPLY DROPOUT HERE ---
+        # Apply dropout to the activations before they are used.
+        # This should only be active during training.
+        activations_reg = F.dropout(activations, p=dropout_p, training=self.training)
+        
+        # Re-compute the strategy code using the regularized activations
+        strategy_code = torch.matmul(activations_reg, bricks)
+        
+        # --- Policy/Value Stream ---
+        pv_features = self.pv_film(transformer_output, strategy_code)
+        action_logits = self.action_head(pv_features)
+        state_values = self.value_head(pv_features)
+
+        # --- Opponent Modeling Stream ---
+        # Opponent prediction also uses the regularized strategy code
+        opp_logits = self.opp_action_head(strategy_code)
+        
+        # Belief probe uses a detached, non-regularized code for purer analysis
+        # We re-calculate it with the original activations
+        strategy_code_probe = torch.matmul(activations, bricks).detach()
+        belief_logits = self.belief_head(strategy_code_probe)
+        
+        # Apply action mask for our turns
         LARGE_NEG = torch.finfo(action_logits.dtype).min / 4.0
         if action_masks is not None:
-            our_turns = (agent_types == 0).unsqueeze(-1)              # [B,T,1]
+            our_turns = (agent_types == 0).unsqueeze(-1)
             invalid = (~action_masks.bool()) & our_turns
             action_logits = action_logits.masked_fill(invalid, LARGE_NEG)
 
         if return_embeddings:
-            return (action_logits, opp_logits, state_values, belief_logits, belief_hidden.detach())
+            # We return the original, non-dropped-out activations for the regularization losses
+            # The losses should be based on the model's "intent", not the noisy version.
+            embedding_tuple = (strategy_code_probe, activations.detach(), bricks)
+            return (action_logits, opp_logits, state_values, belief_logits, embedding_tuple)
         else:
             return (action_logits, opp_logits, state_values, belief_logits)
 
-    # ===== Convenience helpers for planning & challenge evaluation =====
-
+    # ===== Convenience helpers (Unchanged) =====
     @staticmethod
     def _last_nonself_index(agent_types: torch.Tensor, padding_mask: torch.Tensor | None = None) -> torch.Tensor:
-        """
-        agent_types: [B, T] with {0=self, 1/2/3=opponents}
-        padding_mask: [B, T] True for PAD (optional). If provided, pads are ignored.
-
-        Returns:
-            idx: [B] int64, index of the last timestep t' < T where an opponent acted.
-                 If none exists (edge case), returns T-1 clamped to valid (so you can guard on a mask).
-        """
         B, T = agent_types.shape
         nonself = (agent_types != 0)
         if padding_mask is not None:
             nonself &= ~padding_mask.bool()
-
-        # Find last True along time: reverse, argmax of first True, then convert back
         rev = torch.flip(nonself.to(torch.int32), dims=[1])
-        pos_from_end = rev.argmax(dim=1)  # [B], 0 if last element is True, else distance
-        # If a row has no True at all, argmax is 0 but nonself is all False. Detect that:
+        pos_from_end = rev.argmax(dim=1)
         has_any = nonself.any(dim=1)
-        # Convert back to forward index
         idx = (T - 1) - pos_from_end
-        # For rows with no opponent, just point at 0 to stay in-bounds (caller should check has_any)
         idx = torch.where(has_any, idx, torch.zeros_like(idx))
-        return idx  # [B]
+        return idx
 
     @staticmethod
     def _batch_gather_last_step(tensorBTD: torch.Tensor, idxB: torch.Tensor) -> torch.Tensor:
-        """
-        tensorBTD: [B, T, D]  (e.g., opp_logits)
-        idxB:      [B] indices to gather along T
-        Returns:   [B, D]
-        """
         B, T, D = tensorBTD.shape
         gather_idx = idxB.view(B, 1, 1).expand(B, 1, D)
         out = torch.gather(tensorBTD, dim=1, index=gather_idx).squeeze(1)
-        return out  # [B, D]
+        return out
 
     def last_opponent_logits_before_us(
         self,
@@ -183,20 +233,8 @@ class PPOFusedModel(nn.Module):
         agent_types: torch.Tensor,
         padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Get opponent logits for the *immediately previous* opponent timestep (per batch row).
-
-        Args:
-            opp_logits:   [B, T, A]
-            agent_types:  [B, T] with {0=self, 1/2/3=opponents}
-            padding_mask: [B, T] True for PAD (optional)
-
-        Returns:
-            prev_opp_logits: [B, A]
-            has_prev_opp:    [B] bool  (False if no opponent step exists before our current step)
-        """
-        idx = self._last_nonself_index(agent_types, padding_mask)      # [B]
-        prev_opp_logits = self._batch_gather_last_step(opp_logits, idx)  # [B, A]
+        idx = self._last_nonself_index(agent_types, padding_mask)
+        prev_opp_logits = self._batch_gather_last_step(opp_logits, idx)
         has_prev_opp = (agent_types.gather(dim=1, index=idx.view(-1,1)).squeeze(1) != 0)
         return prev_opp_logits, has_prev_opp
 
@@ -204,9 +242,7 @@ class PPOFusedModel(nn.Module):
 class StrategyFiLM(nn.Module):
     """
     Feature-wise Linear Modulation with safe initialization.
-    - Starts as identity: gamma≈0, beta≈0
-    - Optional LayerNorm on the modulated stream
-    - Works token-wise (z: [B,T,D]) or sequence-wise (z: [B,D])
+    (Unchanged, but now takes a condition from the Strategy Dictionary)
     """
     def __init__(self, feat_dim: int, cond_dim: int, use_ln: bool = True):
         super().__init__()
@@ -223,22 +259,24 @@ class StrategyFiLM(nn.Module):
             self.ln = nn.LayerNorm(feat_dim)
         else:
             self.ln = nn.Identity()
+            
+        # Optional: Add a learnable gate for stability, as discussed
+        # self.gate = nn.Parameter(torch.zeros(1))
 
-        # --- Safe init: identity at start (gamma≈0, beta=0) ---
-        # Zero the last layers so gamma,beta start near 0
         nn.init.zeros_(self.to_gamma[-1].weight); nn.init.zeros_(self.to_gamma[-1].bias)
         nn.init.zeros_(self.to_beta[-1].weight);  nn.init.zeros_(self.to_beta[-1].bias)
 
     def forward(self, h: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        """
-        h: [B,T,D] main features to be modulated (from the trunk)
-        z: [B,T,D] (token-wise) or [B,D] (sequence-wise) conditioning
-        """
-        if z.dim() == 2:  # sequence-wise → broadcast along T
-            z = z[:, None, :]  # [B,1,D] → broadcast to [B,T,D]
+        if z.dim() == 2:
+            z = z[:, None, :]
 
-        gamma = torch.tanh(self.to_gamma(z))   # bound scale in [-1,1]
+        gamma = torch.tanh(self.to_gamma(z))
         beta  = self.to_beta(z)
-        # Identity + small, bounded scaling
+        
+        # If using the gate:
+        # gate_s = torch.sigmoid(self.gate) # or just self.gate if you want unbounded
+        # gamma = gamma * gate_s
+        # beta = beta * gate_s
+        
         h_mod = h * (1.0 + gamma) + beta
         return self.ln(h_mod)
