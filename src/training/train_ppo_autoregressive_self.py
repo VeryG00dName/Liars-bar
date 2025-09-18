@@ -324,7 +324,6 @@ def train_generation(
         n_batches = 0
         opp_rows_X = []  # list of np.ndarray chunks, each [N_i, D]
         opp_rows_L = []  # flat list of labels aligned with rows in opp_rows_X
-        all_consistency_scores = []
         for _ in range(k_epochs):
             batch_eps = random.sample(ep_buffer, min(len(ep_buffer), episodes_per_update))
             if not batch_eps: continue
@@ -351,8 +350,7 @@ def train_generation(
                     agg[k] = agg.get(k, 0.0) + float(v.detach().cpu())
                 except Exception:
                     pass
-            if "strategy_consistency_scores" in metrics:
-                all_consistency_scores.extend(metrics["strategy_consistency_scores"])
+                
             n_batches += 1
             # --- ADD: collect per-opponent embeddings from this batch, if present ---
             X_flat = metrics.get("opp_embeds_flat", None)
@@ -458,12 +456,7 @@ def train_generation(
                 ):
                     ratio = float(evr[2] / max(evr[0] + evr[1], 1e-9))
                     writer.add_scalar("Emb/PC3_vs_PC12_ratio", ratio, update)
-            if all_consistency_scores:
-                writer.add_histogram(
-                "Diag/OpponentStrategyConsistency",
-                np.array(all_consistency_scores),
-                update
-            )
+                    
             html_path = os.path.join(run_ckpt_dir, f"embeddings_step_{update}.html")
             try:
                 train_extras.save_interactive_3d(X, labels, html_path)

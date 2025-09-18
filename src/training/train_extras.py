@@ -4,7 +4,7 @@ import random
 from collections import Counter
 from io import BytesIO
 from typing import Dict, Any, List, Optional, Tuple, Iterable, Union
-
+import itertools
 import numpy as np
 import torch
 from src import config
@@ -565,58 +565,81 @@ def embedding_quality_metrics(
         "n_labels": int(labs.size),
     }
 
-def _analyze_consistency_in_batch(
-    belief_tokens: torch.Tensor,    # Shape: [B, T, D]
-    agent_types: torch.Tensor,      # Shape: [B, T]
-    padding_mask: torch.Tensor,     # Shape: [B, T]
-    min_turns: int = 4              # Min opponent turns to be included
+def _analyze_consistency_in_batch_multi_segment(
+    belief_tokens: torch.Tensor,          # [B, T, D]
+    agent_types: torch.Tensor,            # [B, T]  (0=self, 1..3 opponents)
+    padding_mask: torch.Tensor,           # [B, T]
+    *,
+    opp_policy_by_seat: Optional[torch.Tensor] = None,  # [B, 3] policy_id per opponent seat (bots 0..6; learned >=7)
+    hard_bot_max_id: int = HARD_BOT_MAX_ID,
+    num_segments: int = 2,
+    min_turns: int = 4
 ) -> List[float]:
     """
-    Analyzes opponent strategy consistency within a batch.
-    This is called from within the loss function, before embeddings are averaged.
-    It expects agent_types where self=0 and opponents are > 0.
+    Analyze within-episode opponent strategy consistency by splitting each opponent's
+    turns into N segments and averaging pairwise cosine similarity between segment means.
+
+    Bots are skipped if `opp_policy_by_seat` is provided and the seat's policy_id ≤ hard_bot_max_id.
     """
     B, T, D = belief_tokens.shape
-    consistency_scores = []
+    min_turns_for_analysis = max(min_turns, num_segments)
 
-    # Iterate through each episode in the batch
+    scores: List[float] = []
+
     for i in range(B):
-        # Create a mask for all valid opponent turns in this episode
-        # The model receives relative agent types, so opponents are > 0
-        is_opponent_turn = (agent_types[i] > 0) & (~padding_mask[i])
-        
-        if not is_opponent_turn.any():
+        is_opp_turn = (agent_types[i] > 0) & (~padding_mask[i])
+        if not torch.any(is_opp_turn):
             continue
 
-        # Find which unique opponent seats were active (e.g., 1, 2, 3)
-        acting_opp_seats = torch.unique(agent_types[i, is_opponent_turn])
+        # unique opponent seat ids present in this episode (1..3)
+        opp_seats = torch.unique(agent_types[i, is_opp_turn])
 
-        for seat in acting_opp_seats:
-            # Get all embeddings for this specific opponent in this episode
-            is_this_opp_turn = (agent_types[i] == seat) & (~padding_mask[i])
-            
-            if is_this_opp_turn.sum() < min_turns:
+        for seat in opp_seats:
+            seat_val = int(seat.item())
+            if seat_val <= 0:  # safety; 0 is self
                 continue
 
-            this_opp_embeds = belief_tokens[i, is_this_opp_turn] # [num_turns, D]
-            
-            # --- Splitting Logic ---
-            num_turns = this_opp_embeds.shape[0]
-            split_idx = num_turns // 2
-            first_half = this_opp_embeds[:split_idx]
-            second_half = this_opp_embeds[split_idx:]
-            
-            if first_half.shape[0] == 0 or second_half.shape[0] == 0:
+            # --- Filter out bots via seat-level policy id ---
+            if opp_policy_by_seat is not None:
+                seat_ix = seat_val - 1  # map seats 1..3 -> indices 0..2
+                if 0 <= seat_ix < 3:
+                    policy_id = int(opp_policy_by_seat[i, seat_ix].item())
+                    if policy_id <= hard_bot_max_id:
+                        continue  # skip bots
+                else:
+                    continue  # invalid seat index, skip
+
+            # collect embeddings for this opponent's turns
+            mask_this = (agent_types[i] == seat_val) & (~padding_mask[i])
+            if mask_this.sum().item() < min_turns_for_analysis:
                 continue
 
-            # Calculate the cosine similarity between the average of the two halves
-            avg_first_half = F.normalize(first_half.mean(dim=0), p=2, dim=0)
-            avg_second_half = F.normalize(second_half.mean(dim=0), p=2, dim=0)
-            
-            similarity = F.cosine_similarity(avg_first_half.unsqueeze(0), avg_second_half.unsqueeze(0)).item()
-            consistency_scores.append(similarity)
-            
-    return consistency_scores
+            embeds = belief_tokens[i, mask_this]   # [num_turns, D]
+            num_turns = embeds.shape[0]
+
+            # split into N contiguous segments
+            seg_size = num_turns // num_segments
+            segments = []
+            for k in range(num_segments):
+                start = k * seg_size
+                end = (k + 1) * seg_size if k < num_segments - 1 else num_turns
+                if end > start:
+                    segments.append(embeds[start:end])
+
+            if len(segments) < 2:
+                continue
+
+            # average-pool each segment and L2-normalize
+            seg_means = [F.normalize(s.mean(dim=0), p=2, dim=0) for s in segments]
+
+            # average pairwise cosine similarities
+            pairs = list(itertools.combinations(range(len(seg_means)), 2))
+            sim_sum = 0.0
+            for a, b in pairs:
+                sim_sum += torch.dot(seg_means[a], seg_means[b]).item()
+            scores.append(sim_sum / len(pairs))
+
+    return scores
 
 def _visualize_pca_panels(
     writer,
@@ -1291,15 +1314,6 @@ def ppo_losses_batched(
         total = total + AUX_OPP_WEIGHT * opp_loss
     metrics["opp_loss"]        = opp_loss.detach()
     metrics["opp_action_acc"]  = opp_acc.detach()
-
-    if belief_tokens is not None:
-        consistency_scores = _analyze_consistency_in_batch(
-            belief_tokens=belief_tokens.detach(),
-            agent_types=mi['agent_types'],
-            padding_mask=mi['padding_mask']
-        )
-        if consistency_scores:
-            metrics["strategy_consistency_scores"] = consistency_scores
 
     return total, metrics
 
