@@ -593,7 +593,10 @@ def calculate_autoregressive_loss(
     belief_logits=None,
     belief_targets=None,
     value_pred=None,
-    value_target=None
+    value_target=None,
+    *,
+    activations: torch.Tensor | None = None,
+    bricks: torch.Tensor | None = None,
 ):
     device = self_logits.device
     valid  = (~padding_mask).bool()
@@ -653,8 +656,65 @@ def calculate_autoregressive_loss(
     value_w  = 1.0                      # value stays at 1.0 by default
     belief_w = 1.0                      # belief is evaluated on opponent turns now
 
-    total = self_w * self_loss + opp_w * opp_loss + value_w * value_loss + belief_w * belief_loss
-    return total, self_loss, opp_loss, value_loss, belief_loss
+    # === New regularization losses for Sparse Dictionary ===
+    l1_sparsity_loss = torch.tensor(0.0, device=device)
+    usage_balance_loss = torch.tensor(0.0, device=device)
+    brick_diversity_loss = torch.tensor(0.0, device=device)
+
+    if activations is not None and activations.numel() > 0:
+        # Opponent-only activations: [N_opp, K]
+        if opp_mask.any():
+            opp_acts = activations[opp_mask]  # shape [N, K]
+            # L1 sparsity over opponent steps
+            l1_sparsity_loss = opp_acts.abs().mean()
+
+            # Usage balance: KL divergence from uniform over bricks
+            # Compute mean activation per brick, normalize to a distribution
+            per_brick = opp_acts.sum(dim=0)
+            eps = 1e-8
+            p = per_brick / (per_brick.sum() + eps)
+            K = p.numel()
+            if K > 0:
+                uniform = torch.full_like(p, 1.0 / K)
+                # KL(p || u) = sum p * (log p - log u)
+                usage_balance_loss = (p * (torch.log(p + eps) - torch.log(uniform + eps))).sum()
+
+    if bricks is not None and bricks.numel() > 0:
+        # Encourage diversity by penalizing cosine similarity between different bricks
+        Bk = bricks
+        Bn = F.normalize(Bk, dim=1)  # [K, D]
+        sim = (Bn @ Bn.t())          # [K, K]
+        K = sim.size(0)
+        if K > 1:
+            eye = torch.eye(K, device=sim.device, dtype=sim.dtype)
+            off_diag = (sim - eye)
+            brick_diversity_loss = (off_diag.pow(2).sum()) / (K * (K - 1))
+
+    # Weights from config (fallback defaults if missing)
+    w_l1 = float(getattr(config, "L1_SPARSITY_WEIGHT", 0.01))
+    w_usage = float(getattr(config, "USAGE_BALANCE_WEIGHT", 1.0))
+    w_div = float(getattr(config, "BRICK_DIVERSITY_WEIGHT", 1.0))
+
+    total = (
+        self_w * self_loss
+        + opp_w * opp_loss
+        + value_w * value_loss
+        + belief_w * belief_loss
+        + w_l1 * l1_sparsity_loss
+        + w_usage * usage_balance_loss
+        + w_div * brick_diversity_loss
+    )
+
+    return (
+        total,
+        self_loss,
+        opp_loss,
+        value_loss,
+        belief_loss,
+        l1_sparsity_loss,
+        usage_balance_loss,
+        brick_diversity_loss,
+    )
 
 def compute_accuracy(logits, targets, mask=None):
     """
@@ -757,7 +817,9 @@ def train_autoregressive_model(
         num_layers=2,
         dropout_rate=0.1,
         max_seq_length=max_seq_length,
-        num_agent_types=4
+        num_agent_types=4,
+        num_bricks=getattr(config, "NUM_BRICKS", 32),
+        brick_dim=getattr(config, "BRICK_DIM", 32),
     ).to(device)
 
     pt_dtype = torch.float16 if device.type == 'cuda' else torch.bfloat16
@@ -793,25 +855,43 @@ def train_autoregressive_model(
         train_agent_acc    = 0.0
         train_opponent_acc = 0.0
         train_belief_acc   = 0.0
+        # New regularization aggregators
+        train_l1_loss      = 0.0
+        train_usage_loss   = 0.0
+        train_diversity_loss = 0.0
 
         train_progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Train)", leave=False)
         for batch in train_progress:
             batch = move_batch_to_device(batch, device)
             with amp.autocast(device_type=device.type, dtype=pt_dtype):
-                self_logits, opp_logits, value_pred, belief_logits = model(
+                outs = model(
                     obs_sequence=batch['obs'],
                     action_sequence=batch['action'],
                     agent_types=batch['agent_type'],
                     positions=batch['position'],
                     action_masks=batch['action_mask'],
-                    padding_mask=batch['padding_mask']
+                    padding_mask=batch['padding_mask'],
+                    return_embeddings=True,
+                    dropout_p=float(getattr(config, "DROPOUT_P", 0.25)),
                 )
+                self_logits, opp_logits, value_pred, belief_logits = outs[:4]
+                embedding_tuple = outs[4] if len(outs) > 4 else (None, None, None)
+                strategy_code, activations, bricks = embedding_tuple
 
                 opp_belief_targets = None
                 if batch['belief'] is not None:
                     opp_belief_targets = extract_opponent_belief_targets(batch['agent_type'], batch['belief'])
 
-                total_loss, self_loss, opp_loss, value_loss, belief_loss = calculate_autoregressive_loss(
+                (
+                    total_loss,
+                    self_loss,
+                    opp_loss,
+                    value_loss,
+                    belief_loss,
+                    l1_loss,
+                    usage_loss,
+                    diversity_loss,
+                ) = calculate_autoregressive_loss(
                     self_logits=self_logits,
                     opp_logits=opp_logits,
                     target_actions=batch['target_action'],
@@ -820,7 +900,9 @@ def train_autoregressive_model(
                     belief_logits=belief_logits,
                     belief_targets=opp_belief_targets,
                     value_pred=value_pred,
-                    value_target=None
+                    value_target=None,
+                    activations=activations,
+                    bricks=bricks,
                 )
 
             optimizer.zero_grad()
@@ -836,6 +918,9 @@ def train_autoregressive_model(
             train_opp_loss   += opp_loss.item()
             train_value_loss += value_loss.item()
             train_belief_loss += belief_loss.item()
+            train_l1_loss     += float(l1_loss.item() if torch.is_tensor(l1_loss) else l1_loss)
+            train_usage_loss  += float(usage_loss.item() if torch.is_tensor(usage_loss) else usage_loss)
+            train_diversity_loss += float(diversity_loss.item() if torch.is_tensor(diversity_loss) else diversity_loss)
             train_batches    += 1
 
             # compute accuracies
@@ -866,6 +951,9 @@ def train_autoregressive_model(
         train_agent_acc    /= train_batches
         train_opponent_acc /= train_batches
         train_belief_acc   /= train_batches
+        train_l1_loss      /= train_batches
+        train_usage_loss   /= train_batches
+        train_diversity_loss /= train_batches
 
         # scheduler step
         scheduler.step(train_total_loss)
@@ -876,7 +964,8 @@ def train_autoregressive_model(
             f"Epoch {epoch+1}/{num_epochs} (Time: {epoch_time:.2f}s)\n"
             f"  Train - Loss: {train_total_loss:.6f}, Self: {train_self_loss:.6f}, Opp: {train_opp_loss:.6f}, "
             f"Agent Acc: {train_agent_acc:.4f}, Opp Acc: {train_opponent_acc:.4f}, "
-            f"Belief Acc: {train_belief_acc:.4f}"
+            f"Belief Acc: {train_belief_acc:.4f}, "
+            f"L1: {train_l1_loss:.6f}, Usage: {train_usage_loss:.6f}, Diversity: {train_diversity_loss:.6f}"
         )
 
         # log to TensorBoard
@@ -885,6 +974,9 @@ def train_autoregressive_model(
         writer.add_scalar("Loss/Train/Opp",    train_opp_loss, epoch)
         writer.add_scalar("Loss/Train/Value",  train_value_loss, epoch)
         writer.add_scalar("Loss/Train/Belief", train_belief_loss / train_batches, epoch)
+        writer.add_scalar("Loss/Train/L1_Sparsity", train_l1_loss, epoch)
+        writer.add_scalar("Loss/Train/Usage_Balance", train_usage_loss, epoch)
+        writer.add_scalar("Loss/Train/Brick_Diversity", train_diversity_loss, epoch)
         writer.add_scalar("Acc/Train/Agent",   train_agent_acc, epoch)
         writer.add_scalar("Acc/Train/Opponent",train_opponent_acc, epoch)
         writer.add_scalar("Acc/Train/Belief",  train_belief_acc, epoch)

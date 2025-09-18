@@ -9,6 +9,7 @@ from src.model.ppo_autoregressive_model import PPOAutoregressiveModel
 from src.model.ppo_fused_model import PPOFusedModel
 from src.model.model_factory import ModelFactory as MFactoryUtil
 from src.misc import lb
+from src import config
 logger = logging.getLogger(__name__)
 
 class BatchPPOAutoregressiveAgent(BaseAgent):
@@ -46,7 +47,8 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
 
         # --- ARCHITECTURE DETECTION ---
         ModelClass = None
-        if MFactoryUtil.is_fused_model(model_state_dict):
+        is_fused = MFactoryUtil.is_fused_model(model_state_dict)
+        if is_fused:
             logger.debug(f"[{self.player_id}] Detected PPOFusedModel architecture.")
             ModelClass = PPOFusedModel
         elif MFactoryUtil.is_ppo_autoregressive_model(model_state_dict):
@@ -68,8 +70,23 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
             logger.error(f"Failed to infer dimensions for {self.player_id}: {e}", exc_info=True)
             raise
 
-        self.max_seq_length = inferred_max_seq - 1 
-        
+        self.max_seq_length = inferred_max_seq - 1
+
+        extra_kwargs: Dict[str, Any] = {}
+        if is_fused:
+            bricks_tensor = None
+            for key, tensor in model_state_dict.items():
+                if key.endswith("strategy_dictionary.bricks"):
+                    bricks_tensor = tensor
+                    break
+            if bricks_tensor is not None:
+                num_bricks, brick_dim = bricks_tensor.shape
+                extra_kwargs["num_bricks"] = num_bricks
+                extra_kwargs["brick_dim"] = brick_dim
+            else:
+                extra_kwargs["num_bricks"] = getattr(config, "NUM_BRICKS", 32)
+                extra_kwargs["brick_dim"] = getattr(config, "BRICK_DIM", 32)
+
         # Instantiate the CORRECT ModelClass with all inferred parameters
         self.model = ModelClass(
             obs_dim=inferred_obs_dim,
@@ -78,6 +95,7 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
             hidden_dim=inferred_hidden_dim,
             num_heads=num_heads,
             max_seq_length=inferred_max_seq,
+            **extra_kwargs,
         ).to(self.device)
 
         try:

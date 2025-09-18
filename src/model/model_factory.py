@@ -161,13 +161,26 @@ class ModelFactory:
         """
         Detects the new PPOFusedModel by checking for the unique fusion layer.
         """
-        # The presence of this layer is the unique signature of the new architecture.
-        has_fusion_layer = 'policy_value_feature_extractor.0.weight' in state_dict
-        
-        # Add a sanity check for other expected components
-        has_belief_fc = 'belief_fc.0.weight' in state_dict
-        has_action_head = 'action_head.weight' in state_dict
-        
+        def _has(key: str) -> bool:
+            if key in state_dict:
+                return True
+            for prefix in ("module.", "model.", "policy_nets.", "_orig_mod."):
+                pref_key = f"{prefix}{key}"
+                if pref_key in state_dict:
+                    return True
+            return any(k.endswith(key) for k in state_dict.keys())
+
+        has_strategy_dictionary = any(
+            k.endswith("strategy_dictionary.bricks") for k in state_dict.keys()
+        )
+        if has_strategy_dictionary and _has("action_head.weight"):
+            return True
+
+        # Legacy fused models relied on a policy/value fusion stack.
+        has_fusion_layer = _has('policy_value_feature_extractor.0.weight')
+        has_belief_fc = _has('belief_fc.0.weight')
+        has_action_head = _has('action_head.weight')
+
         return has_fusion_layer and has_belief_fc and has_action_head
 
     @staticmethod

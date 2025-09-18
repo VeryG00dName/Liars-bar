@@ -118,7 +118,12 @@ def _create_new_agent(agent_type: str, device: torch.device) -> BatchPPOAutoregr
     """Creates a new agent and its corresponding model."""
     agent = BatchPPOAutoregressiveAgent(device, f"learner_{agent_type}")
     if agent_type == 'main':
-        model = PPOFusedModel(obs_dim=9, belief_dim=64)
+        model = PPOFusedModel(
+            obs_dim=9,
+            belief_dim=64,
+            num_bricks=getattr(config, "NUM_BRICKS", 32),
+            brick_dim=getattr(config, "BRICK_DIM", 32),
+        )
     else: # In the future, you can add 'exploiter' logic here
         raise ValueError(f"Unknown agent type for creation: {agent_type}")
     agent.model = model.to(device)
@@ -324,6 +329,7 @@ def train_generation(
         n_batches = 0
         opp_rows_X = []  # list of np.ndarray chunks, each [N_i, D]
         opp_rows_L = []  # flat list of labels aligned with rows in opp_rows_X
+        avg_brick_usage_chunks: List[np.ndarray] = []
         for _ in range(k_epochs):
             batch_eps = random.sample(ep_buffer, min(len(ep_buffer), episodes_per_update))
             if not batch_eps: continue
@@ -350,7 +356,7 @@ def train_generation(
                     agg[k] = agg.get(k, 0.0) + float(v.detach().cpu())
                 except Exception:
                     pass
-                
+
             n_batches += 1
             # --- ADD: collect per-opponent embeddings from this batch, if present ---
             X_flat = metrics.get("opp_embeds_flat", None)
@@ -381,6 +387,10 @@ def train_generation(
                         Lb = [None] * int(good.sum())
                     opp_rows_X.append(Xb)
                     opp_rows_L.extend(Lb)
+
+            avg_usage = metrics.get("avg_brick_usage_np")
+            if avg_usage is not None:
+                avg_brick_usage_chunks.append(np.asarray(avg_usage, dtype=np.float32))
 
         t_opt_end = time.time()
         # Timings
@@ -416,6 +426,9 @@ def train_generation(
         writer.add_scalar("Loss/Value", avg.get("value_loss", 0.0), update)
         writer.add_scalar("Loss/Belief", avg.get("belief_loss", 0.0), update)
         writer.add_scalar("Loss/Opponent", avg.get("opp_loss", 0.0), update)
+        writer.add_scalar("Loss/L1Sparsity", avg.get("l1_sparsity_loss", 0.0), update)
+        writer.add_scalar("Loss/UsageBalance", avg.get("usage_balance_loss", 0.0), update)
+        writer.add_scalar("Loss/BrickDiversity", avg.get("brick_diversity_loss", 0.0), update)
         writer.add_scalar("Policy/Entropy", avg.get("entropy", 0.0), update)
         writer.add_scalar("Policy/ApproxKL", avg.get("approx_kl", 0.0), update)
         writer.add_scalar("Policy/ClipFraction", avg.get("clip_fraction", 0.0), update)
@@ -437,7 +450,7 @@ def train_generation(
             labels = opp_rows_L                               # [N] (may contain None)
             visualize_opponent_embeddings_all(
                 writer, (X, labels), step=update,
-                title_prefix="Per-Opponent belief_fc"
+                title_prefix="Per-Opponent strategy_code"
             )
 
             metrics = train_extras.embedding_quality_metrics(X, labels, k=10)
@@ -473,6 +486,17 @@ def train_generation(
                 except Exception:
                     pass
             torch.save({"model_state_dict": to_save.state_dict(), **extra}, path)
+
+        if avg_brick_usage_chunks:
+            stacked_usage = np.stack(avg_brick_usage_chunks)  # [num_chunks, K]
+            mean_usage = stacked_usage.mean(axis=0)           # [K]
+
+            # histogram of the whole vector (nice overview)
+            writer.add_histogram("Strategy/AvgBrickUsageHist", mean_usage, update)
+
+            # log each brick as its own scalar under one namespace
+            for i, v in enumerate(mean_usage):
+                writer.add_scalar(f"Strategy/AvgBrickUsage/brick_{i}", float(v), update)
 
     # 5. FINALIZE AND SAVE
     final_path = os.path.join(run_ckpt_dir, "final.pth")

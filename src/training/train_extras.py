@@ -5,6 +5,7 @@ from collections import Counter
 from io import BytesIO
 from typing import Dict, Any, List, Optional, Tuple, Iterable, Union
 import itertools
+import math
 import numpy as np
 import torch
 from src import config
@@ -992,12 +993,19 @@ def ppo_losses_batched(
     old_logp = batch["old_logp"].float()  # [B, T]
     rewards = batch["rewards"].float()    # [B, T]
 
-    outs = model(**{**mi, "return_embeddings": True})
+    outs = model(**{**mi, "return_embeddings": True, "dropout_p": getattr(config, "DROPOUT_P", 0.25)})
     action_logits = outs[0]                                # [B, L, A]
     opp_logits    = outs[1] if len(outs) > 1 else None     # [B, L, A] or None
     values_full   = outs[2].squeeze(-1).to(torch.float32)  # [B, L]
-    b0            = outs[3]                                # [B, L, D]
-    belief_tokens = outs[4] if len(outs) > 4 else None     # [B, L, D]
+    belief_logits = outs[3]                                # [B, L, D]
+    embedding_tuple = outs[4] if len(outs) > 4 else None   # (strategy_code, activations, bricks)
+
+    strategy_code = None
+    activations = None
+    bricks = None
+    if isinstance(embedding_tuple, tuple) and len(embedding_tuple) == 3:
+        strategy_code, activations, bricks = embedding_tuple
+    belief_tokens = strategy_code
 
     B, T = our_idx.shape
     A = action_logits.size(-1)
@@ -1123,6 +1131,49 @@ def ppo_losses_batched(
     
     total = policy_loss + VALUE_WEIGHT * value_loss + entropy_loss
 
+    l1_sparsity_loss = torch.zeros((), device=values_full.device)
+    usage_balance_loss = torch.zeros((), device=values_full.device)
+    brick_diversity_loss = torch.zeros((), device=values_full.device)
+    avg_brick_usage_np = None
+
+    if activations is not None:
+        agent_types = mi.get("agent_types")
+        padding_mask = mi.get("padding_mask")
+        if agent_types is not None:
+            opp_mask = (agent_types != 0)
+            if padding_mask is not None:
+                opp_mask = opp_mask & (~padding_mask.bool())
+            if opp_mask.any():
+                opp_activations = activations[opp_mask]
+                l1_sparsity_loss = opp_activations.abs().mean()
+
+                brick_sums = opp_activations.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+                probs = opp_activations / brick_sums
+                probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+                log_probs = torch.log(probs + 1e-8)
+                num_bricks = probs.size(-1)
+                if num_bricks > 0:
+                    log_uniform = math.log(1.0 / num_bricks)
+                    usage_balance_loss = (probs * (log_probs - log_uniform)).sum(dim=-1).mean()
+
+                avg_brick_usage = opp_activations.mean(dim=0)
+                avg_brick_usage_np = avg_brick_usage.detach().cpu().float().numpy()
+
+    if bricks is not None and bricks.ndim == 2 and bricks.size(0) > 1:
+        norm_bricks = F.normalize(bricks, dim=-1)
+        sim_matrix = norm_bricks @ norm_bricks.t()
+        eye = torch.eye(sim_matrix.size(0), device=sim_matrix.device, dtype=sim_matrix.dtype)
+        off_diag = sim_matrix - eye
+        denom = max(sim_matrix.size(0) * (sim_matrix.size(0) - 1), 1)
+        brick_diversity_loss = off_diag.pow(2).sum() / denom
+
+    total = (
+        total
+        + getattr(config, "L1_SPARSITY_WEIGHT", 0.0) * l1_sparsity_loss
+        + getattr(config, "USAGE_BALANCE_WEIGHT", 0.0) * usage_balance_loss
+        + getattr(config, "BRICK_DIVERSITY_WEIGHT", 0.0) * brick_diversity_loss
+    )
+
     metrics: Dict[str, torch.Tensor] = {
         "policy_loss": policy_loss.detach(),
         "value_loss": value_loss.detach(),
@@ -1132,6 +1183,12 @@ def ppo_losses_batched(
         "trinal_clip_neg_frac": trinal_clip_neg_frac.detach(),
         "value_clip_frac": vclip_frac.detach(),
     }
+
+    metrics["l1_sparsity_loss"] = l1_sparsity_loss.detach()
+    metrics["usage_balance_loss"] = usage_balance_loss.detach()
+    metrics["brick_diversity_loss"] = brick_diversity_loss.detach()
+    if avg_brick_usage_np is not None:
+        metrics["avg_brick_usage_np"] = avg_brick_usage_np
 
     # ---- Teacher KL (optional) ----
     if (BC_KL_WEIGHT > 0.0) and (sl_teacher is not None):
@@ -1277,9 +1334,9 @@ def ppo_losses_batched(
     belief_loss = torch.zeros((), device=device)
     belief_acc  = torch.zeros((), device=device)
 
-    if (AUX_BELIEF_WEIGHT > 0.0) and (belief_idx is not None) and (belief_tgt is not None) and (b0 is not None):
-        B_, L_, C_ = b0.shape
-        b_sel = b0.gather(1, belief_idx.unsqueeze(-1).expand(-1, -1, C_))
+    if (AUX_BELIEF_WEIGHT > 0.0) and (belief_idx is not None) and (belief_tgt is not None) and (belief_logits is not None):
+        B_, L_, C_ = belief_logits.shape
+        b_sel = belief_logits.gather(1, belief_idx.unsqueeze(-1).expand(-1, -1, C_))
 
         ce = torch.nn.functional.cross_entropy(
             b_sel.reshape(-1, C_), belief_tgt.reshape(-1),

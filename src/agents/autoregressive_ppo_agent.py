@@ -9,6 +9,7 @@ from src.agents.base_agent import BaseAgent
 from src.model.ppo_autoregressive_model import PPOAutoregressiveModel
 from src.model.ppo_fused_model import PPOFusedModel
 from src.model.model_factory import ModelFactory as MFactoryUtil
+from src import config
 logger = logging.getLogger(__name__)
 
 
@@ -65,11 +66,12 @@ class PPOAutoregressiveAgent(BaseAgent):
         ModelClass = None
         model_kwargs = {} # Arguments for the model constructor
 
-        if MFactoryUtil.is_fused_model(model_state_dict):
+        is_fused = MFactoryUtil.is_fused_model(model_state_dict)
+        if is_fused:
             logger.debug(f"[{self.player_id}] Detected PPOFusedModel architecture.")
             ModelClass = PPOFusedModel
             # The fused model doesn't use the use_shared_belief_head flag
-            
+
         elif MFactoryUtil.is_ppo_autoregressive_model(model_state_dict):
             logger.debug(f"[{self.player_id}] Detected legacy PPOAutoregressiveModel architecture.")
             ModelClass = PPOAutoregressiveModel
@@ -101,6 +103,20 @@ class PPOAutoregressiveAgent(BaseAgent):
         self.max_seq_length = inferred_max_seq - 1
         
         # Instantiate the correct ModelClass with the correct kwargs
+        if is_fused:
+            bricks_tensor = None
+            for key, tensor in model_state_dict.items():
+                if key.endswith("strategy_dictionary.bricks"):
+                    bricks_tensor = tensor
+                    break
+            if bricks_tensor is not None:
+                num_bricks, brick_dim = bricks_tensor.shape
+                model_kwargs["num_bricks"] = num_bricks
+                model_kwargs["brick_dim"] = brick_dim
+            else:
+                model_kwargs["num_bricks"] = getattr(config, "NUM_BRICKS", 32)
+                model_kwargs["brick_dim"] = getattr(config, "BRICK_DIM", 32)
+
         self.model = ModelClass(
             obs_dim=inferred_obs_dim,
             action_dim=inferred_action_dim,
