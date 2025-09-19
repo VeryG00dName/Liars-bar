@@ -39,35 +39,46 @@ class StrategyDictionary(nn.Module):
         )
 
     def forward(self, transformer_output: torch.Tensor, dropout_p: float = 0.0):
-        # transformer_output shape: [B, T, D_transformer]
-
-        # 1. Produce raw activations for each brick
+        # [B, T, D_model] -> logits over bricks
         logits = self.activation_encoder(transformer_output)
 
+        # feature dropout (locked across time) — same at train/eval given self.training
         if self.training and dropout_p > 0.0:
             keep_prob = 1.0 - dropout_p
-            locked_mask = torch.ones(
-                logits.size(0), 1, logits.size(-1), device=logits.device, dtype=logits.dtype
+            mask = torch.ones(
+                logits.size(0), 1, logits.size(-1),
+                device=logits.device, dtype=logits.dtype
             )
             if keep_prob > 0.0:
-                locked_mask = locked_mask.bernoulli_(keep_prob) / keep_prob
+                mask = mask.bernoulli_(keep_prob) / keep_prob
             else:
-                locked_mask.zero_()
-            logits = logits * locked_mask
+                mask.zero_()
+            logits = logits * mask
 
+        # optional temperature to control sharpness (kept constant everywhere)
+        tau = float(getattr(config, "DICT_TAU", 1.0))
+        if tau != 1.0:
+            logits = logits / max(tau, 1e-6)
+
+        # top-k mask (kept everywhere)
         k = max(1, min(self.top_k, logits.size(-1)))
         _, topk_idx = logits.topk(k, dim=-1)
         topk_mask = torch.zeros_like(logits, dtype=torch.bool)
         topk_mask.scatter_(-1, topk_idx, True)
 
-        neg_inf = torch.finfo(logits.dtype).min
-        masked_logits = torch.where(topk_mask, logits, logits.new_full((), neg_inf))
-        max_logits = masked_logits.amax(dim=-1, keepdim=True)
-        max_logits = torch.where(torch.isfinite(max_logits), max_logits, torch.zeros_like(max_logits))
-        masked_logits = masked_logits - max_logits
+        # finite mask value (avoids -inf edge cases)
+        masked_logits = logits.masked_fill(~topk_mask, -1e9)
 
-        weights = masked_logits.softmax(dim=-1)
-        strategy_code = torch.matmul(weights, self.bricks)
+        # single, consistent pathway:
+        # (1) build nonnegative activations that retain magnitude (intensity)
+        activ = torch.nn.functional.softplus(masked_logits)
+
+        # (2) strategy code for FiLM / heads uses intensity-bearing activations
+        strategy_code = activ @ self.bricks  # (B,T,K) @ (K,D) -> (B,T,D)
+
+        # (3) normalized weights only for losses/analytics (global balance, TV, etc.)
+        denom = activ.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        weights = activ / denom
 
         return strategy_code, weights, self.bricks
 
@@ -83,7 +94,6 @@ class PPOFusedModel(nn.Module):
     def __init__(self,
                  obs_dim,
                  action_dim=7,
-                 belief_dim=64,
                  hidden_dim=256,
                  num_heads=4,
                  num_layers=2,
@@ -96,7 +106,6 @@ class PPOFusedModel(nn.Module):
         super().__init__()
         self.obs_dim = obs_dim
         self.action_dim = action_dim
-        self.belief_dim = belief_dim # Kept for belief_head probe compatibility
         self.hidden_dim = hidden_dim
         self.max_seq_length = max_seq_length
         self.count_pad = 4
@@ -140,9 +149,6 @@ class PPOFusedModel(nn.Module):
         )
 
         # === Heads (Updated to use the new strategy code) ===
-        # Probe for backward-compatible belief analysis
-        self.belief_head = nn.Linear(brick_dim, belief_dim)
-        
         # FiLM layer now conditioned on the strategy code's dimension
         self.pv_film = StrategyFiLM(feat_dim=hidden_dim, cond_dim=brick_dim, use_ln=True)
 
@@ -209,10 +215,6 @@ class PPOFusedModel(nn.Module):
         # Opponent prediction also uses the regularized strategy code
         opp_logits = self.opp_action_head(strategy_code)
 
-        # Belief probe uses a detached, diagnostic-only code
-        strategy_code_probe = (weights.detach() @ bricks).detach()
-        belief_logits = self.belief_head(strategy_code_probe)
-        
         # Apply action mask for our turns
         LARGE_NEG = torch.finfo(action_logits.dtype).min / 4.0
         if action_masks is not None:
@@ -224,9 +226,9 @@ class PPOFusedModel(nn.Module):
             # Return the clean strategy code alongside the sparse weights and bricks
             # so regularization losses operate on the undisturbed representation.
             embedding_tuple = (strategy_code.detach(), weights, bricks)
-            return (action_logits, opp_logits, state_values, belief_logits, embedding_tuple)
+            return (action_logits, opp_logits, state_values, embedding_tuple)
         else:
-            return (action_logits, opp_logits, state_values, belief_logits)
+            return (action_logits, opp_logits, state_values)
 
     # ===== Convenience helpers (Unchanged) =====
     @staticmethod

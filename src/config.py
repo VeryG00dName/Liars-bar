@@ -21,7 +21,7 @@ TRANSFORMER_CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "transformer_classifi
 HISTORICAL_MODEL_DIR = PLAYERS_DIR
 
 # Optional: path to a supervised/teacher checkpoint used for warm start / teacher KL
-SL_TEACHER_CKPT = r"/mnt/l/Coding_Projects/Liars_bar_2/Liars-bar/checkpoints/autoreg_20250918_190651/autoreg_model_final.pth"
+SL_TEACHER_CKPT = r"/mnt/l/Coding_Projects/Liars_bar_2/Liars-bar/checkpoints/autoreg_20250918_213453/autoreg_model_final.pth"
 
 # ============================
 # Directory Preparation
@@ -128,7 +128,7 @@ VALUE_WEIGHT          = 1            # value loss multiplier
 # Sparse Dictionary / Bricks (New Stabilized System)
 # ============================
 # Sparsity & dropout
-SPARSE_K              = 5            # top-k bricks per token
+SPARSE_K              = 4            # top-k bricks per token
 DROPOUT_P             = 0.10         # locked/variational dropout on dictionary logits
 LOCKED_DROPOUT        = True         # documentation flag; dropout mask is [B,1,K]
 

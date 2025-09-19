@@ -150,12 +150,6 @@ class PlayVsAIGUI:
             self.loaded_state_dict = cloned_state
             self.loaded_checkpoint = checkpoint if isinstance(checkpoint, dict) else {"model_state_dict": self.loaded_state_dict}
 
-            if isinstance(checkpoint, dict) and ("proto_bank" in checkpoint):
-                try:
-                    train_extras._GLOB = train_extras._GlobalProtoBank.load(checkpoint["proto_bank"])
-                except Exception:
-                    logger.exception("Failed to restore proto bank from checkpoint.")
-
             self.checkpoint_status_var.set("Checkpoint loaded: PPO autoregressive model ready.")
             self.show_info("Checkpoint loaded successfully.")
         except FileNotFoundError:
