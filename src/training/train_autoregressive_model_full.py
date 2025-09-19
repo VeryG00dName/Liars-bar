@@ -649,7 +649,6 @@ def calculate_autoregressive_loss(
         self_w * self_loss
         + opp_w * opp_loss
         + value_w * value_loss
-        + belief_w * belief_loss
         + w_l1 * l1_sparsity_loss
         + w_usage * usage_balance_loss
         + w_div * brick_diversity_loss
@@ -660,7 +659,6 @@ def calculate_autoregressive_loss(
         self_loss,
         opp_loss,
         value_loss,
-        belief_loss,
         l1_sparsity_loss,
         usage_balance_loss,
         brick_diversity_loss,
