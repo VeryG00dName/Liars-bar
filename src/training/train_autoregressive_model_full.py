@@ -827,7 +827,6 @@ def train_autoregressive_model(
                     self_loss,
                     opp_loss,
                     value_loss,
-                    belief_loss,
                     l1_loss,
                     usage_loss,
                     diversity_loss,
@@ -855,7 +854,6 @@ def train_autoregressive_model(
             train_self_loss  += self_loss.item()
             train_opp_loss   += opp_loss.item()
             train_value_loss += value_loss.item()
-            train_belief_loss += belief_loss.item()
             train_l1_loss     += float(l1_loss.item() if torch.is_tensor(l1_loss) else l1_loss)
             train_usage_loss  += float(usage_loss.item() if torch.is_tensor(usage_loss) else usage_loss)
             train_diversity_loss += float(diversity_loss.item() if torch.is_tensor(diversity_loss) else diversity_loss)
@@ -883,7 +881,6 @@ def train_autoregressive_model(
         train_value_loss   /= train_batches
         train_agent_acc    /= train_batches
         train_opponent_acc /= train_batches
-        train_belief_acc   /= train_batches
         train_l1_loss      /= train_batches
         train_usage_loss   /= train_batches
         train_diversity_loss /= train_batches
@@ -897,7 +894,6 @@ def train_autoregressive_model(
             f"Epoch {epoch+1}/{num_epochs} (Time: {epoch_time:.2f}s)\n"
             f"  Train - Loss: {train_total_loss:.6f}, Self: {train_self_loss:.6f}, Opp: {train_opp_loss:.6f}, "
             f"Agent Acc: {train_agent_acc:.4f}, Opp Acc: {train_opponent_acc:.4f}, "
-            f"Belief Acc: {train_belief_acc:.4f}, "
             f"L1: {train_l1_loss:.6f}, Usage: {train_usage_loss:.6f}, Diversity: {train_diversity_loss:.6f}"
         )
 
@@ -906,7 +902,6 @@ def train_autoregressive_model(
         writer.add_scalar("Loss/Train/Self",   train_self_loss, epoch)
         writer.add_scalar("Loss/Train/Opp",    train_opp_loss, epoch)
         writer.add_scalar("Loss/Train/Value",  train_value_loss, epoch)
-        writer.add_scalar("Loss/Train/Belief", train_belief_loss / train_batches, epoch)
         writer.add_scalar("Loss/Train/L1_Sparsity", train_l1_loss, epoch)
         writer.add_scalar("Loss/Train/Usage_Balance", train_usage_loss, epoch)
         writer.add_scalar("Loss/Train/Brick_Diversity", train_diversity_loss, epoch)
