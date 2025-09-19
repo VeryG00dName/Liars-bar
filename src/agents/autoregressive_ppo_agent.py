@@ -109,20 +109,43 @@ class PPOAutoregressiveAgent(BaseAgent):
                 if key.endswith("strategy_dictionary.bricks"):
                     bricks_tensor = tensor
                     break
+
+            inferred_num_bricks = None
+            inferred_brick_dim = None
+
             if bricks_tensor is not None:
-                num_bricks, brick_dim = bricks_tensor.shape
-                model_kwargs["num_bricks"] = num_bricks
-                model_kwargs["brick_dim"] = brick_dim
+                inferred_num_bricks, inferred_brick_dim = bricks_tensor.shape
             else:
-                model_kwargs["num_bricks"] = getattr(config, "NUM_BRICKS", 32)
-                model_kwargs["brick_dim"] = getattr(config, "BRICK_DIM", 32)
+                activation_w = model_state_dict.get("strategy_dictionary.activation_encoder.2.weight")
+                activation_b = model_state_dict.get("strategy_dictionary.activation_encoder.2.bias")
+                opp_head_w = model_state_dict.get("opp_action_head.weight")
+                belief_head_w = model_state_dict.get("belief_head.weight")
+
+                if activation_w is not None:
+                    inferred_num_bricks = activation_w.shape[0]
+                    inferred_brick_dim = activation_w.shape[1]
+                elif activation_b is not None:
+                    inferred_num_bricks = activation_b.shape[0]
+
+                if opp_head_w is not None:
+                    inferred_brick_dim = opp_head_w.shape[1]
+                elif belief_head_w is not None:
+                    inferred_brick_dim = belief_head_w.shape[1]
+
+            if inferred_num_bricks is None:
+                inferred_num_bricks = getattr(config, "NUM_BRICKS", 32) or 32
+            if inferred_brick_dim is None:
+                inferred_brick_dim = getattr(config, "BRICK_DIM", 32) or 32
+
+            model_kwargs["num_bricks"] = int(inferred_num_bricks)
+            model_kwargs["brick_dim"] = int(inferred_brick_dim)
 
         self.model = ModelClass(
-            obs_dim=inferred_obs_dim,
-            action_dim=inferred_action_dim,
-            belief_dim=inferred_belief_dim,
-            hidden_dim=inferred_hidden_dim,
-            max_seq_length=inferred_max_seq,
+            obs_dim=9,
+            action_dim=7,
+            belief_dim=64,
+            hidden_dim=256,
+            max_seq_length=256,
             **model_kwargs  # Pass specific args like use_shared_belief_head here
         ).to(self.device)
 
@@ -297,7 +320,7 @@ class PPOAutoregressiveAgent(BaseAgent):
         # 4) run model, write chosen action to the last row
         model_input = self._prepare_model_input(self.sequence_history)
         
-        action_logits, _, state_values, belief0, belief1, belief2 = self.model(**model_input)
+        action_logits, _, state_values, _ = self.model(**model_input)
          # --- Process Outputs for the Current Timestep ---
         last_step_idx = model_input['valid_lengths'][0].item() - 1
         logits = action_logits[0, last_step_idx]
@@ -321,15 +344,6 @@ class PPOAutoregressiveAgent(BaseAgent):
             return action.item(), log_prob.item(), value.item()
         else: # Evaluation mode
             action = torch.argmax(masked_logits).item()
-            if belief0 is not None and belief1 is not None:
-                opponents = sorted([p for p in env.possible_agents if p != agent_id_env])
-                self._last_expert_info = {}
-                if len(opponents) > 0:
-                    self._last_expert_info['player_1'] = {"expert_index": int(torch.argmax(belief0[0, last_step_idx]).item()), "source": "internal"}
-                if len(opponents) > 1:
-                    self._last_expert_info['player_2'] = {"expert_index": int(torch.argmax(belief1[0, last_step_idx]).item()), "source": "internal"}
-                if len(opponents) > 2:
-                    self._last_expert_info['player_3'] = {"expert_index": int(torch.argmax(belief2[0, last_step_idx]).item()), "source": "internal"}
             self.sequence_history[-1]["action"] = int(action)
             return action
         
