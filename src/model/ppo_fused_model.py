@@ -2,22 +2,34 @@
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torch.nn.utils import parametrize
+
+from src import config
 
 class StrategyDictionary(nn.Module):
     """
     Learns a shared dictionary of strategy "bricks" and produces a sparse,
     compositional strategy code for a given history.
     """
-    def __init__(self, input_dim: int, hidden_dim: int, num_bricks: int, brick_dim: int):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        num_bricks: int,
+        brick_dim: int,
+        *,
+        top_k: int | None = None,
+    ):
         super().__init__()
         self.num_bricks = num_bricks
         self.brick_dim = brick_dim
+        self.top_k = max(1, min(num_bricks, top_k if top_k is not None else num_bricks))
 
         # The shared dictionary of "bricks" (learnable parameters)
         self.bricks = nn.Parameter(torch.randn(num_bricks, brick_dim))
         # Initialize bricks to be orthogonal to encourage diversity from the start
         nn.init.orthogonal_(self.bricks)
+        parametrize.register_parametrization(self, "bricks", RowUnitNorm(dim=-1))
 
         # Encoder to produce activations from the transformer's output
         self.activation_encoder = nn.Sequential(
@@ -26,21 +38,38 @@ class StrategyDictionary(nn.Module):
             nn.Linear(hidden_dim, num_bricks)
         )
 
-    def forward(self, transformer_output: torch.Tensor):
+    def forward(self, transformer_output: torch.Tensor, dropout_p: float = 0.0):
         # transformer_output shape: [B, T, D_transformer]
-        
+
         # 1. Produce raw activations for each brick
-        raw_activations = self.activation_encoder(transformer_output)
-        
-        # 2. Ensure activations are non-negative to act as weights
-        # Softplus is a smooth version of ReLU, which is good here.
-        activations = F.softplus(raw_activations)  # Shape: [B, T, num_bricks]
-        
-        # 3. Combine bricks using activations to form the strategy code
-        # Matmul: (B, T, num_bricks) @ (num_bricks, brick_dim) -> (B, T, brick_dim)
-        strategy_code = torch.matmul(activations, self.bricks)
-        
-        return strategy_code, activations, self.bricks
+        logits = self.activation_encoder(transformer_output)
+
+        if self.training and dropout_p > 0.0:
+            keep_prob = 1.0 - dropout_p
+            locked_mask = torch.ones(
+                logits.size(0), 1, logits.size(-1), device=logits.device, dtype=logits.dtype
+            )
+            if keep_prob > 0.0:
+                locked_mask = locked_mask.bernoulli_(keep_prob) / keep_prob
+            else:
+                locked_mask.zero_()
+            logits = logits * locked_mask
+
+        k = max(1, min(self.top_k, logits.size(-1)))
+        _, topk_idx = logits.topk(k, dim=-1)
+        topk_mask = torch.zeros_like(logits, dtype=torch.bool)
+        topk_mask.scatter_(-1, topk_idx, True)
+
+        neg_inf = torch.finfo(logits.dtype).min
+        masked_logits = torch.where(topk_mask, logits, logits.new_full((), neg_inf))
+        max_logits = masked_logits.amax(dim=-1, keepdim=True)
+        max_logits = torch.where(torch.isfinite(max_logits), max_logits, torch.zeros_like(max_logits))
+        masked_logits = masked_logits - max_logits
+
+        weights = masked_logits.softmax(dim=-1)
+        strategy_code = torch.matmul(weights, self.bricks)
+
+        return strategy_code, weights, self.bricks
 
 
 class PPOFusedModel(nn.Module):
@@ -106,7 +135,8 @@ class PPOFusedModel(nn.Module):
             input_dim=hidden_dim,
             hidden_dim=hidden_dim,
             num_bricks=num_bricks,
-            brick_dim=brick_dim
+            brick_dim=brick_dim,
+            top_k=getattr(config, "SPARSE_K", None),
         )
 
         # === Heads (Updated to use the new strategy code) ===
@@ -165,17 +195,10 @@ class PPOFusedModel(nn.Module):
             is_causal=True,
         )
 
-        # Get the raw activations from the dictionary
-        # Note: We don't use the strategy_code from here directly
-        _, activations, bricks = self.strategy_dictionary(transformer_output)
-
-        # --- APPLY DROPOUT HERE ---
-        # Apply dropout to the activations before they are used.
-        # This should only be active during training.
-        activations_reg = F.dropout(activations, p=dropout_p, training=self.training)
-        
-        # Re-compute the strategy code using the regularized activations
-        strategy_code = torch.matmul(activations_reg, bricks)
+        # Dictionary produces sparse weights and strategy code directly
+        strategy_code, weights, bricks = self.strategy_dictionary(
+            transformer_output, dropout_p=dropout_p
+        )
         
         # --- Policy/Value Stream ---
         pv_features = self.pv_film(transformer_output, strategy_code)
@@ -185,10 +208,9 @@ class PPOFusedModel(nn.Module):
         # --- Opponent Modeling Stream ---
         # Opponent prediction also uses the regularized strategy code
         opp_logits = self.opp_action_head(strategy_code)
-        
-        # Belief probe uses a detached, non-regularized code for purer analysis
-        # We re-calculate it with the original activations
-        strategy_code_probe = torch.matmul(activations, bricks).detach()
+
+        # Belief probe uses a detached, diagnostic-only code
+        strategy_code_probe = (weights.detach() @ bricks).detach()
         belief_logits = self.belief_head(strategy_code_probe)
         
         # Apply action mask for our turns
@@ -199,9 +221,9 @@ class PPOFusedModel(nn.Module):
             action_logits = action_logits.masked_fill(invalid, LARGE_NEG)
 
         if return_embeddings:
-            # We return the original, non-dropped-out activations for the regularization losses
-            # The losses should be based on the model's "intent", not the noisy version.
-            embedding_tuple = (strategy_code_probe, activations, bricks)
+            # Return the clean strategy code alongside the sparse weights and bricks
+            # so regularization losses operate on the undisturbed representation.
+            embedding_tuple = (strategy_code.detach(), weights, bricks)
             return (action_logits, opp_logits, state_values, belief_logits, embedding_tuple)
         else:
             return (action_logits, opp_logits, state_values, belief_logits)
@@ -280,3 +302,16 @@ class StrategyFiLM(nn.Module):
         
         h_mod = h * (1.0 + gamma) + beta
         return self.ln(h_mod)
+
+class RowUnitNorm(nn.Module):
+    def __init__(self, dim: int = -1, eps: float = 1e-12):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+    def forward(self, W: torch.Tensor) -> torch.Tensor:
+        # Map W -> row-normalized W
+        return W / (W.norm(dim=self.dim, keepdim=True) + self.eps)
+    def right_inverse(self, A: torch.Tensor) -> torch.Tensor:
+        # Optional: lets you do `module.bricks = A` and keep things consistent.
+        # For unit-norm constraints, identity is a reasonable right-inverse.
+        return A

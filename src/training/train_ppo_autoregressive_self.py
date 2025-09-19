@@ -229,7 +229,22 @@ def train_generation(
     learner.model.train()
 
     all_params = list(learner.model.parameters())
-    optimizer = torch.optim.AdamW(all_params, lr=float(config.LEARNING_RATE))
+    main_params = [
+        p for name, p in learner.model.named_parameters() if not name.startswith("strategy_dictionary.")
+    ]
+    dict_params = list(learner.model.strategy_dictionary.parameters())
+
+    dict_lr = float(config.LEARNING_RATE * 0.25)
+    dict_wd = float(getattr(config, "DICT_WEIGHT_DECAY", 0.0))
+    base_wd = float(getattr(config, "WEIGHT_DECAY", 0.0))
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": main_params},
+            {"params": dict_params, "lr": dict_lr, "weight_decay": dict_wd},
+        ],
+        lr=float(config.LEARNING_RATE),
+        weight_decay=base_wd,
+    )
     scaler = amp.GradScaler(enabled=(device.type == "cuda"))
 
     if hasattr(learner.model, "belief_head"):
