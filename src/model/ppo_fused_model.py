@@ -184,6 +184,7 @@ class PPOFusedModel(nn.Module):
         # Belief probe uses a detached, non-regularized code for purer analysis
         # We re-calculate it with the original activations
         strategy_code_probe = torch.matmul(activations, bricks).detach()
+        belief_logits = self.belief_head(strategy_code_probe)
         
         # Apply action mask for our turns
         LARGE_NEG = torch.finfo(action_logits.dtype).min / 4.0
@@ -196,7 +197,7 @@ class PPOFusedModel(nn.Module):
             # We return the original, non-dropped-out activations for the regularization losses
             # The losses should be based on the model's "intent", not the noisy version.
             embedding_tuple = (strategy_code_probe, activations, bricks)
-            return (action_logits, opp_logits, state_values, embedding_tuple)
+            return (action_logits, opp_logits, state_values, belief_logits, embedding_tuple)
         else:
             return (action_logits, opp_logits, state_values)
 
