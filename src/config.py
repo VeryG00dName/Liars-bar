@@ -21,7 +21,7 @@ TRANSFORMER_CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "transformer_classifi
 HISTORICAL_MODEL_DIR = PLAYERS_DIR
 
 # Optional: path to a supervised/teacher checkpoint used for warm start / teacher KL
-SL_TEACHER_CKPT = r"/mnt/l/Coding_Projects/Liars_bar_2/Liars-bar/checkpoints/autoreg_20250918_213453/autoreg_model_final.pth"
+SL_TEACHER_CKPT = r"/mnt/l/Coding_Projects/Liars_bar_2/Liars-bar/checkpoints/autoreg_20250918_002912/autoreg_model_final.pth"
 
 # ============================
 # Directory Preparation
@@ -99,59 +99,46 @@ STRATEGY_DROPOUT = 0.1
 # ============================
 # PPO / Training Hyperparameters
 # ============================
-NUM_EPISODES          = 40000
-EPISODES_PER_UPDATE   = 512
-FIXED_L_TOK           = 200
-LEARNING_RATE         = 0.00019
-WEIGHT_DECAY          = 0.0          # base WD for non-dictionary params (new; used in optimizer)
-GAMMA                 = 0.974
-GAE_LAMBDA            = 0.98
-EPS_CLIP              = 0.2
-K_EPOCHS              = 2
-UPDATE_STEPS          = 3
-MAX_NORM              = 0.3          # global grad clip for main params
-BELIEF_MAX_NORM       = 0.3          # probe grad clip (new; defaults to MAX_NORM in code if missing)
+NUM_EPISODES = 40000
+EPISODES_PER_UPDATE = 512
+FIXED_L_TOK = 200
+LEARNING_RATE = 0.00019
+GAMMA = 0.974
+GAE_LAMBDA = 0.98
+EPS_CLIP = 0.2
+K_EPOCHS = 2
+UPDATE_STEPS = 3
+MAX_NORM = 0.3
 
-# Entropy / Value
-INIT_ENTROPY_COEF     = 0.005
-VALUE_COEF            = 0.5          # currently unused by trainer, kept for future use
-
-# ============================
-# Auxiliary Loss Weights (Task Heads)
-# ============================
-AUX_LOSS_WEIGHT       = 1            # legacy global aux weight (kept for backward compat)
-AUX_BELIEF_WEIGHT     = 1            # belief/probe classification weight
-AUX_OPP_WEIGHT        = 1            # opponent action supervision weight
-VALUE_WEIGHT          = 1            # value loss multiplier
+# Coefficients
+INIT_ENTROPY_COEF = 0.005
+# Optional: expose value coeff (trainer currently uses 0.5 inline; this is here for future use)
+VALUE_COEF = 0.5
 
 # ============================
-# Sparse Dictionary / Bricks (New Stabilized System)
+# Auxiliary Loss Weights
 # ============================
-# Sparsity & dropout
-SPARSE_K              = 4            # top-k bricks per token
-DROPOUT_P             = 0.10         # locked/variational dropout on dictionary logits
-LOCKED_DROPOUT        = True         # documentation flag; dropout mask is [B,1,K]
+# Old global aux weight (kept for backward-compat fallback)
+AUX_LOSS_WEIGHT = 1
 
-# Regularization weights (new)
-LAMBDA_GLOBAL_BALANCE = 1e-3         # KL(p̄ || uniform), p̄ averaged over tokens (optionally opp-only)
-LAMBDA_TV             = 2e-3         # temporal variation (Huber) between consecutive tokens
-LAMBDA_DIVERSITY      = 1e-3         # Gram(off-diag)^2 on unit-norm bricks
-LAMBDA_SPARSITY       = 0.0          # optional entropy penalty on weights (0 if using strict top-k)
-
-# Dictionary optimizer (gentler updates)
-DICT_WEIGHT_DECAY     = 1e-3         # mild WD for bricks/activation encoder
-
+# Split aux weights (current PPO usage)
+AUX_BELIEF_WEIGHT = 1   # belief heads weight (was 0.5 in your PPO runs)
+AUX_OPP_WEIGHT    = 1   # opponent action weight (1.0 to match SL)
+VALUE_WEIGHT      = 1     # value loss weight
+L1_SPARSITY_WEIGHT = 0.01
+USAGE_BALANCE_WEIGHT = 1.0
+BRICK_DIVERSITY_WEIGHT = 1.0
 # ============================
 # Teacher KL / Behavior Cloning Leash
 # ============================
-BC_KL_WEIGHT          = 0            # typical range: 1e-4 .. 1e-2; 0 disables
+BC_KL_WEIGHT = 0  # typical exploration range: 1e-4 .. 1e-2 (decay in code if desired)
 
 # ============================
 # Trinal-Clip PPO (Policy) — Optional
 # ============================
-TRINAL_DELTA1         = 1.8          # requires TRINAL_DELTA1 > 1 + EPS_CLIP
-RET_STD_EMA           = 1.0          # init value for return std EMA (for stakes value clip)
-
+# Use extra upper cap δ1 for A<0; must satisfy TRINAL_DELTA1 > 1 + EPS_CLIP
+TRINAL_DELTA1 = 1.8
+RET_STD_EMA = 1.0  # initial value for return std EMA (for stakes value clip)
 # ============================
 # Off-Policy Data Buffering — Optional
 # ============================
@@ -160,26 +147,17 @@ OFFPOLICY_EP_BUFFER_MULT = 4
 # ============================
 # Stakes-Based Value Target Clip (Public-Info) — Optional
 # ============================
-EPS_V                 = 0.9          # base epsilon for value clip (try 0.3–5.0 log-scale)
-RET_STD_EMA_DECAY     = 0.99         # EMA smoothing for ReturnScale
+# Clipping of target returns by ± (EPS_V * Stakes * ReturnScale)
+EPS_V = 0.9                 # base epsilon for value clip (try 0.3–5.0 log-scale)
+RET_STD_EMA_DECAY = 0.99    # EMA smoothing for return std used as ReturnScale
 
 # Stakes components (public-only)
-STAKES_CHALLENGE_BASE = 4.0          # base when action==6 (challenge)
-STAKES_BASE_EXP       = 1.0          # curvature on base (cards played)
-STAKES_PEN_NORM       = 4.0          # normalizer for penalties used
-STAKES_PEN_EXP        = 1.0          # curvature for penalties factor
-STAKES_CLIP_MIN       = 0.5          # clamp multiplier min
-STAKES_CLIP_MAX       = 3.5          # clamp multiplier max
-
-# ============================
-# Legacy / Deprecated (kept; no functional removal)
-# ============================
-# These were used by the previous dictionary regularization scheme.
-# Leave at their current values or set to 0.0 if you want them inert,
-# but do not remove to preserve backward-compat config loading.
-L1_SPARSITY_WEIGHT     = 0.01
-USAGE_BALANCE_WEIGHT   = 1.0
-BRICK_DIVERSITY_WEIGHT = 1.0
+STAKES_CHALLENGE_BASE = 4.0  # base when action==6 (challenge)
+STAKES_BASE_EXP = 1.0        # curvature on base (cards played)
+STAKES_PEN_NORM = 4.0        # normalizer for penalties used
+STAKES_PEN_EXP = 1.0         # curvature for penalties factor
+STAKES_CLIP_MIN = 0.5        # clamp multiplier min
+STAKES_CLIP_MAX = 3.5        # clamp multiplier max
 
 # ============================
 # Logging and Checkpointing

@@ -802,10 +802,11 @@ def ppo_losses_batched(
     embedding_tuple = outs[3] if len(outs) > 3 else None   # (strategy_code, weights, bricks)
 
     strategy_code = None
-    weights = None
+    activations = None
     bricks = None
     if isinstance(embedding_tuple, tuple) and len(embedding_tuple) == 3:
-        strategy_code, weights, bricks = embedding_tuple
+        strategy_code, activations, bricks = embedding_tuple
+    belief_tokens = strategy_code
 
     B, T = our_idx.shape
     A = action_logits.size(-1)
@@ -931,13 +932,12 @@ def ppo_losses_batched(
     
     total = policy_loss + VALUE_WEIGHT * value_loss + entropy_loss
 
-    sparsity_loss = torch.zeros((), device=values_full.device)
-    global_balance_loss = torch.zeros((), device=values_full.device)
+    l1_sparsity_loss = torch.zeros((), device=values_full.device)
+    usage_balance_loss = torch.zeros((), device=values_full.device)
     brick_diversity_loss = torch.zeros((), device=values_full.device)
-    temporal_variation_loss = torch.zeros((), device=values_full.device)
     avg_brick_usage_np = None
 
-    if weights is not None:
+    if activations is not None:
         agent_types = mi.get("agent_types")
         padding_mask = mi.get("padding_mask")
         if agent_types is not None:
@@ -945,52 +945,34 @@ def ppo_losses_batched(
             if padding_mask is not None:
                 opp_mask = opp_mask & (~padding_mask.bool())
             if opp_mask.any():
-                opp_weights = weights[opp_mask]
-                weights_clamped = opp_weights.clamp_min(1e-8)
-                entropy = -(weights_clamped * weights_clamped.log()).sum(dim=-1)
-                sparsity_loss = entropy.mean()
+                opp_activations = activations[opp_mask]
+                l1_sparsity_loss = opp_activations.abs().mean()
 
-                opp_weights_full = weights * opp_mask.unsqueeze(-1).to(weights.dtype)
-                opp_count = opp_mask.sum().to(weights.dtype).clamp_min(1.0)
-                p_bar = opp_weights_full.sum(dim=(0, 1)) / opp_count
-                p_bar = p_bar / p_bar.sum().clamp_min(1e-8)
-                if p_bar.numel() > 0:
-                    uniform = torch.full_like(p_bar, 1.0 / p_bar.numel())
-                    global_balance_loss = F.kl_div(
-                        p_bar.clamp_min(1e-8).log(), uniform, reduction="sum"
-                    )
-                    avg_brick_usage_np = p_bar.detach().cpu().float().numpy()
+                brick_sums = opp_activations.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+                probs = opp_activations / brick_sums
+                probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+                log_probs = torch.log(probs + 1e-8)
+                num_bricks = probs.size(-1)
+                if num_bricks > 0:
+                    log_uniform = math.log(1.0 / num_bricks)
+                    usage_balance_loss = (probs * (log_probs - log_uniform)).sum(dim=-1).mean()
 
-                pad_mask = (
-                    padding_mask.bool()
-                    if padding_mask is not None
-                    else torch.zeros_like(opp_mask, dtype=torch.bool)
-                )
-                valid_mask = opp_mask & (~pad_mask)
-                if valid_mask.shape[1] > 1:
-                    pair_mask = valid_mask[:, 1:] & valid_mask[:, :-1]
-                    same_agent = agent_types[:, 1:] == agent_types[:, :-1]
-                    pair_mask = pair_mask & same_agent
-                    if pair_mask.any():
-                        w_t = weights[:, 1:][pair_mask]
-                        w_tm1 = weights[:, :-1][pair_mask]
-                        temporal_variation_loss = F.huber_loss(
-                            w_t, w_tm1, reduction="mean", delta=0.05
-                        )
+                avg_brick_usage = opp_activations.mean(dim=0)
+                avg_brick_usage_np = avg_brick_usage.detach().cpu().float().numpy()
 
     if bricks is not None and bricks.ndim == 2 and bricks.size(0) > 1:
-        G = bricks @ bricks.t()
-        diag = torch.diagonal(G)
-        off_diag = G - torch.diag_embed(diag)
-        denom = max(G.size(0) * (G.size(0) - 1), 1)
+        norm_bricks = F.normalize(bricks, dim=-1)
+        sim_matrix = norm_bricks @ norm_bricks.t()
+        eye = torch.eye(sim_matrix.size(0), device=sim_matrix.device, dtype=sim_matrix.dtype)
+        off_diag = sim_matrix - eye
+        denom = max(sim_matrix.size(0) * (sim_matrix.size(0) - 1), 1)
         brick_diversity_loss = off_diag.pow(2).sum() / denom
 
     total = (
         total
-        + getattr(config, "LAMBDA_SPARSITY", 0.0) * sparsity_loss
-        + getattr(config, "LAMBDA_GLOBAL_BALANCE", 0.0) * global_balance_loss
-        + getattr(config, "LAMBDA_DIVERSITY", 0.0) * brick_diversity_loss
-        + getattr(config, "LAMBDA_TV", 0.0) * temporal_variation_loss
+        + getattr(config, "L1_SPARSITY_WEIGHT", 0.0) * l1_sparsity_loss
+        + getattr(config, "USAGE_BALANCE_WEIGHT", 0.0) * usage_balance_loss
+        + getattr(config, "BRICK_DIVERSITY_WEIGHT", 0.0) * brick_diversity_loss
     )
 
     metrics: Dict[str, torch.Tensor] = {
@@ -1003,10 +985,9 @@ def ppo_losses_batched(
         "value_clip_frac": vclip_frac.detach(),
     }
 
-    metrics["sparsity_loss"] = sparsity_loss.detach()
-    metrics["global_balance_loss"] = global_balance_loss.detach()
+    metrics["l1_sparsity_loss"] = l1_sparsity_loss.detach()
+    metrics["usage_balance_loss"] = usage_balance_loss.detach()
     metrics["brick_diversity_loss"] = brick_diversity_loss.detach()
-    metrics["temporal_variation_loss"] = temporal_variation_loss.detach()
     if avg_brick_usage_np is not None:
         metrics["avg_brick_usage_np"] = avg_brick_usage_np
 

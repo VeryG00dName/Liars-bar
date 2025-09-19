@@ -606,43 +606,28 @@ def calculate_autoregressive_loss(
     opp_w    = 1.0                      # keep opponents at 1.0 (tune if needed)
     value_w  = 1.0                      # value stays at 1.0 by default
 
-    # === Dictionary regularizers (new names, stable forms) ===
-    sparsity_loss = torch.tensor(0.0, device=device)
-    global_balance_loss = torch.tensor(0.0, device=device)
+    # === New regularization losses for Sparse Dictionary ===
+    l1_sparsity_loss = torch.tensor(0.0, device=device)
+    usage_balance_loss = torch.tensor(0.0, device=device)
     brick_diversity_loss = torch.tensor(0.0, device=device)
-    tv_loss = torch.tensor(0.0, device=device)
 
     if activations is not None and activations.numel() > 0:
-        # activations are probability weights over bricks per token: [B, T, K]
-        # Opponent-only slice for global stats
+        # Opponent-only activations: [N_opp, K]
         if opp_mask.any():
-            opp_probs = activations[opp_mask]  # [N, K]
+            opp_acts = activations[opp_mask]  # shape [N, K]
+            # L1 sparsity over opponent steps
+            l1_sparsity_loss = opp_acts.abs().mean()
+
+            # Usage balance: KL divergence from uniform over bricks
+            # Compute mean activation per brick, normalize to a distribution
+            per_brick = opp_acts.sum(dim=0)
             eps = 1e-8
-
-            # Optional sparsity signal: mean entropy across tokens (encourages peaky weights)
-            pw = opp_probs.clamp_min(eps)
-            ent = -(pw * pw.log()).sum(dim=-1)
-            sparsity_loss = ent.mean()
-
-            # Global balance: KL(p_bar || uniform)
-            p_bar = opp_probs.sum(dim=0)
-            count = max(opp_probs.size(0), 1)
-            p_bar = p_bar / float(count)
-            p_bar = p_bar / p_bar.sum().clamp_min(eps)
-            Kb = p_bar.numel()
-            if Kb > 0:
-                uniform = torch.full_like(p_bar, 1.0 / Kb)
-                global_balance_loss = (p_bar * (p_bar.add(eps).log() - uniform.add(eps).log())).sum()
-
-        # Temporal variation across consecutive valid tokens (Huber with small delta)
-        w = activations
-        if w.dim() == 3 and w.size(1) > 1:
-            pair_mask = valid[:, 1:] & valid[:, :-1]
-            if pair_mask.any():
-                w_t = w[:, 1:, :][pair_mask]
-                w_tm1 = w[:, :-1, :][pair_mask]
-                tv_delta = float(getattr(config, "TV_DELTA", 0.05))
-                tv_loss = F.huber_loss(w_t, w_tm1, reduction="mean", delta=tv_delta)
+            p = per_brick / (per_brick.sum() + eps)
+            K = p.numel()
+            if K > 0:
+                uniform = torch.full_like(p, 1.0 / K)
+                # KL(p || u) = sum p * (log p - log u)
+                usage_balance_loss = (p * (torch.log(p + eps) - torch.log(uniform + eps))).sum()
 
     if bricks is not None and bricks.numel() > 0:
         # Encourage diversity by penalizing cosine similarity between different bricks
@@ -655,20 +640,19 @@ def calculate_autoregressive_loss(
             off_diag = (sim - eye)
             brick_diversity_loss = (off_diag.pow(2).sum()) / (K * (K - 1))
 
-    # Weights from config (new names)
-    w_glob = float(getattr(config, "LAMBDA_GLOBAL_BALANCE", 0.0))
-    w_tv   = float(getattr(config, "LAMBDA_TV", 0.0))
-    w_div  = float(getattr(config, "LAMBDA_DIVERSITY", 0.0))
-    w_sp   = float(getattr(config, "LAMBDA_SPARSITY", 0.0))
+    # Weights from config (fallback defaults if missing)
+    w_l1 = float(getattr(config, "L1_SPARSITY_WEIGHT", 0.01))
+    w_usage = float(getattr(config, "USAGE_BALANCE_WEIGHT", 1.0))
+    w_div = float(getattr(config, "BRICK_DIVERSITY_WEIGHT", 1.0))
 
     total = (
         self_w * self_loss
         + opp_w * opp_loss
         + value_w * value_loss
-        + w_sp  * sparsity_loss
-        + w_glob * global_balance_loss
+        + belief_w * belief_loss
+        + w_l1 * l1_sparsity_loss
+        + w_usage * usage_balance_loss
         + w_div * brick_diversity_loss
-        + w_tv * tv_loss
     )
 
     return (
@@ -676,10 +660,10 @@ def calculate_autoregressive_loss(
         self_loss,
         opp_loss,
         value_loss,
-        sparsity_loss,
-        global_balance_loss,
+        belief_loss,
+        l1_sparsity_loss,
+        usage_balance_loss,
         brick_diversity_loss,
-        tv_loss,
     )
 
 def compute_accuracy(logits, targets, mask=None):
@@ -794,23 +778,7 @@ def train_autoregressive_model(
     logger.info(f"Total parameters: {total_params}, Trainable parameters: {trainable_params}")
     
     scaler = amp.GradScaler(device=device, enabled=(device.type == 'cuda'))
-    # Optimizer groups: main vs strategy dictionary (parametrized via UnitNorm)
-    base_wd = float(getattr(config, "WEIGHT_DECAY", 1e-5))
-    dict_lr = getattr(config, "DICT_LEARNING_RATE", None)
-    if dict_lr is None:
-        dict_lr = float(learning_rate) * float(getattr(config, "DICT_LR_MULTIPLIER", 0.25))
-    dict_wd = float(getattr(config, "DICT_WEIGHT_DECAY", base_wd))
-
-    dict_params = list(model.strategy_dictionary.parameters())
-    main_params = [p for n, p in model.named_parameters() if not n.startswith("strategy_dictionary.")]
-
-    optimizer = optim.AdamW(
-        [
-            {"params": main_params, "lr": float(learning_rate), "weight_decay": base_wd},
-            {"params": dict_params, "lr": float(dict_lr), "weight_decay": dict_wd},
-        ],
-        fused=False,
-    )
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5, fused=False)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
     start_epoch, best_train_loss = 0, float('inf')
@@ -835,10 +803,9 @@ def train_autoregressive_model(
         train_agent_acc    = 0.0
         train_opponent_acc = 0.0
         # New regularization aggregators
-        train_sparsity_loss     = 0.0
-        train_global_balance_loss = 0.0
-        train_diversity_loss    = 0.0
-        train_tv_loss           = 0.0
+        train_l1_loss      = 0.0
+        train_usage_loss   = 0.0
+        train_diversity_loss = 0.0
 
         train_progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Train)", leave=False)
         for batch in train_progress:
@@ -862,10 +829,10 @@ def train_autoregressive_model(
                     self_loss,
                     opp_loss,
                     value_loss,
-                    sparsity_loss,
-                    global_balance_loss,
+                    belief_loss,
+                    l1_loss,
+                    usage_loss,
                     diversity_loss,
-                    tv_loss,
                 ) = calculate_autoregressive_loss(
                     self_logits=self_logits,
                     opp_logits=opp_logits,
@@ -890,10 +857,10 @@ def train_autoregressive_model(
             train_self_loss  += self_loss.item()
             train_opp_loss   += opp_loss.item()
             train_value_loss += value_loss.item()
-            train_sparsity_loss += float(sparsity_loss.item() if torch.is_tensor(sparsity_loss) else sparsity_loss)
-            train_global_balance_loss += float(global_balance_loss.item() if torch.is_tensor(global_balance_loss) else global_balance_loss)
+            train_belief_loss += belief_loss.item()
+            train_l1_loss     += float(l1_loss.item() if torch.is_tensor(l1_loss) else l1_loss)
+            train_usage_loss  += float(usage_loss.item() if torch.is_tensor(usage_loss) else usage_loss)
             train_diversity_loss += float(diversity_loss.item() if torch.is_tensor(diversity_loss) else diversity_loss)
-            train_tv_loss += float(tv_loss.item() if torch.is_tensor(tv_loss) else tv_loss)
             train_batches    += 1
 
             # compute accuracies
@@ -918,10 +885,10 @@ def train_autoregressive_model(
         train_value_loss   /= train_batches
         train_agent_acc    /= train_batches
         train_opponent_acc /= train_batches
-        train_sparsity_loss       /= train_batches
-        train_global_balance_loss /= train_batches
-        train_diversity_loss      /= train_batches
-        train_tv_loss             /= train_batches
+        train_belief_acc   /= train_batches
+        train_l1_loss      /= train_batches
+        train_usage_loss   /= train_batches
+        train_diversity_loss /= train_batches
 
         # scheduler step
         scheduler.step(train_total_loss)
@@ -932,8 +899,8 @@ def train_autoregressive_model(
             f"Epoch {epoch+1}/{num_epochs} (Time: {epoch_time:.2f}s)\n"
             f"  Train - Loss: {train_total_loss:.6f}, Self: {train_self_loss:.6f}, Opp: {train_opp_loss:.6f}, "
             f"Agent Acc: {train_agent_acc:.4f}, Opp Acc: {train_opponent_acc:.4f}, "
-            f"Entropy: {train_sparsity_loss:.6f}, Global: {train_global_balance_loss:.6f}, "
-            f"Diversity: {train_diversity_loss:.6f}, TV: {train_tv_loss:.6f}"
+            f"Belief Acc: {train_belief_acc:.4f}, "
+            f"L1: {train_l1_loss:.6f}, Usage: {train_usage_loss:.6f}, Diversity: {train_diversity_loss:.6f}"
         )
 
         # log to TensorBoard
@@ -941,10 +908,10 @@ def train_autoregressive_model(
         writer.add_scalar("Loss/Train/Self",   train_self_loss, epoch)
         writer.add_scalar("Loss/Train/Opp",    train_opp_loss, epoch)
         writer.add_scalar("Loss/Train/Value",  train_value_loss, epoch)
-        writer.add_scalar("Loss/Train/SparsityEntropy", train_sparsity_loss, epoch)
-        writer.add_scalar("Loss/Train/Global_Balance", train_global_balance_loss, epoch)
+        writer.add_scalar("Loss/Train/Belief", train_belief_loss / train_batches, epoch)
+        writer.add_scalar("Loss/Train/L1_Sparsity", train_l1_loss, epoch)
+        writer.add_scalar("Loss/Train/Usage_Balance", train_usage_loss, epoch)
         writer.add_scalar("Loss/Train/Brick_Diversity", train_diversity_loss, epoch)
-        writer.add_scalar("Loss/Train/Temporal_Variation", train_tv_loss, epoch)
         writer.add_scalar("Acc/Train/Agent",   train_agent_acc, epoch)
         writer.add_scalar("Acc/Train/Opponent",train_opponent_acc, epoch)
 
