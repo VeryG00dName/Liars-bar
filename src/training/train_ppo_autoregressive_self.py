@@ -120,6 +120,7 @@ def _create_new_agent(agent_type: str, device: torch.device) -> BatchPPOAutoregr
     if agent_type == 'main':
         model = PPOFusedModel(
             obs_dim=9,
+            belief_dim=64,
             num_bricks=getattr(config, "NUM_BRICKS", 32),
             brick_dim=getattr(config, "BRICK_DIM", 32),
         )
@@ -139,6 +140,11 @@ def _load_agent_from_checkpoint(
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     state_dict = checkpoint.get('model_state_dict', checkpoint)
     agent.load_models_from_checkpoint({"policy_nets": {"agent_model": state_dict}}, "agent_model")
+    if restore_proto and isinstance(checkpoint, dict) and ("proto_bank" in checkpoint):
+        try:
+            train_extras._GLOB = train_extras._GlobalProtoBank.load(checkpoint["proto_bank"])
+        except Exception:
+            pass
     return agent
 
 def _clone_agent_from_agent(src_agent: BatchPPOAutoregressiveAgent,
@@ -222,26 +228,19 @@ def train_generation(
         
     learner.model.train()
 
-    main_params = [
-        p for name, p in learner.model.named_parameters() if not name.startswith("strategy_dictionary.")
-    ]
-    dict_params = list(learner.model.strategy_dictionary.parameters())
-
     all_params = list(learner.model.parameters())
-
-    dict_lr = float(config.LEARNING_RATE * 0.25)
-    dict_wd = float(getattr(config, "DICT_WEIGHT_DECAY", 0.0))
-    base_wd = float(getattr(config, "WEIGHT_DECAY", 0.0))
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": main_params},
-            {"params": dict_params, "lr": dict_lr, "weight_decay": dict_wd},
-        ],
-        lr=float(config.LEARNING_RATE),
-        weight_decay=base_wd,
-    )
+    optimizer = torch.optim.AdamW(all_params, lr=float(config.LEARNING_RATE))
     scaler = amp.GradScaler(enabled=(device.type == "cuda"))
 
+    if hasattr(learner.model, "belief_head"):
+        belief_head_params = list(learner.model.belief_head.parameters())
+    else:
+        belief_head_params = []
+    belief_param_ids = {id(p) for p in belief_head_params}
+    # Keep belief-head gradients isolated so the probe loss never triggers clipping on the main policy/value stack.
+    non_belief_params = [p for p in all_params if id(p) not in belief_param_ids]
+    belief_max_norm = float(getattr(config, "BELIEF_MAX_NORM", config.MAX_NORM))
+    
     # Build unified policy map: include C++ bot wrappers for labels 0..6,
     # historical AI agents at their stored labels (>=7), and the current learner.
     policy_map: Dict[int, Any] = {}
@@ -343,7 +342,11 @@ def train_generation(
                 total_loss, metrics = ppo_losses_batched(learner.model, batch_gpu, sl_teacher=None)
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
-            clip_grad_norm_(all_params, max_norm=float(config.MAX_NORM))
+            # Clip the core model separately so belief-head spikes cannot shrink its update.
+            if non_belief_params:
+                clip_grad_norm_(non_belief_params, max_norm=float(config.MAX_NORM))
+            if belief_head_params:
+                clip_grad_norm_(belief_head_params, max_norm=belief_max_norm)
             scaler.step(optimizer)
             scaler.update()
             # Aggregate metrics
@@ -367,6 +370,23 @@ def train_generation(
                 if Xb.size > 0:
                     opp_rows_X.append(Xb)
                     opp_rows_L.extend(list(L_flat))
+            else:
+                emb = metrics.get("opp_embeds_batch", None)
+                if emb is not None:
+                    E_np, L_np, C_np = emb
+                    B, seats, D = E_np.shape
+                    Xb = E_np.reshape(B * seats, D)
+                    counts = C_np.reshape(B * seats)
+                    good = (~np.isnan(Xb).any(axis=1)) & (counts > 0)
+                    if not np.any(good):
+                        continue
+                    Xb = Xb[good]
+                    if L_np is not None:
+                        Lb = L_np.reshape(B * seats)[good].tolist()
+                    else:
+                        Lb = [None] * int(good.sum())
+                    opp_rows_X.append(Xb)
+                    opp_rows_L.extend(Lb)
 
             avg_usage = metrics.get("avg_brick_usage_np")
             if avg_usage is not None:
@@ -404,6 +424,7 @@ def train_generation(
         writer.add_scalar("Loss/Total", avg.get("total_loss", 0.0), update)
         writer.add_scalar("Loss/Policy", avg.get("policy_loss", 0.0), update)
         writer.add_scalar("Loss/Value", avg.get("value_loss", 0.0), update)
+        writer.add_scalar("Loss/Belief", avg.get("belief_loss", 0.0), update)
         writer.add_scalar("Loss/Opponent", avg.get("opp_loss", 0.0), update)
         writer.add_scalar("Loss/L1Sparsity", avg.get("l1_sparsity_loss", 0.0), update)
         writer.add_scalar("Loss/UsageBalance", avg.get("usage_balance_loss", 0.0), update)
@@ -422,6 +443,7 @@ def train_generation(
                 writer.add_scalar(f"PerOpponent/episodes_vs_{label}", total, update)
         writer.add_scalar("Buffer/Size", len(ep_buffer), update)
         writer.add_scalar("Acc/OpponentAction", avg.get("opp_action_acc", 0.0), update)
+        writer.add_scalar("Acc/Belief", avg.get("belief_acc", 0.0), update)
         
         if (update % 50) == 0 and opp_rows_X:
             X = np.concatenate(opp_rows_X, axis=0)            # [N, D]
@@ -457,7 +479,13 @@ def train_generation(
         if update % int(config.CHECKPOINT_INTERVAL) == 0:
             path = os.path.join(run_ckpt_dir, f"update_{update}.pth")
             to_save = getattr(learner.model, "_orig_mod", learner.model)
-            torch.save({"model_state_dict": to_save.state_dict()}, path)
+            extra = {}
+            if (train_extras._GLOB is not None) and (getattr(train_extras._GLOB, 'C', None) is not None):
+                try:
+                    extra["proto_bank"] = train_extras._GLOB.state_dict()
+                except Exception:
+                    pass
+            torch.save({"model_state_dict": to_save.state_dict(), **extra}, path)
 
         if avg_brick_usage_chunks:
             stacked_usage = np.stack(avg_brick_usage_chunks)  # [num_chunks, K]
@@ -473,7 +501,13 @@ def train_generation(
     # 5. FINALIZE AND SAVE
     final_path = os.path.join(run_ckpt_dir, "final.pth")
     to_save = getattr(learner.model, "_orig_mod", learner.model)
-    torch.save({"model_state_dict": to_save.state_dict()}, final_path)
+    extra = {}
+    if (train_extras._GLOB is not None) and (getattr(train_extras._GLOB, 'C', None) is not None):
+        try:
+            extra["proto_bank"] = train_extras._GLOB.state_dict()
+        except Exception:
+            pass
+    torch.save({"model_state_dict": to_save.state_dict(), **extra}, final_path)
     pool_manager.add_agent(name=run_name, model_type='main', path=final_path)
     writer.close()
     logging.info(f"Saved final model for '{run_name}' to {final_path}")

@@ -54,6 +54,7 @@ class PPOFusedModel(nn.Module):
     def __init__(self,
                  obs_dim,
                  action_dim=7,
+                 belief_dim=64,
                  hidden_dim=256,
                  num_heads=4,
                  num_layers=2,
@@ -66,6 +67,7 @@ class PPOFusedModel(nn.Module):
         super().__init__()
         self.obs_dim = obs_dim
         self.action_dim = action_dim
+        self.belief_dim = belief_dim # Kept for belief_head probe compatibility
         self.hidden_dim = hidden_dim
         self.max_seq_length = max_seq_length
         self.count_pad = 4
@@ -108,6 +110,9 @@ class PPOFusedModel(nn.Module):
         )
 
         # === Heads (Updated to use the new strategy code) ===
+        # Probe for backward-compatible belief analysis
+        self.belief_head = nn.Linear(brick_dim, belief_dim)
+        
         # FiLM layer now conditioned on the strategy code's dimension
         self.pv_film = StrategyFiLM(feat_dim=hidden_dim, cond_dim=brick_dim, use_ln=True)
 
@@ -199,7 +204,7 @@ class PPOFusedModel(nn.Module):
             embedding_tuple = (strategy_code_probe, activations, bricks)
             return (action_logits, opp_logits, state_values, belief_logits, embedding_tuple)
         else:
-            return (action_logits, opp_logits, state_values)
+            return (action_logits, opp_logits, state_values, belief_logits)
 
     # ===== Convenience helpers (Unchanged) =====
     @staticmethod

@@ -31,7 +31,7 @@ class PPOAutoregressiveAgent(BaseAgent):
         self.extended_action_dim: Optional[int] = 9
         self.hidden_dim: Optional[int] = 256
         self.max_seq_length: Optional[int] = None
-        self.belief_dim: Optional[int] = None
+        self.belief_dim: Optional[int] = 7 # Inferred from the model's belief head
         self._mask_by_step = {}
         # --- Runtime state ---
         self.sequence_history: List[Dict[str, Any]] = []
@@ -119,6 +119,7 @@ class PPOAutoregressiveAgent(BaseAgent):
                 activation_w = model_state_dict.get("strategy_dictionary.activation_encoder.2.weight")
                 activation_b = model_state_dict.get("strategy_dictionary.activation_encoder.2.bias")
                 opp_head_w = model_state_dict.get("opp_action_head.weight")
+                belief_head_w = model_state_dict.get("belief_head.weight")
 
                 if activation_w is not None:
                     inferred_num_bricks = activation_w.shape[0]
@@ -128,6 +129,8 @@ class PPOAutoregressiveAgent(BaseAgent):
 
                 if opp_head_w is not None:
                     inferred_brick_dim = opp_head_w.shape[1]
+                elif belief_head_w is not None:
+                    inferred_brick_dim = belief_head_w.shape[1]
 
             if inferred_num_bricks is None:
                 inferred_num_bricks = getattr(config, "NUM_BRICKS", 32) or 32
@@ -140,6 +143,7 @@ class PPOAutoregressiveAgent(BaseAgent):
         self.model = ModelClass(
             obs_dim=9,
             action_dim=7,
+            belief_dim=64,
             hidden_dim=256,
             max_seq_length=256,
             **model_kwargs  # Pass specific args like use_shared_belief_head here

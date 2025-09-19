@@ -30,7 +30,202 @@ from sklearn.metrics import (
 from sklearn.neighbors import NearestNeighbors
 import umap.umap_ as umap
 
-HARD_BOT_MAX_ID = 6
+# =============================================================================
+# Opponent relabel configuration & prototype bank (module scope)
+# =============================================================================
+
+"""
+Relabeling config (bots keep 0..6); learned opponents use 20..64.
+We maintain a larger internal prototype bank, but expose at most
+MAX_VISIBLE_SUB visible labels at any time. A prototype becomes
+visible only after it has accrued MIN_SUPPORT_TO_SHOW support.
+"""
+# ---- Relabeling config (bots keep 0..6) ----
+HARD_BOT_MAX_ID   = 6
+LEARNED_LABEL_MIN = 20
+LEARNED_LABEL_MAX = 64
+_MAX_SUB = LEARNED_LABEL_MAX - LEARNED_LABEL_MIN + 1  # hard cap (internal bank)
+
+# how many sublabels you actually want to SEE/use (choose 8–16)
+MAX_VISIBLE_SUB = 12
+# A prototype becomes visible once its share of total support >= this pct (e.g., 0.10 == 10%)
+MIN_SUPPORT_PCT_TO_SHOW = 0.10
+
+
+class _GlobalProtoBank:
+    """
+    Keeps a large(ish) pool of prototypes but exposes at most MAX_VISIBLE_SUB
+    'visible' clusters. Non-visible clusters are mapped to their nearest visible one.
+
+    Promotion rule: a proto becomes visible when (n_j / sum_k n_k) >= MIN_SUPPORT_PCT_TO_SHOW,
+    subject to available visible budget and label space.
+    """
+    def __init__(self, dim: int, sim_th: float = 0.85, ema: float = 0.05,
+                 max_k: int = _MAX_SUB, max_visible: int = MAX_VISIBLE_SUB,
+                 min_support_pct_to_show: float = MIN_SUPPORT_PCT_TO_SHOW):
+        self.dim = int(dim)
+        self.sim_th = float(sim_th)
+        self.ema = float(ema)
+        self.max_k = int(max_k)
+        self.max_visible = int(max_visible)
+        self.min_support_pct_to_show = float(min_support_pct_to_show)
+
+        self.C = None      # [k, D] prototypes (unit-norm)
+        self.n = None      # [k]   support counts
+        # visible mapping: proto_idx -> visible_label (20..)
+        self._vis_map = {}           # {proto_idx: visible_label}
+        self._next_vis_label = LEARNED_LABEL_MIN
+
+    @staticmethod
+    def _norm(x):
+        n = np.linalg.norm(x, axis=-1, keepdims=True) + 1e-9
+        return x / n
+
+    def _maybe_make_visible(self, j: int):
+        """Promote proto j to a visible label if we have budget and support share."""
+        if j in self._vis_map:
+            return
+        if len(self._vis_map) >= self.max_visible:
+            return
+        total = float(self.n.sum()) if (self.n is not None and self.n.size > 0) else 0.0
+        if total <= 0.0:
+            return
+        share = float(self.n[j]) / total
+        if share < self.min_support_pct_to_show:
+            return
+        lbl = self._next_vis_label
+        if lbl > LEARNED_LABEL_MAX:
+            return
+        self._vis_map[j] = lbl
+        self._next_vis_label += 1
+
+    def _nearest_visible_label(self, Xn: np.ndarray) -> np.ndarray:
+        """Return visible labels for Xn [N,D] by NN to visible prototypes.
+           If no visible prototypes exist, return -1 for all rows."""
+        if not self._vis_map:
+            return np.full((Xn.shape[0],), -1, np.int64)
+        vis_idx = np.array(list(self._vis_map.keys()), dtype=np.int64)  # [m]
+        Cn_vis = self.C[vis_idx]                                        # [m,D]
+        sims = Xn @ Cn_vis.T                                            # [N,m]
+        nn = sims.argmax(1)
+        vis_labels = np.array([self._vis_map[int(vi)] for vi in vis_idx], np.int64)
+        return vis_labels[nn]                                           # [N]
+
+    def assign(self, X: np.ndarray, tokens_per_row: np.ndarray | None = None):
+        """
+        X: [N,D] float32 seat-level embeddings. Returns:
+            sub_id   [N]  (internal proto indices 0..k-1)
+            conf     [N]  cosine sim to assigned proto
+            vis_lbl  [N]  visible label in 20..64, or -1 if none yet
+        """
+        X = np.asarray(X, np.float32)
+        N = X.shape[0]
+        if N == 0:
+            return (np.empty((0,), np.int64),
+                    np.empty((0,), np.float32),
+                    np.empty((0,), np.int64))
+        Xn = self._norm(X)
+
+        # cold start
+        if self.C is None:
+            self.C = Xn[:1].copy()
+            self.n = np.array([1.0], np.float32)
+
+        Cn = self._norm(self.C)
+        sims = Xn @ Cn.T                      # [N,k]
+        best = sims.argmax(1)
+        conf = sims.max(1)
+        take = conf >= self.sim_th
+
+        # update / spawn
+        for i in range(N):
+            xi = Xn[i]
+            j  = int(best[i])
+            # Only update EMA if we 'trust' this point
+            ok_tokens = (0 if tokens_per_row is None else int(tokens_per_row[i]))
+            if take[i] and ok_tokens >= 6:
+                w = self.ema
+                self.C[j] = self._norm((1.0 - w) * self.C[j] + w * xi)
+                self.n[j] += 1.0
+            else:
+                # spawn if not similar and have capacity, else nudge best
+                if (conf[i] < self.sim_th) and (self.C.shape[0] < self.max_k):
+                    self.C = np.vstack([self.C, xi[None, :]])
+                    self.n = np.concatenate([self.n, np.array([1.0], np.float32)])
+                else:
+                    w = self.ema * 0.25
+                    self.C[j] = self._norm((1.0 - w) * self.C[j] + w * xi)
+                    self.n[j] += 1.0
+
+        # final internal assignments after updates
+        Cn = self._norm(self.C)
+        sims2 = Xn @ Cn.T
+        sub_id = sims2.argmax(1).astype(np.int64)
+        conf2  = sims2.max(1).astype(np.float32)
+
+        # maybe promote heavily used prototypes to visible
+        uniq = np.unique(sub_id)
+        for j in uniq:
+            self._maybe_make_visible(int(j))
+
+        # map to visible labels (or -1 if we have zero visible yet)
+        vis_lbl = self._nearest_visible_label(Xn)
+        return sub_id, conf2, vis_lbl
+
+    # ----- checkpoint I/O -----
+    def state_dict(self):
+        return {
+            "C": self.C, "n": self.n,
+            "vis_map": self._vis_map,
+            "next_vis_label": self._next_vis_label,
+            "sim_th": self.sim_th, "ema": self.ema,
+            "max_k": self.max_k, "max_visible": self.max_visible,
+            "min_support_pct_to_show": self.min_support_pct_to_show,  # <-- updated key
+            "dim": self.dim
+        }
+
+    @classmethod
+    def load(cls, state: dict):
+        # Fallback for older checkpoints that used an absolute MIN_SUPPORT_TO_SHOW:
+        pct = state.get("min_support_pct_to_show", None)
+        if pct is None:
+            # If only the old absolute threshold exists, we can't know the historic total support.
+            # Default to global constant as a sensible baseline.
+            pct = MIN_SUPPORT_PCT_TO_SHOW
+
+        obj = cls(dim=int(state.get("dim", 0)),
+                  sim_th=float(state.get("sim_th", 0.85)),
+                  ema=float(state.get("ema", 0.05)),
+                  max_k=int(state.get("max_k", _MAX_SUB)),
+                  max_visible=int(state.get("max_visible", MAX_VISIBLE_SUB)),
+                  min_support_pct_to_show=float(pct))
+        obj.C = state["C"].astype(np.float32)
+        obj.n = state["n"].astype(np.float32)
+        obj._vis_map = {int(k): int(v) for k, v in state["vis_map"].items()}
+        obj._next_vis_label = int(state["next_vis_label"])
+        return obj
+
+
+_GLOB: Optional[_GlobalProtoBank] = None
+
+# Belief-head class index mapping (visible label -> fixed class index)
+BELIEF_NUM_CLASSES = 64
+_CLASSMAP: Dict[int, int] = {i: i for i in range(HARD_BOT_MAX_ID + 1)}
+_INVCLASS: Dict[int, int] = {i: i for i in range(HARD_BOT_MAX_ID + 1)}
+
+
+def class_index_for(visible_label: int) -> int:
+    """Map a visible label (0..6, 20..64) to a stable class index."""
+    v = int(visible_label)
+    idx = _CLASSMAP.get(v)
+    if idx is not None:
+        return idx
+    nxt = len(_CLASSMAP)
+    if nxt >= BELIEF_NUM_CLASSES:
+        return -1
+    _CLASSMAP[v] = nxt
+    _INVCLASS[nxt] = v
+    return nxt
 
 def set_seed(seed=42):
     """
@@ -690,6 +885,7 @@ GAE_LAMBDA        = float(getattr(config, "GAE_LAMBDA", 0.98))
 
 # --- Loss Function Weights ---
 VALUE_WEIGHT      = float(getattr(config, "VALUE_WEIGHT", 1.0))
+AUX_BELIEF_WEIGHT = float(getattr(config, "AUX_BELIEF_WEIGHT", 0.3))
 AUX_OPP_WEIGHT    = float(getattr(config, "AUX_OPP_WEIGHT", 0.5))
 BC_KL_WEIGHT      = float(getattr(config, "BC_KL_WEIGHT", 0.002))
 
@@ -779,6 +975,7 @@ def ppo_losses_batched(
     Fully batched PPO objective with:
       • irregular-step GAE computed inside (from batch['rewards'] & model values)
       • stakes-based value target clipping (optional)
+      • belief-head CE (batched, masked; -100 ignored)
       • opponent action CE (batched; NO action masking; -100 ignored)
       • optional teacher KL at OUR steps
 
@@ -786,6 +983,7 @@ def ppo_losses_batched(
       mi, our_idx [B,T], mask [B,T], actions [B,T], old_logp [B,T],
       rewards [B,T], penalties_used [B,T],
       our_action_mask [B,L,A] or None,
+      belief_tgt{0,1,2}, belief{0,1,2}_mask,
       opp_idx [B,To], opp_targets [B,To], opp_have_label [B,To]
     """
     mi = batch["mi"]
@@ -799,7 +997,8 @@ def ppo_losses_batched(
     action_logits = outs[0]                                # [B, L, A]
     opp_logits    = outs[1] if len(outs) > 1 else None     # [B, L, A] or None
     values_full   = outs[2].squeeze(-1).to(torch.float32)  # [B, L]
-    embedding_tuple = outs[3] if len(outs) > 3 else None   # (strategy_code, weights, bricks)
+    belief_logits = outs[3]                                # [B, L, D]
+    embedding_tuple = outs[4] if len(outs) > 4 else None   # (strategy_code, activations, bricks)
 
     strategy_code = None
     activations = None
@@ -1017,33 +1216,148 @@ def ppo_losses_batched(
     opp_have_label = batch.get("opp_have_label", None)     # [B, To]
     device = values_full.device
 
-    # ---- Opponent embedding visualization ----
-    episode_labels = batch.get("episode_player_labels", None)
-    if strategy_code is not None:
-        agent_types = mi.get("agent_types")
-        padding_mask = mi.get("padding_mask")
-        if agent_types is not None:
-            embeds_flat: List[np.ndarray] = []
-            labels_flat: List[Any] = []
-            B_emb, _, _ = strategy_code.shape
-            for b in range(B_emb):
-                labels_for_episode = None
-                if isinstance(episode_labels, (list, tuple)) and b < len(episode_labels):
-                    labels_for_episode = episode_labels[b]
-                for seat in (1, 2, 3):
-                    seat_mask = (agent_types[b] == seat)
-                    if padding_mask is not None:
-                        seat_mask = seat_mask & (~padding_mask[b].bool())
-                    if seat_mask.any():
-                        seat_embed = strategy_code[b, seat_mask].mean(dim=0)
-                        embeds_flat.append(seat_embed.detach().cpu().float().numpy())
-                        seat_label = None
-                        if isinstance(labels_for_episode, (list, tuple)) and seat < len(labels_for_episode):
-                            seat_label = labels_for_episode[seat]
-                        labels_flat.append(seat_label)
-            if embeds_flat:
-                metrics["opp_embeds_flat"] = np.stack(embeds_flat, axis=0)
-                metrics["opp_labels_flat"] = labels_flat
+    # ---- Aux: single detached belief head on OPPONENT tokens ----
+    belief_idx  = batch.get("belief_idx", None)   # [B, To]
+    belief_tgt  = batch.get("belief_tgt", None)   # [B, To], -100 ignored
+    belief_have = batch.get("belief_have", None)  # [B, To] bool
+
+    # ---- Seat-level opponent embeddings & relabeling ----
+    if (belief_tokens is not None) and (belief_idx is not None) and (belief_tgt is not None):
+        with torch.no_grad():
+            device_bt = belief_tokens.device
+            B_tok, L_tok, D_tok = belief_tokens.shape
+
+            idx = belief_idx.long().clamp_min(0)
+            tok = belief_tokens.gather(1, idx.unsqueeze(-1).expand(-1, -1, D_tok))
+
+            seats = mi["agent_types"].long().gather(1, idx)
+            have_mask = belief_have if belief_have is not None else torch.ones_like(idx, dtype=torch.bool)
+            valid = have_mask & (seats > 0) & (belief_idx >= 0)
+
+            raw_lbl = belief_tgt.clone()
+
+            E_list: List[torch.Tensor] = []
+            L_list: List[torch.Tensor] = []
+            C_list: List[torch.Tensor] = []
+
+            for s in (1, 2, 3):
+                m = (seats == s) & valid
+                w = m.float().unsqueeze(-1)
+
+                Es = (tok * w).sum(1) / w.sum(1).clamp_min(1e-6)
+                Ls = ((raw_lbl.float() * m.float()).sum(1) / m.float().sum(1).clamp_min(1)).round().long()
+                counts = m.float().sum(1)
+
+                empty = (counts == 0)
+                Es[empty] = float('nan')
+                Ls[empty] = -1
+
+                E_list.append(Es)
+                L_list.append(Ls)
+                C_list.append(counts)
+
+            E = torch.stack(E_list, dim=1)
+            opp_policy_by_seat = torch.stack(L_list, dim=1)
+            seat_counts = torch.stack(C_list, dim=1)
+
+            metrics["opp_embeds_batch"] = (
+                E.detach().cpu().float().numpy(),
+                opp_policy_by_seat.detach().cpu().numpy(),
+                seat_counts.detach().cpu().float().numpy(),
+            )
+
+            # ---- Global sublabels per (seat, episode) for learned opponents only ----
+            try:
+                device = values_full.device
+                E_np = E.detach().cpu().float().numpy()                     # [B,3,D]
+                P_np = opp_policy_by_seat.detach().cpu().numpy()            # [B,3]
+                B_, S, D_ = E_np.shape
+                X_flat = E_np.reshape(B_ * S, D_)                           # [B*3, D]
+                P_flat = P_np.reshape(B_ * S)                               # [B*3]
+
+                valid_flat = (~np.isnan(X_flat).any(axis=1)) & (P_flat > HARD_BOT_MAX_ID)
+                X_learned = X_flat[valid_flat]
+                idx_back  = np.nonzero(valid_flat)[0]
+
+                global _GLOB
+                if _GLOB is None:
+                    _GLOB = _GlobalProtoBank(dim=D_, sim_th=0.85, ema=0.05,
+                                             max_k=_MAX_SUB, max_visible=MAX_VISIBLE_SUB)
+
+                # tokens_per_row optional: you can pass seat token counts here for extra gating
+                sub_id, conf, vis_lbl = _GLOB.assign(X_learned)             # each length N
+
+                # build final visible labels: bots keep 0..6; learned use vis_lbl (20..), fallback to nearest visible
+                relabels = np.full((B_ * S,), -1, dtype=np.int64)
+                relabels[idx_back] = vis_lbl
+                # if no visible clusters yet, you’ll get -1; just skip those seats this update
+
+                final_labels_flat = np.where(P_flat <= HARD_BOT_MAX_ID, P_flat.astype(np.int64), relabels)
+                final_labels = final_labels_flat.reshape(B_, S)
+
+                metrics["opp_relabel_ids_by_seat"]  = final_labels
+                # For plotting (drop -1s)
+                good_plot = (~np.isnan(X_flat).any(axis=1)) & (final_labels_flat >= 0)
+                metrics["opp_embeds_flat"]          = X_flat[good_plot]
+                metrics["opp_labels_flat"]          = final_labels_flat[good_plot].tolist()
+
+            except Exception:
+                pass
+
+            # ---- Map visible labels back to token-level targets ----
+            if 'final_labels' in locals():
+                seat_labels_t = torch.from_numpy(final_labels).to(device_bt, dtype=torch.long)
+                seats_tok = seats.clamp(min=0, max=3) - 1
+                tok_vis = torch.full_like(seats_tok, -100)
+                for s in (0, 1, 2):
+                    m = (seats_tok == s) & valid
+                    if m.any():
+                        seat_vals = seat_labels_t[:, s].unsqueeze(1).expand_as(seats_tok)
+                        tok_vis[m] = seat_vals[m]
+
+                tok_cls = torch.full_like(tok_vis, -100)
+                m_use = tok_vis >= 0
+                if m_use.any():
+                    vis_cpu = tok_vis[m_use].detach().cpu().numpy().tolist()
+                    cls_cpu = np.array([class_index_for(int(v)) for v in vis_cpu], dtype=np.int64)
+                    cls_cpu[cls_cpu < 0] = -100
+                    tok_cls_vals = torch.from_numpy(cls_cpu).to(device_bt, dtype=torch.long)
+                    tok_cls[m_use] = tok_cls_vals
+
+                belief_tgt.copy_(tok_cls)
+                new_have = tok_cls != -100
+                if belief_have is not None:
+                    belief_have.copy_(new_have)
+                else:
+                    belief_have = new_have
+
+    belief_loss = torch.zeros((), device=device)
+    belief_acc  = torch.zeros((), device=device)
+
+    if (AUX_BELIEF_WEIGHT > 0.0) and (belief_idx is not None) and (belief_tgt is not None) and (belief_logits is not None):
+        B_, L_, C_ = belief_logits.shape
+        b_sel = belief_logits.gather(1, belief_idx.unsqueeze(-1).expand(-1, -1, C_))
+
+        ce = torch.nn.functional.cross_entropy(
+            b_sel.reshape(-1, C_), belief_tgt.reshape(-1),
+            ignore_index=-100, reduction="none"
+        ).view_as(belief_tgt)
+
+        if belief_have is not None:
+            w = belief_have.to(ce.dtype)
+            if w.sum() > 0:
+                belief_loss = (ce * w).sum() / w.sum().clamp_min(1.0)
+                with torch.no_grad():
+                    pred = b_sel.argmax(dim=-1)
+                    belief_acc = (((pred == belief_tgt) & belief_have).sum().to(torch.float32)
+                                / belief_have.sum().clamp_min(1))
+        else:
+            belief_loss = ce.mean()
+
+        total = total + AUX_BELIEF_WEIGHT * belief_loss
+
+    metrics["belief_loss"] = belief_loss.detach()
+    metrics["belief_acc"]  = belief_acc.detach()
 
     # ---- Aux: opponent action supervision (re-use opp_idx/targets/mask) ----
     opp_loss = torch.zeros((), device=device)
@@ -1089,6 +1403,7 @@ def _collate_batch(
       mi: dict with only time-major tensors (dim>=2) padded to L_pad, plus 'valid_lengths' [B]
       our_idx [B,T], mask [B,T], actions [B,T], old_logp [B,T], rewards [B,T],
       penalties_used [B,T], our_action_mask [B,L_pad,A] or None,
+      belief_tgt{0,1,2} [B,T], belief{0,1,2}_mask [B,T],
       opp_idx [B,To], opp_targets [B,To], opp_have_label [B,To]
       padding_mask [B,L_pad] (True where padded)
     """
@@ -1209,6 +1524,11 @@ def _collate_batch(
     rewards    = _pm(torch.zeros((B, T),  dtype=torch.float32))
     pen_used   = _pm(torch.zeros((B, T),  dtype=torch.long))
 
+    # Belief targets at opponent tokens (filled on opponent turns)
+    belief_idx   = _pm(torch.zeros((B, To), dtype=torch.long))
+    belief_tgt   = _pm(torch.full((B, To), IGN, dtype=torch.long))
+    belief_have  = _pm(torch.zeros((B, To), dtype=torch.bool))
+
     # Opponent action supervision (unchanged)
     opp_idx        = _pm(torch.zeros((B, To),  dtype=torch.long))
     opp_targets    = _pm(torch.full((B, To), IGN, dtype=torch.long))
@@ -1267,6 +1587,17 @@ def _collate_batch(
                     opp_targets[b, t_local] = int(tgt)
                     opp_have_label[b, t_local] = True
 
+                # ---- Belief supervision ON THE SAME OPPONENT TOKEN ----
+                t_global = int(opp_pos[t_local].item())
+                belief_idx[b, t_local] = t_global
+
+                seat_acting = int(agent_id_seq[step_ep])  # absolute seat at this step
+                if 0 <= seat_acting < len(player_labels):
+                    lbl = player_labels[seat_acting]
+                    if lbl is not None:
+                        belief_tgt[b, t_local]  = int(lbl)
+                        belief_have[b, t_local] = True
+
     return {
         "mi": mi_batch,
         "our_idx": our_idx,
@@ -1276,10 +1607,14 @@ def _collate_batch(
         "rewards": rewards,
         "penalties_used": pen_used,
         "our_action_mask": our_action_mask,
+
+        "belief_idx":  belief_idx,
+        "belief_tgt":  belief_tgt,
+        "belief_have": belief_have,
+
         "opp_idx":        opp_idx,
         "opp_targets":    opp_targets,
         "opp_have_label": opp_have_label,
-        "episode_player_labels": [tuple(ep.get("player_labels", ())) for ep in episodes],
     }
 
 def _to_device_batch(batch_cpu: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
@@ -1297,10 +1632,14 @@ def _to_device_batch(batch_cpu: Dict[str, Any], device: torch.device) -> Dict[st
         "penalties_used":  batch_cpu["penalties_used"].to(device, non_blocking=True),
         "our_action_mask": oam_dev,
 
+        # NEW single-head belief supervision
+        "belief_idx":  batch_cpu["belief_idx"].to(device, non_blocking=True),
+        "belief_tgt":  batch_cpu["belief_tgt"].to(device, non_blocking=True),
+        "belief_have": batch_cpu["belief_have"].to(device, non_blocking=True),
+
         # Opponent action supervision
         "opp_idx":        batch_cpu["opp_idx"].to(device, non_blocking=True),
         "opp_targets":    batch_cpu["opp_targets"].to(device, non_blocking=True),
         "opp_have_label": batch_cpu["opp_have_label"].to(device, non_blocking=True),
-        "episode_player_labels": batch_cpu["episode_player_labels"],
     }
     return out

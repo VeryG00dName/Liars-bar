@@ -309,6 +309,8 @@ class AutoregressiveGameDataset(Dataset):
                 for seat, name in opponent_labels.items()
             }
 
+        belief_targets = []
+
         for i, step in enumerate(sequence):
             agent_id = int(step.get("agent_id", 0))
             agent_type_list.append(agent_id)
@@ -329,12 +331,18 @@ class AutoregressiveGameDataset(Dataset):
                     for idx, name in enumerate(names)
                 })
 
+            belief_targets.append(seat_label_indices.get(agent_id, 0))
+
         obs_tensor = torch.tensor(np.stack(obs_list), dtype=torch.float32)
         action_tensor = torch.tensor(input_actions, dtype=torch.long)
         target_tensor = torch.tensor(target_actions, dtype=torch.long)
         mask_tensor = torch.tensor(np.array(action_mask_list), dtype=torch.bool)
         agent_type_tensor = torch.tensor(agent_type_list, dtype=torch.long)
         position_tensor = torch.tensor(position_list, dtype=torch.long)
+
+        belief_tensor = None
+        if opponent_labels is not None or seat_label_indices:
+            belief_tensor = torch.tensor(np.array(belief_targets, dtype=np.int64), dtype=torch.long)
 
         attention_mask = torch.triu(
             torch.ones(seq_len, seq_len, dtype=torch.bool),
@@ -351,6 +359,7 @@ class AutoregressiveGameDataset(Dataset):
             "attention_mask": attention_mask,
             "length": seq_len,
             "round_id": round_data.get("round_id", round_data.get("game_id", None)),
+            "belief": belief_tensor,
         }
 
         return seq_dict
@@ -370,6 +379,8 @@ def collate_variable_length_sequences(batch):
     first_seq = batch[0]
     device = first_seq['obs'].device
     obs_dim = first_seq['obs'].shape[1]
+    belief_example = first_seq.get('belief')
+
     batched_obs = torch.zeros(batch_size, max_seq_len, obs_dim, device=device)
     batched_action = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
     batched_target_action = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
@@ -378,6 +389,15 @@ def collate_variable_length_sequences(batch):
     batched_position = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
     padding_mask = torch.ones(batch_size, max_seq_len, dtype=torch.bool, device=device)
 
+    if belief_example is not None:
+        if belief_example.dim() == 1:
+            batched_belief = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
+        else:
+            trailing = belief_example.shape[1:]
+            batched_belief = torch.zeros((batch_size, max_seq_len) + trailing, dtype=torch.long, device=device)
+    else:
+        batched_belief = None
+
     round_ids = []
     for i, seq in enumerate(batch):
         seq_len = seq["length"]
@@ -385,6 +405,8 @@ def collate_variable_length_sequences(batch):
         batched_action[i, :seq_len] = seq["action"]
         batched_target_action[i, :seq_len] = seq["target_action"]
         batched_action_mask[i, :seq_len] = seq["action_mask"]
+        if batched_belief is not None and seq["belief"] is not None:
+            batched_belief[i, :seq_len] = seq["belief"]
         batched_agent_type[i, :seq_len] = seq["agent_type"]
         batched_position[i, :seq_len] = seq["position"]
         padding_mask[i, :seq_len] = False
@@ -399,6 +421,7 @@ def collate_variable_length_sequences(batch):
         "position": batched_position,
         "padding_mask": padding_mask,
         "round_ids": round_ids,
+        "belief": batched_belief,
     }
     return batch_dict
 
@@ -548,12 +571,27 @@ def load_autoreg_data(data_dir, max_files=None, max_samples=None):
     print(f"Total loaded sequences: {len(all_rounds)}")
     return all_rounds
 
+def extract_opponent_belief_targets(agent_types: torch.Tensor, belief_targets: torch.Tensor | None):
+    """Slice the per-seat belief targets down to the acting opponent."""
+    if belief_targets is None:
+        return None
+    if belief_targets.dim() == 2:
+        return belief_targets
+    if belief_targets.dim() == 3 and belief_targets.size(-1) > 0:
+        seat_idx = torch.clamp(agent_types.long() - 1, min=0).unsqueeze(-1)
+        gathered = torch.gather(belief_targets.long(), dim=-1, index=seat_idx)
+        return gathered.squeeze(-1)
+    return None
+
+
 def calculate_autoregressive_loss(
     self_logits,
     opp_logits,
     target_actions,
     agent_types,
     padding_mask,
+    belief_logits=None,
+    belief_targets=None,
     value_pred=None,
     value_target=None,
     *,
@@ -596,8 +634,19 @@ def calculate_autoregressive_loss(
     else:
         value_loss = torch.tensor(0.0, device=device)
 
+    # === Belief loss on opponent steps ===
+    belief_loss = torch.tensor(0.0, device=device)
+    if (belief_logits is not None) and (belief_targets is not None) and (n_opp > 0):
+        opp_belief_targets = extract_opponent_belief_targets(agent_types, belief_targets)
+        if opp_belief_targets is not None:
+            flat_mask = opp_mask.reshape(-1)
+            flat_logits = belief_logits.reshape(-1, belief_logits.size(-1))[flat_mask]
+            flat_targets = opp_belief_targets.reshape(-1)[flat_mask]
+            if flat_targets.numel() > 0:
+                belief_loss = F.cross_entropy(flat_logits, flat_targets)
+
     # === Adaptive weights based on effective sample amounts ===
-    # Our-turns got rarer going 3P->4P; keep the self-policy influence stable by ~1/p(our_turn).
+    # Our-turns got rarer going 3P->4P; keep self & belief influence stable by ~1/p(our_turn).
     # Use empirical p_our_hat for robustness to padding/truncation.
     p_our_hat = n_self / max(n_total, 1)
     inv_p_our = 1.0 / max(p_our_hat, 1e-6)
@@ -605,6 +654,7 @@ def calculate_autoregressive_loss(
     self_w   = inv_p_our                # e.g., ~num_players if batches are balanced
     opp_w    = 1.0                      # keep opponents at 1.0 (tune if needed)
     value_w  = 1.0                      # value stays at 1.0 by default
+    belief_w = 1.0                      # belief is evaluated on opponent turns now
 
     # === New regularization losses for Sparse Dictionary ===
     l1_sparsity_loss = torch.tensor(0.0, device=device)
@@ -649,6 +699,7 @@ def calculate_autoregressive_loss(
         self_w * self_loss
         + opp_w * opp_loss
         + value_w * value_loss
+        + belief_w * belief_loss
         + w_l1 * l1_sparsity_loss
         + w_usage * usage_balance_loss
         + w_div * brick_diversity_loss
@@ -659,6 +710,7 @@ def calculate_autoregressive_loss(
         self_loss,
         opp_loss,
         value_loss,
+        belief_loss,
         l1_sparsity_loss,
         usage_balance_loss,
         brick_diversity_loss,
@@ -760,6 +812,7 @@ def train_autoregressive_model(
         obs_dim=obs_dim,
         action_dim=action_dim,
         hidden_dim=hidden_dim,
+        belief_dim=64,
         num_heads=hidden_dim//64,
         num_layers=2,
         dropout_rate=0.1,
@@ -797,9 +850,11 @@ def train_autoregressive_model(
         train_self_loss    = 0.0
         train_opp_loss     = 0.0
         train_value_loss   = 0.0
+        train_belief_loss  = 0.0
         train_batches      = 0
         train_agent_acc    = 0.0
         train_opponent_acc = 0.0
+        train_belief_acc   = 0.0
         # New regularization aggregators
         train_l1_loss      = 0.0
         train_usage_loss   = 0.0
@@ -819,8 +874,13 @@ def train_autoregressive_model(
                     return_embeddings=True,
                     dropout_p=float(getattr(config, "DROPOUT_P", 0.25)),
                 )
-                self_logits, opp_logits, value_pred, embedding_tuple = outs
+                self_logits, opp_logits, value_pred, belief_logits = outs[:4]
+                embedding_tuple = outs[4] if len(outs) > 4 else (None, None, None)
                 strategy_code, activations, bricks = embedding_tuple
+
+                opp_belief_targets = None
+                if batch['belief'] is not None:
+                    opp_belief_targets = extract_opponent_belief_targets(batch['agent_type'], batch['belief'])
 
                 (
                     total_loss,
@@ -837,6 +897,8 @@ def train_autoregressive_model(
                     target_actions=batch['target_action'],
                     agent_types=batch['agent_type'],
                     padding_mask=batch['padding_mask'],
+                    belief_logits=belief_logits,
+                    belief_targets=opp_belief_targets,
                     value_pred=value_pred,
                     value_target=None,
                     activations=activations,
@@ -870,10 +932,15 @@ def train_autoregressive_model(
             train_agent_acc    += agent_acc
             train_opponent_acc += opponent_acc
 
+            if belief_logits is not None and opp_belief_targets is not None:
+                belief_acc = compute_accuracy(belief_logits, opp_belief_targets, opp_mask)
+                train_belief_acc += belief_acc
+
             train_progress.set_postfix({
                 'tot': total_loss.item(),
                 'self': self_loss.item(),
-                'opp': opp_loss.item()
+                'opp': opp_loss.item(),
+                'belief': belief_loss.item()
             })
 
         # average metrics
@@ -912,6 +979,7 @@ def train_autoregressive_model(
         writer.add_scalar("Loss/Train/Brick_Diversity", train_diversity_loss, epoch)
         writer.add_scalar("Acc/Train/Agent",   train_agent_acc, epoch)
         writer.add_scalar("Acc/Train/Opponent",train_opponent_acc, epoch)
+        writer.add_scalar("Acc/Train/Belief",  train_belief_acc, epoch)
 
         # Save model if train loss improved
         if train_total_loss < best_train_loss:
@@ -925,6 +993,7 @@ def train_autoregressive_model(
                 'opponent_mapping': opponent_mapping,
                 'num_opponent_types': num_opponent_types,
                 'obs_dim': obs_dim,
+                'belief_dim': num_opponent_types,
                 'action_dim': action_dim,
                 'hidden_dim': hidden_dim
             }, checkpoint_path)
@@ -941,6 +1010,7 @@ def train_autoregressive_model(
                 'opponent_mapping': opponent_mapping,
                 'num_opponent_types': num_opponent_types,
                 'obs_dim': obs_dim,
+                'belief_dim': num_opponent_types,
                 'action_dim': action_dim,
                 'hidden_dim': hidden_dim
             }, checkpoint_path)
@@ -956,6 +1026,7 @@ def train_autoregressive_model(
         'opponent_mapping': opponent_mapping,
         'num_opponent_types': num_opponent_types,
         'obs_dim': obs_dim,
+        'belief_dim': num_opponent_types,
         'action_dim': action_dim,
         'hidden_dim': hidden_dim
     }, final_path)

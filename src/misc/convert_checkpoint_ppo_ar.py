@@ -178,17 +178,10 @@ def _convert_one_file(path_in: str, out_dir: str, episode: int):
         print(f"    - Shared Belief Head: {model_kwargs['use_shared_belief_head']}")
 
     arch_params = {
-        'obs_dim': obs_dim,
-        'action_dim': action_dim,
-        'hidden_dim': hidden_dim,
-        'max_seq_length': max_seq_length,
-        'num_heads': 4,
-        'num_layers': 2,
-        'dropout_rate': 0.1,
-        'num_agent_types': 4,
+        'obs_dim': obs_dim, 'action_dim': action_dim, 'belief_dim': belief_dim,
+        'hidden_dim': hidden_dim, 'max_seq_length': max_seq_length,
+        'num_heads': 4, 'num_layers': 2, 'dropout_rate': 0.1, 'num_agent_types': 4
     }
-    if ModelClass is not PPOFusedModel:
-        arch_params['belief_dim'] = belief_dim
     arch_params.update(model_kwargs)
     
     # Rebuild a clean model instance & load the (potentially messy) state dict

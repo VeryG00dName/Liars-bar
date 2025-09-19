@@ -91,6 +91,7 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
         self.model = ModelClass(
             obs_dim=inferred_obs_dim,
             action_dim=inferred_action_dim,
+            belief_dim=64,
             hidden_dim=inferred_hidden_dim,
             num_heads=num_heads,
             max_seq_length=inferred_max_seq,
@@ -172,7 +173,7 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
             'padding_mask':    padding_mask,
             'valid_lengths':   valid_lengths_t,
         }
-        action_logits, _, state_values = self.model(**model_input)
+        action_logits, _, state_values, _ = self.model(**model_input)
 
         rows = torch.arange(B, device=device)
         last_idx = (valid_lengths_t - 1).clamp_min(0)
