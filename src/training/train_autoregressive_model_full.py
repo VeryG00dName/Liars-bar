@@ -19,15 +19,7 @@ from typing import List
 from torch.utils.tensorboard import SummaryWriter
 from src.model.ppo_fused_model import PPOFusedModel
 from src import config
-
-torch.backends.cudnn.benchmark = True
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.set_float32_matmul_precision("high")
-
-try:
-    from torch.nn.attention import sdp_kernel
-    sdp_kernel.enable_flash(True); sdp_kernel.enable_math(False); sdp_kernel.enable_mem_efficient(True)
-except Exception: pass
+from src.training.train_extras import set_seed
 
 # Define hardcoded opponent labels consistent with other training scripts
 HARD_CODED_LABELS = {
@@ -1005,7 +997,7 @@ def main():
     
     args = parser.parse_args()
     SEED = int(getattr(config, "SEED", 42))
-    random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+    set_seed(SEED)
     
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")

@@ -56,16 +56,41 @@ def set_seed(seed=42):
     """
     Sets the seed for reproducibility.
     """
+    # Python / NumPy RNGs
+    os.environ.setdefault("PYTHONHASHSEED", str(seed))
     random.seed(seed)
     np.random.seed(seed)
+
+    # Torch RNGs (CPU & CUDA)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-    torch.backends.cudnn.deterministic = True
+    # Disable non-deterministic kernel selection / precision trade-offs
     torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    if hasattr(torch.backends, "cudnn") and hasattr(torch.backends.cudnn, "allow_tf32"):
+        torch.backends.cudnn.allow_tf32 = False
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda.matmul, "allow_tf32"):
+        torch.backends.cuda.matmul.allow_tf32 = False
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda.matmul, "allow_fp16_reduced_precision_reduction"):
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction"):
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+
+    torch.set_float32_matmul_precision("medium")
+
+    # Enforce deterministic algorithm usage (raises if unavailable)
     torch.use_deterministic_algorithms(True)
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
+
+    try:
+        from torch.nn.attention import sdp_kernel  # type: ignore
+        sdp_kernel.enable_flash(False)
+        sdp_kernel.enable_math(True)
+        sdp_kernel.enable_mem_efficient(False)
+    except Exception:
+        pass
 
 def convert_memory_to_features(memory, response_mapping, action_mapping):
     """

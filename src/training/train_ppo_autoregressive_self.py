@@ -5,7 +5,7 @@ import os, logging, warnings
 import json
 import time
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Callable
 from numpy.random import Generator
 import random
 import numpy as np
@@ -40,6 +40,7 @@ from src.training.train_extras import (
     _to_device_batch,
     ppo_losses_batched,
     visualize_opponent_embeddings_all,
+    set_seed
 )
 import src.training.train_extras as train_extras
 
@@ -48,49 +49,8 @@ def _silence_torch_symbolic_logs():
         logging.getLogger(name).setLevel(logging.ERROR)
 _silence_torch_symbolic_logs()
 
-# ------------------------- Determinism configuration -----------------------
-
-def _configure_global_determinism(seed: int) -> None:
-    """Configure all stochastic libraries to operate deterministically."""
-    # Python / NumPy RNGs
-    os.environ.setdefault("PYTHONHASHSEED", str(seed))
-    random.seed(seed)
-    np.random.seed(seed)
-
-    # Torch RNGs (CPU & CUDA)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-
-    # Disable non-deterministic kernel selection / precision trade-offs
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    if hasattr(torch.backends, "cudnn") and hasattr(torch.backends.cudnn, "allow_tf32"):
-        torch.backends.cudnn.allow_tf32 = False
-    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda.matmul, "allow_tf32"):
-        torch.backends.cuda.matmul.allow_tf32 = False
-    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda.matmul, "allow_fp16_reduced_precision_reduction"):
-        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
-    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction"):
-        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
-
-    torch.set_float32_matmul_precision("medium")
-
-    # Enforce deterministic algorithm usage (raises if unavailable)
-    torch.use_deterministic_algorithms(True)
-
-    try:
-        from torch.nn.attention import sdp_kernel  # type: ignore
-        sdp_kernel.enable_flash(False)
-        sdp_kernel.enable_math(True)
-        sdp_kernel.enable_mem_efficient(False)
-    except Exception:
-        pass
-
-
 SEED = int(getattr(config, "SEED", 42))
-_configure_global_determinism(SEED)
+set_seed(SEED)
 _GLOBAL_RNG = np.random.default_rng(SEED)
 
 # ==============================================================================
@@ -218,6 +178,8 @@ def train_generation(
     # New: cache for already loaded opponents/agents to avoid reloading
     agent_cache: Optional[Dict[str, BatchPPOAutoregressiveAgent]] = None,
     rng: Optional[Generator] = None,
+    collect_metrics: bool = False,
+    metrics_callback: Optional[Callable[[int, Dict[str, Any]], None]] = None,
 ):
     """
     Trains a single generation of an agent for 100 updates.
@@ -332,6 +294,8 @@ def train_generation(
     ep_buffer: List[Dict[str, Any]] = []
     opp_label_lookup: Dict[int, Any] = {}
     
+    collected_updates: List[Dict[str, Any]] = []
+
     for update in range(1, max_updates + 1):
         # -------- Rollout --------
         t0 = time.time()
@@ -451,6 +415,38 @@ def train_generation(
                 if training_won:
                     totals[0] += 1.0
                 totals[1] += 1.0
+        per_opponent_win_rates = {}
+        per_opponent_episode_counts = {}
+        for label, (wins_vs, total) in per_opponent_totals.items():
+            if total <= 0:
+                continue
+            label_int = int(label) if isinstance(label, (int, np.integer, str)) else label
+            try:
+                label_key = int(label_int)
+            except Exception:
+                label_key = label
+            per_opponent_win_rates[label_key] = wins_vs / total
+            per_opponent_episode_counts[label_key] = total
+
+        update_summary = {
+            "update": update,
+            "win_rate": win_rate,
+            "per_opponent_win_rates": per_opponent_win_rates,
+            "per_opponent_episode_counts": per_opponent_episode_counts,
+        }
+
+        stop_requested = False
+        if metrics_callback is not None:
+            try:
+                decision = metrics_callback(update, update_summary)
+                if bool(decision):
+                    stop_requested = True
+            except Exception as exc:
+                logging.warning(f"metrics_callback raised exception at update {update}: {exc}")
+
+        if collect_metrics:
+            collected_updates.append(update_summary)
+
         # Timings
         writer.add_scalar("Time/Rollout", dur_roll, update)
         writer.add_scalar("Time/Optimize", dur_opt, update)
@@ -471,12 +467,27 @@ def train_generation(
         writer.add_scalar("Diag/ReturnStdEMA", getattr(config, "RET_STD_EMA", 1.0), update)
         # Rollout stats
         writer.add_scalar("Rollout/WinRate", win_rate, update)
-        for label, (wins_vs, total) in sorted(per_opponent_totals.items(), key=lambda item: str(item[0])):
+        # Sort once (same criterion you use below)
+        sorted_items = sorted(per_opponent_totals.items(), key=lambda item: str(item[0]))
+
+        # Log per-opponent metrics
+        for label, (wins_vs, total) in sorted_items:
             if total > 0:
                 writer.add_scalar(f"PerOpponent/win_rate_vs_{label}", wins_vs / total, update)
                 writer.add_scalar(f"PerOpponent/episodes_vs_{label}", total, update)
+
+        # Also log the largest label's win rate under a fixed name
+        if sorted_items:
+            most_recent_label, (mr_wins, mr_total) = sorted_items[-1]  # largest by str(label)
+            if mr_total > 0:
+                writer.add_scalar("PerOpponent/Win_rate_vs_most_recent", mr_wins / mr_total, update)
         writer.add_scalar("Buffer/Size", len(ep_buffer), update)
         writer.add_scalar("Acc/OpponentAction", avg.get("opp_action_acc", 0.0), update)
+
+        # Allow early stopping of the generation if requested by the callback
+        if stop_requested:
+            logging.info(f"Early stop requested at update {update}; finalizing generation '{run_name}'.")
+            break
         
         if (update % 50) == 0 and opp_rows_X:
             X = np.concatenate(opp_rows_X, axis=0)            # [N, D]
@@ -540,6 +551,15 @@ def train_generation(
     pool_manager.add_agent(name=run_name, model_type='main', path=final_path)
     writer.close()
     logging.info(f"Saved final model for '{run_name}' to {final_path}")
+
+    result: Dict[str, Any] = {
+        "run_name": run_name,
+        "final_model_path": final_path,
+    }
+    if collect_metrics:
+        result["update_metrics"] = collected_updates
+
+    return result
 
 
 # ==============================================================================
