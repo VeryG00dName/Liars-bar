@@ -6,6 +6,7 @@ import json
 import time
 from datetime import datetime
 from typing import Dict, Any, List, Optional
+from numpy.random import Generator
 import random
 import numpy as np
 import argparse
@@ -16,6 +17,8 @@ os.environ.pop("TORCH_LOGS", None)           # disable extra compile logs
 os.environ.setdefault("TORCHDYNAMO_VERBOSE", "0")
 os.environ.setdefault("TORCH_COMPILE_DEBUG", "0")
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+# Deterministic cuBLAS workspace requirement for CUDA
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
 
 # Hide symbolic_shapes warnings printed via warnings module (belt-and-suspenders)
 warnings.filterwarnings("ignore", message=".*symbolic_shapes.*")
@@ -45,19 +48,50 @@ def _silence_torch_symbolic_logs():
         logging.getLogger(name).setLevel(logging.ERROR)
 _silence_torch_symbolic_logs()
 
-# ---------------------- Speed knobs (no determinism) -----------------------
-torch.backends.cudnn.benchmark = True
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.set_float32_matmul_precision("high")
+# ------------------------- Determinism configuration -----------------------
 
-try:
-    from torch.nn.attention import sdp_kernel
-    sdp_kernel.enable_flash(True); sdp_kernel.enable_math(False); sdp_kernel.enable_mem_efficient(True)
-except Exception: pass
+def _configure_global_determinism(seed: int) -> None:
+    """Configure all stochastic libraries to operate deterministically."""
+    # Python / NumPy RNGs
+    os.environ.setdefault("PYTHONHASHSEED", str(seed))
+    random.seed(seed)
+    np.random.seed(seed)
 
-# Lightweight seeding (no determinism)
+    # Torch RNGs (CPU & CUDA)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    # Disable non-deterministic kernel selection / precision trade-offs
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    if hasattr(torch.backends, "cudnn") and hasattr(torch.backends.cudnn, "allow_tf32"):
+        torch.backends.cudnn.allow_tf32 = False
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda.matmul, "allow_tf32"):
+        torch.backends.cuda.matmul.allow_tf32 = False
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda.matmul, "allow_fp16_reduced_precision_reduction"):
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction"):
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+
+    torch.set_float32_matmul_precision("medium")
+
+    # Enforce deterministic algorithm usage (raises if unavailable)
+    torch.use_deterministic_algorithms(True)
+
+    try:
+        from torch.nn.attention import sdp_kernel  # type: ignore
+        sdp_kernel.enable_flash(False)
+        sdp_kernel.enable_math(True)
+        sdp_kernel.enable_mem_efficient(False)
+    except Exception:
+        pass
+
+
 SEED = int(getattr(config, "SEED", 42))
-random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+_configure_global_determinism(SEED)
+_GLOBAL_RNG = np.random.default_rng(SEED)
 
 # ==============================================================================
 # SECTION 1: HELPER CLASSES AND FUNCTIONS
@@ -183,6 +217,7 @@ def train_generation(
     warm_start_path: Optional[str] = None,
     # New: cache for already loaded opponents/agents to avoid reloading
     agent_cache: Optional[Dict[str, BatchPPOAutoregressiveAgent]] = None,
+    rng: Optional[Generator] = None,
 ):
     """
     Trains a single generation of an agent for 100 updates.
@@ -289,7 +324,7 @@ def train_generation(
 
     # 3. INITIALIZE ARENA, ROLLOUT MANAGER, AND PLATEAU DETECTOR
     arena = lb.VecArena()
-    rollout_manager = PPOVecRolloutManager(arena, policy_map, device)
+    rollout_manager = PPOVecRolloutManager(arena, policy_map, device, rng=(rng or _GLOBAL_RNG))
 
     # 4. MAIN TRAINING LOOP
     episodes_per_update = int(config.EPISODES_PER_UPDATE)
@@ -539,6 +574,7 @@ if __name__ == "__main__":
             pool_manager=pool_manager,
             warm_start_path=initial_sl_path,
             agent_cache=agent_cache,
+            rng=_GLOBAL_RNG,
         )
 
     # --- Step 2: The Main Generational Loop ---
@@ -560,6 +596,7 @@ if __name__ == "__main__":
                     pool_manager=pool_manager,
                     warm_start_path=initial_sl_path,
                     agent_cache=agent_cache,
+                    rng=_GLOBAL_RNG,
                 )
         
         # The new generation is a clone of the previous one
@@ -585,4 +622,5 @@ if __name__ == "__main__":
             pool_manager=pool_manager,
             learner=new_learner,
             agent_cache=agent_cache,
+            rng=_GLOBAL_RNG,
         )

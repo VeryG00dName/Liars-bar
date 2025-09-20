@@ -1,6 +1,6 @@
 # src/training/vec_ppo_rollout.py
 
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import logging
 import time
 import numpy as np
@@ -17,10 +17,12 @@ class PPOVecRolloutManager:
     def __init__(self,
                  arena: lb.VecArena,
                  policies: Dict[int, BatchPPOAutoregressiveAgent],
-                 device: torch.device):
+                 device: torch.device,
+                 rng: Optional[np.random.Generator] = None):
         self.arena = arena
         self.policies = policies
         self.device = device
+        self.rng = rng if rng is not None else np.random.default_rng()
 
     def _reset_policy_state(self):
         for policy in self.policies.values():
@@ -76,12 +78,12 @@ class PPOVecRolloutManager:
         for _ in range(batch_size):
             env_roles = [0 for _ in range(num_players)]
             seats = list(range(num_players))
-            np.random.shuffle(seats)
+            self.rng.shuffle(seats)
             training_seat = seats.pop()
             env_roles[training_seat] = training_policy_id
 
             num_opponents = num_players - 1
-            chosen = np.random.choice(opponent_pool, size=num_opponents, replace=True, p=probs).tolist()
+            chosen = self.rng.choice(opponent_pool, size=num_opponents, replace=True, p=probs).tolist()
             for i in range(num_opponents):
                 env_roles[seats[i]] = int(chosen[i])
             all_env_roles.append(env_roles)
@@ -99,7 +101,7 @@ class PPOVecRolloutManager:
             batch_size = int(min(batch_guess, max_batch_envs))
         else:
             batch_size = int(batch_guess)
-        self.arena.reset(batch=batch_size, players=num_players, seed=np.random.randint(0, 2**31))
+        self.arena.reset(batch=batch_size, players=num_players, seed=int(self.rng.integers(0, 2**31)))
         self._reset_policy_state()
 
         roles = self._setup_roles(batch_size, num_players, training_policy_id, opponent_pool)
