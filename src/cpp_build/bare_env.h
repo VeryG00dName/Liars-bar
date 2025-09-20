@@ -35,6 +35,9 @@ public:
   int global_step = 0;
   std::vector<HistoryEntry> game_history;
 
+  int get_total_history_entries() const;
+  std::vector<HistoryEntry> get_history_entries_slice(int start_index, int end_index) const;
+
   // ---- Lifecycle ----
   void reset(int players, uint32_t seed = 0xC001BEEF);
   void set_seed(uint32_t seed);

@@ -4,7 +4,6 @@ import random
 from collections import Counter
 from io import BytesIO
 from typing import Dict, Any, List, Optional, Tuple, Iterable, Union, Hashable
-import itertools
 import math
 import numpy as np
 import torch

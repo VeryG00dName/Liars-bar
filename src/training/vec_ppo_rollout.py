@@ -192,12 +192,20 @@ class PPOVecRolloutManager:
                 continue
 
             env = self.arena.get_env(env_idx)
-            history = env.game_history()
 
-            # consume new history entries
-            while ep_tracker['last_history_len'] < len(history):
+            total_history_len = env.total_history_entries()
+            start_idx = ep_tracker.get('last_processed_cxx_history_len', 0)
+
+            if ep_tracker['last_history_len'] < start_idx:
+                ep_tracker['last_history_len'] = start_idx
+
+            if start_idx < total_history_len:
+                history_chunk = env.history_slice(start_idx, total_history_len)
+            else:
+                history_chunk = []
+
+            for entry in history_chunk:
                 entry_idx = ep_tracker['last_history_len']
-                entry = history[entry_idx]
                 ep_tracker['last_history_len'] += 1
 
                 is_our_turn = (entry['player'] == ep_tracker['training_agent_seat'])
@@ -213,6 +221,8 @@ class PPOVecRolloutManager:
                 else:
                     step_idx = self._append_step_row(ep_tracker, entry['player'])
                     ep_tracker['data']['opp_target_action'][step_idx] = entry['action']
+
+            ep_tracker['last_processed_cxx_history_len'] = total_history_len
 
             if done_statuses[env_idx]:
                 self._finalize_episode(ep_tracker, pending_data)
@@ -326,6 +336,7 @@ class PPOVecRolloutManager:
             "training_agent_seat": training_agent_seat,
             "training_policy_id": training_policy_id,
             "last_history_len": 0,
+            "last_processed_cxx_history_len": 0,
             "global_step": -1,
             "data": ep_data
         }

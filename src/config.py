@@ -64,42 +64,14 @@ DEFAULT_SCORING_PARAMS = {
     "unchallenged_bluff_penalty": 0
 }
 
-# ============================
-# Neural Network Configuration
-# ============================
-HIDDEN_DIM = 256
-INPUT_DIM = 26  # Will be dynamically set
-OUTPUT_DIM = 7  # Will be dynamically set
-NUM_OBS_STACK = 50
 
 # Strategy Dictionary Hyperparameters
 NUM_BRICKS = 32
 BRICK_DIM = 32
-
-# ============================
-# Opponent Model Configuration
-# ============================
-NUM_OPPONENT_CLASSES = 10
-OPPONENT_INPUT_DIM = 4
-OPPONENT_HIDDEN_DIM = 128
-OPPONENT_LEARNING_RATE = 1e-4
-MAX_SEQUENCE_LENGTH = 400
-
-# ============================
-# Transformer Configuration (Strategy Embedding)
-# ============================
-STRATEGY_NUM_TOKENS = 5
-STRATEGY_TOKEN_EMBEDDING_DIM = 64
-STRATEGY_NHEAD = 4
-STRATEGY_NUM_LAYERS = 2
-STRATEGY_DIM = 5
-STRATEGY_NUM_CLASSES = 10  # Unused
-STRATEGY_DROPOUT = 0.1
-
+DROPOUT_P = 0.25
 # ============================
 # PPO / Training Hyperparameters
 # ============================
-NUM_EPISODES = 40000
 EPISODES_PER_UPDATE = 512
 FIXED_L_TOK = 200
 LEARNING_RATE = 0.00019
@@ -107,26 +79,19 @@ GAMMA = 0.974
 GAE_LAMBDA = 0.98
 EPS_CLIP = 0.2
 K_EPOCHS = 2
-UPDATE_STEPS = 3
 MAX_NORM = 0.3
 
 # Coefficients
 INIT_ENTROPY_COEF = 0.005
-# Optional: expose value coeff (trainer currently uses 0.5 inline; this is here for future use)
-VALUE_COEF = 0.5
 
 # ============================
 # Auxiliary Loss Weights
 # ============================
-# Old global aux weight (kept for backward-compat fallback)
-AUX_LOSS_WEIGHT = 1
-
 # Split aux weights (current PPO usage)
-AUX_BELIEF_WEIGHT = 1   # belief heads weight (was 0.5 in your PPO runs)
-AUX_OPP_WEIGHT    = 1   # opponent action weight (1.0 to match SL)
-VALUE_WEIGHT      = 1     # value loss weight
-L1_SPARSITY_WEIGHT = 0.01
-USAGE_BALANCE_WEIGHT = 1.0
+AUX_OPP_WEIGHT         = 1   # opponent action weight (SL is 1.0)
+VALUE_WEIGHT           = 1      # value loss weight
+L1_SPARSITY_WEIGHT     = 0.01
+USAGE_BALANCE_WEIGHT   = 1.0
 BRICK_DIVERSITY_WEIGHT = 1.0
 # ============================
 # Teacher KL / Behavior Cloning Leash
@@ -187,7 +152,37 @@ TOTAL_PLAYERS = 12
 # ============================
 SEED = 42
 DEVICE = "cuda"
-DROPOUT_P = 0.25
+
+# ============================
+# Depreated, kept for compatiblty
+# ============================
+NUM_EPISODES = 40000
+UPDATE_STEPS = 3
+AUX_LOSS_WEIGHT = 1
+
+# Opponent Model Configuration
+NUM_OPPONENT_CLASSES = 10
+OPPONENT_INPUT_DIM = 4
+OPPONENT_HIDDEN_DIM = 128
+OPPONENT_LEARNING_RATE = 1e-4
+MAX_SEQUENCE_LENGTH = 400
+
+# Neural Network Configuration
+HIDDEN_DIM = 256
+INPUT_DIM = 26  # Will be dynamically set
+OUTPUT_DIM = 7  # Will be dynamically set
+NUM_OBS_STACK = 50
+
+# ============================
+# Transformer Configuration (Strategy Embedding)
+# ============================
+STRATEGY_NUM_TOKENS = 5
+STRATEGY_TOKEN_EMBEDDING_DIM = 64
+STRATEGY_NHEAD = 4
+STRATEGY_NUM_LAYERS = 2
+STRATEGY_DIM = 5
+STRATEGY_NUM_CLASSES = 10  # Unused
+STRATEGY_DROPOUT = 0.1
 
 # ============================
 # Derived Configurations

@@ -52,25 +52,42 @@ static std::vector<int> env_terminations_list(const Env& e) {
     return v;
 }
 
+static py::dict history_entry_to_py(const HistoryEntry& h) {
+    py::dict obs_map;
+    for (size_t p = 0; p < h.observations.size(); ++p) {
+        const auto& v = h.observations[p];
+        py::list pyv;
+        for (float x : v) pyv.append(x);
+        obs_map[py::int_(p)] = pyv;
+    }
+    py::list mask7;
+    for (int i = 0; i < 7; ++i) mask7.append((int)h.mask[i]);
+    py::dict d;
+    d["player"] = h.player;
+    d["action"] = (int)h.action;
+    d["step"] = h.step;
+    d["observations"] = obs_map;
+    d["mask"] = mask7;
+    return d;
+}
+
 static py::list env_game_history_py(const Env& e) {
     py::list out;
     for (const auto& h : e.game_history) {
-        py::dict obs_map;
-        for (size_t p = 0; p < h.observations.size(); ++p) {
-            const auto& v = h.observations[p];
-            py::list pyv;
-            for (float x : v) pyv.append(x);
-            obs_map[py::int_(p)] = pyv;
-        }
-        py::list mask7;
-        for (int i = 0; i < 7; ++i) mask7.append((int)h.mask[i]);
-        py::dict d;
-        d["player"] = h.player;
-        d["action"] = (int)h.action;
-        d["step"] = h.step;
-        d["observations"] = obs_map;
-        d["mask"] = mask7;
-        out.append(d);
+        out.append(history_entry_to_py(h));
+    }
+    return out;
+}
+
+static py::list env_game_history_slice_py(const Env& e, int start_index, int end_index) {
+    const int total = e.get_total_history_entries();
+    if (start_index < 0) start_index = 0;
+    if (end_index < start_index) end_index = start_index;
+    if (end_index > total) end_index = total;
+
+    py::list out;
+    for (int i = start_index; i < end_index; ++i) {
+        out.append(history_entry_to_py(e.game_history[i]));
     }
     return out;
 }
@@ -129,6 +146,8 @@ PYBIND11_MODULE(lb, m) {
         .def("current_player", &Env::current_player)
         .def("num_players", &Env::num_players)
         .def("game_history", &env_game_history_py)
+        .def("total_history_entries", &Env::get_total_history_entries)
+        .def("history_slice", &env_game_history_slice_py, py::arg("start_index"), py::arg("end_index"))
         .def_property_readonly("penalties", &env_penalties_list)
         .def_property_readonly("terminations", &env_terminations_list)
         ;

@@ -1,6 +1,5 @@
 # src/training/train_ppo_autoregressive_self.py
 
-import copy
 import os, logging, warnings
 import json
 import time
@@ -10,8 +9,7 @@ from numpy.random import Generator
 import random
 import numpy as np
 import argparse
-from collections import deque, defaultdict
-import math
+
 # Quiet Torch compile logs
 os.environ.pop("TORCH_LOGS", None)           # disable extra compile logs
 os.environ.setdefault("TORCHDYNAMO_VERBOSE", "0")
@@ -24,7 +22,6 @@ os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
 warnings.filterwarnings("ignore", message=".*symbolic_shapes.*")
 
 import torch
-import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from torch.nn.utils import clip_grad_norm_
 import torch.amp as amp
@@ -327,7 +324,7 @@ def train_generation(
             batch_eps = random.sample(ep_buffer, min(len(ep_buffer), episodes_per_update))
             if not batch_eps: continue
             
-            batch_cpu = _collate_batch(batch_eps, L_max=200)
+            batch_cpu = _collate_batch(batch_eps)
             batch_gpu = _to_device_batch(batch_cpu, device)
             
             optimizer.zero_grad()
@@ -477,7 +474,7 @@ def train_generation(
                 writer.add_scalar(f"PerOpponent/episodes_vs_{label}", total, update)
 
         # Also log the largest label's win rate under a fixed name
-        if sorted_items:
+        if sorted_items and run_name != "gen_1":
             most_recent_label, (mr_wins, mr_total) = sorted_items[-1]  # largest by str(label)
             if mr_total > 0:
                 writer.add_scalar("PerOpponent/Win_rate_vs_most_recent", mr_wins / mr_total, update)

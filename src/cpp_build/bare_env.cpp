@@ -241,5 +241,27 @@ bool Env::step(uint8_t a) {
     return game_is_over;
 }
 
+int Env::get_total_history_entries() const {
+    return static_cast<int>(game_history.size());
+}
+
+std::vector<HistoryEntry> Env::get_history_entries_slice(int start_index, int end_index) const {
+    const int total = static_cast<int>(game_history.size());
+    if (start_index < 0) start_index = 0;
+    if (end_index < start_index) end_index = start_index;
+    if (end_index > total) end_index = total;
+
+    std::vector<HistoryEntry> out;
+    const int count = end_index - start_index;
+    if (count <= 0) {
+        return out;
+    }
+    out.reserve(count);
+    for (int i = start_index; i < end_index; ++i) {
+        out.push_back(game_history[i]);
+    }
+    return out;
+}
+
 // explicit template instantiation
 template void Env::shuffle<20>(std::array<uint8_t, 20>&);
