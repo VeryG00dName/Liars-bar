@@ -22,6 +22,13 @@ class PPOVecRolloutManager:
         self.policies = policies
         self.device = device
 
+    def _reset_policy_state(self):
+        for policy in self.policies.values():
+            try:
+                policy.reset()
+            except Exception:
+                logging.exception("Failed to reset policy %s", getattr(policy, 'player_id', '<unknown>'))
+
     def _setup_roles(self,
                  batch_size: int,
                  num_players: int,
@@ -93,6 +100,7 @@ class PPOVecRolloutManager:
         else:
             batch_size = int(batch_guess)
         self.arena.reset(batch=batch_size, players=num_players, seed=np.random.randint(0, 2**31))
+        self._reset_policy_state()
 
         roles = self._setup_roles(batch_size, num_players, training_policy_id, opponent_pool)
         self.arena.set_roles(roles)

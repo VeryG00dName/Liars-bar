@@ -1009,9 +1009,8 @@ def ppo_losses_batched(
 
             if embeds_flat:
                 embeds_tensor = torch.stack(embeds_flat, dim=0)
-                remapped_labels = _remap_embed_labels(labels_flat)
                 metrics["opp_embeds_flat"] = embeds_tensor.numpy()
-                metrics["opp_labels_flat"] = remapped_labels
+                metrics["opp_labels_flat"] = labels_flat
                 metrics["opp_labels_flat_original"] = labels_flat
 
     # ---- Teacher KL (optional) ----

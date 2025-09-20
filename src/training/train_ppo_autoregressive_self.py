@@ -185,7 +185,7 @@ def train_generation(
     agent_cache: Optional[Dict[str, BatchPPOAutoregressiveAgent]] = None,
 ):
     """
-    Trains a single generation of an agent until it plateaus.
+    Trains a single generation of an agent for 100 updates.
     Saves the final model and adds it to the opponent pool.
     """
     # 1. SETUP
@@ -364,7 +364,7 @@ def train_generation(
                     Xb = Xb.reshape(1, -1)
                 if Xb.size > 0:
                     opp_rows_X.append(Xb)
-                    seq_labels = [int(l) for l in np.asarray(L_flat).tolist()]
+                    seq_labels = [int(l) for l in np.asarray(L_orig).tolist()]
                     opp_rows_L.extend(seq_labels)
                     if L_orig is not None and len(L_orig) == len(seq_labels):
                         for seq, orig in zip(seq_labels, L_orig):
