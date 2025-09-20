@@ -571,27 +571,12 @@ def load_autoreg_data(data_dir, max_files=None, max_samples=None):
     print(f"Total loaded sequences: {len(all_rounds)}")
     return all_rounds
 
-def extract_opponent_belief_targets(agent_types: torch.Tensor, belief_targets: torch.Tensor | None):
-    """Slice the per-seat belief targets down to the acting opponent."""
-    if belief_targets is None:
-        return None
-    if belief_targets.dim() == 2:
-        return belief_targets
-    if belief_targets.dim() == 3 and belief_targets.size(-1) > 0:
-        seat_idx = torch.clamp(agent_types.long() - 1, min=0).unsqueeze(-1)
-        gathered = torch.gather(belief_targets.long(), dim=-1, index=seat_idx)
-        return gathered.squeeze(-1)
-    return None
-
-
 def calculate_autoregressive_loss(
     self_logits,
     opp_logits,
     target_actions,
     agent_types,
     padding_mask,
-    belief_logits=None,
-    belief_targets=None,
     value_pred=None,
     value_target=None,
     *,
@@ -634,17 +619,6 @@ def calculate_autoregressive_loss(
     else:
         value_loss = torch.tensor(0.0, device=device)
 
-    # === Belief loss on opponent steps ===
-    belief_loss = torch.tensor(0.0, device=device)
-    if (belief_logits is not None) and (belief_targets is not None) and (n_opp > 0):
-        opp_belief_targets = extract_opponent_belief_targets(agent_types, belief_targets)
-        if opp_belief_targets is not None:
-            flat_mask = opp_mask.reshape(-1)
-            flat_logits = belief_logits.reshape(-1, belief_logits.size(-1))[flat_mask]
-            flat_targets = opp_belief_targets.reshape(-1)[flat_mask]
-            if flat_targets.numel() > 0:
-                belief_loss = F.cross_entropy(flat_logits, flat_targets)
-
     # === Adaptive weights based on effective sample amounts ===
     # Our-turns got rarer going 3P->4P; keep self & belief influence stable by ~1/p(our_turn).
     # Use empirical p_our_hat for robustness to padding/truncation.
@@ -654,7 +628,6 @@ def calculate_autoregressive_loss(
     self_w   = inv_p_our                # e.g., ~num_players if batches are balanced
     opp_w    = 1.0                      # keep opponents at 1.0 (tune if needed)
     value_w  = 1.0                      # value stays at 1.0 by default
-    belief_w = 1.0                      # belief is evaluated on opponent turns now
 
     # === New regularization losses for Sparse Dictionary ===
     l1_sparsity_loss = torch.tensor(0.0, device=device)
@@ -699,7 +672,6 @@ def calculate_autoregressive_loss(
         self_w * self_loss
         + opp_w * opp_loss
         + value_w * value_loss
-        + belief_w * belief_loss
         + w_l1 * l1_sparsity_loss
         + w_usage * usage_balance_loss
         + w_div * brick_diversity_loss
@@ -710,7 +682,6 @@ def calculate_autoregressive_loss(
         self_loss,
         opp_loss,
         value_loss,
-        belief_loss,
         l1_sparsity_loss,
         usage_balance_loss,
         brick_diversity_loss,
@@ -812,7 +783,6 @@ def train_autoregressive_model(
         obs_dim=obs_dim,
         action_dim=action_dim,
         hidden_dim=hidden_dim,
-        belief_dim=64,
         num_heads=hidden_dim//64,
         num_layers=2,
         dropout_rate=0.1,
@@ -850,11 +820,9 @@ def train_autoregressive_model(
         train_self_loss    = 0.0
         train_opp_loss     = 0.0
         train_value_loss   = 0.0
-        train_belief_loss  = 0.0
         train_batches      = 0
         train_agent_acc    = 0.0
         train_opponent_acc = 0.0
-        train_belief_acc   = 0.0
         # New regularization aggregators
         train_l1_loss      = 0.0
         train_usage_loss   = 0.0
@@ -874,20 +842,15 @@ def train_autoregressive_model(
                     return_embeddings=True,
                     dropout_p=float(getattr(config, "DROPOUT_P", 0.25)),
                 )
-                self_logits, opp_logits, value_pred, belief_logits = outs[:4]
-                embedding_tuple = outs[4] if len(outs) > 4 else (None, None, None)
+                self_logits, opp_logits, value_pred = outs[:3]
+                embedding_tuple = outs[3] if len(outs) > 3 else (None, None, None)
                 strategy_code, activations, bricks = embedding_tuple
-
-                opp_belief_targets = None
-                if batch['belief'] is not None:
-                    opp_belief_targets = extract_opponent_belief_targets(batch['agent_type'], batch['belief'])
 
                 (
                     total_loss,
                     self_loss,
                     opp_loss,
                     value_loss,
-                    belief_loss,
                     l1_loss,
                     usage_loss,
                     diversity_loss,
@@ -897,8 +860,6 @@ def train_autoregressive_model(
                     target_actions=batch['target_action'],
                     agent_types=batch['agent_type'],
                     padding_mask=batch['padding_mask'],
-                    belief_logits=belief_logits,
-                    belief_targets=opp_belief_targets,
                     value_pred=value_pred,
                     value_target=None,
                     activations=activations,
@@ -917,7 +878,6 @@ def train_autoregressive_model(
             train_self_loss  += self_loss.item()
             train_opp_loss   += opp_loss.item()
             train_value_loss += value_loss.item()
-            train_belief_loss += belief_loss.item()
             train_l1_loss     += float(l1_loss.item() if torch.is_tensor(l1_loss) else l1_loss)
             train_usage_loss  += float(usage_loss.item() if torch.is_tensor(usage_loss) else usage_loss)
             train_diversity_loss += float(diversity_loss.item() if torch.is_tensor(diversity_loss) else diversity_loss)
@@ -932,15 +892,10 @@ def train_autoregressive_model(
             train_agent_acc    += agent_acc
             train_opponent_acc += opponent_acc
 
-            if belief_logits is not None and opp_belief_targets is not None:
-                belief_acc = compute_accuracy(belief_logits, opp_belief_targets, opp_mask)
-                train_belief_acc += belief_acc
-
             train_progress.set_postfix({
                 'tot': total_loss.item(),
                 'self': self_loss.item(),
                 'opp': opp_loss.item(),
-                'belief': belief_loss.item()
             })
 
         # average metrics
@@ -950,7 +905,6 @@ def train_autoregressive_model(
         train_value_loss   /= train_batches
         train_agent_acc    /= train_batches
         train_opponent_acc /= train_batches
-        train_belief_acc   /= train_batches
         train_l1_loss      /= train_batches
         train_usage_loss   /= train_batches
         train_diversity_loss /= train_batches
@@ -964,7 +918,6 @@ def train_autoregressive_model(
             f"Epoch {epoch+1}/{num_epochs} (Time: {epoch_time:.2f}s)\n"
             f"  Train - Loss: {train_total_loss:.6f}, Self: {train_self_loss:.6f}, Opp: {train_opp_loss:.6f}, "
             f"Agent Acc: {train_agent_acc:.4f}, Opp Acc: {train_opponent_acc:.4f}, "
-            f"Belief Acc: {train_belief_acc:.4f}, "
             f"L1: {train_l1_loss:.6f}, Usage: {train_usage_loss:.6f}, Diversity: {train_diversity_loss:.6f}"
         )
 
@@ -973,13 +926,11 @@ def train_autoregressive_model(
         writer.add_scalar("Loss/Train/Self",   train_self_loss, epoch)
         writer.add_scalar("Loss/Train/Opp",    train_opp_loss, epoch)
         writer.add_scalar("Loss/Train/Value",  train_value_loss, epoch)
-        writer.add_scalar("Loss/Train/Belief", train_belief_loss / train_batches, epoch)
         writer.add_scalar("Loss/Train/L1_Sparsity", train_l1_loss, epoch)
         writer.add_scalar("Loss/Train/Usage_Balance", train_usage_loss, epoch)
         writer.add_scalar("Loss/Train/Brick_Diversity", train_diversity_loss, epoch)
         writer.add_scalar("Acc/Train/Agent",   train_agent_acc, epoch)
         writer.add_scalar("Acc/Train/Opponent",train_opponent_acc, epoch)
-        writer.add_scalar("Acc/Train/Belief",  train_belief_acc, epoch)
 
         # Save model if train loss improved
         if train_total_loss < best_train_loss:

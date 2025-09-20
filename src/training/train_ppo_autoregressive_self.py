@@ -120,7 +120,6 @@ def _create_new_agent(agent_type: str, device: torch.device) -> BatchPPOAutoregr
     if agent_type == 'main':
         model = PPOFusedModel(
             obs_dim=9,
-            belief_dim=64,
             num_bricks=getattr(config, "NUM_BRICKS", 32),
             brick_dim=getattr(config, "BRICK_DIM", 32),
         )
@@ -133,18 +132,12 @@ def _load_agent_from_checkpoint(
     path: str,
     model_type: str,
     device: torch.device,
-    restore_proto: bool = False,
 ) -> BatchPPOAutoregressiveAgent:
     """Loads an agent's state from a checkpoint path. Optionally compiles its model."""
     agent = BatchPPOAutoregressiveAgent(device, f"loaded_{model_type}")
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     state_dict = checkpoint.get('model_state_dict', checkpoint)
     agent.load_models_from_checkpoint({"policy_nets": {"agent_model": state_dict}}, "agent_model")
-    if restore_proto and isinstance(checkpoint, dict) and ("proto_bank" in checkpoint):
-        try:
-            train_extras._GLOB = train_extras._GlobalProtoBank.load(checkpoint["proto_bank"])
-        except Exception:
-            pass
     return agent
 
 def _clone_agent_from_agent(src_agent: BatchPPOAutoregressiveAgent,
@@ -215,7 +208,7 @@ def train_generation(
             if agent_cache is not None and cache_key in agent_cache:
                 learner = _clone_agent_from_agent(agent_cache[cache_key], device)
             else:
-                base_agent = _load_agent_from_checkpoint(warm_start_path, 'main', device, restore_proto=True)
+                base_agent = _load_agent_from_checkpoint(warm_start_path, 'main', device)
                 if agent_cache is not None:
                     agent_cache[cache_key] = base_agent  # keep a copy of the base
                 learner = _clone_agent_from_agent(base_agent, device)
@@ -302,6 +295,7 @@ def train_generation(
     episodes_per_update = int(config.EPISODES_PER_UPDATE)
     k_epochs = int(config.K_EPOCHS)
     ep_buffer: List[Dict[str, Any]] = []
+    opp_label_lookup: Dict[int, Any] = {}
     
     for update in range(1, max_updates + 1):
         # -------- Rollout --------
@@ -328,7 +322,7 @@ def train_generation(
         agg = {"total_loss": 0.0}
         n_batches = 0
         opp_rows_X = []  # list of np.ndarray chunks, each [N_i, D]
-        opp_rows_L = []  # flat list of labels aligned with rows in opp_rows_X
+        opp_rows_L = []  # flat list of remapped labels aligned with rows in opp_rows_X
         avg_brick_usage_chunks: List[np.ndarray] = []
         for _ in range(k_epochs):
             batch_eps = random.sample(ep_buffer, min(len(ep_buffer), episodes_per_update))
@@ -361,6 +355,7 @@ def train_generation(
             # --- ADD: collect per-opponent embeddings from this batch, if present ---
             X_flat = metrics.get("opp_embeds_flat", None)
             L_flat = metrics.get("opp_labels_flat", None)
+            L_orig = metrics.get("opp_labels_flat_original", None)
             if X_flat is not None and L_flat is not None:
                 Xb = np.asarray(X_flat, dtype=np.float32)
                 if Xb.ndim == 1:
@@ -369,7 +364,12 @@ def train_generation(
                     Xb = Xb.reshape(1, -1)
                 if Xb.size > 0:
                     opp_rows_X.append(Xb)
-                    opp_rows_L.extend(list(L_flat))
+                    seq_labels = [int(l) for l in np.asarray(L_flat).tolist()]
+                    opp_rows_L.extend(seq_labels)
+                    if L_orig is not None and len(L_orig) == len(seq_labels):
+                        for seq, orig in zip(seq_labels, L_orig):
+                            if seq not in opp_label_lookup:
+                                opp_label_lookup[seq] = orig
             else:
                 emb = metrics.get("opp_embeds_batch", None)
                 if emb is not None:
@@ -424,7 +424,6 @@ def train_generation(
         writer.add_scalar("Loss/Total", avg.get("total_loss", 0.0), update)
         writer.add_scalar("Loss/Policy", avg.get("policy_loss", 0.0), update)
         writer.add_scalar("Loss/Value", avg.get("value_loss", 0.0), update)
-        writer.add_scalar("Loss/Belief", avg.get("belief_loss", 0.0), update)
         writer.add_scalar("Loss/Opponent", avg.get("opp_loss", 0.0), update)
         writer.add_scalar("Loss/L1Sparsity", avg.get("l1_sparsity_loss", 0.0), update)
         writer.add_scalar("Loss/UsageBalance", avg.get("usage_balance_loss", 0.0), update)
@@ -443,17 +442,24 @@ def train_generation(
                 writer.add_scalar(f"PerOpponent/episodes_vs_{label}", total, update)
         writer.add_scalar("Buffer/Size", len(ep_buffer), update)
         writer.add_scalar("Acc/OpponentAction", avg.get("opp_action_acc", 0.0), update)
-        writer.add_scalar("Acc/Belief", avg.get("belief_acc", 0.0), update)
         
         if (update % 50) == 0 and opp_rows_X:
             X = np.concatenate(opp_rows_X, axis=0)            # [N, D]
-            labels = opp_rows_L                               # [N] (may contain None)
+            labels_seq = np.asarray(opp_rows_L, dtype=np.int64)
+            if opp_label_lookup:
+                labels_display = [
+                    f"{int(seq)}: {opp_label_lookup.get(int(seq), int(seq))}"
+                    for seq in labels_seq
+                ]
+            else:
+                labels_display = [str(int(seq)) for seq in labels_seq]
+
             visualize_opponent_embeddings_all(
-                writer, (X, labels), step=update,
+                writer, (X, labels_display), step=update,
                 title_prefix="Per-Opponent strategy_code"
             )
 
-            metrics = train_extras.embedding_quality_metrics(X, labels, k=10)
+            metrics = train_extras.embedding_quality_metrics(X, labels_seq, k=10)
             if metrics:
                 evr = metrics.get("pca_evr")
                 for key, value in metrics.items():
@@ -472,20 +478,14 @@ def train_generation(
                     
             html_path = os.path.join(run_ckpt_dir, f"embeddings_step_{update}.html")
             try:
-                train_extras.save_interactive_3d(X, labels, html_path)
+                train_extras.save_interactive_3d(X, labels_display, html_path)
             except Exception as exc:
                 print(f"[viz][3d] failed: {exc}")
 
         if update % int(config.CHECKPOINT_INTERVAL) == 0:
             path = os.path.join(run_ckpt_dir, f"update_{update}.pth")
             to_save = getattr(learner.model, "_orig_mod", learner.model)
-            extra = {}
-            if (train_extras._GLOB is not None) and (getattr(train_extras._GLOB, 'C', None) is not None):
-                try:
-                    extra["proto_bank"] = train_extras._GLOB.state_dict()
-                except Exception:
-                    pass
-            torch.save({"model_state_dict": to_save.state_dict(), **extra}, path)
+            torch.save({"model_state_dict": to_save.state_dict()}, path)
 
         if avg_brick_usage_chunks:
             stacked_usage = np.stack(avg_brick_usage_chunks)  # [num_chunks, K]
@@ -501,13 +501,7 @@ def train_generation(
     # 5. FINALIZE AND SAVE
     final_path = os.path.join(run_ckpt_dir, "final.pth")
     to_save = getattr(learner.model, "_orig_mod", learner.model)
-    extra = {}
-    if (train_extras._GLOB is not None) and (getattr(train_extras._GLOB, 'C', None) is not None):
-        try:
-            extra["proto_bank"] = train_extras._GLOB.state_dict()
-        except Exception:
-            pass
-    torch.save({"model_state_dict": to_save.state_dict(), **extra}, final_path)
+    torch.save({"model_state_dict": to_save.state_dict()}, final_path)
     pool_manager.add_agent(name=run_name, model_type='main', path=final_path)
     writer.close()
     logging.info(f"Saved final model for '{run_name}' to {final_path}")

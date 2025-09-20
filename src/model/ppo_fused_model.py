@@ -54,7 +54,6 @@ class PPOFusedModel(nn.Module):
     def __init__(self,
                  obs_dim,
                  action_dim=7,
-                 belief_dim=64,
                  hidden_dim=256,
                  num_heads=4,
                  num_layers=2,
@@ -67,7 +66,6 @@ class PPOFusedModel(nn.Module):
         super().__init__()
         self.obs_dim = obs_dim
         self.action_dim = action_dim
-        self.belief_dim = belief_dim # Kept for belief_head probe compatibility
         self.hidden_dim = hidden_dim
         self.max_seq_length = max_seq_length
         self.count_pad = 4
@@ -110,9 +108,6 @@ class PPOFusedModel(nn.Module):
         )
 
         # === Heads (Updated to use the new strategy code) ===
-        # Probe for backward-compatible belief analysis
-        self.belief_head = nn.Linear(brick_dim, belief_dim)
-        
         # FiLM layer now conditioned on the strategy code's dimension
         self.pv_film = StrategyFiLM(feat_dim=hidden_dim, cond_dim=brick_dim, use_ln=True)
 
@@ -186,11 +181,6 @@ class PPOFusedModel(nn.Module):
         # Opponent prediction also uses the regularized strategy code
         opp_logits = self.opp_action_head(strategy_code)
         
-        # Belief probe uses a detached, non-regularized code for purer analysis
-        # We re-calculate it with the original activations
-        strategy_code_probe = torch.matmul(activations, bricks).detach()
-        belief_logits = self.belief_head(strategy_code_probe)
-        
         # Apply action mask for our turns
         LARGE_NEG = torch.finfo(action_logits.dtype).min / 4.0
         if action_masks is not None:
@@ -201,10 +191,11 @@ class PPOFusedModel(nn.Module):
         if return_embeddings:
             # We return the original, non-dropped-out activations for the regularization losses
             # The losses should be based on the model's "intent", not the noisy version.
+            strategy_code_probe = torch.matmul(activations, bricks).detach()
             embedding_tuple = (strategy_code_probe, activations, bricks)
-            return (action_logits, opp_logits, state_values, belief_logits, embedding_tuple)
+            return (action_logits, opp_logits, state_values, embedding_tuple)
         else:
-            return (action_logits, opp_logits, state_values, belief_logits)
+            return (action_logits, opp_logits, state_values)
 
     # ===== Convenience helpers (Unchanged) =====
     @staticmethod
