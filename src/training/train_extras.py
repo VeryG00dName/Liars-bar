@@ -2,6 +2,7 @@
 
 import random
 from collections import Counter
+from contextlib import contextmanager
 from io import BytesIO
 from typing import Dict, Any, List, Optional, Tuple, Iterable, Union, Hashable
 import math
@@ -738,171 +739,59 @@ def _value_loss_with_stakes_clip_public(
     return loss, clip_frac
 
 # ---------------------- Batched PPO loss (graph-safe) ----------------------
-def ppo_losses_batched(
-    model: torch.nn.Module,
+def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    w = mask.to(x.dtype)
+    denom = w.sum().clamp_min(1.0)
+    return (x * w).sum() / denom
+
+
+def _normalize_advantages(advantages: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    w = mask.to(advantages.dtype)
+    denom = w.sum()
+    if denom.item() == 0:
+        return torch.zeros_like(advantages)
+    mean = (advantages * w).sum() / denom
+    var = ((advantages - mean).pow(2) * w).sum() / denom
+    std = torch.sqrt(var + 1e-8)
+    norm = (advantages - mean) / (std + 1e-8)
+    return norm * w
+
+
+def _brick_decorrelation_penalty(bricks: Optional[torch.Tensor], device: torch.device) -> torch.Tensor:
+    if bricks is None or bricks.ndim != 2 or bricks.size(0) == 0:
+        return torch.zeros((), device=device)
+    eps = 1e-6
+    norm_bricks = bricks / (bricks.norm(dim=1, keepdim=True) + eps)
+    gram = norm_bricks @ norm_bricks.t()
+    eye = torch.eye(gram.size(0), device=gram.device, dtype=gram.dtype)
+    diff = gram - eye
+    return diff.pow(2).sum()
+
+
+def _dictionary_regularizers(
+    embedding_tuple: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    mi: Dict[str, torch.Tensor],
     batch: Dict[str, torch.Tensor],
-    sl_teacher: Optional[torch.nn.Module] = None,
-) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """
-    Fully batched PPO objective with:
-      • irregular-step GAE computed inside (from batch['rewards'] & model values)
-      • stakes-based value target clipping (optional)
-      • opponent action CE (batched; NO action masking; -100 ignored)
-      • optional teacher KL at OUR steps
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[np.ndarray], Dict[str, Any]]:
+    sample_tensor = None
+    for v in mi.values():
+        if torch.is_tensor(v):
+            sample_tensor = v
+            break
+    device = sample_tensor.device if sample_tensor is not None else torch.device("cpu")
+    zero = torch.zeros((), device=device)
 
-    Requires in batch:
-      mi, our_idx [B,T], mask [B,T], actions [B,T], old_logp [B,T],
-      rewards [B,T], penalties_used [B,T],
-      our_action_mask [B,L,A] or None,
-      opp_idx [B,To], opp_targets [B,To], opp_have_label [B,To]
-    """
-    mi = batch["mi"]
-    our_idx = batch["our_idx"].long()     # [B, T]
-    our_mask = batch["mask"].bool()       # [B, T]
-    actions = batch["actions"].long()     # [B, T]
-    old_logp = batch["old_logp"].float()  # [B, T]
-    rewards = batch["rewards"].float()    # [B, T]
+    l1_sparsity_loss = zero.clone()
+    usage_balance_loss = zero.clone()
+    brick_diversity_loss = zero.clone()
+    decor_penalty = zero.clone()
+    avg_brick_usage_np: Optional[np.ndarray] = None
+    metrics_extra: Dict[str, Any] = {}
 
-    outs = model(**{**mi, "return_embeddings": True, "dropout_p": getattr(config, "DROPOUT_P", 0.25)})
-    action_logits = outs[0]                                # [B, L, A]
-    opp_logits    = outs[1] if len(outs) > 1 else None     # [B, L, A] or None
-    values_full   = outs[2].squeeze(-1).to(torch.float32)  # [B, L]
-    embedding_tuple = outs[3] if len(outs) > 3 else None   # (strategy_code, activations, bricks)
+    if not (isinstance(embedding_tuple, tuple) and len(embedding_tuple) == 3):
+        return l1_sparsity_loss, usage_balance_loss, brick_diversity_loss, decor_penalty, avg_brick_usage_np, metrics_extra
 
-    strategy_code = None
-    activations = None
-    bricks = None
-    if isinstance(embedding_tuple, tuple) and len(embedding_tuple) == 3:
-        strategy_code, activations, bricks = embedding_tuple
-
-    B, T = our_idx.shape
-    A = action_logits.size(-1)
-
-    # ---- Gather OUR-step logits ----
-    logits_at = action_logits.gather(1, our_idx.unsqueeze(-1).expand(-1, -1, A))  # [B,T,A]
-
-    def _neg_inf_like(x: torch.Tensor) -> torch.Tensor:
-        return torch.tensor(torch.finfo(x.dtype).min, dtype=x.dtype, device=x.device)
-    
-    # Apply legality mask for OUR steps only (if provided)
-    if batch.get("our_action_mask", None) is not None:
-        step_mask = batch["our_action_mask"].gather(
-            1, our_idx.unsqueeze(-1).expand(-1, -1, A)
-        )
-        invalid_rows = (~step_mask).all(dim=-1)
-        if invalid_rows.any():
-            fb_cols = logits_at[invalid_rows].argmax(dim=-1)
-            step_mask[invalid_rows] = False
-            step_mask[invalid_rows, fb_cols] = True
-        logits_at = logits_at.masked_fill(~step_mask, _neg_inf_like(logits_at))
-
-    logits_at = torch.nan_to_num(logits_at, nan=0.0, posinf=0.0, neginf=float(torch.finfo(logits_at.dtype).min))
-    values_at = values_full.gather(1, our_idx)
-    values_at = torch.nan_to_num(values_at, nan=0.0, posinf=0.0, neginf=0.0)
-
-    # ---- Build "next" indices & gaps for irregular-step GAE ----
-    next_idx = torch.full_like(our_idx, -1)
-    if T > 1:
-        next_idx[:, :-1] = our_idx[:, 1:]
-
-    has_next = torch.zeros_like(our_mask)
-    if T > 1:
-        has_next[:, :-1] = our_mask[:, 1:]
-
-    gaps = torch.zeros_like(our_idx, dtype=torch.long)
-    valid_gap = has_next & our_mask
-    gaps[valid_gap] = (next_idx[valid_gap] - our_idx[valid_gap]).clamp_min(1)
-    gamma_gap = (GAMMA ** gaps.to(torch.float32))
-    lam_gap   = (GAE_LAMBDA ** gaps.to(torch.float32))
-
-    # ---- Irregular-step GAE (vectorized backward over T) ----
-    with torch.no_grad():
-        advantages = torch.zeros_like(values_at)
-        lastgaelam = torch.zeros((B,), device=values_at.device, dtype=torch.float32)
-        for t in reversed(range(T)):
-            g  = torch.where(has_next[:, t], gamma_gap[:, t], torch.zeros_like(gamma_gap[:, t]))
-            gl = torch.where(has_next[:, t], gamma_gap[:, t] * lam_gap[:, t], torch.zeros_like(gamma_gap[:, t]))
-            L = values_full.size(1)
-            idx_safe = next_idx[:, t].clamp(0, L - 1)
-            nv = torch.where(
-                has_next[:, t],
-                values_full.gather(1, idx_safe.unsqueeze(-1)).squeeze(-1),
-                torch.zeros_like(values_at[:, t]),
-            )
-            delta = rewards[:, t] + g * nv - values_at[:, t]
-            lastgaelam = delta + gl * lastgaelam
-            advantages[:, t] = lastgaelam
-            lastgaelam = torch.where(our_mask[:, t], lastgaelam, lastgaelam * 0.0)
-        returns = advantages + values_at
-
-    # Normalize advantages using only valid positions
-    m = our_mask.to(torch.float32)
-    adv_sum = (advantages * m).sum()
-    m_sum = m.sum().clamp_min(1.0)
-    adv_mean = adv_sum / m_sum
-    adv_var  = ((advantages - adv_mean).pow(2) * m).sum() / m_sum
-    adv_std  = torch.sqrt(adv_var)
-    advantages = (advantages - adv_mean) / (adv_std + 1e-8)
-
-    # ---- PPO objective (masked) ----
-    dist = torch.distributions.Categorical(logits=logits_at)
-    
-    # Replace padded actions (-100) with a valid placeholder (0) to prevent crash.
-    actions_for_log_prob = actions.masked_fill(~our_mask, 0)
-    
-    # Calculate log_prob and entropy. The results for padded steps are garbage.
-    new_logp = dist.log_prob(actions_for_log_prob).to(torch.float32)
-    entropy  = dist.entropy().to(torch.float32)
-
-    # CRITICAL FIX: Zero out the garbage values for padded steps.
-    new_logp = new_logp.where(our_mask, 0.0)
-    entropy = entropy.where(our_mask, 0.0)
-    # old_logp is already correctly zero for padded steps from the collate function.
-
-    def masked_mean(x: torch.Tensor) -> torch.Tensor:
-        w = our_mask.to(x.dtype)
-        return (x * w).sum() / w.sum().clamp_min(1.0)
-
-    # The rest of the calculation is now safe.
-    log_ratio = (new_logp - old_logp).clamp(min=-60.0, max=60.0)
-    ratio = log_ratio.exp()
-
-    clipped_std = torch.clamp(ratio, 1.0 - EPS_CLIP, 1.0 + EPS_CLIP)
-    clipped_neg = torch.clamp(ratio, 1.0 - EPS_CLIP, TRINAL_DELTA1)
-    r_clipped = torch.where(advantages < 0, clipped_neg, clipped_std)
-    surr1 = ratio * advantages
-    surr2 = r_clipped * advantages
-    policy_loss = -masked_mean(torch.min(surr1, surr2))
-    
-    with torch.no_grad():
-        neg_mask = (advantages < 0) & our_mask
-        trinal_clip_neg_frac = ((ratio > (1.0 + EPS_CLIP)) & neg_mask).float()
-        trinal_clip_neg_frac = trinal_clip_neg_frac.sum() / neg_mask.float().sum().clamp_min(1.0)
-
-    ent_mean = masked_mean(entropy)
-    entropy_loss = -ent_mean * ENT_COEF
-    approx_kl = masked_mean(old_logp - new_logp)
-    clipfrac  = masked_mean(((ratio - 1.0).abs() > EPS_CLIP).float())
-
-    # ---- Value loss ----
-    # Ensure we only compute value loss on valid, unpadded steps
-    if our_mask.any():
-        value_loss, vclip_frac = _value_loss_with_stakes_clip_public(
-            v_pred=values_at[our_mask],
-            returns=returns[our_mask],
-            action_ids=actions[our_mask],
-            penalties_used=batch["penalties_used"][our_mask].long(),
-        )
-    else: # Handle empty batch case
-        value_loss = torch.tensor(0.0, device=values_at.device)
-        vclip_frac = torch.tensor(0.0, device=values_at.device)
-    
-    total = policy_loss + VALUE_WEIGHT * value_loss + entropy_loss
-
-    l1_sparsity_loss = torch.zeros((), device=values_full.device)
-    usage_balance_loss = torch.zeros((), device=values_full.device)
-    brick_diversity_loss = torch.zeros((), device=values_full.device)
-    avg_brick_usage_np = None
+    strategy_code, activations, bricks = embedding_tuple
 
     if activations is not None:
         agent_types = mi.get("agent_types")
@@ -916,8 +805,7 @@ def ppo_losses_batched(
                 l1_sparsity_loss = opp_activations.abs().mean()
 
                 brick_sums = opp_activations.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-                probs = opp_activations / brick_sums
-                probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+                probs = torch.nan_to_num(opp_activations / brick_sums, nan=0.0, posinf=0.0, neginf=0.0)
                 log_probs = torch.log(probs + 1e-8)
                 num_bricks = probs.size(-1)
                 if num_bricks > 0:
@@ -934,31 +822,10 @@ def ppo_losses_batched(
         off_diag = sim_matrix - eye
         denom = max(sim_matrix.size(0) * (sim_matrix.size(0) - 1), 1)
         brick_diversity_loss = off_diag.pow(2).sum() / denom
+        decor_penalty = _brick_decorrelation_penalty(bricks, bricks.device)
+    else:
+        decor_penalty = torch.zeros((), device=device)
 
-    total = (
-        total
-        + getattr(config, "L1_SPARSITY_WEIGHT", 0.0) * l1_sparsity_loss
-        + getattr(config, "USAGE_BALANCE_WEIGHT", 0.0) * usage_balance_loss
-        + getattr(config, "BRICK_DIVERSITY_WEIGHT", 0.0) * brick_diversity_loss
-    )
-
-    metrics: Dict[str, torch.Tensor] = {
-        "policy_loss": policy_loss.detach(),
-        "value_loss": value_loss.detach(),
-        "entropy": ent_mean.detach(),
-        "approx_kl": approx_kl.detach(),
-        "clip_fraction": clipfrac.detach(),
-        "trinal_clip_neg_frac": trinal_clip_neg_frac.detach(),
-        "value_clip_frac": vclip_frac.detach(),
-    }
-
-    metrics["l1_sparsity_loss"] = l1_sparsity_loss.detach()
-    metrics["usage_balance_loss"] = usage_balance_loss.detach()
-    metrics["brick_diversity_loss"] = brick_diversity_loss.detach()
-    if avg_brick_usage_np is not None:
-        metrics["avg_brick_usage_np"] = avg_brick_usage_np
-
-    # ---- Opponent embedding summaries (for visualization) ----
     if strategy_code is not None:
         agent_types = mi.get("agent_types")
         padding_mask = mi.get("padding_mask")
@@ -1025,7 +892,7 @@ def ppo_losses_batched(
                         embeds_flat.append(embed_vec.detach().cpu().float())
                         labels_flat.append(label_val)
 
-            metrics["opp_embeds_batch"] = (
+            metrics_extra["opp_embeds_batch"] = (
                 seat_embeds.detach().cpu().float().numpy(),
                 seat_labels.detach().cpu().numpy(),
                 seat_counts.detach().cpu().float().numpy(),
@@ -1033,65 +900,326 @@ def ppo_losses_batched(
 
             if embeds_flat:
                 embeds_tensor = torch.stack(embeds_flat, dim=0)
-                metrics["opp_embeds_flat"] = embeds_tensor.numpy()
-                metrics["opp_labels_flat"] = labels_flat
-                metrics["opp_labels_flat_original"] = labels_flat
+                metrics_extra["opp_embeds_flat"] = embeds_tensor.numpy()
+                metrics_extra["opp_labels_flat"] = labels_flat
+                metrics_extra["opp_labels_flat_original"] = labels_flat
 
-    # ---- Teacher KL (optional) ----
-    if (BC_KL_WEIGHT > 0.0) and (sl_teacher is not None):
-        with torch.no_grad():
-            t_outs = sl_teacher(**mi)
-            t_logits = t_outs[0]
-            t_logits_at = t_logits.gather(1, our_idx.unsqueeze(-1).expand(-1, -1, A))
-            if batch.get("our_action_mask", None) is not None:
-                step_mask = batch["our_action_mask"].gather(1, our_idx.unsqueeze(-1).expand(-1, -1, A))
-                t_logits_at = t_logits_at.masked_fill(~step_mask, _neg_inf_like(t_logits_at))
-            t_logits_at = torch.nan_to_num(t_logits_at, nan=0.0, posinf=0.0, neginf=float(torch.finfo(t_logits_at.dtype).min))
-        dist_sl = torch.distributions.Categorical(logits=t_logits_at)
-        bc_kl = torch.distributions.kl_divergence(dist, dist_sl)
-        bc_kl = masked_mean(bc_kl)
-        total = total + BC_KL_WEIGHT * bc_kl
-        metrics["bc_kl"] = bc_kl.detach()
-    else:
-        metrics["bc_kl"] = torch.zeros((), device=logits_at.device)
+    return (
+        l1_sparsity_loss,
+        usage_balance_loss,
+        brick_diversity_loss,
+        decor_penalty,
+        avg_brick_usage_np,
+        metrics_extra,
+    )
 
-    # =========================
-    # Shared opponent timeline
-    # =========================
-    opp_idx        = batch.get("opp_idx", None)            # [B, To]
-    opp_targets    = batch.get("opp_targets", None)        # [B, To]
-    opp_have_label = batch.get("opp_have_label", None)     # [B, To]
+
+@contextmanager
+def _temporarily_freeze_heads(model: torch.nn.Module):
+    params: List[Tuple[torch.nn.Parameter, bool]] = []
+    try:
+        for name in ("action_head", "value_head", "opp_action_head"):
+            module = getattr(model, name, None)
+            if module is None:
+                continue
+            for p in module.parameters(recurse=True):
+                params.append((p, p.requires_grad))
+                p.requires_grad_(False)
+        yield
+    finally:
+        for p, req in params:
+            p.requires_grad_(req)
+
+
+def _single_pass_ppo(
+    outs: Tuple[Any, ...],
+    *,
+    batch: Dict[str, torch.Tensor],
+    mi: Dict[str, torch.Tensor],
+    our_idx: torch.Tensor,
+    our_mask: torch.Tensor,
+    actions: torch.Tensor,
+    old_logp: torch.Tensor,
+    rewards: torch.Tensor,
+    penalties_used: torch.Tensor,
+    our_action_mask: Optional[torch.Tensor],
+    step_mask: torch.Tensor,
+    episode_mask: torch.Tensor,
+    sl_teacher: Optional[torch.nn.Module],
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
+    action_logits = outs[0]
+    opp_logits = outs[1] if len(outs) > 1 else None
+    values_full = outs[2].squeeze(-1).to(torch.float32)
+    embedding_tuple = outs[3] if len(outs) > 3 else None
+
+    B, T = our_idx.shape
+    A = action_logits.size(-1)
     device = values_full.device
 
-    # ---- Aux: opponent action supervision (re-use opp_idx/targets/mask) ----
+    logits_at = action_logits.gather(1, our_idx.unsqueeze(-1).expand(-1, -1, A))
+
+    def _neg_inf_like(x: torch.Tensor) -> torch.Tensor:
+        return torch.tensor(torch.finfo(x.dtype).min, dtype=x.dtype, device=x.device)
+
+    if our_action_mask is not None:
+        step_mask_full = our_action_mask.gather(1, our_idx.unsqueeze(-1).expand(-1, -1, A))
+        invalid_rows = (~step_mask_full).all(dim=-1)
+        if invalid_rows.any():
+            fb_cols = logits_at[invalid_rows].argmax(dim=-1)
+            step_mask_full[invalid_rows] = False
+            step_mask_full[invalid_rows, fb_cols] = True
+        logits_at = logits_at.masked_fill(~step_mask_full, _neg_inf_like(logits_at))
+
+    logits_at = torch.nan_to_num(
+        logits_at, nan=0.0, posinf=0.0, neginf=float(torch.finfo(logits_at.dtype).min)
+    )
+    values_at = values_full.gather(1, our_idx)
+    values_at = torch.nan_to_num(values_at, nan=0.0, posinf=0.0, neginf=0.0)
+
+    next_idx = torch.full_like(our_idx, -1)
+    if T > 1:
+        next_idx[:, :-1] = our_idx[:, 1:]
+
+    has_next = torch.zeros_like(our_mask)
+    if T > 1:
+        has_next[:, :-1] = our_mask[:, 1:]
+
+    gaps = torch.zeros_like(our_idx, dtype=torch.long)
+    valid_gap = has_next & our_mask
+    gaps[valid_gap] = (next_idx[valid_gap] - our_idx[valid_gap]).clamp_min(1)
+    gamma_gap = (GAMMA ** gaps.to(torch.float32))
+    lam_gap = (GAE_LAMBDA ** gaps.to(torch.float32))
+
+    advantages = torch.zeros_like(values_at)
+    lastgaelam = torch.zeros((B,), device=device, dtype=torch.float32)
+    for t in reversed(range(T)):
+        g = torch.where(has_next[:, t], gamma_gap[:, t], torch.zeros_like(gamma_gap[:, t]))
+        gl = torch.where(has_next[:, t], gamma_gap[:, t] * lam_gap[:, t], torch.zeros_like(gamma_gap[:, t]))
+        L = values_full.size(1)
+        idx_safe = next_idx[:, t].clamp(0, L - 1)
+        nv = torch.where(
+            has_next[:, t],
+            values_full.gather(1, idx_safe.unsqueeze(-1)).squeeze(-1),
+            torch.zeros_like(values_at[:, t]),
+        )
+        delta = rewards[:, t] + g * nv - values_at[:, t]
+        lastgaelam = delta + gl * lastgaelam
+        advantages[:, t] = lastgaelam
+        lastgaelam = torch.where(our_mask[:, t], lastgaelam, lastgaelam * 0.0)
+    returns = advantages + values_at
+
+    adv_norm = _normalize_advantages(advantages, step_mask)
+
+    dist = torch.distributions.Categorical(logits=logits_at)
+    actions_for_log_prob = actions.masked_fill(~our_mask, 0)
+    new_logp = dist.log_prob(actions_for_log_prob).to(torch.float32)
+    entropy = dist.entropy().to(torch.float32)
+    new_logp = new_logp.where(our_mask, torch.zeros_like(new_logp))
+    entropy = entropy.where(our_mask, torch.zeros_like(entropy))
+
+    log_ratio = (new_logp - old_logp).clamp(min=-60.0, max=60.0)
+    ratio = log_ratio.exp()
+    clipped_std = torch.clamp(ratio, 1.0 - EPS_CLIP, 1.0 + EPS_CLIP)
+    clipped_neg = torch.clamp(ratio, 1.0 - EPS_CLIP, TRINAL_DELTA1)
+    r_clipped = torch.where(advantages < 0, clipped_neg, clipped_std)
+    surr1 = ratio * adv_norm
+    surr2 = r_clipped * adv_norm
+    policy_loss = -_masked_mean(torch.min(surr1, surr2), step_mask)
+
+    with torch.no_grad():
+        neg_mask = (advantages < 0) & step_mask
+        trinal_clip_neg_frac = ((ratio > (1.0 + EPS_CLIP)) & neg_mask).float()
+        denom_neg = neg_mask.float().sum().clamp_min(1.0)
+        trinal_clip_neg_frac = trinal_clip_neg_frac.sum() / denom_neg
+
+    ent_mean = _masked_mean(entropy, step_mask)
+    entropy_loss = -ent_mean * ENT_COEF
+    approx_kl = _masked_mean(old_logp - new_logp, step_mask)
+    clipfrac = _masked_mean(((ratio - 1.0).abs() > EPS_CLIP).float(), step_mask)
+
+    if step_mask.any():
+        value_loss, vclip_frac = _value_loss_with_stakes_clip_public(
+            v_pred=values_at[step_mask],
+            returns=returns[step_mask],
+            action_ids=actions[step_mask],
+            penalties_used=penalties_used[step_mask].long(),
+        )
+    else:
+        value_loss = torch.zeros((), device=device)
+        vclip_frac = torch.zeros((), device=device)
+
+    total = policy_loss + VALUE_WEIGHT * value_loss + entropy_loss
+
     opp_loss = torch.zeros((), device=device)
-    opp_acc  = torch.zeros((), device=device)
-    if AUX_OPP_WEIGHT > 0.0 and (opp_logits is not None) and (opp_idx is not None):
+    opp_acc = torch.zeros((), device=device)
+    opp_idx = batch.get("opp_idx")
+    opp_targets = batch.get("opp_targets")
+    opp_have_label = batch.get("opp_have_label")
+    if (
+        AUX_OPP_WEIGHT > 0.0
+        and (opp_logits is not None)
+        and (opp_idx is not None)
+        and episode_mask.any()
+    ):
         if opp_idx.numel() > 0:
-            B, L, A_opp = opp_logits.shape
+            B_sel, L_sel, A_opp = opp_logits.shape
             To = opp_idx.size(1)
-            opp_sel = opp_logits.gather(1, opp_idx.unsqueeze(-1).expand(-1, -1, A_opp))  # [B, To, A]
+            opp_sel = opp_logits.gather(1, opp_idx.unsqueeze(-1).expand(-1, -1, A_opp))
             ce_opp = torch.nn.functional.cross_entropy(
                 opp_sel.reshape(-1, A_opp),
-                opp_targets.view(-1) if opp_targets is not None else torch.full((B*To,), -100, device=device, dtype=torch.long),
-                ignore_index=-100, reduction="none"
-            ).view(B, To)
+                opp_targets.view(-1)
+                if opp_targets is not None
+                else torch.full((B_sel * To,), -100, device=device, dtype=torch.long),
+                ignore_index=-100,
+                reduction="none",
+            ).view(B_sel, To)
 
             if opp_have_label is not None:
-                w = opp_have_label.to(ce_opp.dtype)
+                w = (opp_have_label & episode_mask.unsqueeze(1)).to(ce_opp.dtype)
                 if w.sum() > 0:
                     opp_loss = (ce_opp * w).sum() / w.sum().clamp_min(1.0)
                     with torch.no_grad():
                         pred = opp_sel.argmax(dim=-1)
-                        corr = ((pred == opp_targets) & opp_have_label).sum().to(torch.float32)
-                        opp_acc = corr / opp_have_label.sum().clamp_min(1).to(torch.float32)
+                        corr = ((pred == opp_targets) & opp_have_label & episode_mask.unsqueeze(1)).sum().to(torch.float32)
+                        denom = (opp_have_label & episode_mask.unsqueeze(1)).sum().clamp_min(1)
+                        opp_acc = corr / denom.to(torch.float32)
 
     if AUX_OPP_WEIGHT > 0.0:
         total = total + AUX_OPP_WEIGHT * opp_loss
-    metrics["opp_loss"]        = opp_loss.detach()
-    metrics["opp_action_acc"]  = opp_acc.detach()
 
-    return total, metrics
+    bc_kl = torch.zeros((), device=device)
+    if (BC_KL_WEIGHT > 0.0) and (sl_teacher is not None) and step_mask.any():
+        with torch.no_grad():
+            t_outs = sl_teacher(**mi)
+            t_logits = t_outs[0]
+            t_logits_at = t_logits.gather(1, our_idx.unsqueeze(-1).expand(-1, -1, A))
+            if our_action_mask is not None:
+                step_mask_full = our_action_mask.gather(1, our_idx.unsqueeze(-1).expand(-1, -1, A))
+                t_logits_at = t_logits_at.masked_fill(~step_mask_full, _neg_inf_like(t_logits_at))
+            t_logits_at = torch.nan_to_num(
+                t_logits_at,
+                nan=0.0,
+                posinf=0.0,
+                neginf=float(torch.finfo(t_logits_at.dtype).min),
+            )
+        dist_sl = torch.distributions.Categorical(logits=t_logits_at)
+        bc_kl_val = torch.distributions.kl_divergence(dist, dist_sl)
+        bc_kl = _masked_mean(bc_kl_val, step_mask)
+        total = total + BC_KL_WEIGHT * bc_kl
+
+    metrics: Dict[str, torch.Tensor] = {
+        "policy_loss": policy_loss.detach(),
+        "value_loss": value_loss.detach(),
+        "entropy": ent_mean.detach(),
+        "approx_kl": approx_kl.detach(),
+        "clip_fraction": clipfrac.detach(),
+        "trinal_clip_neg_frac": trinal_clip_neg_frac.detach(),
+        "value_clip_frac": vclip_frac.detach(),
+        "opp_loss": opp_loss.detach(),
+        "opp_action_acc": opp_acc.detach(),
+        "bc_kl": bc_kl.detach(),
+    }
+
+    return total, metrics, embedding_tuple
+
+
+def ppo_losses_batched(
+    model: torch.nn.Module,
+    batch: Dict[str, torch.Tensor],
+    sl_teacher: Optional[torch.nn.Module] = None,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """
+    Batched PPO objective with compositional pressure support.
+    """
+    mi = batch["mi"]
+    our_idx = batch["our_idx"].long()
+    our_mask = batch["mask"].bool()
+    actions = batch["actions"].long()
+    old_logp = batch["old_logp"].float()
+    rewards = batch["rewards"].float()
+    penalties_used = batch["penalties_used"].long()
+    our_action_mask = batch.get("our_action_mask")
+    heldout_episode_mask = batch.get("heldout_episode_mask")
+    if heldout_episode_mask is None:
+        heldout_episode_mask = torch.zeros(our_idx.size(0), dtype=torch.bool, device=our_idx.device)
+
+    dropout_p = getattr(config, "DROPOUT_P", 0.25)
+    train_episode_mask = ~heldout_episode_mask
+    train_step_mask = our_mask & train_episode_mask.unsqueeze(1)
+    heldout_step_mask = our_mask & heldout_episode_mask.unsqueeze(1)
+
+    outs_train = model(**{**mi, "return_embeddings": True, "dropout_p": dropout_p})
+    train_loss, train_metrics, embedding_tuple = _single_pass_ppo(
+        outs_train,
+        batch=batch,
+        mi=mi,
+        our_idx=our_idx,
+        our_mask=our_mask,
+        actions=actions,
+        old_logp=old_logp,
+        rewards=rewards,
+        penalties_used=penalties_used,
+        our_action_mask=our_action_mask,
+        step_mask=train_step_mask,
+        episode_mask=train_episode_mask,
+        sl_teacher=sl_teacher,
+    )
+
+    (
+        l1_sparsity_loss,
+        usage_balance_loss,
+        brick_diversity_loss,
+        decor_penalty,
+        avg_brick_usage_np,
+        embed_metrics,
+    ) = _dictionary_regularizers(embedding_tuple, mi, batch)
+
+    metrics: Dict[str, Any] = dict(train_metrics)
+    metrics.update(embed_metrics)
+    metrics["l1_sparsity_loss"] = l1_sparsity_loss.detach()
+    metrics["usage_balance_loss"] = usage_balance_loss.detach()
+    metrics["brick_diversity_loss"] = brick_diversity_loss.detach()
+    metrics["brick_decorrelation_loss"] = decor_penalty.detach()
+    if avg_brick_usage_np is not None:
+        metrics["avg_brick_usage_np"] = avg_brick_usage_np
+
+    lambda_cp = float(getattr(config, "DCP_LOSS_WEIGHT", 0.0))
+    decor_weight = float(getattr(config, "BRICK_DECORRELATION_WEIGHT", 0.0))
+
+    dcp_loss = torch.zeros_like(train_loss)
+    if heldout_step_mask.any():
+        with _temporarily_freeze_heads(model):
+            outs_cp = model(**{**mi, "return_embeddings": True, "dropout_p": dropout_p})
+        dcp_loss, dcp_metrics, _ = _single_pass_ppo(
+            outs_cp,
+            batch=batch,
+            mi=mi,
+            our_idx=our_idx,
+            our_mask=our_mask,
+            actions=actions,
+            old_logp=old_logp,
+            rewards=rewards,
+            penalties_used=penalties_used,
+            our_action_mask=our_action_mask,
+            step_mask=heldout_step_mask,
+            episode_mask=heldout_episode_mask,
+            sl_teacher=sl_teacher,
+        )
+        metrics.update({f"dcp_{k}": v for k, v in dcp_metrics.items()})
+        metrics["dcp_total_loss"] = dcp_loss.detach()
+    else:
+        metrics["dcp_total_loss"] = dcp_loss.detach()
+
+    total_loss = train_loss + lambda_cp * dcp_loss
+    total_loss = total_loss + getattr(config, "L1_SPARSITY_WEIGHT", 0.0) * l1_sparsity_loss
+    total_loss = total_loss + getattr(config, "USAGE_BALANCE_WEIGHT", 0.0) * usage_balance_loss
+    total_loss = total_loss + getattr(config, "BRICK_DIVERSITY_WEIGHT", 0.0) * brick_diversity_loss
+    total_loss = total_loss + decor_weight * decor_penalty
+
+    metrics["dcp_weighted_loss"] = (lambda_cp * dcp_loss).detach()
+    metrics["total_loss"] = total_loss.detach()
+
+    return total_loss, metrics
 
 
 def _collate_batch(
@@ -1217,11 +1345,83 @@ def _collate_batch(
     To = max((int(x.numel()) for x in opp_pos_lists), default=0)
 
     opponent_counts: List[int] = []
+    heldout_flags: List[bool] = []
+
+    def _label_to_int(label: Any) -> Optional[int]:
+        if label is None:
+            return None
+        if isinstance(label, (int, np.integer)):
+            return int(label)
+        if isinstance(label, torch.Tensor):
+            return int(label.item())
+        try:
+            return int(label)
+        except (TypeError, ValueError):
+            try:
+                if hasattr(label, "item"):
+                    return int(label.item())
+            except Exception:
+                pass
+        return None
+
+    episode_infos: List[Dict[str, Any]] = []
+    heldout_label: Optional[int] = None
+
     for ep in episodes:
         player_labels = tuple(ep.get("player_labels", ()))
-        training_seat = ep.get("training_agent_seat", -1)
+        training_seat = int(ep.get("training_agent_seat", -1))
+        training_label = _label_to_int(ep.get("training_agent_label"))
+        true_opp = tuple(ep.get("true_opponent_labels", ()))
+
         count = sum(1 for seat_idx in range(len(player_labels)) if seat_idx != training_seat)
         opponent_counts.append(count)
+
+        candidate_labels: List[int] = []
+        for lab in true_opp:
+            lab_i = _label_to_int(lab)
+            if lab_i is not None:
+                candidate_labels.append(lab_i)
+        if not candidate_labels:
+            for seat_idx, lab in enumerate(player_labels):
+                if seat_idx == training_seat:
+                    continue
+                lab_i = _label_to_int(lab)
+                if lab_i is not None:
+                    candidate_labels.append(lab_i)
+
+        for lab_i in candidate_labels:
+            if training_label is not None and lab_i == training_label:
+                continue
+            if heldout_label is None or lab_i > heldout_label:
+                heldout_label = lab_i
+
+        episode_infos.append(
+            {
+                "player_labels": player_labels,
+                "true_opponent_labels": true_opp,
+                "training_seat": training_seat,
+                "training_label": training_label,
+            }
+        )
+
+    for info in episode_infos:
+        has_heldout = False
+        if heldout_label is not None:
+            for lab in info["true_opponent_labels"]:
+                lab_i = _label_to_int(lab)
+                if lab_i is not None and lab_i == heldout_label:
+                    has_heldout = True
+                    break
+            if not has_heldout:
+                training_seat = info["training_seat"]
+                for seat_idx, lab in enumerate(info["player_labels"]):
+                    if seat_idx == training_seat:
+                        continue
+                    lab_i = _label_to_int(lab)
+                    if lab_i is not None and lab_i == heldout_label:
+                        has_heldout = True
+                        break
+        heldout_flags.append(has_heldout)
     num_opponents = max(opponent_counts + [0])
 
     # -------- allocate supervision tensors (CPU) --------
@@ -1242,6 +1442,7 @@ def _collate_batch(
 
     opp_labels_by_seat = _pm(torch.full((B, num_opponents), IGN, dtype=torch.long))
     opp_seat_ids = _pm(torch.full((B, num_opponents), -1, dtype=torch.long))
+    heldout_episode_mask = _pm(torch.tensor(heldout_flags, dtype=torch.bool))
 
     # -------- fill from episodes (only real steps) --------
     for b, ep in enumerate(episodes):
@@ -1325,6 +1526,7 @@ def _collate_batch(
         "opp_have_label": opp_have_label,
         "opp_labels_by_seat": opp_labels_by_seat,
         "opp_seat_ids": opp_seat_ids,
+        "heldout_episode_mask": heldout_episode_mask,
     }
 
 def _to_device_batch(batch_cpu: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
@@ -1347,5 +1549,6 @@ def _to_device_batch(batch_cpu: Dict[str, Any], device: torch.device) -> Dict[st
         "opp_have_label": batch_cpu["opp_have_label"].to(device, non_blocking=True),
         "opp_labels_by_seat": batch_cpu["opp_labels_by_seat"].to(device, non_blocking=True),
         "opp_seat_ids":      batch_cpu["opp_seat_ids"].to(device, non_blocking=True),
+        "heldout_episode_mask": batch_cpu["heldout_episode_mask"].to(device, non_blocking=True),
     }
     return out
