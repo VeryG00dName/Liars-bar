@@ -289,7 +289,7 @@ def train_generation(
     episodes_per_update = int(config.EPISODES_PER_UPDATE)
     k_epochs = int(config.K_EPOCHS)
     ep_buffer: List[Dict[str, Any]] = []
-    opp_label_lookup: Dict[int, Any] = {}
+    # Use direct opponent labels for visualization; no remapping/lookup
     
     collected_updates: List[Dict[str, Any]] = []
 
@@ -352,7 +352,7 @@ def train_generation(
             X_flat = metrics.get("opp_embeds_flat", None)
             L_flat = metrics.get("opp_labels_flat", None)
             L_orig = metrics.get("opp_labels_flat_original", None)
-            if X_flat is not None and L_flat is not None:
+            if X_flat is not None and (L_flat is not None or L_orig is not None):
                 Xb = np.asarray(X_flat, dtype=np.float32)
                 if Xb.ndim == 1:
                     if Xb.size == 0:
@@ -360,12 +360,12 @@ def train_generation(
                     Xb = Xb.reshape(1, -1)
                 if Xb.size > 0:
                     opp_rows_X.append(Xb)
-                    seq_labels = [int(l) for l in np.asarray(L_orig).tolist()]
+                    labels_src = L_orig if L_orig is not None else L_flat
+                    labels_list = np.asarray(labels_src).tolist()
+                    if not isinstance(labels_list, (list, tuple)):
+                        labels_list = [labels_list]
+                    seq_labels = [int(l) for l in labels_list]
                     opp_rows_L.extend(seq_labels)
-                    if L_orig is not None and len(L_orig) == len(seq_labels):
-                        for seq, orig in zip(seq_labels, L_orig):
-                            if seq not in opp_label_lookup:
-                                opp_label_lookup[seq] = orig
             else:
                 emb = metrics.get("opp_embeds_batch", None)
                 if emb is not None:
@@ -498,13 +498,8 @@ def train_generation(
         if (update % 50) == 0 and opp_rows_X:
             X = np.concatenate(opp_rows_X, axis=0)            # [N, D]
             labels_seq = np.asarray(opp_rows_L, dtype=np.int64)
-            if opp_label_lookup:
-                labels_display = [
-                    f"{int(seq)}: {opp_label_lookup.get(int(seq), int(seq))}"
-                    for seq in labels_seq
-                ]
-            else:
-                labels_display = [str(int(seq)) for seq in labels_seq]
+            # Display labels directly (no "orig:seq" formatting)
+            labels_display = [str(int(seq)) for seq in labels_seq]
 
             visualize_opponent_embeddings_all(
                 writer, (X, labels_display), step=update,

@@ -1347,6 +1347,9 @@ def _collate_batch(
     opponent_counts: List[int] = []
     heldout_flags: List[bool] = []
 
+    # Labels <= 6 are classic C++ bots; only consider held-out labels > 6
+    BOT_MAX_ID = 6
+
     def _label_to_int(label: Any) -> Optional[int]:
         if label is None:
             return None
@@ -1379,14 +1382,14 @@ def _collate_batch(
         candidate_labels: List[int] = []
         for lab in true_opp:
             lab_i = _label_to_int(lab)
-            if lab_i is not None:
+            if lab_i is not None and lab_i > BOT_MAX_ID:
                 candidate_labels.append(lab_i)
         if not candidate_labels:
             for seat_idx, lab in enumerate(player_labels):
                 if seat_idx == training_seat:
                     continue
                 lab_i = _label_to_int(lab)
-                if lab_i is not None:
+                if lab_i is not None and lab_i > BOT_MAX_ID:
                     candidate_labels.append(lab_i)
 
         for lab_i in candidate_labels:

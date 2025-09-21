@@ -71,7 +71,7 @@ BRICK_DIM = 32
 DROPOUT_P = 0.25
 
 # Dictionary compositional pressure (DCP) and decorrelation controls
-DCP_LOSS_WEIGHT = 0.1
+DCP_LOSS_WEIGHT = 0.15
 BRICK_DECORRELATION_WEIGHT = 1e-3
 # ============================
 # PPO / Training Hyperparameters
