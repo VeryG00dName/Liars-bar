@@ -486,23 +486,19 @@ def _visualize_pca_panels(
                 show_pts = pts[take]
             ax.scatter(show_pts[:, 0], show_pts[:, 1], color=color, s=8, alpha=0.25, linewidths=0)
 
-            centroid = pts.mean(axis=0)
-            ax.scatter(
-                centroid[0],
-                centroid[1],
-                marker="X",
-                s=80,
-                color=color,
-                edgecolor="black",
-                linewidths=0.8,
-            )
+            # Add legend handle for the first panel only (no centroid marker)
             if i == valid_pairs[0][0] and j == valid_pairs[0][1]:
-                legend_handles.append(Line2D([0], [0], marker="X", color="w",
-                                             markerfacecolor=color, markeredgecolor="black",
-                                             linewidth=0, markersize=9, label=f"Opp {lab}"))
+                legend_handles.append(
+                    Line2D([0], [0],
+                           marker="o", color="w",
+                           markerfacecolor=color, markeredgecolor="none",
+                           linewidth=0, markersize=6, label=f"Opp {lab}")
+                )
 
+            # Only compute centroid if we actually need it for the ellipse
             if pts.shape[0] >= 3:
                 cov = np.cov(pts, rowvar=False)
+                centroid = pts.mean(axis=0)  # computed only when used
                 ell = _ellipse_from_cov(centroid, cov, color)
                 if ell is not None:
                     ax.add_patch(ell)

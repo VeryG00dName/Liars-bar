@@ -38,9 +38,8 @@ class StrategyDictionary(nn.Module):
         
         # 3. Combine bricks using activations to form the strategy code
         # Matmul: (B, T, num_bricks) @ (num_bricks, brick_dim) -> (B, T, brick_dim)
-        strategy_code = torch.matmul(activations, self.bricks)
         
-        return strategy_code, activations, self.bricks
+        return activations, self.bricks
 
 
 class PPOFusedModel(nn.Module):
@@ -161,15 +160,14 @@ class PPOFusedModel(nn.Module):
         )
 
         # Get the raw activations from the dictionary
-        # Note: We don't use the strategy_code from here directly
-        _, activations, bricks = self.strategy_dictionary(transformer_output)
+        activations, bricks = self.strategy_dictionary(transformer_output)
 
         # --- APPLY DROPOUT HERE ---
         # Apply dropout to the activations before they are used.
         # This should only be active during training.
         activations_reg = F.dropout(activations, p=dropout_p, training=self.training)
         
-        # Re-compute the strategy code using the regularized activations
+        # compute the strategy code using the regularized activations
         strategy_code = torch.matmul(activations_reg, bricks)
         
         # --- Policy/Value Stream ---

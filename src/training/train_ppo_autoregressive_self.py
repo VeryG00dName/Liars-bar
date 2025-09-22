@@ -482,11 +482,24 @@ def train_generation(
                 writer.add_scalar(f"PerOpponent/win_rate_vs_{label}", wins_vs / total, update)
                 writer.add_scalar(f"PerOpponent/episodes_vs_{label}", total, update)
 
-        # Also log the largest label's win rate under a fixed name
-        if sorted_items and run_name != "gen_1":
-            most_recent_label, (mr_wins, mr_total) = sorted_items[-1]  # largest by str(label)
-            if mr_total > 0:
-                writer.add_scalar("PerOpponent/Win_rate_vs_most_recent", mr_wins / mr_total, update)
+        # Efficient held-out metric using aggregated per-opponent totals
+        # Choose held-out as the largest non-bot label (>6) among opponents seen this update
+        BOT_MAX_ID = 6
+        per_opponent_totals_int: Dict[int, List[float]] = {}
+        for lab_any, (wins_vs, total) in per_opponent_totals.items():
+            try:
+                lab_int = int(lab_any)
+            except Exception:
+                continue
+            acc = per_opponent_totals_int.setdefault(lab_int, [0.0, 0.0])
+            acc[0] += float(wins_vs)
+            acc[1] += float(total)
+        heldout_candidates = [lab for lab in per_opponent_totals_int.keys() if lab > BOT_MAX_ID]
+        if heldout_candidates:
+            heldout_label = max(heldout_candidates)
+            hw, ht = per_opponent_totals_int[heldout_label]
+            if ht > 0:
+                writer.add_scalar("PerOpponent/Win_rate_vs_heldout", hw / ht, update)
         writer.add_scalar("Buffer/Size", len(ep_buffer), update)
         writer.add_scalar("Acc/OpponentAction", avg.get("opp_action_acc", 0.0), update)
 
