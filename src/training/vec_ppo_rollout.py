@@ -224,6 +224,8 @@ class PPOVecRolloutManager:
 
             ep_tracker['last_processed_cxx_history_len'] = total_history_len
 
+            self._update_penalty_rewards(ep_tracker, env.penalties)
+
             if done_statuses[env_idx]:
                 self._finalize_episode(ep_tracker, pending_data)
 
@@ -238,6 +240,8 @@ class PPOVecRolloutManager:
 
         env     = self.arena.get_env(env_idx)
         ep_data = ep_tracker['data']
+
+        self._update_penalty_rewards(ep_tracker, env.penalties)
 
         # If our action ended the game and pending data still exists, flush it
         data = pending_data.pop(env_idx, None)
@@ -273,7 +277,7 @@ class PPOVecRolloutManager:
 
         # If we actually took an action, assign the final reward to our last step.
         if our_last_step_idx != -1:
-            ep_data['reward'][our_last_step_idx] = 1.0 if is_winner else -1.0
+            ep_data['reward'][our_last_step_idx] += 1.0 if is_winner else -1.0
         # --- END FIX ---
 
         ep_data['episode_return'] = float(sum(ep_data['reward']))
@@ -338,6 +342,8 @@ class PPOVecRolloutManager:
             "last_history_len": 0,
             "last_processed_cxx_history_len": 0,
             "global_step": -1,
+            "last_training_step_idx": -1,
+            "last_penalties": None,
             "data": ep_data
         }
 
@@ -354,4 +360,40 @@ class PPOVecRolloutManager:
         # align penalties_used length with rows; will be filled on our steps
         ep['penalties_used'].append(None)
 
-        return len(ep['agent_id']) - 1
+        idx = len(ep['agent_id']) - 1
+        if agent_seat == ep_tracker.get('training_agent_seat'):
+            ep_tracker['last_training_step_idx'] = idx
+        return idx
+
+    def _update_penalty_rewards(self, ep_tracker: Dict[str, Any], penalties: Any) -> None:
+        if not ep_tracker.get('is_training_episode', False):
+            ep_tracker['last_penalties'] = [int(p) for p in penalties]
+            return
+
+        penalties_list = [int(p) for p in penalties]
+        last_penalties = ep_tracker.get('last_penalties')
+        ep_tracker['last_penalties'] = penalties_list
+
+        if last_penalties is None:
+            return
+
+        seat = ep_tracker.get('training_agent_seat', -1)
+        last_idx = ep_tracker.get('last_training_step_idx', -1)
+        ep_data = ep_tracker.get('data') or {}
+
+        if last_idx < 0 or last_idx >= len(ep_data.get('reward', [])):
+            return
+
+        delta_total = 0.0
+        for i, (prev, cur) in enumerate(zip(last_penalties, penalties_list)):
+            diff = int(cur) - int(prev)
+            if diff <= 0:
+                continue
+            if i == seat:
+                delta_total -= 0.1 * diff
+            else:
+                delta_total += 0.033 * diff
+
+        if delta_total != 0.0:
+            ep_data['reward'][last_idx] += float(delta_total)
+

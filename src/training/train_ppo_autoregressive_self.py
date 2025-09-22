@@ -20,7 +20,11 @@ os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
 
 # Hide symbolic_shapes warnings printed via warnings module (belt-and-suspenders)
 warnings.filterwarnings("ignore", message=".*symbolic_shapes.*")
-
+warnings.filterwarnings(
+    "ignore",
+    message=".*does not have a deterministic implementation.*",
+    category=UserWarning,
+)
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from torch.nn.utils import clip_grad_norm_

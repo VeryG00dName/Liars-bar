@@ -156,7 +156,7 @@ def set_seed(seed=42):
     torch.set_float32_matmul_precision("medium")
 
     # Enforce deterministic algorithm usage (raises if unavailable)
-    torch.use_deterministic_algorithms(True)
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
     try:
         from torch.nn.attention import sdp_kernel  # type: ignore
@@ -1217,6 +1217,8 @@ def _single_pass_ppo(
     )
     values_at = values_full.gather(1, our_idx)
     values_at = torch.nan_to_num(values_at, nan=0.0, posinf=0.0, neginf=0.0)
+
+    rewards = rewards.where(our_mask, torch.zeros_like(rewards))
 
     next_idx = torch.full_like(our_idx, -1)
     if T > 1:

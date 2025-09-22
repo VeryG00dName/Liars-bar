@@ -21,7 +21,7 @@ TRANSFORMER_CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "transformer_classifi
 HISTORICAL_MODEL_DIR = PLAYERS_DIR
 
 # Optional: path to a supervised/teacher checkpoint used for warm start / teacher KL
-SL_TEACHER_CKPT = r"/mnt/l/Coding_Projects/Liars_bar_2/Liars-bar/checkpoints/autoreg_20250918_002912/autoreg_model_final.pth"
+SL_TEACHER_CKPT = r"/mnt/l/Coding_Projects/Liars_bar_2/Liars-bar/checkpoints/autoreg_20250922_024334/autoreg_model_final.pth"
 
 # ============================
 # Directory Preparation
@@ -73,7 +73,7 @@ DROPOUT_P = 0.15
 # Dictionary compositional pressure (DCP) and decorrelation controls
 # Base DCP weight is scaled by held-out TOKEN fraction inside the loss
 # (effective_weight = heldout_token_frac * DCP_LOSS_WEIGHT).
-DCP_LOSS_WEIGHT = 0.15
+DCP_LOSS_WEIGHT = 1.2
 BRICK_DECORRELATION_WEIGHT = 1e-3
 # ============================
 # PPO / Training Hyperparameters
