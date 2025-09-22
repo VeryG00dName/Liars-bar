@@ -36,7 +36,6 @@ from src.training.train_extras import (
     _collate_batch,
     _to_device_batch,
     ppo_losses_batched,
-    visualize_opponent_embeddings_all,
     set_seed
 )
 import src.training.train_extras as train_extras
@@ -319,6 +318,8 @@ def train_generation(
         n_batches = 0
         opp_rows_X = []  # list of np.ndarray chunks, each [N_i, D]
         opp_rows_L = []  # flat list of remapped labels aligned with rows in opp_rows_X
+        opp_token_codes: List[np.ndarray] = []
+        opp_token_top_idx: List[np.ndarray] = []
         avg_brick_usage_chunks: List[np.ndarray] = []
         for _ in range(k_epochs):
             batch_eps = random.sample(ep_buffer, min(len(ep_buffer), episodes_per_update))
@@ -383,6 +384,15 @@ def train_generation(
                         Lb = [None] * int(good.sum())
                     opp_rows_X.append(Xb)
                     opp_rows_L.extend(Lb)
+
+            tok_codes = metrics.get("opp_strategy_codes_tokens")
+            if tok_codes is not None:
+                arr = np.asarray(tok_codes, dtype=np.float32)
+                if arr.ndim == 2 and arr.size > 0:
+                    opp_token_codes.append(arr)
+                    top_idx = metrics.get("opp_activation_top_idx")
+                    if top_idx is not None:
+                        opp_token_top_idx.append(np.asarray(top_idx).reshape(-1))
 
             avg_usage = metrics.get("avg_brick_usage_np")
             if avg_usage is not None:
@@ -511,12 +521,41 @@ def train_generation(
         if (update % 50) == 0 and opp_rows_X:
             X = np.concatenate(opp_rows_X, axis=0)            # [N, D]
             labels_seq = np.asarray(opp_rows_L, dtype=np.int64)
-            # Display labels directly (no "orig:seq" formatting)
             labels_display = [str(int(seq)) for seq in labels_seq]
 
-            visualize_opponent_embeddings_all(
-                writer, (X, labels_display), step=update,
-                title_prefix="Per-Opponent strategy_code"
+            activation_codes = None
+            activation_labels = None
+            if opp_token_codes:
+                activation_codes = np.concatenate(opp_token_codes, axis=0)
+                if opp_token_top_idx:
+                    activation_labels = np.concatenate(opp_token_top_idx, axis=0)
+                if activation_labels is not None and activation_labels.shape[0] != activation_codes.shape[0]:
+                    activation_labels = None
+                max_samples = int(getattr(config, "PCA_TOKEN_SAMPLE_TOTAL", 4000))
+                if activation_codes.shape[0] > max_samples:
+                    rng = np.random.default_rng(update)
+                    choice = rng.choice(activation_codes.shape[0], size=max_samples, replace=False)
+                    activation_codes = activation_codes[choice]
+                    if activation_labels is not None:
+                        activation_labels = activation_labels[choice]
+
+            bricks_np = None
+            strat_dict = getattr(getattr(learner, "model", None), "strategy_dictionary", None)
+            if strat_dict is not None and hasattr(strat_dict, "bricks"):
+                with torch.no_grad():
+                    bricks_np = strat_dict.bricks.detach().cpu().float().numpy()
+
+            pca_key = f"{run_name}_strategy_code"
+            train_extras.log_strategy_pca_views(
+                writer,
+                step=update,
+                pca_key=pca_key,
+                opponent_codes=X,
+                opponent_labels=labels_display,
+                brick_vectors=bricks_np,
+                activation_codes=activation_codes,
+                activation_labels=activation_labels,
+                title_prefix="Per-Opponent strategy_code",
             )
 
             metrics = train_extras.embedding_quality_metrics(X, labels_seq, k=10)

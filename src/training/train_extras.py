@@ -4,7 +4,7 @@ import random
 from collections import Counter
 from contextlib import contextmanager
 from io import BytesIO
-from typing import Dict, Any, List, Optional, Tuple, Iterable, Union, Hashable
+from typing import Dict, Any, List, Optional, Tuple, Iterable, Union, Hashable, Callable
 import math
 import numpy as np
 import torch
@@ -34,6 +34,9 @@ import umap.umap_ as umap
 _EMBED_LABEL_MAP: Dict[Hashable, int] = {}
 
 
+_PERSISTENT_PCA: Dict[str, Dict[str, Any]] = {}
+
+
 def _remap_embed_labels(labels: List[Any]) -> List[int]:
     """Map arbitrary opponent identifiers to stable sequential integers."""
     remapped: List[int] = []
@@ -51,6 +54,77 @@ def _remap_embed_labels(labels: List[Any]) -> List[int]:
             _EMBED_LABEL_MAP[key] = len(_EMBED_LABEL_MAP)
         remapped.append(int(_EMBED_LABEL_MAP[key]))
     return remapped
+
+
+def _persistent_pca_project(
+    X: np.ndarray,
+    key: str,
+    step: int,
+    *,
+    allow_fit: bool = True,
+    n_components: Optional[int] = None,
+) -> Optional[Tuple[np.ndarray, Dict[str, Any]]]:
+    """Project ``X`` using a PCA that is fitted at most once per ``key``."""
+    if not isinstance(X, np.ndarray):
+        X = np.asarray(X, dtype=np.float32)
+    if X.ndim != 2 or X.size == 0:
+        return None
+
+    max_comp = int(min(X.shape[0], X.shape[1]))
+    if max_comp <= 0:
+        return None
+
+    entry = _PERSISTENT_PCA.get(key)
+    if entry is None:
+        if not allow_fit:
+            return None
+        if n_components is None:
+            desired = min(4, max_comp)
+            n_comp = max(1, desired)
+        else:
+            n_comp = max(1, min(int(n_components), max_comp))
+        pca = PCA(n_components=n_comp, random_state=0)
+        Xp = pca.fit_transform(X)
+        entry = {
+            "model": pca,
+            "n_components": int(pca.n_components_),
+            "fit_step": int(step),
+            "fit_dim": int(X.shape[1]),
+            "explained_variance_ratio": pca.explained_variance_ratio_.copy(),
+        }
+        _PERSISTENT_PCA[key] = entry
+    else:
+        pca = entry.get("model")
+        if pca is None:
+            if not allow_fit:
+                return None
+            return _persistent_pca_project(X, key, step, allow_fit=True, n_components=n_components)
+        try:
+            Xp = pca.transform(X)
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            if not allow_fit:
+                print(f"[viz][pca] transform failed for key '{key}': {exc}")
+                return None
+            max_comp = int(min(X.shape[0], X.shape[1]))
+            if n_components is None:
+                n_comp = max(1, min(entry.get("n_components", 2), max_comp))
+            else:
+                n_comp = max(1, min(int(n_components), max_comp))
+            pca = PCA(n_components=n_comp, random_state=0)
+            Xp = pca.fit_transform(X)
+            entry = {
+                "model": pca,
+                "n_components": int(pca.n_components_),
+                "fit_step": int(step),
+                "fit_dim": int(X.shape[1]),
+                "explained_variance_ratio": pca.explained_variance_ratio_.copy(),
+                "refit_reason": str(exc),
+                "refit_step": int(step),
+            }
+            _PERSISTENT_PCA[key] = entry
+
+    entry["last_step"] = int(step)
+    return Xp, entry
 
 def set_seed(seed=42):
     """
@@ -437,30 +511,64 @@ def _visualize_pca_panels(
     opp_labels: list,
     step: int,
     title_prefix: str,
+    *,
+    pca_key: Optional[str] = None,
+    allow_fit: bool = True,
+    tag_name: str = "Embeddings/PCA multi-view",
+    legend_label_fn: Optional[Callable[[str], str]] = None,
+    legend_title: str = "Opponents",
+    show_legend: bool = True,
+    scatter_alpha: float = 0.25,
+    scatter_cap: int = 400,
+    point_size: float = 8.0,
+    cmap_name: str = "tab20",
+    equal_aspect: bool = True,
+    auto_hide_legend_over: int = 24,
 ) -> dict:
     label_list = [str(l) for l in opp_labels]
     labels_arr = np.asarray(label_list)
     N, D = X.shape
-    n_comp = int(max(2, min(4, D, N)))
-    pca = PCA(n_components=n_comp, random_state=0)
-    Xp = pca.fit_transform(X)
-    evr = pca.explained_variance_ratio_
 
+    fit_step = step
+    if pca_key:
+        proj = _persistent_pca_project(X, pca_key, step, allow_fit=allow_fit)
+        if proj is None:
+            return {}
+        Xp, entry = proj
+        evr = np.asarray(entry.get("explained_variance_ratio", ()), dtype=np.float32)
+        n_comp = int(entry.get("n_components", Xp.shape[1]))
+        fit_step = int(entry.get("fit_step", step))
+    else:
+        n_comp = int(max(1, min(4, D, N)))
+        pca = PCA(n_components=n_comp, random_state=0)
+        Xp = pca.fit_transform(X)
+        evr = pca.explained_variance_ratio_
+
+    if Xp.ndim != 2 or Xp.shape[0] == 0:
+        return {"pca_evr": evr, "pca_fit_step": fit_step}
+
+    n_comp = int(min(n_comp, Xp.shape[1]))
     pairs = [(0, 1), (1, 2), (2, 3)]
     valid_pairs = [pair for pair in pairs if pair[1] < n_comp]
     if not valid_pairs:
-        return {"pca_evr": evr}
+        return {"pca_evr": evr, "pca_fit_step": fit_step}
 
     fig, axes = plt.subplots(1, len(valid_pairs), figsize=(6 * len(valid_pairs), 5))
     if not isinstance(axes, np.ndarray):
         axes = np.array([axes])
 
     uniq = sorted(set(label_list))
-    cmap = plt.cm.get_cmap("tab20", max(1, len(uniq)))
-    scatter_cap = 400
+    if legend_label_fn is None:
+        legend_label_fn = lambda lab: lab  # type: ignore[return-value]
+    cmap = plt.cm.get_cmap(cmap_name, max(1, len(uniq)))
+    scatter_cap = max(1, int(scatter_cap))
     rng = np.random.default_rng(0)
     legend_handles: List[Line2D] = []
+    # Auto-hide legend when there are too many classes to keep layout readable
+    if show_legend and len(uniq) > int(auto_hide_legend_over):
+        show_legend = False
 
+    legend_added = False
     for ax, (i, j) in zip(axes, valid_pairs):
         ax.set_title(f"PC{i+1} vs PC{j+1}")
         xi = evr[i] if i < len(evr) else float("nan")
@@ -484,30 +592,42 @@ def _visualize_pca_panels(
             if pts.shape[0] > scatter_cap:
                 take = rng.choice(pts.shape[0], size=scatter_cap, replace=False)
                 show_pts = pts[take]
-            ax.scatter(show_pts[:, 0], show_pts[:, 1], color=color, s=8, alpha=0.25, linewidths=0)
+            ax.scatter(
+                show_pts[:, 0],
+                show_pts[:, 1],
+                color=color,
+                s=point_size,
+                alpha=scatter_alpha,
+                linewidths=0,
+            )
 
-            # Add legend handle for the first panel only (no centroid marker)
-            if i == valid_pairs[0][0] and j == valid_pairs[0][1]:
+            if show_legend and i == valid_pairs[0][0] and j == valid_pairs[0][1]:
                 legend_handles.append(
-                    Line2D([0], [0],
-                           marker="o", color="w",
-                           markerfacecolor=color, markeredgecolor="none",
-                           linewidth=0, markersize=6, label=f"Opp {lab}")
+                    Line2D(
+                        [0],
+                        [0],
+                        marker="o",
+                        color="w",
+                        markerfacecolor=color,
+                        markeredgecolor="none",
+                        linewidth=0,
+                        markersize=max(point_size / 1.5, 4.0),
+                        label=legend_label_fn(lab),
+                    )
                 )
 
-            # Only compute centroid if we actually need it for the ellipse
-            if pts.shape[0] >= 3:
-                cov = np.cov(pts, rowvar=False)
-                centroid = pts.mean(axis=0)  # computed only when used
-                ell = _ellipse_from_cov(centroid, cov, color)
-                if ell is not None:
-                    ax.add_patch(ell)
+        if equal_aspect:
+            ax.set_aspect("equal", adjustable="box")
 
-        ax.set_aspect("equal", adjustable="box")
-
-    if legend_handles:
-        axes[0].legend(handles=legend_handles, bbox_to_anchor=(1.02, 1), loc="upper left",
-                       borderaxespad=0.0, title="Opponents")
+    if show_legend and legend_handles:
+        axes[0].legend(
+            handles=legend_handles,
+            bbox_to_anchor=(1.02, 1),
+            loc="upper left",
+            borderaxespad=0.0,
+            title=legend_title,
+        )
+        legend_added = True
 
     evr_pad = np.pad(evr, (0, max(0, 4 - evr.size)), constant_values=np.nan)
     evr_text = ", ".join(
@@ -516,7 +636,9 @@ def _visualize_pca_panels(
             for k, val in enumerate(evr_pad[:4])
         ]
     )
-    fig.suptitle(f"{title_prefix} — PCA multi-view — step {step}\n{evr_text}")
+    fig.suptitle(
+        f"{title_prefix} — PCA multi-view — step {step}\n{evr_text} (fit @ step {fit_step})"
+    )
 
     if evr.size >= 3 and np.isfinite(evr[:3]).all():
         pc3_ratio = float(evr[2] / max(evr[0] + evr[1], 1e-9))
@@ -524,13 +646,18 @@ def _visualize_pca_panels(
     else:
         pc3_ratio = float("nan")
 
-    fig.tight_layout(rect=[0, 0.05, 1, 0.92])
+    # Layout: if there is no legend, expand to full width. Otherwise leave room
+    # on the right for the legend box outside axes[0].
+    if legend_added:
+        fig.tight_layout(rect=[0, 0.05, 0.88, 0.92])
+    else:
+        fig.tight_layout(rect=[0, 0.05, 1.0, 0.92])
 
     buf = BytesIO()
     fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
     buf.seek(0)
     image = Image.open(buf)
-    writer.add_image("Embeddings/PCA multi-view", np.array(image), step, dataformats="HWC")
+    writer.add_image(tag_name, np.array(image), step, dataformats="HWC")
     plt.close(fig)
 
     return {
@@ -538,6 +665,8 @@ def _visualize_pca_panels(
         "pc3_vs_pc12": pc3_ratio,
         "n_components": n_comp,
         "pairs": valid_pairs,
+        "pca_fit_step": fit_step,
+        "pca_key": pca_key,
     }
 
 def visualize_opponent_embeddings_all(
@@ -547,6 +676,7 @@ def visualize_opponent_embeddings_all(
     methods: list | tuple | None = None,
     pca_dim: int = 50,
     title_prefix: str = "Opponent Embeddings",
+    pca_key: Optional[str] = None,
 ):
     """
     Call visualize_opponent_embeddings() for a list of methods.
@@ -565,6 +695,7 @@ def visualize_opponent_embeddings_all(
                 method=m,
                 pca_dim=pca_dim,
                 title_prefix=title_prefix,
+                pca_key=pca_key,
             )
             if out is not None:
                 results[m] = out
@@ -579,7 +710,8 @@ def visualize_opponent_embeddings(
     step: int,
     method: str = "pca_panels",  # 'pca_panels' | 'pca_tsne' | 'pca_umap' | 'pca' | 'tsne' | 'umap'
     pca_dim: int = 50,
-    title_prefix: str = "Opponent Embeddings"
+    title_prefix: str = "Opponent Embeddings",
+    pca_key: Optional[str] = None,
 ):
     # ---- coerce input ----
     X, opp_labels = _coerce_opponent_input(data)
@@ -588,7 +720,16 @@ def visualize_opponent_embeddings(
 
     N, D = X.shape
     if method == "pca_panels":
-        return _visualize_pca_panels(writer, X, opp_labels, step, title_prefix)
+        return _visualize_pca_panels(
+            writer,
+            X,
+            opp_labels,
+            step,
+            title_prefix,
+            pca_key=pca_key,
+            legend_label_fn=lambda lab: f"Opp {lab}",
+            legend_title="Opponents",
+        )
 
     # ---- optional PCA pre-step for mixed methods ----
     use_pca_prefix = method in ("pca_tsne", "pca_umap")
@@ -646,6 +787,93 @@ def visualize_opponent_embeddings(
     image = Image.open(buf)
     writer.add_image(f'Embeddings/{method_name}', np.array(image), step, dataformats='HWC')
     plt.close()
+
+
+def log_strategy_pca_views(
+    writer,
+    *,
+    step: int,
+    pca_key: str,
+    opponent_codes: Optional[np.ndarray] = None,
+    opponent_labels: Optional[Iterable[Any]] = None,
+    brick_vectors: Optional[np.ndarray] = None,
+    activation_codes: Optional[np.ndarray] = None,
+    activation_labels: Optional[Iterable[Any]] = None,
+    title_prefix: str = "Strategy Code",
+) -> Dict[str, Dict[str, Any]]:
+    """Log opponent, brick, and activation projections that share one persistent PCA."""
+
+    results: Dict[str, Dict[str, Any]] = {}
+
+    if opponent_codes is not None and opponent_labels is not None:
+        opp_labels_list = [str(l) for l in opponent_labels]
+        if len(opponent_codes) == len(opp_labels_list) and opp_labels_list:
+            res = _visualize_pca_panels(
+                writer,
+                np.asarray(opponent_codes, dtype=np.float32),
+                opp_labels_list,
+                step,
+                title_prefix,
+                pca_key=pca_key,
+                allow_fit=True,
+                legend_label_fn=lambda lab: f"Opp {lab}",
+                legend_title="Opponents",
+                scatter_alpha=0.35,
+                scatter_cap=600,
+            )
+            results["opponents"] = res
+
+    if brick_vectors is not None and np.asarray(brick_vectors).ndim == 2:
+        if pca_key not in _PERSISTENT_PCA and opponent_codes is None:
+            pass  # need a fitted PCA first
+        else:
+            bricks_np = np.asarray(brick_vectors, dtype=np.float32)
+            labels = [str(i) for i in range(bricks_np.shape[0])]
+            res = _visualize_pca_panels(
+                writer,
+                bricks_np,
+                labels,
+                step,
+                f"{title_prefix} — Dictionary Bricks",
+                pca_key=pca_key,
+                allow_fit=False,
+                legend_label_fn=lambda lab: f"Brick {lab}",
+                legend_title="Bricks",
+                scatter_alpha=0.9,
+                scatter_cap=max(64, bricks_np.shape[0]),
+                point_size=30.0,
+                tag_name="Embeddings/PCA bricks",
+                show_legend=False,
+                equal_aspect=False,
+            )
+            results["bricks"] = res
+
+    if activation_codes is not None:
+        act_np = np.asarray(activation_codes, dtype=np.float32)
+        if act_np.ndim == 2 and act_np.shape[0] > 0:
+            if activation_labels is None:
+                activation_labels = ["activation"] * act_np.shape[0]
+            act_labels = [str(l) for l in activation_labels]
+            res = _visualize_pca_panels(
+                writer,
+                act_np,
+                act_labels,
+                step,
+                f"{title_prefix} — Activation Samples",
+                pca_key=pca_key,
+                allow_fit=False,
+                legend_label_fn=lambda lab: f"Top {lab}",
+                legend_title="Top Brick",
+                show_legend=False,
+                scatter_alpha=0.18,
+                scatter_cap=2000,
+                point_size=6.0,
+                tag_name="Embeddings/PCA activation samples",
+                equal_aspect=False,
+            )
+            results["activations"] = res
+
+    return results
 
 EPS_CLIP          = float(getattr(config, "EPS_CLIP", 0.2))
 ENT_COEF          = float(getattr(config, "INIT_ENTROPY_COEF", 0.005))
@@ -810,6 +1038,24 @@ def _dictionary_regularizers(
 
                 avg_brick_usage = opp_activations.mean(dim=0)
                 avg_brick_usage_np = avg_brick_usage.detach().cpu().float().numpy()
+
+                max_tokens = int(getattr(config, "PCA_TOKEN_SAMPLE", 2048))
+                if strategy_code is not None:
+                    with torch.no_grad():
+                        strat_det = strategy_code.detach()
+                        opp_codes_flat = strat_det[opp_mask]
+                        opp_act_flat = opp_activations.detach()
+                        if opp_codes_flat.numel() > 0:
+                            if opp_codes_flat.size(0) > max_tokens:
+                                perm = torch.randperm(opp_codes_flat.size(0), device=opp_codes_flat.device)[:max_tokens]
+                                opp_codes_flat = opp_codes_flat[perm]
+                                opp_act_flat = opp_act_flat[perm]
+                            metrics_extra["opp_strategy_codes_tokens"] = (
+                                opp_codes_flat.cpu().float().numpy()
+                            )
+                            metrics_extra["opp_activation_top_idx"] = (
+                                opp_act_flat.argmax(dim=-1).cpu().numpy()
+                            )
 
     if bricks is not None and bricks.ndim == 2 and bricks.size(0) > 1:
         norm_bricks = F.normalize(bricks, dim=-1)
@@ -1179,7 +1425,19 @@ def ppo_losses_batched(
     if avg_brick_usage_np is not None:
         metrics["avg_brick_usage_np"] = avg_brick_usage_np
 
-    lambda_cp = float(getattr(config, "DCP_LOSS_WEIGHT", 0.0))
+    # Effective DCP weight scales with held-out prevalence, then tuned by DCP_LOSS_WEIGHT
+    # Change from per-episode to per-token weighting: use proportion of held-out
+    # training tokens (our_mask) rather than count of episodes.
+    dcp_tune = float(getattr(config, "DCP_LOSS_WEIGHT", 1.0))
+    with torch.no_grad():
+        total_tokens = float(our_mask.sum().item())
+        heldout_tokens = float(heldout_step_mask.sum().item())
+        heldout_frac_tokens = (heldout_tokens / max(total_tokens, 1.0)) if total_tokens > 0 else 0.0
+        # Keep episode fraction as a diagnostic for backwards-compat dashboards
+        B_eps = float(heldout_episode_mask.numel()) if heldout_episode_mask is not None else 0.0
+        heldout_eps = float(heldout_episode_mask.sum().item()) if heldout_episode_mask is not None else 0.0
+        heldout_frac = (heldout_eps / max(B_eps, 1.0)) if B_eps > 0 else 0.0
+    lambda_cp = dcp_tune * heldout_frac_tokens
     decor_weight = float(getattr(config, "BRICK_DECORRELATION_WEIGHT", 0.0))
 
     dcp_loss = torch.zeros_like(train_loss)
@@ -1213,6 +1471,9 @@ def ppo_losses_batched(
     total_loss = total_loss + decor_weight * decor_penalty
 
     metrics["dcp_weighted_loss"] = (lambda_cp * dcp_loss).detach()
+    metrics["dcp_weight_eff"] = torch.tensor(lambda_cp, device=train_loss.device)
+    metrics["heldout_token_frac"] = torch.tensor(heldout_frac_tokens, device=train_loss.device)
+    metrics["heldout_episode_frac"] = torch.tensor(heldout_frac, device=train_loss.device)
     metrics["total_loss"] = total_loss.detach()
 
     return total_loss, metrics

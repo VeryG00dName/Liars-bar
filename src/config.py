@@ -68,9 +68,11 @@ DEFAULT_SCORING_PARAMS = {
 # Strategy Dictionary Hyperparameters
 NUM_BRICKS = 32
 BRICK_DIM = 32
-DROPOUT_P = 0.25
+DROPOUT_P = 0.15
 
 # Dictionary compositional pressure (DCP) and decorrelation controls
+# Base DCP weight is scaled by held-out TOKEN fraction inside the loss
+# (effective_weight = heldout_token_frac * DCP_LOSS_WEIGHT).
 DCP_LOSS_WEIGHT = 0.15
 BRICK_DECORRELATION_WEIGHT = 1e-3
 # ============================
