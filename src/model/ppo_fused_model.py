@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from entmax import entmax15
 class StrategyDictionary(nn.Module):
     """
     Learns a shared dictionary of strategy "bricks" and produces a sparse,
@@ -34,7 +34,7 @@ class StrategyDictionary(nn.Module):
         
         # 2. Ensure activations are non-negative to act as weights
         # Softplus is a smooth version of ReLU, which is good here.
-        activations = F.softplus(raw_activations)  # Shape: [B, T, num_bricks]
+        activations = entmax15(raw_activations, dim=-1)  # Shape: [B, T, num_bricks]
         
         # 3. Combine bricks using activations to form the strategy code
         # Matmul: (B, T, num_bricks) @ (num_bricks, brick_dim) -> (B, T, brick_dim)
