@@ -616,13 +616,14 @@ def plot_agent_heatmap(
     
     M = np.zeros((n, n), dtype=float)
     M[:] = np.nan
+    # Populate upper triangle and mirror to lower with respective rates
     for i, a in enumerate(order):
-        for j, b in enumerate(order):
-            if a == b:
-                M[i, j] = np.nan
-                continue
-            r = h2h_rates.get((a, b))
-            M[i, j] = float(r) if r is not None else np.nan
+        for j in range(i + 1, n):
+            b = order[j]
+            rate_ab = h2h_rates.get((a, b))
+            rate_ba = h2h_rates.get((b, a))
+            M[i, j] = float(rate_ab) if rate_ab is not None else np.nan
+            M[j, i] = float(rate_ba) if rate_ba is not None else np.nan
 
     # --- Save to CSV ---
     try:

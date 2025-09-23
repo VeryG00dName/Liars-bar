@@ -8,11 +8,6 @@ from typing import Dict, List, Set
 
 # Encourage deterministic CUDA behavior (must be set before CUDA is initialized)
 os.environ.pop("TORCH_LOGS", None)
-os.environ.setdefault("TORCHDYNAMO_VERBOSE", "0")
-os.environ.setdefault("TORCH_COMPILE_DEBUG", "0")
-os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-
 import torch
 import warnings
 warnings.filterwarnings("ignore", message=".*symbolic_shapes.*")
