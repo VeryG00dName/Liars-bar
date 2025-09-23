@@ -32,9 +32,14 @@ class PPOVecRolloutManager:
         self._all_shadow_pool_labels: List[int] = []
         self._current_shadow_rotation_queue: List[int] = []
         self._shadow_pool_reference: List[int] = []
+        self._cpp_bots: List[int] = []
+        self._latest_historical_agents: List[int] = []
+        self._shadow_historical_agents: List[int] = []
+        self._opponent_pool_snapshot: List[Dict[str, Any]] = []
+        self._partitions_ready: bool = False
 
-    def set_available_agents_for_sampling(self, all_opponent_pool_data: List[Dict[str, Any]]):
-        """Update opponent partitions and refresh the rotating shadow queue."""
+    def _update_internal_agent_partitions(self, all_opponent_pool_data: List[Dict[str, Any]]) -> None:
+        """Update cached opponent partitions and refresh the rotating shadow queue."""
         cpp_bots: List[int] = []
         historical: List[int] = []
 
@@ -42,19 +47,30 @@ class PPOVecRolloutManager:
             label = entry.get("label")
             if label is None:
                 continue
-            if label <= config.CPP_BOT_MAX_LABEL:
-                cpp_bots.append(int(label))
+            label_int = int(label)
+            if label_int <= config.CPP_BOT_MAX_LABEL:
+                cpp_bots.append(label_int)
             else:
-                historical.append(int(label))
+                historical.append(label_int)
 
         cpp_bots = sorted(set(cpp_bots))
         historical_sorted = sorted(set(historical))
 
-        latest_historical_agents = historical_sorted[-config.LATEST_K:] if config.LATEST_K > 0 else []
-        shadow_historical_agents = [label for label in historical_sorted if label not in latest_historical_agents]
+        latest_historical_agents = (
+            historical_sorted[-config.LATEST_K:]
+            if config.LATEST_K > 0
+            else []
+        )
+        shadow_historical_agents = [
+            label for label in historical_sorted if label not in latest_historical_agents
+        ]
 
         shadow_reference = list(shadow_historical_agents)
         refresh_shadow_rotation = shadow_reference != self._shadow_pool_reference
+
+        self._cpp_bots = list(cpp_bots)
+        self._latest_historical_agents = list(latest_historical_agents)
+        self._shadow_historical_agents = list(shadow_historical_agents)
 
         if refresh_shadow_rotation:
             self._shadow_pool_reference = shadow_reference
@@ -67,7 +83,12 @@ class PPOVecRolloutManager:
         elif not self._current_shadow_rotation_queue and self._all_shadow_pool_labels:
             self._current_shadow_rotation_queue = list(self._all_shadow_pool_labels)
 
-        return cpp_bots, latest_historical_agents, shadow_historical_agents
+        self._partitions_ready = True
+
+    def set_opponent_pool(self, pool_data: List[Dict[str, Any]]) -> None:
+        """Store the latest opponent pool definition and refresh cached partitions."""
+        self._opponent_pool_snapshot = list(pool_data)
+        self._update_internal_agent_partitions(self._opponent_pool_snapshot)
 
     def _reset_policy_state(self):
         for policy in self.policies.values():
@@ -163,10 +184,11 @@ class PPOVecRolloutManager:
         self.arena.reset(batch=batch_size, players=num_players, seed=int(self.rng.integers(0, 2**31)))
         self._reset_policy_state()
 
-        cpp_bots: List[int] = []
-        latest_historical_agents: List[int] = []
-        if self.pool_manager is not None:
-            cpp_bots, latest_historical_agents, _ = self.set_available_agents_for_sampling(self.pool_manager.pool)
+        if self.pool_manager is not None and not self._partitions_ready:
+            self.set_opponent_pool(self.pool_manager.pool)
+
+        cpp_bots: List[int] = list(self._cpp_bots)
+        latest_historical_agents: List[int] = list(self._latest_historical_agents)
 
         active_shadow_agents_for_this_update: List[int] = []
         if self._all_shadow_pool_labels:
@@ -468,6 +490,8 @@ class PPOVecRolloutManager:
             "last_history_len": 0,
             "last_processed_cxx_history_len": 0,
             "global_step": -1,
+            "last_training_step_idx": -1,
+            "last_penalties": None,
             "data": ep_data,
         }
 
@@ -481,4 +505,40 @@ class PPOVecRolloutManager:
         ep['done'].append(False)
         ep['opp_target_action'].append(None)
         ep['penalties_used'].append(None)
-        return len(ep['agent_id']) - 1
+        idx = len(ep['agent_id']) - 1
+        if agent_seat == ep_tracker.get('training_agent_seat'):
+            ep_tracker['last_training_step_idx'] = idx
+        return idx
+
+    def _update_penalty_rewards(self, ep_tracker: Dict[str, Any], penalties: Any) -> None:
+        """Update cached penalty state and adjust the latest training reward."""
+        if not ep_tracker.get('is_training_episode', False):
+            ep_tracker['last_penalties'] = [int(p) for p in penalties]
+            return
+
+        penalties_list = [int(p) for p in penalties]
+        last_penalties = ep_tracker.get('last_penalties')
+        ep_tracker['last_penalties'] = penalties_list
+
+        if last_penalties is None:
+            return
+
+        seat = ep_tracker.get('training_agent_seat', -1)
+        last_idx = ep_tracker.get('last_training_step_idx', -1)
+        ep_data = ep_tracker.get('data') or {}
+
+        if last_idx < 0 or last_idx >= len(ep_data.get('reward', [])):
+            return
+
+        delta_total = 0.0
+        for i, (prev, cur) in enumerate(zip(last_penalties, penalties_list)):
+            diff = int(cur) - int(prev)
+            if diff <= 0:
+                continue
+            if i == seat:
+                delta_total -= 0.1 * diff
+            else:
+                delta_total += 0.033 * diff
+
+        if delta_total != 0.0:
+            ep_data['reward'][last_idx] += float(delta_total)

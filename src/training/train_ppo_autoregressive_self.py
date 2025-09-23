@@ -294,7 +294,7 @@ def train_generation(
         rng=(rng or _GLOBAL_RNG),
     )
 
-    rollout_manager.set_available_agents_for_sampling(pool_manager.pool)
+    rollout_manager.set_opponent_pool(pool_manager.pool)
 
     # 4. MAIN TRAINING LOOP
     episodes_per_update = int(config.EPISODES_PER_UPDATE)
