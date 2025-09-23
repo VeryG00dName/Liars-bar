@@ -5,6 +5,7 @@ from typing import Dict, List, Tuple
 from src.agents.base_agent import BaseAgent
 import torch
 from src.misc import lb
+from src import config
 
 class CppBotWrapper(BaseAgent):
     """Wraps a C++ bot class so it can be treated as a policy object."""
@@ -35,7 +36,7 @@ class CppBotWrapper(BaseAgent):
             if bot is None:
                 # StrategicChallenger requires (name, num_players, agent_index)
                 if getattr(self.bot_cls, "__name__", None) == getattr(getattr(lb, "StrategicChallenger", object), "__name__", ""):
-                    bot = self.bot_cls("bot", 4, seat_idx)
+                    bot = self.bot_cls("bot", int(getattr(config, "NUM_PLAYERS", 4)), seat_idx)
                 else:
                     bot = self.bot_cls("bot")
                 self._bot_cache[key] = bot

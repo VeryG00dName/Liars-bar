@@ -1,380 +1,283 @@
-# src/evaluation/evaluate_tournament.py
+"""Swiss-style tournament evaluation using the batched VecArena backend."""
+from __future__ import annotations
 
-import json
-import os
-import re
-import torch
 import argparse
-from src.env.liars_deck_env_core import LiarsDeckEnv
+from collections import defaultdict
+from typing import Dict, List, Set
+
+import torch
+
 from src import config
-
-# Import shared functions from evaluate_utils.py (including RichProgressScoreboard and evaluate_agents)
 from src.eval.evaluate_utils import (
-    model as openskill_model,  # Shared OpenSkill model
+    openskill_model,
+    load_evaluation_policies,
+    run_batched_games,
     RichProgressScoreboard,
-    evaluate_agents,
-    compare_scoreboards,
     load_scoreboard,
-    initialize_players,
-    rich_print_expert_activations
-)
-
-# Rich imports for final scoreboard rendering
-from rich.console import Console
-from rich.table import Table
-
-import warnings
-warnings.filterwarnings("ignore", message="enable_nested_tensor is True, but self.use_nested_tensor is False", category=UserWarning)
-
-# Import hardcoded agents.
-from src.model.hard_coded_agents import (
-    GreedyCardSpammer,
-    TableFirstConservativeChallenger,
-    StrategicChallenger,
-    RandomAgent,
-    TableNonTableAgent,
-    Classic
+    save_scoreboard,
+    compare_scoreboards,
+    rich_print_scoreboard,
+    rich_print_expert_activations,
+    plot_agent_heatmap,
 )
 
 
-def add_hardcoded_players(players, device):
-    """
-    Add hard-coded bots to the players dictionary.
-    """
-    hardcoded_constructors = {
-        "GreedyCardSpammer": GreedyCardSpammer,
-        "TableFirst": TableFirstConservativeChallenger,
-        "Strategic": lambda name: StrategicChallenger(name, 3, 2),
-        "Conservative": lambda name: TableFirstConservativeChallenger(name),
-        "TableNonTableAgent": TableNonTableAgent,
-        "Classic": Classic,
-        "Random": RandomAgent
-    }
-    for name, constructor in hardcoded_constructors.items():
-        player_id = f"Hardcoded_{name}"
-        try:
-            agent_instance = constructor(name)
-        except Exception:
-            agent_instance = constructor()
-        rating = openskill_model.rating(name=player_id)
-        players[player_id] = {
-            'hardcoded_bot': True,
-            'agent': agent_instance,
-            'rating': rating,
-            'score': rating.ordinal(),
-            'games_played': 0,
-            'uses_memory': False,
-            # New tournament tracking fields:
-            'total_round_wins': 0,
-            'wins_match': 0,
-            'win_rate_match': 0.0,
-            'win_rate_total': 0.0
-        }
-    return players
+def parse_run_specs(specs: List[str]) -> Dict[str, List[str]]:
+    """Parse run specs.
 
-def update_openskill_ratings(players, group, group_ranking, cumulative_wins):
-    rank_dict = {}
-    current_rank = 0
-    prev_wins = None
-    for i, pid in enumerate(group_ranking):
-        w = cumulative_wins[pid]
-        if i == 0:
-            rank_dict[pid] = 0
-            prev_wins = w
-        else:
-            if w == prev_wins:
-                rank_dict[pid] = current_rank
-            else:
-                current_rank = i
-                rank_dict[pid] = current_rank
-            prev_wins = w
-    match = []
-    ranks = []
-    for pid in group:
-        match.append([players[pid]['rating']])
-        ranks.append(rank_dict[pid])
-    new_ratings = openskill_model.rate(match, ranks=ranks)
-    for i, pid in enumerate(group):
-        players[pid]['rating'] = new_ratings[i][0]
-        players[pid]['score'] = players[pid]['rating'].ordinal()
+    Supports two forms:
+    - "run_name:gen_a,gen_b" to load specific generations
+    - "run_name" (no colon) to load ALL available generations for that run
+    """
+    parsed: Dict[str, List[str]] = {}
+    for spec in specs:
+        if not spec:
+            continue
+        if ":" not in spec:
+            # Interpret as "load all available gens" for this run
+            run_name = spec.strip()
+            if not run_name:
+                continue
+            parsed.setdefault(run_name, []).append("ALL")
+            continue
+        run_name, generations = spec.split(":", 1)
+        gens = [g.strip() for g in generations.split(",") if g.strip()]
+        if not gens:
+            raise ValueError(f"No generations provided for run '{run_name}'.")
+        parsed.setdefault(run_name, []).extend(gens)
+    return parsed
 
-def swiss_grouping(players, match_history, group_size):
+
+def parse_cpp_labels(arg: str) -> List[int]:
+    if not arg:
+        return []
+    labels = []
+    for item in arg.split(","):
+        if not item.strip():
+            continue
+        labels.append(int(item.strip()))
+    return labels
+
+
+def swiss_grouping(
+    players: Dict[int, Dict[str, any]],
+    match_history: Dict[int, Set[int]],
+    group_size: int,
+) -> List[List[int]]:
     player_ids = sorted(players.keys(), key=lambda pid: players[pid]["score"], reverse=True)
-    groups = []
-    used = set()
+    groups: List[List[int]] = []
+    used: Set[int] = set()
+
     while len(used) < len(player_ids):
-        group = []
-        available_players = [pid for pid in player_ids if pid not in used]
-        if available_players:
-            group.append(available_players.pop(0))
-        else:
+        available = [pid for pid in player_ids if pid not in used]
+        if not available:
             break
-        while len(group) < group_size and available_players:
+        group = [available.pop(0)]
+        while len(group) < group_size and available:
             best_candidate = None
             least_repeats = float("inf")
-            for candidate in available_players:
-                past_matches = sum(candidate in match_history.get(pid, set()) for pid in group)
-                if past_matches < least_repeats:
+            for candidate in available:
+                repeats = sum(candidate in match_history[member] for member in group)
+                if repeats < least_repeats:
                     best_candidate = candidate
-                    least_repeats = past_matches
-            if best_candidate:
-                group.append(best_candidate)
-                available_players.remove(best_candidate)
+                    least_repeats = repeats
+            if best_candidate is None:
+                break
+            group.append(best_candidate)
+            available.remove(best_candidate)
         groups.append(group)
         used.update(group)
     return groups
 
-def rich_print_scoreboard(players, differences=None):
-    console = Console()
-    table = Table(title="Final Tournament OpenSkill Scoreboard")
-    table.add_column("Rank", style="dim")
-    table.add_column("Player ID", min_width=30)
-    table.add_column("Skill Score", justify="right")
-    table.add_column("Match Win Rate", justify="right")
-    table.add_column("Round Win Rate", justify="right")
-    table.add_column("Δ Rank", justify="right")
-    
-    sorted_players = sorted(players.items(), key=lambda x: x[1]['rating'].ordinal(), reverse=True)
-    
-    for rank, (pid, data) in enumerate(sorted_players, start=1):
-        skill = data['rating'].ordinal()
-        mwr = data.get('win_rate_match', 0.0)
-        rwr = data.get('win_rate_total', 0.0)
-        # Get the rank change from differences if available.
-        rank_change = differences.get(pid, {}).get("rank_change") if differences else None
-        if rank_change is None:
-            rank_change_str = "New"
-        elif rank_change > 0:
-            rank_change_str = f"+{rank_change}"
-        elif rank_change < 0:
-            rank_change_str = f"{rank_change}"
-        else:
-            rank_change_str = "0"
-        table.add_row(
-            str(rank),
-            pid,
-            f"{skill:.2f}",
-            f"{mwr:.2%}",
-            f"{rwr:.2%}",
-            rank_change_str
-        )
-    console.print(table)
 
-def rich_print_action_counts(players, action_counts):
-    console = Console()
-    table = Table(title="Action Counts per Player")
-    table.add_column("Player ID", min_width=30)
-    for i in range(config.OUTPUT_DIM):
-        table.add_column(f"Action {i}", justify="right")
-    for player_id in sorted(players.keys()):
-        counts = action_counts[player_id]
-        row = [player_id] + [str(counts.get(i, 0)) for i in range(config.OUTPUT_DIM)]
-        table.add_row(*row)
-    console.print(table)
+def assign_openskill_ranks(group: List[int], match_results: Dict[int, Dict[str, any]]) -> List[int]:
+    ordered = sorted(group, key=lambda pid: match_results[pid]["total_wins"], reverse=True)
+    ranks: Dict[int, int] = {}
+    current_rank = 0
+    prev_wins = None
+    for idx, pid in enumerate(ordered):
+        wins = match_results[pid]["total_wins"]
+        if prev_wins is None or wins < prev_wins:
+            current_rank = idx
+            prev_wins = wins
+        ranks[pid] = current_rank
+    return [ranks[pid] for pid in group]
 
-def delete_bottom_half_checkpoints_by_score(players, checkpoints_dir):
-    cp_to_scores = {}
-    for player_id, data in players.items():
-        cp_filename = player_id.split("_player_")[0]
-        cp_to_scores.setdefault(cp_filename, []).append(data['score'])
-    cp_best_scores = {cp: max(scores) for cp, scores in cp_to_scores.items()}
-    sorted_cps = sorted(cp_best_scores.items(), key=lambda x: x[1])
-    num_to_delete = len(sorted_cps) // 2
-    bottom_half = sorted_cps[:num_to_delete]
-    for cp_filename, score in bottom_half:
-        cp_path = os.path.join(checkpoints_dir, cp_filename)
-        if os.path.exists(cp_path):
-            try:
-                os.remove(cp_path)
-                print(f"Deleted checkpoint '{cp_filename}' with best score {score:.2f}")
-            except Exception as e:
-                print(f"Failed to delete '{cp_filename}': {e}")
-        else:
-            print(f"Checkpoint '{cp_filename}' not found in {checkpoints_dir}.")
 
-def run_group_swiss_tournament(env, device, players, num_games_per_match=11, NUM_ROUNDS=7):
-    """
-    Runs a Swiss tournament where each match consists of multiple games (num_games_per_match).
-    Two win rates are tracked:
-      - win_rate_match: based on one win per match.
-      - win_rate_total: based on cumulative round wins across all games.
-    """
-    group_size = env.num_players
-    match_history = {pid: set() for pid in players}
-    global_action_counts = {pid: {action: 0 for action in range(config.OUTPUT_DIM)} for pid in players}
-    
-    # Calculate total number of episodes (matches × episodes per match)
-    total_matches = 0
-    groups = swiss_grouping(players, match_history, group_size)
-    for _ in range(NUM_ROUNDS):
-        for group in groups:
-            if len(group) == group_size:
-                total_matches += num_games_per_match
-    
-    old_scoreboard = load_scoreboard("tournament_scoreboard.json")
-    progress_ui = RichProgressScoreboard(total_steps=total_matches, players=players)
+def run_group_swiss_tournament(
+    all_policies: Dict[int, any],
+    players: Dict[int, Dict[str, any]],
+    num_games_per_match: int,
+    num_rounds: int,
+    num_players_in_env: int,
+) -> Dict[int, Dict[str, any]]:
+    match_history: Dict[int, Set[int]] = {pid: set() for pid in players}
+    num_groups = max(1, len(players) // num_players_in_env)
+    total_steps = max(1, num_rounds * num_groups * num_games_per_match)
+    progress_ui = RichProgressScoreboard(total_steps=total_steps, players=players)
+    scoreboard_file = "tournament_scoreboard.json"
+    historical_scoreboard = load_scoreboard(scoreboard_file)
+
+    tournament_expert_data: Dict[int, Dict[str, any]] = defaultdict(dict)
+    # Head-to-head tracking (match-level): (A,B) = number of matches A beat B
+    h2h_match_wins: Dict[tuple[int, int], int] = defaultdict(int)
+    h2h_match_counts: Dict[tuple[int, int], int] = defaultdict(int)
     match_counter = 0
-    tournament_expert_activations = {}
-    
-    for round_num in range(1, NUM_ROUNDS + 1):
-        groups = swiss_grouping(players, match_history, group_size)
+
+    for round_idx in range(num_rounds):
+        groups = swiss_grouping(players, match_history, num_players_in_env)
         for group in groups:
-            if len(group) != group_size:
+            if len(group) != num_players_in_env:
                 continue
-
-            players_in_this_game = {pid: players[pid] for pid in group}
-            # Build agent map: maps "player_0", "player_1", ... to actual player IDs.
-            agent_map = {f'player_{i}': pid for i, pid in enumerate(players_in_this_game.keys())}
-            
-            # Define a simple progress callback that advances the progress bar.
-            progress_cb = lambda ep: progress_ui.update(increment=1)
-            
-            (cumulative_wins,
-             action_counts,
-             game_wins_list,
-             avg_steps,
-             steps_per_sec,
-             expert_activations) = evaluate_agents(
-                env=env,
-                device=device,
-                players_in_this_game=players_in_this_game,
-                episodes=num_games_per_match,
-                is_tournament=True,
-                progress_callback=progress_cb,
-                track_experts=True
+            results = run_batched_games(
+                all_policies,
+                group,
+                num_games_per_match,
+                num_players_in_env,
+                track_experts=True,
             )
-            
-            # Transform expert activations from env IDs to actual agent IDs.
-            transformed_expert_activations = {}
-            for env_agent, opp_data in expert_activations.items():
-                actual_agent = agent_map.get(env_agent, env_agent)
-                transformed_expert_activations.setdefault(actual_agent, {})
-                for env_opp, details in opp_data.items():
-                    actual_opp = agent_map.get(env_opp, env_opp)
-                    transformed_expert_activations[actual_agent][actual_opp] = details
-
-            # Aggregate expert activations over all matches.
-            for agent, opp_data in transformed_expert_activations.items():
-                if agent in tournament_expert_activations:
-                    tournament_expert_activations[agent].update(opp_data)
-                else:
-                    tournament_expert_activations[agent] = opp_data
-
-            # Update action counts.
-            for pid in group:
-                for action in range(config.OUTPUT_DIM):
-                    global_action_counts[pid][action] += action_counts[pid][action]
-            # Update tournament tracking fields.
-            for pid in group:
-                players[pid]['games_played'] += 1
-                players[pid]['total_round_wins'] += cumulative_wins[pid]
-            group_ranking = sorted(group, key=lambda pid: cumulative_wins[pid], reverse=True)
-            players[group_ranking[0]]['wins_match'] += 1
-            for pid in group:
-                players[pid]['win_rate_match'] = players[pid]['wins_match'] / players[pid]['games_played']
-                players[pid]['win_rate_total'] = players[pid]['total_round_wins'] / (num_games_per_match * players[pid]['games_played'])
-            update_openskill_ratings(players, group, group_ranking, cumulative_wins)
-            for pid in group:
-                for other in group:
-                    if other != pid:
-                        match_history[pid].add(other)
             match_counter += 1
 
-            # After each match update, recompute scoreboard differences and update progress UI.
-            differences = compare_scoreboards(old_scoreboard, players)
-            progress_ui.update(differences=differences, description=f"Match {match_counter}", steps_per_sec=steps_per_sec)
+            for pid in group:
+                meta = players[pid]
+                meta["games_played"] += 1
+                meta["total_round_wins"] += results[pid]["total_wins"]
+                total_games = meta["games_played"] * num_games_per_match
+                meta["win_rate_total"] = meta["total_round_wins"] / total_games if total_games else 0.0
+
+            max_wins = max(results[pid]["total_wins"] for pid in group)
+            winners = [pid for pid in group if results[pid]["total_wins"] == max_wins]
+            for pid in winners:
+                players[pid]["wins_match"] += 1
+            for pid in group:
+                games = players[pid]["games_played"]
+                players[pid]["win_rate_match"] = players[pid]["wins_match"] / games if games else 0.0
+
+            ranks = assign_openskill_ranks(group, results)
+            match = [[players[pid]["rating"]] for pid in group]
+            new_ratings = openskill_model.rate(match, ranks=ranks)
+            for idx, pid in enumerate(group):
+                players[pid]["rating"] = new_ratings[idx][0]
+                players[pid]["score"] = players[pid]["rating"].ordinal()
+
+            for pid in group:
+                for other in group:
+                    if pid != other:
+                        match_history[pid].add(other)
+
+            # Update head-to-head (match-level): for each ordered pair (a,b)
+            for i in range(len(group)):
+                for j in range(len(group)):
+                    if i == j:
+                        continue
+                    a = group[i]
+                    b = group[j]
+                    h2h_match_counts[(a, b)] += 1
+                    wins_a = results[a]["total_wins"]
+                    wins_b = results[b]["total_wins"]
+                    if wins_a > wins_b:
+                        h2h_match_wins[(a, b)] += 1
+
+            for pid in group:
+                expert_info = results[pid].get("expert_data")
+                if expert_info:
+                    key = players[pid]["player_id"]
+                    existing = tournament_expert_data[key]
+                    if isinstance(expert_info, dict):
+                        existing.update(expert_info)
+                    else:
+                        existing.setdefault("summary", []).append(expert_info)
+
+            differences = compare_scoreboards(historical_scoreboard, players)
+            progress_ui.update(
+                increment=num_games_per_match,
+                differences=differences,
+                description=f"Round {round_idx + 1} Match {match_counter}",
+            )
+
     progress_ui.close()
+    save_scoreboard(scoreboard_file, players)
 
-    # After all tournament matches, display aggregated expert activations.
-    #if tournament_expert_activations:
-        # Here, the keys are actual agent IDs so we can pass an identity mapping.
-        #identity_map = {agent: agent for agent in tournament_expert_activations.keys()}
-        #rich_print_expert_activations(tournament_expert_activations, identity_map)
+    # Compute H2H win rates
+    h2h_rates: Dict[tuple[int, int], float] = {}
+    for pair, count in h2h_match_counts.items():
+        wins = h2h_match_wins.get(pair, 0)
+        if count > 0:
+            h2h_rates[pair] = wins / count
+    # Print a concise H2H summary
+    print("\nHead-to-Head (match-level) win rates:")
+    # Order by descending rating
+    order = sorted(players.keys(), key=lambda pid: players[pid]["rating"].ordinal() if players[pid].get("rating") else 0.0, reverse=True)
+    for a in order:
+        for b in order:
+            if a == b:
+                continue
+            rate = h2h_rates.get((a, b))
+            if rate is not None:
+                print(f"{players[a]['player_id']} vs {players[b]['player_id']}: {rate:.2%} ({h2h_match_wins.get((a,b),0)}/{h2h_match_counts.get((a,b),0)})")
 
-    return global_action_counts
+    # Plot heatmap
+    try:
+        plot_agent_heatmap(h2h_rates, players, title="Head-to-Head Win Rates (match-level)")
+    except Exception as e:
+        print(f"[WARN] Failed to plot H2H heatmap: {e}")
 
-def rich_print_scoreboard_action_counts(players, action_counts):
-    rich_print_scoreboard(players)
-    rich_print_action_counts(players, action_counts)
+    return tournament_expert_data
 
-def main():
-    """
-    Runs a Swiss-style tournament evaluation.
-    Loads players, runs multiple rounds of matches, updates ratings, and saves results.
-    Optionally deletes weaker checkpoints based on performance.
-    """
-    global args  # So that run_group_swiss_tournament can access args
-    parser = argparse.ArgumentParser(description="ET - Evaluate Tournament")
-    parser.add_argument("--default", action="store_true", help="Load players from config.PLAYERS_DIR instead of config.CHECKPOINT_DIR")
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run a Swiss-style tournament evaluation.")
+    parser.add_argument(
+        "--eval-runs",
+        nargs="*",
+        default=[],
+        help="Runs to evaluate in the format run_name:gen_a,gen_b",
+    )
+    parser.add_argument(
+        "--cpp-bots",
+        type=str,
+        default="",
+        help="Comma-separated list of C++ bot labels to include.",
+    )
+    parser.add_argument(
+        "--num-games-per-match",
+        type=int,
+        default=config.NUM_GAMES_PER_MATCH,
+        help="Number of games to play per matchup.",
+    )
+    parser.add_argument(
+        "--num-rounds",
+        type=int,
+        default=config.NUM_ROUNDS,
+        help="Number of Swiss rounds to run.",
+    )
     args = parser.parse_args()
 
-    device = torch.device(config.DEVICE)
-    # Select players directory based on the argument.
-    players_dir = config.PLAYERS_DIR if args.default else config.CHECKPOINT_DIR
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    run_specs = parse_run_specs(args.eval_runs)
+    # Default to config.CPP_BOT_LABELS when --cpp-bots not provided
+    if not args.cpp_bots:
+        cpp_bot_labels = list(getattr(config, "CPP_BOT_LABELS", []))
+    else:
+        cpp_bot_labels = parse_cpp_labels(args.cpp_bots)
 
-    if not os.path.isdir(players_dir):
-        raise FileNotFoundError(f"Directory '{players_dir}' does not exist.")
-    env = LiarsDeckEnv(num_players=config.NUM_PLAYERS, render_mode=None)
-    obs, _ = env.reset()
-    agents = env.agents
-    config.set_derived_config(env.observation_spaces[agents[0]], env.action_spaces[agents[0]], config.NUM_PLAYERS - 1)
-    
-    # Initialize players from the chosen directory.
-    players = initialize_players(players_dir, device)
-    # Add hardcoded bot players.
-    players = add_hardcoded_players(players, device)
-    
-    # Ensure tournament tracking fields are present.
-    for pid, player in players.items():
-        player.setdefault('total_round_wins', 0)
-        player.setdefault('wins_match', 0)
-        player.setdefault('games_played', 0)
-        player.setdefault('win_rate_match', 0.0)
-        player.setdefault('win_rate_total', 0.0)
-        if 'obs_version' not in player:
-            player['obs_version'] = 2
+    all_policies, players = load_evaluation_policies(run_specs, cpp_bot_labels, device)
+    num_players = config.NUM_PLAYERS
+    if len(players) < num_players:
+        raise ValueError(f"Need at least {num_players} agents to run the tournament; got {len(players)}.")
 
-    if len(players) < 3:
-        raise ValueError("Need at least 3 individual players for the tournament.")
-    NUM_GAMES_PER_MATCH = config.NUM_GAMES_PER_MATCH
-    NUM_ROUNDS = config.NUM_ROUNDS
-
-    action_counts = run_group_swiss_tournament(
-        env, device, players,
-        num_games_per_match=NUM_GAMES_PER_MATCH,
-        NUM_ROUNDS=NUM_ROUNDS
+    expert_data = run_group_swiss_tournament(
+        all_policies,
+        players,
+        num_games_per_match=args.num_games_per_match,
+        num_rounds=args.num_rounds,
+        num_players_in_env=num_players,
     )
-    
-    # Determine which scoreboard to load based on the flag.
-    scoreboard_file = "scoreboard.json" if args.default else "tournament_scoreboard.json"
-    previous_scoreboard = load_scoreboard(scoreboard_file)
-    differences = compare_scoreboards(previous_scoreboard, players)
-    
-    # Print the final scoreboard with rank change column.
-    rich_print_scoreboard(players, differences)
-    rich_print_action_counts(players, action_counts)
-    
-    # Only save the tournament scoreboard and prompt deletion when not in default mode.
-    if not args.default:
-        new_scoreboard = {}
-        for pid, pdata in players.items():
-            new_scoreboard[pid] = {
-                "score": pdata["rating"].ordinal(),
-                "win_rate_match": pdata.get("win_rate_match", 0.0),
-                "win_rate_total": pdata.get("win_rate_total", 0.0),
-                "rank_change": differences.get(pid, {}).get("rank_change", None)
-            }
-        try:
-            with open("tournament_scoreboard.json", "w") as f:
-                json.dump(new_scoreboard, f, indent=2)
-        except Exception as e:
-            print(f"Error saving scoreboard: {e}")
-        
-        response = input("Delete bottom half of checkpoint files by best agent score? (y/n): ")
-        if response.lower().startswith('y'):
-            delete_bottom_half_checkpoints_by_score(players, players_dir)
-        else:
-            print("No checkpoints were deleted.")
+
+    final_differences = compare_scoreboards(load_scoreboard("tournament_scoreboard.json"), players)
+    rich_print_scoreboard(players, final_differences)
+    rich_print_expert_activations(expert_data)
+
 
 if __name__ == "__main__":
     main()
