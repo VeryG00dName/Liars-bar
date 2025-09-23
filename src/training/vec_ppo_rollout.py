@@ -275,12 +275,13 @@ class PPOVecRolloutManager:
                 assert prepared_batch is not None
                 actions, log_probs, values = agent.get_actions_from_prepared(prepared_batch, indices)
 
+                # Capture lightweight metadata before the underlying C++ requests are released.
+                env_indices = [int(ppo_requests[global_idx].env) for global_idx in indices]
+
                 self.arena.submit_actions(policy_id, actions)
 
                 if policy_id == training_policy_id:
-                    for offset, global_idx in enumerate(indices):
-                        req = ppo_requests[global_idx]
-                        env_idx = req.env
+                    for offset, (global_idx, env_idx) in enumerate(zip(indices, env_indices)):
                         ep = episodes[env_idx]
                         if ep['done']:
                             continue
@@ -302,11 +303,12 @@ class PPOVecRolloutManager:
 
                 actions, log_probs, values = agent.get_actions_batch(reqs)
 
+                env_indices = [int(req.env) for req in reqs]
+
                 self.arena.submit_actions(policy_id, actions)
 
                 if policy_id == training_policy_id:
-                    for i, req in enumerate(reqs):
-                        env_idx = req.env
+                    for i, env_idx in enumerate(env_indices):
                         ep = episodes[env_idx]
                         if ep['done']:
                             continue
@@ -317,9 +319,6 @@ class PPOVecRolloutManager:
                             "value": values[i],
                             "penalties_used": penalties_snapshot_np[i],
                         }
-
-            requests_by_policy.clear()
-            del requests_by_policy
 
             requests_by_policy.clear()
             del requests_by_policy

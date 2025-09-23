@@ -79,7 +79,6 @@ BRICK_DECORRELATION_WEIGHT = 1e-3
 # PPO / Training Hyperparameters
 # ============================
 EPISODES_PER_UPDATE = 576
-FIXED_L_TOK = 200
 LEARNING_RATE = 0.00019
 GAMMA = 0.974
 GAE_LAMBDA = 0.98

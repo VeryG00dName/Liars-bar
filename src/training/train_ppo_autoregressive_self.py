@@ -314,6 +314,7 @@ def train_generation(
             training_policy_id=training_policy_id,
             max_batch_envs=int(getattr(config, "EPISODES_PER_UPDATE", 512))
         )
+        torch.cuda.synchronize()
         t_roll = time.time()
         if not new_eps:
             logging.warning(f"Update {update}: No episodes collected. Skipping.")
@@ -408,7 +409,7 @@ def train_generation(
             avg_usage = metrics.get("avg_brick_usage_np")
             if avg_usage is not None:
                 avg_brick_usage_chunks.append(np.asarray(avg_usage, dtype=np.float32))
-
+        torch.cuda.synchronize()
         t_opt_end = time.time()
         # Timings
         dur_roll = t_roll - t0

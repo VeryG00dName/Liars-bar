@@ -1641,7 +1641,6 @@ def _collate_batch(
         our_action_mask = m
 
     opponent_counts: List[int] = []
-    heldout_flags: List[bool] = []
 
     # Labels <= 6 are classic C++ bots; only consider held-out labels > 6
     BOT_MAX_ID = 6
@@ -1663,65 +1662,45 @@ def _collate_batch(
                 pass
         return None
 
-    episode_infos: List[Dict[str, Any]] = []
-    heldout_label: Optional[int] = None
+    # --- REVISED: Efficient Held-out Label Selection (Single Pass) ---
+    heldout_label = None
+    episode_opponent_labels_sets = []
 
+    # First pass: find the max opponent label across the batch AND cache each episode's opponents
     for ep in episodes:
-        player_labels = tuple(ep.get("player_labels", ()))
         training_seat = int(ep.get("training_agent_seat", -1))
-        training_label = _label_to_int(ep.get("training_agent_label"))
-        true_opp = tuple(ep.get("true_opponent_labels", ()))
-
-        count = sum(1 for seat_idx in range(len(player_labels)) if seat_idx != training_seat)
-        opponent_counts.append(count)
-
-        candidate_labels: List[int] = []
-        for lab in true_opp:
-            lab_i = _label_to_int(lab)
-            if lab_i is not None and lab_i > BOT_MAX_ID:
-                candidate_labels.append(lab_i)
-        if not candidate_labels:
-            for seat_idx, lab in enumerate(player_labels):
-                if seat_idx == training_seat:
-                    continue
-                lab_i = _label_to_int(lab)
-                if lab_i is not None and lab_i > BOT_MAX_ID:
-                    candidate_labels.append(lab_i)
-
-        for lab_i in candidate_labels:
-            if training_label is not None and lab_i == training_label:
+        # Prefer true_opponent_labels if available, else derive from player_labels
+        opp_labels_source = ep.get("true_opponent_labels", ep.get("player_labels", ()))
+        
+        current_ep_opp_labels = set()
+        for i, lab in enumerate(opp_labels_source):
+            # If using player_labels, skip the training agent
+            if "true_opponent_labels" not in ep and i == training_seat:
                 continue
-            if heldout_label is None or lab_i > heldout_label:
-                heldout_label = lab_i
+            lab_i = _label_to_int(lab)
+            if lab_i is not None and lab_i != ep.get("training_agent_label") and lab_i > BOT_MAX_ID:
+                current_ep_opp_labels.add(lab_i)
+        
+        episode_opponent_labels_sets.append(current_ep_opp_labels)
+        
+        if current_ep_opp_labels:
+            ep_max_label = max(current_ep_opp_labels)
+            if heldout_label is None or ep_max_label > heldout_label:
+                heldout_label = ep_max_label
 
-        episode_infos.append(
-            {
-                "player_labels": player_labels,
-                "true_opponent_labels": true_opp,
-                "training_seat": training_seat,
-                "training_label": training_label,
-            }
-        )
-
-    for info in episode_infos:
-        has_heldout = False
-        if heldout_label is not None:
-            for lab in info["true_opponent_labels"]:
-                lab_i = _label_to_int(lab)
-                if lab_i is not None and lab_i == heldout_label:
-                    has_heldout = True
-                    break
-            if not has_heldout:
-                training_seat = info["training_seat"]
-                for seat_idx, lab in enumerate(info["player_labels"]):
-                    if seat_idx == training_seat:
-                        continue
-                    lab_i = _label_to_int(lab)
-                    if lab_i is not None and lab_i == heldout_label:
-                        has_heldout = True
-                        break
-        heldout_flags.append(has_heldout)
-    num_opponents = max(opponent_counts + [0])
+    # Second pass (fast): build the boolean mask based on the determined heldout_label
+    if heldout_label is not None:
+        heldout_flags = [heldout_label in opp_set for opp_set in episode_opponent_labels_sets]
+    else:
+        heldout_flags = [False] * len(episodes)
+    
+    num_opponents = 0
+    for ep in episodes:
+        count = sum(1 for seat_idx in range(len(ep.get("player_labels", ()))) if seat_idx != ep.get("training_agent_seat", -1))
+        opponent_counts.append(count)
+    if opponent_counts:
+        num_opponents = max(opponent_counts)
+    # --- END REVISION ---
 
     # -------- allocate supervision tensors (CPU) --------
     def _pm(x: torch.Tensor) -> torch.Tensor:
