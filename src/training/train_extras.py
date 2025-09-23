@@ -155,13 +155,13 @@ def set_seed(seed=42):
 
     torch.set_float32_matmul_precision("medium")
 
-    try:
-        from torch.nn.attention import sdp_kernel  # type: ignore
-        sdp_kernel.enable_flash(False)
-        sdp_kernel.enable_math(True)
-        sdp_kernel.enable_mem_efficient(False)
-    except Exception:
-        pass
+    if hasattr(torch.backends, "cuda"):
+        if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+            torch.backends.cuda.enable_flash_sdp(False)
+        if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+        if hasattr(torch.backends.cuda, "enable_math_sdp"):
+            torch.backends.cuda.enable_math_sdp(True)
 
     # Enforce deterministic algorithm usage (raises if unavailable)
     torch.use_deterministic_algorithms(True, warn_only=True)
