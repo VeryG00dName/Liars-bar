@@ -1,4 +1,4 @@
-# setup.py (renamed from setup_lb.py for convention)
+# Build configuration for the Liars Bar C++ extension.
 import sys
 from setuptools import setup
 from pybind11.setup_helpers import Pybind11Extension, build_ext
@@ -42,7 +42,7 @@ ext = Pybind11Extension(
 )
 
 setup(
-    name="LiarsBarCore", # A more descriptive name for the package
+    name="LiarsBarCore",  # A more descriptive name for the package
     version="1.0.0",
     author="<Your Name>",
     author_email="<your_email@example.com>",
