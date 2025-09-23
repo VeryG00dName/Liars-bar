@@ -10,7 +10,6 @@ import numpy as np
 import torch
 from src import config
 import os
-
 os.environ.setdefault("MPLBACKEND", "Agg")
 import matplotlib
 import torch.nn.functional as F

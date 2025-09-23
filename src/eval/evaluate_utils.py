@@ -4,10 +4,11 @@ from __future__ import annotations
 import json
 import os
 import random
-from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
-
+from typing import Any, Dict, List, Tuple, Optional
+os.environ.setdefault("MPLBACKEND", "Agg")
+import matplotlib
+matplotlib.use("Agg")
 import numpy as np
 import torch
 from openskill.models import PlackettLuce
@@ -23,20 +24,15 @@ from src.agents.base_agent import BaseAgent
 from src.agents.batch_autoregressive_ppo_agent import BatchPPOAutoregressiveAgent
 from src.agents.cpp_bot_wrapper import CppBotWrapper
 from src.misc import lb
-import math
-import itertools
 
-try:
-    import matplotlib.pyplot as plt  # type: ignore
-    _HAS_MPL = True
-except Exception:
-    _HAS_MPL = False
-try:
-    import seaborn as sns  # type: ignore
-    import pandas as pd  # type: ignore
-    _HAS_SNS = True
-except Exception:
-    _HAS_SNS = False
+
+import matplotlib.pyplot as plt  # type: ignore
+_HAS_MPL = True
+
+import seaborn as sns  # type: ignore
+import pandas as pd  # type: ignore
+_HAS_SNS = True
+
 
 CPP_BOT_LABEL_TO_NAME = {
     0: "Classic",
@@ -201,7 +197,7 @@ def run_batched_games(
     num_games_per_match: int,
     num_players_in_env: int,
     track_experts: bool = False,
-) -> Dict[int, Dict[str, Any]]:
+) -> Tuple[Dict[int, Dict[str, Any]], Dict[tuple, int], Dict[tuple, int]]:
     """Run a batch of games between the specified policies using VecArena."""
 
     if len(matchup_policy_ids) != num_players_in_env:
@@ -211,21 +207,28 @@ def run_batched_games(
         pid: {"total_wins": 0, "total_returns": 0.0, "num_games": 0, "expert_data": {}}
         for pid in matchup_policy_ids
     }
+    # Per-game head-to-head tallies at the round (game) level
+    h2h_round_counts: Dict[tuple, int] = {}
+    h2h_round_wins: Dict[tuple, int] = {}
 
     arena = lb.VecArena()
-    rng = random.Random()
+    # Use a dedicated, seeded RNG for deterministic batching and role shuffles
+    seed_base = int(getattr(config, "SEED", 42))
+    rng_np = np.random.default_rng(seed_base)
     games_remaining = num_games_per_match
     max_batch = max(1, getattr(config, "EVAL_VEC_BATCH_SIZE", num_games_per_match))
 
     while games_remaining > 0:
         batch_size = min(games_remaining, max_batch)
-        seed = rng.randint(0, 2**31 - 1)
+        # Derive a fresh seed from the RNG to drive the C++ env deterministically
+        seed = int(rng_np.integers(0, 2**31 - 1, dtype=np.int64))
         arena.reset(batch=batch_size, players=num_players_in_env, seed=seed)
 
         roles: List[List[int]] = []
         for _ in range(batch_size):
             seats = list(matchup_policy_ids)
-            rng.shuffle(seats)
+            # Deterministic in-place shuffle via the seeded numpy RNG
+            rng_np.shuffle(seats)
             roles.append(seats)
         arena.set_roles(roles)
 
@@ -241,11 +244,18 @@ def run_batched_games(
             requests_by_policy = arena.collect_requests()
             if not requests_by_policy:
                 break
-            for policy_id, requests in requests_by_policy.items():
+            # Enforce a stable processing order across policies and requests
+            for policy_id in sorted(requests_by_policy.keys()):
+                requests = requests_by_policy[policy_id]
                 agent = all_policies.get(policy_id)
                 if agent is None or not requests:
                     continue
-                actions, _, _ = agent.get_actions_batch(requests)
+                # Also sort each policy's requests stably by (env, seat)
+                try:
+                    requests_sorted = sorted(requests, key=lambda r: (int(r.env), int(r.seat)))
+                except Exception:
+                    requests_sorted = list(requests)
+                actions, _, _ = agent.get_actions_batch(requests_sorted)
                 arena.submit_actions(policy_id, actions)
             done_mask = np.array(arena.done, dtype=bool)
 
@@ -262,6 +272,17 @@ def run_batched_games(
                     entry["total_returns"] += 1.0
                 elif winner_seat is not None:
                     entry["total_returns"] -= 1.0
+            # Update pairwise round-level H2H: ordered pairs (a,b) of policy_ids in this game
+            # Count every pair that co-appeared; give a win to the winner against each other
+            for i in range(num_players_in_env):
+                a = seats[i]
+                for j in range(num_players_in_env):
+                    if i == j:
+                        continue
+                    b = seats[j]
+                    h2h_round_counts[(a, b)] = h2h_round_counts.get((a, b), 0) + 1
+                    if winner_seat is not None and i == winner_seat:
+                        h2h_round_wins[(a, b)] = h2h_round_wins.get((a, b), 0) + 1
         games_remaining -= batch_size
 
     if track_experts:
@@ -277,7 +298,7 @@ def run_batched_games(
         for entry in results.values():
             entry["expert_data"] = {}
 
-    return results
+    return results, h2h_round_counts, h2h_round_wins
 
 
 class RichProgressScoreboard:
@@ -307,7 +328,7 @@ class RichProgressScoreboard:
     def _generate_scoreboard_table(self, differences: Dict[int, Dict[str, Any]] | None = None) -> Table:
         table = Table(title="Live Scoreboard", show_header=True, header_style="bold magenta")
         table.add_column("Rank", style="dim")
-        table.add_column("Player", min_width=24)
+        table.add_column("Player", min_width=8)
         table.add_column("Skill", justify="right")
         table.add_column("Match Win Rate", justify="right")
         table.add_column("Round Win Rate", justify="right")
@@ -444,37 +465,102 @@ def compare_scoreboards(
     return differences
 
 
-def rich_print_scoreboard(players: Dict[int, Dict[str, Any]], differences: Dict[int, Dict[str, Any]] | None = None) -> None:
+def rich_print_scoreboard(
+    players: Dict[int, Dict[str, Any]],
+    differences: Optional[Dict[int, Dict[str, Any]]] = None,
+    *,
+    title: str = "Final Tournament Scoreboard",
+    save_csv: str = "final_scoreboard.csv",
+) -> None:
     console = Console()
-    table = Table(title="Final Tournament Scoreboard")
+
+    table = Table(
+        title=title,
+        show_header=True,
+        header_style="bold magenta"
+    )
     table.add_column("Rank", style="dim")
-    table.add_column("Player", min_width=24)
+    table.add_column("Player", min_width=8)
     table.add_column("Skill", justify="right")
     table.add_column("Match Win Rate", justify="right")
     table.add_column("Round Win Rate", justify="right")
     table.add_column("Δ Rank", justify="right")
 
-    sorted_players = sorted(players.items(), key=lambda item: item[1]["rating"].ordinal(), reverse=True)
+    # Sort by rating.ordinal() descending (fallback 0.0)
+    sorted_players = sorted(
+        players.items(),
+        key=lambda item: item[1]["rating"].ordinal() if item[1].get("rating") else 0.0,
+        reverse=True,
+    )
+
+    rows_for_csv = []  # optional CSV export
+
     for rank, (pid, data) in enumerate(sorted_players, start=1):
         player_name = data.get("player_id", str(pid))
-        skill = data["rating"].ordinal()
+        skill = data["rating"].ordinal() if data.get("rating") else 0.0
         match_wr = data.get("win_rate_match", 0.0)
         round_wr = data.get("win_rate_total", 0.0)
-        diff = differences.get(pid) if differences else None
-        if diff is None or diff.get("rank_change") is None:
-            rank_change_str = "New"
+
+        # --- Δ Rank formatting (match the live widget) ---
+        rank_change_str = ""
+        if differences and pid in differences:
+            rank_change = differences[pid].get("rank_change")
+            if rank_change is None:
+                rank_change_str = "New"
+            elif rank_change > 0:
+                rank_change_str = f"[green]+{rank_change}[/green]"
+            elif rank_change < 0:
+                rank_change_str = f"[red]{rank_change}[/red]"
+            else:
+                rank_change_str = "0"
+
+        # --- Medal colors for top 3 ranks (match the live widget) ---
+        if rank == 1:
+            rank_str = f"[bold gold1]{rank}[/bold gold1]"
+        elif rank == 2:
+            rank_str = f"[bold silver]{rank}[/bold silver]"
+        elif rank == 3:
+            rank_str = f"[bold dark_orange]{rank}[/bold dark_orange]"
         else:
-            delta = diff["rank_change"]
-            rank_change_str = f"{delta:+d}" if isinstance(delta, int) else "0"
+            rank_str = str(rank)
+
         table.add_row(
-            str(rank),
+            rank_str,
             player_name,
             f"{skill:.2f}",
             f"{match_wr:.2%}",
             f"{round_wr:.2%}",
             rank_change_str,
         )
+
+        # for CSV (strip rich markup)
+        rows_for_csv.append({
+            "Rank": rank,
+            "Player": player_name,
+            "Skill": round(skill, 2),
+            "Match Win Rate": round(match_wr, 4),
+            "Round Win Rate": round(round_wr, 4),
+            "Δ Rank": (
+                "New" if (differences and pid in differences and differences[pid].get("rank_change") is None)
+                else (differences[pid]["rank_change"] if (differences and pid in differences and isinstance(differences[pid].get("rank_change"), int)) else "")
+            ),
+        })
+
     console.print(table)
+
+    # Optional CSV export (no pandas dependency)
+    if save_csv:
+        try:
+            import csv
+            with open(save_csv, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["Rank", "Player", "Skill", "Match Win Rate", "Round Win Rate", "Δ Rank"],
+                )
+                writer.writeheader()
+                writer.writerows(rows_for_csv)
+        except Exception as e:
+            print(f"[WARN] Failed to save CSV '{save_csv}': {e}")
 
 
 def rich_print_expert_activations(expert_activations: Dict[int, Any]) -> None:
@@ -508,8 +594,9 @@ def plot_agent_heatmap(
     players: Dict[int, Dict[str, Any]],
     title: str = "Head-to-Head Win Rates",
     out_file: str = "h2h_winrate_heatmap.png",
+    csv_file: str = "h2h_winrate_matrix.csv",
 ) -> None:
-    """Plot a heatmap of head-to-head win rates.
+    """Plot a heatmap of head-to-head win rates and save to CSV.
 
     h2h_rates: mapping of (A,B) -> win rate for A vs B in [0,1].
     players: tournament players metadata (for names and ordering).
@@ -519,10 +606,14 @@ def plot_agent_heatmap(
         return
 
     # Order agents by descending skill (rating.ordinal), fallback to pid
-    order = sorted(players.keys(), key=lambda pid: players[pid]["rating"].ordinal() if players[pid].get("rating") else 0.0, reverse=True)
+    order = sorted(
+        players.keys(),
+        key=lambda pid: players[pid]["rating"].ordinal() if players[pid].get("rating") else 0.0,
+        reverse=True,
+    )
     labels = [players[pid].get("player_id", str(pid)) for pid in order]
     n = len(order)
-    import numpy as np
+    
     M = np.zeros((n, n), dtype=float)
     M[:] = np.nan
     for i, a in enumerate(order):
@@ -531,14 +622,18 @@ def plot_agent_heatmap(
                 M[i, j] = np.nan
                 continue
             r = h2h_rates.get((a, b))
-            if r is None:
-                M[i, j] = np.nan
-            else:
-                M[i, j] = float(r)
+            M[i, j] = float(r) if r is not None else np.nan
 
+    # --- Save to CSV ---
+    try:
+        df = pd.DataFrame(M, index=labels, columns=labels)
+        df.to_csv(csv_file, float_format="%.3f")
+    except Exception as e:
+        print(f"[WARN] Failed to save CSV: {e}")
+
+    # --- Plot heatmap ---
     plt.figure(figsize=(max(8, n * 0.6), max(6, n * 0.5)))
     if _HAS_SNS:
-        df = pd.DataFrame(M, index=labels, columns=labels)
         sns.heatmap(df, annot=False, cmap="Blues", vmin=0.0, vmax=1.0, cbar=True)
     else:
         im = plt.imshow(M, cmap="Blues", vmin=0.0, vmax=1.0)

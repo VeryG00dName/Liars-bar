@@ -185,3 +185,5 @@ opponent_training_data.pkl
 *.db
 CODING_GUIDELINES.md
 *.html
+*.csv
+*.png

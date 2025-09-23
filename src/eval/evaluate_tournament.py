@@ -1,12 +1,26 @@
 """Swiss-style tournament evaluation using the batched VecArena backend."""
 from __future__ import annotations
 
+import os
 import argparse
 from collections import defaultdict
 from typing import Dict, List, Set
 
-import torch
+# Encourage deterministic CUDA behavior (must be set before CUDA is initialized)
+os.environ.pop("TORCH_LOGS", None)
+os.environ.setdefault("TORCHDYNAMO_VERBOSE", "0")
+os.environ.setdefault("TORCH_COMPILE_DEBUG", "0")
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
+import torch
+import warnings
+warnings.filterwarnings("ignore", message=".*symbolic_shapes.*")
+warnings.filterwarnings(
+    "ignore",
+    message=".*does not have a deterministic implementation.*",
+    category=UserWarning,
+)
 from src import config
 from src.eval.evaluate_utils import (
     openskill_model,
@@ -20,7 +34,9 @@ from src.eval.evaluate_utils import (
     rich_print_expert_activations,
     plot_agent_heatmap,
 )
-
+from src.training.train_extras import set_seed
+SEED = int(getattr(config, "SEED", 42))
+set_seed(SEED)
 
 def parse_run_specs(specs: List[str]) -> Dict[str, List[str]]:
     """Parse run specs.
@@ -119,9 +135,9 @@ def run_group_swiss_tournament(
     historical_scoreboard = load_scoreboard(scoreboard_file)
 
     tournament_expert_data: Dict[int, Dict[str, any]] = defaultdict(dict)
-    # Head-to-head tracking (match-level): (A,B) = number of matches A beat B
-    h2h_match_wins: Dict[tuple[int, int], int] = defaultdict(int)
-    h2h_match_counts: Dict[tuple[int, int], int] = defaultdict(int)
+    # Head-to-head tracking (round-level): (A,B) counts games together and A's game-wins vs B
+    h2h_round_wins: Dict[tuple[int, int], int] = defaultdict(int)
+    h2h_round_counts: Dict[tuple[int, int], int] = defaultdict(int)
     match_counter = 0
 
     for round_idx in range(num_rounds):
@@ -129,7 +145,7 @@ def run_group_swiss_tournament(
         for group in groups:
             if len(group) != num_players_in_env:
                 continue
-            results = run_batched_games(
+            results, round_counts, round_wins = run_batched_games(
                 all_policies,
                 group,
                 num_games_per_match,
@@ -165,18 +181,11 @@ def run_group_swiss_tournament(
                     if pid != other:
                         match_history[pid].add(other)
 
-            # Update head-to-head (match-level): for each ordered pair (a,b)
-            for i in range(len(group)):
-                for j in range(len(group)):
-                    if i == j:
-                        continue
-                    a = group[i]
-                    b = group[j]
-                    h2h_match_counts[(a, b)] += 1
-                    wins_a = results[a]["total_wins"]
-                    wins_b = results[b]["total_wins"]
-                    if wins_a > wins_b:
-                        h2h_match_wins[(a, b)] += 1
+            # Aggregate head-to-head at the round (game) level across this match
+            for k, v in round_counts.items():
+                h2h_round_counts[k] += v
+            for k, v in round_wins.items():
+                h2h_round_wins[k] += v
 
             for pid in group:
                 expert_info = results[pid].get("expert_data")
@@ -198,27 +207,15 @@ def run_group_swiss_tournament(
     progress_ui.close()
     save_scoreboard(scoreboard_file, players)
 
-    # Compute H2H win rates
+    # Compute H2H win rates at the round level
     h2h_rates: Dict[tuple[int, int], float] = {}
-    for pair, count in h2h_match_counts.items():
-        wins = h2h_match_wins.get(pair, 0)
+    for pair, count in h2h_round_counts.items():
+        wins = h2h_round_wins.get(pair, 0)
         if count > 0:
             h2h_rates[pair] = wins / count
-    # Print a concise H2H summary
-    print("\nHead-to-Head (match-level) win rates:")
-    # Order by descending rating
-    order = sorted(players.keys(), key=lambda pid: players[pid]["rating"].ordinal() if players[pid].get("rating") else 0.0, reverse=True)
-    for a in order:
-        for b in order:
-            if a == b:
-                continue
-            rate = h2h_rates.get((a, b))
-            if rate is not None:
-                print(f"{players[a]['player_id']} vs {players[b]['player_id']}: {rate:.2%} ({h2h_match_wins.get((a,b),0)}/{h2h_match_counts.get((a,b),0)})")
-
     # Plot heatmap
     try:
-        plot_agent_heatmap(h2h_rates, players, title="Head-to-Head Win Rates (match-level)")
+        plot_agent_heatmap(h2h_rates, players, title="Head-to-Head Win Rates (round-level)")
     except Exception as e:
         print(f"[WARN] Failed to plot H2H heatmap: {e}")
 
@@ -252,7 +249,7 @@ def main() -> None:
         help="Number of Swiss rounds to run.",
     )
     args = parser.parse_args()
-
+    historical_scoreboard = load_scoreboard("tournament_scoreboard.json")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     run_specs = parse_run_specs(args.eval_runs)
     # Default to config.CPP_BOT_LABELS when --cpp-bots not provided
@@ -274,7 +271,7 @@ def main() -> None:
         num_players_in_env=num_players,
     )
 
-    final_differences = compare_scoreboards(load_scoreboard("tournament_scoreboard.json"), players)
+    final_differences = compare_scoreboards(historical_scoreboard, players)
     rich_print_scoreboard(players, final_differences)
     rich_print_expert_activations(expert_data)
 
