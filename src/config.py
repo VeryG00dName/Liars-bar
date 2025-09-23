@@ -78,7 +78,7 @@ BRICK_DECORRELATION_WEIGHT = 1e-3
 # ============================
 # PPO / Training Hyperparameters
 # ============================
-EPISODES_PER_UPDATE = 512
+EPISODES_PER_UPDATE = 576
 FIXED_L_TOK = 200
 LEARNING_RATE = 0.00019
 GAMMA = 0.974
@@ -89,6 +89,13 @@ MAX_NORM = 0.3
 
 # Coefficients
 INIT_ENTROPY_COEF = 0.005
+
+# Opponent sampling configuration
+SHADOW_P_NEW = 0.116
+FRONT_P_ADJUSTED = 1.0 - SHADOW_P_NEW
+NUM_ACTIVE_SHADOW_AGENTS_PER_UPDATE = 2
+CPP_BOT_MAX_LABEL = 6
+LATEST_K = 4
 
 # ============================
 # Auxiliary Loss Weights

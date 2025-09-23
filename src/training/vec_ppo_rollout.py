@@ -6,6 +6,7 @@ import time
 import numpy as np
 import torch
 from src.misc import lb
+from src import config
 
 from src.agents.batch_autoregressive_ppo_agent import BatchPPOAutoregressiveAgent
 
@@ -18,11 +19,52 @@ class PPOVecRolloutManager:
                  arena: lb.VecArena,
                  policies: Dict[int, BatchPPOAutoregressiveAgent],
                  device: torch.device,
+                 pool_manager: Optional[Any] = None,
                  rng: Optional[np.random.Generator] = None):
         self.arena = arena
         self.policies = policies
         self.device = device
         self.rng = rng if rng is not None else np.random.default_rng()
+        self.pool_manager = pool_manager
+        self._all_shadow_pool_labels: List[int] = []
+        self._current_shadow_rotation_queue: List[int] = []
+        self._shadow_pool_reference: List[int] = []
+
+    def set_available_agents_for_sampling(self, all_opponent_pool_data: List[Dict[str, Any]]):
+        """Update opponent partitions and refresh the rotating shadow queue."""
+        cpp_bots: List[int] = []
+        historical: List[int] = []
+
+        for entry in all_opponent_pool_data:
+            label = entry.get("label")
+            if label is None:
+                continue
+            if label <= config.CPP_BOT_MAX_LABEL:
+                cpp_bots.append(int(label))
+            else:
+                historical.append(int(label))
+
+        cpp_bots = sorted(set(cpp_bots))
+        historical_sorted = sorted(set(historical))
+
+        latest_historical_agents = historical_sorted[-config.LATEST_K:] if config.LATEST_K > 0 else []
+        shadow_historical_agents = [label for label in historical_sorted if label not in latest_historical_agents]
+
+        shadow_reference = list(shadow_historical_agents)
+        refresh_shadow_rotation = shadow_reference != self._shadow_pool_reference
+
+        if refresh_shadow_rotation:
+            self._shadow_pool_reference = shadow_reference
+            self._all_shadow_pool_labels = list(shadow_reference)
+            if self._all_shadow_pool_labels:
+                self.rng.shuffle(self._all_shadow_pool_labels)
+                self._current_shadow_rotation_queue = list(self._all_shadow_pool_labels)
+            else:
+                self._current_shadow_rotation_queue = []
+        elif not self._current_shadow_rotation_queue and self._all_shadow_pool_labels:
+            self._current_shadow_rotation_queue = list(self._all_shadow_pool_labels)
+
+        return cpp_bots, latest_historical_agents, shadow_historical_agents
 
     def _reset_policy_state(self):
         for policy in self.policies.values():
@@ -35,44 +77,50 @@ class PPOVecRolloutManager:
                  batch_size: int,
                  num_players: int,
                  training_policy_id: int = 0,
-                 opponent_pool: List[int] = None) -> List[List[int]]:
-        if opponent_pool is None:
-            opponent_pool = [0]
+                 cpp_bots: Optional[List[int]] = None,
+                 latest_historical_agents: Optional[List[int]] = None,
+                 active_shadow_agents_for_this_update: Optional[List[int]] = None) -> List[List[int]]:
+        cpp_bots = cpp_bots or []
+        latest_historical_agents = latest_historical_agents or []
+        active_shadow_agents_for_this_update = active_shadow_agents_for_this_update or []
 
-        BOT_MAX_ID = 6
-        LATEST_K   = 4
+        front = sorted(set(cpp_bots).union(latest_historical_agents))
+        shadow = sorted(set(active_shadow_agents_for_this_update) - set(front))
 
-        FRONT_P   = 0.95  # bots ∪ latest
-        SHADOW_P  = 0.05  # shadow
+        opponent_pool = front + shadow
+        if not opponent_pool:
+            opponent_pool = [training_policy_id]
 
-        # Partition pool
-        bots    = [i for i in opponent_pool if i <= BOT_MAX_ID]
-        frozens = sorted([i for i in opponent_pool if i > BOT_MAX_ID])
-        latest  = frozens[-LATEST_K:] if LATEST_K > 0 else []
-        shadow  = [i for i in frozens if i not in latest]
-        front   = sorted(set(bots + latest))
-
-        # Bucket masses (renormalize if some buckets are empty)
         masses = {
-            "front":  FRONT_P  if front  else 0.0,
-            "shadow": SHADOW_P if shadow else 0.0,
+            "front": config.FRONT_P_ADJUSTED if front else 0.0,
+            "shadow": config.SHADOW_P_NEW if shadow else 0.0,
         }
+
         s = masses["front"] + masses["shadow"]
 
-        if s <= 0.0:
-            # Fallback: uniform over entire pool
-            probs = np.full(len(opponent_pool), 1.0 / max(1, len(opponent_pool)))
+        if s <= 0.0 or len(opponent_pool) == 0:
+            probs = np.full(len(opponent_pool), 1.0 / max(1, len(opponent_pool)), dtype=np.float64)
         else:
-            # Renormalize to 1.0 if a bucket was empty
-            masses["front"]  /= s
+            masses["front"] /= s
             masses["shadow"] /= s
 
-            def bucket(x: int) -> str:
-                return "front" if x in front else "shadow"
+            front_set = set(front)
 
-            sizes = {"front": max(1, len(front)), "shadow": max(1, len(shadow))}
-            probs = np.array([masses[bucket(x)] / sizes[bucket(x)] for x in opponent_pool], dtype=np.float64)
-            probs /= probs.sum()
+            def bucket(x: int) -> str:
+                return "front" if x in front_set else "shadow"
+
+            sizes = {
+                "front": max(1, len(front)),
+                "shadow": max(1, len(shadow)),
+            }
+            probs = np.array([
+                masses[bucket(x)] / sizes[bucket(x)] for x in opponent_pool
+            ], dtype=np.float64)
+            probs_sum = probs.sum()
+            if probs_sum > 0:
+                probs /= probs_sum
+            else:
+                probs = np.full(len(opponent_pool), 1.0 / max(1, len(opponent_pool)), dtype=np.float64)
 
         all_env_roles = []
         for _ in range(batch_size):
@@ -94,7 +142,6 @@ class PPOVecRolloutManager:
                          num_episodes: int,
                          num_players: int,
                          training_policy_id: int = 0,
-                         opponent_pool: List[int] = None,
                          max_batch_envs: int = None) -> List[Dict[str, Any]]:
         batch_guess = self.arena.B if self.arena.B > 0 else num_episodes
         if max_batch_envs is not None:
@@ -104,7 +151,30 @@ class PPOVecRolloutManager:
         self.arena.reset(batch=batch_size, players=num_players, seed=int(self.rng.integers(0, 2**31)))
         self._reset_policy_state()
 
-        roles = self._setup_roles(batch_size, num_players, training_policy_id, opponent_pool)
+        cpp_bots: List[int] = []
+        latest_historical_agents: List[int] = []
+        if self.pool_manager is not None:
+            cpp_bots, latest_historical_agents, _ = self.set_available_agents_for_sampling(self.pool_manager.pool)
+
+        active_shadow_agents_for_this_update: List[int] = []
+        if self._all_shadow_pool_labels:
+            for _ in range(int(config.NUM_ACTIVE_SHADOW_AGENTS_PER_UPDATE)):
+                if not self._current_shadow_rotation_queue and self._all_shadow_pool_labels:
+                    refreshed = list(self._all_shadow_pool_labels)
+                    self.rng.shuffle(refreshed)
+                    self._current_shadow_rotation_queue = refreshed
+                if not self._current_shadow_rotation_queue:
+                    break
+                active_shadow_agents_for_this_update.append(int(self._current_shadow_rotation_queue.pop(0)))
+
+        roles = self._setup_roles(
+            batch_size,
+            num_players,
+            training_policy_id,
+            cpp_bots=cpp_bots,
+            latest_historical_agents=latest_historical_agents,
+            active_shadow_agents_for_this_update=active_shadow_agents_for_this_update,
+        )
         self.arena.set_roles(roles)
 
         episodes = [self._new_episode_tracker(b, roles[b], training_policy_id) for b in range(batch_size)]

@@ -286,7 +286,15 @@ def train_generation(
 
     # 3. INITIALIZE ARENA, ROLLOUT MANAGER, AND PLATEAU DETECTOR
     arena = lb.VecArena()
-    rollout_manager = PPOVecRolloutManager(arena, policy_map, device, rng=(rng or _GLOBAL_RNG))
+    rollout_manager = PPOVecRolloutManager(
+        arena,
+        policy_map,
+        device,
+        pool_manager=pool_manager,
+        rng=(rng or _GLOBAL_RNG),
+    )
+
+    rollout_manager.set_available_agents_for_sampling(pool_manager.pool)
 
     # 4. MAIN TRAINING LOOP
     episodes_per_update = int(config.EPISODES_PER_UPDATE)
@@ -304,7 +312,6 @@ def train_generation(
             num_episodes=episodes_per_update,
             num_players=4,
             training_policy_id=training_policy_id,
-            opponent_pool=[int(a['label']) for a in pool_manager.pool if a['type'] == 'cpp_bot' or a['type'] == 'historical'],
             max_batch_envs=int(getattr(config, "EPISODES_PER_UPDATE", 512))
         )
         t_roll = time.time()

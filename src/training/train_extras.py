@@ -155,9 +155,6 @@ def set_seed(seed=42):
 
     torch.set_float32_matmul_precision("medium")
 
-    # Enforce deterministic algorithm usage (raises if unavailable)
-    torch.use_deterministic_algorithms(True, warn_only=True)
-
     try:
         from torch.nn.attention import sdp_kernel  # type: ignore
         sdp_kernel.enable_flash(False)
@@ -165,6 +162,9 @@ def set_seed(seed=42):
         sdp_kernel.enable_mem_efficient(False)
     except Exception:
         pass
+
+    # Enforce deterministic algorithm usage (raises if unavailable)
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
 def convert_memory_to_features(memory, response_mapping, action_mapping):
     """
