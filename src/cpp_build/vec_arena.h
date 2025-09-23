@@ -47,9 +47,9 @@ struct VecArena {
         void reset(int B_, int n_players_, uint32_t seed0);
         void set_roles(const std::vector<std::vector<int>>& policy_ids_per_env);
 
-	// Advance everything until any POLICY seat needs an action.
-	// Returns grouped requests per policy_id.
-	std::unordered_map<int, std::vector<PolicyRequest>> collect_requests();
+        // Advance everything until any POLICY seat needs an action.
+        // Returns grouped requests per policy_id.
+        const std::unordered_map<int, std::vector<PolicyRequest>>& collect_requests();
 
 	// Submit batched actions for a specific policy_id (must match order & count of last collect_requests()).
 	void submit_actions(int policy_id, const std::vector<uint8_t>& actions);

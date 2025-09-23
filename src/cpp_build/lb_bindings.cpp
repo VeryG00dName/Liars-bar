@@ -2,6 +2,8 @@
 #include <pybind11/stl.h>
 #include <pybind11/functional.h>
 #include <pybind11/numpy.h>
+#include <algorithm>
+#include <memory>
 
 #include "bare_env.h"
 #include "bots.h"
@@ -92,6 +94,23 @@ static py::list env_game_history_slice_py(const Env& e, int start_index, int end
     return out;
 }
 
+static py::array_t<int32_t> env_game_history_slice_basic(const Env& e, int start_index, int end_index) {
+    const int total = e.get_total_history_entries();
+    if (start_index < 0) start_index = 0;
+    if (end_index < start_index) end_index = start_index;
+    if (end_index > total) end_index = total;
+
+    const int count = end_index - start_index;
+    py::array_t<int32_t> out({std::max(0, count), 2});
+    auto buf = out.mutable_unchecked<2>();
+    for (int i = 0; i < count; ++i) {
+        const auto& h = e.game_history[start_index + i];
+        buf(i, 0) = h.player;
+        buf(i, 1) = static_cast<int32_t>(h.action);
+    }
+    return out;
+}
+
 static void seq_to_mask_7(const py::sequence& s, uint8_t out[7]) {
     if ((size_t)py::len(s) < 7) throw std::runtime_error("mask needs length >= 7");
     for (int i = 0; i < 7; ++i) out[i] = (uint8_t)py::cast<int>(s[i]);
@@ -148,6 +167,7 @@ PYBIND11_MODULE(lb, m) {
         .def("game_history", &env_game_history_py)
         .def("total_history_entries", &Env::get_total_history_entries)
         .def("history_slice", &env_game_history_slice_py, py::arg("start_index"), py::arg("end_index"))
+        .def("history_slice_basic", &env_game_history_slice_basic, py::arg("start_index"), py::arg("end_index"))
         .def_property_readonly("penalties", &env_penalties_list)
         .def_property_readonly("terminations", &env_terminations_list)
         ;
@@ -220,18 +240,36 @@ PYBIND11_MODULE(lb, m) {
         .def("set_v5_penalty", &PerfectSearch::set_v5_penalty);
 
     // ---- PolicyRequest ----
-    py::class_<PolicyRequest>(m, "PolicyRequest")
+    py::class_<PolicyRequest, std::unique_ptr<PolicyRequest, py::nodelete>>(m, "PolicyRequest")
         .def_readonly("env", &PolicyRequest::env)
         .def_readonly("seat", &PolicyRequest::seat)
         .def_property_readonly("mask", [](PolicyRequest& r){return py::array_t<uint8_t>({7}, r.mask);})
         .def_readonly("done", &PolicyRequest::done)
-        .def_property_readonly("classic_obs", [](PolicyRequest& r){return py::array_t<float>({(size_t)std::max(0, r.classic_obs_len)}, r.classic_obs);})
+        .def_property_readonly("classic_obs", [](PolicyRequest& r){
+            const py::ssize_t len = std::max(0, r.classic_obs_len);
+            return py::array_t<float>({len}, r.classic_obs);
+        })
         .def_readonly("classic_obs_len", &PolicyRequest::classic_obs_len)
-        .def_property_readonly("obs_sequence", [](PolicyRequest& r){return py::array_t<float>({r.valid_len, OBS_DIM}, r.obs_sequence[0]);})
-        .def_property_readonly("action_sequence", [](PolicyRequest& r){return py::array_t<int64_t>({r.valid_len}, r.action_sequence);})
-        .def_property_readonly("agent_type_sequence", [](PolicyRequest& r){return py::array_t<int64_t>({r.valid_len}, r.agent_type_sequence);})
-        .def_property_readonly("position_sequence", [](PolicyRequest& r){return py::array_t<int64_t>({r.valid_len}, r.position_sequence);})
-        .def_property_readonly("action_mask_sequence", [](PolicyRequest& r){return py::array_t<uint8_t>({r.valid_len, 7}, r.action_mask_sequence[0]);})
+        .def_property_readonly("obs_sequence", [](PolicyRequest& r){
+            const py::ssize_t len = std::max(0, r.valid_len);
+            return py::array_t<float>({len, static_cast<py::ssize_t>(OBS_DIM)}, r.obs_sequence[0]);
+        })
+        .def_property_readonly("action_sequence", [](PolicyRequest& r){
+            const py::ssize_t len = std::max(0, r.valid_len);
+            return py::array_t<int64_t>({len}, r.action_sequence);
+        })
+        .def_property_readonly("agent_type_sequence", [](PolicyRequest& r){
+            const py::ssize_t len = std::max(0, r.valid_len);
+            return py::array_t<int64_t>({len}, r.agent_type_sequence);
+        })
+        .def_property_readonly("position_sequence", [](PolicyRequest& r){
+            const py::ssize_t len = std::max(0, r.valid_len);
+            return py::array_t<int64_t>({len}, r.position_sequence);
+        })
+        .def_property_readonly("action_mask_sequence", [](PolicyRequest& r){
+            const py::ssize_t len = std::max(0, r.valid_len);
+            return py::array_t<uint8_t>({len, static_cast<py::ssize_t>(7)}, r.action_mask_sequence[0]);
+        })
         .def_readonly("valid_len", &PolicyRequest::valid_len);
 
     py::class_<VecArena>(m, "VecArena")
@@ -262,9 +300,14 @@ PYBIND11_MODULE(lb, m) {
             }, py::arg("roles"))
 
         .def("collect_requests", [](VecArena& A) {
-        py::dict out; auto grouped = A.collect_requests();
+        py::dict out;
+        const auto& grouped = A.collect_requests();
         for (auto& kv : grouped) {
-            py::list lst; for (auto& r : kv.second) lst.append(r);
+            py::list lst;
+            auto& reqs = kv.second;
+            for (auto& r : reqs) {
+                lst.append(py::cast(&r, py::return_value_policy::reference));
+            }
             out[py::int_(kv.first)] = lst;
         }
         return out;

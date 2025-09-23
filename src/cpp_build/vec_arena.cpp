@@ -4,6 +4,7 @@
 #include <limits>
 #include <stdexcept>
 #include <cstdio>
+#include <cstring>
 // ---------- small helpers ----------
 uint8_t VecArena::first_valid(const uint8_t mask[7]) {
     for (int i = 0; i < 7; ++i) if (mask[i]) return (uint8_t)i;
@@ -33,8 +34,9 @@ void VecArena::prepare_ai_sequence(const Env& e, int ai_seat, PolicyRequest& out
     for (int i = start; i < total && idx < MAX_LEN; ++i) {
         const HistoryEntry& h = e.game_history[i];
         const auto& obs = h.observations[ai_seat];
-        for (int j = 0; j < OBS_DIM && j < (int)obs.size(); ++j) {
-            out.obs_sequence[idx][j] = obs[j];
+        const int obs_take = std::min<int>(OBS_DIM, static_cast<int>(obs.size()));
+        if (obs_take > 0) {
+            std::memcpy(out.obs_sequence[idx], obs.data(), sizeof(float) * obs_take);
         }
         int rel = (h.player - ai_seat + n_players) % n_players;
         out.agent_type_sequence[idx] = rel;
@@ -46,9 +48,9 @@ void VecArena::prepare_ai_sequence(const Env& e, int ai_seat, PolicyRequest& out
         }
         // For opponent rows, store zeros; trainer will only use our rows' masks
         if (rel == 0) {
-            for (int j = 0; j < 7; ++j) out.action_mask_sequence[idx][j] = h.mask[j];
+            std::memcpy(out.action_mask_sequence[idx], h.mask.data(), sizeof(uint8_t) * 7);
         } else {
-            for (int j = 0; j < 7; ++j) out.action_mask_sequence[idx][j] = 0;
+            std::memset(out.action_mask_sequence[idx], 0, sizeof(uint8_t) * 7);
         }
         out.position_sequence[idx] = idx;
         ++idx;
@@ -57,7 +59,7 @@ void VecArena::prepare_ai_sequence(const Env& e, int ai_seat, PolicyRequest& out
     if (idx < MAX_LEN) {
         float cur_obs[OBS_DIM];
         e.observe_vector_newerest(ai_seat, cur_obs);
-        for (int j = 0; j < OBS_DIM; ++j) out.obs_sequence[idx][j] = cur_obs[j];
+        std::memcpy(out.obs_sequence[idx], cur_obs, sizeof(float) * OBS_DIM);
         out.agent_type_sequence[idx] = 0; // me
         if (total > 0) {
             const HistoryEntry& last_h = e.game_history[total - 1];
@@ -149,18 +151,15 @@ void VecArena::advance_env_until_policy_or_done(
   }
 }
 
-std::unordered_map<int, std::vector<PolicyRequest>> VecArena::collect_requests() {
+const std::unordered_map<int, std::vector<PolicyRequest>>& VecArena::collect_requests() {
     pending.clear();
-    std::unordered_map<int, std::vector<PolicyRequest>> grouped;
 
     for (int b = 0; b < B; ++b) {
         if (done[b]) continue;
-        advance_env_until_policy_or_done(b, grouped);
+        advance_env_until_policy_or_done(b, pending);
     }
 
-    // Keep a copy for submit_actions matching
-    pending = grouped;
-    return grouped;
+    return pending;
 }
 
 void VecArena::submit_actions(int policy_id, const std::vector<uint8_t>& actions) {

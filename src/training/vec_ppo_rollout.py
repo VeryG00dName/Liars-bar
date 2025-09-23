@@ -8,7 +8,10 @@ import torch
 from src.misc import lb
 from src import config
 
-from src.agents.batch_autoregressive_ppo_agent import BatchPPOAutoregressiveAgent
+from src.agents.batch_autoregressive_ppo_agent import (
+    BatchPPOAutoregressiveAgent,
+    PreparedPolicyBatch,
+)
 
 class PPOVecRolloutManager:
     """
@@ -221,24 +224,64 @@ class PPOVecRolloutManager:
                 logging.warning(f"[rollout] no progress for 5000 iters; still {done_now} done. Keys: {list(requests_by_policy.keys())}")
             last_done_count = done_now
 
+            ppo_requests: List[lb.PolicyRequest] = []
+            ppo_indices_by_policy: Dict[int, List[int]] = {}
+            penalties_snapshot: List[int] = []
+            non_ppo_requests: List[tuple[int, List[lb.PolicyRequest]]] = []
+
             for policy_id, reqs in requests_by_policy.items():
                 if policy_id not in self.policies:
                     continue
                 agent = self.policies[policy_id]
+                if isinstance(agent, BatchPPOAutoregressiveAgent):
+                    indices: List[int] = []
+                    for req in reqs:
+                        indices.append(len(ppo_requests))
+                        ppo_requests.append(req)
+                        env = self.arena.get_env(int(req.env))
+                        penalties_snapshot.append(int(env.penalties[int(req.seat)]))
+                    ppo_indices_by_policy[policy_id] = indices
+                else:
+                    non_ppo_requests.append((policy_id, reqs))
 
-                env_indices = np.array([r.env for r in reqs], dtype=int)
-                seat_indices = np.array([r.seat for r in reqs], dtype=int)
+            prepared_batch: Optional[PreparedPolicyBatch] = None
+            if ppo_requests:
+                prepared_batch = BatchPPOAutoregressiveAgent.build_prepared_batch(ppo_requests)
 
-                penalties_snapshot: List[int] = []
-                for env_idx, seat in zip(env_indices, seat_indices):
-                    env = self.arena.get_env(int(env_idx))
-                    penalties_snapshot.append(int(env.penalties[int(seat)]))
+            for policy_id, indices in ppo_indices_by_policy.items():
+                agent = self.policies[policy_id]
+                assert prepared_batch is not None
+                actions, log_probs, values = agent.get_actions_from_prepared(prepared_batch, indices)
+
+                self.arena.submit_actions(policy_id, actions)
+
+                if policy_id == training_policy_id:
+                    for offset, global_idx in enumerate(indices):
+                        req = ppo_requests[global_idx]
+                        env_idx = req.env
+                        ep = episodes[env_idx]
+                        if ep['done']:
+                            continue
+                        step_idx = self._append_step_row(ep, ep['training_agent_seat'])
+                        ep['data']['our_action'][step_idx] = actions[offset]
+                        pending_data[env_idx] = {
+                            "log_prob": log_probs[offset],
+                            "value": values[offset],
+                            "penalties_used": penalties_snapshot[global_idx],
+                        }
+
+            for policy_id, reqs in non_ppo_requests:
+                agent = self.policies[policy_id]
+
+                penalties_snapshot_np = [
+                    int(self.arena.get_env(int(req.env)).penalties[int(req.seat)])
+                    for req in reqs
+                ]
 
                 actions, log_probs, values = agent.get_actions_batch(reqs)
 
                 self.arena.submit_actions(policy_id, actions)
 
-                # Only log our action rows when the training policy acted
                 if policy_id == training_policy_id:
                     for i, req in enumerate(reqs):
                         env_idx = req.env
@@ -250,8 +293,11 @@ class PPOVecRolloutManager:
                         pending_data[env_idx] = {
                             "log_prob": log_probs[i],
                             "value": values[i],
-                            "penalties_used": penalties_snapshot[i],
+                            "penalties_used": penalties_snapshot_np[i],
                         }
+
+            requests_by_policy.clear()
+            del requests_by_policy
 
             requests_by_policy.clear()
             del requests_by_policy
@@ -281,28 +327,31 @@ class PPOVecRolloutManager:
             if ep_tracker['last_history_len'] < start_idx:
                 ep_tracker['last_history_len'] = start_idx
 
-            if start_idx < total_history_len:
-                history_chunk = env.history_slice(start_idx, total_history_len)
-            else:
-                history_chunk = []
+            history_chunk = (
+                env.history_slice_basic(start_idx, total_history_len)
+                if start_idx < total_history_len
+                else None
+            )
 
-            for entry in history_chunk:
-                entry_idx = ep_tracker['last_history_len']
-                ep_tracker['last_history_len'] += 1
+            if history_chunk is not None and history_chunk.size > 0:
+                players = history_chunk[:, 0].astype(int, copy=False)
+                actions = history_chunk[:, 1].astype(int, copy=False)
 
-                is_our_turn = (entry['player'] == ep_tracker['training_agent_seat'])
+                for idx in range(players.shape[0]):
+                    ep_tracker['last_history_len'] += 1
+                    actor = int(players[idx])
+                    action = int(actions[idx])
 
-                if is_our_turn:
-                    data = pending_data.pop(env_idx, None)
-                    if data:
-                        step_idx = len(ep_tracker['data']['our_action']) - 1
-                        ep_tracker['data']['log_prob'][step_idx] = data['log_prob']
-                        ep_tracker['data']['value'][step_idx] = data['value']
-                        # save the penalties we snapped pre-step
-                        ep_tracker['data']['penalties_used'][step_idx] = int(data['penalties_used'])
-                else:
-                    step_idx = self._append_step_row(ep_tracker, entry['player'])
-                    ep_tracker['data']['opp_target_action'][step_idx] = entry['action']
+                    if actor == ep_tracker['training_agent_seat']:
+                        data = pending_data.pop(env_idx, None)
+                        if data:
+                            step_idx = len(ep_tracker['data']['our_action']) - 1
+                            ep_tracker['data']['log_prob'][step_idx] = data['log_prob']
+                            ep_tracker['data']['value'][step_idx] = data['value']
+                            ep_tracker['data']['penalties_used'][step_idx] = int(data['penalties_used'])
+                    else:
+                        step_idx = self._append_step_row(ep_tracker, actor)
+                        ep_tracker['data']['opp_target_action'][step_idx] = action
 
             ep_tracker['last_processed_cxx_history_len'] = total_history_len
 
@@ -380,11 +429,9 @@ class PPOVecRolloutManager:
         training_agent_seat = training_seats[0] if is_training_episode else -1
 
         n_players = len(roles)
-        # Opponent seats in **relative turn order**: next, next+1, next+2
         if is_training_episode:
-            opp_seats = [ (training_agent_seat + r) % n_players for r in range(1, n_players) ]
+            opp_seats = [(training_agent_seat + r) % n_players for r in range(1, n_players)]
         else:
-            # no training seat this episode — keep all seats in table order
             opp_seats = list(range(n_players))
 
         player_labels = []
@@ -399,7 +446,6 @@ class PPOVecRolloutManager:
             "training_agent_label": training_agent_label,
             "player_labels": tuple(player_labels),
             "true_opponent_labels": true_opp_labels,
-
             "agent_id": [],
             "our_action": [],
             "log_prob": [],
@@ -407,9 +453,7 @@ class PPOVecRolloutManager:
             "reward": [],
             "done": [],
             "opp_target_action": [],
-
             "penalties_used": [],
-
             "model_input": None,
             "episode_return": 0.0,
             "win": 0,
@@ -424,9 +468,7 @@ class PPOVecRolloutManager:
             "last_history_len": 0,
             "last_processed_cxx_history_len": 0,
             "global_step": -1,
-            "last_training_step_idx": -1,
-            "last_penalties": None,
-            "data": ep_data
+            "data": ep_data,
         }
 
     def _append_step_row(self, ep_tracker: Dict[str, Any], agent_seat: int) -> int:
@@ -438,44 +480,5 @@ class PPOVecRolloutManager:
         ep['reward'].append(0.0)
         ep['done'].append(False)
         ep['opp_target_action'].append(None)
-
-        # align penalties_used length with rows; will be filled on our steps
         ep['penalties_used'].append(None)
-
-        idx = len(ep['agent_id']) - 1
-        if agent_seat == ep_tracker.get('training_agent_seat'):
-            ep_tracker['last_training_step_idx'] = idx
-        return idx
-
-    def _update_penalty_rewards(self, ep_tracker: Dict[str, Any], penalties: Any) -> None:
-        if not ep_tracker.get('is_training_episode', False):
-            ep_tracker['last_penalties'] = [int(p) for p in penalties]
-            return
-
-        penalties_list = [int(p) for p in penalties]
-        last_penalties = ep_tracker.get('last_penalties')
-        ep_tracker['last_penalties'] = penalties_list
-
-        if last_penalties is None:
-            return
-
-        seat = ep_tracker.get('training_agent_seat', -1)
-        last_idx = ep_tracker.get('last_training_step_idx', -1)
-        ep_data = ep_tracker.get('data') or {}
-
-        if last_idx < 0 or last_idx >= len(ep_data.get('reward', [])):
-            return
-
-        delta_total = 0.0
-        for i, (prev, cur) in enumerate(zip(last_penalties, penalties_list)):
-            diff = int(cur) - int(prev)
-            if diff <= 0:
-                continue
-            if i == seat:
-                delta_total -= 0.1 * diff
-            else:
-                delta_total += 0.033 * diff
-
-        if delta_total != 0.0:
-            ep_data['reward'][last_idx] += float(delta_total)
-
+        return len(ep['agent_id']) - 1
