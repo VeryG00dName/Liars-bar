@@ -87,9 +87,9 @@ class PPOVecRolloutManager:
         front = sorted(set(cpp_bots).union(latest_historical_agents))
         shadow = sorted(set(active_shadow_agents_for_this_update) - set(front))
 
-        opponent_pool = front + shadow
-        if not opponent_pool:
-            opponent_pool = [training_policy_id]
+        opponent_pool = np.array(front + shadow, dtype=np.int64)
+        if opponent_pool.size == 0:
+            opponent_pool = np.array([training_policy_id], dtype=np.int64)
 
         masses = {
             "front": config.FRONT_P_ADJUSTED if front else 0.0,
@@ -98,8 +98,8 @@ class PPOVecRolloutManager:
 
         s = masses["front"] + masses["shadow"]
 
-        if s <= 0.0 or len(opponent_pool) == 0:
-            probs = np.full(len(opponent_pool), 1.0 / max(1, len(opponent_pool)), dtype=np.float64)
+        if s <= 0.0 or opponent_pool.size == 0:
+            probs = np.full(opponent_pool.shape[0], 1.0 / max(1, opponent_pool.shape[0]), dtype=np.float64)
         else:
             masses["front"] /= s
             masses["shadow"] /= s
@@ -114,29 +114,38 @@ class PPOVecRolloutManager:
                 "shadow": max(1, len(shadow)),
             }
             probs = np.array([
-                masses[bucket(x)] / sizes[bucket(x)] for x in opponent_pool
+                masses[bucket(int(x))] / sizes[bucket(int(x))] for x in opponent_pool
             ], dtype=np.float64)
             probs_sum = probs.sum()
             if probs_sum > 0:
                 probs /= probs_sum
             else:
-                probs = np.full(len(opponent_pool), 1.0 / max(1, len(opponent_pool)), dtype=np.float64)
+                probs = np.full(opponent_pool.shape[0], 1.0 / max(1, opponent_pool.shape[0]), dtype=np.float64)
 
-        all_env_roles = []
-        for _ in range(batch_size):
-            env_roles = [0 for _ in range(num_players)]
-            seats = list(range(num_players))
-            self.rng.shuffle(seats)
-            training_seat = seats.pop()
-            env_roles[training_seat] = training_policy_id
+        num_opponents = max(0, num_players - 1)
+        if batch_size <= 0:
+            return []
 
-            num_opponents = num_players - 1
-            chosen = self.rng.choice(opponent_pool, size=num_opponents, replace=True, p=probs).tolist()
-            for i in range(num_opponents):
-                env_roles[seats[i]] = int(chosen[i])
-            all_env_roles.append(env_roles)
+        seat_order = np.argsort(self.rng.random((batch_size, num_players)), axis=1)
+        training_seats = seat_order[:, 0]
 
-        return all_env_roles
+        if opponent_pool.size == 0:
+            opponent_samples = np.full((batch_size, num_opponents), training_policy_id, dtype=np.int64)
+        else:
+            opponent_samples = self.rng.choice(
+                opponent_pool,
+                size=(batch_size, num_opponents),
+                replace=True,
+                p=probs,
+            )
+
+        env_roles = np.full((batch_size, num_players), training_policy_id, dtype=np.int64)
+        if num_opponents > 0:
+            env_roles[np.arange(batch_size)[:, None], seat_order[:, 1:]] = opponent_samples
+
+        env_roles[np.arange(batch_size), training_seats] = np.int64(training_policy_id)
+
+        return env_roles.astype(int).tolist()
 
     def collect_episodes(self,
                          num_episodes: int,
@@ -243,6 +252,9 @@ class PPOVecRolloutManager:
                             "value": values[i],
                             "penalties_used": penalties_snapshot[i],
                         }
+
+            requests_by_policy.clear()
+            del requests_by_policy
 
         # flush last chunk
         self._log_rewards_and_dones(episodes, pending_data)

@@ -36,6 +36,18 @@ _EMBED_LABEL_MAP: Dict[Hashable, int] = {}
 _PERSISTENT_PCA: Dict[str, Dict[str, Any]] = {}
 
 
+# Expected model_input keys collated during batching. Keeping this tuple at module
+# scope avoids repeatedly constructing temporary containers in the hot _collate_batch
+# path during PPO training.
+_COLLATE_EXPECTED_MI_KEYS: Tuple[str, ...] = (
+    "action_masks",
+    "action_sequence",
+    "agent_types",
+    "obs_sequence",
+    "positions",
+)
+
+
 def _remap_embed_labels(labels: List[Any]) -> List[int]:
     """Map arbitrary opponent identifiers to stable sequential integers."""
     remapped: List[int] = []
@@ -1096,42 +1108,24 @@ def _dictionary_regularizers(
                 valid_tok = valid_tok & (~pad_at.bool())
 
             num_seats = opp_labels_by_seat.size(1)
-            seat_embeds = torch.full(
-                (B_emb, num_seats, D_emb),
+            seat_valid = opp_seat_ids >= 0
+
+            seat_match = (
+                seat_tokens.unsqueeze(-1) == opp_seat_ids.unsqueeze(1)
+            ) & valid_tok.unsqueeze(-1)
+            seat_match_f = seat_match.to(tok_embeds.dtype)
+            seat_counts = seat_match_f.sum(dim=1)
+            embeds_sum = torch.einsum("btn,btd->bnd", seat_match_f, tok_embeds)
+            seat_counts_safe = seat_counts.clamp_min(1e-6).unsqueeze(-1)
+            seat_embeds = embeds_sum / seat_counts_safe
+            seat_embeds = seat_embeds.masked_fill(
+                (seat_counts.unsqueeze(-1) == 0) | (~seat_valid.unsqueeze(-1)),
                 float("nan"),
-                device=tok_embeds.device,
-                dtype=tok_embeds.dtype,
             )
-            seat_counts = torch.zeros(
-                (B_emb, num_seats), device=tok_embeds.device, dtype=tok_embeds.dtype
-            )
+            seat_counts = seat_counts.masked_fill(~seat_valid, 0.0)
+
             seat_labels = opp_labels_by_seat.clone()
-            seat_labels = seat_labels.masked_fill(seat_labels < 0, -1)
-
-            embeds_flat: List[torch.Tensor] = []
-            labels_flat: List[int] = []
-
-            for b in range(B_emb):
-                for slot in range(num_seats):
-                    seat_id = int(opp_seat_ids[b, slot].item())
-                    if seat_id < 0:
-                        seat_labels[b, slot] = -1
-                        continue
-
-                    mask = (seat_tokens[b] == seat_id) & valid_tok[b]
-                    count = int(mask.sum().item())
-                    if count == 0:
-                        seat_labels[b, slot] = -1
-                        continue
-
-                    embed_vec = tok_embeds[b, mask].mean(dim=0)
-                    seat_embeds[b, slot] = embed_vec
-                    seat_counts[b, slot] = float(count)
-
-                    label_val = int(seat_labels[b, slot].item())
-                    if label_val >= 0 and not torch.isnan(embed_vec).any():
-                        embeds_flat.append(embed_vec.detach().cpu().float())
-                        labels_flat.append(label_val)
+            seat_labels = seat_labels.masked_fill(~seat_valid, -1)
 
             metrics_extra["opp_embeds_batch"] = (
                 seat_embeds.detach().cpu().float().numpy(),
@@ -1139,11 +1133,14 @@ def _dictionary_regularizers(
                 seat_counts.detach().cpu().float().numpy(),
             )
 
-            if embeds_flat:
-                embeds_tensor = torch.stack(embeds_flat, dim=0)
+            valid_flat_mask = (seat_counts > 0) & (seat_labels >= 0)
+            if valid_flat_mask.any():
+                embeds_tensor = seat_embeds[valid_flat_mask].detach().cpu().float()
+                labels_tensor = seat_labels[valid_flat_mask].detach().cpu()
+                labels_list = labels_tensor.tolist()
                 metrics_extra["opp_embeds_flat"] = embeds_tensor.numpy()
-                metrics_extra["opp_labels_flat"] = labels_flat
-                metrics_extra["opp_labels_flat_original"] = labels_flat
+                metrics_extra["opp_labels_flat"] = labels_list
+                metrics_extra["opp_labels_flat_original"] = labels_list
 
     return (
         l1_sparsity_loss,
@@ -1219,36 +1216,36 @@ def _single_pass_ppo(
 
     rewards = rewards.where(our_mask, torch.zeros_like(rewards))
 
-    next_idx = torch.full_like(our_idx, -1)
+    next_idx = torch.zeros_like(our_idx)
     if T > 1:
         next_idx[:, :-1] = our_idx[:, 1:]
+    L = values_full.size(1)
+    idx_safe = next_idx.clamp(0, max(L - 1, 0))
+    next_values = torch.take_along_dim(values_full, idx_safe, dim=1)
 
     has_next = torch.zeros_like(our_mask)
     if T > 1:
         has_next[:, :-1] = our_mask[:, 1:]
+    has_next = has_next & our_mask
 
-    gaps = torch.zeros_like(our_idx, dtype=torch.long)
-    valid_gap = has_next & our_mask
-    gaps[valid_gap] = (next_idx[valid_gap] - our_idx[valid_gap]).clamp_min(1)
-    gamma_gap = (GAMMA ** gaps.to(torch.float32))
-    lam_gap = (GAE_LAMBDA ** gaps.to(torch.float32))
+    gap_steps = (next_idx - our_idx).clamp_min(1).to(torch.float32)
+    gap_steps = torch.where(has_next, gap_steps, torch.zeros_like(gap_steps))
+    log_gamma = math.log(GAMMA)
+    log_lam = math.log(GAE_LAMBDA)
+    gamma_gap = torch.where(has_next, torch.exp(log_gamma * gap_steps), torch.zeros_like(gap_steps))
+    lam_gap = torch.where(has_next, torch.exp(log_lam * gap_steps), torch.zeros_like(gap_steps))
+
+    next_values = torch.where(has_next, next_values, torch.zeros_like(next_values))
+    delta = rewards + gamma_gap * next_values - values_at
+    delta = delta.where(our_mask, torch.zeros_like(delta))
+    discount = gamma_gap * lam_gap
 
     advantages = torch.zeros_like(values_at)
     lastgaelam = torch.zeros((B,), device=device, dtype=torch.float32)
     for t in reversed(range(T)):
-        g = torch.where(has_next[:, t], gamma_gap[:, t], torch.zeros_like(gamma_gap[:, t]))
-        gl = torch.where(has_next[:, t], gamma_gap[:, t] * lam_gap[:, t], torch.zeros_like(gamma_gap[:, t]))
-        L = values_full.size(1)
-        idx_safe = next_idx[:, t].clamp(0, L - 1)
-        nv = torch.where(
-            has_next[:, t],
-            values_full.gather(1, idx_safe.unsqueeze(-1)).squeeze(-1),
-            torch.zeros_like(values_at[:, t]),
-        )
-        delta = rewards[:, t] + g * nv - values_at[:, t]
-        lastgaelam = delta + gl * lastgaelam
+        lastgaelam = delta[:, t] + discount[:, t] * lastgaelam
+        lastgaelam = torch.where(our_mask[:, t], lastgaelam, torch.zeros_like(lastgaelam))
         advantages[:, t] = lastgaelam
-        lastgaelam = torch.where(our_mask[:, t], lastgaelam, lastgaelam * 0.0)
     returns = advantages + values_at
 
     adv_norm = _normalize_advantages(advantages, step_mask)
@@ -1526,25 +1523,9 @@ def _collate_batch(
     if L_pad <= 0:
         L_pad = L_batch_max
 
-    # -------- helper: pad/trim only tensors with a time dimension (dim >= 2) --------
-    def _pad_trim(v: torch.Tensor, L_tgt: int) -> torch.Tensor:
-        L = v.size(1)
-        if L == L_tgt: return v
-        if L > L_tgt:  return v[:, :L_tgt, ...]
-        pad_len = L_tgt - L
-        pad_shape = list(v.shape); pad_shape[1] = pad_len
-        z = torch.zeros(pad_shape, dtype=v.dtype, device=v.device)
-        return torch.cat([v, z], dim=1)
-
     # -------- build batched model inputs (time-major tensors only) --------
-    # --- FIX: ROBUST KEY HANDLING ---
-    EXPECTED_MI_KEYS = {
-        "obs_sequence", "action_sequence", "agent_types",
-        "positions", "action_masks"
-    }
-
     mi_batch: Dict[str, torch.Tensor] = {}
-    for k in sorted(list(EXPECTED_MI_KEYS)):
+    for k in _COLLATE_EXPECTED_MI_KEYS:
         vs = [ep["model_input"].get(k) for ep in episodes]
 
         valid_vs = [v for v in vs if v is not None and torch.is_tensor(v) and v.dim() >= 2]
@@ -1555,23 +1536,46 @@ def _collate_batch(
             print(f"Warning: Key '{k}' missing in some episodes, skipping for this batch.")
             continue
 
-        padded = [_pad_trim(v, L_pad) for v in vs]
-        cat = torch.cat(padded, dim=0).contiguous()
+        first = valid_vs[0]
+        if first.dim() < 2:
+            raise ValueError(f"model_input['{k}'] must be at least 2D per episode.")
+
+        out_shape = list(first.shape)
+        out_shape[0] = len(vs)
+        out_shape[1] = L_pad
+        cat = first.new_zeros(out_shape)
+
+        for b, v in enumerate(vs):
+            if not torch.is_tensor(v):
+                raise ValueError(f"model_input['{k}'] missing tensor for episode {b}.")
+            if v.dim() < 2:
+                raise ValueError(f"model_input['{k}'] must be at least 2D per episode.")
+            if v.size(0) != 1:
+                raise ValueError(
+                    f"model_input['{k}'] expected leading batch size 1 per episode, got {v.size(0)}."
+                )
+            Lb = min(v.size(1), L_pad)
+            if Lb > 0:
+                cat[b, :Lb].copy_(v[0, :Lb].contiguous())
+
+        cat = cat.contiguous()
         if pin_memory:
             cat = cat.pin_memory()
         mi_batch[k] = cat
-    # --- END FIX ---
 
     # ---- REBUILD valid_lengths and padding_mask from the true lengths ----
     valid_lengths = torch.tensor([min(l, L_pad) for l in raw_lens], dtype=torch.long)
     if pin_memory: valid_lengths = valid_lengths.pin_memory()
     mi_batch["valid_lengths"] = valid_lengths  # [B]
 
-    padding_mask = torch.zeros((B, L_pad), dtype=torch.bool)
-    for b, Lb in enumerate(valid_lengths.tolist()):
-        if Lb < L_pad:
-            padding_mask[b, Lb:] = True          # True = PAD
-    if pin_memory: padding_mask = padding_mask.pin_memory()
+    if L_pad > 0:
+        token_range = torch.arange(L_pad, dtype=torch.long)
+        padding_mask = token_range.unsqueeze(0) >= valid_lengths.unsqueeze(1)
+    else:
+        token_range = torch.arange(0, dtype=torch.long)
+        padding_mask = torch.zeros((B, 0), dtype=torch.bool)
+    if pin_memory:
+        padding_mask = padding_mask.pin_memory()
     mi_batch["padding_mask"] = padding_mask     # [B, L_pad]
 
     # Require agent_types for actor/opp selection
@@ -1579,28 +1583,62 @@ def _collate_batch(
         raise ValueError("model_input must include 'agent_types' with dim>=2 (batched [B, L]).")
     agent_types = mi_batch["agent_types"].long()  # [B, L_pad]
 
+    valid_token_mask = ~padding_mask
+    our_token_mask_full = (agent_types == 0) & valid_token_mask
+    opp_token_mask_full = (agent_types != 0) & valid_token_mask
+
+    our_counts = our_token_mask_full.sum(dim=1)
+    opp_counts = opp_token_mask_full.sum(dim=1)
+
+    T = int(our_counts.max().item()) if our_counts.numel() > 0 else 0
+    To = int(opp_counts.max().item()) if opp_counts.numel() > 0 else 0
+
+    if L_pad > 0:
+        token_idx = token_range.unsqueeze(0).expand(B, -1)
+        sentinel_idx = torch.full_like(token_idx, L_pad)
+    else:
+        token_idx = torch.zeros((B, 0), dtype=torch.long)
+        sentinel_idx = token_idx.clone()
+
+    def _mk_idx(mask: torch.Tensor, counts: torch.Tensor, max_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        if max_len <= 0:
+            empty_idx = torch.zeros((B, 0), dtype=torch.long)
+            empty_mask = torch.zeros((B, 0), dtype=torch.bool)
+            if pin_memory:
+                empty_idx = empty_idx.pin_memory()
+                empty_mask = empty_mask.pin_memory()
+            return empty_idx, empty_mask
+
+        sorted_idx = torch.sort(torch.where(mask, token_idx, sentinel_idx), dim=1).values[:, :max_len]
+        sorted_idx = sorted_idx.contiguous()
+        slot_mask = torch.arange(max_len, dtype=torch.long).unsqueeze(0) < counts.unsqueeze(1)
+        sorted_idx = sorted_idx.clamp_max(max(L_pad - 1, 0))
+        sorted_idx = torch.where(slot_mask, sorted_idx, torch.zeros_like(sorted_idx))
+        slot_mask = slot_mask.to(torch.bool)
+        if pin_memory:
+            sorted_idx = sorted_idx.pin_memory()
+            slot_mask = slot_mask.pin_memory()
+        return sorted_idx, slot_mask
+
+    our_idx_tensor, our_mask_tensor = _mk_idx(our_token_mask_full, our_counts, T)
+    opp_idx_tensor, _ = _mk_idx(opp_token_mask_full, opp_counts, To)
+
     # Optional legality mask for OUR steps; we'll zero it past each valid length
     our_action_mask = None
     if "action_masks" in mi_batch:
-        m = mi_batch["action_masks"].bool()  # [B, L_pad, A]
-        # trim mask beyond valid lengths so padding is never considered legal
-        for b in range(B):
-            Lb = int(valid_lengths[b].item())
-            if Lb < m.size(1):
-                m[b, Lb:, :].fill_(False)
+        m = mi_batch["action_masks"].bool()
+        if m.size(1) != L_pad:
+            new_shape = (m.size(0), L_pad, m.size(2))
+            new_m = m.new_zeros(new_shape)
+            Lb = min(m.size(1), L_pad)
+            if Lb > 0:
+                new_m[:, :Lb].copy_(m[:, :Lb])
+            m = new_m
+        valid_mask = valid_token_mask.unsqueeze(-1)
+        m = m & valid_mask
+        if pin_memory:
+            m = m.pin_memory()
         our_action_mask = m
-
-    # -------- build OUR/OPP timestep indices using ONLY valid tokens --------
-    our_pos_lists: List[torch.Tensor] = []
-    opp_pos_lists: List[torch.Tensor] = []
-    for b in range(B):
-        Lb = int(valid_lengths[b].item())
-        at = agent_types[b, :Lb].detach().cpu().numpy()  # slice to true length
-        our_pos_lists.append(torch.from_numpy((at == 0).nonzero()[0]).long())
-        opp_pos_lists.append(torch.from_numpy((at != 0).nonzero()[0]).long())
-
-    T  = max((int(x.numel()) for x in our_pos_lists), default=0)
-    To = max((int(x.numel()) for x in opp_pos_lists), default=0)
 
     opponent_counts: List[int] = []
     heldout_flags: List[bool] = []
@@ -1687,41 +1725,46 @@ def _collate_batch(
 
     # -------- allocate supervision tensors (CPU) --------
     def _pm(x: torch.Tensor) -> torch.Tensor:
-        return x.pin_memory() if pin_memory else x
+        return x.pin_memory() if pin_memory and hasattr(x, "is_pinned") and not x.is_pinned() else x
 
-    our_idx    = _pm(torch.zeros((B, T),  dtype=torch.long))
-    our_mask   = _pm(torch.zeros((B, T),  dtype=torch.bool))
+    our_idx    = _pm(our_idx_tensor)
+    our_mask   = _pm(our_mask_tensor)
     actions    = _pm(torch.full((B, T), IGN, dtype=torch.long))
     old_logp   = _pm(torch.zeros((B, T),  dtype=torch.float32))
     rewards    = _pm(torch.zeros((B, T),  dtype=torch.float32))
     pen_used   = _pm(torch.zeros((B, T),  dtype=torch.long))
 
     # Opponent action supervision (unchanged)
-    opp_idx        = _pm(torch.zeros((B, To),  dtype=torch.long))
+    opp_idx        = _pm(opp_idx_tensor)
     opp_targets    = _pm(torch.full((B, To), IGN, dtype=torch.long))
     opp_have_label = _pm(torch.zeros((B, To),  dtype=torch.bool))
+
+    if our_action_mask is not None:
+        our_action_mask = _pm(our_action_mask)
 
     opp_labels_by_seat = _pm(torch.full((B, num_opponents), IGN, dtype=torch.long))
     opp_seat_ids = _pm(torch.full((B, num_opponents), -1, dtype=torch.long))
     heldout_episode_mask = _pm(torch.tensor(heldout_flags, dtype=torch.bool))
 
     # -------- fill from episodes (only real steps) --------
+    our_counts_list = our_counts.tolist()
+    opp_counts_list = opp_counts.tolist()
+
     for b, ep in enumerate(episodes):
         # ===== OUR timeline (unchanged) =====
-        our_pos = our_pos_lists[b]
-        K = int(our_pos.numel())
         our_ep_idx = [i for i, seat in enumerate(ep["agent_id"]) if seat == ep["training_agent_seat"]]
+        max_steps = min(T, len(our_ep_idx), int(our_counts_list[b]))
 
-        for t_local in range(min(T, K)):
-            if t_local >= len(our_ep_idx):
-                break
+        if max_steps < our_mask.size(1):
+            our_mask[b, max_steps:] = False
+            if max_steps < our_idx.size(1):
+                our_idx[b, max_steps:] = 0
+
+        for t_local in range(max_steps):
             step_ep = our_ep_idx[t_local]
             lp = ep["log_prob"][step_ep] if step_ep < len(ep["log_prob"]) else None
             if lp is None:
                 continue
-
-            our_mask[b, t_local] = True
-            our_idx[b, t_local]  = our_pos[t_local]
 
             a  = ep["our_action"][step_ep] if step_ep < len(ep["our_action"]) else None
             rw = ep["reward"][step_ep]     if step_ep < len(ep["reward"])     else 0.0
@@ -1734,12 +1777,8 @@ def _collate_batch(
             pen_used[b, t_local] = int(pu)
 
         # ===== OPP timeline =====
-        opp_pos = opp_pos_lists[b]
-        M = int(opp_pos.numel())
-        M_fill = min(To, M)
+        M_fill = min(To, int(opp_counts_list[b]))
         if M_fill > 0:
-            opp_idx[b, :M_fill] = opp_pos[:M_fill]
-
             # Episode metadata we already saved
             player_labels = tuple(ep.get("player_labels", ()))  # absolute seat -> label
             agent_id_seq  = ep["agent_id"]                      # per-step absolute seat index
