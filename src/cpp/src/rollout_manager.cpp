@@ -1,12 +1,21 @@
 #include "rollout_manager.h"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstring>
+#include <iostream>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <stdexcept>
 #include <unordered_set>
 
+#include <torch/torch.h>
+
 namespace {
+const torch::Device kInferenceDevice = torch::kCUDA;
+
 std::mt19937::result_type seed_with_optional(uint32_t seed) {
     if (seed != 0) {
         return static_cast<std::mt19937::result_type>(seed);
@@ -17,7 +26,12 @@ std::mt19937::result_type seed_with_optional(uint32_t seed) {
 }
 
 RolloutManager::RolloutManager()
-    : rng_(seed_with_optional(0)) {}
+    : rng_(seed_with_optional(0)) {
+    if (!torch::cuda::is_available()) {
+        throw std::runtime_error(
+            "CUDA is not available, but the RolloutManager requires it for historical agent inference.");
+    }
+}
 
 void RolloutManager::start_rollouts(int num_episodes,
                                     int num_players,
@@ -69,10 +83,53 @@ void RolloutManager::start_rollouts(int num_episodes,
 }
 
 std::unordered_map<int, std::vector<PolicyRequest>> RolloutManager::collect_requests_for_inference() {
-    log_rewards_and_dones();
+    std::unordered_map<int, std::vector<PolicyRequest>> learner_requests;
 
-    const auto& raw = arena_.collect_requests();
-    return raw;
+    while (true) {
+        log_rewards_and_dones();
+
+        const auto& raw = arena_.collect_requests();
+        bool handled_historical = false;
+
+        for (const auto& kv : raw) {
+            const int policy_id = kv.first;
+            const auto& requests = kv.second;
+            if (requests.empty()) {
+                continue;
+            }
+
+            auto model_it = historical_models_.find(policy_id);
+            if (model_it != historical_models_.end() && model_it->second) {
+                bool success = false;
+                try {
+                    auto actions = run_historical_inference(*model_it->second, requests);
+                    arena_.submit_actions(policy_id, actions);
+                    handled_historical = true;
+                    success = true;
+                } catch (const std::exception& ex) {
+                    std::cerr << "[RolloutManager] Historical inference failed for policy " << policy_id
+                              << ": " << ex.what() << std::endl;
+                } catch (...) {
+                    std::cerr << "[RolloutManager] Historical inference failed for policy " << policy_id
+                              << ": unknown error" << std::endl;
+                }
+
+                if (!success) {
+                    auto& dst = learner_requests[policy_id];
+                    dst.insert(dst.end(), requests.begin(), requests.end());
+                }
+            } else {
+                auto& dst = learner_requests[policy_id];
+                dst.insert(dst.end(), requests.begin(), requests.end());
+            }
+        }
+
+        if (!handled_historical || !learner_requests.empty()) {
+            break;
+        }
+    }
+
+    return learner_requests;
 }
 
 void RolloutManager::submit_inference_results(int policy_id,
@@ -141,6 +198,158 @@ std::vector<TrajectoryData> RolloutManager::get_completed_episodes() {
         }
     }
     return out;
+}
+
+void RolloutManager::load_historical_model(int policy_id, const std::string& path) {
+    try {
+        auto module = std::make_shared<torch::jit::Module>(torch::jit::load(path));
+        module->to(kInferenceDevice);
+        module->eval();
+        historical_models_[policy_id] = std::move(module);
+    } catch (const c10::Error& err) {
+        std::cerr << "[RolloutManager] Failed to load TorchScript module from '" << path
+                  << "': " << err.what_without_backtrace() << std::endl;
+    } catch (const std::exception& err) {
+        std::cerr << "[RolloutManager] Failed to load TorchScript module from '" << path
+                  << "': " << err.what() << std::endl;
+    }
+}
+
+std::vector<uint8_t> RolloutManager::run_historical_inference(torch::jit::Module& module,
+                                                              const std::vector<PolicyRequest>& requests) {
+    if (requests.empty()) {
+        return {};
+    }
+
+    torch::NoGradGuard no_grad;
+
+    const int64_t batch_size = static_cast<int64_t>(requests.size());
+    int64_t max_len = 1;
+    for (const auto& req : requests) {
+        const int64_t len = std::max<int64_t>(1, std::min<int64_t>(req.valid_len, MAX_LEN));
+        max_len = std::max(max_len, len);
+    }
+
+    auto opts_float_cpu = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+    auto opts_long_cpu = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+    auto opts_bool_cpu = torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU);
+
+    auto obs_sequence = torch::zeros({batch_size, max_len, OBS_DIM}, opts_float_cpu);
+    auto action_sequence = torch::zeros({batch_size, max_len}, opts_long_cpu);
+    auto agent_types = torch::zeros({batch_size, max_len}, opts_long_cpu);
+    auto positions = torch::zeros({batch_size, max_len}, opts_long_cpu);
+    auto action_masks = torch::zeros({batch_size, max_len, 7}, opts_bool_cpu);
+    auto padding_mask = torch::zeros({batch_size, max_len}, opts_bool_cpu);
+    auto valid_lengths = torch::zeros({batch_size}, opts_long_cpu);
+
+    for (int64_t b = 0; b < batch_size; ++b) {
+        const auto& req = requests[static_cast<size_t>(b)];
+        const int64_t requested_len = std::max<int64_t>(0, std::min<int64_t>(req.valid_len, max_len));
+        const int64_t used_len = std::max<int64_t>(1, requested_len);
+
+        valid_lengths[b] = used_len;
+
+        float* obs_ptr = obs_sequence[b].data_ptr<float>();
+        int64_t* act_ptr = action_sequence[b].data_ptr<int64_t>();
+        int64_t* agent_ptr = agent_types[b].data_ptr<int64_t>();
+        int64_t* pos_ptr = positions[b].data_ptr<int64_t>();
+        bool* mask_ptr = action_masks[b].data_ptr<bool>();
+
+        for (int64_t t = 0; t < requested_len; ++t) {
+            std::memcpy(obs_ptr + t * OBS_DIM, req.obs_sequence[t], sizeof(float) * OBS_DIM);
+            act_ptr[t] = req.action_sequence[t];
+            agent_ptr[t] = req.agent_type_sequence[t];
+            pos_ptr[t] = req.position_sequence[t];
+            bool* step_mask = mask_ptr + t * 7;
+            for (int j = 0; j < 7; ++j) {
+                step_mask[j] = req.action_mask_sequence[t][j] != 0;
+            }
+        }
+
+        if (requested_len == 0) {
+            bool* step_mask = mask_ptr;
+            for (int j = 0; j < 7; ++j) {
+                step_mask[j] = req.mask[j] != 0;
+            }
+        }
+
+        for (int64_t t = requested_len; t < used_len; ++t) {
+            pos_ptr[t] = t;
+        }
+
+        bool* pad_ptr = padding_mask[b].data_ptr<bool>();
+        for (int64_t t = used_len; t < max_len; ++t) {
+            pad_ptr[t] = true;
+        }
+    }
+
+    auto opts_long_device = torch::TensorOptions().dtype(torch::kInt64).device(kInferenceDevice);
+
+    obs_sequence = obs_sequence.to(kInferenceDevice);
+    action_sequence = action_sequence.to(kInferenceDevice);
+    agent_types = agent_types.to(kInferenceDevice);
+    positions = positions.to(kInferenceDevice);
+    action_masks = action_masks.to(kInferenceDevice);
+    padding_mask = padding_mask.to(kInferenceDevice);
+    auto valid_lengths_device = valid_lengths.to(kInferenceDevice);
+
+    std::vector<torch::jit::IValue> inputs;
+    inputs.reserve(6);
+    inputs.emplace_back(obs_sequence);
+    inputs.emplace_back(action_sequence);
+    inputs.emplace_back(agent_types);
+    inputs.emplace_back(positions);
+    inputs.emplace_back(action_masks);
+    inputs.emplace_back(padding_mask);
+
+    auto outputs = module.forward(inputs).toTuple();
+    if (!outputs || outputs->elements().size() < 3) {
+        throw std::runtime_error("Historical model returned unexpected output shape");
+    }
+
+    auto action_logits = outputs->elements()[0].toTensor().contiguous();
+    (void)outputs->elements()[2].toTensor(); // ensure tensor materializes even if unused
+
+    auto batch_indices = torch::arange(batch_size, opts_long_device);
+    auto last_indices = (valid_lengths_device - 1).clamp_min(0);
+    auto last_logits = action_logits.index({batch_indices, last_indices}).contiguous();
+    auto last_masks = action_masks.index({batch_indices, last_indices}).contiguous();
+
+    auto has_legal = last_masks.any(1);
+    if (!has_legal.all().item<bool>()) {
+        auto fallback_indices = has_legal.logical_not().nonzero().flatten();
+        for (int64_t i = 0; i < fallback_indices.size(0); ++i) {
+            const int64_t row = fallback_indices[i].item<int64_t>();
+            auto mask_row_tensor = last_masks.select(0, row);
+            mask_row_tensor.fill_(false);
+            bool assigned = false;
+            const auto& req = requests[static_cast<size_t>(row)];
+            for (int j = 0; j < 7; ++j) {
+                if (req.mask[j]) {
+                    mask_row_tensor.index_put_({j}, true);
+                    assigned = true;
+                }
+            }
+            if (!assigned) {
+                mask_row_tensor.fill_(true);
+            }
+            last_logits.select(0, row).fill_(0.0f);
+        }
+    }
+
+    last_logits.masked_fill_(~last_masks, -std::numeric_limits<float>::infinity());
+
+    auto probs = torch::softmax(last_logits, /*dim=*/1);
+    auto actions_tensor = torch::multinomial(probs, /*num_samples=*/1);
+    actions_tensor = actions_tensor.squeeze(-1).to(torch::kCPU);
+
+    auto actions_ptr = actions_tensor.data_ptr<int64_t>();
+    std::vector<uint8_t> chosen(static_cast<size_t>(batch_size));
+    for (int64_t b = 0; b < batch_size; ++b) {
+        chosen[static_cast<size_t>(b)] = static_cast<uint8_t>(actions_ptr[b]);
+    }
+
+    return chosen;
 }
 
 std::vector<std::vector<int>> RolloutManager::build_roles(int batch_size,

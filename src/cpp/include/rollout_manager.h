@@ -4,9 +4,12 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <random>
 #include <unordered_map>
 #include <vector>
+
+#include <torch/script.h>
 
 struct TrajectoryData {
     int env_index{-1};
@@ -72,6 +75,8 @@ public:
 
     std::vector<TrajectoryData> get_completed_episodes();
 
+    void load_historical_model(int policy_id, const std::string& path);
+
 private:
     VecArena arena_;
     int target_episodes_{0};
@@ -83,6 +88,7 @@ private:
     std::vector<EpisodeTracker> episodes_;
     std::unordered_map<int, PendingStepData> pending_step_data_;
     std::vector<TrajectoryData> completed_buffer_;
+    std::unordered_map<int, std::shared_ptr<torch::jit::Module>> historical_models_;
 
     std::vector<std::vector<int>> build_roles(int batch_size,
                                               int num_players,
@@ -96,5 +102,7 @@ private:
     void update_penalty_rewards(EpisodeTracker& tracker, const std::array<uint8_t, Env::MAX_PLAYERS>& penalties);
     void log_rewards_and_dones();
     void finalize_episode(EpisodeTracker& tracker);
+    std::vector<uint8_t> run_historical_inference(torch::jit::Module& module,
+                                                  const std::vector<PolicyRequest>& requests);
 };
 
