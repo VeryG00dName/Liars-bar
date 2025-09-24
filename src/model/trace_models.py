@@ -111,7 +111,7 @@ def _build_example_inputs(model: torch.nn.Module, seq_len: Optional[int] = None)
         raise ValueError("Model missing expected attributes required for tracing.")
 
     max_len = int(getattr(model, "max_seq_length"))
-    seq_len = int(seq_len or min(max_len, 64))
+    seq_len = int(seq_len or min(max_len, 256))
 
     obs_dim = int(getattr(model, "obs_dim"))
     action_dim = int(getattr(model, "action_dim", 7))
