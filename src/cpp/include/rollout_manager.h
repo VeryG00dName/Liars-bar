@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <random>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -51,6 +52,16 @@ struct PendingStepData {
     int penalties_used{0};
 };
 
+struct PreparedBatch {
+    torch::Tensor obs_sequence;
+    torch::Tensor action_sequence;
+    torch::Tensor agent_types;
+    torch::Tensor positions;
+    torch::Tensor action_masks;
+    torch::Tensor padding_mask;
+    torch::Tensor valid_lengths;
+};
+
 class RolloutManager {
 public:
     RolloutManager();
@@ -77,6 +88,12 @@ public:
 
     void load_historical_model(int policy_id, const std::string& path);
 
+    PreparedBatch prepare_training_batch(const std::vector<PolicyRequest>& requests) const;
+    void set_training_device(const std::string& device_str);
+    int training_policy_id() const { return training_policy_id_; }
+
+    const torch::Device& training_device() const { return training_device_; }
+
 private:
     VecArena arena_;
     int target_episodes_{0};
@@ -84,6 +101,7 @@ private:
     int num_players_{0};
     int training_policy_id_{-1};
     std::mt19937 rng_;
+    torch::Device training_device_{torch::kCPU};
 
     std::vector<EpisodeTracker> episodes_;
     std::unordered_map<int, PendingStepData> pending_step_data_;

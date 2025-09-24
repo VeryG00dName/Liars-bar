@@ -10,7 +10,6 @@ from numpy.random import Generator
 import random
 import numpy as np
 import argparse
-
 # Quiet Torch compile logs
 os.environ.pop("TORCH_LOGS", None)           # disable extra compile logs
 os.environ.setdefault("TORCHDYNAMO_VERBOSE", "0")
@@ -33,8 +32,8 @@ import torch.amp as amp
 from src.misc import lb
 from src import config
 from src.model.ppo_fused_model import PPOFusedModel
-from src.agents.batch_autoregressive_ppo_agent import BatchPPOAutoregressiveAgent
 from src.agents.cpp_bot_wrapper import CppBotWrapper
+from src.agents.learner_ar_agent import LearnerAutoregressiveAgent
 from src.training.vec_ppo_rollout import PPOVecRolloutManager
 from src.training.tracing_utils import trace_model_from_checkpoint
 from src.training.train_extras import (
@@ -53,6 +52,7 @@ _silence_torch_symbolic_logs()
 SEED = int(getattr(config, "SEED", 42))
 set_seed(SEED)
 _GLOBAL_RNG = np.random.default_rng(SEED)
+
 
 # ==============================================================================
 # SECTION 1: HELPER CLASSES AND FUNCTIONS
@@ -124,34 +124,36 @@ class OpponentPoolManager:
         self._save(self.pool)
         print(f"Added '{name}' to pool with label {next_label}.")
 
-def _create_new_agent(agent_type: str, device: torch.device) -> BatchPPOAutoregressiveAgent:
+def _create_new_agent(agent_type: str, device: torch.device) -> LearnerAutoregressiveAgent:
     """Creates a new agent and its corresponding model."""
-    agent = BatchPPOAutoregressiveAgent(device, f"learner_{agent_type}")
+    agent = LearnerAutoregressiveAgent(device, f"learner_{agent_type}")
     if agent_type == 'main':
         model = PPOFusedModel(
             obs_dim=9,
             num_bricks=getattr(config, "NUM_BRICKS", 32),
             brick_dim=getattr(config, "BRICK_DIM", 32),
         )
-    else: # In the future, you can add 'exploiter' logic here
+    else:  # Future branches (e.g., exploiter) can be added here.
         raise ValueError(f"Unknown agent type for creation: {agent_type}")
     agent.model = model.to(device)
+    agent.max_seq_length = getattr(model, "max_seq_length", None)
+    agent.reset()
     return agent
 
 def _load_agent_from_checkpoint(
     path: str,
     model_type: str,
     device: torch.device,
-) -> BatchPPOAutoregressiveAgent:
+) -> LearnerAutoregressiveAgent:
     """Loads an agent's state from a checkpoint path. Optionally compiles its model."""
-    agent = BatchPPOAutoregressiveAgent(device, f"loaded_{model_type}")
+    agent = LearnerAutoregressiveAgent(device, f"loaded_{model_type}")
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     state_dict = checkpoint.get('model_state_dict', checkpoint)
-    agent.load_models_from_checkpoint({"policy_nets": {"agent_model": state_dict}}, "agent_model")
+    agent.load_from_state_dict(state_dict)
     return agent
 
-def _clone_agent_from_agent(src_agent: BatchPPOAutoregressiveAgent,
-                            device: torch.device) -> BatchPPOAutoregressiveAgent:
+def _clone_agent_from_agent(src_agent: LearnerAutoregressiveAgent,
+                            device: torch.device) -> LearnerAutoregressiveAgent:
     """Clone an agent using the exact same path as checkpoint loading:
     build a fresh agent and load via load_models_from_checkpoint with an
     in-memory state_dict. This avoids architecture inference and stays
@@ -165,8 +167,8 @@ def _clone_agent_from_agent(src_agent: BatchPPOAutoregressiveAgent,
     src_state = {k: v.detach().cpu() for k, v in src_model.state_dict().items()}
 
     # make a fresh agent and load exactly like _load_agent_from_checkpoint
-    clone = BatchPPOAutoregressiveAgent(device, f"clone_of_{src_agent.player_id}")
-    clone.load_models_from_checkpoint({"policy_nets": {"agent_model": src_state}}, "agent_model")
+    clone = LearnerAutoregressiveAgent(device, f"clone_of_{src_agent.player_id}")
+    clone.load_from_state_dict(src_state)
 
     # bookkeeping to mirror the source
     clone.label = getattr(src_agent, "label", -1)
@@ -231,10 +233,10 @@ def train_generation(
     pool_manager: OpponentPoolManager,
     max_updates: int = 100,
     # New: pass a preloaded/compiled learner or a warm_start_path for backward-compat
-    learner: Optional[BatchPPOAutoregressiveAgent] = None,
+    learner: Optional[LearnerAutoregressiveAgent] = None,
     warm_start_path: Optional[str] = None,
     # New: cache for already loaded opponents/agents to avoid reloading
-    agent_cache: Optional[Dict[str, BatchPPOAutoregressiveAgent]] = None,
+    agent_cache: Optional[Dict[str, LearnerAutoregressiveAgent]] = None,
     rng: Optional[Generator] = None,
     collect_metrics: bool = False,
     metrics_callback: Optional[Callable[[int, Dict[str, Any]], None]] = None,
@@ -273,7 +275,8 @@ def train_generation(
     else:
         # Ensure learner is on the correct device
         learner.model = learner.model.to(device)
-        
+    learner.device = device
+
     learner.model.train()
 
     all_params = list(learner.model.parameters())
@@ -742,7 +745,7 @@ if __name__ == "__main__":
     
     pool_manager = OpponentPoolManager(args.pool_file)
     # Keep agents/models in memory across generations
-    agent_cache: Dict[str, BatchPPOAutoregressiveAgent] = {}
+    agent_cache: Dict[str, LearnerAutoregressiveAgent] = {}
     initial_sl_path = None if args.no_sl else args.sl_path
     # --- Step 1: Bootstrap Generation 1 (if it doesn't exist) ---
     gen1_name = "gen_1"

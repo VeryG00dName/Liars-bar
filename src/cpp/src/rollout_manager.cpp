@@ -31,6 +31,7 @@ RolloutManager::RolloutManager()
         throw std::runtime_error(
             "CUDA is not available, but the RolloutManager requires it for historical agent inference.");
     }
+    training_device_ = torch::cuda::is_available() ? torch::Device(torch::kCUDA) : torch::Device(torch::kCPU);
 }
 
 void RolloutManager::start_rollouts(int num_episodes,
@@ -212,6 +213,104 @@ void RolloutManager::load_historical_model(int policy_id, const std::string& pat
     } catch (const std::exception& err) {
         std::cerr << "[RolloutManager] Failed to load TorchScript module from '" << path
                   << "': " << err.what() << std::endl;
+    }
+}
+
+PreparedBatch RolloutManager::prepare_training_batch(const std::vector<PolicyRequest>& requests) const {
+    PreparedBatch batch;
+    if (requests.empty()) {
+        return batch;
+    }
+
+    const int64_t batch_size = static_cast<int64_t>(requests.size());
+    int64_t max_len = 1;
+    for (const auto& req : requests) {
+        const int64_t len = std::max<int64_t>(1, std::min<int64_t>(req.valid_len, MAX_LEN));
+        max_len = std::max(max_len, len);
+    }
+
+    auto opts_float_cpu = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+    auto opts_long_cpu = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+    auto opts_bool_cpu = torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU);
+
+    auto obs_sequence = torch::zeros({batch_size, max_len, OBS_DIM}, opts_float_cpu);
+    auto action_sequence = torch::zeros({batch_size, max_len}, opts_long_cpu);
+    auto agent_types = torch::zeros({batch_size, max_len}, opts_long_cpu);
+    auto positions = torch::zeros({batch_size, max_len}, opts_long_cpu);
+    auto action_masks = torch::zeros({batch_size, max_len, 7}, opts_bool_cpu);
+    auto padding_mask = torch::zeros({batch_size, max_len}, opts_bool_cpu);
+    auto valid_lengths = torch::zeros({batch_size}, opts_long_cpu);
+
+    for (int64_t b = 0; b < batch_size; ++b) {
+        const auto& req = requests[static_cast<size_t>(b)];
+        const int64_t requested_len = std::max<int64_t>(0, std::min<int64_t>(req.valid_len, max_len));
+        const int64_t used_len = std::max<int64_t>(1, requested_len);
+
+        valid_lengths[b] = used_len;
+
+        float* obs_ptr = obs_sequence[b].data_ptr<float>();
+        int64_t* act_ptr = action_sequence[b].data_ptr<int64_t>();
+        int64_t* agent_ptr = agent_types[b].data_ptr<int64_t>();
+        int64_t* pos_ptr = positions[b].data_ptr<int64_t>();
+        bool* mask_ptr = action_masks[b].data_ptr<bool>();
+
+        for (int64_t t = 0; t < requested_len; ++t) {
+            std::memcpy(obs_ptr + t * OBS_DIM, req.obs_sequence[t], sizeof(float) * OBS_DIM);
+            act_ptr[t] = req.action_sequence[t];
+            agent_ptr[t] = req.agent_type_sequence[t];
+            pos_ptr[t] = req.position_sequence[t];
+            bool* step_mask = mask_ptr + t * 7;
+            for (int j = 0; j < 7; ++j) {
+                step_mask[j] = req.action_mask_sequence[t][j] != 0;
+            }
+        }
+
+        if (requested_len == 0) {
+            bool* step_mask = mask_ptr;
+            for (int j = 0; j < 7; ++j) {
+                step_mask[j] = req.mask[j] != 0;
+            }
+        }
+
+        for (int64_t t = requested_len; t < used_len; ++t) {
+            pos_ptr[t] = t;
+        }
+
+        bool* pad_ptr = padding_mask[b].data_ptr<bool>();
+        for (int64_t t = used_len; t < max_len; ++t) {
+            pad_ptr[t] = true;
+        }
+    }
+
+    torch::Device target_device = training_device_;
+    if (target_device.is_cuda() && !torch::cuda::is_available()) {
+        target_device = torch::Device(torch::kCPU);
+    }
+
+    batch.obs_sequence = obs_sequence.to(target_device, /*non_blocking=*/false, /*copy=*/true);
+    batch.action_sequence = action_sequence.to(target_device, false, true);
+    batch.agent_types = agent_types.to(target_device, false, true);
+    batch.positions = positions.to(target_device, false, true);
+    batch.action_masks = action_masks.to(target_device, false, true);
+    batch.padding_mask = padding_mask.to(target_device, false, true);
+    batch.valid_lengths = valid_lengths.to(target_device, false, true);
+
+    return batch;
+}
+
+void RolloutManager::set_training_device(const std::string& device_str) {
+    try {
+        torch::Device candidate(device_str);
+        if (candidate.is_cuda() && !torch::cuda::is_available()) {
+            std::cerr << "[RolloutManager] Requested CUDA training device but CUDA is unavailable."
+                      << " Falling back to CPU." << std::endl;
+            training_device_ = torch::Device(torch::kCPU);
+        } else {
+            training_device_ = candidate;
+        }
+    } catch (const std::exception& err) {
+        std::cerr << "[RolloutManager] Invalid training device string '" << device_str
+                  << "': " << err.what() << ". Keeping previous device." << std::endl;
     }
 }
 

@@ -10,18 +10,12 @@ import torch
 from src.misc import lb
 from src import config
 
-from src.agents.batch_autoregressive_ppo_agent import (
-    BatchPPOAutoregressiveAgent,
-    PreparedPolicyBatch,
-)
-
-
 class PPOVecRolloutManager:
     """High-level Python wrapper around the C++ RolloutManager."""
 
     def __init__(
         self,
-        policies: Dict[int, BatchPPOAutoregressiveAgent],
+        policies: Dict[int, Any],
         device: torch.device,
         pool_manager: Optional[Any] = None,
         rng: Optional[np.random.Generator] = None,
@@ -32,6 +26,11 @@ class PPOVecRolloutManager:
         self.device = device
         self.rng = rng if rng is not None else np.random.default_rng()
         self.pool_manager = pool_manager
+
+        try:
+            self.cpp_manager.set_training_device(str(device))
+        except AttributeError:
+            pass
 
         self._all_shadow_pool_labels: List[int] = []
         self._current_shadow_rotation_queue: List[int] = []
@@ -236,7 +235,7 @@ class PPOVecRolloutManager:
             if not requests_by_policy:
                 break
 
-            for policy_id_raw, req_list in requests_by_policy.items():
+            for policy_id_raw, payload in requests_by_policy.items():
                 policy_id = int(policy_id_raw)
                 agent = self.policies.get(policy_id)
                 if agent is None:
@@ -247,23 +246,29 @@ class PPOVecRolloutManager:
                     )
                     raise RuntimeError(f"No policy object for id: {policy_id}")
 
-                prepared_requests = self._prepare_requests(list(req_list))
+                tensors_payload = None
+                if isinstance(payload, dict):
+                    tensors_payload = payload.get("tensors")
+                    request_entries = list(payload.get("requests", []))
+                else:
+                    request_entries = list(payload)
+
+                prepared_requests = self._prepare_requests(request_entries)
+
                 if not prepared_requests:
                     continue
 
-                if isinstance(agent, BatchPPOAutoregressiveAgent):
+                if tensors_payload and hasattr(agent, "compute_actions"):
                     if policy_id != training_policy_id:
                         raise RuntimeError(
-                            "Received inference requests for historical policy %s; "
-                            "historical agents must use C++ TorchScript inference." % policy_id
+                            "Received tensor payload for non-training policy %s." % policy_id
                         )
 
-                    prepared_batch: PreparedPolicyBatch = BatchPPOAutoregressiveAgent.build_prepared_batch(
-                        prepared_requests
-                    )
-                    indices = list(range(len(prepared_batch.requests)))
-                    actions, log_probs, values = agent.get_actions_from_prepared(
-                        prepared_batch, indices
+                    tensor_inputs = {
+                        str(key): tensors_payload[key] for key in tensors_payload.keys()
+                    }
+                    actions, log_probs, values = agent.compute_actions(
+                        tensor_inputs, prepared_requests
                     )
                 else:
                     actions, log_probs, values = agent.get_actions_batch(prepared_requests)

@@ -45,6 +45,18 @@ py::dict policy_request_to_dict(const PolicyRequest& req) {
     out["valid_len"] = req.valid_len;
     return out;
 }
+
+py::dict prepared_batch_to_dict(const PreparedBatch& batch) {
+    py::dict tensors;
+    tensors["obs_sequence"] = batch.obs_sequence;
+    tensors["action_sequence"] = batch.action_sequence;
+    tensors["agent_types"] = batch.agent_types;
+    tensors["positions"] = batch.positions;
+    tensors["action_masks"] = batch.action_masks;
+    tensors["padding_mask"] = batch.padding_mask;
+    tensors["valid_lengths"] = batch.valid_lengths;
+    return tensors;
+}
 } // end anonymous namespace
 
 void bind_rollout_manager(py::module_& m) {
@@ -82,12 +94,21 @@ void bind_rollout_manager(py::module_& m) {
         .def("collect_requests_for_inference", [](RolloutManager& self) {
             auto grouped = self.collect_requests_for_inference();
             py::dict out;
+            const int training_id = self.training_policy_id();
             for (auto const& [policy_id, req_vec] : grouped) {
+                py::dict payload;
                 py::list req_list;
                 for (const auto& req : req_vec) {
                     req_list.append(policy_request_to_dict(req));
                 }
-                out[py::int_(policy_id)] = req_list;
+                payload["requests"] = req_list;
+                if (policy_id == training_id && !req_vec.empty()) {
+                    auto prepared = self.prepare_training_batch(req_vec);
+                    payload["tensors"] = prepared_batch_to_dict(prepared);
+                } else {
+                    payload["tensors"] = py::none();
+                }
+                out[py::int_(policy_id)] = payload;
             }
             return out;
         })
@@ -104,5 +125,7 @@ void bind_rollout_manager(py::module_& m) {
                 self.load_historical_model(policy_id, path);
             },
             py::arg("policy_id"),
-            py::arg("path"));
+            py::arg("path"))
+        .def("set_training_device", &RolloutManager::set_training_device,
+             py::arg("device"));
 }
