@@ -155,7 +155,7 @@ class StrategyDictionary(nn.Module):
             nn.Linear(hidden_dim, num_bricks)
         )
         
-        self.entmax_activation = Entmax15(dim=-1, n_iter=50, topk=None, temperature=1.0)
+        self.entmax_activation = Entmax15(dim=-1, n_iter=32, topk=None, temperature=1.0)
 
     def forward(self, transformer_output: torch.Tensor):
         # transformer_output shape: [B, T, D_transformer]
