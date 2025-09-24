@@ -1,54 +1,56 @@
 # setup.py
-import sys
-from setuptools import setup
+import os, sys
 from glob import glob
-import os
-# --- NEW IMPORTS ---
-import torch
+from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CppExtension
 
-# --- Define project structure (unchanged) ---
-PROJ_ROOT = os.path.dirname(os.path.abspath(__file__))
-CPP_INCLUDE_DIR = os.path.join(PROJ_ROOT, "src", "cpp", "include")
-CPP_SRC_DIR = os.path.join(PROJ_ROOT, "src", "cpp", "src")
-BINDINGS_DIR = os.path.join(PROJ_ROOT, "src", "cpp", "bindings")
+PROJ_ROOT     = os.path.dirname(os.path.abspath(__file__))
+CPP_INCLUDE   = os.path.join(PROJ_ROOT, "src", "cpp", "include")
+CPP_SRC_DIR   = os.path.join(PROJ_ROOT, "src", "cpp", "src")
+BINDINGS_DIR  = os.path.join(PROJ_ROOT, "src", "cpp", "bindings")
+SOURCES = sorted(glob(os.path.join(CPP_SRC_DIR, "*.cpp")) +
+                 glob(os.path.join(BINDINGS_DIR, "*.cpp")))
 
-# --- Collect all C++ source files (unchanged) ---
-sources = sorted(
-    glob(os.path.join(CPP_SRC_DIR, "*.cpp")) +
-    glob(os.path.join(BINDINGS_DIR, "*.cpp"))
-)
+# Toggle with: PROFILE=1 python setup.py build_ext -i
+PROFILE = 0
 
-# --- Platform-specific compiler arguments (can be simplified) ---
-# The CppExtension will handle many of these flags for us
-extra_compile_args = []
+def linux_macos_flags(profile: bool):
+    if profile:
+        cxx = ["-O2", "-g", "-fno-omit-frame-pointer", "-fno-lto", "-std=c++17", "-UNDEBUG"]
+        link = ["-fno-lto"]
+    else:
+        cxx = ["-O3", "-DNDEBUG", "-std=c++17"]
+        link = []
+    return {"cxx": cxx}, link
+
+def windows_flags(profile: bool):
+    # /Zi: debug symbols, /Zo: enhanced optimized debugging, /Oy-: keep frame ptrs
+    if profile:
+        cxx = ["/O2", "/Zi", "/Zo", "/Oy-", "/std:c++17"]
+        link = ["/DEBUG"]     # generate PDB
+        # Avoid LTCG in profiling: /GL disables, so don't add it
+    else:
+        cxx = ["/O2", "/DNDEBUG", "/std:c++17"]
+        link = []
+    return {"cxx": cxx}, link
+
 if sys.platform == "win32":
-    extra_compile_args = ['/O2', '/std:c++17']
+    extra_compile_args, extra_link_args = windows_flags(PROFILE)
 else:
-    # We can keep optimization flags, but CppExtension will add the crucial ones.
-    extra_compile_args = ['-O3', '-std=c++17']
+    extra_compile_args, extra_link_args = linux_macos_flags(PROFILE)
 
-# --- NEW EXTENSION DEFINITION ---
 ext = CppExtension(
-    # The name defines the import path
     name="src.misc.lb",
-    sources=sources,
-    # CppExtension automatically finds Pybind11 headers if it's installed
-    # It also automatically finds torch headers. We just need our own.
-    include_dirs=[CPP_INCLUDE_DIR],
-    extra_compile_args=extra_compile_args,
-    # Note: We no longer need to manually specify libtorch paths or libraries!
-    # CppExtension finds them automatically from your torch installation.
+    sources=SOURCES,
+    include_dirs=[CPP_INCLUDE],
+    extra_compile_args=extra_compile_args,   # dict form is supported (cxx/nvcc)
+    extra_link_args=extra_link_args,
 )
 
 setup(
     name="LiarsBarCore",
-    version="1.0.2", # Incremented for the build system change
-    author="<Your Name>",
-    author_email="<your_email@example.com>",
-    description="Core C++ components for the Liar's Bar project",
+    version="1.0.3",
     ext_modules=[ext],
-    # Use the custom BuildExtension from torch
     cmdclass={"build_ext": BuildExtension},
     zip_safe=False,
 )

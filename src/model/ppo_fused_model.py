@@ -5,132 +5,98 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-@torch.jit.script
-def _entmax15_bisect_functional(
-    x: torch.Tensor,
-    dim: int = -1,
-    n_iter: int = 50,
-    *,
-    mask: Optional[torch.Tensor] = None,   # same shape as x; False/0 => invalid
-    topk: Optional[int] = None,            # None/0 disables; else restrict to top-k along dim
-    eps: float = 1e-20,
-    temperature: float = 1.0,
-) -> torch.Tensor:
-    # Do math in fp32 for AMP safety; return original dtype
-    x32 = x.to(torch.float32)
+import torch
+from torch import nn
+from typing import Optional
 
-    # Optional temperature (logit scaling)
+# ---- TorchScript core: no keyword-only args, no Optional, no defaults
+@torch.jit.script
+def _entmax15_bisect_script(x: torch.Tensor,
+                            dim: int,
+                            n_iter: int,
+                            eps: float,
+                            temperature: float) -> torch.Tensor:
+    orig_dtype = x.dtype
+    x32 = x.to(torch.float32)
     if temperature != 1.0:
         x32 = x32 / temperature
 
-    # Mask invalid positions by pushing to -inf pre-topk
-    if mask is not None:
-        m = mask.to(torch.bool)
-        neg_inf = torch.finfo(x32.dtype).min
-        x32 = torch.where(m, x32, torch.full_like(x32, neg_inf))
-    else:
-        m = None
+    # α=1.5: u = z / 3, shift by max (use tuple returns in TorchScript)
+    u = x32 / 3.0
+    umax, _ = torch.max(u, dim=dim, keepdim=True)
+    u = u - umax
 
-    # Optional top-k preselection for speed on large action spaces
-    if topk is not None and topk > 0:
-        k = min(topk, x32.size(dim))
-        vals, idx = torch.topk(x32, k=k, dim=dim)
-        work = vals
-        top_idx = idx
-    else:
-        work = x32
-        top_idx = None
-
-    # Canonical scaling for alpha = 1.5: u = z / 3
-    u = work / 3.0
-    u = u - u.max(dim=dim, keepdim=True).values  # shift-invariant, improves stability
-
-    # Bracket tau: s(tau) = sum((u - tau)_+^2)
-    u_max = u.max(dim=dim, keepdim=True).values
-    u_min = u.min(dim=dim, keepdim=True).values
+    u_max, _ = torch.max(u, dim=dim, keepdim=True)
+    u_min, _ = torch.min(u, dim=dim, keepdim=True)
     hi = u_max
-    lo = u_min - 1.0  # safe bound so s(lo) >= 1
+    lo = u_min - 1.0
 
-    # Fixed-iteration bisection (deterministic when det. flags are on)
-    for _ in range(n_iter):
-        mid = 0.5 * (lo + hi)
+    i = 0
+    while i < n_iter:
+        mid = (lo + hi) * 0.5
         p = torch.clamp(u - mid, min=0.0)
         s = (p * p).sum(dim=dim, keepdim=True)
         gt = s > 1.0
         lo = torch.where(gt, mid, lo)
         hi = torch.where(gt, hi, mid)
+        i += 1
 
-    tau = 0.5 * (lo + hi)
+    tau = (lo + hi) * 0.5
     p = torch.clamp(u - tau, min=0.0)
     p = p * p
-
-    # Renormalize to protect against tiny roundoff
     zsum = p.sum(dim=dim, keepdim=True)
     p = p / (zsum + eps)
+    return p.to(orig_dtype)
 
-    # If we used top-k, scatter back; else p already matches shape
-    if top_idx is not None:
-        out = torch.zeros_like(x32)
-        out = out.scatter(dim, top_idx, p)
-        p = out
-
-    # Enforce exact zeros on masked entries
-    if m is not None:
-        p = torch.where(m, p, torch.zeros_like(p))
-
-    return p.to(x.dtype)
+# ---- Python wrapper with defaults (can handle mask before calling scripted core)
+def entmax15_bisect(x: torch.Tensor,
+                    dim: int = -1,
+                    n_iter: int = 50,
+                    *,
+                    eps: float = 1e-20,
+                    temperature: float = 1.0,
+                    mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    x_in = x
+    if mask is not None:
+        # apply mask by pushing invalid positions to -inf in fp32 space
+        x32 = x.to(torch.float32)
+        m = mask.to(torch.bool)
+        neg_inf = torch.finfo(x32.dtype).min
+        x32 = torch.where(m, x32, torch.full_like(x32, neg_inf))
+        out = _entmax15_bisect_script(x32, dim, n_iter, eps, temperature)
+        out = torch.where(m, out, torch.zeros_like(out))
+        return out.to(x_in.dtype)
+    else:
+        return _entmax15_bisect_script(x, dim, n_iter, eps, temperature)
 
 class Entmax15(nn.Module):
-    """
-    Entmax-1.5 as an nn.Module.
-
-    Args:
-        dim: class dimension
-        n_iter: bisection iterations (fixed for determinism)
-        eps: tiny epsilon for safe renorm
-        topk: optional top-k preselect for speed (None/0 disables)
-        temperature: optional logit temperature (>=1.0 is smoother)
-    """
-    def __init__(
-        self,
-        dim: int = -1,
-        n_iter: int = 50,
-        eps: float = 1e-20,
-        topk: Optional[int] = None,
-        temperature: float = 1.0,
-    ):
+    def __init__(self,
+                 dim: int = -1,
+                 n_iter: int = 50,
+                 eps: float = 1e-20,
+                 temperature: float = 1.0):
         super().__init__()
         self.dim = dim
         self.n_iter = int(n_iter)
         self.eps = float(eps)
-        self.topk = topk if (topk is not None and topk > 0) else None
         self.temperature = float(temperature)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        return _entmax15_bisect_functional(
-            x,
-            dim=self.dim,
-            n_iter=self.n_iter,
-            mask=mask,
-            topk=self.topk,
-            eps=self.eps,
-            temperature=self.temperature,
+        return entmax15_bisect(
+            x, dim=self.dim, n_iter=self.n_iter, eps=self.eps,
+            temperature=self.temperature, mask=mask
         )
 
     @staticmethod
-    def functional(
-        x: torch.Tensor,
-        dim: int = -1,
-        n_iter: int = 50,
-        *,
-        mask: Optional[torch.Tensor] = None,
-        topk: Optional[int] = None,
-        eps: float = 1e-20,
-        temperature: float = 1.0,
-    ) -> torch.Tensor:
-        """Convenience stateless functional API."""
-        return _entmax15_bisect_functional(
-            x, dim=dim, n_iter=n_iter, mask=mask, topk=topk, eps=eps, temperature=temperature
+    def functional(x: torch.Tensor,
+                   dim: int = -1,
+                   n_iter: int = 50,
+                   *,
+                   eps: float = 1e-20,
+                   temperature: float = 1.0,
+                   mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return entmax15_bisect(
+            x, dim=dim, n_iter=n_iter, eps=eps, temperature=temperature, mask=mask
         )
 
 class StrategyDictionary(nn.Module):
@@ -155,7 +121,7 @@ class StrategyDictionary(nn.Module):
             nn.Linear(hidden_dim, num_bricks)
         )
         
-        self.entmax_activation = Entmax15(dim=-1, n_iter=32, topk=None, temperature=1.0)
+        self.entmax_activation = Entmax15(dim=-1, n_iter=32, temperature=1.0)
 
     def forward(self, transformer_output: torch.Tensor):
         # transformer_output shape: [B, T, D_transformer]
