@@ -4,7 +4,8 @@ import os, logging, warnings
 import json
 import time
 from datetime import datetime
-from typing import Dict, Any, List, Optional, Callable
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Callable, Tuple
 from numpy.random import Generator
 import random
 import numpy as np
@@ -162,6 +163,48 @@ def _clone_agent_from_agent(src_agent: BatchPPOAutoregressiveAgent,
 
     return clone
 
+
+def _find_traced_artifact_for_checkpoint(checkpoint_path: str) -> Optional[Path]:
+    """Return the TorchScript trace produced by ``trace_models.py`` if it exists."""
+
+    ckpt_path = Path(os.path.abspath(checkpoint_path))
+    candidate = ckpt_path.with_name(f"{ckpt_path.stem}_traced.pt")
+    if candidate.exists():
+        return candidate
+
+    index_path = ckpt_path.parent / "traced_index.json"
+    if index_path.exists():
+        try:
+            entries = json.loads(index_path.read_text())
+        except json.JSONDecodeError:
+            entries = []
+
+        if isinstance(entries, dict):
+            entries = [entries]
+
+        resolved_ckpt = str(ckpt_path.resolve(strict=False))
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+
+            traced_name = entry.get("traced_module")
+            if not traced_name:
+                continue
+
+            traced_candidate = (ckpt_path.parent / traced_name).resolve(strict=False)
+            if not traced_candidate.exists():
+                continue
+
+            source = entry.get("source_checkpoint")
+            if not source:
+                return traced_candidate
+
+            if source == resolved_ckpt or source == str(ckpt_path) or source.endswith(ckpt_path.name):
+                return traced_candidate
+
+    return candidate if candidate.exists() else None
+
+
 # ==============================================================================
 # SECTION 2: THE CORE TRAIN FUNCTION
 # ==============================================================================
@@ -257,6 +300,8 @@ def train_generation(
 
     # Add historical AI agents using their stored labels (>=7)
     used_labels = set([a['label'] for a in pool_manager.pool if a['type'] != 'cpp_bot' and 'label' in a])
+    traced_artifacts: List[Tuple[int, Path]] = []
+
     for agent_def in pool_manager.pool:
         if agent_def['type'] != 'cpp_bot' and agent_def.get('path'):
             policy_id = int(agent_def['label'])
@@ -274,6 +319,16 @@ def train_generation(
             agent.label = policy_id
             policy_map[policy_id] = agent
 
+            traced_candidate = _find_traced_artifact_for_checkpoint(ckpt_path)
+            if traced_candidate is not None:
+                traced_artifacts.append((policy_id, traced_candidate))
+            else:
+                logging.warning(
+                    "No traced TorchScript module found for historical policy %s at %s",
+                    policy_id,
+                    ckpt_path,
+                )
+
     # Assign a training policy id >= 7 that doesn't collide with existing labels
     training_policy_id = 7
     while training_policy_id in policy_map:
@@ -290,6 +345,21 @@ def train_generation(
         pool_manager=pool_manager,
         rng=(rng or _GLOBAL_RNG),
     )
+
+    for policy_id, traced_path in traced_artifacts:
+        try:
+            rollout_manager.cpp_manager.load_historical_model(int(policy_id), str(traced_path))
+            logging.info(
+                "Loaded traced historical policy %s from %s into C++ rollout manager",
+                policy_id,
+                traced_path,
+            )
+        except Exception:
+            logging.exception(
+                "Failed to register traced historical model for policy %s from %s",
+                policy_id,
+                traced_path,
+            )
 
     rollout_manager.set_opponent_pool(pool_manager.pool)
 

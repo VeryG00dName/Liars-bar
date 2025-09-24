@@ -19,7 +19,7 @@ import torch
 # ---------------------------------------------------------------------------
 # Repository bootstrap so we can import from ``src`` when executed as a script
 # ---------------------------------------------------------------------------
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2] # Change this from 1 to 2
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 

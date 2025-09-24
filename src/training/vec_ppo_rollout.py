@@ -27,6 +27,7 @@ class PPOVecRolloutManager:
         rng: Optional[np.random.Generator] = None,
     ) -> None:
         self.rollout_manager = lb.RolloutManager()
+        self.cpp_manager = self.rollout_manager
         self.policies = policies
         self.device = device
         self.rng = rng if rng is not None else np.random.default_rng()
@@ -251,6 +252,12 @@ class PPOVecRolloutManager:
                     continue
 
                 if isinstance(agent, BatchPPOAutoregressiveAgent):
+                    if policy_id != training_policy_id:
+                        raise RuntimeError(
+                            "Received inference requests for historical policy %s; "
+                            "historical agents must use C++ TorchScript inference." % policy_id
+                        )
+
                     prepared_batch: PreparedPolicyBatch = BatchPPOAutoregressiveAgent.build_prepared_batch(
                         prepared_requests
                     )
