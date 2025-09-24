@@ -99,4 +99,10 @@ void bind_rollout_manager(py::module_& m) {
              py::arg("values") = std::vector<float>())
              
         .def("get_completed_episodes", &RolloutManager::get_completed_episodes);
+        .def("load_historical_model",
+            [](RolloutManager& self, int policy_id, const std::string& path) {
+                self.load_historical_model(policy_id, path);
+            },
+            py::arg("policy_id"),
+            py::arg("path"))
 }
