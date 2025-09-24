@@ -31,7 +31,7 @@ class ClassicBot : public CppBotBase {
 public:
     ClassicBot() : bot_("bot") {}
     uint8_t act(const PolicyRequest& request, VecArena&) override {
-        return bot_.act(request.classic_obs, request.classic_obs_len, request.mask);
+        return bot_.act(request.classic_obs.data(), request.classic_obs_len, request.mask.data());
     }
 
 private:
@@ -42,7 +42,7 @@ class GreedyCardSpammerBot : public CppBotBase {
 public:
     GreedyCardSpammerBot() : bot_("bot") {}
     uint8_t act(const PolicyRequest& request, VecArena&) override {
-        return bot_.act(request.classic_obs, request.classic_obs_len, request.mask);
+        return bot_.act(request.classic_obs.data(), request.classic_obs_len, request.mask.data());
     }
 
 private:
@@ -53,7 +53,7 @@ class RandomAgentBot : public CppBotBase {
 public:
     RandomAgentBot() : bot_("bot") {}
     uint8_t act(const PolicyRequest& request, VecArena&) override {
-        return bot_.act(request.classic_obs, request.classic_obs_len, request.mask);
+        return bot_.act(request.classic_obs.data(), request.classic_obs_len, request.mask.data());
     }
 
 private:
@@ -64,7 +64,7 @@ class SelectiveTableConservativeChallengerBot : public CppBotBase {
 public:
     SelectiveTableConservativeChallengerBot() : bot_("bot") {}
     uint8_t act(const PolicyRequest& request, VecArena&) override {
-        return bot_.act(request.classic_obs, request.classic_obs_len, request.mask);
+        return bot_.act(request.classic_obs.data(), request.classic_obs_len, request.mask.data());
     }
 
 private:
@@ -77,7 +77,7 @@ public:
         : bot_("bot", num_players, seat) {}
 
     uint8_t act(const PolicyRequest& request, VecArena&) override {
-        return bot_.act(request.classic_obs, request.classic_obs_len, request.mask);
+        return bot_.act(request.classic_obs.data(), request.classic_obs_len, request.mask.data());
     }
 
 private:
@@ -88,7 +88,7 @@ class TableFirstConservativeChallengerBot : public CppBotBase {
 public:
     TableFirstConservativeChallengerBot() : bot_("bot") {}
     uint8_t act(const PolicyRequest& request, VecArena&) override {
-        return bot_.act(request.classic_obs, request.classic_obs_len, request.mask);
+        return bot_.act(request.classic_obs.data(), request.classic_obs_len, request.mask.data());
     }
 
 private:
@@ -99,7 +99,7 @@ class TableNonTableAgentBot : public CppBotBase {
 public:
     TableNonTableAgentBot() : bot_("bot") {}
     uint8_t act(const PolicyRequest& request, VecArena&) override {
-        return bot_.act(request.classic_obs, request.classic_obs_len, request.mask);
+        return bot_.act(request.classic_obs.data(), request.classic_obs_len, request.mask.data());
     }
 
 private:
@@ -260,47 +260,63 @@ void RolloutManager::submit_inference_results(int policy_id,
                                               const std::vector<uint8_t>& actions,
                                               const std::vector<float>& log_probs,
                                               const std::vector<float>& values) {
+    submit_inference_results_array(policy_id,
+                                   actions.empty() ? nullptr : actions.data(),
+                                   actions.size(),
+                                   log_probs.empty() ? nullptr : log_probs.data(),
+                                   log_probs.size(),
+                                   values.empty() ? nullptr : values.data(),
+                                   values.size());
+}
+
+void RolloutManager::submit_inference_results_array(int policy_id,
+                                                    const uint8_t* actions,
+                                                    size_t action_count,
+                                                    const float* log_probs,
+                                                    size_t log_prob_count,
+                                                    const float* values,
+                                                    size_t value_count) {
     auto it_req = arena_.pending.find(policy_id);
-    if (it_req == arena_.pending.end()) {
-        return;
+    if (it_req != arena_.pending.end()) {
+        const auto& reqs = it_req->second;
+
+        const size_t count = std::min(reqs.size(), action_count);
+        const bool has_log_probs = (log_probs != nullptr) && (log_prob_count >= count);
+        const bool has_values = (values != nullptr) && (value_count >= count);
+
+        for (size_t i = 0; i < count; ++i) {
+            const int env_idx = reqs[i].env;
+            const int seat = reqs[i].seat;
+            if (env_idx < 0 || env_idx >= static_cast<int>(episodes_.size())) {
+                continue;
+            }
+            EpisodeTracker& tracker = episodes_[env_idx];
+            if (tracker.done) {
+                continue;
+            }
+            if (!tracker.is_training_episode || seat != tracker.training_agent_seat ||
+                policy_id != training_policy_id_) {
+                continue;
+            }
+
+            const int step_idx = append_step_row(tracker, seat);
+            if (step_idx >= 0 && step_idx < static_cast<int>(tracker.data.our_action.size()) &&
+                actions != nullptr && i < action_count) {
+                tracker.data.our_action[step_idx] = static_cast<int>(actions[i]);
+            }
+
+            PendingStepData pending{};
+            pending.log_prob = (has_log_probs ? log_probs[i] : 0.0f);
+            pending.value = (has_values ? values[i] : 0.0f);
+            if (env_idx >= 0 && env_idx < static_cast<int>(arena_.envs.size()) &&
+                seat >= 0 && seat < arena_.envs[env_idx].num_players()) {
+                pending.penalties_used = static_cast<int>(arena_.envs[env_idx].penalties[seat]);
+            }
+            pending_step_data_[env_idx] = pending;
+        }
     }
-    const auto& reqs = it_req->second;
 
-    const size_t count = std::min(reqs.size(), actions.size());
-    const bool has_log_probs = log_probs.size() == count;
-    const bool has_values = values.size() == count;
-
-    for (size_t i = 0; i < count; ++i) {
-        const int env_idx = reqs[i].env;
-        const int seat = reqs[i].seat;
-        if (env_idx < 0 || env_idx >= static_cast<int>(episodes_.size())) {
-            continue;
-        }
-        EpisodeTracker& tracker = episodes_[env_idx];
-        if (tracker.done) {
-            continue;
-        }
-        if (!tracker.is_training_episode || seat != tracker.training_agent_seat ||
-            policy_id != training_policy_id_) {
-            continue;
-        }
-
-        const int step_idx = append_step_row(tracker, seat);
-        if (step_idx >= 0 && step_idx < static_cast<int>(tracker.data.our_action.size())) {
-            tracker.data.our_action[step_idx] = static_cast<int>(actions[i]);
-        }
-
-        PendingStepData pending{};
-        pending.log_prob = (has_log_probs ? log_probs[i] : 0.0f);
-        pending.value = (has_values ? values[i] : 0.0f);
-        if (env_idx >= 0 && env_idx < static_cast<int>(arena_.envs.size()) &&
-            seat >= 0 && seat < arena_.envs[env_idx].num_players()) {
-            pending.penalties_used = static_cast<int>(arena_.envs[env_idx].penalties[seat]);
-        }
-        pending_step_data_[env_idx] = pending;
-    }
-
-    arena_.submit_actions(policy_id, actions);
+    arena_.submit_actions(policy_id, actions, action_count);
 }
 
 std::vector<TrajectoryData> RolloutManager::get_completed_episodes() {
@@ -392,14 +408,40 @@ PreparedBatch RolloutManager::prepare_training_batch(const std::vector<PolicyReq
         int64_t* pos_ptr = positions[b].data_ptr<int64_t>();
         bool* mask_ptr = action_masks[b].data_ptr<bool>();
 
+        const float* req_obs_ptr = req.obs_sequence.empty() ? nullptr : req.obs_sequence.data();
+        const int64_t* req_action_ptr = req.action_sequence.empty() ? nullptr : req.action_sequence.data();
+        const int64_t* req_agent_ptr = req.agent_type_sequence.empty() ? nullptr : req.agent_type_sequence.data();
+        const int64_t* req_pos_ptr = req.position_sequence.empty() ? nullptr : req.position_sequence.data();
+        const uint8_t* req_mask_ptr = req.action_mask_sequence.empty() ? nullptr : req.action_mask_sequence.data();
+
+        const int64_t obs_rows = req_obs_ptr ? static_cast<int64_t>(req.obs_sequence.size()) / OBS_DIM : 0;
+        const int64_t mask_rows = req_mask_ptr ? static_cast<int64_t>(req.action_mask_sequence.size()) / 7 : 0;
+        const int64_t action_rows = req_action_ptr ? static_cast<int64_t>(req.action_sequence.size()) : 0;
+        const int64_t agent_rows = req_agent_ptr ? static_cast<int64_t>(req.agent_type_sequence.size()) : 0;
+        const int64_t pos_rows = req_pos_ptr ? static_cast<int64_t>(req.position_sequence.size()) : 0;
+
         for (int64_t t = 0; t < requested_len; ++t) {
-            std::memcpy(obs_ptr + t * OBS_DIM, req.obs_sequence[t], sizeof(float) * OBS_DIM);
-            act_ptr[t] = req.action_sequence[t];
-            agent_ptr[t] = req.agent_type_sequence[t];
-            pos_ptr[t] = req.position_sequence[t];
+            float* dst_obs = obs_ptr + t * OBS_DIM;
+            if (req_obs_ptr && t < obs_rows) {
+                std::memcpy(dst_obs, req_obs_ptr + t * OBS_DIM, sizeof(float) * OBS_DIM);
+            } else {
+                std::memset(dst_obs, 0, sizeof(float) * OBS_DIM);
+            }
+
+            act_ptr[t] = (req_action_ptr && t < action_rows) ? req_action_ptr[t] : 0;
+            agent_ptr[t] = (req_agent_ptr && t < agent_rows) ? req_agent_ptr[t] : 0;
+            pos_ptr[t] = (req_pos_ptr && t < pos_rows) ? req_pos_ptr[t] : t;
+
             bool* step_mask = mask_ptr + t * 7;
-            for (int j = 0; j < 7; ++j) {
-                step_mask[j] = req.action_mask_sequence[t][j] != 0;
+            if (req_mask_ptr && t < mask_rows) {
+                const uint8_t* src_mask = req_mask_ptr + t * 7;
+                for (int j = 0; j < 7; ++j) {
+                    step_mask[j] = src_mask[j] != 0;
+                }
+            } else {
+                for (int j = 0; j < 7; ++j) {
+                    step_mask[j] = false;
+                }
             }
         }
 
@@ -492,14 +534,40 @@ std::vector<uint8_t> RolloutManager::run_historical_inference(torch::jit::Module
         int64_t* pos_ptr = positions[b].data_ptr<int64_t>();
         bool* mask_ptr = action_masks[b].data_ptr<bool>();
 
+        const float* req_obs_ptr = req.obs_sequence.empty() ? nullptr : req.obs_sequence.data();
+        const int64_t* req_action_ptr = req.action_sequence.empty() ? nullptr : req.action_sequence.data();
+        const int64_t* req_agent_ptr = req.agent_type_sequence.empty() ? nullptr : req.agent_type_sequence.data();
+        const int64_t* req_pos_ptr = req.position_sequence.empty() ? nullptr : req.position_sequence.data();
+        const uint8_t* req_mask_ptr = req.action_mask_sequence.empty() ? nullptr : req.action_mask_sequence.data();
+
+        const int64_t obs_rows = req_obs_ptr ? static_cast<int64_t>(req.obs_sequence.size()) / OBS_DIM : 0;
+        const int64_t mask_rows = req_mask_ptr ? static_cast<int64_t>(req.action_mask_sequence.size()) / 7 : 0;
+        const int64_t action_rows = req_action_ptr ? static_cast<int64_t>(req.action_sequence.size()) : 0;
+        const int64_t agent_rows = req_agent_ptr ? static_cast<int64_t>(req.agent_type_sequence.size()) : 0;
+        const int64_t pos_rows = req_pos_ptr ? static_cast<int64_t>(req.position_sequence.size()) : 0;
+
         for (int64_t t = 0; t < requested_len; ++t) {
-            std::memcpy(obs_ptr + t * OBS_DIM, req.obs_sequence[t], sizeof(float) * OBS_DIM);
-            act_ptr[t] = req.action_sequence[t];
-            agent_ptr[t] = req.agent_type_sequence[t];
-            pos_ptr[t] = req.position_sequence[t];
+            float* dst_obs = obs_ptr + t * OBS_DIM;
+            if (req_obs_ptr && t < obs_rows) {
+                std::memcpy(dst_obs, req_obs_ptr + t * OBS_DIM, sizeof(float) * OBS_DIM);
+            } else {
+                std::memset(dst_obs, 0, sizeof(float) * OBS_DIM);
+            }
+
+            act_ptr[t] = (req_action_ptr && t < action_rows) ? req_action_ptr[t] : 0;
+            agent_ptr[t] = (req_agent_ptr && t < agent_rows) ? req_agent_ptr[t] : 0;
+            pos_ptr[t] = (req_pos_ptr && t < pos_rows) ? req_pos_ptr[t] : t;
+
             bool* step_mask = mask_ptr + t * 7;
-            for (int j = 0; j < 7; ++j) {
-                step_mask[j] = req.action_mask_sequence[t][j] != 0;
+            if (req_mask_ptr && t < mask_rows) {
+                const uint8_t* src_mask = req_mask_ptr + t * 7;
+                for (int j = 0; j < 7; ++j) {
+                    step_mask[j] = src_mask[j] != 0;
+                }
+            } else {
+                for (int j = 0; j < 7; ++j) {
+                    step_mask[j] = false;
+                }
             }
         }
 

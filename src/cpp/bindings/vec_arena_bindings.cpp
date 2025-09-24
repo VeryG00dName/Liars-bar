@@ -15,32 +15,37 @@ void bind_vec_arena(py::module_& m) {
     py::class_<PolicyRequest>(m, "PolicyRequest")
         .def_readonly("env", &PolicyRequest::env)
         .def_readonly("seat", &PolicyRequest::seat)
-        .def_property_readonly("mask", [](PolicyRequest& r) { return py::array_t<uint8_t>({7}, r.mask); })
+        .def_property_readonly("mask", [](PolicyRequest& r) { return py::array_t<uint8_t>({7}, r.mask.data()); })
         .def_readonly("done", &PolicyRequest::done)
         .def_property_readonly("classic_obs", [](PolicyRequest& r) {
             const py::ssize_t len = std::max(0, r.classic_obs_len);
-            return py::array_t<float>({len}, r.classic_obs);
+            return py::array_t<float>({len}, r.classic_obs.data());
         })
         .def_readonly("classic_obs_len", &PolicyRequest::classic_obs_len)
         .def_property_readonly("obs_sequence", [](PolicyRequest& r) {
             const py::ssize_t len = std::max(0, r.valid_len);
-            return py::array_t<float>({len, static_cast<py::ssize_t>(OBS_DIM)}, r.obs_sequence[0]);
+            const float* ptr = r.obs_sequence.empty() ? nullptr : r.obs_sequence.data();
+            return py::array_t<float>({len, static_cast<py::ssize_t>(OBS_DIM)}, ptr);
         })
         .def_property_readonly("action_sequence", [](PolicyRequest& r) {
             const py::ssize_t len = std::max(0, r.valid_len);
-            return py::array_t<int64_t>({len}, r.action_sequence);
+            const int64_t* ptr = r.action_sequence.empty() ? nullptr : r.action_sequence.data();
+            return py::array_t<int64_t>({len}, ptr);
         })
         .def_property_readonly("agent_type_sequence", [](PolicyRequest& r) {
             const py::ssize_t len = std::max(0, r.valid_len);
-            return py::array_t<int64_t>({len}, r.agent_type_sequence);
+            const int64_t* ptr = r.agent_type_sequence.empty() ? nullptr : r.agent_type_sequence.data();
+            return py::array_t<int64_t>({len}, ptr);
         })
         .def_property_readonly("position_sequence", [](PolicyRequest& r) {
             const py::ssize_t len = std::max(0, r.valid_len);
-            return py::array_t<int64_t>({len}, r.position_sequence);
+            const int64_t* ptr = r.position_sequence.empty() ? nullptr : r.position_sequence.data();
+            return py::array_t<int64_t>({len}, ptr);
         })
         .def_property_readonly("action_mask_sequence", [](PolicyRequest& r) {
             const py::ssize_t len = std::max(0, r.valid_len);
-            return py::array_t<uint8_t>({len, static_cast<py::ssize_t>(7)}, r.action_mask_sequence[0]);
+            const uint8_t* ptr = r.action_mask_sequence.empty() ? nullptr : r.action_mask_sequence.data();
+            return py::array_t<uint8_t>({len, static_cast<py::ssize_t>(7)}, ptr);
         })
         .def_readonly("valid_len", &PolicyRequest::valid_len);
 

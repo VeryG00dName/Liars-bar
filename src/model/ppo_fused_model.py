@@ -1,67 +1,137 @@
 # src/model/ppo_fused_model.py
 
+from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 @torch.jit.script
-def _entmax15_op(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    """
-    A pure PyTorch, scriptable and deterministic implementation of entmax1-alpha.
-    This implementation is for alpha = 1.5.
-    
-    Based on:
-    "Sparse Sequence-to-Sequence Models"
-    """
-    # entmax is defined as: sparsemax(x * (α - 1))
-    # For α = 1.5, this is sparsemax(x * 0.5)
-    x = x * 0.5
+def _entmax15_bisect_functional(
+    x: torch.Tensor,
+    dim: int = -1,
+    n_iter: int = 50,
+    *,
+    mask: Optional[torch.Tensor] = None,   # same shape as x; False/0 => invalid
+    topk: Optional[int] = None,            # None/0 disables; else restrict to top-k along dim
+    eps: float = 1e-20,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    # Do math in fp32 for AMP safety; return original dtype
+    x32 = x.to(torch.float32)
 
-    # The rest of the algorithm is sparsemax
-    max_val, _ = torch.max(x, dim=dim, keepdim=True)
-    x = x - max_val  # Subtract max for numerical stability
+    # Optional temperature (logit scaling)
+    if temperature != 1.0:
+        x32 = x32 / temperature
 
-    # Sort descending
-    x_sorted, _ = torch.sort(x, dim=dim, descending=True)
+    # Mask invalid positions by pushing to -inf pre-topk
+    if mask is not None:
+        m = mask.to(torch.bool)
+        neg_inf = torch.finfo(x32.dtype).min
+        x32 = torch.where(m, x32, torch.full_like(x32, neg_inf))
+    else:
+        m = None
 
-    # Calculate cumulative sums
-    cumsum = torch.cumsum(x_sorted, dim=dim)
-    
-    # Create a tensor of [1, 2, 3, ...] for comparison
-    k = torch.arange(1, x.shape[dim] + 1, device=x.device, dtype=x.dtype)
-    
-    # The support size `rho` is the largest index `k` where the condition holds for each row
-    # Condition: 1 + k * z_k > cumsum_k
-    is_in_support = 1 + k * x_sorted > cumsum
-    
-    # Sum the boolean mask to get the support size `rho` for each sample in the batch
-    # This is equivalent to finding the largest k
-    rho = is_in_support.sum(dim=dim, keepdim=True)
-    
-    # The threshold tau is derived from the k=rho value
-    # We use gather to select the rho-th element for each row.
-    # rho is 1-indexed, so we subtract 1 for 0-indexed gather.
-    rho_idx = (rho - 1).long()
-    tau_numerator = cumsum.gather(dim, rho_idx)
-    
-    # Calculate the threshold tau for each row
-    tau = (tau_numerator - 1) / rho.to(x.dtype)
-    
-    # Apply the thresholding (this is the sparsemax operation)
-    # The result is squared as the final step of entmax for α=1.5
-    p = torch.max(torch.zeros_like(x), x - tau)
-    return p.pow(2) # For entmax(α=1.5), the result of sparsemax is squared.
+    # Optional top-k preselection for speed on large action spaces
+    if topk is not None and topk > 0:
+        k = min(topk, x32.size(dim))
+        vals, idx = torch.topk(x32, k=k, dim=dim)
+        work = vals
+        top_idx = idx
+    else:
+        work = x32
+        top_idx = None
+
+    # Canonical scaling for alpha = 1.5: u = z / 3
+    u = work / 3.0
+    u = u - u.max(dim=dim, keepdim=True).values  # shift-invariant, improves stability
+
+    # Bracket tau: s(tau) = sum((u - tau)_+^2)
+    u_max = u.max(dim=dim, keepdim=True).values
+    u_min = u.min(dim=dim, keepdim=True).values
+    hi = u_max
+    lo = u_min - 1.0  # safe bound so s(lo) >= 1
+
+    # Fixed-iteration bisection (deterministic when det. flags are on)
+    for _ in range(n_iter):
+        mid = 0.5 * (lo + hi)
+        p = torch.clamp(u - mid, min=0.0)
+        s = (p * p).sum(dim=dim, keepdim=True)
+        gt = s > 1.0
+        lo = torch.where(gt, mid, lo)
+        hi = torch.where(gt, hi, mid)
+
+    tau = 0.5 * (lo + hi)
+    p = torch.clamp(u - tau, min=0.0)
+    p = p * p
+
+    # Renormalize to protect against tiny roundoff
+    zsum = p.sum(dim=dim, keepdim=True)
+    p = p / (zsum + eps)
+
+    # If we used top-k, scatter back; else p already matches shape
+    if top_idx is not None:
+        out = torch.zeros_like(x32)
+        out = out.scatter(dim, top_idx, p)
+        p = out
+
+    # Enforce exact zeros on masked entries
+    if m is not None:
+        p = torch.where(m, p, torch.zeros_like(p))
+
+    return p.to(x.dtype)
 
 class Entmax15(nn.Module):
     """
-    A traceable, scriptable nn.Module for the entmax1.5 activation function.
+    Entmax-1.5 as an nn.Module.
+
+    Args:
+        dim: class dimension
+        n_iter: bisection iterations (fixed for determinism)
+        eps: tiny epsilon for safe renorm
+        topk: optional top-k preselect for speed (None/0 disables)
+        temperature: optional logit temperature (>=1.0 is smoother)
     """
-    def __init__(self, dim: int = -1):
+    def __init__(
+        self,
+        dim: int = -1,
+        n_iter: int = 50,
+        eps: float = 1e-20,
+        topk: Optional[int] = None,
+        temperature: float = 1.0,
+    ):
         super().__init__()
         self.dim = dim
+        self.n_iter = int(n_iter)
+        self.eps = float(eps)
+        self.topk = topk if (topk is not None and topk > 0) else None
+        self.temperature = float(temperature)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return _entmax15_op(x, self.dim)
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return _entmax15_bisect_functional(
+            x,
+            dim=self.dim,
+            n_iter=self.n_iter,
+            mask=mask,
+            topk=self.topk,
+            eps=self.eps,
+            temperature=self.temperature,
+        )
+
+    @staticmethod
+    def functional(
+        x: torch.Tensor,
+        dim: int = -1,
+        n_iter: int = 50,
+        *,
+        mask: Optional[torch.Tensor] = None,
+        topk: Optional[int] = None,
+        eps: float = 1e-20,
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+        """Convenience stateless functional API."""
+        return _entmax15_bisect_functional(
+            x, dim=dim, n_iter=n_iter, mask=mask, topk=topk, eps=eps, temperature=temperature
+        )
 
 class StrategyDictionary(nn.Module):
     """
@@ -85,7 +155,7 @@ class StrategyDictionary(nn.Module):
             nn.Linear(hidden_dim, num_bricks)
         )
         
-        self.entmax_activation = Entmax15(dim=-1)
+        self.entmax_activation = Entmax15(dim=-1, n_iter=50, topk=None, temperature=1.0)
 
     def forward(self, transformer_output: torch.Tensor):
         # transformer_output shape: [B, T, D_transformer]
@@ -226,7 +296,18 @@ class PPOFusedModel(nn.Module):
         # --- APPLY DROPOUT HERE ---
         # Apply dropout to the activations before they are used.
         # This should only be active during training.
-        activations_reg = F.dropout(activations, p=dropout_p, training=self.training)
+        
+        if self.training and dropout_p > 0:
+            # sample mask (same semantics as dropout but without 1/(1-p) scaling)
+            keep = torch.rand_like(activations) > dropout_p
+            dropped = activations * keep
+            row_sum = dropped.sum(-1, keepdim=True).clamp_min(1e-12)
+            # if a row goes all-zero (very rare when p small), fall back to original activations
+            all_zero = (row_sum <= 1e-12)
+            activations_reg = dropped / row_sum
+            activations_reg = torch.where(all_zero, activations, activations_reg)
+        else:
+            activations_reg = activations
         
         # compute the strategy code using the regularized activations
         strategy_code = torch.matmul(activations_reg, bricks)

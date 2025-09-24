@@ -2,9 +2,11 @@
 #include "bare_env.h"
 #include "roles.h"
 
-#include <vector>
-#include <unordered_map>
+#include <array>
+#include <cstddef>
 #include <cstdint>
+#include <unordered_map>
+#include <vector>
 
 static constexpr int MAX_LEN = 255;
 static constexpr int OBS_DIM = 2 + (Env::MAX_PLAYERS - 1) + Env::MAX_PLAYERS; // newerest dim
@@ -12,19 +14,19 @@ static constexpr int OBS_DIM = 2 + (Env::MAX_PLAYERS - 1) + Env::MAX_PLAYERS; //
 struct PolicyRequest {
         int env = -1;    // env index [0..B)
         int seat = -1;   // seat in [0..n_players)
-        uint8_t mask[7]{0,0,0,0,0,0,0};
+        std::array<uint8_t, 7> mask{};
         uint8_t done = 0;  // 1 if env already terminal
 
         // For classic C++ bots
-        float classic_obs[3 + Env::MAX_PLAYERS]{};
+        std::array<float, 3 + Env::MAX_PLAYERS> classic_obs{};
         int   classic_obs_len = 0;
 
         // For AI models (pre-built sequence)
-        float   obs_sequence[MAX_LEN][OBS_DIM]{};
-        int64_t action_sequence[MAX_LEN]{};
-        int64_t agent_type_sequence[MAX_LEN]{};
-        int64_t position_sequence[MAX_LEN]{};
-        uint8_t action_mask_sequence[MAX_LEN][7]{};
+        std::vector<float> obs_sequence;           // [valid_len, OBS_DIM]
+        std::vector<int64_t> action_sequence;      // [valid_len]
+        std::vector<int64_t> agent_type_sequence;  // [valid_len]
+        std::vector<int64_t> position_sequence;    // [valid_len]
+        std::vector<uint8_t> action_mask_sequence; // [valid_len, 7]
         int     valid_len = 0;
 };
 
@@ -52,7 +54,8 @@ struct VecArena {
         const std::unordered_map<int, std::vector<PolicyRequest>>& collect_requests();
 
 	// Submit batched actions for a specific policy_id (must match order & count of last collect_requests()).
-	void submit_actions(int policy_id, const std::vector<uint8_t>& actions);
+        void submit_actions(int policy_id, const std::vector<uint8_t>& actions);
+        void submit_actions(int policy_id, const uint8_t* actions, size_t count);
 
 	// Observation dimensionality for newerest
 	int obs_dim() const { return 2 + (n_players - 1) + n_players; }

@@ -3,6 +3,7 @@
 #include "vec_arena.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <random>
@@ -89,6 +90,14 @@ public:
                                   const std::vector<uint8_t>& actions,
                                   const std::vector<float>& log_probs = {},
                                   const std::vector<float>& values = {});
+
+    void submit_inference_results_array(int policy_id,
+                                        const uint8_t* actions,
+                                        size_t action_count,
+                                        const float* log_probs,
+                                        size_t log_prob_count,
+                                        const float* values,
+                                        size_t value_count);
 
     std::vector<TrajectoryData> get_completed_episodes();
 

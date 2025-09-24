@@ -15,26 +15,29 @@ py::dict policy_request_to_dict(const PolicyRequest& req) {
     out["seat"] = req.seat;
     out["done"] = req.done;
 
-    // This one is fine as is
-    out["mask"] = py::array_t<uint8_t>({7}, req.mask);
+    out["mask"] = py::array_t<uint8_t>({7}, req.mask.data());
 
-    out["classic_obs"] = py::array_t<float>({(py::ssize_t)req.classic_obs_len}, req.classic_obs);
+    out["classic_obs"] = py::array_t<float>({(py::ssize_t)req.classic_obs_len}, req.classic_obs.data());
     out["classic_obs_len"] = req.classic_obs_len;
-    
+
     const py::ssize_t valid_len = req.valid_len;
-    
-    // Create numpy arrays from raw pointers.
-    // The C-style arrays are contiguous in memory, so this is safe.
-    out["obs_sequence"] = py::array_t<float>({valid_len, static_cast<py::ssize_t>(OBS_DIM)}, &req.obs_sequence[0][0]);
-    out["action_sequence"] = py::array_t<int64_t>({valid_len}, &req.action_sequence[0]);
-    out["agent_type_sequence"] = py::array_t<int64_t>({valid_len}, &req.agent_type_sequence[0]);
-    out["position_sequence"] = py::array_t<int64_t>({valid_len}, &req.position_sequence[0]);
-    
+
+    const float* obs_ptr = req.obs_sequence.empty() ? nullptr : req.obs_sequence.data();
+    const int64_t* action_ptr = req.action_sequence.empty() ? nullptr : req.action_sequence.data();
+    const int64_t* agent_ptr = req.agent_type_sequence.empty() ? nullptr : req.agent_type_sequence.data();
+    const int64_t* pos_ptr = req.position_sequence.empty() ? nullptr : req.position_sequence.data();
+    const uint8_t* mask_ptr = req.action_mask_sequence.empty() ? nullptr : req.action_mask_sequence.data();
+
+    out["obs_sequence"] = py::array_t<float>({valid_len, static_cast<py::ssize_t>(OBS_DIM)}, obs_ptr);
+    out["action_sequence"] = py::array_t<int64_t>({valid_len}, action_ptr);
+    out["agent_type_sequence"] = py::array_t<int64_t>({valid_len}, agent_ptr);
+    out["position_sequence"] = py::array_t<int64_t>({valid_len}, pos_ptr);
+
     // *** THE MAIN FIX IS HERE ***
     // For 2D C-style arrays, it's safest to create a buffer_info object
     // to explicitly describe the memory layout (shape and strides).
     py::buffer_info action_mask_buf(
-        (void*)req.action_mask_sequence,              // Pointer to buffer
+        (void*)mask_ptr,                               // Pointer to buffer
         sizeof(uint8_t),                              // Size of one scalar
         py::format_descriptor<uint8_t>::format(),     // Python struct-style format descriptor
         2,                                            // Number of dimensions
@@ -114,11 +117,58 @@ void bind_rollout_manager(py::module_& m) {
             return out;
         })
 
-        .def("submit_inference_results", &RolloutManager::submit_inference_results,
+        .def("submit_inference_results",
+             [](RolloutManager& self,
+                int policy_id,
+                py::object actions_obj,
+                py::object log_probs_obj,
+                py::object values_obj) {
+                 auto actions_arr = py::array_t<uint8_t, py::array::c_style | py::array::forcecast>::ensure(actions_obj);
+                 if (!actions_arr) {
+                     throw py::type_error("actions must be convertible to a uint8 numpy array");
+                 }
+                 const uint8_t* actions_ptr = actions_arr.size() > 0
+                                                 ? static_cast<const uint8_t*>(actions_arr.data())
+                                                 : nullptr;
+                 const size_t action_count = static_cast<size_t>(actions_arr.size());
+
+                 const float* log_ptr = nullptr;
+                 size_t log_count = 0;
+                 py::array_t<float, py::array::c_style | py::array::forcecast> log_arr;
+                 if (!log_probs_obj.is_none()) {
+                     log_arr = py::array_t<float, py::array::c_style | py::array::forcecast>::ensure(log_probs_obj);
+                     if (!log_arr) {
+                         throw py::type_error("log_probs must be convertible to a float32 numpy array");
+                     }
+                     log_ptr = log_arr.size() > 0 ? static_cast<const float*>(log_arr.data()) : nullptr;
+                     log_count = static_cast<size_t>(log_arr.size());
+                 }
+
+                 const float* val_ptr = nullptr;
+                 size_t val_count = 0;
+                 py::array_t<float, py::array::c_style | py::array::forcecast> val_arr;
+                 if (!values_obj.is_none()) {
+                     val_arr = py::array_t<float, py::array::c_style | py::array::forcecast>::ensure(values_obj);
+                     if (!val_arr) {
+                         throw py::type_error("values must be convertible to a float32 numpy array");
+                     }
+                     val_ptr = val_arr.size() > 0 ? static_cast<const float*>(val_arr.data()) : nullptr;
+                     val_count = static_cast<size_t>(val_arr.size());
+                 }
+
+                 self.submit_inference_results_array(
+                     policy_id,
+                     actions_ptr,
+                     action_count,
+                     log_ptr,
+                     log_count,
+                     val_ptr,
+                     val_count);
+             },
              py::arg("policy_id"),
              py::arg("actions"),
-             py::arg("log_probs") = std::vector<float>(),
-             py::arg("values") = std::vector<float>())
+             py::arg("log_probs") = py::none(),
+             py::arg("values") = py::none())
              
         .def("get_completed_episodes", &RolloutManager::get_completed_episodes)
         .def("load_historical_model",

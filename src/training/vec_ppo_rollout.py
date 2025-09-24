@@ -302,29 +302,29 @@ class PPOVecRolloutManager:
                 else:
                     actions, log_probs, values = agent.get_actions_batch(prepared_requests)
 
-                actions_arr = np.asarray(actions, dtype=np.uint8)
+                actions_arr = np.ascontiguousarray(actions, dtype=np.uint8)
                 log_probs_arr = (
-                    np.asarray(log_probs, dtype=np.float32)
+                    np.ascontiguousarray(log_probs, dtype=np.float32)
                     if log_probs is not None
-                    else np.empty(0, dtype=np.float32)
+                    else None
                 )
                 values_arr = (
-                    np.asarray(values, dtype=np.float32)
+                    np.ascontiguousarray(values, dtype=np.float32)
                     if values is not None
-                    else np.empty(0, dtype=np.float32)
+                    else None
                 )
 
                 if policy_id == training_policy_id:
                     self.rollout_manager.submit_inference_results(
                         policy_id,
-                        actions_arr.tolist(),
-                        log_probs_arr.tolist(),
-                        values_arr.tolist(),
+                        actions_arr,
+                        log_probs_arr if log_probs_arr is not None else None,
+                        values_arr if values_arr is not None else None,
                     )
                 else:
                     self.rollout_manager.submit_inference_results(
                         policy_id,
-                        actions_arr.tolist(),
+                        actions_arr,
                     )
 
         completed = self.rollout_manager.get_completed_episodes()
