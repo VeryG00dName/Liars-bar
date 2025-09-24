@@ -1,11 +1,17 @@
 # src/agents/cpp_bot_wrapper.py
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 from src.agents.base_agent import BaseAgent
 import torch
 from src.misc import lb
 from src import config
+
+
+def _req_get(req: Any, key: str, default: Any = None) -> Any:
+    if isinstance(req, dict):
+        return req.get(key, default)
+    return getattr(req, key, default)
 
 class CppBotWrapper(BaseAgent):
     """Wraps a C++ bot class so it can be treated as a policy object."""
@@ -25,11 +31,11 @@ class CppBotWrapper(BaseAgent):
         # Not used in VecArena training; implemented to satisfy BaseAgent.
         raise NotImplementedError("CppBotWrapper is only supported in batched VecArena via get_actions_batch().")
 
-    def get_actions_batch(self, requests: List[lb.PolicyRequest]):
+    def get_actions_batch(self, requests: List[Any]):
         actions = []
         for req in requests:
-            env_idx = int(req.env)
-            seat_idx = int(req.seat)
+            env_idx = int(_req_get(req, "env", -1))
+            seat_idx = int(_req_get(req, "seat", -1))
             key = (env_idx, seat_idx)
 
             bot = self._bot_cache.get(key)
@@ -40,9 +46,9 @@ class CppBotWrapper(BaseAgent):
                 else:
                     bot = self.bot_cls("bot")
                 self._bot_cache[key] = bot
-            obs = np.array(req.classic_obs, dtype=np.float32)
-            L = int(getattr(req, 'classic_obs_len', len(obs)))
-            mask = np.array(req.mask, dtype=np.uint8)
+            obs = np.asarray(_req_get(req, "classic_obs", ()), dtype=np.float32)
+            L = int(_req_get(req, "classic_obs_len", len(obs)))
+            mask = np.asarray(_req_get(req, "mask", ()), dtype=np.uint8)
             a = bot.act(obs, L, mask)
             actions.append(int(a))
         return np.array(actions, dtype=np.uint8), None, None

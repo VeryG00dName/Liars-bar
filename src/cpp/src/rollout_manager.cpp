@@ -394,6 +394,8 @@ PreparedBatch RolloutManager::prepare_training_batch(const std::vector<PolicyReq
     auto action_masks = torch::zeros({batch_size, max_len, 7}, opts_bool_cpu);
     auto padding_mask = torch::zeros({batch_size, max_len}, opts_bool_cpu);
     auto valid_lengths = torch::zeros({batch_size}, opts_long_cpu);
+    auto env_indices = torch::zeros({batch_size}, opts_long_cpu);
+    auto seat_indices = torch::zeros({batch_size}, opts_long_cpu);
 
     for (int64_t b = 0; b < batch_size; ++b) {
         const auto& req = requests[static_cast<size_t>(b)];
@@ -401,6 +403,8 @@ PreparedBatch RolloutManager::prepare_training_batch(const std::vector<PolicyReq
         const int64_t used_len = std::max<int64_t>(1, requested_len);
 
         valid_lengths[b] = used_len;
+        env_indices[b] = static_cast<int64_t>(req.env);
+        seat_indices[b] = static_cast<int64_t>(req.seat);
 
         float* obs_ptr = obs_sequence[b].data_ptr<float>();
         int64_t* act_ptr = action_sequence[b].data_ptr<int64_t>();
@@ -474,6 +478,8 @@ PreparedBatch RolloutManager::prepare_training_batch(const std::vector<PolicyReq
     batch.action_masks = action_masks.to(target_device, false, true);
     batch.padding_mask = padding_mask.to(target_device, false, true);
     batch.valid_lengths = valid_lengths.to(target_device, false, true);
+    batch.env_indices = env_indices.to(target_device, false, true);
+    batch.seat_indices = seat_indices.to(target_device, false, true);
 
     return batch;
 }

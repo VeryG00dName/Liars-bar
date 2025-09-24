@@ -17,33 +17,36 @@ py::dict policy_request_to_dict(const PolicyRequest& req) {
 
     out["mask"] = py::array_t<uint8_t>({7}, req.mask.data());
 
-    out["classic_obs"] = py::array_t<float>({(py::ssize_t)req.classic_obs_len}, req.classic_obs.data());
+    out["classic_obs"] =
+        py::array_t<float>({(py::ssize_t)req.classic_obs_len}, req.classic_obs.data());
     out["classic_obs_len"] = req.classic_obs_len;
 
     const py::ssize_t valid_len = req.valid_len;
 
     const float* obs_ptr = req.obs_sequence.empty() ? nullptr : req.obs_sequence.data();
-    const int64_t* action_ptr = req.action_sequence.empty() ? nullptr : req.action_sequence.data();
-    const int64_t* agent_ptr = req.agent_type_sequence.empty() ? nullptr : req.agent_type_sequence.data();
-    const int64_t* pos_ptr = req.position_sequence.empty() ? nullptr : req.position_sequence.data();
-    const uint8_t* mask_ptr = req.action_mask_sequence.empty() ? nullptr : req.action_mask_sequence.data();
+    const int64_t* action_ptr =
+        req.action_sequence.empty() ? nullptr : req.action_sequence.data();
+    const int64_t* agent_ptr =
+        req.agent_type_sequence.empty() ? nullptr : req.agent_type_sequence.data();
+    const int64_t* pos_ptr =
+        req.position_sequence.empty() ? nullptr : req.position_sequence.data();
+    const uint8_t* mask_ptr =
+        req.action_mask_sequence.empty() ? nullptr : req.action_mask_sequence.data();
 
-    out["obs_sequence"] = py::array_t<float>({valid_len, static_cast<py::ssize_t>(OBS_DIM)}, obs_ptr);
+    out["obs_sequence"] =
+        py::array_t<float>({valid_len, static_cast<py::ssize_t>(OBS_DIM)}, obs_ptr);
     out["action_sequence"] = py::array_t<int64_t>({valid_len}, action_ptr);
     out["agent_type_sequence"] = py::array_t<int64_t>({valid_len}, agent_ptr);
     out["position_sequence"] = py::array_t<int64_t>({valid_len}, pos_ptr);
 
-    // *** THE MAIN FIX IS HERE ***
-    // For 2D C-style arrays, it's safest to create a buffer_info object
-    // to explicitly describe the memory layout (shape and strides).
+    // Explicitly describe the 2D layout to avoid stride issues.
     py::buffer_info action_mask_buf(
-        (void*)mask_ptr,                               // Pointer to buffer
-        sizeof(uint8_t),                              // Size of one scalar
-        py::format_descriptor<uint8_t>::format(),     // Python struct-style format descriptor
-        2,                                            // Number of dimensions
-        { valid_len, (py::ssize_t)7 },                // Shape of the matrix
-        { sizeof(uint8_t) * 7, sizeof(uint8_t) }      // Strides (in bytes) for each index
-    );
+        (void*)mask_ptr,
+        sizeof(uint8_t),
+        py::format_descriptor<uint8_t>::format(),
+        2,
+        {valid_len, (py::ssize_t)7},
+        {sizeof(uint8_t) * 7, sizeof(uint8_t)});
     out["action_mask_sequence"] = py::array_t<uint8_t>(action_mask_buf);
 
     out["valid_len"] = req.valid_len;
@@ -59,6 +62,8 @@ py::dict prepared_batch_to_dict(const PreparedBatch& batch) {
     tensors["action_masks"] = batch.action_masks;
     tensors["padding_mask"] = batch.padding_mask;
     tensors["valid_lengths"] = batch.valid_lengths;
+    tensors["env_indices"] = batch.env_indices;
+    tensors["seat_indices"] = batch.seat_indices;
     return tensors;
 }
 } // end anonymous namespace

@@ -133,11 +133,16 @@ class PPOVecRolloutManager:
                 )
 
     @staticmethod
-    def _prepare_requests(raw_requests: List[Any]) -> List[SimpleNamespace]:
-        prepared: List[SimpleNamespace] = []
+    def _prepare_requests(raw_requests: List[Any]) -> List[Any]:
+        prepared: List[Any] = []
+        append = prepared.append
         for req in raw_requests:
-            data = dict(req)
-            prepared.append(SimpleNamespace(**data))
+            if isinstance(req, SimpleNamespace):
+                append(req)
+            elif isinstance(req, dict):
+                append(SimpleNamespace(**req))
+            else:
+                append(req)  # PolicyRequest from pybind already exposes attributes
         return prepared
 
     def _convert_completed_episode(self, traj: lb.TrajectoryData) -> Dict[str, Any]:
@@ -169,14 +174,20 @@ class PPOVecRolloutManager:
             player_labels[seat] for seat in opp_seats if seat != training_seat
         )
 
-        agent_ids = [int(x) for x in traj.agent_id]
-        our_actions = [int(x) if int(x) >= 0 else None for x in traj.our_action]
-        log_probs = [float(x) for x in traj.log_prob]
-        values = [float(x) for x in traj.value]
-        rewards = [float(x) for x in traj.reward]
-        dones = [bool(x) for x in traj.done]
-        opp_targets = [int(x) if int(x) >= 0 else None for x in traj.opp_target_action]
-        penalties_used = [int(x) for x in traj.penalties_used]
+        def _as_numpy(sequence: Any, dtype: Any) -> np.ndarray:
+            if sequence is None:
+                return np.empty(0, dtype=dtype)
+            arr = np.asarray(sequence, dtype=dtype)
+            return arr.reshape(-1) if arr.ndim != 1 else arr
+
+        agent_ids = _as_numpy(traj.agent_id, np.int32)
+        our_actions = _as_numpy(traj.our_action, np.int32)
+        log_probs = _as_numpy(traj.log_prob, np.float32)
+        values = _as_numpy(traj.value, np.float32)
+        rewards = _as_numpy(traj.reward, np.float32)
+        dones = _as_numpy(traj.done, np.bool_)
+        opp_targets = _as_numpy(traj.opp_target_action, np.int32)
+        penalties_used = _as_numpy(traj.penalties_used, np.int32)
 
         training_policy_id = int(traj.training_policy_id)
         training_agent = self.policies.get(training_policy_id)
@@ -278,14 +289,9 @@ class PPOVecRolloutManager:
                 tensors_payload = None
                 if isinstance(payload, dict):
                     tensors_payload = payload.get("tensors")
-                    request_entries = list(payload.get("requests", []))
+                    request_entries = payload.get("requests", [])
                 else:
-                    request_entries = list(payload)
-
-                prepared_requests = self._prepare_requests(request_entries)
-
-                if not prepared_requests:
-                    continue
+                    request_entries = payload
 
                 if tensors_payload and hasattr(agent, "compute_actions"):
                     if policy_id != training_policy_id:
@@ -293,26 +299,45 @@ class PPOVecRolloutManager:
                             "Received tensor payload for non-training policy %s." % policy_id
                         )
 
-                    tensor_inputs = {
-                        str(key): tensors_payload[key] for key in tensors_payload.keys()
-                    }
+                    tensor_inputs: Dict[str, Any] = {}
+                    metadata: Dict[str, Any] = {}
+                    for key in tensors_payload.keys():
+                        key_str = str(key)
+                        value = tensors_payload[key]
+                        if key_str in {"env_indices", "seat_indices"}:
+                            metadata[key_str] = value
+                        else:
+                            tensor_inputs[key_str] = value
                     actions, log_probs, values = agent.compute_actions(
-                        tensor_inputs, prepared_requests
+                        tensor_inputs, metadata=metadata
                     )
                 else:
+                    request_entries = list(request_entries)
+                    prepared_requests = self._prepare_requests(request_entries)
+
+                    if not prepared_requests:
+                        continue
+
                     actions, log_probs, values = agent.get_actions_batch(prepared_requests)
 
-                actions_arr = np.ascontiguousarray(actions, dtype=np.uint8)
-                log_probs_arr = (
-                    np.ascontiguousarray(log_probs, dtype=np.float32)
-                    if log_probs is not None
-                    else None
-                )
-                values_arr = (
-                    np.ascontiguousarray(values, dtype=np.float32)
-                    if values is not None
-                    else None
-                )
+                if isinstance(actions, np.ndarray) and actions.dtype == np.uint8 and actions.flags.c_contiguous:
+                    actions_arr = actions
+                else:
+                    actions_arr = np.ascontiguousarray(actions, dtype=np.uint8)
+
+                if log_probs is not None and isinstance(log_probs, np.ndarray) and log_probs.dtype == np.float32 and log_probs.flags.c_contiguous:
+                    log_probs_arr = log_probs
+                elif log_probs is not None:
+                    log_probs_arr = np.ascontiguousarray(log_probs, dtype=np.float32)
+                else:
+                    log_probs_arr = None
+
+                if values is not None and isinstance(values, np.ndarray) and values.dtype == np.float32 and values.flags.c_contiguous:
+                    values_arr = values
+                elif values is not None:
+                    values_arr = np.ascontiguousarray(values, dtype=np.float32)
+                else:
+                    values_arr = None
 
                 if policy_id == training_policy_id:
                     self.rollout_manager.submit_inference_results(

@@ -42,14 +42,10 @@ class LearnerAutoregressiveAgent:
     def compute_actions(
         self,
         tensor_inputs: Dict[str, torch.Tensor],
-        requests: List[Any],
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         if self.model is None:
             raise RuntimeError("LearnerAutoregressiveAgent model has not been initialized.")
-
-        if not requests:
-            empty = np.array([], dtype=np.float32)
-            return empty.astype(np.uint8), empty, empty
 
         model_input: Dict[str, torch.Tensor] = {}
         for key, value in tensor_inputs.items():
@@ -65,6 +61,9 @@ class LearnerAutoregressiveAgent:
             action_logits, _, state_values = self.model(**model_input)
 
         valid_lengths = model_input["valid_lengths"].long()
+        if valid_lengths.numel() == 0:
+            empty = np.array([], dtype=np.float32)
+            return empty.astype(np.uint8), empty, empty
         rows = torch.arange(valid_lengths.shape[0], device=self.device)
         last_idx = (valid_lengths - 1).clamp_min(0)
 
@@ -81,73 +80,89 @@ class LearnerAutoregressiveAgent:
         log_probs_np = log_probs_t.detach().cpu().numpy().astype(np.float32)
         values_np = values_last.detach().cpu().numpy().astype(np.float32)
 
-        self._record_last_inputs(requests, model_input)
+        env_indices = None
+        seat_indices = None
+        if metadata:
+            env_indices = metadata.get("env_indices")
+            seat_indices = metadata.get("seat_indices")
+
+        self._record_last_inputs(env_indices, seat_indices, model_input)
 
         return actions_np, log_probs_np, values_np
 
     def _record_last_inputs(
         self,
-        requests: List[Any],
+        env_indices: Optional[Any],
+        seat_indices: Optional[Any],
         model_input: Dict[str, torch.Tensor],
     ) -> None:
+        if env_indices is None or seat_indices is None:
+            return
+
+        if isinstance(env_indices, torch.Tensor):
+            env_tensor = env_indices.detach().cpu().to(torch.long)
+        else:
+            env_tensor = torch.as_tensor(env_indices, dtype=torch.long)
+
+        if isinstance(seat_indices, torch.Tensor):
+            seat_tensor = seat_indices.detach().cpu().to(torch.long)
+        else:
+            seat_tensor = torch.as_tensor(seat_indices, dtype=torch.long)
+
+        valid_lengths_t = model_input.get("valid_lengths")
         obs_tensor = model_input.get("obs_sequence")
-        if isinstance(obs_tensor, torch.Tensor) and obs_tensor.dim() >= 3:
-            obs_dim = int(obs_tensor.shape[-1])
-        else:
-            obs_dim = int(getattr(getattr(self.model, "_orig_mod", self.model), "obs_dim", 0) or 0)
-            if obs_dim <= 0:
-                obs_dim = 9
-
+        action_tensor = model_input.get("action_sequence")
+        agent_tensor = model_input.get("agent_types")
+        position_tensor = model_input.get("positions")
         mask_tensor = model_input.get("action_masks")
-        if isinstance(mask_tensor, torch.Tensor) and mask_tensor.dim() >= 3:
-            mask_dim = int(mask_tensor.shape[-1])
-        else:
-            mask_dim = 7
+        padding_tensor = model_input.get("padding_mask")
 
-        valid_lengths = model_input.get("valid_lengths")
-        valid_lengths_cpu = (
-            valid_lengths.detach().cpu().tolist()
-            if isinstance(valid_lengths, torch.Tensor)
-            else [max(int(getattr(req, "valid_len", 1)), 1) for req in requests]
-        )
+        if not all(isinstance(t, torch.Tensor) for t in (
+            valid_lengths_t,
+            obs_tensor,
+            action_tensor,
+            agent_tensor,
+            position_tensor,
+            mask_tensor,
+            padding_tensor,
+        )):
+            return
 
-        for idx, req in enumerate(requests):
-            env_idx = int(getattr(req, "env", -1))
-            seat_idx = int(getattr(req, "seat", -1))
-            requested_len = int(getattr(req, "valid_len", 0))
-            used_len = int(valid_lengths_cpu[idx]) if idx < len(valid_lengths_cpu) else max(requested_len, 1)
+        if obs_tensor.dim() < 3 or mask_tensor.dim() < 3:
+            return
 
-            obs_storage = torch.zeros((1, used_len, obs_dim), dtype=torch.float32)
-            action_storage = torch.zeros((1, used_len), dtype=torch.long)
-            agent_storage = torch.zeros((1, used_len), dtype=torch.long)
-            pos_storage = torch.zeros((1, used_len), dtype=torch.long)
-            mask_storage = torch.zeros((1, used_len, mask_dim), dtype=torch.bool)
+        obs_cpu = obs_tensor.detach().cpu()
+        action_cpu = action_tensor.detach().cpu()
+        agent_cpu = agent_tensor.detach().cpu()
+        position_cpu = position_tensor.detach().cpu()
+        mask_cpu = mask_tensor.detach().cpu()
+        padding_cpu = padding_tensor.detach().cpu()
+        valid_lengths_cpu = valid_lengths_t.detach().cpu().to(torch.long)
 
-            if requested_len > 0:
-                obs_np = np.asarray(req.obs_sequence, dtype=np.float32)
-                act_np = np.asarray(req.action_sequence, dtype=np.int64)
-                agent_np = np.asarray(req.agent_type_sequence, dtype=np.int64)
-                pos_np = np.asarray(req.position_sequence, dtype=np.int64)
-                mask_np = np.asarray(req.action_mask_sequence, dtype=np.uint8)
+        batch_size = valid_lengths_cpu.shape[0]
+        for idx in range(batch_size):
+            if idx >= env_tensor.numel() or idx >= seat_tensor.numel():
+                break
 
-                obs_storage[0, :requested_len].copy_(torch.from_numpy(obs_np[:requested_len].copy()))
-                action_storage[0, :requested_len].copy_(torch.from_numpy(act_np[:requested_len].copy()))
-                agent_storage[0, :requested_len].copy_(torch.from_numpy(agent_np[:requested_len].copy()))
-                pos_storage[0, :requested_len].copy_(torch.from_numpy(pos_np[:requested_len].copy()))
-                mask_bool = torch.from_numpy(mask_np[:requested_len].astype(np.bool_, copy=True))
-                mask_storage[0, :requested_len].copy_(mask_bool)
+            env_idx = int(env_tensor[idx].item())
+            seat_idx = int(seat_tensor[idx].item())
+            used_len = int(valid_lengths_cpu[idx].item())
+            used_len = max(used_len, 1)
 
-            padding_mask = torch.ones((1, used_len), dtype=torch.bool)
-            if requested_len > 0:
-                padding_mask[0, :requested_len] = False
+            obs_slice = obs_cpu[idx : idx + 1, :used_len].clone()
+            action_slice = action_cpu[idx : idx + 1, :used_len].clone()
+            agent_slice = agent_cpu[idx : idx + 1, :used_len].clone()
+            position_slice = position_cpu[idx : idx + 1, :used_len].clone()
+            mask_slice = mask_cpu[idx : idx + 1, :used_len].clone()
+            padding_slice = padding_cpu[idx : idx + 1, :used_len].clone()
 
             snapshot = {
-                "obs_sequence": obs_storage.cpu(),
-                "action_sequence": action_storage.cpu(),
-                "agent_types": agent_storage.cpu(),
-                "positions": pos_storage.cpu(),
-                "action_masks": mask_storage.cpu(),
-                "padding_mask": padding_mask.cpu(),
+                "obs_sequence": obs_slice,
+                "action_sequence": action_slice,
+                "agent_types": agent_slice,
+                "positions": position_slice,
+                "action_masks": mask_slice,
+                "padding_mask": padding_slice,
                 "valid_lengths": torch.tensor([used_len], dtype=torch.long),
             }
 

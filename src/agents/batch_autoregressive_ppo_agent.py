@@ -9,8 +9,13 @@ from src.agents.base_agent import BaseAgent
 from src.model.ppo_autoregressive_model import PPOAutoregressiveModel
 from src.model.ppo_fused_model import PPOFusedModel
 from src.model.model_factory import ModelFactory as MFactoryUtil
-from src.misc import lb
 from src import config
+
+
+def _req_get(req: Any, key: str, default: Any = None) -> Any:
+    if isinstance(req, dict):
+        return req.get(key, default)
+    return getattr(req, key, default)
 logger = logging.getLogger(__name__)
 
 
@@ -18,7 +23,7 @@ logger = logging.getLogger(__name__)
 class PreparedPolicyBatch:
     """Lightweight container for a pre-built batch of policy requests."""
 
-    requests: List[lb.PolicyRequest]
+    requests: List[Any]
     model_input_cpu: Dict[str, torch.Tensor]
     last_inputs: List[Dict[str, torch.Tensor]]
 
@@ -143,7 +148,7 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
         return {(my_seat + i) % num_players: i for i in range(num_players)}
     
     @staticmethod
-    def build_prepared_batch(requests: List[lb.PolicyRequest]) -> PreparedPolicyBatch:
+    def build_prepared_batch(requests: List[Any]) -> PreparedPolicyBatch:
         if not requests:
             empty = torch.empty((0, 0))
             model_input_cpu = {
@@ -166,12 +171,18 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
         last_inputs: List[Dict[str, torch.Tensor]] = []
 
         for req in requests:
-            L = int(req.valid_len)
-            obs = torch.from_numpy(np.asarray(req.obs_sequence[:L], dtype=np.float32)).clone()
-            act = torch.from_numpy(np.asarray(req.action_sequence[:L], dtype=np.int64)).clone()
-            ag = torch.from_numpy(np.asarray(req.agent_type_sequence[:L], dtype=np.int64)).clone()
-            pos = torch.from_numpy(np.asarray(req.position_sequence[:L], dtype=np.int64)).clone()
-            mask = torch.from_numpy(np.asarray(req.action_mask_sequence[:L], dtype=np.uint8)).to(torch.bool).clone()
+            L = int(_req_get(req, "valid_len", 0))
+            obs_seq = _req_get(req, "obs_sequence", ())
+            act_seq = _req_get(req, "action_sequence", ())
+            agent_seq = _req_get(req, "agent_type_sequence", ())
+            pos_seq = _req_get(req, "position_sequence", ())
+            mask_seq = _req_get(req, "action_mask_sequence", ())
+
+            obs = torch.from_numpy(np.asarray(obs_seq[:L], dtype=np.float32)).clone()
+            act = torch.from_numpy(np.asarray(act_seq[:L], dtype=np.int64)).clone()
+            ag = torch.from_numpy(np.asarray(agent_seq[:L], dtype=np.int64)).clone()
+            pos = torch.from_numpy(np.asarray(pos_seq[:L], dtype=np.int64)).clone()
+            mask = torch.from_numpy(np.asarray(mask_seq[:L], dtype=np.uint8)).to(torch.bool).clone()
 
             obs_list.append(obs)
             act_list.append(act)
@@ -242,7 +253,9 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
 
         for out_idx, global_idx in enumerate(indices):
             req = prepared.requests[global_idx]
-            self._last_model_input[(req.env, req.seat)] = prepared.last_inputs[global_idx]
+            env_idx = int(_req_get(req, "env", -1))
+            seat_idx = int(_req_get(req, "seat", -1))
+            self._last_model_input[(env_idx, seat_idx)] = prepared.last_inputs[global_idx]
 
         return (
             actions_t.detach().cpu().numpy().astype(np.uint8),
@@ -251,7 +264,7 @@ class BatchPPOAutoregressiveAgent(BaseAgent):
         )
 
     @torch.inference_mode()
-    def get_actions_batch(self, requests: List[lb.PolicyRequest]):
+    def get_actions_batch(self, requests: List[Any]):
         prepared = self.build_prepared_batch(requests)
         return self.get_actions_from_prepared(prepared, list(range(len(prepared.requests))))
 

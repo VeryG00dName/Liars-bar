@@ -52,6 +52,8 @@ SEED = int(getattr(config, "SEED", 42))
 set_seed(SEED)
 _GLOBAL_RNG = np.random.default_rng(SEED)
 
+FORCE_CUDA_SYNC_FOR_TIMING = bool(getattr(config, "FORCE_CUDA_SYNC_FOR_TIMING", False))
+
 
 # ==============================================================================
 # SECTION 1: HELPER CLASSES AND FUNCTIONS
@@ -390,6 +392,9 @@ def train_generation(
     # 4. MAIN TRAINING LOOP
     episodes_per_update = int(config.EPISODES_PER_UPDATE)
     k_epochs = int(config.K_EPOCHS)
+    max_batch_envs = int(getattr(config, "EPISODES_PER_UPDATE", 512))
+    buffer_mult = int(getattr(config, "OFFPOLICY_EP_BUFFER_MULT", 4))
+    buffer_capacity = buffer_mult * episodes_per_update
     ep_buffer: List[Dict[str, Any]] = []
     # Use direct opponent labels for visualization; no remapping/lookup
     
@@ -403,17 +408,18 @@ def train_generation(
             num_episodes=episodes_per_update,
             num_players=4,
             training_policy_id=training_policy_id,
-            max_batch_envs=int(getattr(config, "EPISODES_PER_UPDATE", 512))
+            max_batch_envs=max_batch_envs,
         )
-        torch.cuda.synchronize()
+        if device.type == "cuda" and FORCE_CUDA_SYNC_FOR_TIMING:
+            torch.cuda.synchronize()
         t_roll = time.time()
         if not new_eps:
             logging.warning(f"Update {update}: No episodes collected. Skipping.")
             continue
         
         ep_buffer.extend(new_eps)
-        buffer_size = int(getattr(config, "OFFPOLICY_EP_BUFFER_MULT", 4)) * episodes_per_update
-        if len(ep_buffer) > buffer_size: ep_buffer = ep_buffer[-buffer_size:]
+        if len(ep_buffer) > buffer_capacity:
+            ep_buffer = ep_buffer[-buffer_capacity:]
         
         # -------- Optimize (aggregate metrics) --------
         learner.model.train()
@@ -500,7 +506,8 @@ def train_generation(
             avg_usage = metrics.get("avg_brick_usage_np")
             if avg_usage is not None:
                 avg_brick_usage_chunks.append(np.asarray(avg_usage, dtype=np.float32))
-        torch.cuda.synchronize()
+        if device.type == "cuda" and FORCE_CUDA_SYNC_FOR_TIMING:
+            torch.cuda.synchronize()
         t_opt_end = time.time()
         # Timings
         dur_roll = t_roll - t0

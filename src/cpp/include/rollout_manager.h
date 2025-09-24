@@ -67,6 +67,8 @@ struct PreparedBatch {
     torch::Tensor action_masks;
     torch::Tensor padding_mask;
     torch::Tensor valid_lengths;
+    torch::Tensor env_indices;
+    torch::Tensor seat_indices;
 };
 
 class RolloutManager {

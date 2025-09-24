@@ -1725,43 +1725,108 @@ def _collate_batch(
     opp_seat_ids = _pm(torch.full((B, num_opponents), -1, dtype=torch.long))
     heldout_episode_mask = _pm(torch.tensor(heldout_flags, dtype=torch.bool))
 
-    # -------- fill from episodes (only real steps) --------
-    our_counts_list = our_counts.tolist()
-    opp_counts_list = opp_counts.tolist()
+    def _int_array(seq: Any, invalid_fill: int = -1) -> np.ndarray:
+        if seq is None:
+            return np.empty(0, dtype=np.int64)
+        if isinstance(seq, np.ndarray):
+            arr = seq
+        elif torch.is_tensor(seq):
+            arr = seq.detach().cpu().numpy()
+        else:
+            arr = np.asarray(seq)
+        if arr.dtype == np.object_:
+            flat = [
+                invalid_fill
+                if (x is None or (isinstance(x, float) and np.isnan(x)))
+                else int(x)
+                for x in arr.tolist()
+            ]
+            arr = np.asarray(flat, dtype=np.int64)
+        else:
+            arr = arr.astype(np.int64, copy=False)
+        return arr.reshape(-1)
 
+    def _float_array(seq: Any) -> np.ndarray:
+        if seq is None:
+            return np.empty(0, dtype=np.float32)
+        if isinstance(seq, np.ndarray):
+            arr = seq
+        elif torch.is_tensor(seq):
+            arr = seq.detach().cpu().numpy()
+        else:
+            arr = np.asarray(seq)
+        if arr.dtype == np.object_:
+            arr = np.asarray(
+                [0.0 if (x is None or (isinstance(x, float) and np.isnan(x))) else float(x) for x in arr.tolist()],
+                dtype=np.float32,
+            )
+        else:
+            arr = arr.astype(np.float32, copy=False)
+        return arr.reshape(-1)
+
+    # -------- fill from episodes (only real steps) --------
     for b, ep in enumerate(episodes):
-        # ===== OUR timeline (unchanged) =====
-        our_ep_idx = [i for i, seat in enumerate(ep["agent_id"]) if seat == ep["training_agent_seat"]]
-        max_steps = min(T, len(our_ep_idx), int(our_counts_list[b]))
+        training_seat = int(ep.get("training_agent_seat", -1))
+        agent_id_seq = _int_array(ep.get("agent_id"), invalid_fill=-1)
+
+        # ===== OUR timeline =====
+        our_ep_idx = np.nonzero(agent_id_seq == training_seat)[0]
+        max_steps = min(T, our_ep_idx.size, int(our_counts[b].item())) if our_counts.numel() > 0 else 0
 
         if max_steps < our_mask.size(1):
             our_mask[b, max_steps:] = False
             if max_steps < our_idx.size(1):
                 our_idx[b, max_steps:] = 0
 
-        for t_local in range(max_steps):
-            step_ep = our_ep_idx[t_local]
-            lp = ep["log_prob"][step_ep] if step_ep < len(ep["log_prob"]) else None
-            if lp is None:
-                continue
+        if max_steps > 0:
+            steps = our_ep_idx[:max_steps]
 
-            a  = ep["our_action"][step_ep] if step_ep < len(ep["our_action"]) else None
-            rw = ep["reward"][step_ep]     if step_ep < len(ep["reward"])     else 0.0
-            pu = ep["penalties_used"][step_ep] if step_ep < len(ep["penalties_used"]) else 0
+            # Log probabilities
+            lp_src = _float_array(ep.get("log_prob"))
+            lp_dest = np.zeros(max_steps, dtype=np.float32)
+            if lp_src.size > 0:
+                valid_lp = steps < lp_src.shape[0]
+                if np.any(valid_lp):
+                    lp_dest[valid_lp] = lp_src[steps[valid_lp]]
+            old_logp[b, :max_steps] = torch.from_numpy(lp_dest)
 
-            if a is not None:
-                actions[b, t_local] = int(a)
-            old_logp[b, t_local] = float(lp)
-            rewards[b, t_local]  = float(rw)
-            pen_used[b, t_local] = int(pu)
+            # Rewards
+            rw_src = _float_array(ep.get("reward"))
+            rw_dest = np.zeros(max_steps, dtype=np.float32)
+            if rw_src.size > 0:
+                valid_rw = steps < rw_src.shape[0]
+                if np.any(valid_rw):
+                    rw_dest[valid_rw] = rw_src[steps[valid_rw]]
+            rewards[b, :max_steps] = torch.from_numpy(rw_dest)
+
+            # Penalties used
+            pu_src = _int_array(ep.get("penalties_used"), invalid_fill=0)
+            pu_dest = np.zeros(max_steps, dtype=np.int64)
+            if pu_src.size > 0:
+                valid_pu = steps < pu_src.shape[0]
+                if np.any(valid_pu):
+                    pu_dest[valid_pu] = pu_src[steps[valid_pu]]
+            pen_used[b, :max_steps] = torch.from_numpy(pu_dest)
+
+            # Actions (respect IGN sentinel)
+            act_src = _int_array(ep.get("our_action"), invalid_fill=-1)
+            act_dest = np.full(max_steps, IGN, dtype=np.int64)
+            if act_src.size > 0:
+                valid_act = steps < act_src.shape[0]
+                if np.any(valid_act):
+                    sel = act_src[steps[valid_act]]
+                    valid_vals = sel >= 0
+                    if np.any(valid_vals):
+                        idx = np.nonzero(valid_act)[0][valid_vals]
+                        act_dest[idx] = sel[valid_vals]
+            actions[b, :max_steps] = torch.from_numpy(act_dest)
 
         # ===== OPP timeline =====
-        M_fill = min(To, int(opp_counts_list[b]))
+        opp_ep_idx = np.nonzero(agent_id_seq != training_seat)[0]
+        M_fill = min(To, opp_ep_idx.size, int(opp_counts[b].item())) if opp_counts.numel() > 0 else 0
         if M_fill > 0:
             # Episode metadata we already saved
             player_labels = tuple(ep.get("player_labels", ()))  # absolute seat -> label
-            agent_id_seq  = ep["agent_id"]                      # per-step absolute seat index
-            training_seat = ep.get("training_agent_seat", -1)
 
             # Record per-seat labels for visualization later
             opp_entries: List[Tuple[int, int]] = []
@@ -1777,19 +1842,23 @@ def _collate_batch(
                 if lbl != IGN:
                     opp_labels_by_seat[b, j] = lbl
 
-            # Indices of opponent steps in episode timeline
-            opp_ep_idx = [i for i, seat in enumerate(agent_id_seq) if seat != training_seat]
+            steps = opp_ep_idx[:M_fill]
 
-            for t_local in range(M_fill):
-                if t_local >= len(opp_ep_idx):
-                    break
-                step_ep = opp_ep_idx[t_local]
+            tgt_src = _int_array(ep.get("opp_target_action"), invalid_fill=-1)
+            tgt_dest = np.full(M_fill, IGN, dtype=np.int64)
+            have_dest = np.zeros(M_fill, dtype=np.bool_)
+            if tgt_src.size > 0:
+                valid_tgt = steps < tgt_src.shape[0]
+                if np.any(valid_tgt):
+                    sel = tgt_src[steps[valid_tgt]]
+                    valid_vals = sel >= 0
+                    if np.any(valid_vals):
+                        idx = np.nonzero(valid_tgt)[0][valid_vals]
+                        tgt_dest[idx] = sel[valid_vals]
+                        have_dest[idx] = True
 
-                # Opponent action supervision (unchanged)
-                tgt = ep.get("opp_target_action", [None]*len(agent_id_seq))[step_ep]
-                if tgt is not None:
-                    opp_targets[b, t_local] = int(tgt)
-                    opp_have_label[b, t_local] = True
+            opp_targets[b, :M_fill] = torch.from_numpy(tgt_dest)
+            opp_have_label[b, :M_fill] = torch.from_numpy(have_dest)
 
     return {
         "mi": mi_batch,
