@@ -48,4 +48,13 @@ def trace_model_from_checkpoint(checkpoint_path: str, output_path: str, device: 
         return True
     except Exception as e:
         logging.error(f"Failed to trace model from {checkpoint_path}: {e}", exc_info=True)
+        # Remove any partially written artifact so downstream consumers do not
+        # attempt to load an invalid TorchScript file on subsequent runs.
+        try:
+            Path(output_path).unlink(missing_ok=True)
+        except Exception:
+            logging.debug(
+                "Unable to clean up incomplete TorchScript artifact at %s", output_path,
+                exc_info=True,
+            )
         return False

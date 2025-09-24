@@ -127,6 +127,12 @@ void bind_rollout_manager(py::module_& m) {
             },
             py::arg("policy_id"),
             py::arg("path"))
+        .def("register_cpp_bot",
+             [](RolloutManager& self, int policy_id, const std::string& name) {
+                 self.register_cpp_bot(policy_id, name);
+             },
+             py::arg("policy_id"),
+             py::arg("name"))
         .def("set_training_device", &RolloutManager::set_training_device,
              py::arg("device"));
 }

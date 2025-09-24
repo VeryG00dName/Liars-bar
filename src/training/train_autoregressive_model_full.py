@@ -2,7 +2,12 @@
 # train_autoregressive_model_full.py - Train PPOAutoregressiveModel using PS-generated sequence data
 import os
 import random
+os.environ.pop("TORCH_LOGS", None)           # disable extra compile logs
+os.environ.setdefault("TORCHDYNAMO_VERBOSE", "0")
+os.environ.setdefault("TORCH_COMPILE_DEBUG", "0")
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+# Deterministic cuBLAS workspace requirement for CUDA
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
 import argparse
 import pickle
 import time

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cctype>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -12,6 +13,8 @@
 #include <unordered_set>
 
 #include <torch/torch.h>
+
+#include "bots.h"
 
 namespace {
 const torch::Device kInferenceDevice = torch::kCUDA;
@@ -23,6 +26,85 @@ std::mt19937::result_type seed_with_optional(uint32_t seed) {
     std::random_device rd;
     return static_cast<std::mt19937::result_type>(rd());
 }
+
+class ClassicBot : public CppBotBase {
+public:
+    ClassicBot() : bot_("bot") {}
+    uint8_t act(const PolicyRequest& request, VecArena&) override {
+        return bot_.act(request.classic_obs, request.classic_obs_len, request.mask);
+    }
+
+private:
+    bots::Classic bot_;
+};
+
+class GreedyCardSpammerBot : public CppBotBase {
+public:
+    GreedyCardSpammerBot() : bot_("bot") {}
+    uint8_t act(const PolicyRequest& request, VecArena&) override {
+        return bot_.act(request.classic_obs, request.classic_obs_len, request.mask);
+    }
+
+private:
+    bots::GreedyCardSpammer bot_;
+};
+
+class RandomAgentBot : public CppBotBase {
+public:
+    RandomAgentBot() : bot_("bot") {}
+    uint8_t act(const PolicyRequest& request, VecArena&) override {
+        return bot_.act(request.classic_obs, request.classic_obs_len, request.mask);
+    }
+
+private:
+    bots::RandomAgent bot_;
+};
+
+class SelectiveTableConservativeChallengerBot : public CppBotBase {
+public:
+    SelectiveTableConservativeChallengerBot() : bot_("bot") {}
+    uint8_t act(const PolicyRequest& request, VecArena&) override {
+        return bot_.act(request.classic_obs, request.classic_obs_len, request.mask);
+    }
+
+private:
+    bots::SelectiveTableConservativeChallenger bot_;
+};
+
+class StrategicChallengerBot : public CppBotBase {
+public:
+    StrategicChallengerBot(int num_players, int seat)
+        : bot_("bot", num_players, seat) {}
+
+    uint8_t act(const PolicyRequest& request, VecArena&) override {
+        return bot_.act(request.classic_obs, request.classic_obs_len, request.mask);
+    }
+
+private:
+    bots::StrategicChallenger bot_;
+};
+
+class TableFirstConservativeChallengerBot : public CppBotBase {
+public:
+    TableFirstConservativeChallengerBot() : bot_("bot") {}
+    uint8_t act(const PolicyRequest& request, VecArena&) override {
+        return bot_.act(request.classic_obs, request.classic_obs_len, request.mask);
+    }
+
+private:
+    bots::TableFirstConservativeChallenger bot_;
+};
+
+class TableNonTableAgentBot : public CppBotBase {
+public:
+    TableNonTableAgentBot() : bot_("bot") {}
+    uint8_t act(const PolicyRequest& request, VecArena&) override {
+        return bot_.act(request.classic_obs, request.classic_obs_len, request.mask);
+    }
+
+private:
+    bots::TableNonTableAgent bot_;
+};
 }
 
 RolloutManager::RolloutManager()
@@ -81,6 +163,10 @@ void RolloutManager::start_rollouts(int num_episodes,
     for (int env_idx = 0; env_idx < batch_size_; ++env_idx) {
         episodes_[env_idx] = new_episode_tracker(env_idx, roles[env_idx]);
     }
+
+    for (auto& kv : cpp_bot_registry_) {
+        kv.second.instances.clear();
+    }
 }
 
 std::unordered_map<int, std::vector<PolicyRequest>> RolloutManager::collect_requests_for_inference() {
@@ -90,12 +176,49 @@ std::unordered_map<int, std::vector<PolicyRequest>> RolloutManager::collect_requ
         log_rewards_and_dones();
 
         const auto& raw = arena_.collect_requests();
+        if (raw.empty()) {
+            break;
+        }
+
+        std::vector<int> policy_ids;
+        policy_ids.reserve(raw.size());
+        for (const auto& kv : raw) {
+            policy_ids.push_back(kv.first);
+        }
+
         bool handled_historical = false;
 
-        for (const auto& kv : raw) {
-            const int policy_id = kv.first;
-            const auto& requests = kv.second;
+        for (int policy_id : policy_ids) {
+            auto raw_it = raw.find(policy_id);
+            if (raw_it == raw.end()) {
+                continue;
+            }
+
+            const auto& requests = raw_it->second;
             if (requests.empty()) {
+                continue;
+            }
+
+            auto cpp_it = cpp_bot_registry_.find(policy_id);
+            if (cpp_it != cpp_bot_registry_.end()) {
+                bool success = false;
+                try {
+                    auto actions = run_cpp_bot(policy_id, requests);
+                    arena_.submit_actions(policy_id, actions);
+                    handled_historical = true;
+                    success = true;
+                } catch (const std::exception& ex) {
+                    std::cerr << "[RolloutManager] Native C++ bot execution failed for policy "
+                              << policy_id << ": " << ex.what() << std::endl;
+                } catch (...) {
+                    std::cerr << "[RolloutManager] Native C++ bot execution failed for policy "
+                              << policy_id << ": unknown error" << std::endl;
+                }
+
+                if (!success) {
+                    auto& dst = learner_requests[policy_id];
+                    dst.insert(dst.end(), requests.begin(), requests.end());
+                }
                 continue;
             }
 
@@ -210,9 +333,24 @@ void RolloutManager::load_historical_model(int policy_id, const std::string& pat
     } catch (const c10::Error& err) {
         std::cerr << "[RolloutManager] Failed to load TorchScript module from '" << path
                   << "': " << err.what_without_backtrace() << std::endl;
+        throw;
     } catch (const std::exception& err) {
         std::cerr << "[RolloutManager] Failed to load TorchScript module from '" << path
                   << "': " << err.what() << std::endl;
+        throw;
+    }
+}
+
+void RolloutManager::register_cpp_bot(int policy_id, const std::string& bot_name) {
+    try {
+        CppBotKind kind = parse_cpp_bot_kind(bot_name);
+        auto& entry = cpp_bot_registry_[policy_id];
+        entry.kind = kind;
+        entry.instances.clear();
+    } catch (const std::exception& err) {
+        std::cerr << "[RolloutManager] Failed to register C++ bot '" << bot_name
+                  << "' for policy " << policy_id << ": " << err.what() << std::endl;
+        throw;
     }
 }
 
@@ -449,6 +587,87 @@ std::vector<uint8_t> RolloutManager::run_historical_inference(torch::jit::Module
     }
 
     return chosen;
+}
+
+std::vector<uint8_t> RolloutManager::run_cpp_bot(int policy_id, const std::vector<PolicyRequest>& requests) {
+    if (requests.empty()) {
+        return {};
+    }
+
+    auto it = cpp_bot_registry_.find(policy_id);
+    if (it == cpp_bot_registry_.end()) {
+        throw std::runtime_error("No registered C++ bot for policy " + std::to_string(policy_id));
+    }
+
+    std::vector<uint8_t> actions;
+    actions.reserve(requests.size());
+
+    for (const auto& req : requests) {
+        uint64_t key = (static_cast<uint64_t>(req.env) << 32) ^ static_cast<uint32_t>(req.seat & 0xFFFFFFFF);
+        auto& entry = it->second;
+        auto inst_it = entry.instances.find(key);
+        if (inst_it == entry.instances.end()) {
+            auto instance = make_cpp_bot_instance(entry.kind, req);
+            inst_it = entry.instances.emplace(key, std::move(instance)).first;
+        }
+        uint8_t action = inst_it->second->act(req, arena_);
+        actions.push_back(action);
+    }
+
+    return actions;
+}
+
+RolloutManager::CppBotKind RolloutManager::parse_cpp_bot_kind(const std::string& name) {
+    std::string lower;
+    lower.reserve(name.size());
+    for (char c : name) {
+        lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+
+    if (lower == "classic") {
+        return CppBotKind::Classic;
+    } else if (lower == "greedycardspammer") {
+        return CppBotKind::GreedyCardSpammer;
+    } else if (lower == "randomagent") {
+        return CppBotKind::RandomAgent;
+    } else if (lower == "selectivetableconservativechallenger") {
+        return CppBotKind::SelectiveTableConservativeChallenger;
+    } else if (lower == "strategicchallenger") {
+        return CppBotKind::StrategicChallenger;
+    } else if (lower == "tablefirstconservativechallenger") {
+        return CppBotKind::TableFirstConservativeChallenger;
+    } else if (lower == "tablenontableagent") {
+        return CppBotKind::TableNonTableAgent;
+    }
+
+    throw std::invalid_argument("Unknown C++ bot name: " + name);
+}
+
+std::unique_ptr<CppBotBase> RolloutManager::make_cpp_bot_instance(RolloutManager::CppBotKind kind,
+                                                                  const PolicyRequest& request) {
+    switch (kind) {
+        case RolloutManager::CppBotKind::Classic:
+            return std::make_unique<ClassicBot>();
+        case RolloutManager::CppBotKind::GreedyCardSpammer:
+            return std::make_unique<GreedyCardSpammerBot>();
+        case RolloutManager::CppBotKind::RandomAgent:
+            return std::make_unique<RandomAgentBot>();
+        case RolloutManager::CppBotKind::SelectiveTableConservativeChallenger:
+            return std::make_unique<SelectiveTableConservativeChallengerBot>();
+        case RolloutManager::CppBotKind::StrategicChallenger: {
+            int num_players = 4;
+            if (request.env >= 0 && request.env < static_cast<int>(arena_.envs.size())) {
+                num_players = arena_.envs[request.env].num_players();
+            }
+            return std::make_unique<StrategicChallengerBot>(num_players, request.seat);
+        }
+        case RolloutManager::CppBotKind::TableFirstConservativeChallenger:
+            return std::make_unique<TableFirstConservativeChallengerBot>();
+        case RolloutManager::CppBotKind::TableNonTableAgent:
+            return std::make_unique<TableNonTableAgentBot>();
+    }
+
+    throw std::runtime_error("Unsupported C++ bot kind");
 }
 
 std::vector<std::vector<int>> RolloutManager::build_roles(int batch_size,

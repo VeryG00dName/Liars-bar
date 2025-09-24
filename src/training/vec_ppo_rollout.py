@@ -1,6 +1,6 @@
 # src/training/vec_ppo_rollout.py
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set
 import logging
 from types import SimpleNamespace
 
@@ -23,6 +23,10 @@ class PPOVecRolloutManager:
         self.rollout_manager = lb.RolloutManager()
         self.cpp_manager = self.rollout_manager
         self.policies = policies
+        self.policy_labels = {
+            int(pid): int(getattr(policy, "label", pid))
+            for pid, policy in policies.items()
+        }
         self.device = device
         self.rng = rng if rng is not None else np.random.default_rng()
         self.pool_manager = pool_manager
@@ -40,6 +44,31 @@ class PPOVecRolloutManager:
         self._shadow_historical_agents: List[int] = []
         self._opponent_pool_snapshot: List[Dict[str, Any]] = []
         self._partitions_ready: bool = False
+        self._cpp_native_policies: Set[int] = set()
+        self._historical_cpp_policies: Set[int] = set()
+
+    def register_cpp_native_policy(self, policy_id: int, label: Optional[int] = None) -> None:
+        policy_id_int = int(policy_id)
+        self._cpp_native_policies.add(policy_id_int)
+        if label is not None:
+            self.policy_labels[policy_id_int] = int(label)
+        else:
+            self.policy_labels.setdefault(policy_id_int, policy_id_int)
+
+    def register_historical_cpp_policy(self, policy_id: int, label: Optional[int] = None) -> None:
+        policy_id_int = int(policy_id)
+        self._historical_cpp_policies.add(policy_id_int)
+        if label is not None:
+            self.policy_labels[policy_id_int] = int(label)
+        else:
+            self.policy_labels.setdefault(policy_id_int, policy_id_int)
+
+    def mark_training_policy(self, policy_id: int, label: Optional[int] = None) -> None:
+        policy_id_int = int(policy_id)
+        if label is not None:
+            self.policy_labels[policy_id_int] = int(label)
+        else:
+            self.policy_labels.setdefault(policy_id_int, policy_id_int)
 
     def _update_internal_agent_partitions(
         self, all_opponent_pool_data: List[Dict[str, Any]]
@@ -52,9 +81,9 @@ class PPOVecRolloutManager:
             if label is None:
                 continue
             label_int = int(label)
-            if label_int <= config.CPP_BOT_MAX_LABEL:
+            if label_int in self._cpp_native_policies:
                 cpp_bots.append(label_int)
-            else:
+            elif label_int in self._historical_cpp_policies:
                 historical.append(label_int)
 
         cpp_bots = sorted(set(cpp_bots))
@@ -117,8 +146,8 @@ class PPOVecRolloutManager:
 
         player_labels: List[Any] = []
         for seat_idx, policy_id in enumerate(player_policy_ids):
-            agent = self.policies.get(int(policy_id))
-            label = getattr(agent, "label", int(policy_id)) if agent is not None else int(policy_id)
+            policy_id_int = int(policy_id)
+            label = self.policy_labels.get(policy_id_int, policy_id_int)
             player_labels.append(label)
 
         training_seat = int(traj.training_agent_seat)

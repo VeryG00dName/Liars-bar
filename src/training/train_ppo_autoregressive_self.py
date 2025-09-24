@@ -5,7 +5,7 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Callable, Tuple
+from typing import Dict, Any, List, Optional, Callable
 from numpy.random import Generator
 import random
 import numpy as np
@@ -32,7 +32,6 @@ import torch.amp as amp
 from src.misc import lb
 from src import config
 from src.model.ppo_fused_model import PPOFusedModel
-from src.agents.cpp_bot_wrapper import CppBotWrapper
 from src.agents.learner_ar_agent import LearnerAutoregressiveAgent
 from src.training.vec_ppo_rollout import PPOVecRolloutManager
 from src.training.tracing_utils import trace_model_from_checkpoint
@@ -292,68 +291,22 @@ def train_generation(
     non_belief_params = [p for p in all_params if id(p) not in belief_param_ids]
     belief_max_norm = float(getattr(config, "BELIEF_MAX_NORM", config.MAX_NORM))
     
-    # Build unified policy map: include C++ bot wrappers for labels 0..6,
-    # historical AI agents at their stored labels (>=7), and the current learner.
-    policy_map: Dict[int, Any] = {}
-
-    # Map labels to C++ bot classes from lb (check existence explicitly)
-    cpp_bot_names = {
-        0: "Classic",
-        1: "GreedyCardSpammer",
-        2: "RandomAgent",
-        3: "SelectiveTableConservativeChallenger",
-        4: "StrategicChallenger",
-        5: "TableFirstConservativeChallenger",
-        6: "TableNonTableAgent",
+    existing_labels = {
+        int(entry.get("label"))
+        for entry in pool_manager.pool
+        if isinstance(entry, dict) and entry.get("label") is not None
     }
-    for label, name in cpp_bot_names.items():
-        if not hasattr(lb, name):
-            logging.error(f"lb missing C++ bot class '{name}' — cannot register wrapper for label {label}")
-            continue
-        cls = getattr(lb, name)
-        try:
-            wrapper = CppBotWrapper(cls, label=label, device=device, player_id=f"cpp_{label}")
-            policy_map[label] = wrapper
-        except Exception as e:
-            logging.exception(f"Failed to create CppBotWrapper for '{name}' (label {label}): {e}")
 
-    # Add historical AI agents using their stored labels (>=7)
-    used_labels = set([a['label'] for a in pool_manager.pool if a['type'] != 'cpp_bot' and 'label' in a])
-    traced_artifacts: List[Tuple[int, Path]] = []
-
-    for agent_def in pool_manager.pool:
-        if agent_def['type'] != 'cpp_bot' and agent_def.get('path'):
-            policy_id = int(agent_def['label'])
-            ckpt_path_pth = agent_def['path']
-            cache_key = f"ckpt:{os.path.abspath(ckpt_path_pth)}"
-            if agent_cache is not None and cache_key in agent_cache:
-                agent = agent_cache[cache_key]
-            else:
-                agent = _load_agent_from_checkpoint(ckpt_path_pth, agent_def.get('model_type', 'main'), device)
-                if agent_cache is not None:
-                    agent_cache[cache_key] = agent
-            agent.model.eval()
-            agent.label = policy_id
-            policy_map[policy_id] = agent
-            
-            # NEW: Check for a traced model path in the agent definition
-            ckpt_path_pt = agent_def.get('path_pt')
-            if ckpt_path_pt and os.path.exists(ckpt_path_pt):
-                # If it exists, add it to our list to be loaded by C++
-                traced_artifacts.append((policy_id, ckpt_path_pt))
-            else:
-                logging.warning(
-                    f"No traced TorchScript module found for historical policy {policy_id} at {ckpt_path_pth}"
-                )
-
-    # Assign a training policy id >= 7 that doesn't collide with existing labels
     training_policy_id = 7
-    while training_policy_id in policy_map:
+    while training_policy_id in existing_labels:
         training_policy_id += 1
-    learner.label = training_policy_id
-    policy_map[training_policy_id] = learner
 
-    logging.info(f"Registered policies: {sorted(list(policy_map.keys()))}")
+    learner.label = training_policy_id
+    policy_map: Dict[int, Any] = {training_policy_id: learner}
+
+    logging.info(
+        f"Assigned training policy id {training_policy_id}; existing opponent labels: {sorted(existing_labels)}"
+    )
 
     # 3. INITIALIZE ROLLOUT MANAGER AND PLATEAU DETECTOR
     rollout_manager = PPOVecRolloutManager(
@@ -363,19 +316,74 @@ def train_generation(
         rng=(rng or _GLOBAL_RNG),
     )
 
-    for policy_id, traced_path in traced_artifacts:
+    rollout_manager.mark_training_policy(training_policy_id, getattr(learner, "label", training_policy_id))
+
+    cpp_bot_names = {
+        0: "Classic",
+        1: "GreedyCardSpammer",
+        2: "RandomAgent",
+        3: "SelectiveTableConservativeChallenger",
+        4: "StrategicChallenger",
+        5: "TableFirstConservativeChallenger",
+        6: "TableNonTableAgent",
+    }
+    registered_cpp_bots: List[int] = []
+    for label, name in cpp_bot_names.items():
+        if not hasattr(lb, name):
+            logging.error(f"lb missing C++ bot class '{name}' — cannot register native bot for label {label}")
+            continue
         try:
-            # This calls the Pybind11 binding we created.
-            rollout_manager.cpp_manager.load_historical_model(policy_id, str(traced_path))
-            logging.info(
-                f"Loaded traced historical policy {policy_id} from {traced_path} into C++ manager."
-            )
-            # We can now potentially remove this agent from the Python policy_map to save memory,
-            # but leaving it as a fallback is safer for now.
-        except Exception as e:
+            rollout_manager.cpp_manager.register_cpp_bot(label, name)
+            rollout_manager.register_cpp_native_policy(label, label)
+            registered_cpp_bots.append(label)
+        except Exception as exc:
             logging.exception(
-                f"Failed to register traced model for policy {policy_id} from {traced_path}: {e}"
+                f"Failed to register native C++ bot '{name}' (label {label}) with rollout manager: {exc}"
             )
+
+    loaded_historical_labels: List[int] = []
+    for agent_def in pool_manager.pool:
+        if agent_def.get('type') == 'cpp_bot':
+            continue
+
+        label = agent_def.get('label')
+        if label is None:
+            continue
+
+        policy_id = int(label)
+        traced_path = agent_def.get('path_pt')
+
+        if traced_path and not os.path.exists(traced_path):
+            traced_path = None
+
+        if not traced_path and agent_def.get('path'):
+            traced_candidate = _find_traced_artifact_for_checkpoint(agent_def['path'])
+            if traced_candidate is not None and traced_candidate.exists():
+                traced_path = str(traced_candidate)
+
+        if not traced_path:
+            logging.warning(
+                f"Skipping historical opponent label {policy_id}: missing TorchScript trace."
+            )
+            continue
+
+        try:
+            rollout_manager.cpp_manager.load_historical_model(policy_id, str(traced_path))
+            rollout_manager.register_historical_cpp_policy(policy_id, policy_id)
+            loaded_historical_labels.append(policy_id)
+            logging.info(
+                f"Loaded historical opponent {policy_id} from traced artifact at {traced_path}."
+            )
+        except Exception as exc:
+            logging.exception(
+                f"Failed to load traced historical policy {policy_id} from {traced_path}: {exc}"
+            )
+
+    logging.info(
+        "Native C++ bots registered: %s; historical TorchScript policies loaded: %s",
+        sorted(registered_cpp_bots),
+        sorted(loaded_historical_labels),
+    )
 
     rollout_manager.set_opponent_pool(pool_manager.pool)
 
@@ -702,15 +710,29 @@ def train_generation(
     logging.info(f"Saved standard PyTorch checkpoint to {final_path_pth}")
 
     # --- NEW AUTOMATED TRACING STEP ---
-    trace_model_from_checkpoint(final_path_pth, final_path_pt, device)
+    traced_success = trace_model_from_checkpoint(final_path_pth, final_path_pt, device)
     # --- END NEW STEP ---
+    extra_metadata = {}
+    if traced_success and os.path.exists(final_path_pt):
+        extra_metadata["path_pt"] = final_path_pt
+    else:
+        if traced_success:
+            logging.warning(
+                "TorchScript artifact %s missing after tracing; skipping pool registration.",
+                final_path_pt,
+            )
+        else:
+            logging.warning(
+                "TorchScript tracing failed for %s; historical self-play will skip C++ loading.",
+                run_name,
+            )
+
     pool_manager.add_agent(
-            name=run_name, 
-            model_type='main', 
+            name=run_name,
+            model_type='main',
             # The 'path' should ALWAYS be the .pth file for cloning and warm-starting.
             path=final_path_pth,
-            # Add a NEW key for the traced model path.
-            path_pt=final_path_pt 
+            **extra_metadata,
         )
     writer.close()
     logging.info(f"Saved final model for '{run_name}' to {final_path_pth}")

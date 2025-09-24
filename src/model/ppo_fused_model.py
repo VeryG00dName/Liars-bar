@@ -3,7 +3,66 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import entmax
+
+@torch.jit.script
+def _entmax15_op(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """
+    A pure PyTorch, scriptable and deterministic implementation of entmax1-alpha.
+    This implementation is for alpha = 1.5.
+    
+    Based on:
+    "Sparse Sequence-to-Sequence Models"
+    """
+    # entmax is defined as: sparsemax(x * (α - 1))
+    # For α = 1.5, this is sparsemax(x * 0.5)
+    x = x * 0.5
+
+    # The rest of the algorithm is sparsemax
+    max_val, _ = torch.max(x, dim=dim, keepdim=True)
+    x = x - max_val  # Subtract max for numerical stability
+
+    # Sort descending
+    x_sorted, _ = torch.sort(x, dim=dim, descending=True)
+
+    # Calculate cumulative sums
+    cumsum = torch.cumsum(x_sorted, dim=dim)
+    
+    # Create a tensor of [1, 2, 3, ...] for comparison
+    k = torch.arange(1, x.shape[dim] + 1, device=x.device, dtype=x.dtype)
+    
+    # The support size `rho` is the largest index `k` where the condition holds for each row
+    # Condition: 1 + k * z_k > cumsum_k
+    is_in_support = 1 + k * x_sorted > cumsum
+    
+    # Sum the boolean mask to get the support size `rho` for each sample in the batch
+    # This is equivalent to finding the largest k
+    rho = is_in_support.sum(dim=dim, keepdim=True)
+    
+    # The threshold tau is derived from the k=rho value
+    # We use gather to select the rho-th element for each row.
+    # rho is 1-indexed, so we subtract 1 for 0-indexed gather.
+    rho_idx = (rho - 1).long()
+    tau_numerator = cumsum.gather(dim, rho_idx)
+    
+    # Calculate the threshold tau for each row
+    tau = (tau_numerator - 1) / rho.to(x.dtype)
+    
+    # Apply the thresholding (this is the sparsemax operation)
+    # The result is squared as the final step of entmax for α=1.5
+    p = torch.max(torch.zeros_like(x), x - tau)
+    return p.pow(2) # For entmax(α=1.5), the result of sparsemax is squared.
+
+class Entmax15(nn.Module):
+    """
+    A traceable, scriptable nn.Module for the entmax1.5 activation function.
+    """
+    def __init__(self, dim: int = -1):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _entmax15_op(x, self.dim)
+
 class StrategyDictionary(nn.Module):
     """
     Learns a shared dictionary of strategy "bricks" and produces a sparse,
@@ -25,6 +84,8 @@ class StrategyDictionary(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, num_bricks)
         )
+        
+        self.entmax_activation = Entmax15(dim=-1)
 
     def forward(self, transformer_output: torch.Tensor):
         # transformer_output shape: [B, T, D_transformer]
@@ -34,7 +95,7 @@ class StrategyDictionary(nn.Module):
         
         # 2. Ensure activations are non-negative to act as weights
         # Softplus is a smooth version of ReLU, which is good here.
-        activations = entmax.entmax15(raw_activations, dim=-1)  # Shape: [B, T, num_bricks]
+        activations = self.entmax_activation(raw_activations)  # Shape: [B, T, num_bricks]
         
         # 3. Combine bricks using activations to form the strategy code
         # Matmul: (B, T, num_bricks) @ (num_bricks, brick_dim) -> (B, T, brick_dim)
