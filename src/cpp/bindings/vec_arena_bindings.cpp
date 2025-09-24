@@ -12,7 +12,7 @@
 namespace py = pybind11;
 
 void bind_vec_arena(py::module_& m) {
-    py::class_<PolicyRequest, std::unique_ptr<PolicyRequest, py::nodelete>>(m, "PolicyRequest")
+    py::class_<PolicyRequest>(m, "PolicyRequest")
         .def_readonly("env", &PolicyRequest::env)
         .def_readonly("seat", &PolicyRequest::seat)
         .def_property_readonly("mask", [](PolicyRequest& r) { return py::array_t<uint8_t>({7}, r.mask); })

@@ -268,19 +268,39 @@ def main():
     if not os.path.isdir(base_dir):
         raise SystemExit(f"Directory not found: {base_dir}")
 
+    prefix = f"test_{args.target}_"  # <-- add this
+
     # Win-rate + samples
     df_win = extract_winrates_with_samples(base_dir)
-    out_win = os.path.join(base_dir, "per_opponent_win_rate_start_end.csv")
+    out_win = os.path.join(base_dir, f"{prefix}per_opponent_win_rate_start_end.csv")
     df_win.to_csv(out_win, index=False)
+
+    # Most-recent (highest opponent_i per generation)
+    if not df_win.empty:
+        # filter first
+        df_win_filtered = df_win[df_win["generation_index"] > 6]
+
+        if not df_win_filtered.empty:
+            idx = df_win_filtered.groupby("generation_index")["opponent_i"].idxmax()
+            df_most_recent = (
+                df_win_filtered.loc[idx, [
+                    "generation","generation_index","opponent_i",
+                    "start_value","end_value","samples_start","samples_end",
+                ]]
+                .sort_values(["generation_index"])
+                .reset_index(drop=True)
+            )
+            out_most_recent = os.path.join(base_dir, f"{prefix}win_rate_vs_most_recent.csv")
+            df_most_recent.to_csv(out_most_recent, index=False)
 
     # Losses
     df_loss = extract_losses(base_dir)
-    out_loss = os.path.join(base_dir, "loss_start_end_by_generation.csv")
+    out_loss = os.path.join(base_dir, f"{prefix}loss_start_end_by_generation.csv")
     df_loss.to_csv(out_loss, index=False)
 
-    # Time averages (with stepwise outlier removal)
+    # Time averages
     df_time = extract_time_averages(base_dir)
-    out_time = os.path.join(base_dir, "time_averages_by_generation.csv")
+    out_time = os.path.join(base_dir, f"{prefix}time_averages_by_generation.csv")
     df_time.to_csv(out_time, index=False)
 
     # Console preview
@@ -296,6 +316,10 @@ def main():
     if not df_time.empty:
         print("\nTime averages preview:")
         print(df_time.head(10).to_string(index=False))
+    if not df_win.empty:
+        print(f"Wrote: {out_most_recent} ({len(df_most_recent)} rows)")
+        print("\nMost-recent (highest opponent_i) preview:")
+        print(df_most_recent.head(10).to_string(index=False))
 
 if __name__ == "__main__":
     main()

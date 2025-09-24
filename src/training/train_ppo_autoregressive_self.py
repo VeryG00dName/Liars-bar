@@ -12,11 +12,7 @@ import argparse
 
 # Quiet Torch compile logs
 os.environ.pop("TORCH_LOGS", None)           # disable extra compile logs
-os.environ.setdefault("TORCHDYNAMO_VERBOSE", "0")
-os.environ.setdefault("TORCH_COMPILE_DEBUG", "0")
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-# Deterministic cuBLAS workspace requirement for CUDA
-os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
 
 # Hide symbolic_shapes warnings printed via warnings module (belt-and-suspenders)
 warnings.filterwarnings("ignore", message=".*symbolic_shapes.*")
