@@ -76,8 +76,6 @@ def train(
     writer = SummaryWriter(log_dir=log_dir)
     logging.info(f"TensorBoard logdir: {log_dir}")
 
-    arena = lb.VecArena()
-
     # ----- SL init -----
     CKPT_PATH = getattr(config, "SL_TEACHER_CKPT", "")
     learner = BatchPPOAutoregressiveAgent(device, "TrainAgent_v1")
@@ -120,7 +118,7 @@ def train(
     scaler = amp.GradScaler(enabled=(device.type == "cuda"))
 
     policies = {0: learner}
-    rollout_manager = PPOVecRolloutManager(arena, policies, device)
+    rollout_manager = PPOVecRolloutManager(policies, device)
     HC_POOL = [
         lb.BotKind.Classic, lb.BotKind.GreedyCardSpammer, lb.BotKind.RandomAgent,
         lb.BotKind.SelectiveTableConservativeChallenger, lb.BotKind.StrategicChallenger,
@@ -144,7 +142,6 @@ def train(
             num_episodes=episodes_per_update,
             num_players=getattr(config, "NUM_PLAYERS", 4),
             training_policy_id=0,
-            opponent_pool=HC_POOL
         )
         if device.type == "cuda":
             torch.cuda.synchronize()

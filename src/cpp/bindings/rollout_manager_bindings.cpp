@@ -6,7 +6,7 @@
 
 namespace py = pybind11;
 
-// HELPER FUNCTION COPIED FROM AGENT 1's SUBMISSION
+// HELPER FUNCTION
 namespace {
 py::dict policy_request_to_dict(const PolicyRequest& req) {
     py::dict out;
@@ -14,29 +14,40 @@ py::dict policy_request_to_dict(const PolicyRequest& req) {
     out["seat"] = req.seat;
     out["done"] = req.done;
 
-    // Correctly copies fixed-size array to numpy array
+    // This one is fine as is
     out["mask"] = py::array_t<uint8_t>({7}, req.mask);
 
-    // Correctly copies variable-length array using len field
     out["classic_obs"] = py::array_t<float>({(py::ssize_t)req.classic_obs_len}, req.classic_obs);
     out["classic_obs_len"] = req.classic_obs_len;
     
     const py::ssize_t valid_len = req.valid_len;
-    // Note: This part can be slow due to element-wise copying.
-    // However, it's safer than dealing with complex buffer protocols for now.
-    out["obs_sequence"] = py::array_t<float>({valid_len, static_cast<py::ssize_t>(OBS_DIM)}, (float*)req.obs_sequence);
-    out["action_sequence"] = py::array_t<int64_t>({valid_len}, req.action_sequence);
-    out["agent_type_sequence"] = py::array_t<int64_t>({valid_len}, req.agent_type_sequence);
-    out["position_sequence"] = py::array_t<int64_t>({valid_len}, req.position_sequence);
-    out["action_mask_sequence"] = py::array_t<uint8_t>({valid_len, 7}, (uint8_t*)req.action_mask_sequence);
+    
+    // Create numpy arrays from raw pointers.
+    // The C-style arrays are contiguous in memory, so this is safe.
+    out["obs_sequence"] = py::array_t<float>({valid_len, static_cast<py::ssize_t>(OBS_DIM)}, &req.obs_sequence[0][0]);
+    out["action_sequence"] = py::array_t<int64_t>({valid_len}, &req.action_sequence[0]);
+    out["agent_type_sequence"] = py::array_t<int64_t>({valid_len}, &req.agent_type_sequence[0]);
+    out["position_sequence"] = py::array_t<int64_t>({valid_len}, &req.position_sequence[0]);
+    
+    // *** THE MAIN FIX IS HERE ***
+    // For 2D C-style arrays, it's safest to create a buffer_info object
+    // to explicitly describe the memory layout (shape and strides).
+    py::buffer_info action_mask_buf(
+        (void*)req.action_mask_sequence,              // Pointer to buffer
+        sizeof(uint8_t),                              // Size of one scalar
+        py::format_descriptor<uint8_t>::format(),     // Python struct-style format descriptor
+        2,                                            // Number of dimensions
+        { valid_len, (py::ssize_t)7 },                // Shape of the matrix
+        { sizeof(uint8_t) * 7, sizeof(uint8_t) }      // Strides (in bytes) for each index
+    );
+    out["action_mask_sequence"] = py::array_t<uint8_t>(action_mask_buf);
+
     out["valid_len"] = req.valid_len;
     return out;
 }
 } // end anonymous namespace
 
-// MAIN BINDING FUNCTION (FROM AGENT 3)
 void bind_rollout_manager(py::module_& m) {
-    // This binding from Agent 3 is clean and correct
     py::class_<TrajectoryData>(m, "TrajectoryData")
         .def_readonly("env_index", &TrajectoryData::env_index)
         .def_readonly("training_policy_id", &TrajectoryData::training_policy_id)
@@ -55,9 +66,19 @@ void bind_rollout_manager(py::module_& m) {
 
     py::class_<RolloutManager>(m, "RolloutManager")
         .def(py::init<>())
-        .def("start_rollouts", &RolloutManager::start_rollouts, /* ... args ... */ ) // Rest of Agent 3's bindings are good
+
+        .def("start_rollouts", &RolloutManager::start_rollouts,
+             py::arg("num_episodes"),
+             py::arg("num_players"),
+             py::arg("training_policy_id"),
+             py::arg("max_batch_envs"),
+             py::arg("seed"),
+             py::arg("cpp_bots"),
+             py::arg("latest_historical_agents"),
+             py::arg("active_shadow_agents"),
+             py::arg("front_mass"),
+             py::arg("shadow_mass"))
         
-        // MODIFIED BINDING using the helper function
         .def("collect_requests_for_inference", [](RolloutManager& self) {
             auto grouped = self.collect_requests_for_inference();
             py::dict out;
@@ -71,6 +92,11 @@ void bind_rollout_manager(py::module_& m) {
             return out;
         })
 
-        .def("submit_inference_results", &RolloutManager::submit_inference_results, /* ... args ... */)
+        .def("submit_inference_results", &RolloutManager::submit_inference_results,
+             py::arg("policy_id"),
+             py::arg("actions"),
+             py::arg("log_probs") = std::vector<float>(),
+             py::arg("values") = std::vector<float>())
+             
         .def("get_completed_episodes", &RolloutManager::get_completed_episodes);
 }
