@@ -72,15 +72,14 @@ class OpponentPoolManager:
             print(f"Pool file '{self.filepath}' not found. Initializing with base C++ bots.")
 
             # Initialize with base C++ bots using fixed labels 0..6
-            # Labels < 7 are treated by C++ as classic C++ bots (classic_obs path)
             base_bots = [
-                {"name": "Classic",                             "type": "cpp_bot", "model_type": "cpp_bot", "label": 0, "path": None},
-                {"name": "GreedyCardSpammer",                   "type": "cpp_bot", "model_type": "cpp_bot", "label": 1, "path": None},
-                {"name": "RandomAgent",                        "type": "cpp_bot", "model_type": "cpp_bot", "label": 2, "path": None},
-                {"name": "SelectiveTableConservativeChallenger","type": "cpp_bot", "model_type": "cpp_bot", "label": 3, "path": None},
-                {"name": "StrategicChallenger",                "type": "cpp_bot", "model_type": "cpp_bot", "label": 4, "path": None},
-                {"name": "TableFirstConservativeChallenger",   "type": "cpp_bot", "model_type": "cpp_bot", "label": 5, "path": None},
-                {"name": "TableNonTableAgent",                 "type": "cpp_bot", "model_type": "cpp_bot", "label": 6, "path": None},
+                {"name": "Classic", "type": "cpp_bot", "model_type": "cpp_bot", "label": 0, "path": None},
+                {"name": "GreedyCardSpammer", "type": "cpp_bot", "model_type": "cpp_bot", "label": 1, "path": None},
+                {"name": "RandomAgent", "type": "cpp_bot", "model_type": "cpp_bot", "label": 2, "path": None},
+                {"name": "SelectiveTableConservativeChallenger", "type": "cpp_bot", "model_type": "cpp_bot", "label": 3, "path": None},
+                {"name": "StrategicChallenger", "type": "cpp_bot", "model_type": "cpp_bot", "label": 4, "path": None},
+                {"name": "TableFirstConservativeChallenger", "type": "cpp_bot", "model_type": "cpp_bot", "label": 5, "path": None},
+                {"name": "TableNonTableAgent", "type": "cpp_bot", "model_type": "cpp_bot", "label": 6, "path": None},
             ]
             
             self._save(base_bots)
@@ -90,8 +89,12 @@ class OpponentPoolManager:
         with open(self.filepath, 'w') as f:
             json.dump(pool_data, f, indent=4)
 
-    def add_agent(self, name: str, model_type: str, path: str):
-        """Adds a new agent to the pool, assigning the next available label."""
+    def add_agent(self, name: str, model_type: str, path: str, **kwargs):
+        """
+        Adds a new agent to the pool, assigning the next available label.
+        Accepts additional keyword arguments to store as metadata.
+        """
+        # The check for existence should be based on the primary .pth path.
         if any(a.get('path') == path for a in self.pool if a.get('path')):
             print(f"Agent at path '{path}' already in pool. Skipping.")
             return
@@ -105,7 +108,19 @@ class OpponentPoolManager:
             print("Warning: Opponent pool has reached the maximum size of 64.")
             return
 
-        self.pool.append({"name": name, "type": "historical", "model_type": model_type, "label": next_label, "path": path})
+        # Create the new agent dictionary
+        new_agent_entry = {
+            "name": name,
+            "type": "historical",
+            "model_type": model_type,
+            "label": next_label,
+            "path": path  # The primary .pth path
+        }
+        
+        # Add any extra metadata passed in, like path_pt
+        new_agent_entry.update(kwargs)
+
+        self.pool.append(new_agent_entry)
         self._save(self.pool)
         print(f"Added '{name}' to pool with label {next_label}.")
 
@@ -166,7 +181,7 @@ def _clone_agent_from_agent(src_agent: BatchPPOAutoregressiveAgent,
 
 
 def _find_traced_artifact_for_checkpoint(checkpoint_path: str) -> Optional[Path]:
-    """Return the TorchScript trace produced by ``trace_models.py`` if it exists."""
+    """Return the TorchScript trace produced by ``train_utils.py`` if it exists."""
 
     ckpt_path = Path(os.path.abspath(checkpoint_path))
     candidate = ckpt_path.with_name(f"{ckpt_path.stem}_traced.pt")
@@ -306,28 +321,26 @@ def train_generation(
     for agent_def in pool_manager.pool:
         if agent_def['type'] != 'cpp_bot' and agent_def.get('path'):
             policy_id = int(agent_def['label'])
-            ckpt_path = agent_def['path']
-            cache_key = f"ckpt:{os.path.abspath(ckpt_path)}"
+            ckpt_path_pth = agent_def['path']
+            cache_key = f"ckpt:{os.path.abspath(ckpt_path_pth)}"
             if agent_cache is not None and cache_key in agent_cache:
                 agent = agent_cache[cache_key]
             else:
-                agent = _load_agent_from_checkpoint(ckpt_path, agent_def.get('model_type', 'main'), device)
+                agent = _load_agent_from_checkpoint(ckpt_path_pth, agent_def.get('model_type', 'main'), device)
                 if agent_cache is not None:
                     agent_cache[cache_key] = agent
             agent.model.eval()
-            for p in agent.model.parameters():
-                p.requires_grad = False
             agent.label = policy_id
             policy_map[policy_id] = agent
-
-            traced_candidate = _find_traced_artifact_for_checkpoint(ckpt_path)
-            if traced_candidate is not None:
-                traced_artifacts.append((policy_id, traced_candidate))
+            
+            # NEW: Check for a traced model path in the agent definition
+            ckpt_path_pt = agent_def.get('path_pt')
+            if ckpt_path_pt and os.path.exists(ckpt_path_pt):
+                # If it exists, add it to our list to be loaded by C++
+                traced_artifacts.append((policy_id, ckpt_path_pt))
             else:
                 logging.warning(
-                    "No traced TorchScript module found for historical policy %s at %s",
-                    policy_id,
-                    ckpt_path,
+                    f"No traced TorchScript module found for historical policy {policy_id} at {ckpt_path_pth}"
                 )
 
     # Assign a training policy id >= 7 that doesn't collide with existing labels
@@ -349,17 +362,16 @@ def train_generation(
 
     for policy_id, traced_path in traced_artifacts:
         try:
-            rollout_manager.cpp_manager.load_historical_model(int(policy_id), str(traced_path))
+            # This calls the Pybind11 binding we created.
+            rollout_manager.cpp_manager.load_historical_model(policy_id, str(traced_path))
             logging.info(
-                "Loaded traced historical policy %s from %s into C++ rollout manager",
-                policy_id,
-                traced_path,
+                f"Loaded traced historical policy {policy_id} from {traced_path} into C++ manager."
             )
-        except Exception:
+            # We can now potentially remove this agent from the Python policy_map to save memory,
+            # but leaving it as a fallback is safer for now.
+        except Exception as e:
             logging.exception(
-                "Failed to register traced historical model for policy %s from %s",
-                policy_id,
-                traced_path,
+                f"Failed to register traced model for policy {policy_id} from {traced_path}: {e}"
             )
 
     rollout_manager.set_opponent_pool(pool_manager.pool)
@@ -689,7 +701,14 @@ def train_generation(
     # --- NEW AUTOMATED TRACING STEP ---
     trace_model_from_checkpoint(final_path_pth, final_path_pt, device)
     # --- END NEW STEP ---
-    pool_manager.add_agent(name=run_name, model_type='main', path=final_path_pt)
+    pool_manager.add_agent(
+            name=run_name, 
+            model_type='main', 
+            # The 'path' should ALWAYS be the .pth file for cloning and warm-starting.
+            path=final_path_pth,
+            # Add a NEW key for the traced model path.
+            path_pt=final_path_pt 
+        )
     writer.close()
     logging.info(f"Saved final model for '{run_name}' to {final_path_pth}")
 
