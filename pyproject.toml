@@ -1,7 +1,8 @@
 [build-system]
 requires = [
-    "setuptools>=64",
-    "wheel",
-    "pybind11>=2.12"
+  "setuptools>=64",
+  "wheel",
+  "torch==2.4.*",   # match your runtime (2.4.1+cu121)
+  "ninja"           # optional but speeds up builds
 ]
 build-backend = "setuptools.build_meta"

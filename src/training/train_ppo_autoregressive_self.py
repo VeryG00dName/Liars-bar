@@ -36,6 +36,7 @@ from src.model.ppo_fused_model import PPOFusedModel
 from src.agents.batch_autoregressive_ppo_agent import BatchPPOAutoregressiveAgent
 from src.agents.cpp_bot_wrapper import CppBotWrapper
 from src.training.vec_ppo_rollout import PPOVecRolloutManager
+from src.training.tracing_utils import trace_model_from_checkpoint
 from src.training.train_extras import (
     _collate_batch,
     _to_device_batch,
@@ -677,16 +678,24 @@ def train_generation(
                 writer.add_scalar(f"Strategy/AvgBrickUsage/brick_{i}", float(v), update)
 
     # 5. FINALIZE AND SAVE
-    final_path = os.path.join(run_ckpt_dir, "final.pth")
-    to_save = getattr(learner.model, "_orig_mod", learner.model)
-    torch.save({"model_state_dict": to_save.state_dict()}, final_path)
-    pool_manager.add_agent(name=run_name, model_type='main', path=final_path)
+    final_path_pth = os.path.join(run_ckpt_dir, "final.pth")
+    final_path_pt = os.path.join(run_ckpt_dir, "final_traced.pt")
+
+    # Save the standard PyTorch state_dict
+    model_to_save = getattr(learner.model, "_orig_mod", learner.model)
+    torch.save({"model_state_dict": model_to_save.state_dict()}, final_path_pth)
+    logging.info(f"Saved standard PyTorch checkpoint to {final_path_pth}")
+
+    # --- NEW AUTOMATED TRACING STEP ---
+    trace_model_from_checkpoint(final_path_pth, final_path_pt, device)
+    # --- END NEW STEP ---
+    pool_manager.add_agent(name=run_name, model_type='main', path=final_path_pt)
     writer.close()
-    logging.info(f"Saved final model for '{run_name}' to {final_path}")
+    logging.info(f"Saved final model for '{run_name}' to {final_path_pth}")
 
     result: Dict[str, Any] = {
         "run_name": run_name,
-        "final_model_path": final_path,
+        "final_model_path": final_path_pth,
     }
     if collect_metrics:
         result["update_metrics"] = collected_updates
