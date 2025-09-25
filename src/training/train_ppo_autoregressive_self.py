@@ -373,9 +373,6 @@ def train_generation(
             rollout_manager.cpp_manager.load_historical_model(policy_id, str(traced_path))
             rollout_manager.register_historical_cpp_policy(policy_id, policy_id)
             loaded_historical_labels.append(policy_id)
-            logging.info(
-                f"Loaded historical opponent {policy_id} from traced artifact at {traced_path}."
-            )
         except Exception as exc:
             logging.exception(
                 f"Failed to load traced historical policy {policy_id} from {traced_path}: {exc}"

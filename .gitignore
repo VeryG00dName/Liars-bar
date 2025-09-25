@@ -188,3 +188,4 @@ CODING_GUIDELINES.md
 *.csv
 *.png
 *.data
+*.dot

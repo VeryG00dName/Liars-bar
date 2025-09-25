@@ -44,7 +44,7 @@ def find_generation_dirs(base_dir: str):
         gen_idx = int(m.group(1))
         gen_dir = os.path.join(base_dir, entry)
         if os.path.isdir(gen_dir):
-            yield entry, gen_dir, gen_idx
+            yield gen_dir, gen_idx
 
 def load_scalars_from_dir(run_dir: str):
     """Load all scalar tags from a directory containing TensorBoard event files."""
@@ -87,7 +87,7 @@ def extract_winrates_with_samples(base_dir: str) -> pd.DataFrame:
     One row per (generation, opponent_i).
     """
     rows = []
-    for gen_name, gen_dir, gen_idx in find_generation_dirs(base_dir):
+    for gen_dir, gen_idx in find_generation_dirs(base_dir):
         scalars = load_scalars_from_dir(gen_dir)
 
         # Build maps: i -> events for win_rate and episodes
@@ -115,8 +115,7 @@ def extract_winrates_with_samples(base_dir: str) -> pd.DataFrame:
             samples_end   = to_int_or_nan(epi_map.get(last_ev.step))
 
             rows.append({
-                "generation": gen_name,
-                "generation_index": gen_idx,
+                "generation": gen_idx,
                 "opponent_i": i,
                 "start_value": to_float(first_ev.value),
                 "end_value":   to_float(last_ev.value),
@@ -125,11 +124,11 @@ def extract_winrates_with_samples(base_dir: str) -> pd.DataFrame:
             })
 
     cols = [
-        "generation","generation_index","opponent_i",
+        "generation","opponent_i",
         "start_value","end_value","samples_start","samples_end"
     ]
     df = pd.DataFrame(rows, columns=cols).sort_values(
-        ["generation_index","opponent_i"]
+        ["generation","opponent_i"]
     ).reset_index(drop=True)
     return df
 
@@ -145,7 +144,7 @@ def extract_losses(base_dir: str) -> pd.DataFrame:
                 to_float(l.value) if l else float("nan"))
 
     rows = []
-    for gen_name, gen_dir, gen_idx in find_generation_dirs(base_dir):
+    for gen_dir, gen_idx in find_generation_dirs(base_dir):
         scalars = load_scalars_from_dir(gen_dir)
 
         matched = {k: [] for k in LOSS_TAGS.keys()}
@@ -159,7 +158,7 @@ def extract_losses(base_dir: str) -> pd.DataFrame:
         l1_start, l1_end = first_last_value(matched["L1Sparsity"])
 
         rows.append({
-            "generation": gen_name,
+            "generation": gen_idx,
             "BrickDiversity_start": bd_start,
             "BrickDiversity_end":   bd_end,
             "Loss/L1Sparsity_start": l1_start,
@@ -223,13 +222,29 @@ def average_time_over_gen(events):
         return float("nan")
     return sum(kept) / len(kept)
 
+def relative_minutes_to_last_step(events):
+    """
+    TensorBoard-style 'Relative' duration for a run:
+      - Sort by (step, wall_time)
+      - Take (last.wall_time - first.wall_time) in minutes.
+      - If no events, returns NaN.
+    """
+    if not events:
+        return float("nan")
+    es = sorted(events, key=lambda e: (e.step, e.wall_time))
+    first, last = es[0], es[-1]
+    rel_seconds = float(last.wall_time) - float(first.wall_time)
+    return rel_seconds / 60.0
+
 def extract_time_averages(base_dir: str) -> pd.DataFrame:
     """
-    For each gen_* folder, compute cleaned averages for Time/Rollout, Time/Optimize, Time/Total.
+    For each gen_* folder:
+      - Rollout/Optimize: cleaned averages (existing behavior)
+      - Total: TensorBoard 'Relative' duration (minutes) to final step
     One row per generation. Missing tags -> NaN.
     """
     rows = []
-    for gen_name, gen_dir, gen_idx in find_generation_dirs(base_dir):
+    for gen_dir, gen_idx in find_generation_dirs(base_dir):
         scalars = load_scalars_from_dir(gen_dir)
 
         # collect events per time tag
@@ -239,19 +254,24 @@ def extract_time_averages(base_dir: str) -> pd.DataFrame:
                 if pat.match(tag):
                     tag_events[key] = events
 
-        rollout_avg = average_time_over_gen(tag_events["Time/Rollout"])
+        rollout_avg  = average_time_over_gen(tag_events["Time/Rollout"])
         optimize_avg = average_time_over_gen(tag_events["Time/Optimize"])
-        total_avg = average_time_over_gen(tag_events["Time/Total"])
+
+        # relative duration (minutes) to final step for Total
+        total_relative_min = relative_minutes_to_last_step(tag_events["Time/Total"])
 
         rows.append({
-            "generation": gen_name,
+            "generation": gen_idx,
             "Time/Rollout_avg": rollout_avg,
             "Time/Optimize_avg": optimize_avg,
-            "Time/Total_avg": total_avg,
+            "Time/Total_relative_min": total_relative_min,  # <-- renamed/clear
         })
 
     df = pd.DataFrame(rows, columns=[
-        "generation","Time/Rollout_avg","Time/Optimize_avg","Time/Total_avg"
+        "generation",
+        "Time/Rollout_avg",
+        "Time/Optimize_avg",
+        "Time/Total_relative_min",
     ]).sort_values("generation").reset_index(drop=True)
     return df
 
@@ -278,16 +298,16 @@ def main():
     # Most-recent (highest opponent_i per generation)
     if not df_win.empty:
         # filter first
-        df_win_filtered = df_win[df_win["generation_index"] > 6]
+        df_win_filtered = df_win[df_win["generation"] > 6]
 
         if not df_win_filtered.empty:
-            idx = df_win_filtered.groupby("generation_index")["opponent_i"].idxmax()
+            idx = df_win_filtered.groupby("generation")["opponent_i"].idxmax()
             df_most_recent = (
                 df_win_filtered.loc[idx, [
-                    "generation","generation_index","opponent_i",
+                    "generation","opponent_i",
                     "start_value","end_value","samples_start","samples_end",
                 ]]
-                .sort_values(["generation_index"])
+                .sort_values(["generation"])
                 .reset_index(drop=True)
             )
             out_most_recent = os.path.join(base_dir, f"{prefix}win_rate_vs_most_recent.csv")

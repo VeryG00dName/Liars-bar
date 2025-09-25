@@ -228,7 +228,6 @@ def main() -> None:
     parser.add_argument(
         "--cpp-bots",
         type=str,
-        default="",
         help="Comma-separated list of C++ bot labels to include.",
     )
     parser.add_argument(

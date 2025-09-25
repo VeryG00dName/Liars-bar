@@ -73,12 +73,12 @@ DROPOUT_P = 0.15
 # Dictionary compositional pressure (DCP) and decorrelation controls
 # Base DCP weight is scaled by held-out TOKEN fraction inside the loss
 # (effective_weight = heldout_token_frac * DCP_LOSS_WEIGHT).
-DCP_LOSS_WEIGHT = 1.29
+DCP_LOSS_WEIGHT = 1.20
 BRICK_DECORRELATION_WEIGHT = 1e-3
 # ============================
 # PPO / Training Hyperparameters
 # ============================
-EPISODES_PER_UPDATE = 576
+EPISODES_PER_UPDATE = 512
 LEARNING_RATE = 0.00019
 GAMMA = 0.974
 GAE_LAMBDA = 0.98
@@ -90,7 +90,7 @@ MAX_NORM = 0.3
 INIT_ENTROPY_COEF = 0.005
 
 # Opponent sampling configuration
-SHADOW_P_NEW = 0.116
+SHADOW_P_NEW = 0.05
 FRONT_P_ADJUSTED = 1.0 - SHADOW_P_NEW
 NUM_ACTIVE_SHADOW_AGENTS_PER_UPDATE = 2
 CPP_BOT_MAX_LABEL = 6
