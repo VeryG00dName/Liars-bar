@@ -1,3 +1,4 @@
+# src/eval/evaluate_tournament.py
 """Swiss-style tournament evaluation using the batched VecArena backend."""
 from __future__ import annotations
 

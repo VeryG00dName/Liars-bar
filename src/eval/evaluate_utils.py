@@ -1,3 +1,4 @@
+# src/eval/evaluate_utils.py
 """Utilities for loading evaluation agents and running VecArena tournaments."""
 from __future__ import annotations
 
