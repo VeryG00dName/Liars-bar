@@ -42,6 +42,8 @@ from src.training.train_extras import (
     set_seed
 )
 import src.training.train_extras as train_extras
+from src.training.meta_game_sampler import MetaGameSampler, SamplerConfig
+from src.training.meta_game_solvers import SolverConfig
 
 def _silence_torch_symbolic_logs():
     for name in ("torch.fx.experimental.symbolic_shapes", "torch._dynamo.symbolic_shapes", "torch._dynamo", "torch._inductor"):
@@ -310,12 +312,33 @@ def train_generation(
         f"Assigned training policy id {training_policy_id}; existing opponent labels: {sorted(existing_labels)}"
     )
 
+    solver_cfg = SolverConfig(
+        solver_type=str(getattr(config, "META_GAME_SOLVER_TYPE", "alpha_rank")),
+        alpha=float(getattr(config, "META_GAME_SOLVER_ALPHA", 10.0)),
+        heldout_floor=float(getattr(config, "META_GAME_HELDOUT_FLOOR", 0.0864)),
+        exploration_epsilon=float(getattr(config, "META_GAME_EXPLORATION_EPS", 0.02)),
+        confidence_threshold=float(getattr(config, "META_GAME_CONFIDENCE_THRESHOLD", 0.05)),
+        alpha_cap=float(getattr(config, "META_GAME_ALPHA_CAP", 50.0)),
+    )
+    store_dir = Path(getattr(config, "META_GAME_STORE_DIR", "meta_game_store"))
+    sampler_config = SamplerConfig(
+        solver=solver_cfg,
+        store_path=store_dir,
+        held_out_labels=list(getattr(config, "META_GAME_HELD_OUT_LABELS", [])),
+        required_support=list(getattr(config, "META_GAME_REQUIRED_SUPPORT", [])),
+        archive_threshold=float(getattr(config, "META_GAME_ARCHIVE_THRESHOLD", 0.0)),
+        archive_patience=int(getattr(config, "META_GAME_ARCHIVE_PATIENCE", 0)),
+        similarity_threshold=float(getattr(config, "META_GAME_SIMILARITY_THRESHOLD", 0.0)),
+    )
+    meta_sampler = MetaGameSampler(sampler_config)
+
     # 3. INITIALIZE ROLLOUT MANAGER AND PLATEAU DETECTOR
     rollout_manager = PPOVecRolloutManager(
         policy_map,
         device,
         pool_manager=pool_manager,
         rng=(rng or _GLOBAL_RNG),
+        meta_sampler=meta_sampler,
     )
 
     rollout_manager.mark_training_policy(training_policy_id, getattr(learner, "label", training_policy_id))
@@ -413,10 +436,38 @@ def train_generation(
         if not new_eps:
             logging.warning(f"Update {update}: No episodes collected. Skipping.")
             continue
-        
+
         ep_buffer.extend(new_eps)
         if len(ep_buffer) > buffer_capacity:
             ep_buffer = ep_buffer[-buffer_capacity:]
+
+        if meta_sampler is not None and new_eps:
+            store = meta_sampler.store
+            for ep in new_eps:
+                player_labels = tuple(int(x) for x in ep.get("player_labels", ()))
+                training_label = int(ep.get("training_agent_label", training_policy_id))
+                seat_perm = player_labels if player_labels else None
+                if ep.get("win", 0):
+                    for lbl in player_labels:
+                        if lbl == training_label:
+                            continue
+                        store.record_match(training_label, lbl, seat_permutation=seat_perm)
+                else:
+                    for lbl in player_labels:
+                        if lbl == training_label:
+                            continue
+                        store.record_match(lbl, training_label, seat_permutation=seat_perm)
+            meta_sampler.refresh_store()
+
+            if rollout_manager._last_sampling_distribution:
+                train_extras.log_meta_game_distribution(
+                    writer,
+                    rollout_manager._last_sampling_distribution,
+                    update,
+                )
+                update_fn = getattr(getattr(learner, "model", None), "update_meta_game_distribution", None)
+                if callable(update_fn):
+                    update_fn(rollout_manager._last_sampling_distribution)
         
         # -------- Optimize (aggregate metrics) --------
         learner.model.train()
@@ -703,6 +754,9 @@ def train_generation(
             # log each brick as its own scalar under one namespace
             for i, v in enumerate(mean_usage):
                 writer.add_scalar(f"Strategy/AvgBrickUsage/brick_{i}", float(v), update)
+
+    if meta_sampler is not None:
+        meta_sampler.refresh_store()
 
     # 5. FINALIZE AND SAVE
     final_path_pth = os.path.join(run_ckpt_dir, "final.pth")

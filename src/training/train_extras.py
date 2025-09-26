@@ -137,6 +137,23 @@ def _persistent_pca_project(
     entry["last_step"] = int(step)
     return Xp, entry
 
+
+def log_meta_game_distribution(
+    writer: Optional[Any],
+    distribution: Dict[int, float],
+    step: int,
+    *,
+    namespace: str = "meta_game",
+) -> None:
+    """Log sampling distributions to TensorBoard in a consistent manner."""
+    if writer is None or not distribution:
+        return
+    for label, prob in sorted(distribution.items()):
+        try:
+            writer.add_scalar(f"{namespace}/sampling_prob_{label}", float(prob), step)
+        except Exception:
+            continue
+
 def set_seed(seed=42):
     """
     Sets the seed for reproducibility.
@@ -1427,15 +1444,7 @@ def ppo_losses_batched(
     # Change from per-episode to per-token weighting: use proportion of held-out
     # training tokens (our_mask) rather than count of episodes.
     dcp_tune = float(getattr(config, "DCP_LOSS_WEIGHT", 1.0))
-    with torch.no_grad():
-        total_tokens = float(our_mask.sum().item())
-        heldout_tokens = float(heldout_step_mask.sum().item())
-        heldout_frac_tokens = (heldout_tokens / max(total_tokens, 1.0)) if total_tokens > 0 else 0.0
-        # Keep episode fraction as a diagnostic for backwards-compat dashboards
-        B_eps = float(heldout_episode_mask.numel()) if heldout_episode_mask is not None else 0.0
-        heldout_eps = float(heldout_episode_mask.sum().item()) if heldout_episode_mask is not None else 0.0
-        heldout_frac = (heldout_eps / max(B_eps, 1.0)) if B_eps > 0 else 0.0
-    lambda_cp = dcp_tune * heldout_frac_tokens
+    lambda_cp = dcp_tune
     decor_weight = float(getattr(config, "BRICK_DECORRELATION_WEIGHT", 0.0))
 
     dcp_loss = torch.zeros_like(train_loss)
@@ -1470,8 +1479,6 @@ def ppo_losses_batched(
 
     metrics["dcp_weighted_loss"] = (lambda_cp * dcp_loss).detach()
     metrics["dcp_weight_eff"] = torch.tensor(lambda_cp, device=train_loss.device)
-    metrics["heldout_token_frac"] = torch.tensor(heldout_frac_tokens, device=train_loss.device)
-    metrics["heldout_episode_frac"] = torch.tensor(heldout_frac, device=train_loss.device)
     metrics["total_loss"] = total_loss.detach()
 
     return total_loss, metrics
