@@ -185,6 +185,39 @@ def _clone_agent_from_agent(src_agent: LearnerAutoregressiveAgent,
     return clone
 
 
+def _episode_token_count(episode: Dict[str, Any]) -> int:
+    """Return the number of autoregressive tokens contained in an episode."""
+    model_input = episode.get("model_input")
+    if isinstance(model_input, dict):
+        valid_lengths = model_input.get("valid_lengths")
+        if isinstance(valid_lengths, torch.Tensor) and valid_lengths.numel() > 0:
+            try:
+                return int(valid_lengths.view(-1)[0].item())
+            except Exception:
+                pass
+        elif valid_lengths is not None:
+            try:
+                return int(valid_lengths)
+            except Exception:
+                pass
+
+    rewards = episode.get("reward")
+    if rewards is not None:
+        try:
+            return int(len(rewards))
+        except Exception:
+            pass
+
+    actions = episode.get("our_action")
+    if actions is not None:
+        try:
+            return int(len(actions))
+        except Exception:
+            pass
+
+    return 0
+
+
 def _find_traced_artifact_for_checkpoint(checkpoint_path: str) -> Optional[Path]:
     """Return the TorchScript trace produced by ``train_utils.py`` if it exists."""
 
@@ -416,8 +449,9 @@ def train_generation(
     buffer_mult = int(getattr(config, "OFFPOLICY_EP_BUFFER_MULT", 4))
     buffer_capacity = buffer_mult * episodes_per_update
     ep_buffer: List[Dict[str, Any]] = []
+    buffer_token_total = 0
     # Use direct opponent labels for visualization; no remapping/lookup
-    
+
     collected_updates: List[Dict[str, Any]] = []
 
     for update in range(1, max_updates + 1):
@@ -437,9 +471,24 @@ def train_generation(
             logging.warning(f"Update {update}: No episodes collected. Skipping.")
             continue
 
+        rollout_tokens = 0
+        for ep in new_eps:
+            tokens = _episode_token_count(ep)
+            ep["_token_count"] = tokens
+            rollout_tokens += tokens
+
         ep_buffer.extend(new_eps)
+        buffer_token_total += rollout_tokens
         if len(ep_buffer) > buffer_capacity:
-            ep_buffer = ep_buffer[-buffer_capacity:]
+            excess = len(ep_buffer) - buffer_capacity
+            removed_eps = ep_buffer[:excess]
+            buffer_token_total -= sum(
+                rem.get("_token_count", _episode_token_count(rem))
+                for rem in removed_eps
+            )
+            del ep_buffer[:excess]
+        if buffer_token_total < 0:
+            buffer_token_total = 0
 
         if meta_sampler is not None and new_eps:
             store = meta_sampler.store
@@ -473,6 +522,7 @@ def train_generation(
         learner.model.train()
         agg = {"total_loss": 0.0}
         n_batches = 0
+        opt_tokens_processed = 0
         opp_rows_X = []  # list of np.ndarray chunks, each [N_i, D]
         opp_rows_L = []  # flat list of remapped labels aligned with rows in opp_rows_X
         opp_token_codes: List[np.ndarray] = []
@@ -483,6 +533,9 @@ def train_generation(
             if not batch_eps: continue
             
             batch_cpu = _collate_batch(batch_eps)
+            valid_lengths_cpu = batch_cpu.get("mi", {}).get("valid_lengths")
+            if isinstance(valid_lengths_cpu, torch.Tensor):
+                opt_tokens_processed += int(valid_lengths_cpu.sum().item())
             batch_gpu = _to_device_batch(batch_cpu, device)
             
             optimizer.zero_grad()
@@ -557,12 +610,17 @@ def train_generation(
         if device.type == "cuda" and FORCE_CUDA_SYNC_FOR_TIMING:
             torch.cuda.synchronize()
         t_opt_end = time.time()
-        # Timings
+        # Timings (rollout + optimize). We'll measure logging separately below
         dur_roll = t_roll - t0
         dur_opt  = t_opt_end - t_roll
-        dur_tot  = t_opt_end - t0
+        # Note: do NOT finalize dur_tot yet; include logging time later
 
-        # -------- Log metrics --------
+        avg_game_length = (rollout_tokens / len(new_eps)) if new_eps else 0.0
+        rollout_tps = (rollout_tokens / dur_roll) if dur_roll > 0 else 0.0
+        optimize_tps = (opt_tokens_processed / dur_opt) if dur_opt > 0 else 0.0
+
+        # -------- Log metrics (timed) --------
+        t_log_start = time.time()
         avg = {k: (v / max(n_batches, 1)) for k, v in agg.items()}
         win_rate = sum(ep["win"] for ep in new_eps) / len(new_eps)
         per_opponent_totals: Dict[Any, List[float]] = {}
@@ -612,10 +670,8 @@ def train_generation(
         if collect_metrics:
             collected_updates.append(update_summary)
 
-        # Timings
-        writer.add_scalar("Time/Rollout", dur_roll, update)
-        writer.add_scalar("Time/Optimize", dur_opt, update)
-        writer.add_scalar("Time/Total", dur_tot, update)
+        # NOTE: defer time scalar logging until end of logging section so we
+        # can include logging overhead in Total and a dedicated Log duration.
         # Losses & diagnostics
         writer.add_scalar("Loss/Total", avg.get("total_loss", 0.0), update)
         writer.add_scalar("Loss/Policy", avg.get("policy_loss", 0.0), update)
@@ -668,8 +724,72 @@ def train_generation(
             hw, ht = per_opponent_totals_int[heldout_label]
             if ht > 0:
                 writer.add_scalar("PerOpponent/Win_rate_vs_heldout", hw / ht, update)
+        writer.add_scalar("Rollout/AvgGameLength", avg_game_length, update)
+        writer.add_scalar("Rollout/TokensCollected", rollout_tokens, update)
+        writer.add_scalar("Rollout/TokensPerSecond", rollout_tps, update)
+        writer.add_scalar("Optimize/TokensProcessed", opt_tokens_processed, update)
+        writer.add_scalar("Optimize/TokensPerSecond", optimize_tps, update)
         writer.add_scalar("Buffer/Size", len(ep_buffer), update)
+        writer.add_scalar("Buffer/Tokens", buffer_token_total, update)
         writer.add_scalar("Acc/OpponentAction", avg.get("opp_action_acc", 0.0), update)
+
+        model_call_stats = rollout_manager.get_last_model_call_stats()
+        total_model_calls = sum(int(stats.get("count", 0) or 0) for stats in model_call_stats.values())
+        total_model_time = sum(float(stats.get("total_time", 0.0) or 0.0) for stats in model_call_stats.values())
+        total_model_min = min(
+            (float(stats.get("min", float("inf"))) for stats in model_call_stats.values() if int(stats.get("count", 0) or 0) > 0),
+            default=0.0,
+        )
+        total_model_max = max(
+            (float(stats.get("max", 0.0)) for stats in model_call_stats.values() if int(stats.get("count", 0) or 0) > 0),
+            default=0.0,
+        )
+        total_model_avg = (total_model_time / total_model_calls) if total_model_calls else 0.0
+
+        train_stats = model_call_stats.get(int(training_policy_id), {})
+        train_count = int(train_stats.get("count", 0) or 0)
+        train_total = float(train_stats.get("total_time", 0.0) or 0.0)
+        train_min = float(train_stats.get("min", 0.0) or 0.0) if train_count else 0.0
+        train_max = float(train_stats.get("max", 0.0) or 0.0) if train_count else 0.0
+        train_avg = (train_total / train_count) if train_count else 0.0
+
+        opponent_stats = [stats for pid, stats in model_call_stats.items() if int(pid) != int(training_policy_id)]
+        opp_count = sum(int(stats.get("count", 0) or 0) for stats in opponent_stats)
+        opp_total = sum(float(stats.get("total_time", 0.0) or 0.0) for stats in opponent_stats)
+        opp_min = min(
+            (float(stats.get("min", float("inf"))) for stats in opponent_stats if int(stats.get("count", 0) or 0) > 0),
+            default=0.0,
+        )
+        opp_max = max(
+            (float(stats.get("max", 0.0)) for stats in opponent_stats if int(stats.get("count", 0) or 0) > 0),
+            default=0.0,
+        )
+        opp_avg = (opp_total / opp_count) if opp_count else 0.0
+
+        writer.add_scalar("ModelCalls/TotalCount", total_model_calls, update)
+        writer.add_scalar("ModelCalls/TotalAvgMs", total_model_avg * 1000.0, update)
+        writer.add_scalar("ModelCalls/TotalMinMs", total_model_min * 1000.0, update)
+        writer.add_scalar("ModelCalls/TotalMaxMs", total_model_max * 1000.0, update)
+        writer.add_scalar("ModelCalls/TrainCount", train_count, update)
+        writer.add_scalar("ModelCalls/TrainAvgMs", train_avg * 1000.0, update)
+        writer.add_scalar("ModelCalls/TrainMinMs", train_min * 1000.0, update)
+        writer.add_scalar("ModelCalls/TrainMaxMs", train_max * 1000.0, update)
+        writer.add_scalar("ModelCalls/OpponentCount", opp_count, update)
+        writer.add_scalar("ModelCalls/OpponentAvgMs", opp_avg * 1000.0, update)
+        writer.add_scalar("ModelCalls/OpponentMinMs", opp_min * 1000.0, update)
+        writer.add_scalar("ModelCalls/OpponentMaxMs", opp_max * 1000.0, update)
+
+        # Finalize logging timings and write time scalars
+        if device.type == "cuda" and FORCE_CUDA_SYNC_FOR_TIMING:
+            torch.cuda.synchronize()
+        t_log_end = time.time()
+        dur_log = t_log_end - t_log_start
+        dur_tot = t_log_end - t0
+
+        writer.add_scalar("Time/Rollout",  dur_roll, update)
+        writer.add_scalar("Time/Optimize", dur_opt,  update)
+        writer.add_scalar("Time/Log",      dur_log,  update)
+        writer.add_scalar("Time/Total",    dur_tot,  update)
 
         # Allow early stopping of the generation if requested by the callback
         if stop_requested:
@@ -703,7 +823,9 @@ def train_generation(
                 with torch.no_grad():
                     bricks_np = strat_dict.bricks.detach().cpu().float().numpy()
 
-            pca_key = f"{run_name}_strategy_code"
+            # Label embeddings with master and generation for clarity in TB/HTML
+            _emb_prefix = f"{master_run_name} / {run_name}"
+            pca_key = f"{_emb_prefix}__strategy_code"
             train_extras.log_strategy_pca_views(
                 writer,
                 step=update,
@@ -713,7 +835,7 @@ def train_generation(
                 brick_vectors=bricks_np,
                 activation_codes=activation_codes,
                 activation_labels=activation_labels,
-                title_prefix="Per-Opponent strategy_code",
+                title_prefix=f"{_emb_prefix} — Per-Opponent strategy_code",
             )
 
             metrics = train_extras.embedding_quality_metrics(X, labels_seq, k=10)
@@ -733,9 +855,11 @@ def train_generation(
                     ratio = float(evr[2] / max(evr[0] + evr[1], 1e-9))
                     writer.add_scalar("Emb/PC3_vs_PC12_ratio", ratio, update)
                     
-            html_path = os.path.join(run_ckpt_dir, f"embeddings_step_{update}.html")
+            html_path = os.path.join(run_ckpt_dir, f"embeddings_{run_name}_step_{update}.html")
             try:
-                train_extras.save_interactive_3d(X, labels_display, html_path)
+                train_extras.save_interactive_3d(
+                    X, labels_display, html_path, title_prefix=_emb_prefix
+                )
             except Exception as exc:
                 print(f"[viz][3d] failed: {exc}")
 

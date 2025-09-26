@@ -3,6 +3,7 @@
 from typing import Dict, Any, List, Optional, Set
 import logging
 from types import SimpleNamespace
+import time
 
 import numpy as np
 import torch
@@ -49,6 +50,7 @@ class PPOVecRolloutManager:
         self._last_sampling_distribution: Dict[int, float] = {}
         self._cpp_native_policies: Set[int] = set()
         self._historical_cpp_policies: Set[int] = set()
+        self._last_model_call_stats: Dict[int, Dict[str, float]] = {}
 
     def register_cpp_native_policy(self, policy_id: int, label: Optional[int] = None) -> None:
         policy_id_int = int(policy_id)
@@ -124,6 +126,10 @@ class PPOVecRolloutManager:
     def set_opponent_pool(self, pool_data: List[Dict[str, Any]]) -> None:
         self._opponent_pool_snapshot = list(pool_data)
         self._update_internal_agent_partitions(self._opponent_pool_snapshot)
+
+    def get_last_model_call_stats(self) -> Dict[int, Dict[str, float]]:
+        """Return a shallow copy of the most recent per-policy model call stats."""
+        return {pid: dict(stats) for pid, stats in self._last_model_call_stats.items()}
 
     def _reset_policy_state(self) -> None:
         for policy in self.policies.values():
@@ -236,9 +242,23 @@ class PPOVecRolloutManager:
         max_batch_envs: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         self._reset_policy_state()
+        self._last_model_call_stats = {}
 
         if self.pool_manager is not None and not self._partitions_ready:
             self.set_opponent_pool(self.pool_manager.pool)
+
+        model_call_stats: Dict[int, Dict[str, float]] = {}
+
+        def _record_model_call(policy_id: int, duration: float) -> None:
+            stats = model_call_stats.setdefault(
+                int(policy_id), {"count": 0, "total_time": 0.0, "min": None, "max": 0.0}
+            )
+            stats["count"] += 1
+            stats["total_time"] += float(duration)
+            if stats["min"] is None or duration < stats["min"]:
+                stats["min"] = float(duration)
+            if duration > stats["max"]:
+                stats["max"] = float(duration)
 
         cpp_bots = list(self._cpp_bots)
         latest_historical_agents = list(self._latest_historical_agents)
@@ -326,9 +346,14 @@ class PPOVecRolloutManager:
                             metadata[key_str] = value
                         else:
                             tensor_inputs[key_str] = value
-                    actions, log_probs, values = agent.compute_actions(
-                        tensor_inputs, metadata=metadata
-                    )
+                    start = time.perf_counter()
+                    try:
+                        actions, log_probs, values = agent.compute_actions(
+                            tensor_inputs, metadata=metadata
+                        )
+                    finally:
+                        duration = time.perf_counter() - start
+                        _record_model_call(policy_id, duration)
                 else:
                     request_entries = list(request_entries)
                     prepared_requests = self._prepare_requests(request_entries)
@@ -336,7 +361,12 @@ class PPOVecRolloutManager:
                     if not prepared_requests:
                         continue
 
-                    actions, log_probs, values = agent.get_actions_batch(prepared_requests)
+                    start = time.perf_counter()
+                    try:
+                        actions, log_probs, values = agent.get_actions_batch(prepared_requests)
+                    finally:
+                        duration = time.perf_counter() - start
+                        _record_model_call(policy_id, duration)
 
                 if isinstance(actions, np.ndarray) and actions.dtype == np.uint8 and actions.flags.c_contiguous:
                     actions_arr = actions
@@ -374,5 +404,15 @@ class PPOVecRolloutManager:
         episodes: List[Dict[str, Any]] = []
         for traj in completed:
             episodes.append(self._convert_completed_episode(traj))
+
+        self._last_model_call_stats = {
+            pid: {
+                "count": int(stats.get("count", 0)),
+                "total_time": float(stats.get("total_time", 0.0)),
+                "min": float(stats["min"]) if stats.get("min") is not None else 0.0,
+                "max": float(stats.get("max", 0.0)),
+            }
+            for pid, stats in model_call_stats.items()
+        }
 
         return episodes[:num_episodes]

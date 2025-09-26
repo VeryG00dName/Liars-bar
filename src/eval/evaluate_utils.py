@@ -27,12 +27,10 @@ from src.agents.cpp_bot_wrapper import CppBotWrapper
 from src.misc import lb
 
 
-import matplotlib.pyplot as plt  # type: ignore
-_HAS_MPL = True
+import matplotlib.pyplot as plt
 
-import seaborn as sns  # type: ignore
-import pandas as pd  # type: ignore
-_HAS_SNS = True
+import seaborn as sns
+import pandas as pd
 
 
 CPP_BOT_LABEL_TO_NAME = {
@@ -602,9 +600,6 @@ def plot_agent_heatmap(
     h2h_rates: mapping of (A,B) -> win rate for A vs B in [0,1].
     players: tournament players metadata (for names and ordering).
     """
-    if not _HAS_MPL:
-        Console().print("[yellow]matplotlib not available; skipping heatmap plot.[/yellow]")
-        return
 
     # Order agents by descending skill (rating.ordinal), fallback to pid
     order = sorted(
@@ -635,13 +630,9 @@ def plot_agent_heatmap(
 
     # --- Plot heatmap ---
     plt.figure(figsize=(max(8, n * 0.6), max(6, n * 0.5)))
-    if _HAS_SNS:
-        sns.heatmap(df, annot=False, cmap="Blues", vmin=0.0, vmax=1.0, cbar=True)
-    else:
-        im = plt.imshow(M, cmap="Blues", vmin=0.0, vmax=1.0)
-        plt.colorbar(im)
-        plt.xticks(range(n), labels, rotation=90)
-        plt.yticks(range(n), labels)
+
+    sns.heatmap(df, annot=False, cmap="Blues", vmin=0.0, vmax=1.0, cbar=True)
+
     plt.title(title)
     plt.tight_layout()
     try:

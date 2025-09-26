@@ -399,6 +399,7 @@ def save_interactive_3d(
     path_html: str,
     method: str = "pca",
     per_label_cap: int = 600,
+    title_prefix: Optional[str] = None,
 ) -> Optional[str]:
     """Save an interactive 3D PCA HTML scatter plot of embeddings."""
     X = np.asarray(X)
@@ -433,8 +434,9 @@ def save_interactive_3d(
         f"3D PCA (EVR: {evr[0]:.2f}, {evr[1]:.2f}, {evr[2]:.2f})"
         if evr.size >= 3 else f"3D PCA — N={Xs.shape[0]}"
     )
+    full_title = (f"{title_prefix} — " if title_prefix else "") + ttl + f" — N={Xs.shape[0]}"
     fig.update_layout(
-        title=ttl + f" — N={Xs.shape[0]}",
+        title=full_title,
         showlegend=True,
         scene=dict(
             xaxis_title="PC1",
