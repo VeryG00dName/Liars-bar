@@ -1,24 +1,23 @@
-# src/eval/evaluate_utils.py
-"""Utilities for loading evaluation agents and running VecArena tournaments."""
+"""Utilities for evaluation league scheduling, statistics, and visualization."""
+
 from __future__ import annotations
 
 import json
+import math
 import os
-import random
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
 os.environ.setdefault("MPLBACKEND", "Agg")
-import matplotlib
-matplotlib.use("Agg")
 import numpy as np
 import torch
-from openskill.models import PlackettLuce
 from rich.console import Console
-from rich.table import Table
-from rich.live import Live
 from rich.layout import Layout
+from rich.live import Live
 from rich.panel import Panel
-from rich.progress import Progress, BarColumn, TextColumn
+from rich.progress import BarColumn, Progress, TextColumn
+from rich.table import Table
 
 from src import config
 from src.agents.base_agent import BaseAgent
@@ -26,11 +25,32 @@ from src.agents.batch_autoregressive_ppo_agent import BatchPPOAutoregressiveAgen
 from src.agents.cpp_bot_wrapper import CppBotWrapper
 from src.misc import lb
 
+from scipy import stats
+import trueskill
 
-import matplotlib.pyplot as plt
+if TYPE_CHECKING:  # pragma: no cover - import-time guard for optional plotting deps
+    import matplotlib.pyplot as plt  # noqa: F401
+    import pandas as pd  # noqa: F401
+    import seaborn as sns  # noqa: F401
 
-import seaborn as sns
-import pandas as pd
+
+def _ensure_plotting() -> None:
+    """Import heavy plotting libraries lazily to avoid slowing common code paths."""
+
+    global plt, pd, sns  # type: ignore[name-defined]
+    if "plt" in globals() and "pd" in globals() and "sns" in globals():
+        return
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as _plt
+    import pandas as _pd
+    import seaborn as _sns
+
+    globals()["plt"] = _plt
+    globals()["pd"] = _pd
+    globals()["sns"] = _sns
 
 
 CPP_BOT_LABEL_TO_NAME = {
@@ -43,22 +63,109 @@ CPP_BOT_LABEL_TO_NAME = {
     6: "TableNonTableAgent",
 }
 
-openskill_model = PlackettLuce(mu=25.0, sigma=25.0 / 3, beta=25.0 / 6)
+
+@dataclass
+class RatingEntry:
+    """Container for a TrueSkill rating."""
+
+    mu: float
+    sigma: float
+
+    @property
+    def conservative(self) -> float:
+        return self.mu - 3.0 * self.sigma
+
+
+class TrueSkillBackend:
+    """Minimal wrapper over :mod:`trueskill` to mimic TrueSkill Through Time style updates."""
+
+    def __init__(
+        self,
+        mu: float = 25.0,
+        sigma: float = 25.0 / 3.0,
+        beta: Optional[float] = None,
+        tau: Optional[float] = None,
+        draw_probability: float = 0.0,
+    ) -> None:
+        beta = beta if beta is not None else 25.0 / 6.0
+        tau = tau if tau is not None else beta / 100.0
+        self.env = trueskill.TrueSkill(
+            mu=mu,
+            sigma=sigma,
+            beta=beta,
+            tau=tau,
+            draw_probability=draw_probability,
+        )
+        self._ratings: Dict[int, trueskill.Rating] = {}
+
+    @property
+    def beta(self) -> float:
+        return float(self.env.beta)
+
+    def ensure_rating(self, player_id: int) -> trueskill.Rating:
+        rating = self._ratings.get(player_id)
+        if rating is None:
+            rating = self.env.create_rating()
+            self._ratings[player_id] = rating
+        return rating
+
+    def rating_entry(self, player_id: int) -> RatingEntry:
+        rating = self.ensure_rating(player_id)
+        return RatingEntry(mu=float(rating.mu), sigma=float(rating.sigma))
+
+    def update_from_ranks(self, ranks: Sequence[Tuple[int, int]]) -> Dict[int, RatingEntry]:
+        """Update the backend using multi-player rank outcomes.
+
+        Args:
+            ranks: Iterable of ``(player_id, rank)`` tuples where lower ranks are better.
+        """
+
+        buckets: Dict[int, List[trueskill.Rating]] = {}
+        for player_id, rank in ranks:
+            buckets.setdefault(rank, []).append(self.ensure_rating(player_id))
+
+        sorted_buckets = sorted(buckets.items(), key=lambda item: item[0])
+        env_input = [members for _, members in sorted_buckets]
+        rated_groups = self.env.rate(env_input)
+
+        updated: Dict[int, RatingEntry] = {}
+        for (rank, members), new_group in zip(sorted_buckets, rated_groups):
+            indices = [pid for pid, r in ranks if r == rank]
+            for pid, new_rating in zip(indices, new_group):
+                self._ratings[pid] = new_rating
+                updated[pid] = RatingEntry(mu=float(new_rating.mu), sigma=float(new_rating.sigma))
+        return updated
+
+    def performance_diff(self, pid_a: int, pid_b: int) -> Tuple[float, float]:
+        rating_a = self.ensure_rating(pid_a)
+        rating_b = self.ensure_rating(pid_b)
+        mu = float(rating_a.mu - rating_b.mu)
+        sigma_sq = (
+            float(rating_a.sigma) ** 2
+            + float(rating_b.sigma) ** 2
+            + 2.0 * float(self.env.beta) ** 2
+        )
+        return mu, math.sqrt(sigma_sq)
+
+    def win_probability(self, pid_a: int, pid_b: int) -> float:
+        mu_diff, sigma = self.performance_diff(pid_a, pid_b)
+        if sigma <= 0:
+            return 0.5
+        return 0.5 * (1.0 + math.erf(mu_diff / (sigma * math.sqrt(2.0))))
+
+
+RATING_BACKEND = TrueSkillBackend()
 
 
 def _prepare_checkpoint(raw: Any) -> Tuple[Dict[str, Dict[str, Any]], str, Dict[str, Any]]:
-    """Convert raw checkpoint payloads to the agent loader format.
+    """Convert raw checkpoint payloads to the agent loader format."""
 
-    Returns a tuple of (normalized_checkpoint, agent_key, meta), where meta may contain
-    auxiliary info such as a stored 'label' if present in the raw payload.
-    """
     meta: Dict[str, Any] = {}
     if isinstance(raw, dict):
-        # Try to capture a label from common locations if present.
         if "label" in raw and isinstance(raw["label"], (int, float)):
-            meta["label"] = int(raw["label"])  # type: ignore[arg-type]
+            meta["label"] = int(raw["label"])
         elif isinstance(raw.get("meta"), dict) and isinstance(raw["meta"].get("label"), (int, float)):
-            meta["label"] = int(raw["meta"]["label"])  # type: ignore[index]
+            meta["label"] = int(raw["meta"]["label"])
 
         if raw.get("policy_nets"):
             nets = raw["policy_nets"]
@@ -68,12 +175,14 @@ def _prepare_checkpoint(raw: Any) -> Tuple[Dict[str, Dict[str, Any]], str, Dict[
             return {"policy_nets": {"agent_model": raw["model_state_dict"]}}, "agent_model", meta
         if "state_dict" in raw:
             return {"policy_nets": {"agent_model": raw["state_dict"]}}, "agent_model", meta
+
     if isinstance(raw, dict):
         looks_like_state_dict = all(
             isinstance(k, str) and isinstance(v, torch.Tensor) for k, v in raw.items()
         )
         if looks_like_state_dict:
             return {"policy_nets": {"agent_model": raw}}, "agent_model", meta
+
     raise ValueError("Unsupported checkpoint format; expected 'policy_nets' or 'model_state_dict'.")
 
 
@@ -82,16 +191,25 @@ def _load_checkpoint(path: Path, device: torch.device) -> Tuple[Dict[str, Dict[s
     return _prepare_checkpoint(checkpoint_raw)
 
 
-def _initial_metadata(player_id: str, label: int, is_cpp_bot: bool) -> Dict[str, Any]:
-    rating = openskill_model.rating(name=player_id)
+def _initial_metadata(
+    policy_id: int,
+    player_id: str,
+    label: int,
+    is_cpp_bot: bool,
+) -> Dict[str, Any]:
+    rating = RATING_BACKEND.rating_entry(policy_id)
     return {
+        "policy_id": policy_id,
         "player_id": player_id,
         "label": label,
-        "rating": rating,
-        "score": rating.ordinal(),
+        "mu": rating.mu,
+        "sigma": rating.sigma,
+        "conservative": rating.conservative,
         "wins_match": 0,
         "total_round_wins": 0,
+        "matches_played": 0,
         "games_played": 0,
+        "total_games_played": 0,
         "win_rate_match": 0.0,
         "win_rate_total": 0.0,
         "is_cpp_bot": is_cpp_bot,
@@ -103,17 +221,10 @@ def load_evaluation_policies(
     cpp_bot_labels: List[int],
     device: torch.device,
 ) -> Tuple[Dict[int, BaseAgent], Dict[int, Dict[str, Any]]]:
-    """Load PPO agents and C++ bots for evaluation.
-
-    Args:
-        run_specs: Mapping of run name to a list of generation specifiers.
-        cpp_bot_labels: Integer labels identifying which compiled bots to load.
-        device: Torch device for all neural agents.
-    """
+    """Load PPO agents and C++ bots for evaluation."""
 
     all_policies: Dict[int, BaseAgent] = {}
     metadata: Dict[int, Dict[str, Any]] = {}
-    # Reserve 0..CPP_BOT_MAX_LABEL for C++ bots per VecArena convention
     next_neural_policy_id = int(getattr(config, "CPP_BOT_MAX_LABEL", 6)) + 1
 
     def _discover_generations(run_name: str) -> List[str]:
@@ -126,14 +237,13 @@ def load_evaluation_policies(
                 suffix = p.name[len("gen_"):]
                 if suffix:
                     gens.append(suffix)
-        # Sort numeric gens first, then any non-numeric like 'final'
         numeric = sorted([g for g in gens if g.isdigit()], key=lambda x: int(x))
         non_numeric = [g for g in gens if not g.isdigit()]
-        # Place 'final' last if present
-        non_numeric_sorted = sorted([g for g in non_numeric if g != "final"]) + (["final"] if "final" in non_numeric else [])
+        non_numeric_sorted = sorted([g for g in non_numeric if g != "final"]) + (
+            ["final"] if "final" in non_numeric else []
+        )
         return numeric + non_numeric_sorted
 
-    # 1) Register C++ bots with their label as policy_id (0..CPP_BOT_MAX_LABEL)
     for cpp_label in cpp_bot_labels:
         name = CPP_BOT_LABEL_TO_NAME.get(cpp_label)
         if name is None:
@@ -149,11 +259,9 @@ def load_evaluation_policies(
             raise ValueError(f"Duplicate policy_id {policy_id} when adding C++ bot label {cpp_label}.")
 
         all_policies[policy_id] = wrapper
-        metadata[policy_id] = _initial_metadata(player_id, cpp_label, is_cpp_bot=True)
+        metadata[policy_id] = _initial_metadata(policy_id, player_id, cpp_label, is_cpp_bot=True)
 
-    # 2) Load neural agents with policy_ids >= CPP_BOT_MAX_LABEL+1
     for run_name, gen_specs in run_specs.items():
-        gens_to_load: List[str]
         if any(g.upper() == "ALL" for g in gen_specs):
             gens_to_load = _discover_generations(run_name)
         else:
@@ -166,7 +274,9 @@ def load_evaluation_policies(
                 checkpoint_path = base_dir / "final.pth"
 
             if not checkpoint_path.exists():
-                print(f"[WARN] No checkpoint found for {run_name} gen {gen_spec} in {base_dir}, skipping...")
+                print(
+                    f"[WARN] No checkpoint found for {run_name} gen {gen_spec} in {base_dir}, skipping..."
+                )
                 continue
 
             checkpoint, agent_key, meta = _load_checkpoint(checkpoint_path, device)
@@ -174,7 +284,6 @@ def load_evaluation_policies(
             agent = BatchPPOAutoregressiveAgent(device, player_id=player_id)
             agent.load_models_from_checkpoint(checkpoint, agent_key)
             agent.model.eval()
-            # Preserve original training label when available; default to 0
             if getattr(agent, "label", None) in (None, -1):
                 agent.label = int(meta.get("label", 0))
 
@@ -182,10 +291,9 @@ def load_evaluation_policies(
             next_neural_policy_id += 1
 
             all_policies[policy_id] = agent
-            metadata_entry = _initial_metadata(player_id, agent.label, is_cpp_bot=False)
-            # Optionally record the source checkpoint path for traceability
-            metadata_entry["checkpoint_path"] = str(checkpoint_path)
-            metadata[policy_id] = metadata_entry
+            entry = _initial_metadata(policy_id, player_id, agent.label, is_cpp_bot=False)
+            entry["checkpoint_path"] = str(checkpoint_path)
+            metadata[policy_id] = entry
 
     return all_policies, metadata
 
@@ -196,108 +304,225 @@ def run_batched_games(
     num_games_per_match: int,
     num_players_in_env: int,
     track_experts: bool = False,
-) -> Tuple[Dict[int, Dict[str, Any]], Dict[tuple, int], Dict[tuple, int]]:
-    """Run a batch of games between the specified policies using VecArena."""
+    seatings: Optional[List[List[int]]] = None,
+    seeds: Optional[List[int]] = None,
+) -> Tuple[Dict[int, Dict[str, Any]], Dict[Tuple[int, int], int], Dict[Tuple[int, int], int]]:
+    """Run a batch of games between policies using VecArena with optional fixed seatings."""
 
     if len(matchup_policy_ids) != num_players_in_env:
         raise ValueError("Number of matchup policy ids must equal the environment player count.")
 
-    results: Dict[int, Dict[str, Any]] = {
-        pid: {"total_wins": 0, "total_returns": 0.0, "num_games": 0, "expert_data": {}}
-        for pid in matchup_policy_ids
-    }
-    # Per-game head-to-head tallies at the round (game) level
-    h2h_round_counts: Dict[tuple, int] = {}
-    h2h_round_wins: Dict[tuple, int] = {}
+    if seatings is not None and len(seatings) != num_games_per_match:
+        raise ValueError("Provided seatings must match num_games_per_match for deterministic play.")
+
+    policy_ids = np.asarray(matchup_policy_ids, dtype=np.int64)
+    num_policies = policy_ids.size
+    policy_index = {pid: idx for idx, pid in enumerate(matchup_policy_ids)}
+    policy_agents = {pid: all_policies[pid] for pid in matchup_policy_ids}
+
+    total_wins = np.zeros(num_policies, dtype=np.int64)
+    total_returns = np.zeros(num_policies, dtype=np.float64)
+    total_games = np.zeros(num_policies, dtype=np.int64)
+    expert_payloads: Dict[int, Dict[str, Any]] = {pid: {} for pid in matchup_policy_ids}
+
+    h2h_counts = np.zeros((num_policies, num_policies), dtype=np.int64)
+    h2h_wins = np.zeros((num_policies, num_policies), dtype=np.int64)
 
     arena = lb.VecArena()
-    # Use a dedicated, seeded RNG for deterministic batching and role shuffles
     seed_base = int(getattr(config, "SEED", 42))
     rng_np = np.random.default_rng(seed_base)
-    games_remaining = num_games_per_match
     max_batch = max(1, getattr(config, "EVAL_VEC_BATCH_SIZE", num_games_per_match))
 
-    while games_remaining > 0:
-        batch_size = min(games_remaining, max_batch)
-        # Derive a fresh seed from the RNG to drive the C++ env deterministically
-        seed = int(rng_np.integers(0, 2**31 - 1, dtype=np.int64))
-        arena.reset(batch=batch_size, players=num_players_in_env, seed=seed)
+    def _chunk_generator() -> Iterable[Tuple[int, List[List[int]]]]:
+        if seatings is None:
+            games_remaining = num_games_per_match
+            while games_remaining > 0:
+                batch_size = min(games_remaining, max_batch)
+                seed = int(rng_np.integers(0, 2**31 - 1, dtype=np.int64))
+                roles: List[List[int]] = []
+                for _ in range(batch_size):
+                    seats = list(matchup_policy_ids)
+                    rng_np.shuffle(seats)
+                    roles.append(seats)
+                yield seed, roles
+                games_remaining -= batch_size
+        else:
+            assert len(seatings) == num_games_per_match
+            idx = 0
+            while idx < len(seatings):
+                if seeds is None:
+                    seed = int(rng_np.integers(0, 2**31 - 1, dtype=np.int64))
+                    batch_end = min(idx + max_batch, len(seatings))
+                else:
+                    seed = int(seeds[idx])
+                    batch_end = idx + 1
+                    while (
+                        batch_end < len(seatings)
+                        and seeds[batch_end] == seed
+                        and (batch_end - idx) < max_batch
+                    ):
+                        batch_end += 1
+                batch_roles = [list(seatings[j]) for j in range(idx, batch_end)]
+                yield seed, batch_roles
+                idx = batch_end
 
-        roles: List[List[int]] = []
-        for _ in range(batch_size):
-            seats = list(matchup_policy_ids)
-            # Deterministic in-place shuffle via the seeded numpy RNG
-            rng_np.shuffle(seats)
-            roles.append(seats)
+    for seed, roles in _chunk_generator():
+        batch_size = len(roles)
+        arena.reset(batch=batch_size, players=num_players_in_env, seed=int(seed))
         arena.set_roles(roles)
 
         for pid in matchup_policy_ids:
-            agent = all_policies[pid]
+            agent = policy_agents[pid]
             try:
                 agent.reset()
             except Exception:
                 continue
 
-        done_mask = np.zeros(batch_size, dtype=bool)
-        while not done_mask.all():
+        while True:
             requests_by_policy = arena.collect_requests()
             if not requests_by_policy:
                 break
-            # Enforce a stable processing order across policies and requests
-            for policy_id in sorted(requests_by_policy.keys()):
-                requests = requests_by_policy[policy_id]
-                agent = all_policies.get(policy_id)
-                if agent is None or not requests:
+
+            for policy_id, requests in requests_by_policy.items():
+                if not requests:
                     continue
-                # Also sort each policy's requests stably by (env, seat)
-                try:
-                    requests_sorted = sorted(requests, key=lambda r: (int(r.env), int(r.seat)))
-                except Exception:
-                    requests_sorted = list(requests)
-                actions, _, _ = agent.get_actions_batch(requests_sorted)
-                arena.submit_actions(policy_id, actions)
-            done_mask = np.array(arena.done, dtype=bool)
+                agent = policy_agents.get(policy_id)
+                if agent is None:
+                    continue
+                actions, _, _ = agent.get_actions_batch(requests)
+                if isinstance(actions, torch.Tensor):
+                    actions_np = (
+                        actions.detach().to(torch.uint8).cpu().contiguous().numpy().reshape(-1)
+                    )
+                else:
+                    actions_np = np.asarray(actions, dtype=np.uint8).reshape(-1)
+                arena.submit_actions(policy_id, actions_np)
+
+            done_mask = np.asarray(arena.done, dtype=np.uint8)
+            if bool(done_mask.all()):
+                break
 
         for env_idx in range(batch_size):
             env = arena.get_env(env_idx)
             seats = roles[env_idx]
+            seat_indices = np.fromiter(
+                (policy_index[int(pid)] for pid in seats), dtype=np.int64, count=num_players_in_env
+            )
+            total_games[seat_indices] += 1
+
             active = [seat for seat in range(num_players_in_env) if env.terminations[seat] == 0]
             winner_seat = active[0] if len(active) == 1 else None
-            for seat_idx, policy_id in enumerate(seats):
-                entry = results[policy_id]
-                entry["num_games"] += 1
-                if winner_seat is not None and seat_idx == winner_seat:
-                    entry["total_wins"] += 1
-                    entry["total_returns"] += 1.0
-                elif winner_seat is not None:
-                    entry["total_returns"] -= 1.0
-            # Update pairwise round-level H2H: ordered pairs (a,b) of policy_ids in this game
-            # Count every pair that co-appeared; give a win to the winner against each other
-            for i in range(num_players_in_env):
-                a = seats[i]
-                for j in range(num_players_in_env):
-                    if i == j:
-                        continue
-                    b = seats[j]
-                    h2h_round_counts[(a, b)] = h2h_round_counts.get((a, b), 0) + 1
-                    if winner_seat is not None and i == winner_seat:
-                        h2h_round_wins[(a, b)] = h2h_round_wins.get((a, b), 0) + 1
-        games_remaining -= batch_size
+
+            if winner_seat is not None:
+                winner_idx = int(seat_indices[winner_seat])
+                total_wins[winner_idx] += 1
+                total_returns[seat_indices] -= 1.0
+                total_returns[winner_idx] += 2.0
+
+                winner_rows = np.full(num_players_in_env, winner_idx, dtype=np.int64)
+                np.add.at(h2h_wins, (winner_rows, seat_indices), 1)
+
+                winner_reps = int(np.count_nonzero(seat_indices == winner_idx))
+                if winner_reps:
+                    h2h_wins[winner_idx, winner_idx] -= winner_reps
+
+            pair_rows = np.repeat(seat_indices, num_players_in_env)
+            pair_cols = np.tile(seat_indices, num_players_in_env)
+            np.add.at(h2h_counts, (pair_rows, pair_cols), 1)
+            unique_indices, counts = np.unique(seat_indices, return_counts=True)
+            if unique_indices.size:
+                np.add.at(
+                    h2h_counts,
+                    (unique_indices, unique_indices),
+                    -(counts.astype(np.int64) ** 2),
+                )
 
     if track_experts:
         for pid in matchup_policy_ids:
             agent = all_policies.get(pid)
             info_fn = getattr(agent, "get_last_expert_info", None)
-            entry = results[pid]
             if callable(info_fn):
                 data = info_fn()
                 if data is not None:
-                    entry["expert_data"] = data
-    else:
-        for entry in results.values():
-            entry["expert_data"] = {}
+                    expert_payloads[pid] = data
+
+    results = {
+        pid: {
+            "total_wins": int(total_wins[idx]),
+            "total_returns": float(total_returns[idx]),
+            "num_games": int(total_games[idx]),
+            "expert_data": expert_payloads.get(pid, {}),
+        }
+        for pid, idx in policy_index.items()
+    }
+
+    h2h_round_counts: Dict[Tuple[int, int], int] = {}
+    h2h_round_wins: Dict[Tuple[int, int], int] = {}
+    for i, pid_i in enumerate(policy_ids):
+        for j, pid_j in enumerate(policy_ids):
+            if i == j:
+                continue
+            count = int(h2h_counts[i, j])
+            wins = int(h2h_wins[i, j])
+            if count:
+                h2h_round_counts[(int(pid_i), int(pid_j))] = count
+            if wins:
+                h2h_round_wins[(int(pid_i), int(pid_j))] = wins
 
     return results, h2h_round_counts, h2h_round_wins
+
+
+# ---------------------------------------------------------------------------
+# Statistical helpers
+# ---------------------------------------------------------------------------
+
+def beta_confidence_interval(wins: int, games: int, confidence: float = 0.95) -> Tuple[float, float]:
+    """Return the Bayesian credible interval for a Bernoulli proportion using SciPy."""
+
+    if games == 0:
+        return 0.0, 1.0
+
+    alpha_post = wins + 1.0
+    beta_post = games - wins + 1.0
+    lower_q = (1.0 - confidence) / 2.0
+    upper_q = 1.0 - lower_q
+
+    lower_bound = stats.beta.ppf(lower_q, alpha_post, beta_post)
+    upper_bound = stats.beta.ppf(upper_q, alpha_post, beta_post)
+
+    return float(lower_bound), float(upper_bound)
+
+
+def dirichlet_confidence_intervals(
+    wins: Sequence[int],
+    alpha0: float = 1.0,
+    confidence: float = 0.95,
+    num_samples: int = 4096,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Monte Carlo credible intervals for a Dirichlet posterior over rank-1 probabilities."""
+
+    wins = list(wins)
+    if sum(wins) == 0:
+        n = len(wins)
+        return np.zeros(n), np.ones(n)
+    alpha = torch.tensor([alpha0 + w for w in wins], dtype=torch.float64)
+    dist = torch.distributions.Dirichlet(alpha)
+    samples = dist.sample((num_samples,)).numpy()
+    lower_q = (1.0 - confidence) / 2.0
+    upper_q = 1.0 - lower_q
+    lower = np.quantile(samples, lower_q, axis=0)
+    upper = np.quantile(samples, upper_q, axis=0)
+    return lower, upper
+
+
+def binary_entropy(p: float) -> float:
+    p = min(max(p, 1e-8), 1 - 1e-8)
+    return -(p * math.log2(p) + (1 - p) * math.log2(1 - p))
+
+
+# ---------------------------------------------------------------------------
+# Rich UI helpers
+# ---------------------------------------------------------------------------
 
 
 class RichProgressScoreboard:
@@ -324,21 +549,25 @@ class RichProgressScoreboard:
         self.live = Live(self._generate_layout(), console=self.console, refresh_per_second=4)
         self.live.__enter__()
 
-    def _generate_scoreboard_table(self, differences: Dict[int, Dict[str, Any]] | None = None) -> Table:
+    def _generate_scoreboard_table(self, differences: Optional[Dict[int, Dict[str, Any]]] = None) -> Table:
         table = Table(title="Live Scoreboard", show_header=True, header_style="bold magenta")
         table.add_column("Rank", style="dim")
         table.add_column("Player", min_width=8)
-        table.add_column("Skill", justify="right")
+        table.add_column("μ", justify="right")
+        table.add_column("σ", justify="right")
+        table.add_column("Conservative", justify="right")
         table.add_column("Match Win Rate", justify="right")
         table.add_column("Round Win Rate", justify="right")
         table.add_column("Δ Rank", justify="right")
 
         sorted_players = sorted(
-            self.players.items(), key=lambda item: item[1]["rating"].ordinal(), reverse=True
+            self.players.items(), key=lambda item: item[1].get("conservative", 0.0), reverse=True
         )
         for rank, (pid, data) in enumerate(sorted_players, start=1):
             player_name = data.get("player_id", str(pid))
-            skill = data["rating"].ordinal()
+            mu = data.get("mu", 0.0)
+            sigma = data.get("sigma", 0.0)
+            conservative = data.get("conservative", mu - 3 * sigma)
             match_wr = data.get("win_rate_match", 0.0)
             round_wr = data.get("win_rate_total", 0.0)
 
@@ -366,14 +595,16 @@ class RichProgressScoreboard:
             table.add_row(
                 rank_str,
                 player_name,
-                f"{skill:.2f}",
+                f"{mu:.2f}",
+                f"{sigma:.2f}",
+                f"{conservative:.2f}",
                 f"{match_wr:.2%}",
                 f"{round_wr:.2%}",
                 rank_change_str,
             )
         return table
 
-    def _generate_layout(self, differences: Dict[int, Dict[str, Any]] | None = None) -> Layout:
+    def _generate_layout(self, differences: Optional[Dict[int, Dict[str, Any]]] = None) -> Layout:
         progress_panel = Panel(self.progress, title="Progress", height=3)
         scoreboard = self._generate_scoreboard_table(differences)
         layout = Layout()
@@ -383,7 +614,7 @@ class RichProgressScoreboard:
     def update(
         self,
         increment: int = 1,
-        differences: Dict[int, Dict[str, Any]] | None = None,
+        differences: Optional[Dict[int, Dict[str, Any]]] = None,
         description: str | None = None,
         steps_per_sec: float | None = None,
     ) -> None:
@@ -405,26 +636,28 @@ class RichProgressScoreboard:
 def load_scoreboard(filename: str) -> Dict[str, Dict[str, Any]]:
     if not os.path.exists(filename):
         return {}
-    with open(filename, "r") as f:
+    with open(filename, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
 def save_scoreboard(filename: str, players: Dict[int, Dict[str, Any]]) -> None:
     data = {
         meta["player_id"]: {
-            "score": meta["rating"].ordinal(),
+            "mu": meta.get("mu", 0.0),
+            "sigma": meta.get("sigma", 0.0),
+            "conservative": meta.get("conservative", 0.0),
             "win_rate_match": meta.get("win_rate_match", 0.0),
             "win_rate_total": meta.get("win_rate_total", 0.0),
         }
         for meta in players.values()
     }
-    with open(filename, "w") as f:
+    with open(filename, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
 
 def _compute_ranks(scoreboard: Dict[str, Dict[str, Any]]) -> Dict[str, int]:
     sorted_entries = sorted(
-        scoreboard.items(), key=lambda item: item[1].get("score", 0), reverse=True
+        scoreboard.items(), key=lambda item: item[1].get("conservative", 0.0), reverse=True
     )
     ranks: Dict[str, int] = {}
     current_rank = 1
@@ -439,68 +672,55 @@ def compare_scoreboards(
     current_players: Dict[int, Dict[str, Any]],
 ) -> Dict[int, Dict[str, Any]]:
     new_scoreboard = {
-        meta["player_id"]: {"score": meta["rating"].ordinal()}
+        meta["player_id"]: {"conservative": meta.get("conservative", 0.0)}
         for meta in current_players.values()
     }
     old_ranks = _compute_ranks(old_scoreboard)
     new_ranks = _compute_ranks(new_scoreboard)
 
     differences: Dict[int, Dict[str, Any]] = {}
-    player_lookup = {meta["player_id"]: pid for pid, meta in current_players.items()}
-
-    for player_id, score_entry in new_scoreboard.items():
-        pid = player_lookup[player_id]
-        current_score = score_entry["score"]
-        previous_score = old_scoreboard.get(player_id, {}).get("score")
-        current_rank = new_ranks.get(player_id)
-        previous_rank = old_ranks.get(player_id)
-        rank_change = None
-        if current_rank is not None and previous_rank is not None:
-            rank_change = previous_rank - current_rank
-        differences[pid] = {
-            "score_change": None if previous_score is None else current_score - previous_score,
-            "rank_change": rank_change,
-        }
+    for pid, meta in current_players.items():
+        player_id = meta["player_id"]
+        old_rank = old_ranks.get(player_id)
+        new_rank = new_ranks.get(player_id)
+        if new_rank is None:
+            continue
+        if old_rank is None:
+            differences[pid] = {"rank_change": None}
+        else:
+            differences[pid] = {"rank_change": old_rank - new_rank}
     return differences
 
 
 def rich_print_scoreboard(
     players: Dict[int, Dict[str, Any]],
     differences: Optional[Dict[int, Dict[str, Any]]] = None,
-    *,
-    title: str = "Final Tournament Scoreboard",
-    save_csv: str = "final_scoreboard.csv",
+    save_csv: Optional[str] = None,
 ) -> None:
     console = Console()
-
-    table = Table(
-        title=title,
-        show_header=True,
-        header_style="bold magenta"
-    )
+    table = Table(title="Final Scoreboard", show_header=True, header_style="bold magenta")
     table.add_column("Rank", style="dim")
-    table.add_column("Player", min_width=8)
-    table.add_column("Skill", justify="right")
+    table.add_column("Player")
+    table.add_column("μ", justify="right")
+    table.add_column("σ", justify="right")
+    table.add_column("Conservative", justify="right")
     table.add_column("Match Win Rate", justify="right")
     table.add_column("Round Win Rate", justify="right")
     table.add_column("Δ Rank", justify="right")
 
-    # Sort by rating.ordinal() descending (fallback 0.0)
+    rows_for_csv: List[Dict[str, Any]] = []
+
     sorted_players = sorted(
-        players.items(),
-        key=lambda item: item[1]["rating"].ordinal() if item[1].get("rating") else 0.0,
-        reverse=True,
+        players.items(), key=lambda item: item[1].get("conservative", 0.0), reverse=True
     )
-
-    rows_for_csv = []  # optional CSV export
-
     for rank, (pid, data) in enumerate(sorted_players, start=1):
         player_name = data.get("player_id", str(pid))
-        skill = data["rating"].ordinal() if data.get("rating") else 0.0
+        mu = data.get("mu", 0.0)
+        sigma = data.get("sigma", 0.0)
+        conservative = data.get("conservative", mu - 3 * sigma)
         match_wr = data.get("win_rate_match", 0.0)
         round_wr = data.get("win_rate_total", 0.0)
 
-        # --- Δ Rank formatting (match the live widget) ---
         rank_change_str = ""
         if differences and pid in differences:
             rank_change = differences[pid].get("rank_change")
@@ -513,7 +733,6 @@ def rich_print_scoreboard(
             else:
                 rank_change_str = "0"
 
-        # --- Medal colors for top 3 ranks (match the live widget) ---
         if rank == 1:
             rank_str = f"[bold gold1]{rank}[/bold gold1]"
         elif rank == 2:
@@ -526,40 +745,51 @@ def rich_print_scoreboard(
         table.add_row(
             rank_str,
             player_name,
-            f"{skill:.2f}",
+            f"{mu:.2f}",
+            f"{sigma:.2f}",
+            f"{conservative:.2f}",
             f"{match_wr:.2%}",
             f"{round_wr:.2%}",
             rank_change_str,
         )
 
-        # for CSV (strip rich markup)
-        rows_for_csv.append({
-            "Rank": rank,
-            "Player": player_name,
-            "Skill": round(skill, 2),
-            "Match Win Rate": round(match_wr, 4),
-            "Round Win Rate": round(round_wr, 4),
-            "Δ Rank": (
-                "New" if (differences and pid in differences and differences[pid].get("rank_change") is None)
-                else (differences[pid]["rank_change"] if (differences and pid in differences and isinstance(differences[pid].get("rank_change"), int)) else "")
-            ),
-        })
+        rows_for_csv.append(
+            {
+                "Rank": rank,
+                "Player": player_name,
+                "μ": round(mu, 3),
+                "σ": round(sigma, 3),
+                "Conservative": round(conservative, 3),
+                "Match Win Rate": round(match_wr, 4),
+                "Round Win Rate": round(round_wr, 4),
+                "Δ Rank": rank_change_str,
+            }
+        )
 
     console.print(table)
 
-    # Optional CSV export (no pandas dependency)
     if save_csv:
         try:
             import csv
+
             with open(save_csv, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(
                     f,
-                    fieldnames=["Rank", "Player", "Skill", "Match Win Rate", "Round Win Rate", "Δ Rank"],
+                    fieldnames=[
+                        "Rank",
+                        "Player",
+                        "μ",
+                        "σ",
+                        "Conservative",
+                        "Match Win Rate",
+                        "Round Win Rate",
+                        "Δ Rank",
+                    ],
                 )
                 writer.writeheader()
                 writer.writerows(rows_for_csv)
-        except Exception as e:
-            print(f"[WARN] Failed to save CSV '{save_csv}': {e}")
+        except Exception as exc:  # pragma: no cover - visualization helper
+            print(f"[WARN] Failed to save CSV '{save_csv}': {exc}")
 
 
 def rich_print_expert_activations(expert_activations: Dict[int, Any]) -> None:
@@ -575,9 +805,14 @@ def rich_print_expert_activations(expert_activations: Dict[int, Any]) -> None:
 
 
 __all__ = [
-    "openskill_model",
+    "RATING_BACKEND",
+    "TrueSkillBackend",
+    "RatingEntry",
     "load_evaluation_policies",
     "run_batched_games",
+    "beta_confidence_interval",
+    "dirichlet_confidence_intervals",
+    "binary_entropy",
     "RichProgressScoreboard",
     "load_scoreboard",
     "save_scoreboard",
@@ -589,30 +824,26 @@ __all__ = [
 
 
 def plot_agent_heatmap(
-    h2h_rates: Dict[tuple[int, int], float],
+    h2h_rates: Dict[Tuple[int, int], float],
     players: Dict[int, Dict[str, Any]],
     title: str = "Head-to-Head Win Rates",
     out_file: str = "h2h_winrate_heatmap.png",
     csv_file: str = "h2h_winrate_matrix.csv",
 ) -> None:
-    """Plot a heatmap of head-to-head win rates and save to CSV.
+    """Plot a heatmap of head-to-head win rates and save to CSV."""
 
-    h2h_rates: mapping of (A,B) -> win rate for A vs B in [0,1].
-    players: tournament players metadata (for names and ordering).
-    """
+    _ensure_plotting()
 
-    # Order agents by descending skill (rating.ordinal), fallback to pid
     order = sorted(
         players.keys(),
-        key=lambda pid: players[pid]["rating"].ordinal() if players[pid].get("rating") else 0.0,
+        key=lambda pid: players[pid].get("conservative", 0.0),
         reverse=True,
     )
     labels = [players[pid].get("player_id", str(pid)) for pid in order]
     n = len(order)
-    
+
     M = np.zeros((n, n), dtype=float)
     M[:] = np.nan
-    # Populate upper triangle and mirror to lower with respective rates
     for i, a in enumerate(order):
         for j in range(i + 1, n):
             b = order[j]
@@ -621,18 +852,15 @@ def plot_agent_heatmap(
             M[i, j] = float(rate_ab) if rate_ab is not None else np.nan
             M[j, i] = float(rate_ba) if rate_ba is not None else np.nan
 
-    # --- Save to CSV ---
     try:
         df = pd.DataFrame(M, index=labels, columns=labels)
         df.to_csv(csv_file, float_format="%.3f")
-    except Exception as e:
-        print(f"[WARN] Failed to save CSV: {e}")
+    except Exception as exc:
+        print(f"[WARN] Failed to save CSV: {exc}")
+        df = pd.DataFrame(M, index=labels, columns=labels)
 
-    # --- Plot heatmap ---
     plt.figure(figsize=(max(8, n * 0.6), max(6, n * 0.5)))
-
     sns.heatmap(df, annot=False, cmap="Blues", vmin=0.0, vmax=1.0, cbar=True)
-
     plt.title(title)
     plt.tight_layout()
     try:

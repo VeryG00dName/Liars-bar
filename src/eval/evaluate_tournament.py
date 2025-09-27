@@ -1,52 +1,119 @@
-# src/eval/evaluate_tournament.py
-"""Swiss-style tournament evaluation using the batched VecArena backend."""
+"""Adaptive TrueSkill-through-time evaluation league runner."""
 from __future__ import annotations
 
-import os
 import argparse
+import os
 from collections import defaultdict
-from typing import Dict, List, Set
+from dataclasses import dataclass, field
+from itertools import combinations
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-# Encourage deterministic CUDA behavior (must be set before CUDA is initialized)
 os.environ.pop("TORCH_LOGS", None)
+
+import numpy as np
 import torch
 import warnings
+
 warnings.filterwarnings("ignore", message=".*symbolic_shapes.*")
 warnings.filterwarnings(
     "ignore",
     message=".*does not have a deterministic implementation.*",
     category=UserWarning,
 )
+
 from src import config
 from src.eval.evaluate_utils import (
-    openskill_model,
-    load_evaluation_policies,
-    run_batched_games,
-    RichProgressScoreboard,
-    load_scoreboard,
-    save_scoreboard,
+    RATING_BACKEND,
+    binary_entropy,
+    beta_confidence_interval,
     compare_scoreboards,
-    rich_print_scoreboard,
-    rich_print_expert_activations,
+    dirichlet_confidence_intervals,
+    load_evaluation_policies,
+    load_scoreboard,
     plot_agent_heatmap,
+    rich_print_expert_activations,
+    rich_print_scoreboard,
+    run_batched_games,
+    save_scoreboard,
+    RichProgressScoreboard,
 )
 from src.training.train_extras import set_seed
+
 SEED = int(getattr(config, "SEED", 42))
 set_seed(SEED)
 
-def parse_run_specs(specs: List[str]) -> Dict[str, List[str]]:
-    """Parse run specs.
+MIN_GAMES_PER_MATCH = 80
+MAX_GAMES_PER_MATCH = 180
+EPS_CI = 0.07
+STABILITY_K = 3
 
-    Supports two forms:
-    - "run_name:gen_a,gen_b" to load specific generations
-    - "run_name" (no colon) to load ALL available generations for that run
-    """
+BASE_ROTATIONS = [
+    [0, 1, 2, 3],
+    [3, 0, 1, 2],
+    [2, 3, 0, 1],
+    [1, 2, 3, 0],
+]
+REFLECTED_ROTATIONS = [
+    [0, 3, 2, 1],
+    [3, 2, 1, 0],
+    [2, 1, 0, 3],
+    [1, 0, 3, 2],
+]
+
+
+@dataclass
+class MatchStoppingConfig:
+    method: str = "beta"  # "beta" or "dirichlet"
+    min_games: int = MIN_GAMES_PER_MATCH
+    max_games: int = MAX_GAMES_PER_MATCH
+    eps_ci: float = EPS_CI
+    stability_k: int = STABILITY_K
+    confidence: float = 0.95
+    alpha0: float = 1.0
+    num_samples: int = 4096
+
+
+@dataclass
+class SchedulerConfig:
+    quartets_per_batch: int = 4
+    candidate_pool_size: int = 12
+    candidate_samples: int = 64
+
+
+@dataclass
+class LeagueStoppingConfig:
+    sigma_fraction: float = 0.9
+    sigma_target_factor: float = 0.5
+    conservative_stability_k: int = 5
+    sigma_cap_factor: float = 0.5
+    pairwise_fraction: float = 0.9
+    pairwise_confidence: float = 0.95
+    copeland_k: int = 4
+    copeland_delta: float = 0.5
+    copeland_stability_k: int = 5
+    enable_global: bool = False
+    global_mu_threshold: float = 0.01
+    global_sigma_threshold: float = 0.01
+    global_consecutive: int = 3
+
+
+@dataclass
+class LeagueTracker:
+    conservative_order: Tuple[int, ...] | None = None
+    conservative_streak: int = 0
+    copeland_set: Tuple[int, ...] | None = None
+    copeland_margin: float = 0.0
+    copeland_streak: int = 0
+    global_streak: int = 0
+    previous_mu_sigma: Dict[int, Tuple[float, float]] = field(default_factory=dict)
+
+
+def parse_run_specs(specs: List[str]) -> Dict[str, List[str]]:
     parsed: Dict[str, List[str]] = {}
     for spec in specs:
         if not spec:
             continue
         if ":" not in spec:
-            # Interpret as "load all available gens" for this run
             run_name = spec.strip()
             if not run_name:
                 continue
@@ -63,7 +130,7 @@ def parse_run_specs(specs: List[str]) -> Dict[str, List[str]]:
 def parse_cpp_labels(arg: str) -> List[int]:
     if not arg:
         return []
-    labels = []
+    labels: List[int] = []
     for item in arg.split(","):
         if not item.strip():
             continue
@@ -71,155 +138,405 @@ def parse_cpp_labels(arg: str) -> List[int]:
     return labels
 
 
-def swiss_grouping(
-    players: Dict[int, Dict[str, any]],
-    match_history: Dict[int, Set[int]],
-    group_size: int,
-) -> List[List[int]]:
-    player_ids = sorted(players.keys(), key=lambda pid: players[pid]["score"], reverse=True)
-    groups: List[List[int]] = []
-    used: Set[int] = set()
+def generate_block_seatings(quartet: Sequence[int]) -> Tuple[List[List[int]], List[List[int]]]:
+    base = [[quartet[idx] for idx in order] for order in BASE_ROTATIONS]
+    reflected = [[quartet[idx] for idx in order] for order in REFLECTED_ROTATIONS]
+    return base, reflected
 
-    while len(used) < len(player_ids):
-        available = [pid for pid in player_ids if pid not in used]
-        if not available:
+
+def aggregate_results(
+    accumulator: Dict[int, Dict[str, Any]],
+    chunk: Dict[int, Dict[str, Any]],
+) -> None:
+    for pid, stats in chunk.items():
+        entry = accumulator.setdefault(
+            pid,
+            {"total_wins": 0, "total_returns": 0.0, "num_games": 0, "expert_data": {}},
+        )
+        entry["total_wins"] += stats.get("total_wins", 0)
+        entry["total_returns"] += stats.get("total_returns", 0.0)
+        entry["num_games"] += stats.get("num_games", 0)
+        if stats.get("expert_data"):
+            entry["expert_data"] = stats["expert_data"]
+
+
+def run_adaptive_quartet(
+    all_policies: Dict[int, Any],
+    quartet: Sequence[int],
+    stopping: MatchStoppingConfig,
+    seed: int,
+    track_experts: bool = False,
+) -> Tuple[Dict[int, Dict[str, Any]], Dict[Tuple[int, int], int], Dict[Tuple[int, int], int], int]:
+    aggregated: Dict[int, Dict[str, Any]] = {}
+    total_counts: Dict[Tuple[int, int], int] = defaultdict(int)
+    total_wins: Dict[Tuple[int, int], int] = defaultdict(int)
+
+    wins = {pid: 0 for pid in quartet}
+    total_games = 0
+    stability_counter = 0
+    prev_dirichlet_order: Tuple[int, ...] | None = None
+    current_seed = seed
+
+    while total_games < stopping.max_games:
+        base_seatings, reflected_seatings = generate_block_seatings(quartet)
+
+        base_results, base_counts, base_wins = run_batched_games(
+            all_policies,
+            list(quartet),
+            num_games_per_match=len(base_seatings),
+            num_players_in_env=len(quartet),
+            track_experts=track_experts,
+            seatings=base_seatings,
+            seeds=[current_seed] * len(base_seatings),
+        )
+        aggregate_results(aggregated, base_results)
+        for k, v in base_counts.items():
+            total_counts[k] += v
+        for k, v in base_wins.items():
+            total_wins[k] += v
+
+        reflected_results, reflected_counts, reflected_wins = run_batched_games(
+            all_policies,
+            list(quartet),
+            num_games_per_match=len(reflected_seatings),
+            num_players_in_env=len(quartet),
+            track_experts=track_experts,
+            seatings=reflected_seatings,
+            seeds=[current_seed + 1] * len(reflected_seatings),
+        )
+        aggregate_results(aggregated, reflected_results)
+        for k, v in reflected_counts.items():
+            total_counts[k] += v
+        for k, v in reflected_wins.items():
+            total_wins[k] += v
+
+        for pid in quartet:
+            wins[pid] = aggregated[pid]["total_wins"]
+        total_games = max(aggregated[pid]["num_games"] for pid in quartet)
+
+        if total_games >= stopping.min_games:
+            if stopping.method == "beta":
+                widths = []
+                for pid in quartet:
+                    lower, upper = beta_confidence_interval(
+                        wins[pid], total_games, confidence=stopping.confidence
+                    )
+                    widths.append(upper - lower)
+                if max(widths) <= stopping.eps_ci:
+                    break
+            else:
+                win_counts = [wins[pid] for pid in quartet]
+                lower, upper = dirichlet_confidence_intervals(
+                    win_counts,
+                    alpha0=stopping.alpha0,
+                    confidence=stopping.confidence,
+                    num_samples=stopping.num_samples,
+                )
+                widths = upper - lower
+                posterior_expectation = np.array(win_counts, dtype=float) + stopping.alpha0
+                posterior_expectation /= posterior_expectation.sum()
+                order = tuple(
+                    pid for _, pid in sorted(
+                        zip(posterior_expectation, quartet), key=lambda item: item[0], reverse=True
+                    )
+                )
+                if prev_dirichlet_order == order:
+                    stability_counter += 1
+                else:
+                    stability_counter = 1
+                    prev_dirichlet_order = order
+                if np.all(widths <= stopping.eps_ci) or stability_counter >= stopping.stability_k:
+                    break
+
+        current_seed += 2
+        if total_games >= stopping.max_games:
             break
-        group = [available.pop(0)]
-        while len(group) < group_size and available:
-            best_candidate = None
-            least_repeats = float("inf")
-            for candidate in available:
-                repeats = sum(candidate in match_history[member] for member in group)
-                if repeats < least_repeats:
-                    best_candidate = candidate
-                    least_repeats = repeats
-            if best_candidate is None:
-                break
-            group.append(best_candidate)
-            available.remove(best_candidate)
-        groups.append(group)
-        used.update(group)
-    return groups
+
+    return aggregated, total_counts, total_wins, total_games
 
 
-def assign_openskill_ranks(group: List[int], match_results: Dict[int, Dict[str, any]]) -> List[int]:
-    ordered = sorted(group, key=lambda pid: match_results[pid]["total_wins"], reverse=True)
+def ranks_from_results(results: Dict[int, Dict[str, Any]]) -> List[Tuple[int, int]]:
+    ordered = sorted(results.items(), key=lambda item: item[1]["total_wins"], reverse=True)
     ranks: Dict[int, int] = {}
     current_rank = 0
-    prev_wins = None
-    for idx, pid in enumerate(ordered):
-        wins = match_results[pid]["total_wins"]
+    prev_wins: Optional[int] = None
+    for idx, (pid, stats) in enumerate(ordered):
+        wins = stats["total_wins"]
         if prev_wins is None or wins < prev_wins:
             current_rank = idx
             prev_wins = wins
         ranks[pid] = current_rank
-    return [ranks[pid] for pid in group]
+    return [(pid, ranks[pid]) for pid in results]
 
 
-def run_group_swiss_tournament(
-    all_policies: Dict[int, any],
-    players: Dict[int, Dict[str, any]],
-    num_games_per_match: int,
-    num_rounds: int,
-    num_players_in_env: int,
-) -> Dict[int, Dict[str, any]]:
-    match_history: Dict[int, Set[int]] = {pid: set() for pid in players}
-    num_groups = max(1, len(players) // num_players_in_env)
-    total_steps = max(1, num_rounds * num_groups * num_games_per_match)
-    progress_ui = RichProgressScoreboard(total_steps=total_steps, players=players)
+def update_player_metadata(
+    players: Dict[int, Dict[str, Any]],
+    results: Dict[int, Dict[str, Any]],
+) -> None:
+    max_wins = max(results[pid]["total_wins"] for pid in results)
+    winners = [pid for pid in results if results[pid]["total_wins"] == max_wins]
+
+    for pid, stats in results.items():
+        meta = players[pid]
+        meta["matches_played"] = meta.get("matches_played", 0) + 1
+        meta["games_played"] = meta.get("games_played", 0) + 1
+        meta["total_games_played"] = meta.get("total_games_played", 0) + stats["num_games"]
+        meta["total_round_wins"] += stats["total_wins"]
+        if pid in winners:
+            meta["wins_match"] += 1
+        matches = meta.get("matches_played", 0)
+        meta["win_rate_match"] = meta["wins_match"] / matches if matches else 0.0
+        total_games = meta.get("total_games_played", 0)
+        meta["win_rate_total"] = (
+            meta["total_round_wins"] / total_games if total_games else 0.0
+        )
+
+    for pid in results:
+        rating = RATING_BACKEND.rating_entry(pid)
+        meta = players[pid]
+        meta["mu"] = rating.mu
+        meta["sigma"] = rating.sigma
+        meta["conservative"] = rating.conservative
+
+
+def quartet_score(quartet: Sequence[int], players: Dict[int, Dict[str, Any]]) -> float:
+    sigma_sum = sum(players[pid].get("sigma", 0.0) for pid in quartet)
+    entropy_sum = 0.0
+    copeland_scores = {pid: 0.0 for pid in quartet}
+    for a, b in combinations(quartet, 2):
+        p_ab = RATING_BACKEND.win_probability(a, b)
+        entropy_sum += binary_entropy(p_ab)
+        copeland_scores[a] += p_ab
+        copeland_scores[b] += 1.0 - p_ab
+    margins = sorted(copeland_scores.values(), reverse=True)
+    margin = margins[0] - margins[-1] if margins else 0.0
+    copeland_uncertainty = 1.0 / (1.0 + margin)
+    return sigma_sum + entropy_sum + copeland_uncertainty
+
+
+def select_quartets(
+    players: Dict[int, Dict[str, Any]],
+    scheduler: SchedulerConfig,
+    rng: np.random.Generator,
+) -> List[Tuple[int, int, int, int]]:
+    player_ids = list(players.keys())
+    if len(player_ids) < 4:
+        return []
+    sorted_by_sigma = sorted(player_ids, key=lambda pid: players[pid].get("sigma", 0.0), reverse=True)
+    pool_size = min(len(sorted_by_sigma), scheduler.candidate_pool_size)
+    candidate_pool = sorted_by_sigma[:pool_size]
+    candidate_quartets = list(combinations(candidate_pool, 4))
+    if len(candidate_quartets) > scheduler.candidate_samples:
+        indices = rng.choice(len(candidate_quartets), size=scheduler.candidate_samples, replace=False)
+        candidate_quartets = [candidate_quartets[int(i)] for i in indices]
+    scored = sorted(candidate_quartets, key=lambda q: quartet_score(q, players), reverse=True)
+    selected: List[Tuple[int, int, int, int]] = []
+    used: set[int] = set()
+    for quartet in scored:
+        if len(selected) >= scheduler.quartets_per_batch:
+            break
+        if any(pid in used for pid in quartet):
+            continue
+        selected.append(quartet)
+        used.update(quartet)
+    if len(selected) < scheduler.quartets_per_batch:
+        for quartet in scored:
+            if quartet not in selected:
+                selected.append(quartet)
+            if len(selected) >= scheduler.quartets_per_batch:
+                break
+    return selected
+
+
+def compute_pairwise_probabilities(player_ids: Iterable[int]) -> Dict[Tuple[int, int], float]:
+    probs: Dict[Tuple[int, int], float] = {}
+    ids = list(player_ids)
+    for a, b in combinations(ids, 2):
+        p_ab = RATING_BACKEND.win_probability(a, b)
+        probs[(a, b)] = p_ab
+        probs[(b, a)] = 1.0 - p_ab
+    return probs
+
+
+def evaluate_league_stopping(
+    players: Dict[int, Dict[str, Any]],
+    tracker: LeagueTracker,
+    config: LeagueStoppingConfig,
+) -> Tuple[bool, Dict[str, bool]]:
+    statuses: Dict[str, bool] = {}
+    num_players = len(players)
+    sigma_target = config.sigma_target_factor * RATING_BACKEND.beta
+    sigma_cap = config.sigma_cap_factor * RATING_BACKEND.beta
+
+    satisfied_sigma = sum(1 for meta in players.values() if meta.get("sigma", 0.0) <= sigma_target)
+    statuses["sigma_threshold"] = (
+        num_players > 0 and satisfied_sigma / num_players >= config.sigma_fraction
+    )
+
+    conservative_order = tuple(
+        pid
+        for pid, _ in sorted(
+            players.items(), key=lambda item: item[1].get("conservative", 0.0), reverse=True
+        )
+    )
+    if tracker.conservative_order == conservative_order:
+        tracker.conservative_streak += 1
+    else:
+        tracker.conservative_order = conservative_order
+        tracker.conservative_streak = 1 if conservative_order else 0
+    statuses["conservative_stability"] = (
+        tracker.conservative_streak >= config.conservative_stability_k
+        and all(meta.get("sigma", 0.0) <= sigma_cap for meta in players.values())
+    )
+
+    pairwise_probs = compute_pairwise_probabilities(players.keys())
+    total_pairs = num_players * (num_players - 1) / 2
+    confident_pairs = sum(
+        1
+        for (a, b), p in pairwise_probs.items()
+        if a < b and (p >= config.pairwise_confidence or p <= 1.0 - config.pairwise_confidence)
+    )
+    statuses["pairwise_certainty"] = (
+        total_pairs > 0 and confident_pairs / total_pairs >= config.pairwise_fraction
+    )
+
+    copeland_scores = {pid: 0.0 for pid in players}
+    for a, b in combinations(players.keys(), 2):
+        p_ab = pairwise_probs[(a, b)]
+        copeland_scores[a] += p_ab
+        copeland_scores[b] += 1.0 - p_ab
+    k = min(config.copeland_k, len(copeland_scores))
+    top_sorted = sorted(copeland_scores.items(), key=lambda item: item[1], reverse=True)
+    if k > 0 and len(top_sorted) >= k:
+        top_set = tuple(sorted(pid for pid, _ in top_sorted[:k]))
+        margin = top_sorted[0][1] - top_sorted[k - 1][1]
+    else:
+        top_set = tuple()
+        margin = 0.0
+    if tracker.copeland_set == top_set and top_set:
+        delta = abs(tracker.copeland_margin - margin)
+        tracker.copeland_streak += 1
+    else:
+        tracker.copeland_set = top_set
+        tracker.copeland_streak = 1 if top_set else 0
+        delta = float("inf")
+    tracker.copeland_margin = margin
+    statuses["copeland_stability"] = (
+        tracker.copeland_streak >= config.copeland_stability_k and delta < config.copeland_delta
+    )
+
+    if config.enable_global:
+        mu_changes: List[float] = []
+        sigma_changes: List[float] = []
+        for pid, meta in players.items():
+            prev_mu, prev_sigma = tracker.previous_mu_sigma.get(pid, (meta.get("mu", 0.0), meta.get("sigma", 0.0)))
+            mu_changes.append(abs(meta.get("mu", 0.0) - prev_mu))
+            sigma_changes.append(abs(meta.get("sigma", 0.0) - prev_sigma))
+            tracker.previous_mu_sigma[pid] = (meta.get("mu", 0.0), meta.get("sigma", 0.0))
+        mean_mu = sum(mu_changes) / len(mu_changes) if mu_changes else 0.0
+        mean_sigma = sum(sigma_changes) / len(sigma_changes) if sigma_changes else 0.0
+        if mean_mu <= config.global_mu_threshold and mean_sigma <= config.global_sigma_threshold:
+            tracker.global_streak += 1
+        else:
+            tracker.global_streak = 0
+        statuses["global_convergence"] = tracker.global_streak >= config.global_consecutive
+    else:
+        tracker.previous_mu_sigma = {
+            pid: (meta.get("mu", 0.0), meta.get("sigma", 0.0)) for pid, meta in players.items()
+        }
+        statuses["global_convergence"] = False
+
+    primary_checks = [
+        statuses["sigma_threshold"],
+        statuses["conservative_stability"],
+        statuses["pairwise_certainty"],
+        statuses["copeland_stability"],
+    ]
+    if config.enable_global:
+        primary_checks.append(statuses["global_convergence"])
+    satisfied = sum(bool(flag) for flag in primary_checks) >= 2
+    return satisfied, statuses
+
+
+def run_active_league(
+    all_policies: Dict[int, Any],
+    players: Dict[int, Dict[str, Any]],
+    scheduler: SchedulerConfig,
+    stopping: MatchStoppingConfig,
+    league_stop: LeagueStoppingConfig,
+    track_experts: bool = False,
+    max_batches: int = 200,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    pairwise_counts: Dict[Tuple[int, int], int] = defaultdict(int)
+    pairwise_wins: Dict[Tuple[int, int], int] = defaultdict(int)
+    tracker = LeagueTracker()
     scoreboard_file = "tournament_scoreboard.json"
     historical_scoreboard = load_scoreboard(scoreboard_file)
+    total_steps = max_batches * scheduler.quartets_per_batch * stopping.max_games
+    progress_ui = RichProgressScoreboard(total_steps=total_steps, players=players)
+    rng = np.random.default_rng(SEED)
 
-    tournament_expert_data: Dict[int, Dict[str, any]] = defaultdict(dict)
-    # Head-to-head tracking (round-level): (A,B) counts games together and A's game-wins vs B
-    h2h_round_wins: Dict[tuple[int, int], int] = defaultdict(int)
-    h2h_round_counts: Dict[tuple[int, int], int] = defaultdict(int)
-    match_counter = 0
+    expert_data: Dict[int, Dict[str, Any]] = defaultdict(dict)
 
-    for round_idx in range(num_rounds):
-        groups = swiss_grouping(players, match_history, num_players_in_env)
-        for group in groups:
-            if len(group) != num_players_in_env:
-                continue
-            results, round_counts, round_wins = run_batched_games(
+    batch_idx = 0
+    league_finished = False
+
+    while not league_finished and batch_idx < max_batches:
+        quartets = select_quartets(players, scheduler, rng)
+        if not quartets:
+            break
+        for quartet in quartets:
+            base_seed = int(rng.integers(0, 2**31 - 1, dtype=np.int64))
+            results, h2h_counts, h2h_wins, games_played = run_adaptive_quartet(
                 all_policies,
-                group,
-                num_games_per_match,
-                num_players_in_env,
-                track_experts=True,
+                quartet,
+                stopping,
+                seed=base_seed,
+                track_experts=track_experts,
             )
-            match_counter += 1
+            for k, v in h2h_counts.items():
+                pairwise_counts[k] += v
+            for k, v in h2h_wins.items():
+                pairwise_wins[k] += v
 
-            for pid in group:
-                meta = players[pid]
-                meta["games_played"] += 1
-                meta["total_round_wins"] += results[pid]["total_wins"]
-                total_games = meta["games_played"] * num_games_per_match
-                meta["win_rate_total"] = meta["total_round_wins"] / total_games if total_games else 0.0
+            ranks = ranks_from_results(results)
+            RATING_BACKEND.update_from_ranks(ranks)
+            update_player_metadata(players, results)
 
-            max_wins = max(results[pid]["total_wins"] for pid in group)
-            winners = [pid for pid in group if results[pid]["total_wins"] == max_wins]
-            for pid in winners:
-                players[pid]["wins_match"] += 1
-            for pid in group:
-                games = players[pid]["games_played"]
-                players[pid]["win_rate_match"] = players[pid]["wins_match"] / games if games else 0.0
-
-            ranks = assign_openskill_ranks(group, results)
-            match = [[players[pid]["rating"]] for pid in group]
-            new_ratings = openskill_model.rate(match, ranks=ranks)
-            for idx, pid in enumerate(group):
-                players[pid]["rating"] = new_ratings[idx][0]
-                players[pid]["score"] = players[pid]["rating"].ordinal()
-
-            for pid in group:
-                for other in group:
-                    if pid != other:
-                        match_history[pid].add(other)
-
-            # Aggregate head-to-head at the round (game) level across this match
-            for k, v in round_counts.items():
-                h2h_round_counts[k] += v
-            for k, v in round_wins.items():
-                h2h_round_wins[k] += v
-
-            for pid in group:
-                expert_info = results[pid].get("expert_data")
-                if expert_info:
+            for pid in quartet:
+                data = results[pid].get("expert_data")
+                if data:
                     key = players[pid]["player_id"]
-                    existing = tournament_expert_data[key]
-                    if isinstance(expert_info, dict):
-                        existing.update(expert_info)
-                    else:
-                        existing.setdefault("summary", []).append(expert_info)
+                    expert_data[key].update(data if isinstance(data, dict) else {"summary": data})
 
             differences = compare_scoreboards(historical_scoreboard, players)
             progress_ui.update(
-                increment=num_games_per_match,
+                increment=games_played,
                 differences=differences,
-                description=f"Round {round_idx + 1} Match {match_counter}",
+                description=f"Batch {batch_idx + 1} quartet {quartet}",
             )
+
+        batch_idx += 1
+        league_finished, _ = evaluate_league_stopping(players, tracker, league_stop)
 
     progress_ui.close()
     save_scoreboard(scoreboard_file, players)
 
-    # Compute H2H win rates at the round level
-    h2h_rates: Dict[tuple[int, int], float] = {}
-    for pair, count in h2h_round_counts.items():
-        wins = h2h_round_wins.get(pair, 0)
+    h2h_rates: Dict[Tuple[int, int], float] = {}
+    for pair, count in pairwise_counts.items():
         if count > 0:
+            wins = pairwise_wins.get(pair, 0)
             h2h_rates[pair] = wins / count
-    # Plot heatmap
     try:
         plot_agent_heatmap(h2h_rates, players, title="Head-to-Head Win Rates (round-level)")
-    except Exception as e:
-        print(f"[WARN] Failed to plot H2H heatmap: {e}")
+    except Exception as exc:
+        print(f"[WARN] Failed to plot H2H heatmap: {exc}")
 
-    return tournament_expert_data
+    return expert_data, historical_scoreboard
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run a Swiss-style tournament evaluation.")
+    parser = argparse.ArgumentParser(description="Run an adaptive TrueSkill evaluation league.")
     parser.add_argument(
         "--eval-runs",
         nargs="*",
@@ -232,22 +549,33 @@ def main() -> None:
         help="Comma-separated list of C++ bot labels to include.",
     )
     parser.add_argument(
-        "--num-games-per-match",
-        type=int,
-        default=config.NUM_GAMES_PER_MATCH,
-        help="Number of games to play per matchup.",
+        "--match-method",
+        type=str,
+        default="beta",
+        choices=["beta", "dirichlet"],
+        help="Stopping rule to use for within-quartet adaptation.",
     )
     parser.add_argument(
-        "--num-rounds",
+        "--quartets-per-batch",
         type=int,
-        default=config.NUM_ROUNDS,
-        help="Number of Swiss rounds to run.",
+        default=4,
+        help="Number of quartets to schedule per batch before re-evaluating stopping criteria.",
+    )
+    parser.add_argument(
+        "--max-batches",
+        type=int,
+        default=200,
+        help="Safety cap on the number of scheduling batches to run.",
+    )
+    parser.add_argument(
+        "--track-experts",
+        action="store_true",
+        help="Collect MoE expert activation summaries when supported by agents.",
     )
     args = parser.parse_args()
-    historical_scoreboard = load_scoreboard("tournament_scoreboard.json")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     run_specs = parse_run_specs(args.eval_runs)
-    # Default to config.CPP_BOT_LABELS when --cpp-bots not provided
     if not args.cpp_bots:
         cpp_bot_labels = list(getattr(config, "CPP_BOT_LABELS", []))
     else:
@@ -256,17 +584,25 @@ def main() -> None:
     all_policies, players = load_evaluation_policies(run_specs, cpp_bot_labels, device)
     num_players = config.NUM_PLAYERS
     if len(players) < num_players:
-        raise ValueError(f"Need at least {num_players} agents to run the tournament; got {len(players)}.")
+        raise ValueError(
+            f"Need at least {num_players} agents to run the tournament; got {len(players)}."
+        )
 
-    expert_data = run_group_swiss_tournament(
+    scheduler = SchedulerConfig(quartets_per_batch=args.quartets_per_batch)
+    stopping = MatchStoppingConfig(method=args.match_method)
+    league_stop = LeagueStoppingConfig()
+
+    expert_data, baseline_scoreboard = run_active_league(
         all_policies,
         players,
-        num_games_per_match=args.num_games_per_match,
-        num_rounds=args.num_rounds,
-        num_players_in_env=num_players,
+        scheduler=scheduler,
+        stopping=stopping,
+        league_stop=league_stop,
+        track_experts=args.track_experts,
+        max_batches=args.max_batches,
     )
 
-    final_differences = compare_scoreboards(historical_scoreboard, players)
+    final_differences = compare_scoreboards(baseline_scoreboard, players)
     rich_print_scoreboard(players, final_differences)
     rich_print_expert_activations(expert_data)
 
