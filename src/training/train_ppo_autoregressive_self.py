@@ -313,8 +313,26 @@ def train_generation(
 
     learner.model.train()
 
+    # grab bricks if they exist
+    strat_dict = getattr(getattr(learner, "model", None), "strategy_dictionary", None)
+    bricks_params = []
+    if strat_dict is not None and hasattr(strat_dict, "bricks"):
+        bricks_params = [strat_dict.bricks]
+
+    # separate param groups
     all_params = list(learner.model.parameters())
-    optimizer = torch.optim.AdamW(all_params, lr=float(config.LEARNING_RATE))
+    decay_params = [p for p in all_params if p not in bricks_params]
+    no_decay_params = bricks_params
+
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": decay_params, "weight_decay": 0.01},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ],
+        lr=float(config.LEARNING_RATE),
+    )
+
+    
     scaler = amp.GradScaler(enabled=(device.type == "cuda"))
 
     if hasattr(learner.model, "belief_head"):
@@ -683,17 +701,6 @@ def train_generation(
         writer.add_scalar("Acc/OpponentAction", avg.get("opp_action_acc", 0.0), update)
 
         model_call_stats = rollout_manager.get_last_model_call_stats()
-        total_model_calls = sum(int(stats.get("count", 0) or 0) for stats in model_call_stats.values())
-        total_model_time = sum(float(stats.get("total_time", 0.0) or 0.0) for stats in model_call_stats.values())
-        total_model_min = min(
-            (float(stats.get("min", float("inf"))) for stats in model_call_stats.values() if int(stats.get("count", 0) or 0) > 0),
-            default=0.0,
-        )
-        total_model_max = max(
-            (float(stats.get("max", 0.0)) for stats in model_call_stats.values() if int(stats.get("count", 0) or 0) > 0),
-            default=0.0,
-        )
-        total_model_avg = (total_model_time / total_model_calls) if total_model_calls else 0.0
 
         train_stats = model_call_stats.get(int(training_policy_id), {})
         train_count = int(train_stats.get("count", 0) or 0)
@@ -702,10 +709,6 @@ def train_generation(
         train_max = float(train_stats.get("max", 0.0) or 0.0) if train_count else 0.0
         train_avg = (train_total / train_count) if train_count else 0.0
 
-        writer.add_scalar("ModelCalls/TotalCount", total_model_calls, update)
-        writer.add_scalar("ModelCalls/TotalAvgMs", total_model_avg * 1000.0, update)
-        writer.add_scalar("ModelCalls/TotalMinMs", total_model_min * 1000.0, update)
-        writer.add_scalar("ModelCalls/TotalMaxMs", total_model_max * 1000.0, update)
         writer.add_scalar("ModelCalls/TrainCount", train_count, update)
         writer.add_scalar("ModelCalls/TrainAvgMs", train_avg * 1000.0, update)
         writer.add_scalar("ModelCalls/TrainMinMs", train_min * 1000.0, update)

@@ -1024,6 +1024,8 @@ def _dictionary_regularizers(
     decor_penalty = zero.clone()
     avg_brick_usage_np: Optional[np.ndarray] = None
     metrics_extra: Dict[str, Any] = {}
+    selected_token_mask: Optional[torch.Tensor] = None
+    opp_mask_for_tokens: Optional[torch.Tensor] = None
 
     if not (isinstance(embedding_tuple, tuple) and len(embedding_tuple) == 3):
         return l1_sparsity_loss, usage_balance_loss, brick_diversity_loss, decor_penalty, avg_brick_usage_np, metrics_extra
@@ -1037,6 +1039,7 @@ def _dictionary_regularizers(
             opp_mask = (agent_types != 0)
             if padding_mask is not None:
                 opp_mask = opp_mask & (~padding_mask.bool())
+            opp_mask_for_tokens = opp_mask
             if opp_mask.any():
                 opp_activations = activations[opp_mask]
                 l1_sparsity_loss = opp_activations.abs().mean()
@@ -1052,23 +1055,6 @@ def _dictionary_regularizers(
                 avg_brick_usage = opp_activations.mean(dim=0)
                 avg_brick_usage_np = avg_brick_usage.detach().cpu().float().numpy()
 
-                max_tokens = int(getattr(config, "PCA_TOKEN_SAMPLE", 2048))
-                if strategy_code is not None:
-                    with torch.no_grad():
-                        strat_det = strategy_code.detach()
-                        opp_codes_flat = strat_det[opp_mask]
-                        opp_act_flat = opp_activations.detach()
-                        if opp_codes_flat.numel() > 0:
-                            if opp_codes_flat.size(0) > max_tokens:
-                                perm = torch.randperm(opp_codes_flat.size(0), device=opp_codes_flat.device)[:max_tokens]
-                                opp_codes_flat = opp_codes_flat[perm]
-                                opp_act_flat = opp_act_flat[perm]
-                            metrics_extra["opp_strategy_codes_tokens"] = (
-                                opp_codes_flat.cpu().float().numpy()
-                            )
-                            metrics_extra["opp_activation_top_idx"] = (
-                                opp_act_flat.argmax(dim=-1).cpu().numpy()
-                            )
 
     if bricks is not None and bricks.ndim == 2 and bricks.size(0) > 1:
         norm_bricks = F.normalize(bricks, dim=-1)
@@ -1086,48 +1072,66 @@ def _dictionary_regularizers(
         padding_mask = mi.get("padding_mask")
         opp_labels_by_seat = batch.get("opp_labels_by_seat")
         opp_seat_ids = batch.get("opp_seat_ids")
-        opp_idx = batch.get("opp_idx")
-        opp_have_label = batch.get("opp_have_label")
+        opp_last_idx = batch.get("opp_last_token_idx")
+        opp_last_adjacent = batch.get("opp_last_token_is_adjacent")
 
         if (
             agent_types is not None
             and opp_labels_by_seat is not None
             and opp_seat_ids is not None
-            and opp_idx is not None
+            and opp_last_idx is not None
+            and opp_last_adjacent is not None
         ):
-            B_emb, To = opp_idx.shape
-            _, _, D_emb = strategy_code.shape
-
-            idx = opp_idx.long().clamp_min(0)
-            tok_embeds = strategy_code.gather(1, idx.unsqueeze(-1).expand(-1, -1, D_emb))
-            seat_tokens = agent_types.gather(1, idx)
-
-            valid_tok = (opp_idx >= 0)
-            if opp_have_label is not None:
-                valid_tok = valid_tok & opp_have_label
-            if padding_mask is not None:
-                pad_at = padding_mask.gather(1, idx.clamp_max(padding_mask.size(1) - 1))
-                valid_tok = valid_tok & (~pad_at.bool())
-
-            num_seats = opp_labels_by_seat.size(1)
+            B_emb, num_seats = opp_labels_by_seat.shape
+            _, L_seq, D_emb = strategy_code.shape
             seat_valid = opp_seat_ids >= 0
+            seat_labels = opp_labels_by_seat.clone().masked_fill(~seat_valid, -1)
 
-            seat_match = (
-                seat_tokens.unsqueeze(-1) == opp_seat_ids.unsqueeze(1)
-            ) & valid_tok.unsqueeze(-1)
-            seat_match_f = seat_match.to(tok_embeds.dtype)
-            seat_counts = seat_match_f.sum(dim=1)
-            embeds_sum = torch.einsum("btn,btd->bnd", seat_match_f, tok_embeds)
-            seat_counts_safe = seat_counts.clamp_min(1e-6).unsqueeze(-1)
-            seat_embeds = embeds_sum / seat_counts_safe
-            seat_embeds = seat_embeds.masked_fill(
-                (seat_counts.unsqueeze(-1) == 0) | (~seat_valid.unsqueeze(-1)),
+            seat_embeds = torch.full(
+                (B_emb, num_seats, D_emb),
                 float("nan"),
+                dtype=strategy_code.dtype,
+                device=strategy_code.device,
             )
-            seat_counts = seat_counts.masked_fill(~seat_valid, 0.0)
+            seat_counts = torch.zeros(
+                (B_emb, num_seats),
+                dtype=strategy_code.dtype,
+                device=strategy_code.device,
+            )
 
-            seat_labels = opp_labels_by_seat.clone()
-            seat_labels = seat_labels.masked_fill(~seat_valid, -1)
+            idx_shape_ok = (
+                opp_last_idx.dim() == 2
+                and opp_last_idx.size(0) == B_emb
+                and opp_last_idx.size(1) == num_seats
+            )
+            adj_shape_ok = (
+                opp_last_adjacent.dim() == 2
+                and opp_last_adjacent.size(0) == B_emb
+                and opp_last_adjacent.size(1) == num_seats
+            )
+
+            if idx_shape_ok and adj_shape_ok and L_seq > 0:
+                idx_clamped = opp_last_idx.clamp(min=0, max=max(L_seq - 1, 0))
+                adjacency_mask = (
+                    opp_last_adjacent.bool()
+                    & seat_valid
+                    & (opp_last_idx >= 0)
+                    & (idx_clamped < L_seq)
+                )
+                if adjacency_mask.any():
+                    flat_idx = adjacency_mask.nonzero(as_tuple=False)
+                    b_sel = flat_idx[:, 0]
+                    seat_sel = flat_idx[:, 1]
+                    tok_sel = idx_clamped[adjacency_mask]
+                    gathered = strategy_code[b_sel, tok_sel, :]
+                    seat_embeds[b_sel, seat_sel, :] = gathered
+                    seat_counts[adjacency_mask] = 1.0
+                    selected_token_mask = torch.zeros(
+                        (B_emb, L_seq), dtype=torch.bool, device=strategy_code.device
+                    )
+                    selected_token_mask[b_sel, tok_sel] = True
+
+            seat_counts = seat_counts.masked_fill(~seat_valid, 0.0)
 
             metrics_extra["opp_embeds_batch"] = (
                 seat_embeds.detach().cpu().float().numpy(),
@@ -1143,6 +1147,31 @@ def _dictionary_regularizers(
                 metrics_extra["opp_embeds_flat"] = embeds_tensor.numpy()
                 metrics_extra["opp_labels_flat"] = labels_list
                 metrics_extra["opp_labels_flat_original"] = labels_list
+
+        mask_for_tokens = selected_token_mask if selected_token_mask is not None else opp_mask_for_tokens
+        if mask_for_tokens is not None:
+            mask_bool = mask_for_tokens.bool()
+            if mask_bool.any():
+                max_tokens = int(getattr(config, "PCA_TOKEN_SAMPLE", 2048))
+                with torch.no_grad():
+                    strat_det = strategy_code.detach()
+                    opp_codes_flat = strat_det[mask_bool]
+                    if opp_codes_flat.numel() > 0:
+                        opp_act_flat = None
+                        if activations is not None:
+                            opp_act_flat = activations.detach()[mask_bool]
+                        if opp_codes_flat.size(0) > max_tokens:
+                            perm = torch.randperm(opp_codes_flat.size(0), device=opp_codes_flat.device)[:max_tokens]
+                            opp_codes_flat = opp_codes_flat[perm]
+                            if opp_act_flat is not None:
+                                opp_act_flat = opp_act_flat[perm]
+                        metrics_extra["opp_strategy_codes_tokens"] = (
+                            opp_codes_flat.cpu().float().numpy()
+                        )
+                        if opp_act_flat is not None:
+                            metrics_extra["opp_activation_top_idx"] = (
+                                opp_act_flat.argmax(dim=-1).cpu().numpy()
+                            )
 
     return (
         l1_sparsity_loss,
@@ -1493,6 +1522,7 @@ def _collate_batch(
       our_idx [B,T], mask [B,T], actions [B,T], old_logp [B,T], rewards [B,T],
       penalties_used [B,T], our_action_mask [B,L_pad,A] or None,
       opp_idx [B,To], opp_targets [B,To], opp_have_label [B,To]
+      opp_last_token_idx [B,num_opponents], opp_last_token_is_adjacent [B,num_opponents]
       padding_mask [B,L_pad] (True where padded)
     """
     IGN = int(ignore_index)
@@ -1723,8 +1753,10 @@ def _collate_batch(
     if our_action_mask is not None:
         our_action_mask = _pm(our_action_mask)
 
-    opp_labels_by_seat = _pm(torch.full((B, num_opponents), IGN, dtype=torch.long))
-    opp_seat_ids = _pm(torch.full((B, num_opponents), -1, dtype=torch.long))
+    opp_labels_by_seat = torch.full((B, num_opponents), IGN, dtype=torch.long)
+    opp_seat_ids = torch.full((B, num_opponents), -1, dtype=torch.long)
+    opp_last_token_idx = torch.full((B, num_opponents), -1, dtype=torch.long)
+    opp_last_token_is_adjacent = torch.zeros((B, num_opponents), dtype=torch.bool)
     heldout_episode_mask = _pm(torch.tensor(heldout_flags, dtype=torch.bool))
 
     def _int_array(seq: Any, invalid_fill: int = -1) -> np.ndarray:
@@ -1839,12 +1871,35 @@ def _collate_batch(
                     opp_entries.append((seat_idx, IGN))
                 else:
                     opp_entries.append((seat_idx, int(lbl)))
+            seat_pos_map: Dict[int, int] = {}
             for j, (seat_idx, lbl) in enumerate(opp_entries[:num_opponents]):
                 opp_seat_ids[b, j] = seat_idx
                 if lbl != IGN:
                     opp_labels_by_seat[b, j] = lbl
+                seat_pos_map[seat_idx] = j
 
             steps = opp_ep_idx[:M_fill]
+
+            if seat_pos_map and agent_id_seq.size > 0 and L_pad > 0 and training_seat >= 0:
+                seq_len = int(agent_id_seq.shape[0])
+                max_token_index = min(L_pad, seq_len)
+                for seat_idx, col in seat_pos_map.items():
+                    occ = np.nonzero(agent_id_seq == seat_idx)[0]
+                    if occ.size == 0:
+                        continue
+                    last_idx = int(occ[-1])
+                    if last_idx >= max_token_index:
+                        continue
+                    opp_last_token_idx[b, col] = last_idx
+                    adjacent = False
+                    if last_idx > 0:
+                        prev_agent = int(agent_id_seq[last_idx - 1])
+                        adjacent = (prev_agent == training_seat)
+                    if not adjacent and (last_idx + 1) < seq_len:
+                        next_agent = int(agent_id_seq[last_idx + 1])
+                        adjacent = (next_agent == training_seat)
+                    if adjacent:
+                        opp_last_token_is_adjacent[b, col] = True
 
             tgt_src = _int_array(ep.get("opp_target_action"), invalid_fill=-1)
             tgt_dest = np.full(M_fill, IGN, dtype=np.int64)
@@ -1874,8 +1929,10 @@ def _collate_batch(
         "opp_idx":        opp_idx,
         "opp_targets":    opp_targets,
         "opp_have_label": opp_have_label,
-        "opp_labels_by_seat": opp_labels_by_seat,
-        "opp_seat_ids": opp_seat_ids,
+        "opp_labels_by_seat": _pm(opp_labels_by_seat),
+        "opp_seat_ids": _pm(opp_seat_ids),
+        "opp_last_token_idx": _pm(opp_last_token_idx),
+        "opp_last_token_is_adjacent": _pm(opp_last_token_is_adjacent),
         "heldout_episode_mask": heldout_episode_mask,
     }
 
@@ -1899,6 +1956,8 @@ def _to_device_batch(batch_cpu: Dict[str, Any], device: torch.device) -> Dict[st
         "opp_have_label": batch_cpu["opp_have_label"].to(device, non_blocking=True),
         "opp_labels_by_seat": batch_cpu["opp_labels_by_seat"].to(device, non_blocking=True),
         "opp_seat_ids":      batch_cpu["opp_seat_ids"].to(device, non_blocking=True),
+        "opp_last_token_idx": batch_cpu["opp_last_token_idx"].to(device, non_blocking=True),
+        "opp_last_token_is_adjacent": batch_cpu["opp_last_token_is_adjacent"].to(device, non_blocking=True),
         "heldout_episode_mask": batch_cpu["heldout_episode_mask"].to(device, non_blocking=True),
     }
     return out
