@@ -143,21 +143,6 @@ CULL_INTERVAL = 20001
 CHECKPOINT_INTERVAL = 25
 LOG_INTERVAL = 100
 
-def _env_flag(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    value = value.strip().lower()
-    return value in {"1", "true", "yes", "on"}
-
-
-VRAM_LOG_INTERVAL = int(os.environ.get("VRAM_LOG_INTERVAL", "10"))
-VRAM_LOG_TOP_MODULES = int(os.environ.get("VRAM_LOG_TOP_MODULES", "8"))
-VRAM_LOG_OPT_STATE = _env_flag("VRAM_LOG_OPT_STATE", True)
-VRAM_LOG_ROLLOUT_INTERVAL = int(os.environ.get("VRAM_LOG_ROLLOUT_INTERVAL", "0"))
-VRAM_LOG_INFERENCE_INTERVAL = int(os.environ.get("VRAM_LOG_INFERENCE_INTERVAL", "0"))
-VRAM_LOG_SUMMARY = _env_flag("VRAM_LOG_SUMMARY", False)
-
 # ============================
 # Evaluation Configuration
 # ============================
