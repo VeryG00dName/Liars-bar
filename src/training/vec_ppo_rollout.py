@@ -20,7 +20,6 @@ class PPOVecRolloutManager:
         device: torch.device,
         pool_manager: Optional[Any] = None,
         rng: Optional[np.random.Generator] = None,
-        meta_sampler: Optional[Any] = None,
     ) -> None:
         self.rollout_manager = lb.RolloutManager()
         self.cpp_manager = self.rollout_manager
@@ -32,7 +31,6 @@ class PPOVecRolloutManager:
         self.device = device
         self.rng = rng if rng is not None else np.random.default_rng()
         self.pool_manager = pool_manager
-        self.meta_sampler = meta_sampler
 
         try:
             self.cpp_manager.set_training_device(str(device))
@@ -47,7 +45,6 @@ class PPOVecRolloutManager:
         self._shadow_historical_agents: List[int] = []
         self._opponent_pool_snapshot: List[Dict[str, Any]] = []
         self._partitions_ready: bool = False
-        self._last_sampling_distribution: Dict[int, float] = {}
         self._cpp_native_policies: Set[int] = set()
         self._historical_cpp_policies: Set[int] = set()
         self._last_model_call_stats: Dict[int, Dict[str, float]] = {}
@@ -274,23 +271,8 @@ class PPOVecRolloutManager:
                     break
                 active_shadow_agents.append(int(self._current_shadow_rotation_queue.pop(0)))
 
-        candidate_labels = list({*cpp_bots, *latest_historical_agents, *active_shadow_agents})
-        if self.meta_sampler is not None and candidate_labels:
-            distribution = self.meta_sampler.sampling_distribution(candidate_labels)
-            self._last_sampling_distribution = distribution
-            cpp_mass = sum(distribution.get(lbl, 0.0) for lbl in cpp_bots)
-            latest_mass = sum(distribution.get(lbl, 0.0) for lbl in latest_historical_agents)
-            shadow_mass = sum(distribution.get(lbl, 0.0) for lbl in active_shadow_agents)
-            front_mass = cpp_mass + latest_mass
-            total = front_mass + shadow_mass
-            if total > 0:
-                front_mass /= total
-                shadow_mass /= total
-        else:
-            distribution = {}
-            self._last_sampling_distribution = {}
-            front_mass = config.FRONT_P_ADJUSTED if (cpp_bots or latest_historical_agents) else 0.0
-            shadow_mass = config.SHADOW_P_NEW if active_shadow_agents else 0.0
+        front_mass = config.FRONT_P_ADJUSTED if (cpp_bots or latest_historical_agents) else 0.0
+        shadow_mass = config.SHADOW_P_NEW if active_shadow_agents else 0.0
 
         seed = int(self.rng.integers(0, 2**31))
         max_batch = int(max_batch_envs) if max_batch_envs is not None else -1

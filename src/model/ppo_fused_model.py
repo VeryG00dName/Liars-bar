@@ -1,6 +1,6 @@
 # src/model/ppo_fused_model.py
 
-from typing import Dict, Optional
+from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -214,8 +214,6 @@ class PPOFusedModel(nn.Module):
         # Opponent action head operates directly on the strategy code
         self.opp_action_head = nn.Linear(brick_dim, action_dim)
 
-        self.meta_game_distribution: Dict[int, float] = {}
-
 
     @torch.no_grad()
     def _decompose_actions(self, action_sequence, padding_mask=None):
@@ -304,9 +302,6 @@ class PPOFusedModel(nn.Module):
             return (action_logits, opp_logits, state_values, embedding_tuple)
         else:
             return (action_logits, opp_logits, state_values)
-
-    def update_meta_game_distribution(self, distribution: Dict[int, float]) -> None:
-        self.meta_game_distribution = dict(distribution)
 
     # ===== Convenience helpers (Unchanged) =====
     @staticmethod

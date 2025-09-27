@@ -73,7 +73,7 @@ DROPOUT_P = 0.15
 # Dictionary compositional pressure (DCP) and decorrelation controls
 # Base DCP weight is scaled by held-out TOKEN fraction inside the loss
 # (effective_weight = heldout_token_frac * DCP_LOSS_WEIGHT).
-DCP_LOSS_WEIGHT = 0.1044
+DCP_LOSS_WEIGHT = 1.20
 BRICK_DECORRELATION_WEIGHT = 1e-3
 # ============================
 # PPO / Training Hyperparameters
@@ -95,20 +95,6 @@ FRONT_P_ADJUSTED = 1.0 - SHADOW_P_NEW
 NUM_ACTIVE_SHADOW_AGENTS_PER_UPDATE = 2
 CPP_BOT_MAX_LABEL = 6
 LATEST_K = 4
-
-# Meta-game solver defaults
-META_GAME_STORE_DIR = os.path.join(BASE_DIR, "meta_game_store")
-META_GAME_SOLVER_TYPE = "alpha_rank"
-META_GAME_SOLVER_ALPHA = 10.0
-META_GAME_ALPHA_CAP = 50.0
-META_GAME_CONFIDENCE_THRESHOLD = 0.05
-META_GAME_EXPLORATION_EPS = 0.02
-META_GAME_HELDOUT_FLOOR = 0.0864
-META_GAME_HELD_OUT_LABELS: list[int] = []
-META_GAME_REQUIRED_SUPPORT: list[int] = []
-META_GAME_ARCHIVE_THRESHOLD = 0.01
-META_GAME_ARCHIVE_PATIENCE = 3
-META_GAME_SIMILARITY_THRESHOLD = 0.995
 
 # ============================
 # Auxiliary Loss Weights
