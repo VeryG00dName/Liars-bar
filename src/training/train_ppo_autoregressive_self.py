@@ -313,16 +313,19 @@ def train_generation(
 
     learner.model.train()
 
-    # grab bricks if they exist
-    strat_dict = getattr(getattr(learner, "model", None), "strategy_dictionary", None)
-    bricks_params = []
-    if strat_dict is not None and hasattr(strat_dict, "bricks"):
-        bricks_params = [strat_dict.bricks]
-
-    # separate param groups
     all_params = list(learner.model.parameters())
-    decay_params = [p for p in all_params if p not in bricks_params]
-    no_decay_params = bricks_params
+
+    # Get the parameters specifically from the strategy dictionary's bricks
+    bricks_params = list(learner.model.strategy_dictionary.bricks)
+
+    # --- THE FIX ---
+    # Create a set of the memory addresses (ids) of the brick parameters
+    bricks_param_ids = {id(p) for p in bricks_params}
+
+    # Separate the parameters by checking if their id is in the set
+    decay_params = [p for p in all_params if id(p) not in bricks_param_ids]
+    no_decay_params = [p for p in all_params if id(p) in bricks_param_ids] # A more robust way to get this list
+    # --- END FIX ---
 
     optimizer = torch.optim.AdamW(
         [
@@ -335,14 +338,19 @@ def train_generation(
     
     scaler = amp.GradScaler(enabled=(device.type == "cuda"))
 
-    if hasattr(learner.model, "belief_head"):
-        belief_head_params = list(learner.model.belief_head.parameters())
-    else:
-        belief_head_params = []
-    belief_param_ids = {id(p) for p in belief_head_params}
-    # Keep belief-head gradients isolated so the probe loss never triggers clipping on the main policy/value stack.
-    non_belief_params = [p for p in all_params if id(p) not in belief_param_ids]
-    belief_max_norm = float(getattr(config, "BELIEF_MAX_NORM", config.MAX_NORM))
+    all_params = list(learner.model.parameters())
+
+    # --- THE FIX ---
+    # Isolate the parameters of the activation_encoder
+    activation_encoder_params = list(learner.model.strategy_dictionary.activation_encoder.parameters())
+    activation_encoder_param_ids = {id(p) for p in activation_encoder_params}
+    
+    # All other parameters are considered "main" parameters
+    main_params = [p for p in all_params if id(p) not in activation_encoder_param_ids]
+    
+    # You can define a separate max_norm for the encoder if you want, or use the main one.
+    # Let's create a new config for it for flexibility.
+    encoder_max_norm = float(getattr(config, "ENCODER_MAX_NORM", config.MAX_NORM))
     
     existing_labels = {
         int(entry.get("label"))
@@ -511,10 +519,10 @@ def train_generation(
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
             # Clip the core model separately so belief-head spikes cannot shrink its update.
-            if non_belief_params:
-                clip_grad_norm_(non_belief_params, max_norm=float(config.MAX_NORM))
-            if belief_head_params:
-                clip_grad_norm_(belief_head_params, max_norm=belief_max_norm)
+            if main_params:
+                clip_grad_norm_(main_params, max_norm=float(config.MAX_NORM))
+            if activation_encoder_params:
+                clip_grad_norm_(activation_encoder_params, max_norm=encoder_max_norm)
             scaler.step(optimizer)
             scaler.update()
             # Aggregate metrics
