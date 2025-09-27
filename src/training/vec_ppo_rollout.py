@@ -39,9 +39,12 @@ class PPOVecRolloutManager:
         except AttributeError:
             pass
 
+        self._all_shadow_pool_labels: List[int] = []
+        self._current_shadow_rotation_queue: List[int] = []
+        self._shadow_pool_reference: List[int] = []
         self._cpp_bots: List[int] = []
-        self._newest_historical_agent: Optional[int] = None
-        self._other_historical_agents: List[int] = []
+        self._latest_historical_agents: List[int] = []
+        self._shadow_historical_agents: List[int] = []
         self._opponent_pool_snapshot: List[Dict[str, Any]] = []
         self._partitions_ready: bool = False
         self._last_sampling_distribution: Dict[int, float] = {}
@@ -91,12 +94,32 @@ class PPOVecRolloutManager:
         cpp_bots = sorted(set(cpp_bots))
         historical_sorted = sorted(set(historical))
 
-        self._cpp_bots = list(cpp_bots)
-        newest = historical_sorted[-1] if historical_sorted else None
-        others = [label for label in historical_sorted if label != newest]
+        latest_historical_agents = (
+            historical_sorted[-config.LATEST_K :]
+            if config.LATEST_K > 0
+            else []
+        )
+        shadow_historical_agents = [
+            label for label in historical_sorted if label not in latest_historical_agents
+        ]
 
-        self._newest_historical_agent = newest
-        self._other_historical_agents = list(others)
+        shadow_reference = list(shadow_historical_agents)
+        refresh_shadow_rotation = shadow_reference != self._shadow_pool_reference
+
+        self._cpp_bots = list(cpp_bots)
+        self._latest_historical_agents = list(latest_historical_agents)
+        self._shadow_historical_agents = list(shadow_historical_agents)
+
+        if refresh_shadow_rotation:
+            self._shadow_pool_reference = shadow_reference
+            self._all_shadow_pool_labels = list(shadow_reference)
+            if self._all_shadow_pool_labels:
+                self.rng.shuffle(self._all_shadow_pool_labels)
+                self._current_shadow_rotation_queue = list(self._all_shadow_pool_labels)
+            else:
+                self._current_shadow_rotation_queue = []
+        elif not self._current_shadow_rotation_queue and self._all_shadow_pool_labels:
+            self._current_shadow_rotation_queue = list(self._all_shadow_pool_labels)
 
         self._partitions_ready = True
 
@@ -238,71 +261,36 @@ class PPOVecRolloutManager:
                 stats["max"] = float(duration)
 
         cpp_bots = list(self._cpp_bots)
-        newest_historical = self._newest_historical_agent
-        other_historical = list(self._other_historical_agents)
+        latest_historical_agents = list(self._latest_historical_agents)
 
-        candidate_set = set(cpp_bots)
-        candidate_set.update(other_historical)
-        if newest_historical is not None:
-            candidate_set.add(int(newest_historical))
+        active_shadow_agents: List[int] = []
+        if self._all_shadow_pool_labels:
+            for _ in range(int(config.NUM_ACTIVE_SHADOW_AGENTS_PER_UPDATE)):
+                if not self._current_shadow_rotation_queue and self._all_shadow_pool_labels:
+                    refreshed = list(self._all_shadow_pool_labels)
+                    self.rng.shuffle(refreshed)
+                    self._current_shadow_rotation_queue = refreshed
+                if not self._current_shadow_rotation_queue:
+                    break
+                active_shadow_agents.append(int(self._current_shadow_rotation_queue.pop(0)))
 
-        candidate_labels = sorted(candidate_set)
-
-        distribution: Dict[int, float]
+        candidate_labels = list({*cpp_bots, *latest_historical_agents, *active_shadow_agents})
         if self.meta_sampler is not None and candidate_labels:
-            distribution = dict(self.meta_sampler.sampling_distribution(candidate_labels))
+            distribution = self.meta_sampler.sampling_distribution(candidate_labels)
+            self._last_sampling_distribution = distribution
+            cpp_mass = sum(distribution.get(lbl, 0.0) for lbl in cpp_bots)
+            latest_mass = sum(distribution.get(lbl, 0.0) for lbl in latest_historical_agents)
+            shadow_mass = sum(distribution.get(lbl, 0.0) for lbl in active_shadow_agents)
+            front_mass = cpp_mass + latest_mass
+            total = front_mass + shadow_mass
+            if total > 0:
+                front_mass /= total
+                shadow_mass /= total
         else:
-            distribution = {label: 1.0 for label in candidate_labels}
-
-        if not candidate_labels:
             distribution = {}
-
-        def _normalize_weights(raw: Dict[int, float]) -> Dict[int, float]:
-            total = sum(raw.get(lbl, 0.0) for lbl in candidate_labels)
-            if total <= 0 or not candidate_labels:
-                if not candidate_labels:
-                    return {}
-                uniform = 1.0 / float(len(candidate_labels))
-                return {lbl: uniform for lbl in candidate_labels}
-            inv_total = 1.0 / float(total)
-            return {lbl: max(0.0, raw.get(lbl, 0.0) * inv_total) for lbl in candidate_labels}
-
-        normalized = _normalize_weights(distribution)
-
-        newest_label = int(newest_historical) if newest_historical is not None else None
-        heldout_floor = float(getattr(config, "META_GAME_HELDOUT_FLOOR", 0.0))
-        heldout_floor = max(0.0, min(heldout_floor, 1.0))
-
-        if newest_label is not None and candidate_labels:
-            current = normalized.get(newest_label, 0.0)
-            if heldout_floor > 0.0 and current < heldout_floor:
-                remaining_labels = [lbl for lbl in candidate_labels if lbl != newest_label]
-                if remaining_labels:
-                    remaining_total = sum(normalized.get(lbl, 0.0) for lbl in remaining_labels)
-                    target_remaining = max(0.0, 1.0 - heldout_floor)
-                    if remaining_total > 0.0:
-                        scale = target_remaining / remaining_total
-                        adjusted = {
-                            lbl: max(0.0, normalized.get(lbl, 0.0) * scale)
-                            for lbl in remaining_labels
-                        }
-                    else:
-                        uniform = target_remaining / float(len(remaining_labels))
-                        adjusted = {lbl: uniform for lbl in remaining_labels}
-                    adjusted[newest_label] = heldout_floor
-                    normalized = adjusted
-                else:
-                    normalized = {newest_label: 1.0}
-
-        weight_sum = sum(normalized.values())
-        if weight_sum > 0.0:
-            inv_sum = 1.0 / float(weight_sum)
-            normalized = {lbl: value * inv_sum for lbl, value in normalized.items()}
-
-        self._last_sampling_distribution = dict(normalized)
-
-        opponent_labels = sorted(normalized.keys())
-        opponent_weights = [normalized.get(lbl, 0.0) for lbl in opponent_labels]
+            self._last_sampling_distribution = {}
+            front_mass = config.FRONT_P_ADJUSTED if (cpp_bots or latest_historical_agents) else 0.0
+            shadow_mass = config.SHADOW_P_NEW if active_shadow_agents else 0.0
 
         seed = int(self.rng.integers(0, 2**31))
         max_batch = int(max_batch_envs) if max_batch_envs is not None else -1
@@ -314,9 +302,10 @@ class PPOVecRolloutManager:
             max_batch,
             seed,
             cpp_bots,
-            opponent_labels,
-            opponent_weights,
-            int(newest_historical) if newest_historical is not None else -1,
+            latest_historical_agents,
+            active_shadow_agents,
+            float(front_mass),
+            float(shadow_mass),
         )
 
         while True:
