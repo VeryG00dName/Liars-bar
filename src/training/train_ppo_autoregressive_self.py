@@ -466,34 +466,6 @@ def train_generation(
             del ep_buffer[:excess]
         if buffer_token_total < 0:
             buffer_token_total = 0
-
-        if meta_sampler is not None and new_eps:
-            store = meta_sampler.store
-            for ep in new_eps:
-                player_labels = tuple(int(x) for x in ep.get("player_labels", ()))
-                training_label = int(ep.get("training_agent_label", training_policy_id))
-                seat_perm = player_labels if player_labels else None
-                if ep.get("win", 0):
-                    for lbl in player_labels:
-                        if lbl == training_label:
-                            continue
-                        store.record_match(training_label, lbl, seat_permutation=seat_perm)
-                else:
-                    for lbl in player_labels:
-                        if lbl == training_label:
-                            continue
-                        store.record_match(lbl, training_label, seat_permutation=seat_perm)
-            meta_sampler.refresh_store()
-
-            if rollout_manager._last_sampling_distribution:
-                train_extras.log_meta_game_distribution(
-                    writer,
-                    rollout_manager._last_sampling_distribution,
-                    update,
-                )
-                update_fn = getattr(getattr(learner, "model", None), "update_meta_game_distribution", None)
-                if callable(update_fn):
-                    update_fn(rollout_manager._last_sampling_distribution)
         
         # -------- Optimize (aggregate metrics) --------
         learner.model.train()
