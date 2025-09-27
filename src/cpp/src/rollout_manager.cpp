@@ -122,10 +122,9 @@ void RolloutManager::start_rollouts(int num_episodes,
                                     int max_batch_envs,
                                     uint32_t seed,
                                     const std::vector<int>& cpp_bots,
-                                    const std::vector<int>& latest_historical_agents,
-                                    const std::vector<int>& active_shadow_agents,
-                                    double front_mass,
-                                    double shadow_mass) {
+                                    const std::vector<int>& opponent_labels,
+                                    const std::vector<double>& opponent_weights,
+                                    int newest_opponent_label) {
     target_episodes_ = num_episodes;
     num_players_ = num_players;
     training_policy_id_ = training_policy_id;
@@ -146,16 +145,27 @@ void RolloutManager::start_rollouts(int num_episodes,
 
     arena_.reset(batch_size_, num_players_, rng_());
 
-    std::vector<int> front_pool = cpp_bots;
-    front_pool.insert(front_pool.end(), latest_historical_agents.begin(), latest_historical_agents.end());
+    std::vector<int> effective_opponents = opponent_labels;
+    std::vector<double> effective_weights = opponent_weights;
+
+    if (effective_weights.size() != effective_opponents.size()) {
+        effective_weights.assign(effective_opponents.size(), 0.0);
+    }
+
+    for (int label : cpp_bots) {
+        if (std::find(effective_opponents.begin(), effective_opponents.end(), label) ==
+            effective_opponents.end()) {
+            effective_opponents.push_back(label);
+            effective_weights.push_back(0.0);
+        }
+    }
 
     auto roles = build_roles(batch_size_,
                              num_players_,
                              training_policy_id_,
-                             front_pool,
-                             active_shadow_agents,
-                             front_mass,
-                             shadow_mass);
+                             effective_opponents,
+                             effective_weights,
+                             newest_opponent_label);
     arena_.set_roles(roles);
 
     episodes_.clear();
@@ -747,71 +757,56 @@ std::unique_ptr<CppBotBase> RolloutManager::make_cpp_bot_instance(RolloutManager
 std::vector<std::vector<int>> RolloutManager::build_roles(int batch_size,
                                                           int num_players,
                                                           int training_policy_id,
-                                                          const std::vector<int>& front_agents,
-                                                          const std::vector<int>& shadow_agents,
-                                                          double front_mass,
-                                                          double shadow_mass) {
+                                                          const std::vector<int>& opponent_labels,
+                                                          const std::vector<double>& opponent_weights,
+                                                          int newest_label) {
     std::vector<std::vector<int>> roles(batch_size, std::vector<int>(num_players, training_policy_id));
     if (batch_size <= 0 || num_players <= 0) {
         return roles;
     }
 
-    auto unique_sorted = [](std::vector<int> values) {
-        std::sort(values.begin(), values.end());
-        values.erase(std::unique(values.begin(), values.end()), values.end());
-        return values;
-    };
-
-    std::vector<int> front = unique_sorted(front_agents);
-    std::vector<int> shadow = unique_sorted(shadow_agents);
-
-    if (!front.empty()) {
-        std::unordered_set<int> front_set(front.begin(), front.end());
-        std::vector<int> filtered;
-        filtered.reserve(shadow.size());
-        for (int id : shadow) {
-            if (!front_set.count(id)) {
-                filtered.push_back(id);
-            }
-        }
-        shadow.swap(filtered);
+    std::vector<int> pool = opponent_labels;
+    if (newest_label >= 0 &&
+        std::find(pool.begin(), pool.end(), newest_label) == pool.end()) {
+        pool.push_back(newest_label);
     }
 
-    std::vector<int> opponent_pool = front;
-    opponent_pool.insert(opponent_pool.end(), shadow.begin(), shadow.end());
-    if (opponent_pool.empty()) {
-        opponent_pool.push_back(training_policy_id);
+    if (pool.empty()) {
+        pool.push_back(training_policy_id);
     }
 
-    const size_t pool_size = opponent_pool.size();
-    std::vector<double> probs(pool_size, 0.0);
+    std::vector<double> probs;
+    probs.reserve(pool.size());
 
-    const double adjusted_front_mass = front.empty() ? 0.0 : front_mass;
-    const double adjusted_shadow_mass = shadow.empty() ? 0.0 : shadow_mass;
-    const double total_mass = adjusted_front_mass + adjusted_shadow_mass;
+    if (opponent_weights.size() == pool.size()) {
+        probs.assign(opponent_weights.begin(), opponent_weights.end());
+    } else {
+        probs.assign(pool.size(), 0.0);
+    }
 
-    if (total_mass <= 0.0 || pool_size == 0) {
-        const double uniform = pool_size > 0 ? 1.0 / static_cast<double>(pool_size) : 1.0;
+    if (probs.size() != pool.size()) {
+        probs.assign(pool.size(), 0.0);
+    }
+
+    double sum = std::accumulate(probs.begin(), probs.end(), 0.0);
+    if (sum <= 0.0) {
+        const double uniform = pool.empty() ? 1.0 : 1.0 / static_cast<double>(pool.size());
         std::fill(probs.begin(), probs.end(), uniform);
     } else {
-        std::unordered_set<int> front_set(front.begin(), front.end());
-        const double front_norm = front.empty() ? 1.0 : static_cast<double>(front.size());
-        const double shadow_norm = shadow.empty() ? 1.0 : static_cast<double>(shadow.size());
-
-        for (size_t i = 0; i < pool_size; ++i) {
-            const bool is_front = front_set.count(opponent_pool[i]) > 0;
-            const double bucket_mass = is_front ? adjusted_front_mass : adjusted_shadow_mass;
-            const double bucket_norm = is_front ? front_norm : shadow_norm;
-            probs[i] = bucket_mass / bucket_norm;
-        }
-        const double sum = std::accumulate(probs.begin(), probs.end(), 0.0);
-        if (sum > 0.0) {
-            for (double& p : probs) {
-                p /= sum;
+        for (double& p : probs) {
+            if (p < 0.0) {
+                p = 0.0;
             }
-        } else {
-            const double uniform = pool_size > 0 ? 1.0 / static_cast<double>(pool_size) : 1.0;
+        }
+        sum = std::accumulate(probs.begin(), probs.end(), 0.0);
+        if (sum <= 0.0) {
+            const double uniform = pool.empty() ? 1.0 : 1.0 / static_cast<double>(pool.size());
             std::fill(probs.begin(), probs.end(), uniform);
+        } else {
+            const double inv_sum = 1.0 / sum;
+            for (double& p : probs) {
+                p *= inv_sum;
+            }
         }
     }
 
@@ -828,7 +823,7 @@ std::vector<std::vector<int>> RolloutManager::build_roles(int batch_size,
 
         for (int opponent_idx = 0; opponent_idx < num_opponents; ++opponent_idx) {
             const int seat = seats[opponent_idx + 1];
-            const int choice = opponent_pool[sampler(rng_)];
+            const int choice = pool[sampler(rng_)];
             roles[b][seat] = choice;
         }
     }

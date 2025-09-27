@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -104,8 +106,9 @@ def test_rollout_manager_uses_meta_sampler(monkeypatch):
 
     class DummyRollout:
         def __init__(self):
-            self.front_mass = None
-            self.shadow_mass = None
+            self.opponent_labels = None
+            self.opponent_weights = None
+            self.newest_label = None
 
         def set_training_device(self, device):
             self.device = device
@@ -114,9 +117,10 @@ def test_rollout_manager_uses_meta_sampler(monkeypatch):
             self,
             *_args,
         ):
-            if len(_args) >= 2:
-                self.front_mass = _args[-2]
-                self.shadow_mass = _args[-1]
+            if len(_args) >= 4:
+                self.opponent_labels = _args[-3]
+                self.opponent_weights = _args[-2]
+                self.newest_label = _args[-1]
 
         def collect_requests_for_inference(self):
             return {}
@@ -130,8 +134,10 @@ def test_rollout_manager_uses_meta_sampler(monkeypatch):
     policy = SimpleNamespace(reset=lambda: None)
     mgr = PPOVecRolloutManager({0: policy}, mock.MagicMock(), meta_sampler=sampler)
     mgr._cpp_bots = [1]
-    mgr._latest_historical_agents = []
-    mgr._shadow_historical_agents = [2]
+    mgr._newest_historical_agent = 2
+    mgr._other_historical_agents = []
     mgr.collect_episodes(1, 4, training_policy_id=0)
-    assert dummy.front_mass is not None
+    assert dummy.opponent_labels == [1, 2]
+    assert dummy.newest_label == 2
+    assert dummy.opponent_weights == pytest.approx([0.7, 0.3])
 

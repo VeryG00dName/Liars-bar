@@ -113,6 +113,7 @@ class MetaGameSolver:
         width = intervals[..., 1] - intervals[..., 0]
         avg_width = float(np.mean(width)) if width.size else 1.0
         if avg_width > self.config.confidence_threshold:
+            print(avg_width)
             # Blend towards uniform when uncertainty is high.
             alpha = max(1.0, alpha / (1.0 + avg_width / self.config.confidence_threshold))
 

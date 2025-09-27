@@ -95,10 +95,9 @@ void bind_rollout_manager(py::module_& m) {
              py::arg("max_batch_envs"),
              py::arg("seed"),
              py::arg("cpp_bots"),
-             py::arg("latest_historical_agents"),
-             py::arg("active_shadow_agents"),
-             py::arg("front_mass"),
-             py::arg("shadow_mass"))
+             py::arg("opponent_labels"),
+             py::arg("opponent_weights"),
+             py::arg("newest_opponent_label") = -1)
         
         .def("collect_requests_for_inference", [](RolloutManager& self) {
             auto grouped = self.collect_requests_for_inference();
