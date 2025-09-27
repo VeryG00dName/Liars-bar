@@ -1,16 +1,18 @@
 #!/usr/bin/env python
 # compare_bricks.py
-# Compare StrategyDictionary.bricks across generations for a given test run.
+# Compare StrategyDictionary.bricks across SL/RL checkpoints.
 #
 # Examples:
 #   python compare_bricks.py --target 54
-#   python compare_bricks.py --target 54 --gens 1 10 20 34 --cos-thr 0.98 --method hungarian --write-csv
+#   python compare_bricks.py --target 54 --sl-path supervised_ckpts/
+#   python compare_bricks.py --target 54 --sl-path supervised_ckpts/ --method hungarian --cos-thr 0.995 --write-csv
 
 from __future__ import annotations
 import argparse
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
 import sys
+import re
 import numpy as np
 import torch
 
@@ -21,12 +23,17 @@ except Exception:
     _HAS_SCIPY = False
 
 
-# ---------- Checkpoint helpers (adapted to your loader) ----------
+# ---------- Checkpoint helpers ----------
 
 def _prepare_checkpoint(raw: Any) -> Tuple[Dict[str, Dict[str, Any]], str]:
     """
     Normalize a loaded checkpoint to: {"policy_nets": {agent_key: state_dict}}, return (ckpt, agent_key).
-    Matches the formats you described.
+
+    Supports:
+      - {"policy_nets": {...}}
+      - {"model_state_dict": ...}
+      - {"state_dict": ...}
+      - bare state_dict (param -> tensor)
     """
     if isinstance(raw, dict):
         if raw.get("policy_nets"):
@@ -49,7 +56,7 @@ def _prepare_checkpoint(raw: Any) -> Tuple[Dict[str, Dict[str, Any]], str]:
 
 
 def _iter_gen_dirs(base: Path):
-    """Yield gen directories (Path) sorted by numeric index."""
+    """Yield gen directories (Path) sorted by numeric index (RL)."""
     gens: List[Tuple[int, Path]] = []
     for p in base.iterdir():
         if not p.is_dir():
@@ -67,43 +74,100 @@ def _iter_gen_dirs(base: Path):
         yield p
 
 
-def load_bricks_from_checkpoint(ckpt_path: Path) -> np.ndarray:
+def _find_bricks_tensor_in_state_dict(state_dict: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
     """
-    Load a checkpoint and extract StrategyDictionary.bricks as numpy [num_bricks, brick_dim].
+    Return the 'strategy_dictionary.bricks' tensor if present under common key patterns.
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    raw = torch.load(ckpt_path, map_location=device, weights_only=False)
-    ckpt, _agent_key = _prepare_checkpoint(raw)
-
-    # We only need the model state dict; no need to instantiate the whole Agent class.
-    state_dict: Dict[str, torch.Tensor] = next(iter(ckpt["policy_nets"].values()))
-
-    # Try common parameter names for your module
-    # (adjust if your actual state_dict key differs)
-    # e.g., "model.strategy_dictionary.bricks", "strategy_dictionary.bricks", etc.
-    candidate_keys = [
+    candidates = [
         "model.strategy_dictionary.bricks",
         "strategy_dictionary.bricks",
         "agent_model.strategy_dictionary.bricks",
     ]
-    bricks_tensor: Optional[torch.Tensor] = None
-    for k in candidate_keys:
+    for k in candidates:
         if k in state_dict:
-            bricks_tensor = state_dict[k]
-            break
+            return state_dict[k]
+    for k, v in state_dict.items():
+        if k.endswith("strategy_dictionary.bricks"):
+            return v
+    return None
 
-    if bricks_tensor is None:
-        # fallback: search keys that end with 'strategy_dictionary.bricks'
-        for k, v in state_dict.items():
-            if k.endswith("strategy_dictionary.bricks"):
-                bricks_tensor = v
-                break
 
+def load_bricks_from_checkpoint_file(ckpt_path: Path) -> np.ndarray:
+    """
+    Load a checkpoint file (RL or SL) and extract StrategyDictionary.bricks as numpy [num_bricks, brick_dim].
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    raw = torch.load(ckpt_path, map_location=device, weights_only=False)
+    ckpt, _agent_key = _prepare_checkpoint(raw)
+    state_dict: Dict[str, torch.Tensor] = next(iter(ckpt["policy_nets"].values()))
+    bricks_tensor = _find_bricks_tensor_in_state_dict(state_dict)
     if bricks_tensor is None:
         raise KeyError(f"Could not find 'strategy_dictionary.bricks' in checkpoint: {ckpt_path}")
+    return bricks_tensor.detach().cpu().float().numpy()
 
-    bricks_np = bricks_tensor.detach().cpu().float().numpy()
-    return bricks_np
+
+# ---------- Loaders for RL (gens) and SL (epochs) ----------
+
+def load_all_bricks_rl(test_dir: Path, filename: str, gens_filter: Optional[List[int]] = None) -> Dict[str, np.ndarray]:
+    """
+    Load bricks for all RL gens (checkpoints/testXX/gen_*/<filename>).
+    Returns dict tag -> bricks, where tag looks like 'rl_gen_34'.
+    """
+    out: Dict[str, np.ndarray] = {}
+    for gen_dir in _iter_gen_dirs(test_dir):
+        name = gen_dir.name.lower()
+        try:
+            gidx = int(name.split("_", 1)[1])
+        except Exception:
+            continue
+        if gens_filter is not None and gidx not in gens_filter:
+            continue
+        ckpt = gen_dir / filename
+        if not ckpt.exists():
+            print(f"[skip-missing] {gen_dir}: {filename} not found")
+            continue
+        try:
+            bricks = load_bricks_from_checkpoint_file(ckpt)
+            out[f"rl_gen_{gidx}"] = bricks
+        except Exception as e:
+            print(f"[error] {gen_dir}: {e}")
+    return out
+
+
+def load_all_bricks_sl(sl_path: Path) -> Dict[str, np.ndarray]:
+    """
+    Load bricks for SL checkpoints in a folder containing files like:
+      autoreg_model_epoch_10.pth, ..., autoreg_model_epoch_100.pth
+    Ignores '*_best.pth' and '*_final.pth'.
+    Returns dict tag -> bricks, where tag looks like 'sl_epoch_10'.
+    """
+    out: Dict[str, np.ndarray] = {}
+    if not sl_path or not sl_path.exists() or not sl_path.is_dir():
+        return out
+
+    epoch_rx = re.compile(r"autoreg_model_epoch_(\d+)\.pth$", re.IGNORECASE)
+    files: List[Tuple[int, Path]] = []
+    for p in sl_path.iterdir():
+        if not p.is_file():
+            continue
+        name = p.name.lower()
+        if name.endswith("_best.pth") or name.endswith("_final.pth"):
+            continue
+        m = epoch_rx.match(name)
+        if not m:
+            continue
+        epoch = int(m.group(1))
+        files.append((epoch, p))
+    files.sort(key=lambda t: t[0])
+
+    for ep, f in files:
+        try:
+            bricks = load_bricks_from_checkpoint_file(f)
+            out[f"sl_epoch_{ep}"] = bricks
+        except Exception as e:
+            print(f"[error] {f}: {e}")
+
+    return out
 
 
 # ---------- Similarity / matching ----------
@@ -121,9 +185,6 @@ def cosine_matrix(A: np.ndarray, B: np.ndarray) -> np.ndarray:
 
 
 def match_any(S: np.ndarray, thr: float) -> Tuple[List[int], List[int], List[float]]:
-    """
-    For each row in S, find if any column >= thr. Return matched indices (not 1-1).
-    """
     max_j = S.argmax(axis=1)
     max_v = S.max(axis=1)
     rows = np.where(max_v >= thr)[0].tolist()
@@ -133,9 +194,6 @@ def match_any(S: np.ndarray, thr: float) -> Tuple[List[int], List[int], List[flo
 
 
 def match_greedy_unique(S: np.ndarray, thr: float) -> Tuple[List[int], List[int], List[float]]:
-    """
-    Greedy 1-1 matching by repeatedly picking the largest remaining sim >= thr.
-    """
     Swork = S.copy()
     rows: List[int] = []
     cols: List[int] = []
@@ -152,10 +210,6 @@ def match_greedy_unique(S: np.ndarray, thr: float) -> Tuple[List[int], List[int]
 
 
 def match_hungarian(S: np.ndarray, thr: float) -> Tuple[List[int], List[int], List[float]]:
-    """
-    Optimal 1-1 assignment using Hungarian on cost = 1 - cosine; filter by thr.
-    Falls back to greedy if SciPy not available.
-    """
     if not _HAS_SCIPY:
         return match_greedy_unique(S, thr)
     cost = 1.0 - S
@@ -168,7 +222,7 @@ def match_hungarian(S: np.ndarray, thr: float) -> Tuple[List[int], List[int], Li
     return rows, cols, vals
 
 
-# ---------- Main compare ----------
+# ---------- Compare ----------
 
 def compare_two(Ba: np.ndarray, Bb: np.ndarray, thr: float, method: str):
     S = cosine_matrix(Ba, Bb)
@@ -180,100 +234,167 @@ def compare_two(Ba: np.ndarray, Bb: np.ndarray, thr: float, method: str):
         r, c, v = match_hungarian(S, thr)
     else:
         raise ValueError(f"Unknown method: {method}")
+
     l2 = np.linalg.norm(Ba[r] - Bb[c], axis=1) if len(r) else np.array([])
     rel = l2 / (np.linalg.norm(Ba[r], axis=1) + 1e-12) if len(r) else np.array([])
+
+    # threshold-free stats (always shown)
+    rowmax = S.max(axis=1)
+    all_mean = float(S.mean()); all_min = float(S.min()); all_max = float(S.max())
+    rowmax_mean = float(rowmax.mean()); rowmax_min = float(rowmax.min()); rowmax_max = float(rowmax.max())
+
     return {
         "nA": Ba.shape[0], "nB": Bb.shape[0],
         "num_matches": len(r),
         "rows_a": r, "cols_b": c,
         "cos": v, "l2": l2.tolist(), "rel": rel.tolist(),
+        "all_mean": all_mean, "all_min": all_min, "all_max": all_max,
+        "rowmax_mean": rowmax_mean, "rowmax_min": rowmax_min, "rowmax_max": rowmax_max,
     }
 
 
-def load_all_bricks(test_dir: Path, filename: str, gens_filter: Optional[List[int]] = None):
-    bricks_by_gen: Dict[int, np.ndarray] = {}
-    for gen_dir in _iter_gen_dirs(test_dir):
-        name = gen_dir.name.lower()
-        try:
-            gidx = int(name.split("_", 1)[1])
-        except Exception:
-            continue
-        if gens_filter is not None and gidx not in gens_filter:
-            continue
-        ckpt = gen_dir / filename
-        if not ckpt.exists():
-            print(f"[skip-missing] {gen_dir}: {filename} not found")
-            continue
-        try:
-            bricks = load_bricks_from_checkpoint(ckpt)
-            bricks_by_gen[gidx] = bricks
-        except Exception as e:
-            print(f"[error] {gen_dir}: {e}")
-    if not bricks_by_gen:
-        raise SystemExit("No bricks loaded. Check --filename and paths.")
-    return dict(sorted(bricks_by_gen.items()))
+# ---------- Utilities ----------
 
+def _numeric_tail(tag: str) -> int:
+    return int(tag.split("_")[-1])
+
+def _split_tags(tags: List[str]) -> Tuple[List[str], List[str]]:
+    sl = [t for t in tags if t.startswith("sl_epoch_")]
+    rl = [t for t in tags if t.startswith("rl_gen_")]
+    sl.sort(key=_numeric_tail)
+    rl.sort(key=_numeric_tail)
+    return sl, rl
+
+
+def build_requested_pairs(sl_tags: List[str], rl_tags: List[str]) -> List[Tuple[str, str]]:
+    """
+    Construct pairs:
+      1) first SL -> last SL                        (if ≥2 SL)
+      2) last SL -> first RL                        (if SL and RL exist)
+      3) first RL -> mid RL                         (if ≥2 RL)
+      4) mid RL   -> last RL                        (if ≥3 RL; if only 2, mid==last so skip)
+    """
+    pairs: List[Tuple[str, str]] = []
+
+    # 1) SL first -> SL last
+    if len(sl_tags) >= 2:
+        pairs.append((sl_tags[0], sl_tags[-1]))
+
+    # 2) last SL -> first RL
+    if len(sl_tags) >= 1 and len(rl_tags) >= 1:
+        pairs.append((sl_tags[-1], rl_tags[0]))
+
+    # 3) first RL -> mid RL
+    if len(rl_tags) >= 2:
+        mid_idx = len(rl_tags) // 2  # for 2 gens, mid is index 1 (the last)
+        mid_tag = rl_tags[mid_idx]
+        pairs.append((rl_tags[0], mid_tag))
+
+    # 4) mid RL -> last RL (only if mid != last)
+    if len(rl_tags) >= 3:
+        mid_idx = len(rl_tags) // 2
+        mid_tag = rl_tags[mid_idx]
+        if mid_tag != rl_tags[-1]:
+            pairs.append((mid_tag, rl_tags[-1]))
+
+    # Deduplicate while preserving order
+    seen = set()
+    out: List[Tuple[str, str]] = []
+    for a, b in pairs:
+        key = (a, b)
+        if a == b:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+# ---------- Main ----------
 
 def main():
-    ap = argparse.ArgumentParser(description="Compare StrategyDictionary.bricks across generations.")
-    ap.add_argument("--target", type=int, required=True, help="Test index, e.g. --target 54 -> checkpoints/test54")
+    ap = argparse.ArgumentParser(description="Compare StrategyDictionary.bricks across SL/RL checkpoints.")
+    ap.add_argument("--target", type=int, required=True, help="RL test index, e.g. --target 54 -> checkpoints/test54")
     ap.add_argument("--root", type=Path, default=Path("checkpoints"))
-    ap.add_argument("--filename", type=str, default="final.pth")
+    ap.add_argument("--filename", type=str, default="final.pth", help="RL filename inside each gen_* (default: final.pth)")
     ap.add_argument("--gens", type=int, nargs="*", default=None,
-                    help="Specific gen numbers to load (default: all found).")
-    ap.add_argument("--pairs", type=int, nargs="*", default=None,
-                    help="Pairs to compare as flat list e.g. --pairs 10 34 20 34 (defaults: first->last, middle->last).")
+                    help="Specific RL gen numbers to load (default: all found).")
+    ap.add_argument("--sl-path", type=Path, default=None,
+                    help="Folder with SL files like autoreg_model_epoch_*.pth (best/final ignored).")
+    ap.add_argument("--pairs", type=str, nargs="*", default=None,
+                    help="Explicit pairs (override) as tags, e.g. --pairs sl_epoch_10 rl_gen_34 rl_gen_1 rl_gen_34")
     ap.add_argument("--method", choices=["any", "greedy", "hungarian"], default="greedy",
-                    help="Matching method for comparing bricks.")
+                    help="Matching method.")
     ap.add_argument("--cos-thr", type=float, default=0.98, help="Cosine threshold to count a 'match'.")
-    ap.add_argument("--write-csv", action="store_true", help="Write CSVs with match details next to gens.")
+    ap.add_argument("--write-csv", action="store_true", help="Write CSVs with match details next to RL test dir.")
     args = ap.parse_args()
 
+    # Load RL bricks
     test_dir = args.root / f"test{args.target}"
     if not test_dir.is_dir():
         sys.exit(f"Directory not found: {test_dir}")
+    rl = load_all_bricks_rl(test_dir, args.filename, gens_filter=args.gens)
 
-    bricks_by_gen = load_all_bricks(test_dir, args.filename, gens_filter=args.gens)
-    gens = list(bricks_by_gen.keys())
-    print(f"Loaded bricks for gens: {gens}")
+    # Load SL bricks (optional)
+    sl: Dict[str, np.ndarray] = {}
+    if args.sl_path is not None:
+        sl = load_all_bricks_sl(args.root/args.sl_path)
 
-    # Decide which pairs to compare
-    pair_list: List[Tuple[int,int]] = []
+    # Merge & list
+    bricks_by_tag: Dict[str, np.ndarray] = {}
+    bricks_by_tag.update(sl)
+    bricks_by_tag.update(rl)
+    if not bricks_by_tag:
+        sys.exit("No bricks loaded from either RL gens or SL path.")
+
+    all_tags = sorted(bricks_by_tag.keys(), key=_numeric_tail if len(bricks_by_tag)==len(sl) or len(bricks_by_tag)==len(rl) else lambda t: (_numeric_tail(t), t))
+    sl_tags, rl_tags = _split_tags(list(bricks_by_tag.keys()))
+    print(f"Loaded SL tags ({len(sl_tags)}): {sl_tags}")
+    print(f"Loaded RL tags ({len(rl_tags)}): {rl_tags}")
+
+    # Build pairs
     if args.pairs and len(args.pairs) % 2 == 0:
         it = iter(args.pairs)
-        pair_list = [(a,b) for a,b in zip(it, it)]
+        pair_list = [(a, b) for a, b in zip(it, it)]
     else:
-        # Defaults: earliest->latest, and mid->latest (if ≥3 gens)
-        first, last = gens[0], gens[-1]
-        pair_list.append((first, last))
-        if len(gens) >= 3:
-            mid = gens[len(gens)//2]
-            if (mid, last) not in pair_list:
-                pair_list.append((mid, last))
+        pair_list = build_requested_pairs(sl_tags, rl_tags)
+
+    if not pair_list:
+        print("No comparison pairs could be constructed from available SL/RL checkpoints.")
+        print("Tip: provide --pairs tagA tagB ... explicitly.")
+        sys.exit(0)
 
     # Compare
-    for (ga, gb) in pair_list:
-        if ga not in bricks_by_gen or gb not in bricks_by_gen:
-            print(f"[skip] missing {ga} or {gb}")
+    for (ta, tb) in pair_list:
+        if ta not in bricks_by_tag or tb not in bricks_by_tag:
+            print(f"[skip] missing {ta} or {tb}")
             continue
-        Ba, Bb = bricks_by_gen[ga], bricks_by_gen[gb]
+        Ba, Bb = bricks_by_tag[ta], bricks_by_tag[tb]
         rep = compare_two(Ba, Bb, thr=args.cos_thr, method=args.method)
-        print(f"\n=== Gen {ga} → Gen {gb} ===")
+        print(f"\n=== {ta} → {tb} ===")
         print(f"num_bricks: {rep['nA']}  matches(≥{args.cos_thr}): {rep['num_matches']}")
+        # Threshold-free stats (always)
+        print(f"best-per-brick cosine (row-wise max): mean={rep['rowmax_mean']:.4f}  min={rep['rowmax_min']:.4f}  max={rep['rowmax_max']:.4f}")
+        print(f"pairwise cosine (all entries):        mean={rep['all_mean']:.4f}     min={rep['all_min']:.4f}     max={rep['all_max']:.4f}")
+        # Matched-only (if any)
         if rep['num_matches'] > 0:
             cos_arr = np.array(rep['cos'])
-            print(f"cos: mean={cos_arr.mean():.4f}  min={cos_arr.min():.4f}  max={cos_arr.max():.4f}")
+            print(f"matched cos (≥{args.cos_thr}):        mean={cos_arr.mean():.4f}  min={cos_arr.min():.4f}  max={cos_arr.max():.4f}")
         else:
-            print("No matches at this threshold.")
+            print("matched cos (≥thr):                    none")
 
         if args.write_csv:
             import csv
-            out = test_dir / f"brick_matches_{ga}_to_{gb}_{args.method}_thr{args.cos_thr}.csv"
+            out = test_dir / f"brick_matches_{ta}_to_{tb}_{args.method}_thr{args.cos_thr}.csv"
             with out.open("w", newline="") as f:
                 w = csv.writer(f)
-                w.writerow(["row_in_genA", "row_in_genB", "cosine", "l2", "rel"])
+                w.writerow(["row_in_A", "row_in_B", "cosine", "l2", "rel"])
                 for i in range(rep["num_matches"]):
-                    w.writerow([rep["rows_a"][i], rep["cols_b"][i], rep["cos"][i], rep["l2"][i], rep["rel"][i]])
+                    w.writerow([
+                        rep["rows_a"][i], rep["cols_b"][i],
+                        rep["cos"][i], rep["l2"][i], rep["rel"][i]
+                    ])
             print(f"[write] {out}")
 
     print("\nDone.")
