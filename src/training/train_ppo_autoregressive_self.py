@@ -702,19 +702,6 @@ def train_generation(
         train_max = float(train_stats.get("max", 0.0) or 0.0) if train_count else 0.0
         train_avg = (train_total / train_count) if train_count else 0.0
 
-        opponent_stats = [stats for pid, stats in model_call_stats.items() if int(pid) != int(training_policy_id)]
-        opp_count = sum(int(stats.get("count", 0) or 0) for stats in opponent_stats)
-        opp_total = sum(float(stats.get("total_time", 0.0) or 0.0) for stats in opponent_stats)
-        opp_min = min(
-            (float(stats.get("min", float("inf"))) for stats in opponent_stats if int(stats.get("count", 0) or 0) > 0),
-            default=0.0,
-        )
-        opp_max = max(
-            (float(stats.get("max", 0.0)) for stats in opponent_stats if int(stats.get("count", 0) or 0) > 0),
-            default=0.0,
-        )
-        opp_avg = (opp_total / opp_count) if opp_count else 0.0
-
         writer.add_scalar("ModelCalls/TotalCount", total_model_calls, update)
         writer.add_scalar("ModelCalls/TotalAvgMs", total_model_avg * 1000.0, update)
         writer.add_scalar("ModelCalls/TotalMinMs", total_model_min * 1000.0, update)
@@ -723,10 +710,6 @@ def train_generation(
         writer.add_scalar("ModelCalls/TrainAvgMs", train_avg * 1000.0, update)
         writer.add_scalar("ModelCalls/TrainMinMs", train_min * 1000.0, update)
         writer.add_scalar("ModelCalls/TrainMaxMs", train_max * 1000.0, update)
-        writer.add_scalar("ModelCalls/OpponentCount", opp_count, update)
-        writer.add_scalar("ModelCalls/OpponentAvgMs", opp_avg * 1000.0, update)
-        writer.add_scalar("ModelCalls/OpponentMinMs", opp_min * 1000.0, update)
-        writer.add_scalar("ModelCalls/OpponentMaxMs", opp_max * 1000.0, update)
 
         # Finalize logging timings and write time scalars
         if device.type == "cuda" and FORCE_CUDA_SYNC_FOR_TIMING:
