@@ -170,7 +170,7 @@ TOTAL_PLAYERS = 12
 # ============================
 SEED = 42
 DEVICE = "cuda"
-
+FORCE_CUDA_SYNC_FOR_TIMING = True
 # ============================
 # Depreated, kept for compatiblty
 # ============================
