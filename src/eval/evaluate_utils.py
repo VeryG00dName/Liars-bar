@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -304,16 +305,15 @@ def run_batched_games(
     num_games_per_match: int,
     num_players_in_env: int,
     track_experts: bool = False,
-    seatings: Optional[List[List[int]]] = None,
-    seeds: Optional[List[int]] = None,
+    base_seed: Optional[int] = None,
 ) -> Tuple[Dict[int, Dict[str, Any]], Dict[Tuple[int, int], int], Dict[Tuple[int, int], int]]:
-    """Run a batch of games between policies using VecArena with optional fixed seatings."""
+    """Run a large batch of games between policies using ``VecArena``."""
 
     if len(matchup_policy_ids) != num_players_in_env:
         raise ValueError("Number of matchup policy ids must equal the environment player count.")
 
-    if seatings is not None and len(seatings) != num_games_per_match:
-        raise ValueError("Provided seatings must match num_games_per_match for deterministic play.")
+    if num_games_per_match <= 0:
+        raise ValueError("num_games_per_match must be positive.")
 
     policy_ids = np.asarray(matchup_policy_ids, dtype=np.int64)
     num_policies = policy_ids.size
@@ -329,47 +329,26 @@ def run_batched_games(
     h2h_wins = np.zeros((num_policies, num_policies), dtype=np.int64)
 
     arena = lb.VecArena()
-    seed_base = int(getattr(config, "SEED", 42))
-    rng_np = np.random.default_rng(seed_base)
-    max_batch = max(1, getattr(config, "EVAL_VEC_BATCH_SIZE", num_games_per_match))
+    max_batch = max(1, getattr(config, "EVAL_VEC_BATCH_SIZE", 512))
+    rng_seed = base_seed if base_seed is not None else int(np.random.randint(0, 2**31 - 1))
+    rng_np = np.random.default_rng(rng_seed)
 
-    def _chunk_generator() -> Iterable[Tuple[int, List[List[int]]]]:
-        if seatings is None:
-            games_remaining = num_games_per_match
-            while games_remaining > 0:
-                batch_size = min(games_remaining, max_batch)
-                seed = int(rng_np.integers(0, 2**31 - 1, dtype=np.int64))
-                roles: List[List[int]] = []
-                for _ in range(batch_size):
-                    seats = list(matchup_policy_ids)
-                    rng_np.shuffle(seats)
-                    roles.append(seats)
-                yield seed, roles
-                games_remaining -= batch_size
-        else:
-            assert len(seatings) == num_games_per_match
-            idx = 0
-            while idx < len(seatings):
-                if seeds is None:
-                    seed = int(rng_np.integers(0, 2**31 - 1, dtype=np.int64))
-                    batch_end = min(idx + max_batch, len(seatings))
-                else:
-                    seed = int(seeds[idx])
-                    batch_end = idx + 1
-                    while (
-                        batch_end < len(seatings)
-                        and seeds[batch_end] == seed
-                        and (batch_end - idx) < max_batch
-                    ):
-                        batch_end += 1
-                batch_roles = [list(seatings[j]) for j in range(idx, batch_end)]
-                yield seed, batch_roles
-                idx = batch_end
+    # Pre-generate the seating assignments for the full set of games.
+    roles: List[List[int]] = []
+    for _ in range(num_games_per_match):
+        seats = list(matchup_policy_ids)
+        rng_np.shuffle(seats)
+        roles.append(seats)
 
-    for seed, roles in _chunk_generator():
-        batch_size = len(roles)
-        arena.reset(batch=batch_size, players=num_players_in_env, seed=int(seed))
-        arena.set_roles(roles)
+    num_games_remaining = num_games_per_match
+    start_idx = 0
+    while num_games_remaining > 0:
+        batch_size = min(num_games_remaining, max_batch)
+        batch_roles = roles[start_idx : start_idx + batch_size]
+        seed = int(rng_np.integers(0, 2**31 - 1, dtype=np.int64))
+
+        arena.reset(batch=batch_size, players=num_players_in_env, seed=seed)
+        arena.set_roles(batch_roles)
 
         for pid in matchup_policy_ids:
             agent = policy_agents[pid]
@@ -404,7 +383,7 @@ def run_batched_games(
 
         for env_idx in range(batch_size):
             env = arena.get_env(env_idx)
-            seats = roles[env_idx]
+            seats = batch_roles[env_idx]
             seat_indices = np.fromiter(
                 (policy_index[int(pid)] for pid in seats), dtype=np.int64, count=num_players_in_env
             )
@@ -436,6 +415,9 @@ def run_batched_games(
                     (unique_indices, unique_indices),
                     -(counts.astype(np.int64) ** 2),
                 )
+
+        num_games_remaining -= batch_size
+        start_idx += batch_size
 
     if track_experts:
         for pid in matchup_policy_ids:
@@ -534,6 +516,7 @@ class RichProgressScoreboard:
         self.current = 0
         self.players = players
         self.steps_per_sec = 0.0
+        self._t0 = time.perf_counter()
 
         self.progress = Progress(
             TextColumn("[progress.description]{task.description}"),
@@ -546,8 +529,18 @@ class RichProgressScoreboard:
             total=self.total,
             steps_per_sec="0.00 steps/sec",
         )
-        self.live = Live(self._generate_layout(), console=self.console, refresh_per_second=4)
+        # Build a persistent layout so we don't recreate renderables and cause flicker
+        self.layout = Layout()
+        self.progress_layout = Layout(name="progress", size=3)
+        self.score_layout = Layout(name="scoreboard")
+        self.progress_layout.update(Panel(self.progress, title="Progress", height=3))
+        self.score_layout.update(self._generate_scoreboard_table())
+        self.layout.split_column(self.progress_layout, self.score_layout)
+
+        # Disable auto refresh; we will refresh explicitly on updates to avoid idle flicker
+        self.live = Live(self.layout, console=self.console, auto_refresh=False)
         self.live.__enter__()
+        self._last_snapshot: Optional[Tuple] = None
 
     def _generate_scoreboard_table(self, differences: Optional[Dict[int, Dict[str, Any]]] = None) -> Table:
         table = Table(title="Live Scoreboard", show_header=True, header_style="bold magenta")
@@ -605,11 +598,37 @@ class RichProgressScoreboard:
         return table
 
     def _generate_layout(self, differences: Optional[Dict[int, Dict[str, Any]]] = None) -> Layout:
-        progress_panel = Panel(self.progress, title="Progress", height=3)
-        scoreboard = self._generate_scoreboard_table(differences)
-        layout = Layout()
-        layout.split_column(Layout(progress_panel, size=3), Layout(scoreboard, ratio=1))
-        return layout
+        # Kept for backward compatibility; not used after refactor
+        return self.layout
+
+    def _scoreboard_state_key(
+        self, differences: Optional[Dict[int, Dict[str, Any]]] = None
+    ) -> Tuple:
+        ordered = sorted(
+            self.players.items(), key=lambda item: item[1].get("conservative", 0.0), reverse=True
+        )
+        diff_key: List[Tuple[int, Optional[int]]] = []
+        if differences:
+            for pid in self.players.keys():
+                entry = differences.get(pid)
+                rank_change = entry.get("rank_change") if entry else None
+                if isinstance(rank_change, (int, type(None))):
+                    diff_key.append((pid, rank_change))
+        state: List[Tuple] = []
+        for idx, (pid, data) in enumerate(ordered):
+            state.append(
+                (
+                    idx + 1,
+                    pid,
+                    data.get("player_id", str(pid)),
+                    round(float(data.get("mu", 0.0)), 6),
+                    round(float(data.get("sigma", 0.0)), 6),
+                    round(float(data.get("conservative", data.get("mu", 0.0) - 3 * data.get("sigma", 0.0))), 6),
+                    round(float(data.get("win_rate_match", 0.0)), 6),
+                    round(float(data.get("win_rate_total", 0.0)), 6),
+                )
+            )
+        return (tuple(state), tuple(sorted(diff_key)))
 
     def update(
         self,
@@ -621,13 +640,23 @@ class RichProgressScoreboard:
         if steps_per_sec is not None:
             self.steps_per_sec = steps_per_sec
         self.current += increment
+        if steps_per_sec is None:
+            # Compute a simple running average rate (steps / second)
+            dt = max(1e-6, time.perf_counter() - self._t0)
+            self.steps_per_sec = float(self.current) / dt
         self.progress.update(
             self.task_id,
             advance=increment,
             description=description or "Evaluating...",
             steps_per_sec=f"{self.steps_per_sec:.2f} steps/sec",
         )
-        self.live.update(self._generate_layout(differences))
+        # Update scoreboard only if any visible value changed
+        new_key = self._scoreboard_state_key(differences)
+        if self._last_snapshot != new_key:
+            self._last_snapshot = new_key
+            self.score_layout.update(self._generate_scoreboard_table(differences))
+        # Explicit refresh to draw current frame
+        self.live.refresh()
 
     def close(self) -> None:
         self.live.__exit__(None, None, None)
