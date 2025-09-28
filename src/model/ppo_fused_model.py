@@ -293,7 +293,7 @@ class PPOFusedModel(nn.Module):
         # --- APPLY DROPOUT HERE ---
         # Apply dropout to the activations before they are used.
         # This should only be active during training.
-        
+        # activations_reg = F.dropout(activations, p=dropout_p, training=self.training)
         if self.training and dropout_p > 0:
             # sample mask (same semantics as dropout but without 1/(1-p) scaling)
             keep = torch.rand_like(activations) > dropout_p
