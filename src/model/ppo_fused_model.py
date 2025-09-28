@@ -329,7 +329,8 @@ class PPOFusedModel(nn.Module):
             # We return the original, non-dropped-out activations for the regularization losses
             # The losses should be based on the model's "intent", not the noisy version.
             strategy_code_probe = torch.matmul(activations, bricks).detach()
-            embedding_tuple = (strategy_code_probe, activations, bricks)
+            pv_features_probe = self.pv_film(transformer_output, strategy_code_probe).detach()
+            embedding_tuple = (strategy_code_probe, activations, bricks, pv_features_probe)
             return (action_logits, opp_logits, state_values, embedding_tuple)
         else:
             return (action_logits, opp_logits, state_values)
