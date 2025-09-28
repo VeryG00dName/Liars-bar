@@ -86,6 +86,10 @@ EPS_CLIP = 0.2
 K_EPOCHS = 2
 MAX_NORM = 0.3
 ENCODER_MAX_NORM = 0.2
+# Gradient optimisation controls
+PPO_MINIBATCH_SIZE = 128
+GRAD_ACCUM_STEPS = EPISODES_PER_UPDATE//PPO_MINIBATCH_SIZE
+USE_GRADIENT_CHECKPOINTING = True
 # Coefficients
 INIT_ENTROPY_COEF = 0.005
 
@@ -142,6 +146,7 @@ STAKES_CLIP_MAX = 3.5        # clamp multiplier max
 CULL_INTERVAL = 20001
 CHECKPOINT_INTERVAL = 25
 LOG_INTERVAL = 100
+EMBED_LOG_INTERVAL = 50
 
 # ============================
 # Evaluation Configuration

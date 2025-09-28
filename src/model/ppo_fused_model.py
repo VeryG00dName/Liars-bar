@@ -1,13 +1,11 @@
 # src/model/ppo_fused_model.py
 
 from typing import Optional
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 import torch
 from torch import nn
-from typing import Optional
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 # ---- TorchScript core: no keyword-only args, no Optional, no defaults
 @torch.jit.script
@@ -158,7 +156,9 @@ class PPOFusedModel(nn.Module):
                  num_agent_types=4,
                  # --- New args for the Strategy Dictionary ---
                  num_bricks=32,
-                 brick_dim=32):
+                 brick_dim=32,
+                 *,
+                 use_gradient_checkpointing: bool = False):
         super().__init__()
         self.obs_dim = obs_dim
         self.action_dim = action_dim
@@ -166,6 +166,7 @@ class PPOFusedModel(nn.Module):
         self.max_seq_length = max_seq_length
         self.count_pad = 4
         self.tflag_pad = 3
+        self.use_gradient_checkpointing = bool(use_gradient_checkpointing)
         
         self.register_buffer(
             "causal_bool_mask_full",
@@ -250,11 +251,41 @@ class PPOFusedModel(nn.Module):
         encoded_inputs = self._encode_inputs(obs_sequence, action_sequence, agent_types, positions, padding_mask)
         T = encoded_inputs.size(1)
         causal_mask = self.causal_bool_mask_full[:T, :T]
-        transformer_output = self.transformer(
-            encoded_inputs, mask=causal_mask,
-            src_key_padding_mask=padding_mask.bool() if padding_mask is not None else None,
-            is_causal=True,
-        )
+        if causal_mask.device != encoded_inputs.device:
+            causal_mask = causal_mask.to(encoded_inputs.device)
+        key_padding = padding_mask.bool() if padding_mask is not None else None
+        transformer_module = self.transformer
+        if (
+            self.training
+            and self.use_gradient_checkpointing
+            and hasattr(transformer_module, "layers")
+        ):
+            hidden = encoded_inputs
+            layers = list(transformer_module.layers)
+            for layer in layers:
+                def layer_forward(inp, layer=layer):
+                    return layer(
+                        inp,
+                        src_mask=causal_mask,
+                        is_causal=True,
+                        src_key_padding_mask=key_padding,
+                    )
+
+                try:
+                    hidden = checkpoint(layer_forward, hidden, use_reentrant=False)
+                except TypeError:  # PyTorch < 2.0 fallback
+                    hidden = checkpoint(layer_forward, hidden)
+
+            if getattr(transformer_module, "norm", None) is not None:
+                hidden = transformer_module.norm(hidden)
+            transformer_output = hidden
+        else:
+            transformer_output = transformer_module(
+                encoded_inputs,
+                mask=causal_mask,
+                src_key_padding_mask=key_padding,
+                is_causal=True,
+            )
 
         # Get the raw activations from the dictionary
         activations, bricks = self.strategy_dictionary(transformer_output)

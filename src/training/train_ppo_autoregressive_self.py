@@ -133,6 +133,7 @@ def _create_new_agent(agent_type: str, device: torch.device) -> LearnerAutoregre
             obs_dim=9,
             num_bricks=getattr(config, "NUM_BRICKS", 32),
             brick_dim=getattr(config, "BRICK_DIM", 32),
+            use_gradient_checkpointing=bool(getattr(config, "USE_GRADIENT_CHECKPOINTING", False)),
         )
     else:  # Future branches (e.g., exploiter) can be added here.
         raise ValueError(f"Unknown agent type for creation: {agent_type}")
@@ -214,6 +215,43 @@ def _episode_token_count(episode: Dict[str, Any]) -> int:
             pass
 
     return 0
+
+
+def _prepare_episode_for_buffer(episode: Dict[str, Any]) -> Dict[str, Any]:
+    """Detach tensors to CPU memory before storing the episode in the buffer."""
+    if not isinstance(episode, dict):
+        return episode
+
+    for key in list(episode.keys()):
+        value = episode[key]
+        if torch.is_tensor(value):
+            episode[key] = value.detach().cpu()
+
+    model_input = episode.get("model_input")
+    if isinstance(model_input, dict):
+        for key, value in list(model_input.items()):
+            if torch.is_tensor(value):
+                model_input[key] = value.detach().cpu()
+
+    return episode
+
+
+def _slice_collated_batch(batch: Dict[str, Any], start: int, end: int) -> Dict[str, Any]:
+    """Create a view over a collated batch for ``[start:end]`` episodes."""
+
+    def _slice_value(value: Any) -> Any:
+        if torch.is_tensor(value):
+            if value.dim() == 0 or value.size(0) == 0:
+                return value
+            length = max(end - start, 0)
+            if length <= 0:
+                return value.narrow(0, 0, 0)
+            return value.narrow(0, start, length).contiguous()
+        if isinstance(value, dict):
+            return {k: _slice_value(v) for k, v in value.items()}
+        return value
+
+    return {k: _slice_value(v) for k, v in batch.items()}
 
 
 def _find_traced_artifact_for_checkpoint(checkpoint_path: str) -> Optional[Path]:
@@ -476,6 +514,7 @@ def train_generation(
 
         rollout_tokens = 0
         for ep in new_eps:
+            _prepare_episode_for_buffer(ep)
             tokens = _episode_token_count(ep)
             ep["_token_count"] = tokens
             rollout_tokens += tokens
@@ -505,83 +544,122 @@ def train_generation(
         avg_brick_usage_chunks: List[np.ndarray] = []
         for _ in range(k_epochs):
             batch_eps = random.sample(ep_buffer, min(len(ep_buffer), episodes_per_update))
-            if not batch_eps: continue
-            
+            if not batch_eps:
+                continue
+
             batch_cpu = _collate_batch(batch_eps)
             valid_lengths_cpu = batch_cpu.get("mi", {}).get("valid_lengths")
             if isinstance(valid_lengths_cpu, torch.Tensor):
                 opt_tokens_processed += int(valid_lengths_cpu.sum().item())
-            batch_gpu = _to_device_batch(batch_cpu, device)
-            
-            optimizer.zero_grad()
-            with amp.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == "cuda")):
-                total_loss, metrics = ppo_losses_batched(learner.model, batch_gpu, sl_teacher=None)
-            scaler.scale(total_loss).backward()
-            scaler.unscale_(optimizer)
-            # Clip the core model separately so belief-head spikes cannot shrink its update.
-            if main_params:
-                clip_grad_norm_(main_params, max_norm=float(config.MAX_NORM))
-            if activation_encoder_params:
-                clip_grad_norm_(activation_encoder_params, max_norm=encoder_max_norm)
-            scaler.step(optimizer)
-            scaler.update()
-            # Aggregate metrics
-            agg["total_loss"] += float(total_loss.detach().cpu())
-            for k, v in metrics.items():
-                try:
-                    agg[k] = agg.get(k, 0.0) + float(v.detach().cpu())
-                except Exception:
-                    pass
 
-            n_batches += 1
-            # --- ADD: collect per-opponent embeddings from this batch, if present ---
-            X_flat = metrics.get("opp_embeds_flat", None)
-            L_flat = metrics.get("opp_labels_flat", None)
-            L_orig = metrics.get("opp_labels_flat_original", None)
-            if X_flat is not None and (L_flat is not None or L_orig is not None):
-                Xb = np.asarray(X_flat, dtype=np.float32)
-                if Xb.ndim == 1:
-                    if Xb.size == 0:
-                        continue
-                    Xb = Xb.reshape(1, -1)
-                if Xb.size > 0:
-                    opp_rows_X.append(Xb)
-                    labels_src = L_orig if L_orig is not None else L_flat
-                    labels_list = np.asarray(labels_src).tolist()
-                    if not isinstance(labels_list, (list, tuple)):
-                        labels_list = [labels_list]
-                    seq_labels = [int(l) for l in labels_list]
-                    opp_rows_L.extend(seq_labels)
-            else:
-                emb = metrics.get("opp_embeds_batch", None)
-                if emb is not None:
-                    E_np, L_np, C_np = emb
-                    B, seats, D = E_np.shape
-                    Xb = E_np.reshape(B * seats, D)
-                    counts = C_np.reshape(B * seats)
-                    good = (~np.isnan(Xb).any(axis=1)) & (counts > 0)
-                    if not np.any(good):
-                        continue
-                    Xb = Xb[good]
-                    if L_np is not None:
-                        Lb = L_np.reshape(B * seats)[good].tolist()
-                    else:
-                        Lb = [None] * int(good.sum())
-                    opp_rows_X.append(Xb)
-                    opp_rows_L.extend(Lb)
+            minibatch_target = int(getattr(config, "PPO_MINIBATCH_SIZE", len(batch_eps)))
+            minibatch_size = max(1, min(minibatch_target, len(batch_eps)))
+            num_minibatches = (len(batch_eps) + minibatch_size - 1) // minibatch_size
+            if num_minibatches <= 0:
+                continue
 
-            tok_codes = metrics.get("opp_strategy_codes_tokens")
-            if tok_codes is not None:
-                arr = np.asarray(tok_codes, dtype=np.float32)
-                if arr.ndim == 2 and arr.size > 0:
-                    opp_token_codes.append(arr)
-                    top_idx = metrics.get("opp_activation_top_idx")
-                    if top_idx is not None:
-                        opp_token_top_idx.append(np.asarray(top_idx).reshape(-1))
+            grad_accum_steps = max(1, int(getattr(config, "GRAD_ACCUM_STEPS", 1)))
+            optimizer.zero_grad(set_to_none=True)
+            group_target = min(grad_accum_steps, num_minibatches)
+            group_count = 0
+            processed_minibatches = 0
 
-            avg_usage = metrics.get("avg_brick_usage_np")
-            if avg_usage is not None:
-                avg_brick_usage_chunks.append(np.asarray(avg_usage, dtype=np.float32))
+            for start in range(0, len(batch_eps), minibatch_size):
+                end = min(start + minibatch_size, len(batch_eps))
+                mini_cpu = _slice_collated_batch(batch_cpu, start, end)
+                mini_gpu = _to_device_batch(mini_cpu, device)
+
+                with amp.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == "cuda")):
+                    total_loss, metrics = ppo_losses_batched(
+                        learner.model,
+                        mini_gpu,
+                        sl_teacher=None,
+                        update_num=update,
+                    )
+
+                loss_denom = max(group_target, 1)
+                scaler.scale(total_loss / loss_denom).backward()
+
+                processed_minibatches += 1
+                group_count += 1
+
+                agg["total_loss"] += float(total_loss.detach().cpu())
+                for k, v in metrics.items():
+                    try:
+                        agg[k] = agg.get(k, 0.0) + float(v.detach().cpu())
+                    except Exception:
+                        pass
+
+                n_batches += 1
+
+                X_flat = metrics.get("opp_embeds_flat", None)
+                L_flat = metrics.get("opp_labels_flat", None)
+                L_orig = metrics.get("opp_labels_flat_original", None)
+                if X_flat is not None and (L_flat is not None or L_orig is not None):
+                    Xb = np.asarray(X_flat, dtype=np.float32)
+                    if Xb.ndim == 1:
+                        if Xb.size == 0:
+                            Xb = None
+                        else:
+                            Xb = Xb.reshape(1, -1)
+                    if Xb is not None and Xb.size > 0:
+                        opp_rows_X.append(Xb)
+                        labels_src = L_orig if L_orig is not None else L_flat
+                        labels_list = np.asarray(labels_src).tolist()
+                        if not isinstance(labels_list, (list, tuple)):
+                            labels_list = [labels_list]
+                        seq_labels = [int(l) for l in labels_list]
+                        opp_rows_L.extend(seq_labels)
+                else:
+                    emb = metrics.get("opp_embeds_batch", None)
+                    if emb is not None:
+                        E_np, L_np, C_np = emb
+                        B, seats, D = E_np.shape
+                        Xb = E_np.reshape(B * seats, D)
+                        counts = C_np.reshape(B * seats)
+                        good = (~np.isnan(Xb).any(axis=1)) & (counts > 0)
+                        if np.any(good):
+                            Xb = Xb[good]
+                            if L_np is not None:
+                                Lb = L_np.reshape(B * seats)[good].tolist()
+                            else:
+                                Lb = [None] * int(good.sum())
+                            opp_rows_X.append(Xb)
+                            opp_rows_L.extend(Lb)
+
+                tok_codes = metrics.get("opp_strategy_codes_tokens")
+                if tok_codes is not None:
+                    arr = np.asarray(tok_codes, dtype=np.float32)
+                    if arr.ndim == 2 and arr.size > 0:
+                        opp_token_codes.append(arr)
+                        top_idx = metrics.get("opp_activation_top_idx")
+                        if top_idx is not None:
+                            opp_token_top_idx.append(np.asarray(top_idx).reshape(-1))
+
+                avg_usage = metrics.get("avg_brick_usage_np")
+                if avg_usage is not None:
+                    avg_brick_usage_chunks.append(np.asarray(avg_usage, dtype=np.float32))
+
+                should_step = (
+                    group_count >= group_target
+                    or processed_minibatches == num_minibatches
+                )
+                if should_step:
+                    scaler.unscale_(optimizer)
+                    if main_params:
+                        clip_grad_norm_(main_params, max_norm=float(config.MAX_NORM))
+                    if activation_encoder_params:
+                        clip_grad_norm_(activation_encoder_params, max_norm=encoder_max_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+                    remaining = num_minibatches - processed_minibatches
+                    group_target = min(grad_accum_steps, remaining) if remaining > 0 else grad_accum_steps
+                    group_count = 0
+
+                del mini_gpu, mini_cpu
+
+            del batch_cpu
         if device.type == "cuda" and FORCE_CUDA_SYNC_FOR_TIMING:
             torch.cuda.synchronize()
         t_opt_end = time.time()

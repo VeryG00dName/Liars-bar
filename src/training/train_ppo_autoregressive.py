@@ -176,7 +176,8 @@ def train(
                 total_loss, metrics = ppo_losses_batched(
                     model,
                     batch_gpu,
-                    sl_teacher=sl_teacher
+                    sl_teacher=sl_teacher,
+                    update_num=update,
                 )
             flat_before = torch.cat([p.detach().float().flatten() for p in model.parameters() if p.requires_grad])[:10000].clone()
             scaler.scale(total_loss).backward()

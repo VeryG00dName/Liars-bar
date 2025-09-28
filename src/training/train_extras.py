@@ -1009,6 +1009,8 @@ def _dictionary_regularizers(
     embedding_tuple: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     mi: Dict[str, torch.Tensor],
     batch: Dict[str, torch.Tensor],
+    *,
+    update_num: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[np.ndarray], Dict[str, Any]]:
     sample_tensor = None
     for v in mi.values():
@@ -1026,6 +1028,7 @@ def _dictionary_regularizers(
     metrics_extra: Dict[str, Any] = {}
     selected_token_mask: Optional[torch.Tensor] = None
     opp_mask_for_tokens: Optional[torch.Tensor] = None
+    should_log_embeddings = (update_num % int(getattr(config, "EMBED_LOG_INTERVAL", 50)) == 0)
 
     if not (isinstance(embedding_tuple, tuple) and len(embedding_tuple) == 3):
         return l1_sparsity_loss, usage_balance_loss, brick_diversity_loss, decor_penalty, avg_brick_usage_np, metrics_extra
@@ -1066,6 +1069,16 @@ def _dictionary_regularizers(
         decor_penalty = _brick_decorrelation_penalty(bricks, bricks.device)
     else:
         decor_penalty = torch.zeros((), device=device)
+
+    if not should_log_embeddings:
+        return (
+            l1_sparsity_loss,
+            usage_balance_loss,
+            brick_diversity_loss,
+            decor_penalty,
+            avg_brick_usage_np,
+            metrics_extra,
+        )
 
     if strategy_code is not None:
         agent_types = mi.get("agent_types")
@@ -1398,6 +1411,8 @@ def ppo_losses_batched(
     model: torch.nn.Module,
     batch: Dict[str, torch.Tensor],
     sl_teacher: Optional[torch.nn.Module] = None,
+    *,
+    update_num: int = 0,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
     Batched PPO objective with compositional pressure support.
@@ -1443,7 +1458,7 @@ def ppo_losses_batched(
         decor_penalty,
         avg_brick_usage_np,
         embed_metrics,
-    ) = _dictionary_regularizers(embedding_tuple, mi, batch)
+    ) = _dictionary_regularizers(embedding_tuple, mi, batch, update_num=update_num)
 
     metrics: Dict[str, Any] = dict(train_metrics)
     metrics.update(embed_metrics)
