@@ -41,7 +41,7 @@ SEED = int(getattr(config, "SEED", 42))
 set_seed(SEED)
 
 MIN_GAMES_PER_MATCH = 80
-MAX_GAMES_PER_MATCH = 180
+MAX_GAMES_PER_MATCH = 100
 
 
 @dataclass
@@ -51,7 +51,7 @@ class MatchStoppingConfig:
 
 @dataclass
 class SchedulerConfig:
-    quartets_per_batch: int = 4
+    quartets_per_batch: int = 8
     candidate_pool_size: int = 12
     candidate_samples: int = 64
 
@@ -70,6 +70,8 @@ class LeagueStoppingConfig:
     avg_sigma_top_k: Optional[int] = None
     # Require this many consecutive batches below threshold.
     avg_sigma_consecutive: int = 1
+    # If True and avg-σ criterion is met, stop immediately (ignore other criteria)
+    avg_sigma_sufficient: bool = False
 
 
 @dataclass
@@ -294,6 +296,10 @@ def evaluate_league_stopping(
         satisfied = satisfied and statuses.get("global_convergence", False)
     if config.avg_sigma_threshold is not None:
         satisfied = satisfied and statuses.get("avg_sigma_below", False)
+    # Allow avg-σ alone to be sufficient, if requested
+    if config.avg_sigma_threshold is not None and config.avg_sigma_sufficient:
+        if statuses.get("avg_sigma_below", False):
+            satisfied = True
     return satisfied, statuses
 
 
@@ -366,6 +372,14 @@ def run_active_league(
         if count > 0:
             wins = pairwise_wins.get(pair, 0)
             h2h_rates[pair] = wins / count
+    # Coverage summary for diagnostics
+    try:
+        n_players = len(players)
+        possible_pairs = max(1, n_players * (n_players - 1))
+        coverage = (len(h2h_rates) / possible_pairs) * 100.0
+        print(f"[INFO] H2H coverage: {len(h2h_rates)}/{possible_pairs} pairs ({coverage:.1f}%) with at least one game.")
+    except Exception:
+        pass
     try:
         plot_agent_heatmap(h2h_rates, players, title="Head-to-Head Win Rates (round-level)")
     except Exception as exc:
@@ -410,17 +424,44 @@ def main() -> None:
         action="store_true",
         help="Collect MoE expert activation summaries when supported by agents.",
     )
+    parser.add_argument(
+        "--save-final-csv",
+        type=str,
+        default="final_scoreboard.csv",
+        help="Path to write the final scoreboard CSV (set empty to skip).",
+    )
+    # Conservative rank stability and global convergence controls
+    parser.add_argument(
+        "--conservative-stability-k",
+        type=int,
+        default=5,
+        help="Batches the conservative order must remain unchanged before stopping.",
+    )
+    group_global = parser.add_mutually_exclusive_group()
+    group_global.add_argument(
+        "--enable-global-stop",
+        dest="enable_global_stop",
+        action="store_true",
+        help="Require global μ/σ convergence to stop (default).",
+    )
+    group_global.add_argument(
+        "--disable-global-stop",
+        dest="enable_global_stop",
+        action="store_false",
+        help="Do not require global μ/σ convergence to stop.",
+    )
+    parser.set_defaults(enable_global_stop=True)
     # Optional absolute-σ stopping controls
     parser.add_argument(
         "--stop-avg-sigma",
         type=float,
-        default=None,
+        default=2,
         help="Stop when average σ (over all or top-k) is at or below this value.",
     )
     parser.add_argument(
         "--stop-avg-sigma-top-k",
         type=int,
-        default=2,
+        default=None,
         help="When using --stop-avg-sigma, compute the average over the top-k by conservative score.",
     )
     parser.add_argument(
@@ -428,6 +469,11 @@ def main() -> None:
         type=int,
         default=1,
         help="Require this many consecutive batches below the average-σ threshold.",
+    )
+    parser.add_argument(
+        "--stop-avg-sigma-alone",
+        action="store_true",
+        help="If set, avg-σ condition alone is sufficient to stop (ignores conservative/global).",
     )
     args = parser.parse_args()
 
@@ -448,9 +494,12 @@ def main() -> None:
     scheduler = SchedulerConfig(quartets_per_batch=args.quartets_per_batch)
     stopping = MatchStoppingConfig(games_per_match=args.games_per_quartet)
     league_stop = LeagueStoppingConfig(
+        conservative_stability_k=args.conservative_stability_k,
+        enable_global=bool(args.enable_global_stop),
         avg_sigma_threshold=args.stop_avg_sigma,
         avg_sigma_top_k=args.stop_avg_sigma_top_k,
         avg_sigma_consecutive=args.stop_avg_sigma_consecutive,
+        avg_sigma_sufficient=args.stop_avg_sigma_alone,
     )
 
     expert_data, baseline_scoreboard = run_active_league(
@@ -464,7 +513,8 @@ def main() -> None:
     )
 
     final_differences = compare_scoreboards(baseline_scoreboard, players)
-    rich_print_scoreboard(players, final_differences)
+    save_csv_path = args.save_final_csv if args.save_final_csv else None
+    rich_print_scoreboard(players, final_differences, save_csv=save_csv_path)
     rich_print_expert_activations(expert_data)
 
 

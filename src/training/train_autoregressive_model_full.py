@@ -22,7 +22,7 @@ from torch.utils.data import Dataset, DataLoader, Sampler
 from tqdm import tqdm
 from typing import List
 from torch.utils.tensorboard import SummaryWriter
-from src.model.ppo_fused_model import PPOFusedModel
+from src.model.ppo_reactive_model import PPOReactiveModel
 from src import config
 from src.training.train_extras import set_seed
 
@@ -776,7 +776,7 @@ def train_autoregressive_model(
     logger.info(f"Model dimensions: obs_dim={obs_dim}, action_dim={action_dim}")
 
     # Main autoregressive model that outputs embeddings
-    model = PPOFusedModel(
+    model = PPOReactiveModel(
         obs_dim=obs_dim,
         action_dim=action_dim,
         hidden_dim=hidden_dim,
@@ -785,8 +785,6 @@ def train_autoregressive_model(
         dropout_rate=0.1,
         max_seq_length=max_seq_length,
         num_agent_types=4,
-        num_bricks=getattr(config, "NUM_BRICKS", 32),
-        brick_dim=getattr(config, "BRICK_DIM", 32),
     ).to(device)
 
     pt_dtype = torch.float16 if device.type == 'cuda' else torch.bfloat16
@@ -836,12 +834,8 @@ def train_autoregressive_model(
                     positions=batch['position'],
                     action_masks=batch['action_mask'],
                     padding_mask=batch['padding_mask'],
-                    return_embeddings=True,
-                    dropout_p=float(getattr(config, "DROPOUT_P", 0.25)),
                 )
-                self_logits, opp_logits, value_pred = outs[:3]
-                embedding_tuple = outs[3] if len(outs) > 3 else (None, None, None)
-                strategy_code, activations, bricks = embedding_tuple
+                self_logits, opp_logits, value_pred = outs
 
                 (
                     total_loss,
@@ -859,8 +853,6 @@ def train_autoregressive_model(
                     padding_mask=batch['padding_mask'],
                     value_pred=value_pred,
                     value_target=None,
-                    activations=activations,
-                    bricks=bricks,
                 )
 
             optimizer.zero_grad()
