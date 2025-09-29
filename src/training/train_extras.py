@@ -4,7 +4,7 @@ import random
 from collections import Counter
 from contextlib import contextmanager
 from io import BytesIO
-from typing import Dict, Any, List, Optional, Tuple, Iterable, Union, Hashable, Callable
+from typing import Dict, Any, List, Optional, Tuple, Iterable, Union, Hashable, Callable, Set
 import math
 import numpy as np
 import torch
@@ -46,6 +46,10 @@ _COLLATE_EXPECTED_MI_KEYS: Tuple[str, ...] = (
     "obs_sequence",
     "positions",
 )
+
+
+def _use_heldout_agents() -> bool:
+    return bool(getattr(config, "USE_HELDOUT_AGENT", True))
 
 
 def _remap_embed_labels(labels: List[Any]) -> List[int]:
@@ -1426,7 +1430,10 @@ def ppo_losses_batched(
     penalties_used = batch["penalties_used"].long()
     our_action_mask = batch.get("our_action_mask")
     heldout_episode_mask = batch.get("heldout_episode_mask")
-    if heldout_episode_mask is None:
+    use_heldout = _use_heldout_agents()
+    if not use_heldout:
+        heldout_episode_mask = torch.zeros(our_idx.size(0), dtype=torch.bool, device=our_idx.device)
+    elif heldout_episode_mask is None:
         heldout_episode_mask = torch.zeros(our_idx.size(0), dtype=torch.bool, device=our_idx.device)
 
     dropout_p = getattr(config, "DROPOUT_P", 0.25)
@@ -1709,35 +1716,39 @@ def _collate_batch(
                 pass
         return None
 
-    # --- REVISED: Efficient Held-out Label Selection (Single Pass) ---
-    heldout_label = None
-    episode_opponent_labels_sets = []
+    use_heldout = _use_heldout_agents()
+    if use_heldout:
+        # --- REVISED: Efficient Held-out Label Selection (Single Pass) ---
+        heldout_label = None
+        episode_opponent_labels_sets: List[Set[int]] = []
 
-    # First pass: find the max opponent label across the batch AND cache each episode's opponents
-    for ep in episodes:
-        training_seat = int(ep.get("training_agent_seat", -1))
-        # Prefer true_opponent_labels if available, else derive from player_labels
-        opp_labels_source = ep.get("true_opponent_labels", ep.get("player_labels", ()))
-        
-        current_ep_opp_labels = set()
-        for i, lab in enumerate(opp_labels_source):
-            # If using player_labels, skip the training agent
-            if "true_opponent_labels" not in ep and i == training_seat:
-                continue
-            lab_i = _label_to_int(lab)
-            if lab_i is not None and lab_i != ep.get("training_agent_label") and lab_i > BOT_MAX_ID:
-                current_ep_opp_labels.add(lab_i)
-        
-        episode_opponent_labels_sets.append(current_ep_opp_labels)
-        
-        if current_ep_opp_labels:
-            ep_max_label = max(current_ep_opp_labels)
-            if heldout_label is None or ep_max_label > heldout_label:
-                heldout_label = ep_max_label
+        # First pass: find the max opponent label across the batch AND cache each episode's opponents
+        for ep in episodes:
+            training_seat = int(ep.get("training_agent_seat", -1))
+            # Prefer true_opponent_labels if available, else derive from player_labels
+            opp_labels_source = ep.get("true_opponent_labels", ep.get("player_labels", ()))
 
-    # Second pass (fast): build the boolean mask based on the determined heldout_label
-    if heldout_label is not None:
-        heldout_flags = [heldout_label in opp_set for opp_set in episode_opponent_labels_sets]
+            current_ep_opp_labels = set()
+            for i, lab in enumerate(opp_labels_source):
+                # If using player_labels, skip the training agent
+                if "true_opponent_labels" not in ep and i == training_seat:
+                    continue
+                lab_i = _label_to_int(lab)
+                if lab_i is not None and lab_i != ep.get("training_agent_label") and lab_i > BOT_MAX_ID:
+                    current_ep_opp_labels.add(lab_i)
+
+            episode_opponent_labels_sets.append(current_ep_opp_labels)
+
+            if current_ep_opp_labels:
+                ep_max_label = max(current_ep_opp_labels)
+                if heldout_label is None or ep_max_label > heldout_label:
+                    heldout_label = ep_max_label
+
+        # Second pass (fast): build the boolean mask based on the determined heldout_label
+        if heldout_label is not None:
+            heldout_flags = [heldout_label in opp_set for opp_set in episode_opponent_labels_sets]
+        else:
+            heldout_flags = [False] * len(episodes)
     else:
         heldout_flags = [False] * len(episodes)
     

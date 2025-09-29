@@ -75,6 +75,8 @@ DROPOUT_P = 0.15
 # (effective_weight = heldout_token_frac * DCP_LOSS_WEIGHT).
 DCP_LOSS_WEIGHT = 1.20
 BRICK_DECORRELATION_WEIGHT = 1e-3
+# Toggle for treating the newest historical opponent as held-out during training/eval
+USE_HELDOUT_AGENT = True
 # ============================
 # PPO / Training Hyperparameters
 # ============================

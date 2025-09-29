@@ -53,6 +53,7 @@ set_seed(SEED)
 _GLOBAL_RNG = np.random.default_rng(SEED)
 
 FORCE_CUDA_SYNC_FOR_TIMING = bool(getattr(config, "FORCE_CUDA_SYNC_FOR_TIMING", False))
+USE_HELDOUT_AGENT = bool(getattr(config, "USE_HELDOUT_AGENT", True))
 
 
 # ==============================================================================
@@ -776,8 +777,6 @@ def train_generation(
                 writer.add_scalar(f"PerOpponent/win_rate_vs_{label}", wins_vs / total, update)
                 writer.add_scalar(f"PerOpponent/episodes_vs_{label}", total, update)
 
-        # Efficient held-out metric using aggregated per-opponent totals
-        # Choose held-out as the largest non-bot label (>6) among opponents seen this update
         BOT_MAX_ID = 6
         per_opponent_totals_int: Dict[int, List[float]] = {}
         for lab_any, (wins_vs, total) in per_opponent_totals.items():
@@ -788,6 +787,7 @@ def train_generation(
             acc = per_opponent_totals_int.setdefault(lab_int, [0.0, 0.0])
             acc[0] += float(wins_vs)
             acc[1] += float(total)
+        
         heldout_candidates = [lab for lab in per_opponent_totals_int.keys() if lab > BOT_MAX_ID]
         if heldout_candidates:
             heldout_label = max(heldout_candidates)
