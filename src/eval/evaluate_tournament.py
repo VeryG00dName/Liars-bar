@@ -13,14 +13,14 @@ import torch
 import warnings
 
 os.environ.pop("TORCH_LOGS", None)
-
+os.environ.setdefault("TORCHDYNAMO_VERBOSE", "0")
+os.environ.setdefault("TORCH_COMPILE_DEBUG", "0")
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+# Deterministic cuBLAS workspace requirement for CUDA
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
 warnings.filterwarnings("ignore", message=".*symbolic_shapes.*")
-warnings.filterwarnings(
-    "ignore",
-    message=".*does not have a deterministic implementation.*",
-    category=UserWarning,
-)
-
+warnings.filterwarnings("ignore", message=".*CuBLAS.*not deterministic.*")
+from src.misc import lb
 from src import config
 from src.eval.evaluate_utils import (
     RATING_BACKEND,
@@ -51,7 +51,7 @@ class MatchStoppingConfig:
 
 @dataclass
 class SchedulerConfig:
-    batch_size: int = 1024
+    batch_size: int = 384
     pair_coverage_target: int = 64
     degree_cap_margin: int = 2
     max_candidate_quartets: int = 4096
@@ -59,11 +59,11 @@ class SchedulerConfig:
 
 @dataclass
 class LeagueStoppingConfig:
-    conservative_stability_k: int = 5
+    conservative_stability_k: int = 3
     enable_global: bool = True
-    global_mu_threshold: float = 0.01
-    global_sigma_threshold: float = 0.01
-    global_consecutive: int = 3
+    global_mu_threshold: float = 0.02
+    global_sigma_threshold: float = 0.02
+    global_consecutive: int = 2
     # Optional absolute-σ stopping: stop when average σ is small enough
     # If None, this criterion is disabled.
     avg_sigma_threshold: Optional[float] = None
@@ -73,6 +73,8 @@ class LeagueStoppingConfig:
     avg_sigma_consecutive: int = 1
     # If True and avg-σ criterion is met, stop immediately (ignore other criteria)
     avg_sigma_sufficient: bool = False
+    # Cap refinement once coverage is complete; 0 disables the cap.
+    max_post_coverage_batches: int = 6
 
 
 @dataclass
@@ -115,7 +117,7 @@ def parse_cpp_labels(arg: str) -> List[int]:
 
 
 def run_adaptive_quartet(
-    all_policies: Dict[int, Any],
+    eval_manager: "lb.EvalManager",
     quartet: Sequence[int],
     stopping: MatchStoppingConfig,
     seed: int,
@@ -123,7 +125,7 @@ def run_adaptive_quartet(
 ) -> Tuple[Dict[int, Dict[str, Any]], Dict[Tuple[int, int], int], Dict[Tuple[int, int], int], int]:
     games_to_play = max(stopping.games_per_match, MIN_GAMES_PER_MATCH)
     results_list, total_counts, total_wins, total_games = run_batched_lineups(
-        all_policies,
+        eval_manager,
         [list(quartet)],
         num_games_per_match=games_to_play,
         num_players_in_env=len(quartet),
@@ -397,7 +399,7 @@ def evaluate_league_stopping(
 
 
 def run_active_league(
-    all_policies: Dict[int, Any],
+    eval_manager: "lb.EvalManager",
     players: Dict[int, Dict[str, Any]],
     scheduler: SchedulerConfig,
     stopping: MatchStoppingConfig,
@@ -427,6 +429,7 @@ def run_active_league(
     batch_idx = 0
     league_finished = False
     coverage_complete = False
+    refinement_batches = 0
 
     while not league_finished and batch_idx < max_batches:
         quartets, updated_usage = schedule_quartets(
@@ -443,7 +446,7 @@ def run_active_league(
         player_usage = updated_usage
         batch_seed = int(rng.integers(0, 2**31 - 1, dtype=np.int64))
         results_list, h2h_counts, h2h_wins, _ = run_batched_lineups(
-            all_policies,
+            eval_manager,
             [list(q) for q in quartets],
             num_games_per_match=stopping.games_per_match,
             num_players_in_env=len(quartets[0]) if quartets else config.NUM_PLAYERS,
@@ -490,19 +493,34 @@ def run_active_league(
                 description=f"Batch {batch_idx + 1} quartet {quartet}",
             )
 
+        just_completed_coverage = False
         if not coverage_complete:
             coverage_complete = all(
                 pair_stats.get(pair, PairStatistics()).games >= scheduler.pair_coverage_target
                 for pair in all_pairs
             )
             if coverage_complete:
+                just_completed_coverage = True
+                refinement_batches = 0
                 print(
                     f"[INFO] Coverage phase complete: every pair reached "
                     f"{scheduler.pair_coverage_target} games. Switching to refinement."
                 )
+        else:
+            refinement_batches += 1
 
         batch_idx += 1
         league_finished, _ = evaluate_league_stopping(players, tracker, league_stop)
+        if coverage_complete and not just_completed_coverage:
+            if (
+                league_stop.max_post_coverage_batches > 0
+                and refinement_batches >= league_stop.max_post_coverage_batches
+            ):
+                if not league_finished:
+                    print(
+                        f"[INFO] Refinement cap reached: {refinement_batches} batches after coverage. Stopping early."
+                    )
+                league_finished = True
 
     progress_ui.close()
     save_scoreboard(scoreboard_file, players)
@@ -550,7 +568,7 @@ def main() -> None:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=1024,
+        default=384,
         help="Target number of games to schedule per batch (used to derive quartets per batch).",
     )
     parser.add_argument(
@@ -565,8 +583,14 @@ def main() -> None:
     parser.add_argument(
         "--max-batches",
         type=int,
-        default=200,
+        default=60,
         help="Safety cap on the number of scheduling batches to run.",
+    )
+    parser.add_argument(
+        "--post-coverage-batches",
+        type=int,
+        default=6,
+        help="Maximum refinement batches to run once coverage is complete (0 disables).",
     )
     parser.add_argument(
         "--track-experts",
@@ -583,7 +607,7 @@ def main() -> None:
     parser.add_argument(
         "--conservative-stability-k",
         type=int,
-        default=5,
+        default=3,
         help="Batches the conservative order must remain unchanged before stopping.",
     )
     group_global = parser.add_mutually_exclusive_group()
@@ -651,7 +675,7 @@ def main() -> None:
     else:
         cpp_bot_labels = parse_cpp_labels(args.cpp_bots)
 
-    all_policies, players = load_evaluation_policies(run_specs, cpp_bot_labels, device)
+    eval_manager, players = load_evaluation_policies(run_specs, cpp_bot_labels, device)
     num_players = config.NUM_PLAYERS
     if len(players) < num_players:
         raise ValueError(
@@ -678,10 +702,11 @@ def main() -> None:
         avg_sigma_top_k=args.stop_avg_sigma_top_k,
         avg_sigma_consecutive=args.stop_avg_sigma_consecutive,
         avg_sigma_sufficient=args.stop_avg_sigma_alone,
+        max_post_coverage_batches=max(0, args.post_coverage_batches),
     )
 
     expert_data, baseline_scoreboard = run_active_league(
-        all_policies,
+        eval_manager,
         players,
         scheduler=scheduler,
         stopping=stopping,

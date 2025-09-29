@@ -21,9 +21,6 @@ from rich.progress import BarColumn, Progress, TextColumn
 from rich.table import Table
 
 from src import config
-from src.agents.base_agent import BaseAgent
-from src.agents.batch_autoregressive_ppo_agent import BatchPPOAutoregressiveAgent
-from src.agents.cpp_bot_wrapper import CppBotWrapper
 from src.misc import lb
 
 from scipy import stats
@@ -221,12 +218,18 @@ def load_evaluation_policies(
     run_specs: Dict[str, List[str]],
     cpp_bot_labels: List[int],
     device: torch.device,
-) -> Tuple[Dict[int, BaseAgent], Dict[int, Dict[str, Any]]]:
-    """Load PPO agents and C++ bots for evaluation."""
+) -> Tuple["lb.EvalManager", Dict[int, Dict[str, Any]]]:
+    """Load TorchScript policies and register C++ bots with the evaluation manager."""
 
-    all_policies: Dict[int, BaseAgent] = {}
+    eval_manager = lb.EvalManager()
     metadata: Dict[int, Dict[str, Any]] = {}
     next_neural_policy_id = int(getattr(config, "CPP_BOT_MAX_LABEL", 6)) + 1
+
+    max_env_batch = int(getattr(config, "EVAL_VEC_BATCH_SIZE", 512))
+    eval_manager.set_max_env_batch(max(1, max_env_batch))
+
+    inference_batch = int(getattr(config, "EVAL_INFERENCE_BATCH_SIZE", max_env_batch))
+    eval_manager.set_inference_batch_size(max(1, inference_batch))
 
     def _discover_generations(run_name: str) -> List[str]:
         run_dir = Path(config.CHECKPOINT_DIR) / run_name
@@ -249,17 +252,9 @@ def load_evaluation_policies(
         name = CPP_BOT_LABEL_TO_NAME.get(cpp_label)
         if name is None:
             raise ValueError(f"Unknown C++ bot label: {cpp_label}")
-        if not hasattr(lb, name):
-            raise RuntimeError(f"lb module missing C++ bot class '{name}'")
-        bot_cls = getattr(lb, name)
-        player_id = f"cpp_bot_{cpp_label}_{name}"
-        wrapper = CppBotWrapper(bot_cls, label=cpp_label, device=device, player_id=player_id)
-
         policy_id = int(cpp_label)
-        if policy_id in all_policies:
-            raise ValueError(f"Duplicate policy_id {policy_id} when adding C++ bot label {cpp_label}.")
-
-        all_policies[policy_id] = wrapper
+        eval_manager.register_cpp_bot(policy_id, name)
+        player_id = f"cpp_bot_{cpp_label}_{name}"
         metadata[policy_id] = _initial_metadata(policy_id, player_id, cpp_label, is_cpp_bot=True)
 
     for run_name, gen_specs in run_specs.items():
@@ -282,25 +277,35 @@ def load_evaluation_policies(
 
             checkpoint, agent_key, meta = _load_checkpoint(checkpoint_path, device)
             player_id = f"{run_name}_gen_{gen_spec}"
-            agent = BatchPPOAutoregressiveAgent(device, player_id=player_id)
-            agent.load_models_from_checkpoint(checkpoint, agent_key)
-            agent.model.eval()
-            if getattr(agent, "label", None) in (None, -1):
-                agent.label = int(meta.get("label", 0))
+            label = int(meta.get("label", 0))
+
+            traced_candidates = [
+                base_dir / "final_traced.pt",
+                base_dir / "compiled_final_traced.pt",
+                base_dir / "final_traced.ts",
+                base_dir / "compiled_final_traced.ts",
+            ]
+            traced_path = next((p for p in traced_candidates if p.exists()), None)
+            if traced_path is None:
+                print(
+                    f"[WARN] No TorchScript trace found for {run_name} gen {gen_spec} in {base_dir}, skipping..."
+                )
+                continue
 
             policy_id = next_neural_policy_id
             next_neural_policy_id += 1
 
-            all_policies[policy_id] = agent
-            entry = _initial_metadata(policy_id, player_id, agent.label, is_cpp_bot=False)
+            eval_manager.load_model(policy_id, str(traced_path))
+            entry = _initial_metadata(policy_id, player_id, label, is_cpp_bot=False)
             entry["checkpoint_path"] = str(checkpoint_path)
+            entry["traced_path"] = str(traced_path)
             metadata[policy_id] = entry
 
-    return all_policies, metadata
+    return eval_manager, metadata
 
 
 def run_batched_lineups(
-    all_policies: Dict[int, BaseAgent],
+    eval_manager: "lb.EvalManager",
     lineups: Sequence[Sequence[int]],
     num_games_per_match: int,
     num_players_in_env: int,
@@ -312,7 +317,10 @@ def run_batched_lineups(
     Dict[Tuple[int, int], int],
     int,
 ]:
-    """Run one or more multiplayer lineups in a single VecArena sweep."""
+    """Run one or more multiplayer lineups using the C++ evaluation manager."""
+
+    if track_experts:
+        print("[WARN] Expert tracking is not supported by the C++ evaluation manager; ignoring request.")
 
     if not lineups:
         return [], {}, {}, 0
@@ -326,192 +334,60 @@ def run_batched_lineups(
                 "Each lineup must contain the same number of players as the environment player count."
             )
 
-    unique_policy_ids = sorted({int(pid) for lineup in lineups for pid in lineup})
-    policy_index = {pid: idx for idx, pid in enumerate(unique_policy_ids)}
-    policy_agents = {pid: all_policies[pid] for pid in unique_policy_ids}
+    seed = base_seed if base_seed is not None else int(np.random.randint(0, 2**31 - 1))
+    rng = np.random.default_rng(seed)
 
-    num_policies = len(unique_policy_ids)
-    total_wins = np.zeros(num_policies, dtype=np.int64)
-    total_returns = np.zeros(num_policies, dtype=np.float64)
-    total_games = np.zeros(num_policies, dtype=np.int64)
-    expert_payloads: Dict[int, Dict[str, Any]] = {pid: {} for pid in unique_policy_ids}
+    scheduled_roles: List[List[int]] = []
+    scheduled_lineup_indices: List[int] = []
 
-    quartet_wins = [np.zeros(num_players_in_env, dtype=np.int64) for _ in lineups]
-    quartet_returns = [np.zeros(num_players_in_env, dtype=np.float64) for _ in lineups]
-    quartet_games = [np.zeros(num_players_in_env, dtype=np.int64) for _ in lineups]
-    quartet_index_maps = [
-        {int(pid): idx for idx, pid in enumerate(map(int, lineup))} for lineup in lineups
-    ]
-
-    h2h_counts = np.zeros((num_policies, num_policies), dtype=np.int64)
-    h2h_wins = np.zeros((num_policies, num_policies), dtype=np.int64)
-
-    arena = lb.VecArena()
-    max_batch = max(1, getattr(config, "EVAL_VEC_BATCH_SIZE", 512))
-    rng_seed = base_seed if base_seed is not None else int(np.random.randint(0, 2**31 - 1))
-    rng_np = np.random.default_rng(rng_seed)
-
-    roles: List[List[int]] = []
-    lineup_assignments: List[int] = []
     for lineup_idx, lineup in enumerate(lineups):
+        lineup_array = np.array(list(map(int, lineup)), dtype=np.int64)
         for _ in range(num_games_per_match):
-            seats = list(map(int, lineup))
-            rng_np.shuffle(seats)
-            roles.append(seats)
-            lineup_assignments.append(int(lineup_idx))
+            shuffled = rng.permutation(lineup_array)
+            scheduled_roles.append([int(x) for x in shuffled.tolist()])
+            scheduled_lineup_indices.append(int(lineup_idx))
 
-    total_games_scheduled = len(roles)
-    games_remaining = total_games_scheduled
-    start_idx = 0
-    while games_remaining > 0:
-        batch_size = min(games_remaining, max_batch)
-        batch_roles = roles[start_idx : start_idx + batch_size]
-        batch_lineups = lineup_assignments[start_idx : start_idx + batch_size]
-        seed = int(rng_np.integers(0, 2**31 - 1, dtype=np.int64))
+    results_list, h2h_counts, h2h_wins, total_games = eval_manager.run_roles(
+        scheduled_roles,
+        scheduled_lineup_indices,
+        num_players_in_env,
+        int(seed),
+    )
 
-        arena.reset(batch=batch_size, players=num_players_in_env, seed=seed)
-        arena.set_roles(batch_roles)
-
-        batch_policy_ids = {int(pid) for seats in batch_roles for pid in seats}
-        for pid in batch_policy_ids:
-            agent = policy_agents.get(pid)
-            if agent is None:
-                continue
-            try:
-                agent.reset()
-            except Exception:
-                continue
-
-        while True:
-            requests_by_policy = arena.collect_requests()
-            if not requests_by_policy:
-                break
-
-            for policy_id, requests in requests_by_policy.items():
-                if not requests:
-                    continue
-                agent = policy_agents.get(int(policy_id))
-                if agent is None:
-                    continue
-                actions, _, _ = agent.get_actions_batch(requests)
-                if isinstance(actions, torch.Tensor):
-                    actions_np = (
-                        actions.detach().to(torch.uint8).cpu().contiguous().numpy().reshape(-1)
-                    )
-                else:
-                    actions_np = np.asarray(actions, dtype=np.uint8).reshape(-1)
-                arena.submit_actions(int(policy_id), actions_np)
-
-            done_mask = np.asarray(arena.done, dtype=np.uint8)
-            if bool(done_mask.all()):
-                break
-
-        for env_idx in range(batch_size):
-            lineup_idx = batch_lineups[env_idx]
-            env = arena.get_env(env_idx)
-            seats = batch_roles[env_idx]
-            seat_indices = np.fromiter(
-                (policy_index[int(pid)] for pid in seats), dtype=np.int64, count=num_players_in_env
-            )
-            local_indices = np.fromiter(
-                (
-                    quartet_index_maps[lineup_idx][int(pid)]
-                    for pid in seats
-                ),
-                dtype=np.int64,
-                count=num_players_in_env,
-            )
-
-            total_games[seat_indices] += 1
-            quartet_games[lineup_idx][local_indices] += 1
-
-            active = [seat for seat in range(num_players_in_env) if env.terminations[seat] == 0]
-            winner_seat = active[0] if len(active) == 1 else None
-
-            if winner_seat is not None:
-                winner_global_idx = int(seat_indices[winner_seat])
-                total_wins[winner_global_idx] += 1
-                total_returns[seat_indices] -= 1.0
-                total_returns[winner_global_idx] += 2.0
-
-                winner_rows = np.full(num_players_in_env, winner_global_idx, dtype=np.int64)
-                np.add.at(h2h_wins, (winner_rows, seat_indices), 1)
-
-                quartet_returns[lineup_idx][local_indices] -= 1.0
-                winner_local_idx = int(local_indices[winner_seat])
-                quartet_returns[lineup_idx][winner_local_idx] += 2.0
-                quartet_wins[lineup_idx][winner_local_idx] += 1
-
-                winner_reps = int(np.count_nonzero(seat_indices == winner_global_idx))
-                if winner_reps:
-                    h2h_wins[winner_global_idx, winner_global_idx] -= winner_reps
-
-            pair_rows = np.repeat(seat_indices, num_players_in_env)
-            pair_cols = np.tile(seat_indices, num_players_in_env)
-            np.add.at(h2h_counts, (pair_rows, pair_cols), 1)
-            unique_indices, counts = np.unique(seat_indices, return_counts=True)
-            if unique_indices.size:
-                np.add.at(
-                    h2h_counts,
-                    (unique_indices, unique_indices),
-                    -(counts.astype(np.int64) ** 2),
-                )
-
-        games_remaining -= batch_size
-        start_idx += batch_size
-
-    if track_experts:
-        for pid in unique_policy_ids:
-            agent = all_policies.get(pid)
-            info_fn = getattr(agent, "get_last_expert_info", None)
-            if callable(info_fn):
-                data = info_fn()
-                if data is not None:
-                    expert_payloads[pid] = data
-
-    results_per_lineup: List[Dict[int, Dict[str, Any]]] = []
-    for lineup_idx, lineup in enumerate(lineups):
-        mapping = quartet_index_maps[lineup_idx]
-        lineup_results: Dict[int, Dict[str, Any]] = {}
-        for pid in map(int, lineup):
-            local_idx = mapping[int(pid)]
-            global_idx = policy_index[int(pid)]
-            lineup_results[int(pid)] = {
-                "total_wins": int(quartet_wins[lineup_idx][local_idx]),
-                "total_returns": float(quartet_returns[lineup_idx][local_idx]),
-                "num_games": int(quartet_games[lineup_idx][local_idx]),
-                "expert_data": expert_payloads.get(int(pid), {}),
+    results_typed: List[Dict[int, Dict[str, Any]]] = []
+    for lineup_idx in range(len(lineups)):
+        lineup_results = results_list[lineup_idx] if lineup_idx < len(results_list) else {}
+        typed_entry: Dict[int, Dict[str, Any]] = {}
+        for pid, stats in lineup_results.items():
+            typed_entry[int(pid)] = {
+                "total_wins": int(stats["total_wins"]),
+                "total_returns": float(stats["total_returns"]),
+                "num_games": int(stats["num_games"]),
+                "expert_data": stats.get("expert_data", {}),
             }
-        results_per_lineup.append(lineup_results)
+        results_typed.append(typed_entry)
 
-    h2h_round_counts: Dict[Tuple[int, int], int] = {}
-    h2h_round_wins: Dict[Tuple[int, int], int] = {}
-    for i, pid_i in enumerate(unique_policy_ids):
-        for j, pid_j in enumerate(unique_policy_ids):
-            if i == j:
-                continue
-            count = int(h2h_counts[i, j])
-            wins = int(h2h_wins[i, j])
-            if count:
-                h2h_round_counts[(int(pid_i), int(pid_j))] = count
-            if wins:
-                h2h_round_wins[(int(pid_i), int(pid_j))] = wins
+    counts_typed: Dict[Tuple[int, int], int] = {
+        (int(a), int(b)): int(v) for (a, b), v in h2h_counts.items()
+    }
+    wins_typed: Dict[Tuple[int, int], int] = {
+        (int(a), int(b)): int(v) for (a, b), v in h2h_wins.items()
+    }
 
-    return results_per_lineup, h2h_round_counts, h2h_round_wins, total_games_scheduled
-
+    return results_typed, counts_typed, wins_typed, int(total_games)
 
 def run_batched_games(
-    all_policies: Dict[int, BaseAgent],
+    eval_manager: "lb.EvalManager",
     matchup_policy_ids: List[int],
     num_games_per_match: int,
     num_players_in_env: int,
     track_experts: bool = False,
     base_seed: Optional[int] = None,
 ) -> Tuple[Dict[int, Dict[str, Any]], Dict[Tuple[int, int], int], Dict[Tuple[int, int], int]]:
-    """Backward-compatible wrapper around :func:`run_batched_lineups`."""
+    """Wrapper around :func:`run_batched_lineups` for a single matchup."""
 
     results, counts, wins, _ = run_batched_lineups(
-        all_policies,
+        eval_manager,
         [matchup_policy_ids],
         num_games_per_match,
         num_players_in_env,
