@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 import torch
 from src import config
-from src.agents.batch_autoregressive_ppo_agent import BatchPPOAutoregressiveAgent
+from src.agents.learner_ar_agent import LearnerAutoregressiveAgent
 
 # This is a simplified version of the logic from trace_models.py,
 # designed to be called as a library function.
@@ -28,7 +28,7 @@ def _build_example_inputs(model: torch.nn.Module, device: torch.device):
 def trace_model_from_checkpoint(checkpoint_path: str, output_path: str, device: torch.device):
     """Loads a .pth checkpoint, traces it, and saves it as a .pt file."""
     try:
-        agent = BatchPPOAutoregressiveAgent(device=device, player_id="tracer")
+        agent = LearnerAutoregressiveAgent(device=device, player_id="tracer")
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         state_dict = checkpoint.get('model_state_dict', checkpoint)
         agent.load_models_from_checkpoint({"policy_nets": {"agent_model": state_dict}}, "agent_model")

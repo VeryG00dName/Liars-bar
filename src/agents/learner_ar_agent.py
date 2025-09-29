@@ -171,6 +171,74 @@ class LearnerAutoregressiveAgent:
             self._last_inputs[(env_idx, seat_idx)] = snapshot
 
 
+    def load_models_from_checkpoint(self, checkpoint: Dict[str, Any], agent_key: str):
+        """
+        Load model state dict, automatically detect the architecture (reactive, fused, legacy),
+        and re-instantiate the correct model class using inferred dimensions.
+        """
+        if "policy_nets" not in checkpoint or agent_key not in checkpoint["policy_nets"]:
+            raise ValueError(f"Checkpoint missing model state for agent '{agent_key}' in 'policy_nets'.")
+
+        model_state_dict = checkpoint["policy_nets"][agent_key]
+
+        # --- NEW, ROBUST ARCHITECTURE DETECTION ---
+        if MFactoryUtil.is_reactive_model(model_state_dict):
+            ModelClass = PPOReactiveModel
+        elif MFactoryUtil.is_fused_model(model_state_dict):
+            ModelClass = PPOFusedModel
+        elif MFactoryUtil.is_ppo_autoregressive_model(model_state_dict):
+            ModelClass = PPOAutoregressiveModel
+        else:
+            ModelClass = PPOFusedModel
+        
+        # Infer dimensions that are common to all architectures
+        inferred_obs_dim = MFactoryUtil.get_input_dim_from_state_dict(model_state_dict, 'obs_encoder.0')
+        
+        # Handle different head structures (MLP vs. Linear)
+        action_head_prefix = "action_head.2" if "action_head.2.weight" in model_state_dict else "action_head"
+        inferred_action_dim = MFactoryUtil.get_output_dim_from_state_dict(model_state_dict, action_head_prefix)
+        
+        inferred_hidden_dim = MFactoryUtil.get_hidden_dim_from_state_dict(model_state_dict, 'obs_encoder.0')
+        inferred_max_seq = model_state_dict.get('position_embedding.weight').shape[0]
+        num_heads = inferred_hidden_dim // 64
+
+
+        self.max_seq_length = inferred_max_seq
+
+        # --- NEW, CONDITIONAL KWARGS FOR FUSED MODEL ---
+        extra_kwargs: Dict[str, Any] = {}
+        if ModelClass is PPOFusedModel:
+            bricks_tensor = None
+            for key, tensor in model_state_dict.items():
+                if key.endswith("strategy_dictionary.bricks"):
+                    bricks_tensor = tensor
+                    break
+            if bricks_tensor is not None:
+                num_bricks, brick_dim = bricks_tensor.shape
+                extra_kwargs["num_bricks"] = num_bricks
+                extra_kwargs["brick_dim"] = brick_dim
+            else:
+                extra_kwargs["num_bricks"] = getattr(config, "NUM_BRICKS", 32)
+                extra_kwargs["brick_dim"] = getattr(config, "BRICK_DIM", 32)
+
+        # Instantiate the CORRECT ModelClass with all inferred parameters
+        self.model = ModelClass(
+            obs_dim=inferred_obs_dim,
+            action_dim=inferred_action_dim,
+            hidden_dim=inferred_hidden_dim,
+            num_heads=num_heads,
+            max_seq_length=inferred_max_seq,
+            **extra_kwargs,
+        ).to(self.device)
+
+            # Use strict=False to handle cases where an agent is loaded into a
+            # slightly different architecture (e.g., a reactive model into a fused
+            # one, where some keys won't match). This is useful for analysis.
+        self.model.load_state_dict(model_state_dict, strict=False)
+
+        self.model.eval()
+        self.reset()
+
 def build_model_from_state(
     model_state_dict: Dict[str, torch.Tensor],
     device: torch.device,

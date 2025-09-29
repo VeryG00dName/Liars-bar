@@ -351,44 +351,48 @@ def train_generation(
 
     learner.model.train()
 
-    all_params = list(learner.model.parameters())
+    # --- NEW, ROBUST OPTIMIZER SETUP ---
+    # Create two lists to hold parameters for weight decay and no weight decay
+    decay_params = []
+    no_decay_params = []
 
-    # Get the parameters specifically from the strategy dictionary's bricks
-    bricks_params = list(learner.model.strategy_dictionary.bricks)
+    # Iterate through all named parameters of the model
+    for name, param in learner.model.named_parameters():
+        if not param.requires_grad:
+            continue
+        
+        # Check if the parameter is a bias, a LayerNorm weight/bias, or an embedding weight.
+        # These are typically excluded from weight decay.
+        if name.endswith(".bias") or "layernorm" in name.lower() or "embedding" in name.lower():
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
 
-    # --- THE FIX ---
-    # Create a set of the memory addresses (ids) of the brick parameters
-    bricks_param_ids = {id(p) for p in bricks_params}
-
-    # Separate the parameters by checking if their id is in the set
-    decay_params = [p for p in all_params if id(p) not in bricks_param_ids]
-    no_decay_params = [p for p in all_params if id(p) in bricks_param_ids] # A more robust way to get this list
-    # --- END FIX ---
-
+    # Create the optimizer with two parameter groups
     optimizer = torch.optim.AdamW(
         [
-            {"params": decay_params, "weight_decay": 0.01},
-            {"params": no_decay_params, "weight_decay": 0.0},
+            {'params': decay_params, 'weight_decay': 0.01}, # Apply weight decay to this group
+            {'params': no_decay_params, 'weight_decay': 0.0}   # No weight decay for this group
         ],
         lr=float(config.LEARNING_RATE),
     )
-
-    
     scaler = amp.GradScaler(enabled=(device.type == "cuda"))
-
     all_params = list(learner.model.parameters())
 
-    # --- THE FIX ---
-    # Isolate the parameters of the activation_encoder
-    activation_encoder_params = list(learner.model.strategy_dictionary.activation_encoder.parameters())
-    activation_encoder_param_ids = {id(p) for p in activation_encoder_params}
-    
-    # All other parameters are considered "main" parameters
-    main_params = [p for p in all_params if id(p) not in activation_encoder_param_ids]
-    
-    # You can define a separate max_norm for the encoder if you want, or use the main one.
-    # Let's create a new config for it for flexibility.
-    encoder_max_norm = float(getattr(config, "ENCODER_MAX_NORM", config.MAX_NORM))
+    # Check if the model has an opponent action head to separate its parameters
+    if hasattr(learner.model, 'opp_action_head'):
+        opp_head_params = list(learner.model.opp_action_head.parameters())
+        opp_head_param_ids = {id(p) for p in opp_head_params}
+        
+        # Main parameters are everything EXCEPT the opponent head
+        main_params = [p for p in all_params if id(p) not in opp_head_param_ids]
+    else:
+        # If the model is purely reactive with no opponent head, all params are main params
+        opp_head_params = []
+        main_params = all_params
+        
+    # or use the main one. Let's use a new config for flexibility.
+    opp_head_max_norm = float(getattr(config, "OPP_HEAD_MAX_NORM", config.MAX_NORM))
     
     existing_labels = {
         int(entry.get("label"))
@@ -644,15 +648,28 @@ def train_generation(
                     group_count >= group_target
                     or processed_minibatches == num_minibatches
                 )
+                should_step = (
+                    group_count >= group_target
+                    or processed_minibatches == num_minibatches
+                )
                 if should_step:
                     scaler.unscale_(optimizer)
+                    
+                    # --- NEW, ROBUST GRADIENT CLIPPING ---
+                    # Clip gradients for the main part of the network
                     if main_params:
                         clip_grad_norm_(main_params, max_norm=float(config.MAX_NORM))
-                    if activation_encoder_params:
-                        clip_grad_norm_(activation_encoder_params, max_norm=encoder_max_norm)
+                    
+                    # Clip gradients for the auxiliary opponent head separately
+                    if opp_head_params:
+                        clip_grad_norm_(opp_head_params, max_norm=opp_head_max_norm)
+                    # --- END OF NEW GRADIENT CLIPPING ---
+                    
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad(set_to_none=True)
+                    
+                    # Reset the accumulation counters
                     remaining = num_minibatches - processed_minibatches
                     group_target = min(grad_accum_steps, remaining) if remaining > 0 else grad_accum_steps
                     group_count = 0
