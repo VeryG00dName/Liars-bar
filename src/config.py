@@ -76,7 +76,7 @@ DROPOUT_P = 0.15
 DCP_LOSS_WEIGHT = 1.20
 BRICK_DECORRELATION_WEIGHT = 1e-3
 # Toggle for treating the newest historical opponent as held-out during training/eval
-USE_HELDOUT_AGENT = True
+USE_HELDOUT_AGENT = False
 # ============================
 # PPO / Training Hyperparameters
 # ============================
@@ -96,9 +96,8 @@ USE_GRADIENT_CHECKPOINTING = True
 INIT_ENTROPY_COEF = 0.005
 
 # Opponent sampling configuration
-SHADOW_P_NEW = 0.05
+SHADOW_P_NEW = 0.25
 FRONT_P_ADJUSTED = 1.0 - SHADOW_P_NEW
-NUM_ACTIVE_SHADOW_AGENTS_PER_UPDATE = 2
 CPP_BOT_MAX_LABEL = 6
 LATEST_K = 4
 

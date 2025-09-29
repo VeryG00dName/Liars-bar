@@ -146,14 +146,16 @@ void RolloutManager::start_rollouts(int num_episodes,
 
     arena_.reset(batch_size_, num_players_, rng_());
 
-    std::vector<int> front_pool = cpp_bots;
-    front_pool.insert(front_pool.end(), latest_historical_agents.begin(), latest_historical_agents.end());
+    std::vector<int> front_pool = latest_historical_agents;
+
+    std::vector<int> shadow_pool = active_shadow_agents;
+    shadow_pool.insert(shadow_pool.end(), cpp_bots.begin(), cpp_bots.end());
 
     auto roles = build_roles(batch_size_,
                              num_players_,
                              training_policy_id_,
                              front_pool,
-                             active_shadow_agents,
+                             shadow_pool,
                              front_mass,
                              shadow_mass);
     arena_.set_roles(roles);

@@ -262,9 +262,14 @@ class PPOVecRolloutManager:
 
         active_shadow_agents: List[int] = []
         if self._all_shadow_pool_labels:
-            active_shadow_agents = self._all_shadow_pool_labels
+            active_shadow_agents = list(self._all_shadow_pool_labels)
 
-        front_mass = config.FRONT_P_ADJUSTED if (cpp_bots or latest_historical_agents) else 0.0
+        if cpp_bots:
+            bot_labels = [label for label in cpp_bots if label not in active_shadow_agents]
+            if bot_labels:
+                active_shadow_agents.extend(bot_labels)
+
+        front_mass = config.FRONT_P_ADJUSTED if latest_historical_agents else 0.0
         shadow_mass = config.SHADOW_P_NEW if active_shadow_agents else 0.0
 
         seed = int(self.rng.integers(0, 2**31))
