@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -25,7 +26,7 @@ from src import config
 from src.eval.evaluate_utils import (
     RATING_BACKEND,
     RichProgressScoreboard,
-    binary_entropy,
+    beta_confidence_interval,
     compare_scoreboards,
     load_evaluation_policies,
     load_scoreboard,
@@ -40,8 +41,8 @@ from src.training.train_extras import set_seed
 SEED = int(getattr(config, "SEED", 42))
 set_seed(SEED)
 
-MIN_GAMES_PER_MATCH = 80
-MAX_GAMES_PER_MATCH = 100
+MIN_GAMES_PER_MATCH = 1
+MAX_GAMES_PER_MATCH = 3
 
 
 @dataclass
@@ -51,9 +52,11 @@ class MatchStoppingConfig:
 
 @dataclass
 class SchedulerConfig:
-    quartets_per_batch: int = 8
-    candidate_pool_size: int = 12
-    candidate_samples: int = 64
+    batch_size: int = 1024
+    candidate_quartets: int = 2048
+    target_pair_coverage: int = 60
+    max_player_imbalance: int = 3
+    reuse_penalty: float = 25.0
 
 
 @dataclass
@@ -177,52 +180,136 @@ def update_player_metadata(
         meta["conservative"] = rating.conservative
 
 
-def quartet_score(quartet: Sequence[int], players: Dict[int, Dict[str, Any]]) -> float:
-    sigma_sum = sum(players[pid].get("sigma", 0.0) for pid in quartet)
-    entropy_sum = 0.0
-    copeland_scores = {pid: 0.0 for pid in quartet}
-    for a, b in combinations(quartet, 2):
-        p_ab = RATING_BACKEND.win_probability(a, b)
-        entropy_sum += binary_entropy(p_ab)
-        copeland_scores[a] += p_ab
-        copeland_scores[b] += 1.0 - p_ab
-    margins = sorted(copeland_scores.values(), reverse=True)
-    margin = margins[0] - margins[-1] if margins else 0.0
-    copeland_uncertainty = 1.0 / (1.0 + margin)
-    return sigma_sum + entropy_sum + copeland_uncertainty
+def _pair_key(a: int, b: int) -> Tuple[int, int]:
+    return (a, b) if a < b else (b, a)
+
+
+def _quartet_pair_keys(quartet: Sequence[int]) -> List[Tuple[int, int]]:
+    return [_pair_key(a, b) for a, b in combinations(quartet, 2)]
+
+
+def _pair_interest(
+    pair: Tuple[int, int],
+    pair_wins: Dict[Tuple[int, int], int],
+) -> float:
+    a, b = pair
+    wins_ab = pair_wins.get((a, b), 0)
+    wins_ba = pair_wins.get((b, a), 0)
+    games = wins_ab + wins_ba
+    if games <= 0:
+        width = 1.0
+        centre = 0.5
+    else:
+        lower, upper = beta_confidence_interval(wins_ab, games)
+        width = upper - lower
+        centre = wins_ab / games if games > 0 else 0.5
+    closeness = 1.0 - abs(centre - 0.5) * 2.0
+    return width + closeness
+
+
+def _respects_degree_cap(
+    quartet: Sequence[int],
+    player_counts: Dict[int, int],
+    slack: int,
+) -> bool:
+    if not player_counts:
+        return True
+    min_count = min(player_counts.values())
+    allowed = min_count + slack
+    return all(player_counts.get(pid, 0) <= allowed for pid in quartet)
 
 
 def select_quartets(
     players: Dict[int, Dict[str, Any]],
     scheduler: SchedulerConfig,
     rng: np.random.Generator,
+    pair_counts: Dict[Tuple[int, int], int],
+    player_counts: Dict[int, int],
+    lineup_counts: Dict[Tuple[int, int, int, int], int],
+    pair_wins: Dict[Tuple[int, int], int],
+    games_per_match: int,
+    quartets_needed: int,
+    coverage_complete: bool,
 ) -> List[Tuple[int, int, int, int]]:
     player_ids = list(players.keys())
-    if len(player_ids) < 4:
+    if len(player_ids) < 4 or quartets_needed <= 0:
         return []
-    sorted_by_sigma = sorted(player_ids, key=lambda pid: players[pid].get("sigma", 0.0), reverse=True)
-    pool_size = min(len(sorted_by_sigma), scheduler.candidate_pool_size)
-    candidate_pool = sorted_by_sigma[:pool_size]
-    candidate_quartets = list(combinations(candidate_pool, 4))
-    if len(candidate_quartets) > scheduler.candidate_samples:
-        indices = rng.choice(len(candidate_quartets), size=scheduler.candidate_samples, replace=False)
-        candidate_quartets = [candidate_quartets[int(i)] for i in indices]
-    scored = sorted(candidate_quartets, key=lambda q: quartet_score(q, players), reverse=True)
+
+    total_possible = math.comb(len(player_ids), 4)
+    if scheduler.candidate_quartets >= total_possible:
+        candidate_quartets = [tuple(combo) for combo in combinations(player_ids, 4)]
+    else:
+        candidate_set: set[Tuple[int, int, int, int]] = set()
+        while len(candidate_set) < scheduler.candidate_quartets:
+            sampled = tuple(sorted(rng.choice(player_ids, size=4, replace=False)))
+            candidate_set.add(sampled)
+        candidate_quartets = list(candidate_set)
+
+    if candidate_quartets:
+        order = rng.permutation(len(candidate_quartets))
+        candidate_quartets = [candidate_quartets[int(i)] for i in order]
+
     selected: List[Tuple[int, int, int, int]] = []
-    used: set[int] = set()
-    for quartet in scored:
-        if len(selected) >= scheduler.quartets_per_batch:
-            break
-        if any(pid in used for pid in quartet):
-            continue
-        selected.append(quartet)
-        used.update(quartet)
-    if len(selected) < scheduler.quartets_per_batch:
-        for quartet in scored:
-            if quartet not in selected:
-                selected.append(quartet)
-            if len(selected) >= scheduler.quartets_per_batch:
+    temp_pair_counts = dict(pair_counts)
+    temp_player_counts = dict(player_counts)
+    temp_lineup_counts = dict(lineup_counts)
+
+    slack = scheduler.max_player_imbalance
+    max_slack = slack + len(player_ids)
+
+    def _coverage_score(quartet: Tuple[int, int, int, int]) -> float:
+        lineup_key = tuple(sorted(quartet))
+        pairs = _quartet_pair_keys(quartet)
+        coverage = sum(temp_pair_counts.get(pair, 0) for pair in pairs)
+        reuse_penalty = scheduler.reuse_penalty * temp_lineup_counts.get(lineup_key, 0)
+        return coverage + reuse_penalty
+
+    def _refinement_score(quartet: Tuple[int, int, int, int]) -> float:
+        lineup_key = tuple(sorted(quartet))
+        interest = sum(_pair_interest(pair, pair_wins) for pair in _quartet_pair_keys(quartet))
+        reuse_penalty = scheduler.reuse_penalty * temp_lineup_counts.get(lineup_key, 0)
+        # Negative interest so that more informative quartets have lower scores.
+        return -interest + reuse_penalty
+
+    while len(selected) < quartets_needed and candidate_quartets:
+        best_quartet: Optional[Tuple[int, int, int, int]] = None
+        best_score: Optional[float] = None
+
+        attempted = False
+        local_slack = slack
+        while best_quartet is None and local_slack <= max_slack:
+            attempted = True
+            for quartet in candidate_quartets:
+                if quartet in selected:
+                    continue
+                if not _respects_degree_cap(quartet, temp_player_counts, local_slack):
+                    continue
+                if coverage_complete:
+                    score = _refinement_score(quartet)
+                else:
+                    score = _coverage_score(quartet)
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_quartet = quartet
+            if best_quartet is None:
+                local_slack += 1
+
+        if best_quartet is None:
+            if not attempted:
                 break
+            else:
+                # Relax slack constraint and retry
+                slack += 1
+                continue
+
+        selected.append(best_quartet)
+        lineup_key = tuple(sorted(best_quartet))
+        temp_lineup_counts[lineup_key] = temp_lineup_counts.get(lineup_key, 0) + 1
+        for pid in best_quartet:
+            temp_player_counts[pid] = temp_player_counts.get(pid, 0) + 1
+        for pair in _quartet_pair_keys(best_quartet):
+            temp_pair_counts[pair] = temp_pair_counts.get(pair, 0) + games_per_match
+
     return selected
 
 
@@ -312,12 +399,19 @@ def run_active_league(
     track_experts: bool = False,
     max_batches: int = 200,
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
-    pairwise_counts: Dict[Tuple[int, int], int] = defaultdict(int)
+    directional_pair_counts: Dict[Tuple[int, int], int] = defaultdict(int)
     pairwise_wins: Dict[Tuple[int, int], int] = defaultdict(int)
+    pairwise_coverage: Dict[Tuple[int, int], int] = {
+        _pair_key(a, b): 0 for a, b in combinations(players.keys(), 2)
+    }
+    player_lineup_counts: Dict[int, int] = {pid: 0 for pid in players}
+    lineup_counts: Dict[Tuple[int, int, int, int], int] = defaultdict(int)
     tracker = LeagueTracker()
     scoreboard_file = "tournament_scoreboard.json"
     historical_scoreboard = load_scoreboard(scoreboard_file)
-    total_steps = max_batches * scheduler.quartets_per_batch * stopping.games_per_match
+    games_per_match = max(stopping.games_per_match, MIN_GAMES_PER_MATCH)
+    quartets_per_batch = max(1, scheduler.batch_size // games_per_match)
+    total_steps = max_batches * quartets_per_batch * games_per_match
     progress_ui = RichProgressScoreboard(total_steps=total_steps, players=players)
     rng = np.random.default_rng(SEED)
 
@@ -325,12 +419,28 @@ def run_active_league(
 
     batch_idx = 0
     league_finished = False
+    coverage_complete = scheduler.target_pair_coverage <= 0
 
     while not league_finished and batch_idx < max_batches:
-        quartets = select_quartets(players, scheduler, rng)
+        quartets = select_quartets(
+            players,
+            scheduler,
+            rng,
+            pair_counts=pairwise_coverage,
+            player_counts=player_lineup_counts,
+            lineup_counts=lineup_counts,
+            pair_wins=pairwise_wins,
+            games_per_match=games_per_match,
+            quartets_needed=quartets_per_batch,
+            coverage_complete=coverage_complete,
+        )
         if not quartets:
             break
         for quartet in quartets:
+            lineup_key = tuple(sorted(quartet))
+            lineup_counts[lineup_key] += 1
+            for pid in quartet:
+                player_lineup_counts[pid] = player_lineup_counts.get(pid, 0) + 1
             base_seed = int(rng.integers(0, 2**31 - 1, dtype=np.int64))
             results, h2h_counts, h2h_wins, games_played = run_adaptive_quartet(
                 all_policies,
@@ -340,7 +450,10 @@ def run_active_league(
                 track_experts=track_experts,
             )
             for k, v in h2h_counts.items():
-                pairwise_counts[k] += v
+                directional_pair_counts[k] += v
+                a, b = k
+                if a < b:
+                    pairwise_coverage[(a, b)] = pairwise_coverage.get((a, b), 0) + v
             for k, v in h2h_wins.items():
                 pairwise_wins[k] += v
 
@@ -362,13 +475,16 @@ def run_active_league(
             )
 
         batch_idx += 1
+        coverage_complete = all(
+            count >= scheduler.target_pair_coverage for count in pairwise_coverage.values()
+        )
         league_finished, _ = evaluate_league_stopping(players, tracker, league_stop)
 
     progress_ui.close()
     save_scoreboard(scoreboard_file, players)
 
     h2h_rates: Dict[Tuple[int, int], float] = {}
-    for pair, count in pairwise_counts.items():
+    for pair, count in directional_pair_counts.items():
         if count > 0:
             wins = pairwise_wins.get(pair, 0)
             h2h_rates[pair] = wins / count
@@ -408,10 +524,37 @@ def main() -> None:
         help="Number of games to evaluate for each quartet matchup.",
     )
     parser.add_argument(
-        "--quartets-per-batch",
+        "--batch-size",
         type=int,
-        default=4,
-        help="Number of quartets to schedule per batch before re-evaluating stopping criteria.",
+        default=SchedulerConfig.batch_size,
+        help=(
+            "Total games scheduled per batch. Quartets per batch are computed as"
+            " batch_size // games_per_quartet."
+        ),
+    )
+    parser.add_argument(
+        "--target-pair-coverage",
+        type=int,
+        default=SchedulerConfig.target_pair_coverage,
+        help="Target number of games per pair before switching to refinement mode.",
+    )
+    parser.add_argument(
+        "--candidate-quartets",
+        type=int,
+        default=SchedulerConfig.candidate_quartets,
+        help="Number of quartet candidates sampled for greedy scheduling.",
+    )
+    parser.add_argument(
+        "--max-player-imbalance",
+        type=int,
+        default=SchedulerConfig.max_player_imbalance,
+        help="Maximum allowed gap between most and least scheduled players during coverage.",
+    )
+    parser.add_argument(
+        "--reuse-penalty",
+        type=float,
+        default=SchedulerConfig.reuse_penalty,
+        help="Penalty applied when reusing identical quartets (higher favors unique lineups).",
     )
     parser.add_argument(
         "--max-batches",
@@ -491,7 +634,13 @@ def main() -> None:
             f"Need at least {num_players} agents to run the tournament; got {len(players)}."
         )
 
-    scheduler = SchedulerConfig(quartets_per_batch=args.quartets_per_batch)
+    scheduler = SchedulerConfig(
+        batch_size=max(1, args.batch_size),
+        candidate_quartets=max(4, args.candidate_quartets),
+        target_pair_coverage=max(0, args.target_pair_coverage),
+        max_player_imbalance=max(0, args.max_player_imbalance),
+        reuse_penalty=max(0.0, float(args.reuse_penalty)),
+    )
     stopping = MatchStoppingConfig(games_per_match=args.games_per_quartet)
     league_stop = LeagueStoppingConfig(
         conservative_stability_k=args.conservative_stability_k,
