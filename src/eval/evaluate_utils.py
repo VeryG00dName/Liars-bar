@@ -299,31 +299,49 @@ def load_evaluation_policies(
     return all_policies, metadata
 
 
-def run_batched_games(
+def run_batched_lineups(
     all_policies: Dict[int, BaseAgent],
-    matchup_policy_ids: List[int],
+    lineups: Sequence[Sequence[int]],
     num_games_per_match: int,
     num_players_in_env: int,
     track_experts: bool = False,
     base_seed: Optional[int] = None,
-) -> Tuple[Dict[int, Dict[str, Any]], Dict[Tuple[int, int], int], Dict[Tuple[int, int], int]]:
-    """Run a large batch of games between policies using ``VecArena``."""
+) -> Tuple[
+    List[Dict[int, Dict[str, Any]]],
+    Dict[Tuple[int, int], int],
+    Dict[Tuple[int, int], int],
+    int,
+]:
+    """Run one or more multiplayer lineups in a single VecArena sweep."""
 
-    if len(matchup_policy_ids) != num_players_in_env:
-        raise ValueError("Number of matchup policy ids must equal the environment player count.")
+    if not lineups:
+        return [], {}, {}, 0
 
     if num_games_per_match <= 0:
         raise ValueError("num_games_per_match must be positive.")
 
-    policy_ids = np.asarray(matchup_policy_ids, dtype=np.int64)
-    num_policies = policy_ids.size
-    policy_index = {pid: idx for idx, pid in enumerate(matchup_policy_ids)}
-    policy_agents = {pid: all_policies[pid] for pid in matchup_policy_ids}
+    for lineup in lineups:
+        if len(lineup) != num_players_in_env:
+            raise ValueError(
+                "Each lineup must contain the same number of players as the environment player count."
+            )
 
+    unique_policy_ids = sorted({int(pid) for lineup in lineups for pid in lineup})
+    policy_index = {pid: idx for idx, pid in enumerate(unique_policy_ids)}
+    policy_agents = {pid: all_policies[pid] for pid in unique_policy_ids}
+
+    num_policies = len(unique_policy_ids)
     total_wins = np.zeros(num_policies, dtype=np.int64)
     total_returns = np.zeros(num_policies, dtype=np.float64)
     total_games = np.zeros(num_policies, dtype=np.int64)
-    expert_payloads: Dict[int, Dict[str, Any]] = {pid: {} for pid in matchup_policy_ids}
+    expert_payloads: Dict[int, Dict[str, Any]] = {pid: {} for pid in unique_policy_ids}
+
+    quartet_wins = [np.zeros(num_players_in_env, dtype=np.int64) for _ in lineups]
+    quartet_returns = [np.zeros(num_players_in_env, dtype=np.float64) for _ in lineups]
+    quartet_games = [np.zeros(num_players_in_env, dtype=np.int64) for _ in lineups]
+    quartet_index_maps = [
+        {int(pid): idx for idx, pid in enumerate(map(int, lineup))} for lineup in lineups
+    ]
 
     h2h_counts = np.zeros((num_policies, num_policies), dtype=np.int64)
     h2h_wins = np.zeros((num_policies, num_policies), dtype=np.int64)
@@ -333,25 +351,32 @@ def run_batched_games(
     rng_seed = base_seed if base_seed is not None else int(np.random.randint(0, 2**31 - 1))
     rng_np = np.random.default_rng(rng_seed)
 
-    # Pre-generate the seating assignments for the full set of games.
     roles: List[List[int]] = []
-    for _ in range(num_games_per_match):
-        seats = list(matchup_policy_ids)
-        rng_np.shuffle(seats)
-        roles.append(seats)
+    lineup_assignments: List[int] = []
+    for lineup_idx, lineup in enumerate(lineups):
+        for _ in range(num_games_per_match):
+            seats = list(map(int, lineup))
+            rng_np.shuffle(seats)
+            roles.append(seats)
+            lineup_assignments.append(int(lineup_idx))
 
-    num_games_remaining = num_games_per_match
+    total_games_scheduled = len(roles)
+    games_remaining = total_games_scheduled
     start_idx = 0
-    while num_games_remaining > 0:
-        batch_size = min(num_games_remaining, max_batch)
+    while games_remaining > 0:
+        batch_size = min(games_remaining, max_batch)
         batch_roles = roles[start_idx : start_idx + batch_size]
+        batch_lineups = lineup_assignments[start_idx : start_idx + batch_size]
         seed = int(rng_np.integers(0, 2**31 - 1, dtype=np.int64))
 
         arena.reset(batch=batch_size, players=num_players_in_env, seed=seed)
         arena.set_roles(batch_roles)
 
-        for pid in matchup_policy_ids:
-            agent = policy_agents[pid]
+        batch_policy_ids = {int(pid) for seats in batch_roles for pid in seats}
+        for pid in batch_policy_ids:
+            agent = policy_agents.get(pid)
+            if agent is None:
+                continue
             try:
                 agent.reset()
             except Exception:
@@ -365,7 +390,7 @@ def run_batched_games(
             for policy_id, requests in requests_by_policy.items():
                 if not requests:
                     continue
-                agent = policy_agents.get(policy_id)
+                agent = policy_agents.get(int(policy_id))
                 if agent is None:
                     continue
                 actions, _, _ = agent.get_actions_batch(requests)
@@ -375,35 +400,51 @@ def run_batched_games(
                     )
                 else:
                     actions_np = np.asarray(actions, dtype=np.uint8).reshape(-1)
-                arena.submit_actions(policy_id, actions_np)
+                arena.submit_actions(int(policy_id), actions_np)
 
             done_mask = np.asarray(arena.done, dtype=np.uint8)
             if bool(done_mask.all()):
                 break
 
         for env_idx in range(batch_size):
+            lineup_idx = batch_lineups[env_idx]
             env = arena.get_env(env_idx)
             seats = batch_roles[env_idx]
             seat_indices = np.fromiter(
                 (policy_index[int(pid)] for pid in seats), dtype=np.int64, count=num_players_in_env
             )
+            local_indices = np.fromiter(
+                (
+                    quartet_index_maps[lineup_idx][int(pid)]
+                    for pid in seats
+                ),
+                dtype=np.int64,
+                count=num_players_in_env,
+            )
+
             total_games[seat_indices] += 1
+            quartet_games[lineup_idx][local_indices] += 1
 
             active = [seat for seat in range(num_players_in_env) if env.terminations[seat] == 0]
             winner_seat = active[0] if len(active) == 1 else None
 
             if winner_seat is not None:
-                winner_idx = int(seat_indices[winner_seat])
-                total_wins[winner_idx] += 1
+                winner_global_idx = int(seat_indices[winner_seat])
+                total_wins[winner_global_idx] += 1
                 total_returns[seat_indices] -= 1.0
-                total_returns[winner_idx] += 2.0
+                total_returns[winner_global_idx] += 2.0
 
-                winner_rows = np.full(num_players_in_env, winner_idx, dtype=np.int64)
+                winner_rows = np.full(num_players_in_env, winner_global_idx, dtype=np.int64)
                 np.add.at(h2h_wins, (winner_rows, seat_indices), 1)
 
-                winner_reps = int(np.count_nonzero(seat_indices == winner_idx))
+                quartet_returns[lineup_idx][local_indices] -= 1.0
+                winner_local_idx = int(local_indices[winner_seat])
+                quartet_returns[lineup_idx][winner_local_idx] += 2.0
+                quartet_wins[lineup_idx][winner_local_idx] += 1
+
+                winner_reps = int(np.count_nonzero(seat_indices == winner_global_idx))
                 if winner_reps:
-                    h2h_wins[winner_idx, winner_idx] -= winner_reps
+                    h2h_wins[winner_global_idx, winner_global_idx] -= winner_reps
 
             pair_rows = np.repeat(seat_indices, num_players_in_env)
             pair_cols = np.tile(seat_indices, num_players_in_env)
@@ -416,11 +457,11 @@ def run_batched_games(
                     -(counts.astype(np.int64) ** 2),
                 )
 
-        num_games_remaining -= batch_size
+        games_remaining -= batch_size
         start_idx += batch_size
 
     if track_experts:
-        for pid in matchup_policy_ids:
+        for pid in unique_policy_ids:
             agent = all_policies.get(pid)
             info_fn = getattr(agent, "get_last_expert_info", None)
             if callable(info_fn):
@@ -428,20 +469,25 @@ def run_batched_games(
                 if data is not None:
                     expert_payloads[pid] = data
 
-    results = {
-        pid: {
-            "total_wins": int(total_wins[idx]),
-            "total_returns": float(total_returns[idx]),
-            "num_games": int(total_games[idx]),
-            "expert_data": expert_payloads.get(pid, {}),
-        }
-        for pid, idx in policy_index.items()
-    }
+    results_per_lineup: List[Dict[int, Dict[str, Any]]] = []
+    for lineup_idx, lineup in enumerate(lineups):
+        mapping = quartet_index_maps[lineup_idx]
+        lineup_results: Dict[int, Dict[str, Any]] = {}
+        for pid in map(int, lineup):
+            local_idx = mapping[int(pid)]
+            global_idx = policy_index[int(pid)]
+            lineup_results[int(pid)] = {
+                "total_wins": int(quartet_wins[lineup_idx][local_idx]),
+                "total_returns": float(quartet_returns[lineup_idx][local_idx]),
+                "num_games": int(quartet_games[lineup_idx][local_idx]),
+                "expert_data": expert_payloads.get(int(pid), {}),
+            }
+        results_per_lineup.append(lineup_results)
 
     h2h_round_counts: Dict[Tuple[int, int], int] = {}
     h2h_round_wins: Dict[Tuple[int, int], int] = {}
-    for i, pid_i in enumerate(policy_ids):
-        for j, pid_j in enumerate(policy_ids):
+    for i, pid_i in enumerate(unique_policy_ids):
+        for j, pid_j in enumerate(unique_policy_ids):
             if i == j:
                 continue
             count = int(h2h_counts[i, j])
@@ -451,7 +497,28 @@ def run_batched_games(
             if wins:
                 h2h_round_wins[(int(pid_i), int(pid_j))] = wins
 
-    return results, h2h_round_counts, h2h_round_wins
+    return results_per_lineup, h2h_round_counts, h2h_round_wins, total_games_scheduled
+
+
+def run_batched_games(
+    all_policies: Dict[int, BaseAgent],
+    matchup_policy_ids: List[int],
+    num_games_per_match: int,
+    num_players_in_env: int,
+    track_experts: bool = False,
+    base_seed: Optional[int] = None,
+) -> Tuple[Dict[int, Dict[str, Any]], Dict[Tuple[int, int], int], Dict[Tuple[int, int], int]]:
+    """Backward-compatible wrapper around :func:`run_batched_lineups`."""
+
+    results, counts, wins, _ = run_batched_lineups(
+        all_policies,
+        [matchup_policy_ids],
+        num_games_per_match,
+        num_players_in_env,
+        track_experts=track_experts,
+        base_seed=base_seed,
+    )
+    return (results[0] if results else {}), counts, wins
 
 
 # ---------------------------------------------------------------------------
@@ -515,19 +582,19 @@ class RichProgressScoreboard:
         self.total = total_steps
         self.current = 0
         self.players = players
-        self.steps_per_sec = 0.0
+        self.games_per_sec = 0.0
         self._t0 = time.perf_counter()
 
         self.progress = Progress(
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
             TextColumn("{task.percentage:>3.0f}%"),
-            TextColumn("[bold]{task.fields[steps_per_sec]}[/bold]", justify="left"),
+            TextColumn("[bold]{task.fields[games_per_sec]}[/bold]", justify="left"),
         )
         self.task_id = self.progress.add_task(
             "Evaluating...",
             total=self.total,
-            steps_per_sec="0.00 steps/sec",
+            games_per_sec="0.00 games/sec",
         )
         # Build a persistent layout so we don't recreate renderables and cause flicker
         self.layout = Layout()
@@ -635,20 +702,20 @@ class RichProgressScoreboard:
         increment: int = 1,
         differences: Optional[Dict[int, Dict[str, Any]]] = None,
         description: str | None = None,
-        steps_per_sec: float | None = None,
+        games_per_sec: float | None = None,
     ) -> None:
-        if steps_per_sec is not None:
-            self.steps_per_sec = steps_per_sec
+        if games_per_sec is not None:
+            self.games_per_sec = games_per_sec
         self.current += increment
-        if steps_per_sec is None:
-            # Compute a simple running average rate (steps / second)
+        if games_per_sec is None:
+            # Compute a simple running average rate (games / second)
             dt = max(1e-6, time.perf_counter() - self._t0)
-            self.steps_per_sec = float(self.current) / dt
+            self.games_per_sec = float(self.current) / dt
         self.progress.update(
             self.task_id,
             advance=increment,
             description=description or "Evaluating...",
-            steps_per_sec=f"{self.steps_per_sec:.2f} steps/sec",
+            games_per_sec=f"{self.games_per_sec:.2f} games/sec",
         )
         # Update scoreboard only if any visible value changed
         new_key = self._scoreboard_state_key(differences)
