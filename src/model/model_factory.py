@@ -161,6 +161,10 @@ class ModelFactory:
         """
         Detects the new PPOFusedModel by checking for the unique fusion layer.
         """
+        
+        if ModelFactory.is_reactive_model(state_dict):
+            return False
+        
         def _has(key: str) -> bool:
             if key in state_dict:
                 return True
@@ -182,6 +186,26 @@ class ModelFactory:
         has_action_head = _has('action_head.weight')
 
         return has_fusion_layer and has_belief_fc and has_action_head
+
+    @staticmethod
+    def is_reactive_model(state_dict: dict) -> bool:
+        """
+        Detects the PPOReactiveModel. The key feature is the *absence* of the
+        StrategyDictionary, while still having a transformer-based architecture.
+        """
+        # A reactive model will NOT have any parameters prefixed with "strategy_dictionary."
+        has_strategy_dictionary = any(
+            k.startswith("strategy_dictionary.") for k in state_dict.keys()
+        )
+        if has_strategy_dictionary:
+            return False
+
+        # To confirm it's our reactive model, we check for other key components
+        # that it shares with the Fused model.
+        has_transformer = any(k.startswith("transformer.") for k in state_dict.keys())
+        has_action_head = any(k.startswith("action_head.") for k in state_dict.keys())
+
+        return has_transformer and has_action_head
 
     @staticmethod
     def get_belief_dimensions(state_dict):

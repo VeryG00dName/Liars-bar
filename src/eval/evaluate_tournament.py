@@ -51,7 +51,7 @@ class MatchStoppingConfig:
 
 @dataclass
 class SchedulerConfig:
-    batch_size: int = 384
+    batch_size: int = 1024
     pair_coverage_target: int = 64
     degree_cap_margin: int = 2
     max_candidate_quartets: int = 4096
@@ -59,7 +59,7 @@ class SchedulerConfig:
 
 @dataclass
 class LeagueStoppingConfig:
-    conservative_stability_k: int = 3
+    conservative_stability_k: int = 5
     enable_global: bool = True
     global_mu_threshold: float = 0.02
     global_sigma_threshold: float = 0.02
@@ -73,8 +73,6 @@ class LeagueStoppingConfig:
     avg_sigma_consecutive: int = 1
     # If True and avg-σ criterion is met, stop immediately (ignore other criteria)
     avg_sigma_sufficient: bool = False
-    # Cap refinement once coverage is complete; 0 disables the cap.
-    max_post_coverage_batches: int = 6
 
 
 @dataclass
@@ -429,7 +427,6 @@ def run_active_league(
     batch_idx = 0
     league_finished = False
     coverage_complete = False
-    refinement_batches = 0
 
     while not league_finished and batch_idx < max_batches:
         quartets, updated_usage = schedule_quartets(
@@ -493,34 +490,19 @@ def run_active_league(
                 description=f"Batch {batch_idx + 1} quartet {quartet}",
             )
 
-        just_completed_coverage = False
         if not coverage_complete:
             coverage_complete = all(
                 pair_stats.get(pair, PairStatistics()).games >= scheduler.pair_coverage_target
                 for pair in all_pairs
             )
             if coverage_complete:
-                just_completed_coverage = True
-                refinement_batches = 0
                 print(
                     f"[INFO] Coverage phase complete: every pair reached "
                     f"{scheduler.pair_coverage_target} games. Switching to refinement."
                 )
-        else:
-            refinement_batches += 1
 
         batch_idx += 1
         league_finished, _ = evaluate_league_stopping(players, tracker, league_stop)
-        if coverage_complete and not just_completed_coverage:
-            if (
-                league_stop.max_post_coverage_batches > 0
-                and refinement_batches >= league_stop.max_post_coverage_batches
-            ):
-                if not league_finished:
-                    print(
-                        f"[INFO] Refinement cap reached: {refinement_batches} batches after coverage. Stopping early."
-                    )
-                league_finished = True
 
     progress_ui.close()
     save_scoreboard(scoreboard_file, players)
@@ -568,7 +550,7 @@ def main() -> None:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=384,
+        default=1024,
         help="Target number of games to schedule per batch (used to derive quartets per batch).",
     )
     parser.add_argument(
@@ -583,14 +565,8 @@ def main() -> None:
     parser.add_argument(
         "--max-batches",
         type=int,
-        default=60,
+        default=200,
         help="Safety cap on the number of scheduling batches to run.",
-    )
-    parser.add_argument(
-        "--post-coverage-batches",
-        type=int,
-        default=6,
-        help="Maximum refinement batches to run once coverage is complete (0 disables).",
     )
     parser.add_argument(
         "--track-experts",
@@ -607,7 +583,7 @@ def main() -> None:
     parser.add_argument(
         "--conservative-stability-k",
         type=int,
-        default=3,
+        default=5,
         help="Batches the conservative order must remain unchanged before stopping.",
     )
     group_global = parser.add_mutually_exclusive_group()
@@ -702,7 +678,6 @@ def main() -> None:
         avg_sigma_top_k=args.stop_avg_sigma_top_k,
         avg_sigma_consecutive=args.stop_avg_sigma_consecutive,
         avg_sigma_sufficient=args.stop_avg_sigma_alone,
-        max_post_coverage_batches=max(0, args.post_coverage_batches),
     )
 
     expert_data, baseline_scoreboard = run_active_league(

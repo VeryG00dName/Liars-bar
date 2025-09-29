@@ -12,6 +12,8 @@ from src import config
 from src.model.model_factory import ModelFactory as MFactoryUtil
 from src.model.ppo_autoregressive_model import PPOAutoregressiveModel
 from src.model.ppo_fused_model import PPOFusedModel
+# --- NEW IMPORT ---
+from src.model.ppo_reactive_model import PPOReactiveModel
 
 __all__ = ["LearnerAutoregressiveAgent", "build_model_from_state"]
 
@@ -173,28 +175,40 @@ def build_model_from_state(
     model_state_dict: Dict[str, torch.Tensor],
     device: torch.device,
 ) -> torch.nn.Module:
-    """Reconstruct a learner model from a serialized state dict."""
-
-    is_fused = MFactoryUtil.is_fused_model(model_state_dict)
-    if is_fused:
+    """
+    Reconstruct a learner model from a serialized state dict.
+    This function is polymorphic and can identify and build either a
+    PPOFusedModel or a PPOReactiveModel.
+    """
+    # --- START OF MODIFICATIONS ---
+    if MFactoryUtil.is_reactive_model(model_state_dict):
+        ModelClass = PPOReactiveModel
+    elif MFactoryUtil.is_fused_model(model_state_dict):
         ModelClass = PPOFusedModel
     elif MFactoryUtil.is_ppo_autoregressive_model(model_state_dict):
         ModelClass = PPOAutoregressiveModel
     else:
+        # Default fallback or raise an error
+        logging.warning("Could not definitively identify model type from state_dict. Defaulting to PPOFusedModel.")
         ModelClass = PPOFusedModel
+    # --- END OF MODIFICATIONS ---
 
     try:
         inferred_obs_dim = MFactoryUtil.get_input_dim_from_state_dict(model_state_dict, "obs_encoder.0")
-        inferred_action_dim = MFactoryUtil.get_output_dim_from_state_dict(model_state_dict, "action_head")
+        # For action_head, we need to check which type of head exists. Reactive has a multi-layer one.
+        action_head_prefix = "action_head.2" if "action_head.2.weight" in model_state_dict else "action_head"
+        inferred_action_dim = MFactoryUtil.get_output_dim_from_state_dict(model_state_dict, action_head_prefix)
         inferred_hidden_dim = MFactoryUtil.get_hidden_dim_from_state_dict(model_state_dict, "obs_encoder.0")
         inferred_max_seq = model_state_dict.get("position_embedding.weight").shape[0]
         num_heads = inferred_hidden_dim // 64
-    except Exception as exc:  # pragma: no cover - defensive logging
+    except Exception as exc:
         logging.error("Failed to infer model dimensions: %s", exc, exc_info=True)
         raise
 
+    # --- START OF MODIFICATIONS ---
     extra_kwargs: Dict[str, Any] = {}
-    if is_fused:
+    # Only populate strategy dictionary kwargs if we are building a Fused model
+    if ModelClass is PPOFusedModel:
         bricks_tensor = None
         for key, tensor in model_state_dict.items():
             if key.endswith("strategy_dictionary.bricks"):
@@ -203,6 +217,7 @@ def build_model_from_state(
         if bricks_tensor is not None:
             extra_kwargs["num_bricks"], extra_kwargs["brick_dim"] = bricks_tensor.shape
         else:
+            # Fallback for older fused models that might not have the dictionary
             extra_kwargs["num_bricks"] = getattr(config, "NUM_BRICKS", 32)
             extra_kwargs["brick_dim"] = getattr(config, "BRICK_DIM", 32)
 
