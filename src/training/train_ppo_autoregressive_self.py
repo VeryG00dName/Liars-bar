@@ -52,7 +52,7 @@ SEED = int(getattr(config, "SEED", 42))
 set_seed(SEED)
 _GLOBAL_RNG = np.random.default_rng(SEED)
 
-PAD_BUCKET_BOUNDARIES = [16, 32, 64, 128, 160, 192, 256]
+PAD_BUCKET_BOUNDARIES = [32, 64, 160, 256]
 
 
 def _select_bucket_length(length: int) -> int:
@@ -635,54 +635,6 @@ def train_generation(
 
                 n_batches += 1
 
-                X_flat = metrics.get("opp_embeds_flat", None)
-                L_flat = metrics.get("opp_labels_flat", None)
-                L_orig = metrics.get("opp_labels_flat_original", None)
-                if X_flat is not None and (L_flat is not None or L_orig is not None):
-                    Xb = np.asarray(X_flat, dtype=np.float32)
-                    if Xb.ndim == 1:
-                        if Xb.size == 0:
-                            Xb = None
-                        else:
-                            Xb = Xb.reshape(1, -1)
-                    if Xb is not None and Xb.size > 0:
-                        opp_rows_X.append(Xb)
-                        labels_src = L_orig if L_orig is not None else L_flat
-                        labels_list = np.asarray(labels_src).tolist()
-                        if not isinstance(labels_list, (list, tuple)):
-                            labels_list = [labels_list]
-                        seq_labels = [int(l) for l in labels_list]
-                        opp_rows_L.extend(seq_labels)
-                else:
-                    emb = metrics.get("opp_embeds_batch", None)
-                    if emb is not None:
-                        E_np, L_np, C_np = emb
-                        B, seats, D = E_np.shape
-                        Xb = E_np.reshape(B * seats, D)
-                        counts = C_np.reshape(B * seats)
-                        good = (~np.isnan(Xb).any(axis=1)) & (counts > 0)
-                        if np.any(good):
-                            Xb = Xb[good]
-                            if L_np is not None:
-                                Lb = L_np.reshape(B * seats)[good].tolist()
-                            else:
-                                Lb = [None] * int(good.sum())
-                            opp_rows_X.append(Xb)
-                            opp_rows_L.extend(Lb)
-
-                tok_codes = metrics.get("opp_strategy_codes_tokens")
-                if tok_codes is not None:
-                    arr = np.asarray(tok_codes, dtype=np.float32)
-                    if arr.ndim == 2 and arr.size > 0:
-                        opp_token_codes.append(arr)
-                        top_idx = metrics.get("opp_activation_top_idx")
-                        if top_idx is not None:
-                            opp_token_top_idx.append(np.asarray(top_idx).reshape(-1))
-
-                avg_usage = metrics.get("avg_brick_usage_np")
-                if avg_usage is not None:
-                    avg_brick_usage_chunks.append(np.asarray(avg_usage, dtype=np.float32))
-
                 should_step = (
                     group_count >= group_target
                     or processed_minibatches == num_minibatches
@@ -955,9 +907,9 @@ def train_generation(
     torch.save({"model_state_dict": model_to_save.state_dict()}, final_path_pth)
     logging.info(f"Saved standard PyTorch checkpoint to {final_path_pth}")
 
-    # --- NEW AUTOMATED TRACING STEP ---
+
     traced_success = trace_model_from_checkpoint(final_path_pth, final_path_pt, device)
-    # --- END NEW STEP ---
+
     extra_metadata = {}
     if traced_success and os.path.exists(final_path_pt):
         extra_metadata["path_pt"] = final_path_pt

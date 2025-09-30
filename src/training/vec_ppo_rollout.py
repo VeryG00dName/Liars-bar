@@ -335,6 +335,7 @@ class PPOVecRolloutManager:
                         duration = time.perf_counter() - start
                         _record_model_call(policy_id, duration)
                 else:
+                    logging.warning("non training agent running in python")
                     request_entries = list(request_entries)
                     prepared_requests = self._prepare_requests(request_entries)
 

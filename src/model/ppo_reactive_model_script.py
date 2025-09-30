@@ -115,7 +115,7 @@ class PPOReactiveModelScript(nn.Module):
         if causal_mask.device != encoded_inputs.device:
             causal_mask = causal_mask.to(encoded_inputs.device)
         
-        key_padding = padding_mask.bool()
+        key_padding = padding_mask.to(torch.bool)
         
         transformer_output = self.transformer(
             encoded_inputs,
@@ -127,11 +127,5 @@ class PPOReactiveModelScript(nn.Module):
         action_logits = self.action_head(transformer_output)
         state_values  = self.value_head(transformer_output)
         opp_logits = self.opp_action_head(transformer_output)
-        
-        # Apply action mask for our turns
-        LARGE_NEG = torch.finfo(action_logits.dtype).min / 4.0
-        our_turns = (agent_types == 0).unsqueeze(-1)
-        invalid = (~action_masks.bool()) & our_turns
-        action_logits = action_logits.masked_fill(invalid, LARGE_NEG)
 
         return action_logits, opp_logits, state_values
