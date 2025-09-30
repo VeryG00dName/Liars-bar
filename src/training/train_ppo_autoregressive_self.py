@@ -559,11 +559,6 @@ def train_generation(
         agg = {"total_loss": 0.0}
         n_batches = 0
         opt_tokens_processed = 0
-        opp_rows_X = []  # list of np.ndarray chunks, each [N_i, D]
-        opp_rows_L = []  # flat list of remapped labels aligned with rows in opp_rows_X
-        opp_token_codes: List[np.ndarray] = []
-        opp_token_top_idx: List[np.ndarray] = []
-        avg_brick_usage_chunks: List[np.ndarray] = []
         for _ in range(k_epochs):
             batch_eps = random.sample(ep_buffer, min(len(ep_buffer), episodes_per_update))
             if not batch_eps:
@@ -710,21 +705,9 @@ def train_generation(
             "per_opponent_episode_counts": per_opponent_episode_counts,
         }
 
-        stop_requested = False
-        if metrics_callback is not None:
-            try:
-                decision = metrics_callback(update, update_summary)
-                if bool(decision):
-                    stop_requested = True
-            except Exception as exc:
-                logging.warning(f"metrics_callback raised exception at update {update}: {exc}")
-
         if collect_metrics:
             collected_updates.append(update_summary)
 
-        # NOTE: defer time scalar logging until end of logging section so we
-        # can include logging overhead in Total and a dedicated Log duration.
-        # Losses & diagnostics
         writer.add_scalar("Loss/Total", avg.get("total_loss", 0.0), update)
         writer.add_scalar("Loss/Policy", avg.get("policy_loss", 0.0), update)
         writer.add_scalar("Loss/Value", avg.get("value_loss", 0.0), update)
@@ -810,93 +793,10 @@ def train_generation(
         writer.add_scalar("Time/Log",      dur_log,  update)
         writer.add_scalar("Time/Total",    dur_tot,  update)
 
-        # Allow early stopping of the generation if requested by the callback
-        if stop_requested:
-            logging.info(f"Early stop requested at update {update}; finalizing generation '{run_name}'.")
-            break
-        
-        if (update % 50) == 0 and opp_rows_X:
-            X = np.concatenate(opp_rows_X, axis=0)            # [N, D]
-            labels_seq = np.asarray(opp_rows_L, dtype=np.int64)
-            labels_display = [str(int(seq)) for seq in labels_seq]
-
-            activation_codes = None
-            activation_labels = None
-            if opp_token_codes:
-                activation_codes = np.concatenate(opp_token_codes, axis=0)
-                if opp_token_top_idx:
-                    activation_labels = np.concatenate(opp_token_top_idx, axis=0)
-                if activation_labels is not None and activation_labels.shape[0] != activation_codes.shape[0]:
-                    activation_labels = None
-                max_samples = int(getattr(config, "PCA_TOKEN_SAMPLE_TOTAL", 4000))
-                if activation_codes.shape[0] > max_samples:
-                    rng = np.random.default_rng(update)
-                    choice = rng.choice(activation_codes.shape[0], size=max_samples, replace=False)
-                    activation_codes = activation_codes[choice]
-                    if activation_labels is not None:
-                        activation_labels = activation_labels[choice]
-
-            bricks_np = None
-            strat_dict = getattr(getattr(learner, "model", None), "strategy_dictionary", None)
-            if strat_dict is not None and hasattr(strat_dict, "bricks"):
-                with torch.no_grad():
-                    bricks_np = strat_dict.bricks.detach().cpu().float().numpy()
-
-            # Label embeddings with master and generation for clarity in TB/HTML
-            _emb_prefix = f"{master_run_name} / {run_name}"
-            pca_key = f"{_emb_prefix}__strategy_code"
-            train_extras.log_strategy_pca_views(
-                writer,
-                step=update,
-                pca_key=pca_key,
-                opponent_codes=X,
-                opponent_labels=labels_display,
-                brick_vectors=bricks_np,
-                activation_codes=activation_codes,
-                activation_labels=activation_labels,
-                title_prefix=f"{_emb_prefix} — Per-Opponent strategy_code",
-            )
-
-            metrics = train_extras.embedding_quality_metrics(X, labels_seq, k=10)
-            if metrics:
-                evr = metrics.get("pca_evr")
-                for key, value in metrics.items():
-                    if isinstance(value, np.ndarray):
-                        for i, s in enumerate(value[:8]):
-                            writer.add_scalar(f"Emb/PCA_EVR_{i+1}", float(s), update)
-                    else:
-                        writer.add_scalar(f"Emb/{key}", float(value), update)
-                if (
-                    isinstance(evr, np.ndarray)
-                    and evr.size >= 3
-                    and np.isfinite(evr[:3]).all()
-                ):
-                    ratio = float(evr[2] / max(evr[0] + evr[1], 1e-9))
-                    writer.add_scalar("Emb/PC3_vs_PC12_ratio", ratio, update)
-                    
-            html_path = os.path.join(run_ckpt_dir, f"embeddings_{run_name}_step_{update}.html")
-            try:
-                train_extras.save_interactive_3d(
-                    X, labels_display, html_path, title_prefix=_emb_prefix
-                )
-            except Exception as exc:
-                print(f"[viz][3d] failed: {exc}")
-
         if update % int(config.CHECKPOINT_INTERVAL) == 0:
             path = os.path.join(run_ckpt_dir, f"update_{update}.pth")
             to_save = getattr(learner.model, "_orig_mod", learner.model)
             torch.save({"model_state_dict": to_save.state_dict()}, path)
-
-        if avg_brick_usage_chunks:
-            stacked_usage = np.stack(avg_brick_usage_chunks)  # [num_chunks, K]
-            mean_usage = stacked_usage.mean(axis=0)           # [K]
-
-            # histogram of the whole vector (nice overview)
-            writer.add_histogram("Strategy/AvgBrickUsageHist", mean_usage, update)
-
-            # log each brick as its own scalar under one namespace
-            for i, v in enumerate(mean_usage):
-                writer.add_scalar(f"Strategy/AvgBrickUsage/brick_{i}", float(v), update)
 
     # 5. FINALIZE AND SAVE
     final_path_pth = os.path.join(run_ckpt_dir, "final.pth")
