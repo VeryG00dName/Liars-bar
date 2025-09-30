@@ -106,7 +106,7 @@ LATEST_K = 4
 # ============================
 # Split aux weights (current PPO usage)
 AUX_OPP_WEIGHT         = 1   # opponent action weight (SL is 1.0)
-VALUE_WEIGHT           = 1      # value loss weight
+VALUE_WEIGHT           = 0.5      # value loss weight
 L1_SPARSITY_WEIGHT     = 0.01
 USAGE_BALANCE_WEIGHT   = 1.0
 BRICK_DIVERSITY_WEIGHT = 1.0

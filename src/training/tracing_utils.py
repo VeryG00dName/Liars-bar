@@ -39,8 +39,8 @@ def trace_model_from_checkpoint(checkpoint_path: str, output_path: str, device: 
         example_inputs = _build_example_inputs(model_to_trace, device)
 
         with torch.no_grad():
-            traced_model = torch.jit.trace(model_to_trace, example_kwarg_inputs=example_inputs, strict=False)
-            traced_model = torch.jit.freeze(traced_model)
+            scripted_model = torch.jit.script(model_to_trace)
+            traced_model = torch.jit.freeze(scripted_model)
         # Save to CPU for portability
         traced_model_cpu = traced_model.to("cpu")
         torch.jit.save(traced_model_cpu, output_path)

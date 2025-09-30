@@ -1441,7 +1441,7 @@ def ppo_losses_batched(
     train_step_mask = our_mask & train_episode_mask.unsqueeze(1)
     heldout_step_mask = our_mask & heldout_episode_mask.unsqueeze(1)
 
-    outs_train = model(**{**mi, "return_embeddings": True, "dropout_p": dropout_p})
+    outs_train = model(**mi)
     train_loss, train_metrics, embedding_tuple = _single_pass_ppo(
         outs_train,
         batch=batch,
@@ -1494,7 +1494,7 @@ def ppo_losses_batched(
     dcp_loss = torch.zeros_like(train_loss)
     if heldout_step_mask.any():
         with _temporarily_freeze_heads(model):
-            outs_cp = model(**{**mi, "return_embeddings": True, "dropout_p": dropout_p})
+            outs_cp = model(**mi)
         dcp_loss, dcp_metrics, _ = _single_pass_ppo(
             outs_cp,
             batch=batch,

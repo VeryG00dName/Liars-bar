@@ -49,15 +49,30 @@ class LearnerAutoregressiveAgent:
         if self.model is None:
             raise RuntimeError("LearnerAutoregressiveAgent model has not been initialized.")
 
+        if "valid_lengths" not in tensor_inputs or "action_masks" not in tensor_inputs:
+            raise RuntimeError("Tensor payload missing required keys for inference.")
+
+        valid_lengths_source = tensor_inputs["valid_lengths"]
+        if not torch.is_tensor(valid_lengths_source):
+            valid_lengths_source = torch.as_tensor(valid_lengths_source)
+        max_len = int(valid_lengths_source.max().item()) if valid_lengths_source.numel() > 0 else 1
+        bucket_boundaries = [16, 32, 64, 128, 160, 192, 256]
+        target_pad_len = max_len
+        for boundary in bucket_boundaries:
+            if max_len <= boundary:
+                target_pad_len = boundary
+                break
+
         model_input: Dict[str, torch.Tensor] = {}
         for key, value in tensor_inputs.items():
             if torch.is_tensor(value):
-                model_input[key] = value.to(self.device, non_blocking=True)
+                tensor_value = value
+                if tensor_value.dim() >= 2:
+                    seq_limit = min(tensor_value.shape[1], target_pad_len)
+                    tensor_value = tensor_value[:, :seq_limit].contiguous()
+                model_input[key] = tensor_value.to(self.device, non_blocking=True)
             else:
                 model_input[key] = value
-
-        if "valid_lengths" not in model_input or "action_masks" not in model_input:
-            raise RuntimeError("Tensor payload missing required keys for inference.")
 
         with torch.inference_mode():
             action_logits, _, state_values = self.model(**model_input)

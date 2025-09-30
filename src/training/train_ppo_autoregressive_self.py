@@ -52,6 +52,15 @@ SEED = int(getattr(config, "SEED", 42))
 set_seed(SEED)
 _GLOBAL_RNG = np.random.default_rng(SEED)
 
+PAD_BUCKET_BOUNDARIES = [16, 32, 64, 128, 160, 192, 256]
+
+
+def _select_bucket_length(length: int) -> int:
+    for boundary in PAD_BUCKET_BOUNDARIES:
+        if length <= boundary:
+            return boundary
+    return int(length)
+
 FORCE_CUDA_SYNC_FOR_TIMING = bool(getattr(config, "FORCE_CUDA_SYNC_FOR_TIMING", False))
 USE_HELDOUT_AGENT = bool(getattr(config, "USE_HELDOUT_AGENT", True))
 
@@ -350,9 +359,17 @@ def train_generation(
         learner.model = learner.model.to(device)
     learner.device = device
 
+    if hasattr(torch, "compile"):
+        base_model = getattr(learner.model, "_orig_mod", learner.model)
+        if learner.model is base_model:
+            try:
+                learner.model = torch.compile(base_model)
+            except Exception as exc:
+                logging.warning(f"torch.compile failed for learner model: {exc}")
+                learner.model = base_model
+
     learner.model.train()
 
-    # --- NEW, ROBUST OPTIMIZER SETUP ---
     # Create two lists to hold parameters for weight decay and no weight decay
     decay_params = []
     no_decay_params = []
@@ -552,14 +569,31 @@ def train_generation(
             if not batch_eps:
                 continue
 
-            batch_cpu = _collate_batch(batch_eps)
-            valid_lengths_cpu = batch_cpu.get("mi", {}).get("valid_lengths")
-            if isinstance(valid_lengths_cpu, torch.Tensor):
-                opt_tokens_processed += int(valid_lengths_cpu.sum().item())
+            bucket_to_indices: Dict[int, List[int]] = {}
+            for idx, episode in enumerate(batch_eps):
+                tokens = int(episode.get("_token_count", _episode_token_count(episode)))
+                if tokens <= 0:
+                    tokens = 1
+                bucket_len = _select_bucket_length(tokens)
+                bucket_to_indices.setdefault(bucket_len, []).append(idx)
 
             minibatch_target = int(getattr(config, "PPO_MINIBATCH_SIZE", len(batch_eps)))
             minibatch_size = max(1, min(minibatch_target, len(batch_eps)))
-            num_minibatches = (len(batch_eps) + minibatch_size - 1) // minibatch_size
+
+            bucket_batches: List[List[int]] = []
+            for indices in bucket_to_indices.values():
+                if not indices:
+                    continue
+                random.shuffle(indices)
+                for start in range(0, len(indices), minibatch_size):
+                    bucket_batches.append(indices[start : start + minibatch_size])
+
+            if not bucket_batches:
+                continue
+
+            random.shuffle(bucket_batches)
+
+            num_minibatches = len(bucket_batches)
             if num_minibatches <= 0:
                 continue
 
@@ -569,9 +603,13 @@ def train_generation(
             group_count = 0
             processed_minibatches = 0
 
-            for start in range(0, len(batch_eps), minibatch_size):
-                end = min(start + minibatch_size, len(batch_eps))
-                mini_cpu = _slice_collated_batch(batch_cpu, start, end)
+            for indices in bucket_batches:
+                mini_eps = [batch_eps[i] for i in indices]
+                mini_cpu = _collate_batch(mini_eps)
+                valid_lengths_cpu = mini_cpu.get("mi", {}).get("valid_lengths")
+                if isinstance(valid_lengths_cpu, torch.Tensor):
+                    opt_tokens_processed += int(valid_lengths_cpu.sum().item())
+
                 mini_gpu = _to_device_batch(mini_cpu, device)
 
                 with amp.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == "cuda")):
@@ -649,35 +687,26 @@ def train_generation(
                     group_count >= group_target
                     or processed_minibatches == num_minibatches
                 )
-                should_step = (
-                    group_count >= group_target
-                    or processed_minibatches == num_minibatches
-                )
                 if should_step:
                     scaler.unscale_(optimizer)
-                    
-                    # --- NEW, ROBUST GRADIENT CLIPPING ---
+
                     # Clip gradients for the main part of the network
                     if main_params:
                         clip_grad_norm_(main_params, max_norm=float(config.MAX_NORM))
-                    
+
                     # Clip gradients for the auxiliary opponent head separately
                     if opp_head_params:
                         clip_grad_norm_(opp_head_params, max_norm=opp_head_max_norm)
-                    # --- END OF NEW GRADIENT CLIPPING ---
-                    
+
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad(set_to_none=True)
-                    
-                    # Reset the accumulation counters
+
                     remaining = num_minibatches - processed_minibatches
                     group_target = min(grad_accum_steps, remaining) if remaining > 0 else grad_accum_steps
                     group_count = 0
 
                 del mini_gpu, mini_cpu
-
-            del batch_cpu
         if device.type == "cuda" and FORCE_CUDA_SYNC_FOR_TIMING:
             torch.cuda.synchronize()
         t_opt_end = time.time()

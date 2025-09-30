@@ -104,7 +104,7 @@ class PPOReactiveModel(nn.Module):
     # -------------------------- forward --------------------------
 
     def forward(self, obs_sequence, action_sequence, agent_types, 
-                positions, action_masks, padding_mask, **kwargs):
+                positions, action_masks, padding_mask,valid_lengths=None):
 
         encoded_inputs = self._encode_inputs(obs_sequence, action_sequence, agent_types, positions, padding_mask)
 

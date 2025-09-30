@@ -162,6 +162,7 @@ void RolloutManager::start_rollouts(int num_episodes,
 
     episodes_.clear();
     episodes_.resize(batch_size_);
+    training_env_inactive_.assign(batch_size_, 0);
     for (int env_idx = 0; env_idx < batch_size_; ++env_idx) {
         episodes_[env_idx] = new_episode_tracker(env_idx, roles[env_idx]);
     }
@@ -188,8 +189,8 @@ std::unordered_map<int, std::vector<PolicyRequest>> RolloutManager::collect_requ
             policy_ids.push_back(kv.first);
         }
 
-        bool handled_historical = false;
-
+        bool progressed_bot = false;
+        bool bot_failure = false;
         for (int policy_id : policy_ids) {
             auto raw_it = raw.find(policy_id);
             if (raw_it == raw.end()) {
@@ -202,57 +203,100 @@ std::unordered_map<int, std::vector<PolicyRequest>> RolloutManager::collect_requ
             }
 
             auto cpp_it = cpp_bot_registry_.find(policy_id);
-            if (cpp_it != cpp_bot_registry_.end()) {
-                bool success = false;
-                try {
-                    auto actions = run_cpp_bot(policy_id, requests);
-                    arena_.submit_actions(policy_id, actions);
-                    handled_historical = true;
-                    success = true;
-                } catch (const std::exception& ex) {
-                    std::cerr << "[RolloutManager] Native C++ bot execution failed for policy "
-                              << policy_id << ": " << ex.what() << std::endl;
-                } catch (...) {
-                    std::cerr << "[RolloutManager] Native C++ bot execution failed for policy "
-                              << policy_id << ": unknown error" << std::endl;
-                }
-
-                if (!success) {
-                    auto& dst = learner_requests[policy_id];
-                    dst.insert(dst.end(), requests.begin(), requests.end());
-                }
+            if (cpp_it == cpp_bot_registry_.end()) {
                 continue;
             }
 
-            auto model_it = historical_models_.find(policy_id);
-            if (model_it != historical_models_.end() && model_it->second) {
-                bool success = false;
-                try {
-                    auto actions = run_historical_inference(*model_it->second, requests);
-                    arena_.submit_actions(policy_id, actions);
-                    handled_historical = true;
-                    success = true;
-                } catch (const std::exception& ex) {
-                    std::cerr << "[RolloutManager] Historical inference failed for policy " << policy_id
-                              << ": " << ex.what() << std::endl;
-                } catch (...) {
-                    std::cerr << "[RolloutManager] Historical inference failed for policy " << policy_id
-                              << ": unknown error" << std::endl;
-                }
+            bool success = false;
+            try {
+                auto actions = run_cpp_bot(policy_id, requests);
+                arena_.submit_actions(policy_id, actions);
+                progressed_bot = true;
+                success = true;
+            } catch (const std::exception& ex) {
+                std::cerr << "[RolloutManager] Native C++ bot execution failed for policy "
+                          << policy_id << ": " << ex.what() << std::endl;
+            } catch (...) {
+                std::cerr << "[RolloutManager] Native C++ bot execution failed for policy "
+                          << policy_id << ": unknown error" << std::endl;
+            }
 
-                if (!success) {
-                    auto& dst = learner_requests[policy_id];
-                    dst.insert(dst.end(), requests.begin(), requests.end());
-                }
-            } else {
+            if (!success) {
                 auto& dst = learner_requests[policy_id];
                 dst.insert(dst.end(), requests.begin(), requests.end());
+                bot_failure = true;
             }
         }
 
-        if (!handled_historical || !learner_requests.empty()) {
+        if (bot_failure) {
             break;
         }
+        if (progressed_bot) {
+            continue;
+        }
+
+        int best_policy = -1;
+        size_t best_count = 0;
+        const std::vector<PolicyRequest>* best_requests = nullptr;
+        for (int policy_id : policy_ids) {
+            if (policy_id == training_policy_id_) {
+                continue;
+            }
+            auto model_it = historical_models_.find(policy_id);
+            if (model_it == historical_models_.end() || !model_it->second) {
+                continue;
+            }
+            auto raw_it = raw.find(policy_id);
+            if (raw_it == raw.end()) {
+                continue;
+            }
+            const auto& requests = raw_it->second;
+            if (requests.empty()) {
+                continue;
+            }
+            if (requests.size() > best_count) {
+                best_count = requests.size();
+                best_policy = policy_id;
+                best_requests = &requests;
+            }
+        }
+
+        if (best_policy >= 0 && best_requests != nullptr) {
+            bool success = false;
+            try {
+                auto actions = run_historical_inference(*historical_models_[best_policy], *best_requests);
+                arena_.submit_actions(best_policy, actions);
+                success = true;
+            } catch (const std::exception& ex) {
+                std::cerr << "[RolloutManager] Historical inference failed for policy " << best_policy
+                          << ": " << ex.what() << std::endl;
+            } catch (...) {
+                std::cerr << "[RolloutManager] Historical inference failed for policy " << best_policy
+                          << ": unknown error" << std::endl;
+            }
+
+            if (!success && best_requests != nullptr) {
+                auto& dst = learner_requests[best_policy];
+                dst.insert(dst.end(), best_requests->begin(), best_requests->end());
+                break;
+            }
+
+            continue;
+        }
+
+        for (int policy_id : policy_ids) {
+            auto raw_it = raw.find(policy_id);
+            if (raw_it == raw.end()) {
+                continue;
+            }
+            const auto& requests = raw_it->second;
+            if (requests.empty()) {
+                continue;
+            }
+            auto& dst = learner_requests[policy_id];
+            dst.insert(dst.end(), requests.begin(), requests.end());
+        }
+        break;
     }
 
     return learner_requests;
@@ -502,6 +546,19 @@ void RolloutManager::set_training_device(const std::string& device_str) {
     }
 }
 
+void RolloutManager::mark_training_env_inactive(int env_idx) {
+    if (env_idx < 0) {
+        return;
+    }
+    if (env_idx >= static_cast<int>(training_env_inactive_.size())) {
+        training_env_inactive_.resize(env_idx + 1, 0);
+    }
+    training_env_inactive_[env_idx] = 1;
+    if (env_idx >= 0 && env_idx < static_cast<int>(arena_.done.size())) {
+        arena_.done[env_idx] = 1;
+    }
+}
+
 std::vector<uint8_t> RolloutManager::run_historical_inference(torch::jit::Module& module,
                                                               const std::vector<PolicyRequest>& requests) {
     if (requests.empty()) {
@@ -517,21 +574,34 @@ std::vector<uint8_t> RolloutManager::run_historical_inference(torch::jit::Module
         max_len = std::max(max_len, len);
     }
 
+    static const std::array<int64_t, 7> kBucketBounds{{16, 32, 64, 128, 160, 192, 256}};
+    int64_t target_pad_len = max_len;
+    for (int64_t bound : kBucketBounds) {
+        if (max_len <= bound) {
+            target_pad_len = bound;
+            break;
+        }
+    }
+    if (max_len > kBucketBounds.back()) {
+        target_pad_len = std::max<int64_t>(max_len, kBucketBounds.back());
+    }
+    target_pad_len = std::min<int64_t>(target_pad_len, static_cast<int64_t>(MAX_LEN));
+
     auto opts_float_cpu = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
     auto opts_long_cpu = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
     auto opts_bool_cpu = torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU);
 
-    auto obs_sequence = torch::zeros({batch_size, max_len, OBS_DIM}, opts_float_cpu);
-    auto action_sequence = torch::zeros({batch_size, max_len}, opts_long_cpu);
-    auto agent_types = torch::zeros({batch_size, max_len}, opts_long_cpu);
-    auto positions = torch::zeros({batch_size, max_len}, opts_long_cpu);
-    auto action_masks = torch::zeros({batch_size, max_len, 7}, opts_bool_cpu);
-    auto padding_mask = torch::zeros({batch_size, max_len}, opts_bool_cpu);
+    auto obs_sequence = torch::zeros({batch_size, target_pad_len, OBS_DIM}, opts_float_cpu);
+    auto action_sequence = torch::zeros({batch_size, target_pad_len}, opts_long_cpu);
+    auto agent_types = torch::zeros({batch_size, target_pad_len}, opts_long_cpu);
+    auto positions = torch::zeros({batch_size, target_pad_len}, opts_long_cpu);
+    auto action_masks = torch::zeros({batch_size, target_pad_len, 7}, opts_bool_cpu);
+    auto padding_mask = torch::zeros({batch_size, target_pad_len}, opts_bool_cpu);
     auto valid_lengths = torch::zeros({batch_size}, opts_long_cpu);
 
     for (int64_t b = 0; b < batch_size; ++b) {
         const auto& req = requests[static_cast<size_t>(b)];
-        const int64_t requested_len = std::max<int64_t>(0, std::min<int64_t>(req.valid_len, max_len));
+        const int64_t requested_len = std::max<int64_t>(0, std::min<int64_t>(req.valid_len, target_pad_len));
         const int64_t used_len = std::max<int64_t>(1, requested_len);
 
         valid_lengths[b] = used_len;
@@ -591,7 +661,7 @@ std::vector<uint8_t> RolloutManager::run_historical_inference(torch::jit::Module
         }
 
         bool* pad_ptr = padding_mask[b].data_ptr<bool>();
-        for (int64_t t = used_len; t < max_len; ++t) {
+        for (int64_t t = used_len; t < target_pad_len; ++t) {
             pad_ptr[t] = true;
         }
     }
@@ -951,6 +1021,15 @@ void RolloutManager::log_rewards_and_dones() {
 
         update_penalty_rewards(tracker, env.penalties);
 
+        if (tracker.is_training_episode && tracker.training_agent_seat >= 0 &&
+            tracker.training_agent_seat < env.num_players()) {
+            if (env.terminations[tracker.training_agent_seat]) {
+                mark_training_env_inactive(tracker.env_idx);
+                finalize_episode(tracker);
+                continue;
+            }
+        }
+
         if (arena_.done[tracker.env_idx]) {
             finalize_episode(tracker);
         }
@@ -1009,6 +1088,7 @@ void RolloutManager::finalize_episode(EpisodeTracker& tracker) {
     tracker.data.episode_return = std::accumulate(tracker.data.reward.begin(), tracker.data.reward.end(), 0.0);
 
     if (tracker.is_training_episode) {
+        mark_training_env_inactive(tracker.env_idx);
         completed_buffer_.push_back(std::move(tracker.data));
         tracker.data = TrajectoryData{};
     }
