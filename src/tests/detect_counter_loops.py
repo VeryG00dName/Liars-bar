@@ -93,7 +93,7 @@ def johnson_simple_cycles(adj: Graph,
                 if min_len <= len(stack) <= max_len:
                     yield list(stack)
                 f = True
-            elif not blocked.get(w, False):
+            elif len(stack) < max_len and not blocked.get(w, False):
                 for cyc in circuit(start, w):
                     yield cyc
                     f = True
@@ -113,6 +113,16 @@ def johnson_simple_cycles(adj: Graph,
         B = {u: set() for u in eligible}
         for cyc in circuit(s, s) or []:
             yield cyc
+
+def is_chordless(cyc, adj):
+    k = len(cyc)
+    nodes = set(cyc)
+    for i, u in enumerate(cyc):
+        allowed = {cyc[(i+1)%k], cyc[(i-1)%k]}  # only next/prev on the ring
+        for v in adj.get(u, {}):
+            if v in nodes and v not in allowed:
+                return False
+    return True
 
 # --------------------------- Cycle scoring --------------------------
 
@@ -141,33 +151,77 @@ def main():
     ap.add_argument("--min-len", type=int, default=3, help="Minimum cycle length [default: 3]")
     ap.add_argument("--max-len", type=int, default=8, help="Maximum cycle length [default: 8]")
     ap.add_argument("--dot", type=str, default=None, help="Optional path to write GraphViz .dot")
+    ap.add_argument("--prefer-run", type=str, default=None,
+                    help="Run/test ID to prioritize (e.g. 'test40'). Cycles fully within this run are shown first, then mixed, then none.")
     args = ap.parse_args()
 
     M = load_matrix(args.csv, percent=args.percent)
     G = build_graph(M, threshold=args.threshold)
 
-    # Optional GraphViz export
-    if args.dot:
-        with open(args.dot, "w", encoding="utf-8") as f:
-            f.write("digraph G {\n")
-            for u, nbrs in G.items():
-                for v, e in nbrs.items():
-                    f.write(f'  "{u}" -> "{v}" [label="{e.margin:.3f} / p={e.p:.3f}"];\n')
-            f.write("}\n")
-        print(f"Wrote {args.dot}")
-
     # Find and score cycles
     cycles = list(johnson_simple_cycles(G, min_len=args.min_len, max_len=args.max_len))
+    cycles = [c for c in cycles if is_chordless(c, G)]
     scored: List[Tuple[float, List[str]]] = [
         (cycle_bottleneck_margin(c, G), c) for c in cycles
     ]
-    scored.sort(key=lambda x: (-x[0], len(x[1]), x[1]))
+
+    if args.dot:
+        # collect edges that appear in the kept cycles
+        edges_in_cycles = {
+            (u, v)
+            for cyc in cycles
+            for (u, v) in zip(cyc, cyc[1:] + cyc[:1])
+        }
+        nodes_in_cycles = {u for (u, v) in edges_in_cycles} | {v for (u, v) in edges_in_cycles}
+
+        with open(args.dot, "w", encoding="utf-8") as f:
+            f.write("digraph G {\n")
+            # optional: explicitly declare nodes (helps if you later style nodes)
+            for u in sorted(nodes_in_cycles):
+                f.write(f'  "{u}";\n')
+            # only edges that belong to chordless cycles
+            for (u, v) in sorted(edges_in_cycles):
+                e = G[u][v]
+                f.write(f'  "{u}" -> "{v}" [label="{e.margin:.3f} / p={e.p:.3f}"];\n')
+            f.write("}\n")
+        print(f'Wrote {args.dot} (from {len(cycles)} chordless cycles, {len(edges_in_cycles)} edges)')
+    
+    # Prioritized sorting: cycles within preferred run, then mixed (include it), then none
+    def cycle_runs(cyc: List[str]) -> set[str]:
+        return {parse_run_and_gen(n)[0] for n in cyc}
+
+    def group_key(cyc: List[str]) -> int:
+        if not args.prefer_run:
+            return 1  # neutral grouping when no preference
+        runs = cycle_runs(cyc)
+        if runs == {args.prefer_run}:
+            return 0  # only preferred run
+        if args.prefer_run in runs:
+            return 1  # mixed
+        return 2      # none from preferred
+
+    scored.sort(key=lambda x: (group_key(x[1]), -x[0], len(x[1]), x[1]))
 
     if not scored:
         print("No counter cycles found with current threshold.")
     else:
-        print(f"Found {len(scored)} cycles (showing top 32):\n")
+        hdr = f"Found {len(scored)} cycles (showing top 32)"
+        if args.prefer_run:
+            hdr += f" [prioritized for '{args.prefer_run}']"
+        print(hdr + ":\n")
+
+        last_group = None
         for i, (marg, cyc) in enumerate(scored[:32], 1):
+            if args.prefer_run:
+                g = group_key(cyc)
+                if g != last_group:
+                    titles = {
+                        0: f"== Cycles within {args.prefer_run} ==",
+                        1: f"== Mixed cycles (include {args.prefer_run}) ==",
+                        2: f"== Cycles with no strategies from {args.prefer_run} ==",
+                    }
+                    print(titles[g])
+                    last_group = g
             edges = [f"{u}→{v} ({G[u][v].margin:+.3f})" for u, v in zip(cyc, cyc[1:] + cyc[:1])]
             print(f"#{i:02d}  length={len(cyc)}  bottleneck_margin={marg:.3f}  cycle: {'  '.join(edges)}")
 
