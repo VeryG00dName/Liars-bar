@@ -7,6 +7,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -118,7 +119,7 @@ RolloutManager::RolloutManager()
 
 void RolloutManager::start_rollouts(int num_episodes,
                                     int num_players,
-                                    int training_policy_id,
+                                    const std::vector<int>& training_policy_ids,
                                     int max_batch_envs,
                                     uint32_t seed,
                                     const std::vector<int>& cpp_bots,
@@ -126,9 +127,13 @@ void RolloutManager::start_rollouts(int num_episodes,
                                     const std::vector<int>& active_shadow_agents,
                                     double front_mass,
                                     double shadow_mass) {
-    target_episodes_ = num_episodes;
+    target_episodes_ = num_episodes * std::max(1, num_players);
     num_players_ = num_players;
-    training_policy_id_ = training_policy_id;
+    training_policy_ids_ = training_policy_ids;
+    training_policy_id_set_.clear();
+    for (int id : training_policy_ids_) {
+        training_policy_id_set_.insert(id);
+    }
     completed_buffer_.clear();
     pending_step_data_.clear();
 
@@ -147,13 +152,16 @@ void RolloutManager::start_rollouts(int num_episodes,
     arena_.reset(batch_size_, num_players_, rng_());
 
     std::vector<int> front_pool = latest_historical_agents;
+    for (int training_id : training_policy_ids_) {
+        front_pool.push_back(training_id);
+    }
 
     std::vector<int> shadow_pool = active_shadow_agents;
     shadow_pool.insert(shadow_pool.end(), cpp_bots.begin(), cpp_bots.end());
 
     auto roles = build_roles(batch_size_,
                              num_players_,
-                             training_policy_id_,
+                             training_policy_ids_,
                              front_pool,
                              shadow_pool,
                              front_mass,
@@ -163,8 +171,10 @@ void RolloutManager::start_rollouts(int num_episodes,
     episodes_.clear();
     episodes_.resize(batch_size_);
     training_env_inactive_.assign(batch_size_, 0);
+    active_training_counts_.assign(batch_size_, 0);
     for (int env_idx = 0; env_idx < batch_size_; ++env_idx) {
         episodes_[env_idx] = new_episode_tracker(env_idx, roles[env_idx]);
+        active_training_counts_[env_idx] = static_cast<int>(episodes_[env_idx].training_seats.size());
     }
 
     for (auto& kv : cpp_bot_registry_) {
@@ -239,32 +249,54 @@ std::unordered_map<int, std::vector<PolicyRequest>> RolloutManager::collect_requ
         size_t best_count = 0;
         const std::vector<PolicyRequest>* best_requests = nullptr;
         for (int policy_id : policy_ids) {
-            if (policy_id == training_policy_id_) {
+            if (is_training_policy(policy_id)) {
                 continue;
             }
-            auto model_it = historical_models_.find(policy_id);
-            if (model_it == historical_models_.end() || !model_it->second) {
-                continue;
-            }
+
             auto raw_it = raw.find(policy_id);
             if (raw_it == raw.end()) {
                 continue;
             }
+
             const auto& requests = raw_it->second;
             if (requests.empty()) {
                 continue;
             }
-            if (requests.size() > best_count) {
-                best_count = requests.size();
+
+            auto model_it = historical_models_.find(policy_id);
+            if (model_it == historical_models_.end() || !model_it->second) {
+                continue;
+            }
+
+            const size_t request_count = requests.size();
+            if (best_policy < 0 || request_count > best_count) {
                 best_policy = policy_id;
+                best_count = request_count;
                 best_requests = &requests;
             }
         }
 
-        if (best_policy >= 0 && best_requests != nullptr) {
+        if (best_policy < 0 || best_requests == nullptr) {
+            for (int policy_id : policy_ids) {
+                auto raw_it = raw.find(policy_id);
+                if (raw_it == raw.end()) {
+                    continue;
+                }
+                const auto& requests = raw_it->second;
+                if (requests.empty()) {
+                    continue;
+                }
+                auto& dst = learner_requests[policy_id];
+                dst.insert(dst.end(), requests.begin(), requests.end());
+            }
+            break;
+        }
+
+        auto model_it = historical_models_.find(best_policy);
+        if (model_it != historical_models_.end() && model_it->second) {
             bool success = false;
             try {
-                auto actions = run_historical_inference(*historical_models_[best_policy], *best_requests);
+                auto actions = run_historical_inference(*model_it->second, *best_requests);
                 arena_.submit_actions(best_policy, actions);
                 success = true;
             } catch (const std::exception& ex) {
@@ -330,35 +362,41 @@ void RolloutManager::submit_inference_results_array(int policy_id,
         const bool has_log_probs = (log_probs != nullptr) && (log_prob_count >= count);
         const bool has_values = (values != nullptr) && (value_count >= count);
 
-        for (size_t i = 0; i < count; ++i) {
-            const int env_idx = reqs[i].env;
-            const int seat = reqs[i].seat;
-            if (env_idx < 0 || env_idx >= static_cast<int>(episodes_.size())) {
-                continue;
-            }
-            EpisodeTracker& tracker = episodes_[env_idx];
-            if (tracker.done) {
-                continue;
-            }
-            if (!tracker.is_training_episode || seat != tracker.training_agent_seat ||
-                policy_id != training_policy_id_) {
-                continue;
-            }
+        if (is_training_policy(policy_id)) {
+            for (size_t i = 0; i < count; ++i) {
+                const int env_idx = reqs[i].env;
+                const int seat = reqs[i].seat;
+                if (env_idx < 0 || env_idx >= static_cast<int>(episodes_.size())) {
+                    continue;
+                }
+                EpisodeTracker& tracker = episodes_[env_idx];
+                if (tracker.done) {
+                    continue;
+                }
+                auto seat_it = tracker.training_seats.find(seat);
+                if (seat_it == tracker.training_seats.end()) {
+                    continue;
+                }
+                SeatTrajectory& seat_tracker = seat_it->second;
+                if (!seat_tracker.active || seat_tracker.policy_id != policy_id) {
+                    continue;
+                }
 
-            const int step_idx = append_step_row(tracker, seat);
-            if (step_idx >= 0 && step_idx < static_cast<int>(tracker.data.our_action.size()) &&
-                actions != nullptr && i < action_count) {
-                tracker.data.our_action[step_idx] = static_cast<int>(actions[i]);
-            }
+                const int step_idx = append_training_step(seat_tracker);
+                if (step_idx >= 0 && step_idx < static_cast<int>(seat_tracker.data.our_action.size()) &&
+                    actions != nullptr && i < action_count) {
+                    seat_tracker.data.our_action[step_idx] = static_cast<int>(actions[i]);
+                }
 
-            PendingStepData pending{};
-            pending.log_prob = (has_log_probs ? log_probs[i] : 0.0f);
-            pending.value = (has_values ? values[i] : 0.0f);
-            if (env_idx >= 0 && env_idx < static_cast<int>(arena_.envs.size()) &&
-                seat >= 0 && seat < arena_.envs[env_idx].num_players()) {
-                pending.penalties_used = static_cast<int>(arena_.envs[env_idx].penalties[seat]);
+                PendingStepData pending{};
+                pending.log_prob = (has_log_probs ? log_probs[i] : 0.0f);
+                pending.value = (has_values ? values[i] : 0.0f);
+                if (env_idx >= 0 && env_idx < static_cast<int>(arena_.envs.size()) &&
+                    seat >= 0 && seat < arena_.envs[env_idx].num_players()) {
+                    pending.penalties_used = static_cast<int>(arena_.envs[env_idx].penalties[seat]);
+                }
+                pending_step_data_[pending_key(env_idx, seat)] = pending;
             }
-            pending_step_data_[env_idx] = pending;
         }
     }
 
@@ -553,10 +591,82 @@ void RolloutManager::mark_training_env_inactive(int env_idx) {
     if (env_idx >= static_cast<int>(training_env_inactive_.size())) {
         training_env_inactive_.resize(env_idx + 1, 0);
     }
-    training_env_inactive_[env_idx] = 1;
-    if (env_idx >= 0 && env_idx < static_cast<int>(arena_.done.size())) {
-        arena_.done[env_idx] = 1;
+    if (!training_env_inactive_[env_idx]) {
+        training_env_inactive_[env_idx] = 1;
+        if (env_idx < static_cast<int>(arena_.done.size())) {
+            arena_.done[env_idx] = 1;
+        }
     }
+}
+
+void RolloutManager::finalize_seat(EpisodeTracker& tracker, SeatTrajectory& seat_tracker, Env& env) {
+    if (!seat_tracker.active) {
+        return;
+    }
+
+    update_penalty_rewards(seat_tracker, env.penalties);
+
+    auto it_pending = pending_step_data_.find(pending_key(tracker.env_idx, seat_tracker.seat));
+    if (it_pending != pending_step_data_.end()) {
+        const int idx = seat_tracker.last_training_step_idx;
+        if (idx >= 0 && idx < static_cast<int>(seat_tracker.data.log_prob.size())) {
+            seat_tracker.data.log_prob[idx] = it_pending->second.log_prob;
+            seat_tracker.data.value[idx] = it_pending->second.value;
+            seat_tracker.data.penalties_used[idx] = it_pending->second.penalties_used;
+        }
+        pending_step_data_.erase(it_pending);
+    }
+
+    int our_last_step_idx = -1;
+    for (int i = static_cast<int>(seat_tracker.data.agent_id.size()) - 1; i >= 0; --i) {
+        if (seat_tracker.data.agent_id[i] == seat_tracker.seat) {
+            our_last_step_idx = i;
+            break;
+        }
+    }
+
+    int alive = 0;
+    for (int p = 0; p < env.num_players(); ++p) {
+        if (!env.terminations[p]) {
+            ++alive;
+        }
+    }
+    const bool seat_alive = seat_tracker.seat >= 0 && seat_tracker.seat < env.num_players() &&
+                            !env.terminations[seat_tracker.seat];
+    const bool is_winner = seat_alive && alive == 1;
+    seat_tracker.data.win = is_winner ? 1 : 0;
+
+    if (our_last_step_idx >= 0 && our_last_step_idx < static_cast<int>(seat_tracker.data.reward.size())) {
+        seat_tracker.data.reward[our_last_step_idx] += is_winner ? 1.0 : -1.0;
+    }
+
+    seat_tracker.data.episode_return =
+        std::accumulate(seat_tracker.data.reward.begin(), seat_tracker.data.reward.end(), 0.0);
+
+    completed_buffer_.push_back(std::move(seat_tracker.data));
+    seat_tracker.data = TrajectoryData{};
+    seat_tracker.active = false;
+    seat_tracker.last_training_step_idx = -1;
+    seat_tracker.last_penalties.fill(0);
+
+    if (tracker.env_idx >= 0 && tracker.env_idx < static_cast<int>(active_training_counts_.size())) {
+        int& count = active_training_counts_[tracker.env_idx];
+        if (count > 0) {
+            --count;
+        }
+        if (count <= 0) {
+            mark_training_env_inactive(tracker.env_idx);
+        }
+    }
+}
+
+uint64_t RolloutManager::pending_key(int env_idx, int seat) const {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(env_idx)) << 32) ^
+           static_cast<uint32_t>(seat & 0xFFFFFFFF);
+}
+
+bool RolloutManager::is_training_policy(int policy_id) const {
+    return training_policy_id_set_.find(policy_id) != training_policy_id_set_.end();
 }
 
 std::vector<uint8_t> RolloutManager::run_historical_inference(torch::jit::Module& module,
@@ -567,169 +677,175 @@ std::vector<uint8_t> RolloutManager::run_historical_inference(torch::jit::Module
 
     torch::NoGradGuard no_grad;
 
-    const int64_t batch_size = static_cast<int64_t>(requests.size());
-    int64_t max_len = 1;
-    for (const auto& req : requests) {
-        const int64_t len = std::max<int64_t>(1, std::min<int64_t>(req.valid_len, MAX_LEN));
-        max_len = std::max(max_len, len);
+    static const std::array<int64_t, 4> kBucketBounds{{32, 64, 160, 256}};
+    auto select_bucket = [&](int64_t length) -> int64_t {
+        const int64_t clamped = std::max<int64_t>(1, std::min<int64_t>(length, MAX_LEN));
+        for (int64_t bound : kBucketBounds) {
+            if (clamped <= bound) {
+                return std::min<int64_t>(bound, MAX_LEN);
+            }
+        }
+        return std::min<int64_t>(static_cast<int64_t>(MAX_LEN), kBucketBounds.back());
+    };
+
+    std::map<int64_t, std::vector<size_t>> bucket_indices;
+    for (size_t idx = 0; idx < requests.size(); ++idx) {
+        const auto& req = requests[idx];
+        const int64_t bucket = select_bucket(req.valid_len);
+        bucket_indices[bucket].push_back(idx);
     }
 
-    static const std::array<int64_t, 7> kBucketBounds{{16, 32, 64, 128, 160, 192, 256}};
-    int64_t target_pad_len = max_len;
-    for (int64_t bound : kBucketBounds) {
-        if (max_len <= bound) {
-            target_pad_len = bound;
-            break;
-        }
-    }
-    if (max_len > kBucketBounds.back()) {
-        target_pad_len = std::max<int64_t>(max_len, kBucketBounds.back());
-    }
-    target_pad_len = std::min<int64_t>(target_pad_len, static_cast<int64_t>(MAX_LEN));
+    std::vector<uint8_t> chosen(requests.size(), 0);
 
     auto opts_float_cpu = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
     auto opts_long_cpu = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
     auto opts_bool_cpu = torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU);
-
-    auto obs_sequence = torch::zeros({batch_size, target_pad_len, OBS_DIM}, opts_float_cpu);
-    auto action_sequence = torch::zeros({batch_size, target_pad_len}, opts_long_cpu);
-    auto agent_types = torch::zeros({batch_size, target_pad_len}, opts_long_cpu);
-    auto positions = torch::zeros({batch_size, target_pad_len}, opts_long_cpu);
-    auto action_masks = torch::zeros({batch_size, target_pad_len, 7}, opts_bool_cpu);
-    auto padding_mask = torch::zeros({batch_size, target_pad_len}, opts_bool_cpu);
-    auto valid_lengths = torch::zeros({batch_size}, opts_long_cpu);
-
-    for (int64_t b = 0; b < batch_size; ++b) {
-        const auto& req = requests[static_cast<size_t>(b)];
-        const int64_t requested_len = std::max<int64_t>(0, std::min<int64_t>(req.valid_len, target_pad_len));
-        const int64_t used_len = std::max<int64_t>(1, requested_len);
-
-        valid_lengths[b] = used_len;
-
-        float* obs_ptr = obs_sequence[b].data_ptr<float>();
-        int64_t* act_ptr = action_sequence[b].data_ptr<int64_t>();
-        int64_t* agent_ptr = agent_types[b].data_ptr<int64_t>();
-        int64_t* pos_ptr = positions[b].data_ptr<int64_t>();
-        bool* mask_ptr = action_masks[b].data_ptr<bool>();
-
-        const float* req_obs_ptr = req.obs_sequence.empty() ? nullptr : req.obs_sequence.data();
-        const int64_t* req_action_ptr = req.action_sequence.empty() ? nullptr : req.action_sequence.data();
-        const int64_t* req_agent_ptr = req.agent_type_sequence.empty() ? nullptr : req.agent_type_sequence.data();
-        const int64_t* req_pos_ptr = req.position_sequence.empty() ? nullptr : req.position_sequence.data();
-        const uint8_t* req_mask_ptr = req.action_mask_sequence.empty() ? nullptr : req.action_mask_sequence.data();
-
-        const int64_t obs_rows = req_obs_ptr ? static_cast<int64_t>(req.obs_sequence.size()) / OBS_DIM : 0;
-        const int64_t mask_rows = req_mask_ptr ? static_cast<int64_t>(req.action_mask_sequence.size()) / 7 : 0;
-        const int64_t action_rows = req_action_ptr ? static_cast<int64_t>(req.action_sequence.size()) : 0;
-        const int64_t agent_rows = req_agent_ptr ? static_cast<int64_t>(req.agent_type_sequence.size()) : 0;
-        const int64_t pos_rows = req_pos_ptr ? static_cast<int64_t>(req.position_sequence.size()) : 0;
-
-        for (int64_t t = 0; t < requested_len; ++t) {
-            float* dst_obs = obs_ptr + t * OBS_DIM;
-            if (req_obs_ptr && t < obs_rows) {
-                std::memcpy(dst_obs, req_obs_ptr + t * OBS_DIM, sizeof(float) * OBS_DIM);
-            } else {
-                std::memset(dst_obs, 0, sizeof(float) * OBS_DIM);
-            }
-
-            act_ptr[t] = (req_action_ptr && t < action_rows) ? req_action_ptr[t] : 0;
-            agent_ptr[t] = (req_agent_ptr && t < agent_rows) ? req_agent_ptr[t] : 0;
-            pos_ptr[t] = (req_pos_ptr && t < pos_rows) ? req_pos_ptr[t] : t;
-
-            bool* step_mask = mask_ptr + t * 7;
-            if (req_mask_ptr && t < mask_rows) {
-                const uint8_t* src_mask = req_mask_ptr + t * 7;
-                for (int j = 0; j < 7; ++j) {
-                    step_mask[j] = src_mask[j] != 0;
-                }
-            } else {
-                for (int j = 0; j < 7; ++j) {
-                    step_mask[j] = false;
-                }
-            }
-        }
-
-        if (requested_len == 0) {
-            bool* step_mask = mask_ptr;
-            for (int j = 0; j < 7; ++j) {
-                step_mask[j] = req.mask[j] != 0;
-            }
-        }
-
-        for (int64_t t = requested_len; t < used_len; ++t) {
-            pos_ptr[t] = t;
-        }
-
-        bool* pad_ptr = padding_mask[b].data_ptr<bool>();
-        for (int64_t t = used_len; t < target_pad_len; ++t) {
-            pad_ptr[t] = true;
-        }
-    }
-
     auto opts_long_device = torch::TensorOptions().dtype(torch::kInt64).device(kInferenceDevice);
 
-    obs_sequence = obs_sequence.to(kInferenceDevice);
-    action_sequence = action_sequence.to(kInferenceDevice);
-    agent_types = agent_types.to(kInferenceDevice);
-    positions = positions.to(kInferenceDevice);
-    action_masks = action_masks.to(kInferenceDevice);
-    padding_mask = padding_mask.to(kInferenceDevice);
-    auto valid_lengths_device = valid_lengths.to(kInferenceDevice);
+    for (const auto& [target_pad_len_raw, indices] : bucket_indices) {
+        if (indices.empty()) {
+            continue;
+        }
+        const int64_t target_pad_len = std::min<int64_t>(target_pad_len_raw, MAX_LEN);
+        const int64_t batch_size = static_cast<int64_t>(indices.size());
 
-    std::vector<torch::jit::IValue> inputs;
-    inputs.reserve(6);
-    inputs.emplace_back(obs_sequence);
-    inputs.emplace_back(action_sequence);
-    inputs.emplace_back(agent_types);
-    inputs.emplace_back(positions);
-    inputs.emplace_back(action_masks);
-    inputs.emplace_back(padding_mask);
+        auto obs_sequence = torch::zeros({batch_size, target_pad_len, OBS_DIM}, opts_float_cpu);
+        auto action_sequence = torch::zeros({batch_size, target_pad_len}, opts_long_cpu);
+        auto agent_types = torch::zeros({batch_size, target_pad_len}, opts_long_cpu);
+        auto positions = torch::zeros({batch_size, target_pad_len}, opts_long_cpu);
+        auto action_masks = torch::zeros({batch_size, target_pad_len, 7}, opts_bool_cpu);
+        auto padding_mask = torch::zeros({batch_size, target_pad_len}, opts_bool_cpu);
+        auto valid_lengths = torch::zeros({batch_size}, opts_long_cpu);
 
-    auto outputs = module.forward(inputs).toTuple();
-    if (!outputs || outputs->elements().size() < 3) {
-        throw std::runtime_error("Historical model returned unexpected output shape");
-    }
+        for (int64_t b = 0; b < batch_size; ++b) {
+            const auto& req = requests[indices[static_cast<size_t>(b)]];
+            const int64_t requested_len = std::max<int64_t>(0, std::min<int64_t>(req.valid_len, target_pad_len));
+            const int64_t used_len = std::max<int64_t>(1, requested_len);
 
-    auto action_logits = outputs->elements()[0].toTensor().contiguous();
-    (void)outputs->elements()[2].toTensor(); // ensure tensor materializes even if unused
+            valid_lengths[b] = used_len;
 
-    auto batch_indices = torch::arange(batch_size, opts_long_device);
-    auto last_indices = (valid_lengths_device - 1).clamp_min(0);
-    auto last_logits = action_logits.index({batch_indices, last_indices}).contiguous();
-    auto last_masks = action_masks.index({batch_indices, last_indices}).contiguous();
+            float* obs_ptr = obs_sequence[b].data_ptr<float>();
+            int64_t* act_ptr = action_sequence[b].data_ptr<int64_t>();
+            int64_t* agent_ptr = agent_types[b].data_ptr<int64_t>();
+            int64_t* pos_ptr = positions[b].data_ptr<int64_t>();
+            bool* mask_ptr = action_masks[b].data_ptr<bool>();
 
-    auto has_legal = last_masks.any(1);
-    if (!has_legal.all().item<bool>()) {
-        auto fallback_indices = has_legal.logical_not().nonzero().flatten();
-        for (int64_t i = 0; i < fallback_indices.size(0); ++i) {
-            const int64_t row = fallback_indices[i].item<int64_t>();
-            auto mask_row_tensor = last_masks.select(0, row);
-            mask_row_tensor.fill_(false);
-            bool assigned = false;
-            const auto& req = requests[static_cast<size_t>(row)];
-            for (int j = 0; j < 7; ++j) {
-                if (req.mask[j]) {
-                    mask_row_tensor.index_put_({j}, true);
-                    assigned = true;
+            const float* req_obs_ptr = req.obs_sequence.empty() ? nullptr : req.obs_sequence.data();
+            const int64_t* req_action_ptr = req.action_sequence.empty() ? nullptr : req.action_sequence.data();
+            const int64_t* req_agent_ptr = req.agent_type_sequence.empty() ? nullptr : req.agent_type_sequence.data();
+            const int64_t* req_pos_ptr = req.position_sequence.empty() ? nullptr : req.position_sequence.data();
+            const uint8_t* req_mask_ptr = req.action_mask_sequence.empty() ? nullptr : req.action_mask_sequence.data();
+
+            const int64_t obs_rows = req_obs_ptr ? static_cast<int64_t>(req.obs_sequence.size()) / OBS_DIM : 0;
+            const int64_t mask_rows = req_mask_ptr ? static_cast<int64_t>(req.action_mask_sequence.size()) / 7 : 0;
+            const int64_t action_rows = req_action_ptr ? static_cast<int64_t>(req.action_sequence.size()) : 0;
+            const int64_t agent_rows = req_agent_ptr ? static_cast<int64_t>(req.agent_type_sequence.size()) : 0;
+            const int64_t pos_rows = req_pos_ptr ? static_cast<int64_t>(req.position_sequence.size()) : 0;
+
+            for (int64_t t = 0; t < requested_len; ++t) {
+                float* dst_obs = obs_ptr + t * OBS_DIM;
+                if (req_obs_ptr && t < obs_rows) {
+                    std::memcpy(dst_obs, req_obs_ptr + t * OBS_DIM, sizeof(float) * OBS_DIM);
+                } else {
+                    std::memset(dst_obs, 0, sizeof(float) * OBS_DIM);
+                }
+
+                act_ptr[t] = (req_action_ptr && t < action_rows) ? req_action_ptr[t] : 0;
+                agent_ptr[t] = (req_agent_ptr && t < agent_rows) ? req_agent_ptr[t] : 0;
+                pos_ptr[t] = (req_pos_ptr && t < pos_rows) ? req_pos_ptr[t] : t;
+
+                bool* step_mask = mask_ptr + t * 7;
+                if (req_mask_ptr && t < mask_rows) {
+                    const uint8_t* src_mask = req_mask_ptr + t * 7;
+                    for (int j = 0; j < 7; ++j) {
+                        step_mask[j] = src_mask[j] != 0;
+                    }
+                } else {
+                    for (int j = 0; j < 7; ++j) {
+                        step_mask[j] = false;
+                    }
                 }
             }
-            if (!assigned) {
-                mask_row_tensor.fill_(true);
+
+            if (requested_len == 0) {
+                bool* step_mask = mask_ptr;
+                for (int j = 0; j < 7; ++j) {
+                    step_mask[j] = req.mask[j] != 0;
+                }
             }
-            last_logits.select(0, row).fill_(0.0f);
+
+            for (int64_t t = requested_len; t < used_len; ++t) {
+                pos_ptr[t] = t;
+            }
+
+            bool* pad_ptr = padding_mask[b].data_ptr<bool>();
+            for (int64_t t = used_len; t < target_pad_len; ++t) {
+                pad_ptr[t] = true;
+            }
         }
-    }
 
-    last_logits.masked_fill_(~last_masks, -std::numeric_limits<float>::infinity());
+        obs_sequence = obs_sequence.to(kInferenceDevice);
+        action_sequence = action_sequence.to(kInferenceDevice);
+        agent_types = agent_types.to(kInferenceDevice);
+        positions = positions.to(kInferenceDevice);
+        action_masks = action_masks.to(kInferenceDevice);
+        padding_mask = padding_mask.to(kInferenceDevice);
+        auto valid_lengths_device = valid_lengths.to(kInferenceDevice);
 
-    auto probs = torch::softmax(last_logits, /*dim=*/1);
-    auto actions_tensor = torch::multinomial(probs, /*num_samples=*/1);
-    actions_tensor = actions_tensor.squeeze(-1).to(torch::kCPU);
+        std::vector<torch::jit::IValue> inputs;
+        inputs.reserve(6);
+        inputs.emplace_back(obs_sequence);
+        inputs.emplace_back(action_sequence);
+        inputs.emplace_back(agent_types);
+        inputs.emplace_back(positions);
+        inputs.emplace_back(action_masks);
+        inputs.emplace_back(padding_mask);
 
-    auto actions_ptr = actions_tensor.data_ptr<int64_t>();
-    std::vector<uint8_t> chosen(static_cast<size_t>(batch_size));
-    for (int64_t b = 0; b < batch_size; ++b) {
-        chosen[static_cast<size_t>(b)] = static_cast<uint8_t>(actions_ptr[b]);
+        auto outputs = module.forward(inputs).toTuple();
+        if (!outputs || outputs->elements().size() < 3) {
+            throw std::runtime_error("Historical model returned unexpected output shape");
+        }
+
+        auto action_logits = outputs->elements()[0].toTensor().contiguous();
+        (void)outputs->elements()[2].toTensor();
+
+        auto batch_indices = torch::arange(batch_size, opts_long_device);
+        auto last_indices = (valid_lengths_device - 1).clamp_min(0);
+        auto last_logits = action_logits.index({batch_indices, last_indices}).contiguous();
+        auto last_masks = action_masks.index({batch_indices, last_indices}).contiguous();
+
+        auto has_legal = last_masks.any(1);
+        if (!has_legal.all().item<bool>()) {
+            auto fallback_indices = has_legal.logical_not().nonzero().flatten();
+            for (int64_t i = 0; i < fallback_indices.size(0); ++i) {
+                const int64_t row = fallback_indices[i].item<int64_t>();
+                auto mask_row_tensor = last_masks.select(0, row);
+                mask_row_tensor.fill_(false);
+                bool assigned = false;
+                const auto& req = requests[indices[static_cast<size_t>(row)]];
+                for (int j = 0; j < 7; ++j) {
+                    if (req.mask[j]) {
+                        mask_row_tensor.index_put_({j}, true);
+                        assigned = true;
+                    }
+                }
+                if (!assigned) {
+                    mask_row_tensor.fill_(true);
+                }
+                last_logits.select(0, row).fill_(0.0f);
+            }
+        }
+
+        last_logits.masked_fill_(~last_masks, -std::numeric_limits<float>::infinity());
+
+        auto probs = torch::softmax(last_logits, /*dim=*/1);
+        auto actions_tensor = torch::multinomial(probs, /*num_samples=*/1);
+        actions_tensor = actions_tensor.squeeze(-1).to(torch::kCPU);
+
+        auto actions_ptr = actions_tensor.data_ptr<int64_t>();
+        for (int64_t b = 0; b < batch_size; ++b) {
+            chosen[indices[static_cast<size_t>(b)]] = static_cast<uint8_t>(actions_ptr[b]);
+        }
     }
 
     return chosen;
@@ -818,12 +934,14 @@ std::unique_ptr<CppBotBase> RolloutManager::make_cpp_bot_instance(RolloutManager
 
 std::vector<std::vector<int>> RolloutManager::build_roles(int batch_size,
                                                           int num_players,
-                                                          int training_policy_id,
+                                                          const std::vector<int>& training_policy_ids,
                                                           const std::vector<int>& front_agents,
                                                           const std::vector<int>& shadow_agents,
                                                           double front_mass,
                                                           double shadow_mass) {
-    std::vector<std::vector<int>> roles(batch_size, std::vector<int>(num_players, training_policy_id));
+    const int fallback_training_id =
+        training_policy_ids.empty() ? training_policy_id() : training_policy_ids.front();
+    std::vector<std::vector<int>> roles(batch_size, std::vector<int>(num_players, fallback_training_id));
     if (batch_size <= 0 || num_players <= 0) {
         return roles;
     }
@@ -852,7 +970,7 @@ std::vector<std::vector<int>> RolloutManager::build_roles(int batch_size,
     std::vector<int> opponent_pool = front;
     opponent_pool.insert(opponent_pool.end(), shadow.begin(), shadow.end());
     if (opponent_pool.empty()) {
-        opponent_pool.push_back(training_policy_id);
+        opponent_pool.push_back(fallback_training_id);
     }
 
     const size_t pool_size = opponent_pool.size();
@@ -887,7 +1005,8 @@ std::vector<std::vector<int>> RolloutManager::build_roles(int batch_size,
         }
     }
 
-    const int num_opponents = std::max(0, num_players - 1);
+    const int training_slots = std::min<int>(std::max<int>(1, static_cast<int>(training_policy_ids.size())), num_players);
+    const int num_opponents = std::max(0, num_players - training_slots);
     std::vector<int> seats(num_players);
     std::iota(seats.begin(), seats.end(), 0);
 
@@ -895,11 +1014,22 @@ std::vector<std::vector<int>> RolloutManager::build_roles(int batch_size,
 
     for (int b = 0; b < batch_size; ++b) {
         std::shuffle(seats.begin(), seats.end(), rng_);
-        const int training_seat = seats.front();
-        roles[b][training_seat] = training_policy_id;
+        std::vector<int> assignments = training_policy_ids;
+        if (assignments.empty()) {
+            assignments.push_back(fallback_training_id);
+        }
+        std::shuffle(assignments.begin(), assignments.end(), rng_);
+        if (static_cast<int>(assignments.size()) > training_slots) {
+            assignments.resize(training_slots);
+        } else if (static_cast<int>(assignments.size()) < training_slots) {
+            assignments.resize(training_slots, assignments.back());
+        }
+        for (int slot = 0; slot < training_slots; ++slot) {
+            roles[b][seats[slot]] = assignments[slot];
+        }
 
         for (int opponent_idx = 0; opponent_idx < num_opponents; ++opponent_idx) {
-            const int seat = seats[opponent_idx + 1];
+            const int seat = seats[opponent_idx + training_slots];
             const int choice = opponent_pool[sampler(rng_)];
             roles[b][seat] = choice;
         }
@@ -911,65 +1041,73 @@ std::vector<std::vector<int>> RolloutManager::build_roles(int batch_size,
 EpisodeTracker RolloutManager::new_episode_tracker(int env_idx, const std::vector<int>& roles) {
     EpisodeTracker tracker;
     tracker.env_idx = env_idx;
-    tracker.training_policy_id = training_policy_id_;
-    tracker.data.env_index = env_idx;
-    tracker.data.training_policy_id = training_policy_id_;
-    tracker.data.player_policy_ids = roles;
+    tracker.last_history_len = 0;
+    tracker.last_processed_history_len = 0;
 
-    int seat = -1;
     for (size_t i = 0; i < roles.size(); ++i) {
-        if (roles[i] == training_policy_id_) {
-            seat = static_cast<int>(i);
-            break;
+        const int policy_id = roles[i];
+        if (training_policy_id_set_.find(policy_id) == training_policy_id_set_.end()) {
+            continue;
         }
+        SeatTrajectory seat_tracker;
+        seat_tracker.seat = static_cast<int>(i);
+        seat_tracker.policy_id = policy_id;
+        seat_tracker.active = true;
+        seat_tracker.last_training_step_idx = -1;
+        seat_tracker.last_penalties.fill(0);
+        seat_tracker.data.env_index = env_idx;
+        seat_tracker.data.training_policy_id = policy_id;
+        seat_tracker.data.training_agent_seat = static_cast<int>(i);
+        seat_tracker.data.player_policy_ids = roles;
+        tracker.training_seats.emplace(seat_tracker.seat, std::move(seat_tracker));
     }
-    if (seat >= 0) {
-        tracker.is_training_episode = true;
-        tracker.training_agent_seat = seat;
-        tracker.data.training_agent_seat = seat;
-    } else {
-        tracker.is_training_episode = false;
-        tracker.training_agent_seat = -1;
-        tracker.data.training_agent_seat = -1;
-    }
-
-    tracker.last_penalties.fill(0);
 
     return tracker;
 }
 
-int RolloutManager::append_step_row(EpisodeTracker& tracker, int seat) {
-    tracker.data.agent_id.push_back(seat);
-    tracker.data.our_action.push_back(-1);
-    tracker.data.log_prob.push_back(0.0f);
-    tracker.data.value.push_back(0.0f);
-    tracker.data.reward.push_back(0.0);
-    tracker.data.done.push_back(0);
-    tracker.data.opp_target_action.push_back(-1);
-    tracker.data.penalties_used.push_back(0);
-    const int idx = static_cast<int>(tracker.data.agent_id.size()) - 1;
-    if (seat == tracker.training_agent_seat) {
-        tracker.last_training_step_idx = idx;
-    }
+int RolloutManager::append_training_step(SeatTrajectory& seat_tracker) {
+    seat_tracker.data.agent_id.push_back(seat_tracker.seat);
+    seat_tracker.data.our_action.push_back(-1);
+    seat_tracker.data.log_prob.push_back(0.0f);
+    seat_tracker.data.value.push_back(0.0f);
+    seat_tracker.data.reward.push_back(0.0);
+    seat_tracker.data.done.push_back(0);
+    seat_tracker.data.opp_target_action.push_back(-1);
+    seat_tracker.data.penalties_used.push_back(0);
+    const int idx = static_cast<int>(seat_tracker.data.agent_id.size()) - 1;
+    seat_tracker.last_training_step_idx = idx;
     return idx;
 }
 
-void RolloutManager::update_penalty_rewards(EpisodeTracker& tracker, const std::array<uint8_t, Env::MAX_PLAYERS>& penalties) {
-    if (!tracker.is_training_episode) {
-        tracker.last_penalties = penalties;
+int RolloutManager::append_opponent_step(SeatTrajectory& seat_tracker, int seat) {
+    seat_tracker.data.agent_id.push_back(seat);
+    seat_tracker.data.our_action.push_back(-1);
+    seat_tracker.data.log_prob.push_back(0.0f);
+    seat_tracker.data.value.push_back(0.0f);
+    seat_tracker.data.reward.push_back(0.0);
+    seat_tracker.data.done.push_back(0);
+    seat_tracker.data.opp_target_action.push_back(-1);
+    seat_tracker.data.penalties_used.push_back(0);
+    return static_cast<int>(seat_tracker.data.agent_id.size()) - 1;
+}
+
+void RolloutManager::update_penalty_rewards(SeatTrajectory& seat_tracker,
+                                            const std::array<uint8_t, Env::MAX_PLAYERS>& penalties) {
+    const int seat = seat_tracker.seat;
+    if (!seat_tracker.active || seat < 0 || seat >= static_cast<int>(penalties.size())) {
+        seat_tracker.last_penalties = penalties;
         return;
     }
 
-    const int seat = tracker.training_agent_seat;
-    const int last_idx = tracker.last_training_step_idx;
-    if (seat < 0 || last_idx < 0 || last_idx >= static_cast<int>(tracker.data.reward.size())) {
-        tracker.last_penalties = penalties;
+    const int last_idx = seat_tracker.last_training_step_idx;
+    if (last_idx < 0 || last_idx >= static_cast<int>(seat_tracker.data.reward.size())) {
+        seat_tracker.last_penalties = penalties;
         return;
     }
 
     double delta_total = 0.0;
     for (size_t i = 0; i < penalties.size(); ++i) {
-        const int diff = static_cast<int>(penalties[i]) - static_cast<int>(tracker.last_penalties[i]);
+        const int diff = static_cast<int>(penalties[i]) - static_cast<int>(seat_tracker.last_penalties[i]);
         if (diff <= 0) {
             continue;
         }
@@ -980,9 +1118,9 @@ void RolloutManager::update_penalty_rewards(EpisodeTracker& tracker, const std::
         }
     }
     if (delta_total != 0.0) {
-        tracker.data.reward[last_idx] += delta_total;
+        seat_tracker.data.reward[last_idx] += delta_total;
     }
-    tracker.last_penalties = penalties;
+    seat_tracker.last_penalties = penalties;
 }
 
 void RolloutManager::log_rewards_and_dones() {
@@ -998,40 +1136,63 @@ void RolloutManager::log_rewards_and_dones() {
             for (const auto& entry : history) {
                 tracker.last_history_len += 1;
                 const int actor = entry.player;
-                if (tracker.is_training_episode && actor == tracker.training_agent_seat) {
-                    auto it_pending = pending_step_data_.find(tracker.env_idx);
-                    if (it_pending != pending_step_data_.end()) {
-                        const int idx = tracker.last_training_step_idx;
-                        if (idx >= 0 && idx < static_cast<int>(tracker.data.log_prob.size())) {
-                            tracker.data.log_prob[idx] = it_pending->second.log_prob;
-                            tracker.data.value[idx] = it_pending->second.value;
-                            tracker.data.penalties_used[idx] = it_pending->second.penalties_used;
-                        }
-                        pending_step_data_.erase(it_pending);
+                for (auto& kv : tracker.training_seats) {
+                    SeatTrajectory& seat_tracker = kv.second;
+                    if (!seat_tracker.active) {
+                        continue;
                     }
-                } else {
-                    const int idx = append_step_row(tracker, actor);
-                    if (idx >= 0 && idx < static_cast<int>(tracker.data.opp_target_action.size())) {
-                        tracker.data.opp_target_action[idx] = static_cast<int>(entry.action);
+                    if (seat_tracker.seat == actor) {
+                        auto it_pending = pending_step_data_.find(pending_key(tracker.env_idx, seat_tracker.seat));
+                        if (it_pending != pending_step_data_.end()) {
+                            const int idx = seat_tracker.last_training_step_idx;
+                            if (idx >= 0 && idx < static_cast<int>(seat_tracker.data.log_prob.size())) {
+                                seat_tracker.data.log_prob[idx] = it_pending->second.log_prob;
+                                seat_tracker.data.value[idx] = it_pending->second.value;
+                                seat_tracker.data.penalties_used[idx] = it_pending->second.penalties_used;
+                            }
+                            pending_step_data_.erase(it_pending);
+                        }
+                    } else {
+                        const int idx = append_opponent_step(seat_tracker, actor);
+                        if (idx >= 0 && idx < static_cast<int>(seat_tracker.data.opp_target_action.size())) {
+                            seat_tracker.data.opp_target_action[idx] = static_cast<int>(entry.action);
+                        }
                     }
                 }
             }
             tracker.last_processed_history_len = total_len;
         }
 
-        update_penalty_rewards(tracker, env.penalties);
-
-        if (tracker.is_training_episode && tracker.training_agent_seat >= 0 &&
-            tracker.training_agent_seat < env.num_players()) {
-            if (env.terminations[tracker.training_agent_seat]) {
-                mark_training_env_inactive(tracker.env_idx);
-                finalize_episode(tracker);
+        for (auto& kv : tracker.training_seats) {
+            SeatTrajectory& seat_tracker = kv.second;
+            if (!seat_tracker.active) {
                 continue;
+            }
+            update_penalty_rewards(seat_tracker, env.penalties);
+        }
+
+        const bool env_done = arena_.done[tracker.env_idx];
+        for (auto& kv : tracker.training_seats) {
+            SeatTrajectory& seat_tracker = kv.second;
+            if (!seat_tracker.active) {
+                continue;
+            }
+            const bool seat_terminated = seat_tracker.seat >= 0 && seat_tracker.seat < env.num_players() &&
+                                         env.terminations[seat_tracker.seat];
+            if (seat_terminated || env_done) {
+                finalize_seat(tracker, seat_tracker, env);
             }
         }
 
-        if (arena_.done[tracker.env_idx]) {
-            finalize_episode(tracker);
+        bool any_active = false;
+        for (const auto& kv : tracker.training_seats) {
+            if (kv.second.active) {
+                any_active = true;
+                break;
+            }
+        }
+        if (!any_active) {
+            tracker.done = true;
         }
     }
 }
@@ -1040,57 +1201,17 @@ void RolloutManager::finalize_episode(EpisodeTracker& tracker) {
     if (tracker.done) {
         return;
     }
-    tracker.done = true;
-
     if (tracker.env_idx < 0 || tracker.env_idx >= static_cast<int>(arena_.envs.size())) {
+        tracker.done = true;
         return;
     }
     Env& env = arena_.envs[tracker.env_idx];
 
-    update_penalty_rewards(tracker, env.penalties);
-
-    auto it_pending = pending_step_data_.find(tracker.env_idx);
-    if (it_pending != pending_step_data_.end()) {
-        if (!tracker.data.agent_id.empty() && tracker.last_training_step_idx >= 0 &&
-            tracker.last_training_step_idx < static_cast<int>(tracker.data.agent_id.size()) &&
-            tracker.data.agent_id[tracker.last_training_step_idx] == tracker.training_agent_seat) {
-            const int idx = tracker.last_training_step_idx;
-            tracker.data.log_prob[idx] = it_pending->second.log_prob;
-            tracker.data.value[idx] = it_pending->second.value;
-            tracker.data.penalties_used[idx] = it_pending->second.penalties_used;
-        }
-        pending_step_data_.erase(it_pending);
+    for (auto& kv : tracker.training_seats) {
+        SeatTrajectory& seat_tracker = kv.second;
+        finalize_seat(tracker, seat_tracker, env);
     }
 
-    int our_last_step_idx = -1;
-    for (int i = static_cast<int>(tracker.data.agent_id.size()) - 1; i >= 0; --i) {
-        if (tracker.data.agent_id[i] == tracker.training_agent_seat) {
-            our_last_step_idx = i;
-            break;
-        }
-    }
-
-    int alive = 0;
-    for (int p = 0; p < env.num_players(); ++p) {
-        if (!env.terminations[p]) {
-            ++alive;
-        }
-    }
-    const bool is_winner = tracker.is_training_episode && tracker.training_agent_seat >= 0 &&
-                           !env.terminations[tracker.training_agent_seat] &&
-                           alive == 1;
-    tracker.data.win = is_winner ? 1 : 0;
-
-    if (our_last_step_idx >= 0 && our_last_step_idx < static_cast<int>(tracker.data.reward.size())) {
-        tracker.data.reward[our_last_step_idx] += is_winner ? 1.0 : -1.0;
-    }
-
-    tracker.data.episode_return = std::accumulate(tracker.data.reward.begin(), tracker.data.reward.end(), 0.0);
-
-    if (tracker.is_training_episode) {
-        mark_training_env_inactive(tracker.env_idx);
-        completed_buffer_.push_back(std::move(tracker.data));
-        tracker.data = TrajectoryData{};
-    }
+    tracker.done = true;
 }
 

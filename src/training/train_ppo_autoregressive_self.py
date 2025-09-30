@@ -2,6 +2,7 @@
 
 import os, logging, warnings
 import json
+import math
 import time
 from datetime import datetime
 from pathlib import Path
@@ -509,6 +510,7 @@ def train_generation(
     episodes_per_update = int(config.EPISODES_PER_UPDATE)
     k_epochs = int(config.K_EPOCHS)
     max_batch_envs = int(getattr(config, "EPISODES_PER_UPDATE", 512))
+    num_players = int(getattr(config, "NUM_PLAYERS", 4))
     buffer_mult = int(getattr(config, "OFFPOLICY_EP_BUFFER_MULT", 4))
     buffer_capacity = buffer_mult * episodes_per_update
     ep_buffer: List[Dict[str, Any]] = []
@@ -521,12 +523,19 @@ def train_generation(
         # -------- Rollout --------
         t0 = time.time()
         learner.model.eval()
+        front_opponents = getattr(rollout_manager, "_latest_historical_agents", [])
+        max_extra_learners = min(len(front_opponents), max(0, num_players - 1))
+        estimated_learners_per_game = 1 + max_extra_learners
+        games_to_collect = max(1, math.ceil(episodes_per_update / estimated_learners_per_game))
+        training_ids_for_rollout = [training_policy_id]
         new_eps = rollout_manager.collect_episodes(
-            num_episodes=episodes_per_update,
+            num_episodes=games_to_collect,
             num_players=4,
-            training_policy_id=training_policy_id,
+            training_policy_ids=training_ids_for_rollout,
             max_batch_envs=max_batch_envs,
         )
+        if len(new_eps) > episodes_per_update:
+            new_eps = new_eps[:episodes_per_update]
         if device.type == "cuda" and FORCE_CUDA_SYNC_FOR_TIMING:
             torch.cuda.synchronize()
         t_roll = time.time()
@@ -559,6 +568,7 @@ def train_generation(
         agg = {"total_loss": 0.0}
         n_batches = 0
         opt_tokens_processed = 0
+
         for _ in range(k_epochs):
             batch_eps = random.sample(ep_buffer, min(len(ep_buffer), episodes_per_update))
             if not batch_eps:
@@ -669,7 +679,7 @@ def train_generation(
         # -------- Log metrics (timed) --------
         t_log_start = time.time()
         avg = {k: (v / max(n_batches, 1)) for k, v in agg.items()}
-        win_rate = sum(ep["win"] for ep in new_eps) / len(new_eps)
+        win_rate = sum(ep["win"] for ep in new_eps) / max(len(new_eps), 1)
         per_opponent_totals: Dict[Any, List[float]] = {}
         for ep in new_eps:
             opp_labels = ep.get("true_opponent_labels", ())
@@ -752,7 +762,7 @@ def train_generation(
             acc[0] += float(wins_vs)
             acc[1] += float(total)
         
-        heldout_candidates = [lab for lab in per_opponent_totals_int.keys() if lab > BOT_MAX_ID]
+        heldout_candidates = [lab for lab in per_opponent_totals_int.keys() if lab > BOT_MAX_ID and lab != training_policy_id]
         if heldout_candidates:
             heldout_label = max(heldout_candidates)
             hw, ht = per_opponent_totals_int[heldout_label]

@@ -91,7 +91,7 @@ void bind_rollout_manager(py::module_& m) {
         .def("start_rollouts", &RolloutManager::start_rollouts,
              py::arg("num_episodes"),
              py::arg("num_players"),
-             py::arg("training_policy_id"),
+             py::arg("training_policy_ids"),
              py::arg("max_batch_envs"),
              py::arg("seed"),
              py::arg("cpp_bots"),
@@ -103,7 +103,6 @@ void bind_rollout_manager(py::module_& m) {
         .def("collect_requests_for_inference", [](RolloutManager& self) {
             auto grouped = self.collect_requests_for_inference();
             py::dict out;
-            const int training_id = self.training_policy_id();
             for (auto const& [policy_id, req_vec] : grouped) {
                 py::dict payload;
                 py::list req_list;
@@ -111,7 +110,7 @@ void bind_rollout_manager(py::module_& m) {
                     req_list.append(policy_request_to_dict(req));
                 }
                 payload["requests"] = req_list;
-                if (policy_id == training_id && !req_vec.empty()) {
+                if (self.is_training_policy(policy_id) && !req_vec.empty()) {
                     auto prepared = self.prepare_training_batch(req_vec);
                     payload["tensors"] = prepared_batch_to_dict(prepared);
                 } else {

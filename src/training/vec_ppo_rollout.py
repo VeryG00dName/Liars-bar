@@ -1,6 +1,6 @@
 # src/training/vec_ppo_rollout.py
 
-from typing import Dict, Any, List, Optional, Set
+from typing import Dict, Any, List, Optional, Sequence, Set
 import logging
 from types import SimpleNamespace
 import time
@@ -235,7 +235,8 @@ class PPOVecRolloutManager:
         self,
         num_episodes: int,
         num_players: int,
-        training_policy_id: int = 0,
+        training_policy_id: Optional[int] = None,
+        training_policy_ids: Optional[Sequence[int]] = None,
         max_batch_envs: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         self._reset_policy_state()
@@ -256,6 +257,19 @@ class PPOVecRolloutManager:
                 stats["min"] = float(duration)
             if duration > stats["max"]:
                 stats["max"] = float(duration)
+
+        if training_policy_ids is not None:
+            training_policy_list = [int(pid) for pid in training_policy_ids]
+        elif training_policy_id is not None:
+            training_policy_list = [int(training_policy_id)]
+        else:
+            training_policy_list = [0]
+
+        if not training_policy_list:
+            training_policy_list = [0]
+
+        training_policy_set = {int(pid) for pid in training_policy_list}
+        effective_training_slots = max(1, len(training_policy_list))
 
         cpp_bots = list(self._cpp_bots)
         latest_historical_agents = list(self._latest_historical_agents)
@@ -278,7 +292,7 @@ class PPOVecRolloutManager:
         self.rollout_manager.start_rollouts(
             num_episodes,
             num_players,
-            training_policy_id,
+            training_policy_list,
             max_batch,
             seed,
             cpp_bots,
@@ -312,7 +326,7 @@ class PPOVecRolloutManager:
                     request_entries = payload
 
                 if tensors_payload and hasattr(agent, "compute_actions"):
-                    if policy_id != training_policy_id:
+                    if policy_id not in training_policy_set:
                         raise RuntimeError(
                             "Received tensor payload for non-training policy %s." % policy_id
                         )
@@ -368,7 +382,7 @@ class PPOVecRolloutManager:
                 else:
                     values_arr = None
 
-                if policy_id == training_policy_id:
+                if policy_id in training_policy_set:
                     self.rollout_manager.submit_inference_results(
                         policy_id,
                         actions_arr,
@@ -396,4 +410,4 @@ class PPOVecRolloutManager:
             for pid, stats in model_call_stats.items()
         }
 
-        return episodes[:num_episodes]
+        return episodes[: num_episodes * effective_training_slots]

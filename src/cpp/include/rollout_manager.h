@@ -9,6 +9,7 @@
 #include <random>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <torch/script.h>
@@ -38,19 +39,21 @@ struct TrajectoryData {
     int win{0};
 };
 
+struct SeatTrajectory {
+    int seat{-1};
+    int policy_id{-1};
+    bool active{false};
+    int last_training_step_idx{-1};
+    std::array<uint8_t, Env::MAX_PLAYERS> last_penalties{};
+    TrajectoryData data;
+};
+
 struct EpisodeTracker {
     int env_idx{-1};
     bool done{false};
-    bool is_training_episode{false};
-    int training_policy_id{-1};
-    int training_agent_seat{-1};
-
     int last_history_len{0};
     int last_processed_history_len{0};
-    int last_training_step_idx{-1};
-    std::array<uint8_t, Env::MAX_PLAYERS> last_penalties{};
-
-    TrajectoryData data;
+    std::unordered_map<int, SeatTrajectory> training_seats;
 };
 
 struct PendingStepData {
@@ -77,7 +80,7 @@ public:
 
     void start_rollouts(int num_episodes,
                         int num_players,
-                        int training_policy_id,
+                        const std::vector<int>& training_policy_ids,
                         int max_batch_envs = -1,
                         uint32_t seed = 0,
                         const std::vector<int>& cpp_bots = {},
@@ -108,7 +111,11 @@ public:
 
     PreparedBatch prepare_training_batch(const std::vector<PolicyRequest>& requests) const;
     void set_training_device(const std::string& device_str);
-    int training_policy_id() const { return training_policy_id_; }
+    int training_policy_id() const {
+        return training_policy_ids_.empty() ? -1 : training_policy_ids_.front();
+    }
+    const std::vector<int>& training_policy_ids() const { return training_policy_ids_; }
+    bool is_training_policy(int policy_id) const;
 
     const torch::Device& training_device() const { return training_device_; }
 
@@ -132,30 +139,36 @@ private:
     int target_episodes_{0};
     int batch_size_{0};
     int num_players_{0};
-    int training_policy_id_{-1};
+    std::vector<int> training_policy_ids_{};
+    std::unordered_set<int> training_policy_id_set_{};
     std::mt19937 rng_;
     torch::Device training_device_{torch::kCPU};
 
     std::vector<EpisodeTracker> episodes_;
-    std::unordered_map<int, PendingStepData> pending_step_data_;
+    std::unordered_map<uint64_t, PendingStepData> pending_step_data_;
     std::vector<TrajectoryData> completed_buffer_;
     std::unordered_map<int, std::shared_ptr<torch::jit::Module>> historical_models_;
     std::unordered_map<int, CppBotRegistryEntry> cpp_bot_registry_;
     std::vector<uint8_t> training_env_inactive_;
+    std::vector<int> active_training_counts_;
 
     std::vector<std::vector<int>> build_roles(int batch_size,
                                               int num_players,
-                                              int training_policy_id,
+                                              const std::vector<int>& training_policy_ids,
                                               const std::vector<int>& front_agents,
                                               const std::vector<int>& shadow_agents,
                                               double front_mass,
                                               double shadow_mass);
     EpisodeTracker new_episode_tracker(int env_idx, const std::vector<int>& roles);
-    int append_step_row(EpisodeTracker& tracker, int seat);
-    void update_penalty_rewards(EpisodeTracker& tracker, const std::array<uint8_t, Env::MAX_PLAYERS>& penalties);
+    int append_training_step(SeatTrajectory& seat_tracker);
+    int append_opponent_step(SeatTrajectory& seat_tracker, int seat);
+    void update_penalty_rewards(SeatTrajectory& seat_tracker,
+                                const std::array<uint8_t, Env::MAX_PLAYERS>& penalties);
     void log_rewards_and_dones();
     void finalize_episode(EpisodeTracker& tracker);
     void mark_training_env_inactive(int env_idx);
+    void finalize_seat(EpisodeTracker& tracker, SeatTrajectory& seat_tracker, Env& env);
+    uint64_t pending_key(int env_idx, int seat) const;
     std::vector<uint8_t> run_historical_inference(torch::jit::Module& module,
                                                   const std::vector<PolicyRequest>& requests);
     std::vector<uint8_t> run_cpp_bot(int policy_id, const std::vector<PolicyRequest>& requests);
