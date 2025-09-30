@@ -14,6 +14,7 @@ from src.model.ppo_autoregressive_model import PPOAutoregressiveModel
 from src.model.ppo_fused_model import PPOFusedModel
 # --- NEW IMPORT ---
 from src.model.ppo_reactive_model import PPOReactiveModel
+from src.model.ppo_reactive_model_script import PPOReactiveModelScript
 
 __all__ = ["LearnerAutoregressiveAgent", "build_model_from_state"]
 
@@ -21,14 +22,14 @@ __all__ = ["LearnerAutoregressiveAgent", "build_model_from_state"]
 class LearnerAutoregressiveAgent:
     """Wrapper that keeps learner state on the target training device."""
 
-    def __init__(self, device: torch.device, player_id: str):
+    def __init__(self, device: torch.device, player_id: str, compile: bool = False):
         self.device = device
         self.player_id = player_id
         self.model: Optional[torch.nn.Module] = None
         self.label: int = -1
         self.max_seq_length: Optional[int] = None
         self._last_inputs: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
-
+        self.compile = compile
     def reset(self) -> None:
         self._last_inputs.clear()
 
@@ -197,7 +198,9 @@ class LearnerAutoregressiveAgent:
         model_state_dict = checkpoint["policy_nets"][agent_key]
 
         # --- NEW, ROBUST ARCHITECTURE DETECTION ---
-        if MFactoryUtil.is_reactive_model(model_state_dict):
+        if self.compile:
+            ModelClass = PPOReactiveModelScript
+        elif MFactoryUtil.is_reactive_model(model_state_dict):
             ModelClass = PPOReactiveModel
         elif MFactoryUtil.is_fused_model(model_state_dict):
             ModelClass = PPOFusedModel

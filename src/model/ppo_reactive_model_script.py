@@ -1,9 +1,9 @@
-# src/model/ppo_reactive_model.py
+# src/model/ppo_reactive_model_script.py
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
+from typing import Optional, Tuple
 
-class PPOReactiveModel(nn.Module):
+class PPOReactiveModelScript(nn.Module):
     """
     A simplified, monolithic autoregressive model for PPO that operates
     reactively based on the full game history.
@@ -11,10 +11,9 @@ class PPOReactiveModel(nn.Module):
     This architecture removes the explicit `StrategyDictionary` and FiLM
     layers. Instead, it relies on a powerful transformer backbone to directly
     process the sequence of observations and actions. The policy and value
-    heads are fed directly from the transformer's output, encouraging the
-    model to learn a direct mapping from game history to optimal action,
-    without an intermediate "strategy labeling" step. This is designed to
-    promote a more general and fluid playstyle.
+
+    This version is specifically designed to be compatible with torch.jit.script
+    for deployment as a fast historical agent in C++.
     
     Action ID Semantics (factorization):
       action_sequence (int 0..10) -> decomposed into:
@@ -23,22 +22,19 @@ class PPOReactiveModel(nn.Module):
         table_flag ∈ {NA=0, TABLE=1, NON_TABLE=2, PAD=3}
     """
     def __init__(self,
-                 obs_dim,
-                 action_dim=7,
-                 hidden_dim=256,
-                 num_heads=4,
-                 num_layers=2,
-                 dropout_rate=0.1,
-                 max_seq_length=256,
-                 num_agent_types=4,
-                 *,
-                 use_gradient_checkpointing: bool = False):
+                 obs_dim: int,
+                 action_dim: int = 7,
+                 hidden_dim: int = 256,
+                 num_heads: int = 4,
+                 num_layers: int = 2,
+                 dropout_rate: float = 0.1,
+                 max_seq_length: int = 256,
+                 num_agent_types: int = 4):
         super().__init__()
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
         self.max_seq_length = max_seq_length
-        self.use_gradient_checkpointing = bool(use_gradient_checkpointing)
         self.count_pad = 4  # Matches lut_count
         self.tflag_pad = 3  # Matches lut_table_flag
         
@@ -70,16 +66,16 @@ class PPOReactiveModel(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer=encoder_layer, num_layers=num_layers)
 
+        # === Output heads ===
         # Policy and Value heads
         self.action_head     = nn.Linear(hidden_dim, action_dim)
         self.value_head      = nn.Linear(hidden_dim, 1)
 
         # Opponent action head
         self.opp_action_head = nn.Linear(hidden_dim, action_dim)
-    # -------------------------- utils --------------------------
 
-    @torch.no_grad()
-    def _decompose_actions(self, action_sequence, padding_mask=None):
+    # -------------------------- utils --------------------------
+    def _decompose_actions(self, action_sequence: torch.Tensor, padding_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         a = action_sequence.long()
         act_kind, count, tflag = self.lut_act_kind[a], self.lut_count[a], self.lut_table_flag[a]
         if padding_mask is not None:
@@ -91,7 +87,7 @@ class PPOReactiveModel(nn.Module):
             tflag    = torch.where(padding_mask, tflag_pad, tflag)
         return act_kind, count, tflag
 
-    def _encode_inputs(self, obs_sequence, action_sequence, agent_types, positions, padding_mask):
+    def _encode_inputs(self, obs_sequence: torch.Tensor, action_sequence: torch.Tensor, agent_types: torch.Tensor, positions: torch.Tensor, padding_mask: Optional[torch.Tensor]) -> torch.Tensor:
         act_kind_ids, count_ids, table_flag_ids = self._decompose_actions(action_sequence, padding_mask)
         combined = (self.obs_encoder(obs_sequence) +
                     self.act_kind_embedding(act_kind_ids) +
@@ -102,53 +98,40 @@ class PPOReactiveModel(nn.Module):
         return combined
 
     # -------------------------- forward --------------------------
-
-    def forward(self, obs_sequence, action_sequence, agent_types, 
-                positions, action_masks, padding_mask,valid_lengths=None):
+    def forward(self,
+                obs_sequence: torch.Tensor,
+                action_sequence: torch.Tensor,
+                agent_types: torch.Tensor, 
+                positions: torch.Tensor,
+                action_masks: torch.Tensor,
+                padding_mask: torch.Tensor,
+                valid_lengths: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
         encoded_inputs = self._encode_inputs(obs_sequence, action_sequence, agent_types, positions, padding_mask)
 
         T = encoded_inputs.size(1)
         causal_mask = self.causal_bool_mask_full[:T, :T]
+        # JIT is strict about devices, ensure mask is on the same device
         if causal_mask.device != encoded_inputs.device:
             causal_mask = causal_mask.to(encoded_inputs.device)
-        key_padding = padding_mask.bool() if padding_mask is not None else None
         
-        # Apply transformer with optional gradient checkpointing
-        if self.training and self.use_gradient_checkpointing:
-            # Custom forward function to handle keyword arguments for checkpointing
-            def create_custom_forward(module):
-                def custom_forward(*inputs):
-                    return module(inputs[0], src_mask=causal_mask, src_key_padding_mask=key_padding, is_causal=True)
-                return custom_forward
-
-            transformer_output = encoded_inputs
-            for layer in self.transformer.layers:
-                transformer_output = checkpoint(
-                    create_custom_forward(layer),
-                    transformer_output,
-                    use_reentrant=False
-                )
-            if self.transformer.norm:
-                transformer_output = self.transformer.norm(transformer_output)
-        else:
-            transformer_output = self.transformer(
-                encoded_inputs,
-                mask=causal_mask,
-                src_key_padding_mask=key_padding,
-                is_causal=True
-            )
+        key_padding = padding_mask.bool()
+        
+        transformer_output = self.transformer(
+            encoded_inputs,
+            mask=causal_mask,
+            src_key_padding_mask=key_padding,
+            is_causal=True
+        )
 
         action_logits = self.action_head(transformer_output)
         state_values  = self.value_head(transformer_output)
         opp_logits = self.opp_action_head(transformer_output)
+        
         # Apply action mask for our turns
         LARGE_NEG = torch.finfo(action_logits.dtype).min / 4.0
-        if action_masks is not None:
-            our_turns = (agent_types == 0).unsqueeze(-1)
-            invalid = (~action_masks.bool()) & our_turns
-            action_logits = action_logits.masked_fill(invalid, LARGE_NEG)
+        our_turns = (agent_types == 0).unsqueeze(-1)
+        invalid = (~action_masks.bool()) & our_turns
+        action_logits = action_logits.masked_fill(invalid, LARGE_NEG)
 
-        # Return a 3-tuple to match the expected signature of the loss function
-        # The opponent logits slot is None as this model does not predict opponent actions.
         return action_logits, opp_logits, state_values

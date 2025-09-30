@@ -429,7 +429,7 @@ def train_generation(
         f"Assigned training policy id {training_policy_id}; existing opponent labels: {sorted(existing_labels)}"
     )
 
-    # 3. INITIALIZE ROLLOUT MANAGER AND PLATEAU DETECTOR
+    # 3. INITIALIZE ROLLOUT MANAGER
     rollout_manager = PPOVecRolloutManager(
         policy_map,
         device,
