@@ -6,7 +6,7 @@ import math
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Callable
+from typing import Dict, Any, List, Optional, Callable, Tuple
 from numpy.random import Generator
 import random
 import numpy as np
@@ -511,11 +511,10 @@ def train_generation(
     k_epochs = int(config.K_EPOCHS)
     max_batch_envs = int(getattr(config, "EPISODES_PER_UPDATE", 512))
     num_players = int(getattr(config, "NUM_PLAYERS", 4))
-    buffer_mult = int(getattr(config, "OFFPOLICY_EP_BUFFER_MULT", 4))
-    buffer_capacity = buffer_mult * episodes_per_update
-    ep_buffer: List[Dict[str, Any]] = []
-    buffer_token_total = 0
-    # Use direct opponent labels for visualization; no remapping/lookup
+    
+    # The buffer stores tuples of (data, age)
+    max_data_age = int(getattr(config, "OFFPOLICY_EP_BUFFER_MULT", 4))
+    ep_buffer: List[Tuple[Dict[str, Any], int]] = [] 
 
     collected_updates: List[Dict[str, Any]] = []
 
@@ -523,22 +522,24 @@ def train_generation(
         # -------- Rollout --------
         t0 = time.time()
         learner.model.eval()
+        
         front_opponents = getattr(rollout_manager, "_latest_historical_agents", [])
-        max_extra_learners = min(len(front_opponents), max(0, num_players - 1))
-        estimated_learners_per_game = 1 + max_extra_learners
-        games_to_collect = max(1, math.ceil(episodes_per_update / estimated_learners_per_game))
-        training_ids_for_rollout = [training_policy_id]
+        num_learning_agents = 1 + min(len(front_opponents), max(0, num_players - 1))
+        
+        games_to_collect = max(1, math.ceil(episodes_per_update / num_learning_agents))
+        training_ids_for_rollout = [training_policy_id] * num_learning_agents
+        
         new_eps = rollout_manager.collect_episodes(
             num_episodes=games_to_collect,
-            num_players=4,
+            num_players=num_players,
             training_policy_ids=training_ids_for_rollout,
             max_batch_envs=max_batch_envs,
         )
-        if len(new_eps) > episodes_per_update:
-            new_eps = new_eps[:episodes_per_update]
+        
         if device.type == "cuda" and FORCE_CUDA_SYNC_FOR_TIMING:
             torch.cuda.synchronize()
         t_roll = time.time()
+        
         if not new_eps:
             logging.warning(f"Update {update}: No episodes collected. Skipping.")
             continue
@@ -550,18 +551,16 @@ def train_generation(
             ep["_token_count"] = tokens
             rollout_tokens += tokens
 
-        ep_buffer.extend(new_eps)
-        buffer_token_total += rollout_tokens
-        if len(ep_buffer) > buffer_capacity:
-            excess = len(ep_buffer) - buffer_capacity
-            removed_eps = ep_buffer[:excess]
-            buffer_token_total -= sum(
-                rem.get("_token_count", _episode_token_count(rem))
-                for rem in removed_eps
-            )
-            del ep_buffer[:excess]
-        if buffer_token_total < 0:
-            buffer_token_total = 0
+        # --- AGE-BASED BUFFER MANAGEMENT ---
+        for i in range(len(ep_buffer)):
+            ep_buffer[i] = (ep_buffer[i][0], ep_buffer[i][1] + 1)
+            
+        for ep in new_eps:
+            ep_buffer.append((ep, 1))
+
+        ep_buffer = [item for item in ep_buffer if item[1] <= max_data_age]
+        
+        buffer_token_total = sum(item[0].get("_token_count", 0) for item in ep_buffer)
         
         # -------- Optimize (aggregate metrics) --------
         learner.model.train()
@@ -570,7 +569,25 @@ def train_generation(
         opt_tokens_processed = 0
 
         for _ in range(k_epochs):
-            batch_eps = random.sample(ep_buffer, min(len(ep_buffer), episodes_per_update))
+            if not ep_buffer:
+                continue
+
+            # Determine the sampling fraction based on the age of the oldest data
+            oldest_age = max(item[1] for item in ep_buffer)
+            sampling_fraction = 1.0 / oldest_age
+            
+            num_to_sample = math.ceil(len(ep_buffer) * sampling_fraction)
+            
+            # Ensure we always sample at least a standard batch size's worth of trajectories
+            num_to_sample = max(num_to_sample, episodes_per_update) 
+            
+            # And never more than what's available in the buffer
+            num_to_sample = min(num_to_sample, len(ep_buffer))
+
+            # The training batch is a NEW random sample for each epoch
+            sampled_indices = random.sample(range(len(ep_buffer)), num_to_sample)
+            batch_eps = [ep_buffer[i][0] for i in sampled_indices]
+
             if not batch_eps:
                 continue
 
