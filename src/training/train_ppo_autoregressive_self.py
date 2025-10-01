@@ -6,7 +6,7 @@ import math
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Callable, Tuple
+from typing import Dict, Any, List, Optional, Callable, Tuple, Sequence
 from numpy.random import Generator
 import random
 import numpy as np
@@ -79,27 +79,41 @@ class OpponentPoolManager:
     def _load(self) -> List[Dict]:
         try:
             with open(self.filepath, 'r') as f:
-                return json.load(f)
+                data = json.load(f)
         except FileNotFoundError:
             print(f"Pool file '{self.filepath}' not found. Initializing with base C++ bots.")
 
             # Initialize with base C++ bots using fixed labels 0..6
             base_bots = [
-                {"name": "Classic", "type": "cpp_bot", "model_type": "cpp_bot", "label": 0, "path": None},
-                {"name": "GreedyCardSpammer", "type": "cpp_bot", "model_type": "cpp_bot", "label": 1, "path": None},
-                {"name": "RandomAgent", "type": "cpp_bot", "model_type": "cpp_bot", "label": 2, "path": None},
-                {"name": "SelectiveTableConservativeChallenger", "type": "cpp_bot", "model_type": "cpp_bot", "label": 3, "path": None},
-                {"name": "StrategicChallenger", "type": "cpp_bot", "model_type": "cpp_bot", "label": 4, "path": None},
-                {"name": "TableFirstConservativeChallenger", "type": "cpp_bot", "model_type": "cpp_bot", "label": 5, "path": None},
-                {"name": "TableNonTableAgent", "type": "cpp_bot", "model_type": "cpp_bot", "label": 6, "path": None},
+                {"name": "Classic", "type": "cpp_bot", "model_type": "cpp_bot", "label": 0, "path": None, "status": "active"},
+                {"name": "GreedyCardSpammer", "type": "cpp_bot", "model_type": "cpp_bot", "label": 1, "path": None, "status": "active"},
+                {"name": "RandomAgent", "type": "cpp_bot", "model_type": "cpp_bot", "label": 2, "path": None, "status": "active"},
+                {"name": "SelectiveTableConservativeChallenger", "type": "cpp_bot", "model_type": "cpp_bot", "label": 3, "path": None, "status": "active"},
+                {"name": "StrategicChallenger", "type": "cpp_bot", "model_type": "cpp_bot", "label": 4, "path": None, "status": "active"},
+                {"name": "TableFirstConservativeChallenger", "type": "cpp_bot", "model_type": "cpp_bot", "label": 5, "path": None, "status": "active"},
+                {"name": "TableNonTableAgent", "type": "cpp_bot", "model_type": "cpp_bot", "label": 6, "path": None, "status": "active"},
             ]
-            
+
             self._save(base_bots)
             return base_bots
+        except FileNotFoundError:
+            data = []
+
+        changed = False
+        for entry in data:
+            if isinstance(entry, dict) and "status" not in entry:
+                entry["status"] = "active"
+                changed = True
+        if changed:
+            self._save(data)
+        return data
 
     def _save(self, pool_data: List[Dict]):
         with open(self.filepath, 'w') as f:
             json.dump(pool_data, f, indent=4)
+
+    def save(self) -> None:
+        self._save(self.pool)
 
     def add_agent(self, name: str, model_type: str, path: str, **kwargs):
         """
@@ -126,9 +140,10 @@ class OpponentPoolManager:
             "type": "historical",
             "model_type": model_type,
             "label": next_label,
-            "path": path  # The primary .pth path
+            "path": path,  # The primary .pth path
+            "status": "active",
         }
-        
+
         # Add any extra metadata passed in, like path_pt
         new_agent_entry.update(kwargs)
 
@@ -136,6 +151,260 @@ class OpponentPoolManager:
         self._save(self.pool)
         print(f"Added '{name}' to pool with label {next_label}.")
 
+    def set_status(self, label: int, status: str, *, save: bool = True) -> None:
+        label_int = int(label)
+        updated = False
+        for entry in self.pool:
+            if int(entry.get("label", -1)) == label_int:
+                if entry.get("status") != status:
+                    entry["status"] = status
+                    updated = True
+                break
+        if updated and save:
+            self._save(self.pool)
+
+    def get_entries(self, *, status: Optional[str] = None, include_cpp: bool = True) -> List[Dict[str, Any]]:
+        entries: List[Dict[str, Any]] = []
+        for entry in self.pool:
+            if not include_cpp and entry.get("type") == "cpp_bot":
+                continue
+            if status is not None and entry.get("status", "active") != status:
+                continue
+            entries.append(entry)
+        return entries
+
+    def build_sampling_weights(
+        self,
+        pressure_scores: Dict[int, float],
+        *,
+        exclude_label: Optional[int] = None,
+    ) -> Tuple[List[int], List[float]]:
+        labels: List[int] = []
+        weights: List[float] = []
+        exclude = int(exclude_label) if exclude_label is not None else None
+        for entry in self.pool:
+            label = entry.get("label")
+            if label is None:
+                continue
+            try:
+                label_int = int(label)
+            except Exception:
+                continue
+            if exclude is not None and label_int == exclude:
+                continue
+            if entry.get("status", "active") != "active":
+                continue
+            base_weight = entry.get("sampling_weight", 1.0)
+            try:
+                base = float(base_weight)
+            except Exception:
+                base = 1.0
+            pressure = pressure_scores.get(label_int)
+            if pressure is not None:
+                base = pressure
+            labels.append(label_int)
+            weights.append(base)
+        return labels, weights
+
+
+class OpponentStatsManager:
+    """Tracks opponent pressure statistics via ridge regression."""
+
+    def __init__(
+        self,
+        pool_manager: OpponentPoolManager,
+        ridge_alpha: float = 1.0,
+        ema_decay: float = 0.9,
+    ) -> None:
+        self.pool_manager = pool_manager
+        self.ridge_alpha = float(max(ridge_alpha, 1e-6))
+        self.ema_decay = float(min(max(ema_decay, 0.0), 1.0))
+        self.current_scores: Dict[int, float] = {}
+        self.ema_scores: Dict[int, float] = {}
+        self.intercept: float = 0.0
+
+    def _active_labels(self) -> List[int]:
+        labels: List[int] = []
+        for entry in self.pool_manager.get_entries(status="active", include_cpp=True):
+            label = entry.get("label")
+            if label is None:
+                continue
+            try:
+                labels.append(int(label))
+            except Exception:
+                continue
+        labels = sorted(set(labels))
+        return labels
+
+    def update_pressure_scores(
+        self,
+        opponent_lineups: Sequence[Tuple[int, ...]],
+        targets: Sequence[float],
+        *,
+        sample_weights: Optional[Sequence[float]] = None,
+        self_play_counts: Optional[Sequence[int]] = None,
+    ) -> None:
+        if not opponent_lineups or not targets:
+            return
+
+        active_labels = self._active_labels()
+        if not active_labels:
+            return
+
+        label_to_index = {label: idx for idx, label in enumerate(active_labels)}
+        num_features = len(active_labels) + 2  # opponents + self-play count + bias
+
+        features: List[List[float]] = []
+        y_vals: List[float] = []
+        weights: List[float] = []
+
+        for idx, lineup in enumerate(opponent_lineups):
+            if idx >= len(targets):
+                break
+            lineup_labels = [int(l) for l in lineup if l is not None and int(l) >= 0]
+            if not lineup_labels:
+                continue
+            row = [0.0 for _ in range(num_features)]
+            for lab in lineup_labels:
+                if lab in label_to_index:
+                    row[label_to_index[lab]] += 1.0
+            if all(v == 0.0 for v in row[:-2]):
+                continue
+            if self_play_counts is not None and idx < len(self_play_counts):
+                row[-2] = float(self_play_counts[idx])
+            else:
+                row[-2] = 0.0
+            row[-1] = 1.0  # bias term
+            features.append(row)
+            y_vals.append(float(targets[idx]))
+            if sample_weights is not None and idx < len(sample_weights):
+                weights.append(float(max(sample_weights[idx], 1e-6)))
+            else:
+                weights.append(1.0)
+
+        if not features:
+            return
+
+        X = np.asarray(features, dtype=np.float32)
+        y = np.asarray(y_vals, dtype=np.float32).reshape(-1, 1)
+        w = np.asarray(weights, dtype=np.float32).reshape(-1, 1)
+
+        if X.shape[0] <= X.shape[1]:
+            ridge = self.ridge_alpha * np.eye(X.shape[1], dtype=np.float32)
+        else:
+            ridge = self.ridge_alpha * np.eye(X.shape[1], dtype=np.float32)
+
+        weighted_X = X * w
+        XtX = weighted_X.T @ X
+        XtY = weighted_X.T @ y
+        try:
+            coef = np.linalg.solve(XtX + ridge, XtY)
+        except np.linalg.LinAlgError:
+            coef, *_ = np.linalg.lstsq(XtX + ridge, XtY, rcond=None)
+
+        coef = coef.reshape(-1)
+        self.intercept = float(coef[-1]) if coef.size > 0 else 0.0
+
+        updated_scores: Dict[int, float] = {}
+        for label, idx in label_to_index.items():
+            updated_scores[label] = float(coef[idx])
+
+        self.current_scores = updated_scores
+        for label, value in updated_scores.items():
+            prev = self.ema_scores.get(label, value)
+            self.ema_scores[label] = prev * self.ema_decay + value * (1.0 - self.ema_decay)
+
+    def get_pressure_scores(self, *, use_ema: bool = True) -> Dict[int, float]:
+        if use_ema and self.ema_scores:
+            return dict(self.ema_scores)
+        return dict(self.current_scores)
+
+
+def _sanitize_sampling_weights(
+    labels: Sequence[int],
+    raw_weights: Sequence[float],
+    *,
+    exploration_floor: float = 0.05,
+) -> Tuple[List[int], List[float]]:
+    label_list = [int(l) for l in labels]
+    weight_array = np.asarray(list(raw_weights), dtype=np.float64)
+    if len(label_list) != weight_array.size or weight_array.size == 0:
+        return label_list, []
+
+    if np.any(np.isnan(weight_array)):
+        weight_array = np.nan_to_num(weight_array, nan=0.0, posinf=0.0, neginf=0.0)
+
+    min_val = float(weight_array.min(initial=0.0))
+    if min_val < 0.0:
+        weight_array = weight_array - min_val
+
+    weight_array += 1e-6
+    weight_array = np.maximum(weight_array, 0.0)
+
+    total = float(weight_array.sum())
+    if not np.isfinite(total) or total <= 0.0:
+        weight_array = np.ones_like(weight_array, dtype=np.float64)
+        total = float(weight_array.sum())
+
+    weight_array /= total
+
+    floor = float(np.clip(exploration_floor, 0.0, 1.0))
+    if floor > 0.0:
+        uniform = np.ones_like(weight_array) / float(weight_array.size)
+        weight_array = (1.0 - floor) * weight_array + floor * uniform
+
+    weight_array /= float(weight_array.sum())
+    return label_list, weight_array.tolist()
+
+
+def _perform_generational_culling(
+    pool_manager: OpponentPoolManager,
+    stats_manager: OpponentStatsManager,
+    training_label: int,
+) -> None:
+    scores = stats_manager.get_pressure_scores()
+    max_active = int(getattr(config, "MAX_ACTIVE_OPPONENTS", 32))
+    min_pressure = float(getattr(config, "CULL_MIN_PRESSURE", float("-inf")))
+    active_candidates = [
+        (label, score)
+        for label, score in scores.items()
+        if score >= min_pressure and label != int(training_label)
+    ]
+    active_candidates.sort(key=lambda item: item[1], reverse=True)
+
+    selected: Dict[int, str] = {}
+    for entry in pool_manager.pool:
+        label = entry.get("label")
+        if label is None:
+            continue
+        label_int = int(label)
+        if entry.get("type") == "cpp_bot" or label_int == int(training_label):
+            selected[label_int] = "active"
+        else:
+            selected[label_int] = entry.get("status", "active")
+
+    limit = max_active
+    for idx, (label, _score) in enumerate(active_candidates):
+        if idx < limit:
+            selected[label] = "active"
+        else:
+            selected.setdefault(label, "inactive")
+
+    updates_needed = False
+    for entry in pool_manager.pool:
+        label = entry.get("label")
+        if label is None:
+            continue
+        label_int = int(label)
+        desired = selected.get(label_int, entry.get("status", "active"))
+        if entry.get("type") == "cpp_bot":
+            desired = "active"
+        if entry.get("status") != desired:
+            entry["status"] = desired
+            updates_needed = True
+
+    if updates_needed:
+        pool_manager.save()
 def _create_new_agent(agent_type: str, device: torch.device) -> LearnerAutoregressiveAgent:
     """Creates a new agent and its corresponding model."""
     agent = LearnerAutoregressiveAgent(device, f"learner_{agent_type}")
@@ -505,6 +774,7 @@ def train_generation(
     )
 
     rollout_manager.set_opponent_pool(pool_manager.pool)
+    stats_manager = OpponentStatsManager(pool_manager)
 
     # 4. MAIN TRAINING LOOP
     episodes_per_update = int(config.EPISODES_PER_UPDATE)
@@ -523,17 +793,51 @@ def train_generation(
         t0 = time.time()
         learner.model.eval()
         
-        front_opponents = getattr(rollout_manager, "_latest_historical_agents", [])
-        num_learning_agents = 1 + min(len(front_opponents), max(0, num_players - 1))
-        
-        games_to_collect = max(1, math.ceil(episodes_per_update / num_learning_agents))
-        training_ids_for_rollout = [training_policy_id] * num_learning_agents
-        
+        # Set the number of games to collect for the update.
+        games_to_collect = episodes_per_update
+
+        # Guarantee at least one learner seat per game. The C++ backend will fill the
+        # remaining seats by sampling from the weighted opponent pool.
+        training_ids_for_rollout = [training_policy_id]
+
+        # Get pressure scores for all active opponents, INCLUDING the learner.
+        pressure_scores = stats_manager.get_pressure_scores()
+        opp_labels_raw, opp_weights_raw = pool_manager.build_sampling_weights(
+            pressure_scores,
+            # NOTE: We DO NOT exclude the training_policy_id here, so it can be sampled as an opponent.
+        )
+
+        # Apply the self-play discount to the learner's sampling weight.
+        # This accounts for getting two trajectories (one for each agent) from one self-play game.
+        try:
+            learner_idx = opp_labels_raw.index(training_policy_id)
+            learner_discount = float(getattr(config, "SELF_PLAY_LEARNER_DISCOUNT", 0.5))
+            opp_weights_raw[learner_idx] *= learner_discount
+        except ValueError:
+            # This can happen if the learner isn't in the active pool for some reason.
+            pass
+
+        # Sanitize weights (make non-negative, normalize, add exploration floor).
+        opp_labels_sanitized, opp_weights_sanitized = _sanitize_sampling_weights(
+            opp_labels_raw,
+            opp_weights_raw,
+            exploration_floor=float(getattr(config, "OPPONENT_EXPLORATION_FLOOR", 0.05)),
+        )
+
+        if not opp_weights_sanitized:
+            opp_labels_arg = None
+            opp_weights_arg = None
+        else:
+            opp_labels_arg = opp_labels_sanitized
+            opp_weights_arg = opp_weights_sanitized
+
         new_eps = rollout_manager.collect_episodes(
             num_episodes=games_to_collect,
             num_players=num_players,
             training_policy_ids=training_ids_for_rollout,
             max_batch_envs=max_batch_envs,
+            opponent_labels=opp_labels_arg,
+            opponent_weights=opp_weights_arg,
         )
         
         if device.type == "cuda" and FORCE_CUDA_SYNC_FOR_TIMING:
@@ -567,6 +871,7 @@ def train_generation(
         agg = {"total_loss": 0.0}
         n_batches = 0
         opt_tokens_processed = 0
+        regression_records: List[Dict[str, Any]] = []
 
         for _ in range(k_epochs):
             if not ep_buffer:
@@ -635,11 +940,12 @@ def train_generation(
                 mini_gpu = _to_device_batch(mini_cpu, device)
 
                 with amp.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == "cuda")):
-                    total_loss, metrics = ppo_losses_batched(
+                    total_loss, metrics, vector_metrics = ppo_losses_batched(
                         learner.model,
                         mini_gpu,
                         sl_teacher=None,
                         update_num=update,
+                        return_vector_metrics=True,
                     )
 
                 loss_denom = max(group_target, 1)
@@ -654,6 +960,34 @@ def train_generation(
                         agg[k] = agg.get(k, 0.0) + float(v.detach().cpu())
                     except Exception:
                         pass
+
+                lineup_targets = vector_metrics.get("lineup_pressure_targets") if isinstance(vector_metrics, dict) else None
+                if lineup_targets is not None:
+                    targets_list = [float(x) for x in lineup_targets.detach().cpu().tolist()]
+                    token_counts_tensor = vector_metrics.get("lineup_token_counts") if isinstance(vector_metrics, dict) else None
+                    if token_counts_tensor is not None:
+                        weights_list = [float(x) for x in token_counts_tensor.detach().cpu().tolist()]
+                    else:
+                        weights_list = [1.0 for _ in targets_list]
+                    opp_lineups = mini_cpu.get("lineup_opponent_labels", []) or []
+                    self_play_counts = mini_cpu.get("lineup_self_play_counts", []) or []
+                    player_lineups = mini_cpu.get("lineup_player_labels", []) or []
+                    for idx, target_val in enumerate(targets_list):
+                        if idx >= len(opp_lineups):
+                            break
+                        opponents = tuple(int(x) for x in opp_lineups[idx])
+                        self_play = int(self_play_counts[idx]) if idx < len(self_play_counts) else 0
+                        weight_val = float(weights_list[idx]) if idx < len(weights_list) else 1.0
+                        players_tuple = tuple(int(x) for x in player_lineups[idx]) if idx < len(player_lineups) else tuple()
+                        regression_records.append(
+                            {
+                                "opponents": opponents,
+                                "self_play": self_play,
+                                "target": float(target_val),
+                                "weight": max(weight_val, 1e-6),
+                                "players": players_tuple,
+                            }
+                        )
 
                 n_batches += 1
 
@@ -681,6 +1015,18 @@ def train_generation(
                     group_count = 0
 
                 del mini_gpu, mini_cpu
+
+        if regression_records:
+            stats_manager.update_pressure_scores(
+                [tuple(rec["opponents"]) for rec in regression_records],
+                [rec["target"] for rec in regression_records],
+                sample_weights=[rec["weight"] for rec in regression_records],
+                self_play_counts=[rec["self_play"] for rec in regression_records],
+            )
+        cull_frequency = max(1, int(getattr(config, "CULL_FREQUENCY", 5)))
+        if regression_records and (update % cull_frequency == 0):
+            _perform_generational_culling(pool_manager, stats_manager, training_policy_id)
+            rollout_manager.set_opponent_pool(pool_manager.pool)
         if device.type == "cuda" and FORCE_CUDA_SYNC_FOR_TIMING:
             torch.cuda.synchronize()
         t_opt_end = time.time()
@@ -824,6 +1170,9 @@ def train_generation(
             path = os.path.join(run_ckpt_dir, f"update_{update}.pth")
             to_save = getattr(learner.model, "_orig_mod", learner.model)
             torch.save({"model_state_dict": to_save.state_dict()}, path)
+
+    _perform_generational_culling(pool_manager, stats_manager, training_policy_id)
+    rollout_manager.set_opponent_pool(pool_manager.pool)
 
     # 5. FINALIZE AND SAVE
     final_path_pth = os.path.join(run_ckpt_dir, "final.pth")

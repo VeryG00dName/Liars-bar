@@ -87,7 +87,9 @@ public:
                         const std::vector<int>& latest_historical_agents = {},
                         const std::vector<int>& active_shadow_agents = {},
                         double front_mass = 0.0,
-                        double shadow_mass = 0.0);
+                        double shadow_mass = 0.0,
+                        const std::vector<int>& weighted_opponents = {},
+                        const std::vector<double>& opponent_weights = {});
 
     std::unordered_map<int, std::vector<PolicyRequest>> collect_requests_for_inference();
 
@@ -151,6 +153,8 @@ private:
     std::unordered_map<int, CppBotRegistryEntry> cpp_bot_registry_;
     std::vector<uint8_t> training_env_inactive_;
     std::vector<int> active_training_counts_;
+    std::vector<int> weighted_opponent_labels_;
+    std::vector<double> weighted_opponent_weights_;
 
     std::vector<std::vector<int>> build_roles(int batch_size,
                                               int num_players,
@@ -158,7 +162,9 @@ private:
                                               const std::vector<int>& front_agents,
                                               const std::vector<int>& shadow_agents,
                                               double front_mass,
-                                              double shadow_mass);
+                                              double shadow_mass,
+                                              const std::vector<int>& weighted_opponents,
+                                              const std::vector<double>& opponent_weights);
     EpisodeTracker new_episode_tracker(int env_idx, const std::vector<int>& roles);
     int append_training_step(SeatTrajectory& seat_tracker);
     int append_opponent_step(SeatTrajectory& seat_tracker, int seat);

@@ -126,7 +126,9 @@ void RolloutManager::start_rollouts(int num_episodes,
                                     const std::vector<int>& latest_historical_agents,
                                     const std::vector<int>& active_shadow_agents,
                                     double front_mass,
-                                    double shadow_mass) {
+                                    double shadow_mass,
+                                    const std::vector<int>& weighted_opponents,
+                                    const std::vector<double>& opponent_weights) {
     target_episodes_ = num_episodes * std::max(1, num_players);
     num_players_ = num_players;
     training_policy_ids_ = training_policy_ids;
@@ -136,6 +138,8 @@ void RolloutManager::start_rollouts(int num_episodes,
     }
     completed_buffer_.clear();
     pending_step_data_.clear();
+    weighted_opponent_labels_ = weighted_opponents;
+    weighted_opponent_weights_ = opponent_weights;
 
     const int batch_guess = (arena_.B > 0) ? arena_.B : num_episodes;
     if (max_batch_envs > 0) {
@@ -165,7 +169,9 @@ void RolloutManager::start_rollouts(int num_episodes,
                              front_pool,
                              shadow_pool,
                              front_mass,
-                             shadow_mass);
+                             shadow_mass,
+                             weighted_opponent_labels_,
+                             weighted_opponent_weights_);
     arena_.set_roles(roles);
 
     episodes_.clear();
@@ -938,7 +944,9 @@ std::vector<std::vector<int>> RolloutManager::build_roles(int batch_size,
                                                           const std::vector<int>& front_agents,
                                                           const std::vector<int>& shadow_agents,
                                                           double front_mass,
-                                                          double shadow_mass) {
+                                                          double shadow_mass,
+                                                          const std::vector<int>& weighted_opponents,
+                                                          const std::vector<double>& opponent_weights) {
     const int fallback_training_id =
         training_policy_ids.empty() ? training_policy_id() : training_policy_ids.front();
     std::vector<std::vector<int>> roles(batch_size, std::vector<int>(num_players, fallback_training_id));
@@ -967,42 +975,75 @@ std::vector<std::vector<int>> RolloutManager::build_roles(int batch_size,
         shadow.swap(filtered);
     }
 
-    std::vector<int> opponent_pool = front;
-    opponent_pool.insert(opponent_pool.end(), shadow.begin(), shadow.end());
-    if (opponent_pool.empty()) {
-        opponent_pool.push_back(fallback_training_id);
+    std::vector<int> opponent_pool;
+    std::vector<double> probs;
+    bool use_weighted = (!weighted_opponents.empty() && weighted_opponents.size() == opponent_weights.size());
+    if (use_weighted) {
+        opponent_pool = weighted_opponents;
+        probs = opponent_weights;
+        double sum = std::accumulate(probs.begin(), probs.end(), 0.0);
+        if (!std::isfinite(sum) || sum <= 0.0) {
+            use_weighted = false;
+        } else {
+            for (double& p : probs) {
+                if (!std::isfinite(p) || p < 0.0) {
+                    p = 0.0;
+                }
+            }
+            sum = std::accumulate(probs.begin(), probs.end(), 0.0);
+            if (sum <= 0.0) {
+                use_weighted = false;
+            } else {
+                for (double& p : probs) {
+                    p /= sum;
+                }
+            }
+        }
+    }
+
+    if (!use_weighted) {
+        opponent_pool = front;
+        opponent_pool.insert(opponent_pool.end(), shadow.begin(), shadow.end());
+        if (opponent_pool.empty()) {
+            opponent_pool.push_back(fallback_training_id);
+        }
+
+        const size_t pool_size = opponent_pool.size();
+        probs.assign(pool_size, 0.0);
+
+        const double adjusted_front_mass = front.empty() ? 0.0 : front_mass;
+        const double adjusted_shadow_mass = shadow.empty() ? 0.0 : shadow_mass;
+        const double total_mass = adjusted_front_mass + adjusted_shadow_mass;
+
+        if (total_mass <= 0.0 || pool_size == 0) {
+            const double uniform = pool_size > 0 ? 1.0 / static_cast<double>(pool_size) : 1.0;
+            std::fill(probs.begin(), probs.end(), uniform);
+        } else {
+            std::unordered_set<int> front_set(front.begin(), front.end());
+            const double front_norm = front.empty() ? 1.0 : static_cast<double>(front.size());
+            const double shadow_norm = shadow.empty() ? 1.0 : static_cast<double>(shadow.size());
+
+            for (size_t i = 0; i < pool_size; ++i) {
+                const bool is_front = front_set.count(opponent_pool[i]) > 0;
+                const double bucket_mass = is_front ? adjusted_front_mass : adjusted_shadow_mass;
+                const double bucket_norm = is_front ? front_norm : shadow_norm;
+                probs[i] = bucket_mass / bucket_norm;
+            }
+            const double sum = std::accumulate(probs.begin(), probs.end(), 0.0);
+            if (sum > 0.0) {
+                for (double& p : probs) {
+                    p /= sum;
+                }
+            } else {
+                const double uniform = pool_size > 0 ? 1.0 / static_cast<double>(pool_size) : 1.0;
+                std::fill(probs.begin(), probs.end(), uniform);
+            }
+        }
     }
 
     const size_t pool_size = opponent_pool.size();
-    std::vector<double> probs(pool_size, 0.0);
-
-    const double adjusted_front_mass = front.empty() ? 0.0 : front_mass;
-    const double adjusted_shadow_mass = shadow.empty() ? 0.0 : shadow_mass;
-    const double total_mass = adjusted_front_mass + adjusted_shadow_mass;
-
-    if (total_mass <= 0.0 || pool_size == 0) {
-        const double uniform = pool_size > 0 ? 1.0 / static_cast<double>(pool_size) : 1.0;
-        std::fill(probs.begin(), probs.end(), uniform);
-    } else {
-        std::unordered_set<int> front_set(front.begin(), front.end());
-        const double front_norm = front.empty() ? 1.0 : static_cast<double>(front.size());
-        const double shadow_norm = shadow.empty() ? 1.0 : static_cast<double>(shadow.size());
-
-        for (size_t i = 0; i < pool_size; ++i) {
-            const bool is_front = front_set.count(opponent_pool[i]) > 0;
-            const double bucket_mass = is_front ? adjusted_front_mass : adjusted_shadow_mass;
-            const double bucket_norm = is_front ? front_norm : shadow_norm;
-            probs[i] = bucket_mass / bucket_norm;
-        }
-        const double sum = std::accumulate(probs.begin(), probs.end(), 0.0);
-        if (sum > 0.0) {
-            for (double& p : probs) {
-                p /= sum;
-            }
-        } else {
-            const double uniform = pool_size > 0 ? 1.0 / static_cast<double>(pool_size) : 1.0;
-            std::fill(probs.begin(), probs.end(), uniform);
-        }
+    if (probs.empty() && pool_size > 0) {
+        probs.assign(pool_size, 1.0 / static_cast<double>(pool_size));
     }
 
     const int training_slots = std::min<int>(std::max<int>(1, static_cast<int>(training_policy_ids.size())), num_players);

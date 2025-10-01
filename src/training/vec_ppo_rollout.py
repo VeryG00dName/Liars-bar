@@ -121,7 +121,13 @@ class PPOVecRolloutManager:
         self._partitions_ready = True
 
     def set_opponent_pool(self, pool_data: List[Dict[str, Any]]) -> None:
-        self._opponent_pool_snapshot = list(pool_data)
+        active_entries: List[Dict[str, Any]] = []
+        for entry in pool_data:
+            status = entry.get("status", "active")
+            if status != "active":
+                continue
+            active_entries.append(entry)
+        self._opponent_pool_snapshot = list(active_entries)
         self._update_internal_agent_partitions(self._opponent_pool_snapshot)
 
     def get_last_model_call_stats(self) -> Dict[int, Dict[str, float]]:
@@ -238,6 +244,8 @@ class PPOVecRolloutManager:
         training_policy_id: Optional[int] = None,
         training_policy_ids: Optional[Sequence[int]] = None,
         max_batch_envs: Optional[int] = None,
+        opponent_labels: Optional[Sequence[int]] = None,
+        opponent_weights: Optional[Sequence[float]] = None,
     ) -> List[Dict[str, Any]]:
         self._reset_policy_state()
         self._last_model_call_stats = {}
@@ -289,6 +297,12 @@ class PPOVecRolloutManager:
         seed = int(self.rng.integers(0, 2**31))
         max_batch = int(max_batch_envs) if max_batch_envs is not None else -1
 
+        opp_labels_vec: List[int] = []
+        opp_weights_vec: List[float] = []
+        if opponent_labels and opponent_weights:
+            opp_labels_vec = [int(l) for l in opponent_labels]
+            opp_weights_vec = [float(w) for w in opponent_weights]
+
         self.rollout_manager.start_rollouts(
             num_episodes,
             num_players,
@@ -300,6 +314,8 @@ class PPOVecRolloutManager:
             active_shadow_agents,
             float(front_mass),
             float(shadow_mass),
+            opp_labels_vec,
+            opp_weights_vec,
         )
 
         while True:
