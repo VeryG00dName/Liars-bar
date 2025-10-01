@@ -1372,6 +1372,32 @@ def train_generation(
                 if training_won:
                     totals[0] += 1.0
                 totals[1] += 1.0
+
+        candidate_labels = set()
+        if opp_labels_arg:
+            try:
+                candidate_labels.update(int(lab) for lab in opp_labels_arg if lab is not None)
+            except Exception:
+                candidate_labels.update(lab for lab in opp_labels_arg if lab is not None)
+        else:
+            try:
+                for entry in pool_manager.get_entries(status="active", include_cpp=True):
+                    lab = entry.get("label")
+                    if lab is None:
+                        continue
+                    try:
+                        candidate_labels.add(int(lab))
+                    except Exception:
+                        candidate_labels.add(lab)
+            except Exception:
+                pass
+        try:
+            candidate_labels.add(int(training_policy_id))
+        except Exception:
+            candidate_labels.add(training_policy_id)
+
+        for lab in candidate_labels:
+            per_opponent_totals.setdefault(lab, [0.0, 0.0])
         per_opponent_win_rates = {}
         per_opponent_episode_counts = {}
         for label, (wins_vs, total) in per_opponent_totals.items():
@@ -1422,11 +1448,11 @@ def train_generation(
         # Sort once (same criterion you use below)
         sorted_items = sorted(per_opponent_totals.items(), key=lambda item: str(item[0]))
 
-        # Log per-opponent metrics
+        # Log per-opponent metrics (always emit), with safe handling for zero totals
         for label, (wins_vs, total) in sorted_items:
-            if total > 0:
-                writer.add_scalar(f"PerOpponent/win_rate_vs_{label}", wins_vs / total, update)
-                writer.add_scalar(f"PerOpponent/episodes_vs_{label}", total, update)
+            win_rate_val = (wins_vs / total) if total > 0 else 0.0
+            writer.add_scalar(f"PerOpponent/win_rate_vs_{label}", win_rate_val, update)
+            writer.add_scalar(f"PerOpponent/episodes_vs_{label}", total, update)
 
         BOT_MAX_ID = 6
         per_opponent_totals_int: Dict[int, List[float]] = {}
