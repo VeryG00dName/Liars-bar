@@ -1454,6 +1454,107 @@ def train_generation(
         writer.add_scalar("Buffer/Tokens", buffer_token_total, update)
         writer.add_scalar("Acc/OpponentAction", avg.get("opp_action_acc", 0.0), update)
 
+        # OpponentStatsManager: Per-agent stats (pressure/redundancy/cull/fingerprint)
+        try:
+            scores = stats_manager.get_pressure_scores()
+            min_pressure = float(getattr(config, "CULL_MIN_PRESSURE", float("-inf")))
+            alpha = float(getattr(config, "CULL_SCORE_ALPHA", 0.7))
+            alpha = min(max(alpha, 0.0), 1.0)
+
+            # Filter to candidates, excluding the training policy itself
+            pressure_map: Dict[int, float] = {
+                int(label): float(score)
+                for label, score in scores.items()
+                if float(score) >= min_pressure and int(label) != int(training_policy_id)
+            }
+
+            # Normalized ranks of pressure
+            pressure_ranks = _normalized_ranks(pressure_map)
+
+            # Compute redundancy scores based on gradient fingerprint dissimilarity
+            min_norm = float(getattr(config, "CULL_MIN_FINGERPRINT_NORM", 1e-4))
+            min_steps = int(getattr(config, "CULL_MIN_COPLAY_STEPS", 0))
+            fingerprint_vectors = getattr(stats_manager, "ema_grad_fingerprints", {})
+            fingerprint_norms = getattr(stats_manager, "fingerprint_norms", {})
+            coplay_steps = getattr(stats_manager, "total_coplay_steps", Counter())
+
+            eligible_vectors: Dict[int, torch.Tensor] = {}
+            for label in pressure_map:
+                arr = fingerprint_vectors.get(label)
+                if arr is None:
+                    continue
+                norm_val = float(fingerprint_norms.get(label, 0.0))
+                steps_val = int(coplay_steps.get(label, 0))
+                if steps_val < min_steps or norm_val < min_norm:
+                    continue
+                vec = torch.from_numpy(arr.astype(np.float32))
+                vec_norm = torch.linalg.norm(vec)
+                if not torch.isfinite(vec_norm) or vec_norm.item() <= 0.0:
+                    continue
+                eligible_vectors[label] = vec / vec_norm
+
+            redundancy_values: Dict[int, float] = {}
+            default_redundancy = 0.5
+            for label in pressure_map:
+                vec_i = eligible_vectors.get(label)
+                if vec_i is None:
+                    redundancy_values[label] = default_redundancy
+                    continue
+                min_dist = None
+                for other_label, vec_j in eligible_vectors.items():
+                    if other_label == label:
+                        continue
+                    cos_sim = torch.dot(vec_i, vec_j).clamp(-1.0, 1.0)
+                    dist = float(1.0 - cos_sim.item())
+                    if min_dist is None or dist < min_dist:
+                        min_dist = dist
+                if min_dist is None:
+                    redundancy_values[label] = 1.0
+                else:
+                    redundancy_values[label] = max(0.0, min_dist)
+
+            redundancy_ranks = _normalized_ranks(redundancy_values)
+            cull_scores: Dict[int, float] = {
+                label: alpha * pressure_ranks.get(label, 0.0)
+                + (1.0 - alpha) * redundancy_ranks.get(label, 0.0)
+                for label in pressure_map
+            }
+
+            # Log per-agent stats deterministically ordered by label
+            for label in sorted(pressure_map.keys(), key=lambda x: str(x)):
+                writer.add_scalar(
+                    f"OpponentStatsManager/PerAgent/pressure_score_{label}",
+                    pressure_map.get(label, 0.0),
+                    update,
+                )
+                writer.add_scalar(
+                    f"OpponentStatsManager/PerAgent/pressure_rank_{label}",
+                    pressure_ranks.get(label, 0.0),
+                    update,
+                )
+                writer.add_scalar(
+                    f"OpponentStatsManager/PerAgent/redundancy_score_{label}",
+                    redundancy_values.get(label, 0.0),
+                    update,
+                )
+                writer.add_scalar(
+                    f"OpponentStatsManager/PerAgent/redundancy_rank_{label}",
+                    redundancy_ranks.get(label, 0.0),
+                    update,
+                )
+                writer.add_scalar(
+                    f"OpponentStatsManager/PerAgent/cull_score_{label}",
+                    cull_scores.get(label, 0.0),
+                    update,
+                )
+                writer.add_scalar(
+                    f"OpponentStatsManager/PerAgent/fingerprint_norm_{label}",
+                    float(fingerprint_norms.get(label, 0.0)),
+                    update,
+                )
+        except Exception as e:
+            logging.debug("OpponentStatsManager per-agent logging error: %s", e)
+
         model_call_stats = rollout_manager.get_last_model_call_stats()
 
         train_stats = model_call_stats.get(int(training_policy_id), {})
