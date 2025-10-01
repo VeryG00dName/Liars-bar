@@ -7,6 +7,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Callable, Tuple, Sequence
+from collections import Counter
 from numpy.random import Generator
 import random
 import numpy as np
@@ -29,6 +30,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 from torch.nn.utils import clip_grad_norm_
 import torch.amp as amp
+import torch.nn.functional as F
 
 from src.misc import lb
 from src import config
@@ -216,12 +218,16 @@ class OpponentStatsManager:
         ridge_alpha: float = 1.0,
         ema_decay: float = 0.9,
     ) -> None:
+        self.ema_decay = float(min(max(ema_decay, 0.0), 1.0))
         self.pool_manager = pool_manager
         self.ridge_alpha = float(max(ridge_alpha, 1e-6))
-        self.ema_decay = float(min(max(ema_decay, 0.0), 1.0))
+        self.ema_alpha = float(getattr(config, "GRAD_FPRINT_EMA_ALPHA", 0.1))
         self.current_scores: Dict[int, float] = {}
         self.ema_scores: Dict[int, float] = {}
         self.intercept: float = 0.0
+        self.ema_grad_fingerprints: Dict[int, np.ndarray] = {}
+        self.fingerprint_norms: Dict[int, float] = {}
+        self.total_coplay_steps: Counter[int] = Counter()
 
     def _active_labels(self) -> List[int]:
         labels: List[int] = []
@@ -319,7 +325,219 @@ class OpponentStatsManager:
             return dict(self.ema_scores)
         return dict(self.current_scores)
 
+    def update_fingerprints(self, batch_fingerprints: Dict[int, Tuple[torch.Tensor, int]]) -> None:
+        if not batch_fingerprints:
+            return
 
+        ema_steps = float(getattr(config, "GRAD_FINGERPRINT_EMA_STEPS", 5000.0))
+        ema_steps = max(ema_steps, 1.0)
+
+        for label, (vector, step_count) in batch_fingerprints.items():
+            if vector is None or step_count is None:
+                continue
+
+            steps_int = int(step_count)
+            if steps_int <= 0:
+                continue
+
+            vec_tensor = vector.detach().to(torch.float32)
+            if vec_tensor.numel() == 0:
+                continue
+
+            vec_norm = torch.linalg.norm(vec_tensor)
+            if not torch.isfinite(vec_norm) or vec_norm.item() <= 0.0:
+                continue
+
+            normalized_vec = (vec_tensor / vec_norm.clamp_min(1e-8)).cpu()
+
+            self.total_coplay_steps[label] += steps_int
+            
+            prev = self.ema_grad_fingerprints.get(label)
+            if prev is not None and prev.size == normalized_vec.numel():
+                prev_vec = torch.from_numpy(prev.astype(np.float32))
+                # Standard EMA update
+                blended = (1.0 - self.ema_alpha) * prev_vec + self.ema_alpha * normalized_vec
+            else:
+                # First time seeing this opponent, just take the new value
+                blended = normalized_vec
+            blended_norm = torch.linalg.norm(blended)
+            if not torch.isfinite(blended_norm) or blended_norm.item() <= 0.0:
+                self.fingerprint_norms[label] = 0.0
+                continue
+
+            self.fingerprint_norms[label] = float(blended_norm.item())
+            blended = blended / blended_norm
+            self.ema_grad_fingerprints[label] = blended.to(torch.float16).cpu().numpy()
+
+
+def _compute_fingerprints_for_update(
+    batch_cpu: Dict[str, Any],
+    batch_gpu: Dict[str, Any],
+    model_outs: Tuple[torch.Tensor, ...],
+    projection_matrix: torch.Tensor,
+) -> Dict[int, Tuple[torch.Tensor, int]]:
+    if projection_matrix is None:
+        return {}
+
+    if len(model_outs) < 4:
+        return {}
+
+    action_logits = model_outs[0]
+    state_values = model_outs[2].squeeze(-1).to(torch.float32)
+    transformer_output = model_outs[-1]
+    if transformer_output.dim() != 3:
+        return {}
+
+    our_idx = batch_gpu["our_idx"].long()
+    our_mask = batch_gpu["mask"].bool()
+    actions = batch_gpu["actions"].long()
+    rewards = batch_gpu["rewards"].to(torch.float32)
+    our_action_mask = batch_gpu.get("our_action_mask")
+
+    device = action_logits.device
+    proj = projection_matrix.to(device=device)
+
+    B, T = our_idx.shape
+    A = action_logits.size(-1)
+    gather_idx = our_idx.unsqueeze(-1).expand(-1, -1, A)
+    logits_at = torch.gather(action_logits, 1, gather_idx)
+
+    if our_action_mask is not None:
+        step_mask_full = our_action_mask.gather(1, gather_idx)
+        invalid_rows = (~step_mask_full).all(dim=-1)
+        if invalid_rows.any():
+            fallback_cols = logits_at[invalid_rows].argmax(dim=-1)
+            step_mask_full = step_mask_full.clone()
+            step_mask_full[invalid_rows] = False
+            step_mask_full[invalid_rows, fallback_cols] = True
+        logits_at = logits_at.masked_fill(
+            ~step_mask_full,
+            torch.finfo(logits_at.dtype).min,
+        )
+
+    logits_at = torch.nan_to_num(
+        logits_at,
+        nan=0.0,
+        posinf=0.0,
+        neginf=float(torch.finfo(logits_at.dtype).min),
+    )
+    probs = F.softmax(logits_at, dim=-1).to(torch.float32)
+
+    hidden_dim = transformer_output.size(-1)
+    hidden_idx = our_idx.unsqueeze(-1).expand(-1, -1, hidden_dim)
+    hidden_states = torch.gather(transformer_output, 1, hidden_idx).to(torch.float32)
+
+    values_at = torch.gather(state_values, 1, our_idx)
+
+    next_idx = torch.zeros_like(our_idx)
+    if T > 1:
+        next_idx[:, :-1] = our_idx[:, 1:]
+
+    L = state_values.size(1)
+    idx_safe = next_idx.clamp(0, max(L - 1, 0))
+    next_values = torch.gather(state_values, 1, idx_safe)
+
+    has_next = torch.zeros_like(our_mask)
+    if T > 1:
+        has_next[:, :-1] = our_mask[:, 1:]
+    has_next = has_next & our_mask
+
+    gap_steps = (next_idx - our_idx).clamp_min(1).to(torch.float32)
+    gap_steps = torch.where(has_next, gap_steps, torch.zeros_like(gap_steps))
+
+    gamma = float(getattr(config, "GAMMA", 0.99))
+    gae_lambda = float(getattr(config, "GAE_LAMBDA", 0.95))
+    if gamma <= 0.0:
+        gamma = 0.0
+    if gae_lambda <= 0.0:
+        gae_lambda = 0.0
+
+    log_gamma = math.log(gamma) if gamma > 0 else 0.0
+    log_lambda = math.log(gae_lambda) if gae_lambda > 0 else 0.0
+    gamma_gap = torch.where(has_next, torch.exp(log_gamma * gap_steps), torch.zeros_like(gap_steps))
+    lambda_gap = torch.where(has_next, torch.exp(log_lambda * gap_steps), torch.zeros_like(gap_steps))
+
+    next_values = torch.where(has_next, next_values, torch.zeros_like(next_values))
+    delta = rewards + gamma_gap * next_values - values_at
+    delta = torch.where(our_mask, delta, torch.zeros_like(delta))
+    discount = gamma_gap * lambda_gap
+
+    advantages = torch.zeros_like(values_at)
+    lastgaelam = torch.zeros(B, device=device, dtype=torch.float32)
+    for t in reversed(range(T)):
+        lastgaelam = delta[:, t] + discount[:, t] * lastgaelam
+        lastgaelam = torch.where(our_mask[:, t], lastgaelam, torch.zeros_like(lastgaelam))
+        advantages[:, t] = lastgaelam
+
+    _returns = advantages + values_at
+
+    adv_valid = advantages[our_mask]
+    advantages_norm = torch.zeros_like(advantages)
+    if adv_valid.numel() > 0:
+        adv_mean = adv_valid.mean()
+        adv_std = adv_valid.std(unbiased=False).clamp_min(1e-6)
+        advantages_norm = (advantages - adv_mean) / adv_std
+    advantages_norm = torch.where(our_mask, advantages_norm, torch.zeros_like(advantages_norm))
+
+    clip_val = float(getattr(config, "GRAD_FINGERPRINT_ADV_CLIP", 4.0))
+    advantages_clip = advantages_norm.clamp(min=-clip_val, max=clip_val)
+    advantages_clip = torch.where(our_mask, advantages_clip, torch.zeros_like(advantages_clip))
+
+    one_hot_actions = torch.zeros_like(probs)
+    valid_action_mask = our_mask & (actions >= 0) & (actions < A)
+    if valid_action_mask.any():
+        action_indices = actions.clamp(0, A - 1)
+        one_hot_actions = F.one_hot(action_indices, num_classes=A).to(probs.dtype)
+        one_hot_actions = one_hot_actions * valid_action_mask.unsqueeze(-1)
+
+    policy_delta = (one_hot_actions - probs) * our_mask.unsqueeze(-1)
+    hidden_states = hidden_states * our_mask.unsqueeze(-1)
+
+    projected_phi = torch.einsum(
+        "bt,bta,bth,ahd->btd",
+        advantages_clip.to(torch.float32),
+        policy_delta.to(torch.float32),
+        hidden_states.to(torch.float32),
+        proj.to(torch.float32),
+    )
+    projected_phi = projected_phi * our_mask.unsqueeze(-1)
+
+    phi_cpu = projected_phi.detach().cpu()
+    mask_cpu = our_mask.detach().cpu()
+
+    opponent_sums: Dict[int, torch.Tensor] = {}
+    opponent_counts: Dict[int, int] = {}
+
+    lineup_labels = batch_cpu.get("lineup_opponent_labels", [])
+    for b in range(phi_cpu.size(0)):
+        if b >= len(lineup_labels):
+            continue
+        labels_tuple = lineup_labels[b]
+        if not labels_tuple:
+            continue
+
+        valid_labels = [int(l) for l in labels_tuple if l is not None and int(l) >= 0]
+        if not valid_labels:
+            continue
+
+        share = 1.0 / max(len(valid_labels), 1)
+        for t in range(phi_cpu.size(1)):
+            if not bool(mask_cpu[b, t]):
+                continue
+            contrib = phi_cpu[b, t] * share
+            for label in valid_labels:
+                acc = opponent_sums.get(label)
+                if acc is None:
+                    opponent_sums[label] = contrib.clone()
+                else:
+                    opponent_sums[label] = acc + contrib
+                opponent_counts[label] = opponent_counts.get(label, 0) + 1
+
+    return {
+        label: (tensor, opponent_counts[label])
+        for label, tensor in opponent_sums.items()
+        if opponent_counts.get(label, 0) > 0
+    }
 def _sanitize_sampling_weights(
     labels: Sequence[int],
     raw_weights: Sequence[float],
@@ -357,6 +575,16 @@ def _sanitize_sampling_weights(
     return label_list, weight_array.tolist()
 
 
+def _normalized_ranks(values: Dict[int, float]) -> Dict[int, float]:
+    if not values:
+        return {}
+    sorted_items = sorted(values.items(), key=lambda item: item[1])
+    if len(sorted_items) == 1:
+        return {sorted_items[0][0]: 1.0}
+    denom = float(len(sorted_items) - 1)
+    return {label: idx / denom for idx, (label, _val) in enumerate(sorted_items)}
+
+
 def _perform_generational_culling(
     pool_manager: OpponentPoolManager,
     stats_manager: OpponentStatsManager,
@@ -370,7 +598,67 @@ def _perform_generational_culling(
         for label, score in scores.items()
         if score >= min_pressure and label != int(training_label)
     ]
-    active_candidates.sort(key=lambda item: item[1], reverse=True)
+
+    pressure_map = {label: score for label, score in active_candidates}
+
+    min_norm = float(getattr(config, "CULL_MIN_FINGERPRINT_NORM", 1e-4))
+    min_steps = int(getattr(config, "CULL_MIN_COPLAY_STEPS", 0))
+    alpha = float(getattr(config, "CULL_SCORE_ALPHA", 0.7))
+    alpha = min(max(alpha, 0.0), 1.0)
+
+    fingerprint_vectors = getattr(stats_manager, "ema_grad_fingerprints", {})
+    fingerprint_norms = getattr(stats_manager, "fingerprint_norms", {})
+    coplay_steps = getattr(stats_manager, "total_coplay_steps", Counter())
+
+    eligible_vectors: Dict[int, torch.Tensor] = {}
+    for label in pressure_map:
+        arr = fingerprint_vectors.get(label)
+        if arr is None:
+            continue
+        norm_val = float(fingerprint_norms.get(label, 0.0))
+        steps_val = int(coplay_steps.get(label, 0))
+        if steps_val < min_steps or norm_val < min_norm:
+            continue
+        vec = torch.from_numpy(arr.astype(np.float32))
+        vec_norm = torch.linalg.norm(vec)
+        if not torch.isfinite(vec_norm) or vec_norm.item() <= 0.0:
+            continue
+        eligible_vectors[label] = vec / vec_norm
+
+    redundancy_values: Dict[int, float] = {}
+    default_redundancy = 0.5
+    for label in pressure_map:
+        vec_i = eligible_vectors.get(label)
+        if vec_i is None:
+            redundancy_values[label] = default_redundancy
+            continue
+
+        min_dist = None
+        for other_label, vec_j in eligible_vectors.items():
+            if other_label == label:
+                continue
+            cos_sim = torch.dot(vec_i, vec_j).clamp(-1.0, 1.0)
+            dist = float(1.0 - cos_sim.item())
+            if min_dist is None or dist < min_dist:
+                min_dist = dist
+
+        if min_dist is None:
+            redundancy_values[label] = 1.0
+        else:
+            redundancy_values[label] = max(0.0, min_dist)
+
+    pressure_ranks = _normalized_ranks(pressure_map)
+    redundancy_ranks = _normalized_ranks(redundancy_values)
+    blended_scores = {
+        label: alpha * pressure_ranks.get(label, 0.0)
+        + (1.0 - alpha) * redundancy_ranks.get(label, 0.0)
+        for label in pressure_map
+    }
+
+    active_candidates.sort(
+        key=lambda item: blended_scores.get(item[0], float("-inf")),
+        reverse=True,
+    )
 
     selected: Dict[int, str] = {}
     for entry in pool_manager.pool:
@@ -515,25 +803,6 @@ def _prepare_episode_for_buffer(episode: Dict[str, Any]) -> Dict[str, Any]:
 
     return episode
 
-
-def _slice_collated_batch(batch: Dict[str, Any], start: int, end: int) -> Dict[str, Any]:
-    """Create a view over a collated batch for ``[start:end]`` episodes."""
-
-    def _slice_value(value: Any) -> Any:
-        if torch.is_tensor(value):
-            if value.dim() == 0 or value.size(0) == 0:
-                return value
-            length = max(end - start, 0)
-            if length <= 0:
-                return value.narrow(0, 0, 0)
-            return value.narrow(0, start, length).contiguous()
-        if isinstance(value, dict):
-            return {k: _slice_value(v) for k, v in value.items()}
-        return value
-
-    return {k: _slice_value(v) for k, v in batch.items()}
-
-
 def _find_traced_artifact_for_checkpoint(checkpoint_path: str) -> Optional[Path]:
     """Return the TorchScript trace produced by ``train_utils.py`` if it exists."""
 
@@ -592,6 +861,7 @@ def train_generation(
     rng: Optional[Generator] = None,
     collect_metrics: bool = False,
     metrics_callback: Optional[Callable[[int, Dict[str, Any]], None]] = None,
+    projection_matrix: Optional[torch.Tensor] = None,
 ):
     """
     Trains a single generation of an agent for 100 updates.
@@ -604,6 +874,8 @@ def train_generation(
     os.makedirs(run_ckpt_dir, exist_ok=True)
     
     device = torch.device(getattr(config, "DEVICE", "cuda" if torch.cuda.is_available() else "cpu"))
+    if projection_matrix is not None:
+        projection_matrix = projection_matrix.to(device)
     writer = SummaryWriter(log_dir=run_log_dir)
     logging.info(f"--- Starting Training Run: '{run_name}' ---")
     logging.info(f"    TensorBoard Log Dir: {run_log_dir}")
@@ -854,6 +1126,29 @@ def train_generation(
             tokens = _episode_token_count(ep)
             ep["_token_count"] = tokens
             rollout_tokens += tokens
+
+        fingerprint_enabled = bool(getattr(config, "USE_GRADIENT_FINGERPRINTING", False))
+        if fingerprint_enabled and projection_matrix is not None:
+            try:
+                update_batch_cpu = _collate_batch(new_eps)
+            except ValueError:
+                update_batch_cpu = None
+            if update_batch_cpu is not None:
+                update_batch_gpu = _to_device_batch(update_batch_cpu, device)
+                with torch.no_grad():
+                    fp_outs = learner.model(
+                        **update_batch_gpu["mi"],
+                        return_policy_features=True,
+                    )
+                fingerprints = _compute_fingerprints_for_update(
+                    update_batch_cpu,
+                    update_batch_gpu,
+                    fp_outs,
+                    projection_matrix,
+                )
+                if fingerprints:
+                    stats_manager.update_fingerprints(fingerprints)
+                del update_batch_gpu, update_batch_cpu, fp_outs, fingerprints
 
         # --- AGE-BASED BUFFER MANAGEMENT ---
         for i in range(len(ep_buffer)):
@@ -1238,11 +1533,28 @@ if __name__ == "__main__":
     
     master_run_name = args.master_run_name or f"selfplay_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     logging.info(f"Starting master self-play run: {master_run_name}")
-    
+
     pool_manager = OpponentPoolManager(args.pool_file)
     # Keep agents/models in memory across generations
     agent_cache: Dict[str, LearnerAutoregressiveAgent] = {}
     initial_sl_path = None if args.no_sl else args.sl_path
+    training_device = torch.device(getattr(config, "DEVICE", "cuda" if torch.cuda.is_available() else "cpu"))
+    projection_matrix = None
+    if getattr(config, "USE_GRADIENT_FINGERPRINTING", False):
+        action_dim = int(getattr(config, "OUTPUT_DIM", 7))
+        hidden_dim = int(getattr(config, "HIDDEN_DIM", 256))
+        fingerprint_dim = int(getattr(config, "GRAD_FINGERPRINT_DIM", 256))
+        generator = torch.Generator(device=training_device)
+        generator.manual_seed(SEED)
+        projection_matrix = torch.randn(
+            action_dim,
+            hidden_dim,
+            fingerprint_dim,
+            generator=generator,
+            device=training_device,
+            dtype=torch.float32,
+        )
+        projection_matrix = F.normalize(projection_matrix, dim=-1)
     # --- Step 1: Bootstrap Generation 1 (if it doesn't exist) ---
     gen1_name = "gen_1"
     if not any(gen1_name in agent['name'] for agent in pool_manager.pool):
@@ -1254,6 +1566,7 @@ if __name__ == "__main__":
             warm_start_path=initial_sl_path,
             agent_cache=agent_cache,
             rng=_GLOBAL_RNG,
+            projection_matrix=projection_matrix,
         )
 
     # --- Step 2: The Main Generational Loop ---
@@ -1276,6 +1589,7 @@ if __name__ == "__main__":
                     warm_start_path=initial_sl_path,
                     agent_cache=agent_cache,
                     rng=_GLOBAL_RNG,
+                    projection_matrix=projection_matrix,
                 )
         
         # The new generation is a clone of the previous one
@@ -1302,4 +1616,5 @@ if __name__ == "__main__":
             learner=new_learner,
             agent_cache=agent_cache,
             rng=_GLOBAL_RNG,
+            projection_matrix=projection_matrix,
         )

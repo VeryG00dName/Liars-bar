@@ -150,6 +150,17 @@ LOG_INTERVAL = 100
 EMBED_LOG_INTERVAL = 50
 
 # ============================
+# Gradient Fingerprinting Configuration
+# ============================
+USE_GRADIENT_FINGERPRINTING = True
+GRAD_FINGERPRINT_DIM = 256
+GRAD_FINGERPRINT_ADV_CLIP = 4.0
+GRAD_FINGERPRINT_EMA_STEPS = 5000
+CULL_SCORE_ALPHA = 0.7
+CULL_MIN_FINGERPRINT_NORM = 1e-4
+CULL_MIN_COPLAY_STEPS = 10000
+
+# ============================
 # Evaluation Configuration
 # ============================
 ELO_K_FACTOR = 32
