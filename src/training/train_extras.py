@@ -1458,7 +1458,6 @@ def ppo_losses_batched(
     elif heldout_episode_mask is None:
         heldout_episode_mask = torch.zeros(our_idx.size(0), dtype=torch.bool, device=our_idx.device)
 
-    dropout_p = getattr(config, "DROPOUT_P", 0.25)
     train_episode_mask = ~heldout_episode_mask
     train_step_mask = our_mask & train_episode_mask.unsqueeze(1)
     heldout_step_mask = our_mask & heldout_episode_mask.unsqueeze(1)
@@ -1554,15 +1553,33 @@ def ppo_losses_batched(
         return total_loss, metrics
 
     vector_metrics: Dict[str, torch.Tensor] = {}
-    advantages = train_detailed_stats.get("advantages")
-    ratio = train_detailed_stats.get("ratio")
-    step_mask_tensor = train_detailed_stats.get("step_mask")
-    if advantages is not None and ratio is not None and step_mask_tensor is not None:
-        masked_adv = (ratio * advantages) * step_mask_tensor.to(advantages.dtype)
-        lineup_targets = masked_adv.sum(dim=1)
-        token_counts = step_mask_tensor.to(torch.float32).sum(dim=1)
-        vector_metrics["lineup_pressure_targets"] = lineup_targets.detach()
-        vector_metrics["lineup_token_counts"] = token_counts.detach()
+    with torch.no_grad():
+        advantages = train_detailed_stats.get("advantages")
+        returns = train_detailed_stats.get("returns")
+        values_at = train_detailed_stats.get("values_at")
+        step_mask = train_detailed_stats.get("step_mask")
+
+        if advantages is not None and returns is not None and values_at is not None and step_mask is not None:
+            # Calculate per-step absolute value error
+            value_error = (returns - values_at).abs()
+
+            # Per-step pressure is the sum of absolute advantage and scaled value error
+            per_step_pressure = advantages.abs() + VALUE_WEIGHT * value_error
+            
+            # Mask to only include valid (non-padded) steps
+            masked_pressure = per_step_pressure * step_mask.to(per_step_pressure.dtype)
+            
+            # Sum the errors for each episode in the batch
+            sum_pressure_per_lineup = masked_pressure.sum(dim=1)
+            
+            # Get the number of valid steps for each episode to compute the mean
+            token_counts = step_mask.to(torch.float32).sum(dim=1).clamp_min(1.0)
+            
+            # The regression target is the MEAN error per step, which normalizes for episode length.
+            lineup_targets = sum_pressure_per_lineup / token_counts
+            
+            vector_metrics["lineup_pressure_targets"] = lineup_targets.detach()
+            vector_metrics["lineup_token_counts"] = token_counts.detach()
 
     return total_loss, metrics, vector_metrics
 

@@ -34,7 +34,7 @@ import torch.nn.functional as F
 
 from src.misc import lb
 from src import config
-from src.model.ppo_fused_model import PPOFusedModel
+from src.model.ppo_reactive_model import PPOReactiveModel
 from src.agents.learner_ar_agent import LearnerAutoregressiveAgent
 from src.training.vec_ppo_rollout import PPOVecRolloutManager
 from src.training.tracing_utils import trace_model_from_checkpoint
@@ -697,10 +697,8 @@ def _create_new_agent(agent_type: str, device: torch.device) -> LearnerAutoregre
     """Creates a new agent and its corresponding model."""
     agent = LearnerAutoregressiveAgent(device, f"learner_{agent_type}")
     if agent_type == 'main':
-        model = PPOFusedModel(
+        model = PPOReactiveModel(
             obs_dim=9,
-            num_bricks=getattr(config, "NUM_BRICKS", 32),
-            brick_dim=getattr(config, "BRICK_DIM", 32),
             use_gradient_checkpointing=bool(getattr(config, "USE_GRADIENT_CHECKPOINTING", False)),
         )
     else:  # Future branches (e.g., exploiter) can be added here.
@@ -1072,21 +1070,42 @@ def train_generation(
         # remaining seats by sampling from the weighted opponent pool.
         training_ids_for_rollout = [training_policy_id]
 
-        # Get pressure scores for all active opponents, INCLUDING the learner.
+        # Get pressure scores for all active opponents from the pool.
         pressure_scores = stats_manager.get_pressure_scores()
+
+        # The learner (e.g., gen_2) is not yet in the opponent pool, so it won't have a score.
+        # We create a proxy score for it based on the average pressure of existing opponents.
+        # This ensures it's always a candidate for self-play.
+        if training_policy_id not in pressure_scores:
+            if pressure_scores:
+                avg_pressure = sum(pressure_scores.values()) / len(pressure_scores)
+                pressure_scores[training_policy_id] = avg_pressure
+            else:
+                # Fallback if there are no opponents with scores yet (e.g., first ever run)
+                pressure_scores[training_policy_id] = 1.0
+        
+        # Build the list of opponents and their weights from the pool.
         opp_labels_raw, opp_weights_raw = pool_manager.build_sampling_weights(
-            pressure_scores,
-            # NOTE: We DO NOT exclude the training_policy_id here, so it can be sampled as an opponent.
+            pressure_scores
         )
 
+        # --- START OF FIX for Missing Learner ---
+        # Manually add the current learner to the sampling pool if it wasn't already found.
+        # This is necessary because the learner is not yet saved to opponent_pool.json.
+        if training_policy_id not in opp_labels_raw:
+            learner_pressure = pressure_scores.get(training_policy_id, 1.0)
+            opp_labels_raw.append(training_policy_id)
+            opp_weights_raw.append(learner_pressure)
+        # --- END OF FIX ---
+
         # Apply the self-play discount to the learner's sampling weight.
-        # This accounts for getting two trajectories (one for each agent) from one self-play game.
         try:
             learner_idx = opp_labels_raw.index(training_policy_id)
             learner_discount = float(getattr(config, "SELF_PLAY_LEARNER_DISCOUNT", 0.5))
             opp_weights_raw[learner_idx] *= learner_discount
         except ValueError:
-            # This can happen if the learner isn't in the active pool for some reason.
+            # This should no longer happen with the fix above, but we keep it as a safeguard.
+            logging.warning(f"Learner ID {training_policy_id} not in labels for discounting. This is unexpected.")
             pass
 
         # Sanitize weights (make non-negative, normalize, add exploration floor).
