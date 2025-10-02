@@ -1,5 +1,7 @@
 # src/model/ppo_reactive_model.py
-
+import os
+for var in ("TORCH_LOGS", "TRITON_LOGGING", "TORCH_COMPILE_DEBUG"):
+    os.environ.pop(var, None)
 from torch.utils.checkpoint import checkpoint
 from torch.nn.attention import sdpa_kernel, SDPBackend
 sdpa_math_only = sdpa_kernel(backends=[SDPBackend.MATH])
@@ -122,10 +124,17 @@ class PPOReactiveModel(nn.Module):
         encoded_inputs = self._encode_inputs(obs_sequence, action_sequence, agent_types, positions, padding_mask)
 
         T = encoded_inputs.size(1)
-        causal_mask = self.causal_bool_mask_full[:T, :T]
-        if causal_mask.device != encoded_inputs.device:
-            causal_mask = causal_mask.to(encoded_inputs.device)
-        key_padding = padding_mask.bool() if padding_mask is not None else None
+
+        # Make contiguous work tensors
+        encoded_inputs = encoded_inputs.contiguous()
+
+        # Break aliasing with the registered buffer (view -> fresh tensor)
+        causal_mask = self.causal_bool_mask_full[:T, :T].to(encoded_inputs.device).clone()
+
+        # padding_mask → bool tensor that’s also a fresh, contiguous tensor
+        key_padding = None
+        if padding_mask is not None:
+            key_padding = padding_mask.bool().contiguous().clone()
         
         # Apply transformer with optional gradient checkpointing
         if self.training and self.use_gradient_checkpointing:
@@ -156,11 +165,16 @@ class PPOReactiveModel(nn.Module):
         state_values  = self.value_head(transformer_output)
         opp_logits = self.opp_action_head(transformer_output)
         # Apply action mask for our turns
-        LARGE_NEG = torch.finfo(action_logits.dtype).min / 4.0
+        neg = torch.tensor(
+            torch.finfo(action_logits.dtype).min / 4.0,
+            dtype=action_logits.dtype,
+            device=action_logits.device,
+        )
         if action_masks is not None:
             our_turns = (agent_types == 0).unsqueeze(-1)
-            invalid = (~action_masks.bool()) & our_turns
-            action_logits = action_logits.masked_fill(invalid, LARGE_NEG)
+            invalid   = (~action_masks.bool()) & our_turns
+            # out-of-place: builds a new tensor, no storage write-back
+            action_logits = torch.where(invalid, neg, action_logits)
 
 
         return action_logits, opp_logits, state_values

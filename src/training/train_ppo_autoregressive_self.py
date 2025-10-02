@@ -14,6 +14,9 @@ import random
 import numpy as np
 import argparse
 # Quiet Torch compile logs
+os.environ.pop("TORCH_LOGS", None)           # disable extra compile logs
+os.environ.setdefault("TORCHDYNAMO_VERBOSE", "0")
+os.environ.setdefault("TORCH_COMPILE_DEBUG", "0")
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 # Deterministic cuBLAS workspace requirement for CUDA
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
@@ -540,6 +543,7 @@ def train_generation(
 
         learner.device = device
         learner.model.to(device) # Ensure base model is on the right device before copying
+        learner.rollout = {}
 
         # 2.2. Create the separate TRAINING model
         logging.info("Creating a separate model for training.")
@@ -563,16 +567,37 @@ def train_generation(
             learner.train_model = train_model
         learner.train_model.train()
 
-        # 2.4. Compile the ROLLOUT model (for dynamic batch sizes)
-        # This modifies the learner's own .model attribute in-place.
-        rollout_base = getattr(learner.model, "_orig_mod", learner.model)
-        if compile_fn and learner.model is rollout_base:
+        # 2.4. Create and compile dedicated ROLLOUT models (bucketed by sequence length)
+        rollout_state = learner.model.state_dict()
+        for bucket_len in PAD_BUCKET_BOUNDARIES:
             try:
-                logging.info("Compiling rollout model (mode='reduce-overhead')...")
-                rollout_base.eval()
-                learner.model = compile_fn(rollout_base, dynamic=False, mode="reduce-overhead")
+                rollout_model = copy.deepcopy(learner.model)
             except Exception as exc:
-                logging.warning(f"torch.compile (rollout) failed; using eager model: {exc}")
+                logging.warning(f"Deepcopy failed for rollout model (L={bucket_len}); recreating: {exc}")
+                rollout_model = type(learner.model)(**getattr(learner.model, "config", {}))
+            rollout_model.load_state_dict(rollout_state, strict=False)
+
+            rollout_model = rollout_model.to(device)
+            rollout_model.eval()
+
+            compiled_rollout = rollout_model
+            if compile_fn:
+                try:
+                    logging.info(
+                        f"Compiling rollout model for length {bucket_len} (mode='reduce-overhead', dynamic=True)..."
+                    )
+                    compiled_rollout = compile_fn(
+                        rollout_model,
+                        dynamic=True,
+                        mode="reduce-overhead",
+                    )
+                except Exception as exc:
+                    logging.warning(
+                        f"torch.compile (rollout L={bucket_len}) failed; using eager model: {exc}"
+                    )
+
+            learner.rollout[bucket_len] = compiled_rollout
+
         learner.model.eval()
 
     else:
@@ -586,6 +611,9 @@ def train_generation(
                 learner.model.to(device)
             if hasattr(learner, "train_model") and learner.train_model is not None:
                 learner.train_model.to(device)
+            if hasattr(learner, "rollout") and isinstance(learner.rollout, dict):
+                for compiled in learner.rollout.values():
+                    getattr(compiled, "_orig_mod", compiled).to(device)
         except Exception as exc:
             logging.warning(f"Failed to move one of the compiled models to device '{device}': {exc}")
 
@@ -735,7 +763,7 @@ def train_generation(
     for update in range(1, max_updates + 1):
         # -------- Rollout --------
         t0 = time.time()
-        learner.model.load_state_dict(learner.train_model.state_dict(), strict=True)
+        learner.sync_rollout_models()
         
         # Set the number of games to collect for the update.
         games_to_collect = episodes_per_update
@@ -892,7 +920,7 @@ def train_generation(
 
                 with amp.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == "cuda")):
                     total_loss, metrics = ppo_losses_batched(
-                        learner.model,
+                        learner.train_model,
                         mini_gpu,
                         sl_teacher=None,
                         update_num=update,

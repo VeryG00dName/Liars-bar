@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List, Optional, Tuple
-
+import os
+for var in ("TORCH_LOGS", "TRITON_LOGGING", "TORCH_COMPILE_DEBUG"):
+    os.environ.pop(var, None)
 import numpy as np
 import torch
 
@@ -34,6 +36,7 @@ class LearnerAutoregressiveAgent:
         self.player_id = player_id
         self.model: Optional[torch.nn.Module] = None
         self.train_model: Optional[torch.nn.Module] = None
+        self.rollout: Dict[int, torch.nn.Module] = {}
         self.label: int = -1
         self.max_seq_length: Optional[int] = None
         self._last_inputs: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
@@ -47,6 +50,7 @@ class LearnerAutoregressiveAgent:
     def load_from_state_dict(self, model_state_dict: Dict[str, torch.Tensor]) -> None:
         model = build_model_from_state(model_state_dict, self.device)
         self.model = model
+        self.rollout.clear()
         self.max_seq_length = getattr(model, "max_seq_length", None)
         self.reset()
 
@@ -73,7 +77,9 @@ class LearnerAutoregressiveAgent:
                 target_pad_len = boundary
                 break
 
-        # Slice to bucket length and move to device
+        inference_model = self._select_inference_model(target_pad_len)
+
+        # Slice/pad to bucket length and move to device
         model_input: Dict[str, torch.Tensor] = {}
         for key, value in tensor_inputs.items():
             if torch.is_tensor(value):
@@ -81,6 +87,18 @@ class LearnerAutoregressiveAgent:
                 if tensor_value.dim() >= 2:
                     seq_limit = min(tensor_value.shape[1], target_pad_len)
                     tensor_value = tensor_value[:, :seq_limit].contiguous()
+                    if tensor_value.shape[1] < target_pad_len:
+                        pad_shape = (tensor_value.shape[0], target_pad_len, *tensor_value.shape[2:])
+                        if key == "padding_mask":
+                            fill_value = True
+                        elif key == "action_masks":
+                            fill_value = False
+                        else:
+                            fill_value = 0
+                        padded = tensor_value.new_full(pad_shape, fill_value)
+                        length = tensor_value.shape[1]
+                        padded[:, :length] = tensor_value
+                        tensor_value = padded
                 model_input[key] = tensor_value.to(self.device, non_blocking=True)
             else:
                 model_input[key] = value
@@ -88,7 +106,7 @@ class LearnerAutoregressiveAgent:
         filtered_model_input = {k: v for k, v in model_input.items() if k in EXPECTED_MODEL_ARGS}
 
         with torch.inference_mode():
-            action_logits, _, state_values = self.model(**filtered_model_input)[:3]
+            action_logits, _, state_values = inference_model(**filtered_model_input)[:3]
 
         valid_lengths = model_input["valid_lengths"].long()
         if valid_lengths.numel() == 0:
@@ -195,6 +213,37 @@ class LearnerAutoregressiveAgent:
 
             self._last_inputs[(env_idx, seat_idx)] = snapshot
 
+    def _select_inference_model(self, target_pad_len: int) -> torch.nn.Module:
+        if self.rollout:
+            model = self.rollout.get(target_pad_len)
+            if model is None:
+                # Fallback to the closest larger bucket if available
+                larger_lengths = sorted(length for length in self.rollout if length >= target_pad_len)
+                if larger_lengths:
+                    model = self.rollout[larger_lengths[0]]
+                else:
+                    model = next(iter(self.rollout.values()))
+            if model is not None:
+                return model
+
+        if self.model is None:
+            raise RuntimeError("LearnerAutoregressiveAgent model has not been initialized.")
+        return self.model
+
+    def sync_rollout_models(self) -> None:
+        if self.train_model is None:
+            return
+
+        source = getattr(self.train_model, "_orig_mod", self.train_model)
+        state = source.state_dict()
+
+        if self.model is not None:
+            self.model.load_state_dict(state, strict=True)
+
+        for compiled in self.rollout.values():
+            target = getattr(compiled, "_orig_mod", compiled)
+            target.load_state_dict(state, strict=True)
+
 
     def load_models_from_checkpoint(self, checkpoint: Dict[str, Any], agent_key: str):
         """
@@ -264,6 +313,7 @@ class LearnerAutoregressiveAgent:
         self.model.load_state_dict(model_state_dict, strict=False)
 
         self.model.eval()
+        self.rollout.clear()
         self.reset()
 
 def build_model_from_state(
