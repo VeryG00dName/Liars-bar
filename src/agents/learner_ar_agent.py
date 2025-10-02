@@ -52,7 +52,6 @@ class LearnerAutoregressiveAgent:
     def compute_actions(
         self,
         tensor_inputs: Dict[str, torch.Tensor],
-        metadata: Optional[Dict[str, Any]] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         if self.model is None:
             raise RuntimeError("LearnerAutoregressiveAgent model has not been initialized.")
@@ -110,12 +109,8 @@ class LearnerAutoregressiveAgent:
         log_probs_np = log_probs_t.detach().cpu().numpy().astype(np.float32)
         values_np = values_last.detach().cpu().numpy().astype(np.float32)
 
-        env_indices = None
-        seat_indices = None
-        if metadata:
-            env_indices = metadata.get("env_indices")
-            seat_indices = metadata.get("seat_indices")
-
+        env_indices = model_input.get("env_indices")
+        seat_indices = model_input.get("seat_indices")
         self._record_last_inputs(env_indices, seat_indices, model_input)
 
         return actions_np, log_probs_np, values_np

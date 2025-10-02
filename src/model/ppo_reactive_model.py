@@ -103,8 +103,16 @@ class PPOReactiveModel(nn.Module):
 
     # -------------------------- forward --------------------------
 
-    def forward(self, obs_sequence, action_sequence, agent_types, 
-                positions, action_masks, padding_mask,valid_lengths=None,return_policy_features: bool = False):
+    def forward(
+        self,
+        obs_sequence,
+        action_sequence,
+        agent_types,
+        positions,
+        action_masks,
+        padding_mask,
+        valid_lengths=None,
+    ):
 
         encoded_inputs = self._encode_inputs(obs_sequence, action_sequence, agent_types, positions, padding_mask)
 
@@ -150,7 +158,4 @@ class PPOReactiveModel(nn.Module):
             action_logits = action_logits.masked_fill(invalid, LARGE_NEG)
 
 
-        if return_policy_features:
-            return action_logits, opp_logits, state_values, transformer_output
-        else:
-            return action_logits, opp_logits, state_values
+        return action_logits, opp_logits, state_values

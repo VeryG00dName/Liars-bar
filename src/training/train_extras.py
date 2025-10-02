@@ -1231,13 +1231,11 @@ def _single_pass_ppo(
     our_action_mask: Optional[torch.Tensor],
     step_mask: torch.Tensor,
     episode_mask: torch.Tensor,
-    sl_teacher: Optional[torch.nn.Module],
-    return_detailed_stats: bool = False,
+    sl_teacher: Optional[torch.nn.Module]
 ) -> Tuple[
     torch.Tensor,
     Dict[str, torch.Tensor],
-    Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
-    Dict[str, torch.Tensor],
+    Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
 ]:
     action_logits = outs[0]
     opp_logits = outs[1] if len(outs) > 1 else None
@@ -1414,19 +1412,7 @@ def _single_pass_ppo(
         "bc_kl": bc_kl.detach(),
     }
 
-    detailed_stats: Dict[str, torch.Tensor]
-    if return_detailed_stats:
-        detailed_stats = {
-            "advantages": advantages.detach(),
-            "returns": returns.detach(),
-            "values_at": values_at.detach(),
-            "ratio": ratio.detach(),
-            "step_mask": step_mask.detach(),
-        }
-    else:
-        detailed_stats = {}
-
-    return total, metrics, embedding_tuple, detailed_stats
+    return total, metrics, embedding_tuple
 
 
 def ppo_losses_batched(
@@ -1435,7 +1421,6 @@ def ppo_losses_batched(
     sl_teacher: Optional[torch.nn.Module] = None,
     *,
     update_num: int = 0,
-    return_vector_metrics: bool = False,
 ) -> Union[
     Tuple[torch.Tensor, Dict[str, torch.Tensor]],
     Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]],
@@ -1463,7 +1448,7 @@ def ppo_losses_batched(
     heldout_step_mask = our_mask & heldout_episode_mask.unsqueeze(1)
 
     outs_train = model(**mi)
-    train_loss, train_metrics, embedding_tuple, train_detailed_stats = _single_pass_ppo(
+    train_loss, train_metrics, embedding_tuple = _single_pass_ppo(
         outs_train,
         batch=batch,
         mi=mi,
@@ -1477,7 +1462,6 @@ def ppo_losses_batched(
         step_mask=train_step_mask,
         episode_mask=train_episode_mask,
         sl_teacher=sl_teacher,
-        return_detailed_stats=return_vector_metrics,
     )
 
     (
@@ -1517,7 +1501,7 @@ def ppo_losses_batched(
     if heldout_step_mask.any():
         with _temporarily_freeze_heads(model):
             outs_cp = model(**mi)
-        dcp_loss, dcp_metrics, _, _ = _single_pass_ppo(
+        dcp_loss, dcp_metrics, _, = _single_pass_ppo(
             outs_cp,
             batch=batch,
             mi=mi,
@@ -1549,39 +1533,7 @@ def ppo_losses_batched(
     metrics["heldout_episode_frac"] = torch.tensor(heldout_frac, device=train_loss.device)
     metrics["total_loss"] = total_loss.detach()
 
-    if not return_vector_metrics:
-        return total_loss, metrics
-
-    vector_metrics: Dict[str, torch.Tensor] = {}
-    with torch.no_grad():
-        advantages = train_detailed_stats.get("advantages")
-        returns = train_detailed_stats.get("returns")
-        values_at = train_detailed_stats.get("values_at")
-        step_mask = train_detailed_stats.get("step_mask")
-
-        if advantages is not None and returns is not None and values_at is not None and step_mask is not None:
-            # Calculate per-step absolute value error
-            value_error = (returns - values_at).abs()
-
-            # Per-step pressure is the sum of absolute advantage and scaled value error
-            per_step_pressure = advantages.abs() + VALUE_WEIGHT * value_error
-            
-            # Mask to only include valid (non-padded) steps
-            masked_pressure = per_step_pressure * step_mask.to(per_step_pressure.dtype)
-            
-            # Sum the errors for each episode in the batch
-            sum_pressure_per_lineup = masked_pressure.sum(dim=1)
-            
-            # Get the number of valid steps for each episode to compute the mean
-            token_counts = step_mask.to(torch.float32).sum(dim=1).clamp_min(1.0)
-            
-            # The regression target is the MEAN error per step, which normalizes for episode length.
-            lineup_targets = sum_pressure_per_lineup / token_counts
-            
-            vector_metrics["lineup_pressure_targets"] = lineup_targets.detach()
-            vector_metrics["lineup_token_counts"] = token_counts.detach()
-
-    return total_loss, metrics, vector_metrics
+    return total_loss, metrics
 
 
 def _collate_batch(
@@ -1878,10 +1830,6 @@ def _collate_batch(
             arr = arr.astype(np.float32, copy=False)
         return arr.reshape(-1)
 
-    lineup_opponent_labels: List[Tuple[int, ...]] = []
-    lineup_self_play_counts: List[int] = []
-    lineup_player_labels: List[Tuple[int, ...]] = []
-
     # -------- fill from episodes (only real steps) --------
     for b, ep in enumerate(episodes):
         training_seat = int(ep.get("training_agent_seat", -1))
@@ -1896,24 +1844,6 @@ def _collate_batch(
                 player_labels_full[idx]
                 for idx in range(len(player_labels_full))
                 if idx != training_seat
-            )
-
-        def _sanitize_tuple(labels: Tuple[Any, ...]) -> Tuple[int, ...]:
-            sanitized: List[int] = []
-            for label in labels:
-                label_int = _label_to_int(label)
-                sanitized.append(int(label_int) if label_int is not None else -1)
-            return tuple(sanitized)
-
-        sanitized_player_labels = _sanitize_tuple(player_labels_full)
-        sanitized_opponent_labels = _sanitize_tuple(opponent_labels_source)
-        lineup_player_labels.append(sanitized_player_labels)
-        lineup_opponent_labels.append(sanitized_opponent_labels)
-        if training_label_int is None:
-            lineup_self_play_counts.append(0)
-        else:
-            lineup_self_play_counts.append(
-                sum(1 for lab in sanitized_opponent_labels if lab == int(training_label_int))
             )
 
         # ===== OUR timeline =====
@@ -2046,10 +1976,7 @@ def _collate_batch(
         "opp_seat_ids": _pm(opp_seat_ids),
         "opp_last_token_idx": _pm(opp_last_token_idx),
         "opp_last_token_is_adjacent": _pm(opp_last_token_is_adjacent),
-        "heldout_episode_mask": heldout_episode_mask,
-        "lineup_opponent_labels": lineup_opponent_labels,
-        "lineup_self_play_counts": lineup_self_play_counts,
-        "lineup_player_labels": lineup_player_labels,
+        "heldout_episode_mask": heldout_episode_mask
     }
 
 def _to_device_batch(batch_cpu: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
@@ -2074,9 +2001,6 @@ def _to_device_batch(batch_cpu: Dict[str, Any], device: torch.device) -> Dict[st
         "opp_seat_ids":      batch_cpu["opp_seat_ids"].to(device, non_blocking=True),
         "opp_last_token_idx": batch_cpu["opp_last_token_idx"].to(device, non_blocking=True),
         "opp_last_token_is_adjacent": batch_cpu["opp_last_token_is_adjacent"].to(device, non_blocking=True),
-        "heldout_episode_mask": batch_cpu["heldout_episode_mask"].to(device, non_blocking=True),
-        "lineup_opponent_labels": batch_cpu.get("lineup_opponent_labels", []),
-        "lineup_self_play_counts": batch_cpu.get("lineup_self_play_counts", []),
-        "lineup_player_labels": batch_cpu.get("lineup_player_labels", []),
+        "heldout_episode_mask": batch_cpu["heldout_episode_mask"].to(device, non_blocking=True)
     }
     return out

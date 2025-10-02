@@ -157,10 +157,7 @@ class PPOVecRolloutManager:
                         raise RuntimeError(f"Received tensor payload for non-training policy {policy_id}.")
                     
                     start = time.perf_counter()
-                    actions, log_probs, values = agent.compute_actions(
-                        tensors_payload, 
-                        metadata={k: v for k, v in tensors_payload.items() if k in {"env_indices", "seat_indices"}}
-                    )
+                    actions, log_probs, values = agent.compute_actions(tensors_payload)
                     duration = time.perf_counter() - start
                     _record_model_call(policy_id, duration)
                 else:
