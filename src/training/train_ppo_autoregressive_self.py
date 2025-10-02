@@ -85,24 +85,23 @@ class OpponentPoolManager:
 
             # Initialize with base C++ bots using fixed labels 0..6
             base_bots = [
-                {"name": "Classic", "type": "cpp_bot", "model_type": "cpp_bot", "label": 0, "path": None, "status": "active"},
-                {"name": "GreedyCardSpammer", "type": "cpp_bot", "model_type": "cpp_bot", "label": 1, "path": None, "status": "active"},
-                {"name": "RandomAgent", "type": "cpp_bot", "model_type": "cpp_bot", "label": 2, "path": None, "status": "active"},
-                {"name": "SelectiveTableConservativeChallenger", "type": "cpp_bot", "model_type": "cpp_bot", "label": 3, "path": None, "status": "active"},
-                {"name": "StrategicChallenger", "type": "cpp_bot", "model_type": "cpp_bot", "label": 4, "path": None, "status": "active"},
-                {"name": "TableFirstConservativeChallenger", "type": "cpp_bot", "model_type": "cpp_bot", "label": 5, "path": None, "status": "active"},
-                {"name": "TableNonTableAgent", "type": "cpp_bot", "model_type": "cpp_bot", "label": 6, "path": None, "status": "active"},
+                {"name": "Classic", "type": "cpp_bot", "model_type": "cpp_bot", "label": 0, "path": None},
+                {"name": "GreedyCardSpammer", "type": "cpp_bot", "model_type": "cpp_bot", "label": 1, "path": None},
+                {"name": "RandomAgent", "type": "cpp_bot", "model_type": "cpp_bot", "label": 2, "path": None},
+                {"name": "SelectiveTableConservativeChallenger", "type": "cpp_bot", "model_type": "cpp_bot", "label": 3, "path": None},
+                {"name": "StrategicChallenger", "type": "cpp_bot", "model_type": "cpp_bot", "label": 4, "path": None},
+                {"name": "TableFirstConservativeChallenger", "type": "cpp_bot", "model_type": "cpp_bot", "label": 5, "path": None},
+                {"name": "TableNonTableAgent", "type": "cpp_bot", "model_type": "cpp_bot", "label": 6, "path": None},
             ]
 
             self._save(base_bots)
             return base_bots
-        except FileNotFoundError:
-            data = []
 
+        # Strip any legacy 'status' fields from existing data
         changed = False
         for entry in data:
-            if isinstance(entry, dict) and "status" not in entry:
-                entry["status"] = "active"
+            if isinstance(entry, dict) and "status" in entry:
+                entry.pop("status", None)
                 changed = True
         if changed:
             self._save(data)
@@ -141,7 +140,6 @@ class OpponentPoolManager:
             "model_type": model_type,
             "label": next_label,
             "path": path,  # The primary .pth path
-            "status": "active",
         }
 
         # Add any extra metadata passed in, like path_pt
@@ -151,24 +149,14 @@ class OpponentPoolManager:
         self._save(self.pool)
         print(f"Added '{name}' to pool with label {next_label}.")
 
+    # Legacy no-op: status is no longer tracked.
     def set_status(self, label: int, status: str, *, save: bool = True) -> None:
-        label_int = int(label)
-        updated = False
-        for entry in self.pool:
-            if int(entry.get("label", -1)) == label_int:
-                if entry.get("status") != status:
-                    entry["status"] = status
-                    updated = True
-                break
-        if updated and save:
-            self._save(self.pool)
+        return
 
-    def get_entries(self, *, status: Optional[str] = None, include_cpp: bool = True) -> List[Dict[str, Any]]:
+    def get_entries(self, *, include_cpp: bool = True) -> List[Dict[str, Any]]:
         entries: List[Dict[str, Any]] = []
         for entry in self.pool:
             if not include_cpp and entry.get("type") == "cpp_bot":
-                continue
-            if status is not None and entry.get("status", "active") != status:
                 continue
             entries.append(entry)
         return entries
@@ -191,8 +179,6 @@ class OpponentPoolManager:
             except Exception:
                 continue
             if exclude is not None and label_int == exclude:
-                continue
-            if entry.get("status", "active") != "active":
                 continue
             base_weight = entry.get("sampling_weight", 1.0)
             try:
@@ -229,11 +215,7 @@ def _build_front_shadow_sampling(
     except Exception:
         training_label_int = training_label
 
-    active_entries = [
-        entry
-        for entry in pool_manager.pool
-        if isinstance(entry, dict) and entry.get("status", "active") == "active"
-    ]
+    active_entries = [entry for entry in pool_manager.pool if isinstance(entry, dict)]
 
     historical_labels: List[int] = []
     shadow_candidates: List[int] = []
@@ -863,12 +845,11 @@ def train_generation(
                 mini_gpu = _to_device_batch(mini_cpu, device)
 
                 with amp.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == "cuda")):
-                    total_loss, metrics, vector_metrics = ppo_losses_batched(
+                    total_loss, metrics = ppo_losses_batched(
                         learner.model,
                         mini_gpu,
                         sl_teacher=None,
                         update_num=update,
-                        return_vector_metrics=True,
                     )
 
                 loss_denom = max(group_target, 1)
@@ -920,6 +901,9 @@ def train_generation(
         # Note: do NOT finalize dur_tot yet; include logging time later
 
         avg_game_length = (rollout_tokens / len(new_eps)) if new_eps else 0.0
+        lengths_this_update = [ep.get("_token_count", 0) for ep in new_eps]
+        min_game_length = min(lengths_this_update) if lengths_this_update else 0
+        max_game_length = max(lengths_this_update) if lengths_this_update else 0
         rollout_tps = (rollout_tokens / dur_roll) if dur_roll > 0 else 0.0
         optimize_tps = (opt_tokens_processed / dur_opt) if dur_opt > 0 else 0.0
 
@@ -951,7 +935,7 @@ def train_generation(
                 candidate_labels.update(lab for lab in opp_labels_arg if lab is not None)
         else:
             try:
-                for entry in pool_manager.get_entries(status="active", include_cpp=True):
+                for entry in pool_manager.get_entries(include_cpp=True):
                     lab = entry.get("label")
                     if lab is None:
                         continue
@@ -1046,6 +1030,8 @@ def train_generation(
             if ht > 0:
                 writer.add_scalar("PerOpponent/Win_rate_vs_heldout", hw / ht, update)
         writer.add_scalar("Rollout/AvgGameLength", avg_game_length, update)
+        writer.add_scalar("Rollout/MinGameLength", min_game_length, update)
+        writer.add_scalar("Rollout/MaxGameLength", max_game_length, update)
         writer.add_scalar("Rollout/TokensCollected", rollout_tokens, update)
         writer.add_scalar("Rollout/TokensPerSecond", rollout_tps, update)
         writer.add_scalar("Optimize/TokensProcessed", opt_tokens_processed, update)
@@ -1054,10 +1040,7 @@ def train_generation(
         writer.add_scalar("Buffer/Tokens", buffer_token_total, update)
         writer.add_scalar("Acc/OpponentAction", avg.get("opp_action_acc", 0.0), update)
 
-        writer.add_scalar("OpponentSampling/front_group_size", len(front_labels), update)
         writer.add_scalar("OpponentSampling/shadow_group_size", len(shadow_labels), update)
-        writer.add_scalar("OpponentSampling/front_probability", front_weight_share, update)
-        writer.add_scalar("OpponentSampling/shadow_probability", shadow_weight_share, update)
 
         model_call_stats = rollout_manager.get_last_model_call_stats()
 
