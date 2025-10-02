@@ -1562,20 +1562,14 @@ def _collate_batch(
     raw_lens: List[int] = []
     for ep in episodes:
         mi = ep["model_input"]
-        # prefer the length saved during acting (correct per-episode length)
-        if "valid_lengths" in mi and torch.is_tensor(mi["valid_lengths"]):
-            # acting stored [B] but here B==1 per-episode snapshot
-            L_true = int(mi["valid_lengths"].view(-1)[0].item())
-            raw_lens.append(L_true)
-        else:
-            # fallback: infer from the longest [1, L, ...] tensor
-            L_found = None
-            for v in mi.values():
-                if torch.is_tensor(v) and v.dim() >= 2 and v.size(0) == 1:
-                    L_found = int(v.size(1)); break
-            if L_found is None:
-                raise ValueError("Cannot infer sequence length for an episode.")
-            raw_lens.append(L_found)
+        # fallback: infer from the longest [1, L, ...] tensor
+        L_found = None
+        for v in mi.values():
+            if torch.is_tensor(v) and v.dim() >= 2 and v.size(0) == 1:
+                L_found = int(v.size(1)); break
+        if L_found is None:
+            raise ValueError("Cannot infer sequence length for an episode.")
+        raw_lens.append(L_found)
 
     # Choose padding length
     L_batch_max = max(raw_lens) if raw_lens else 0

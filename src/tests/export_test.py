@@ -1,19 +1,8 @@
 #!/usr/bin/env python3
 import argparse
-import sys
 import traceback
 import torch
-from typing import List
-
-def maybe_import_model():
-    try:
-        # Prefer your real module
-        from src.model.ppo_reactive_model import PPOReactiveModel
-        return PPOReactiveModel, "imported from src.model.ppo_reactive_model"
-    except Exception as e:
-        print("[WARN] Could not import PPOReactiveModel from src.model.ppo_reactive_model.")
-        print("       Add your repo root to PYTHONPATH or run this from the project root.\n")
-        raise
+from src.model.ppo_reactive_model import PPOReactiveModel
 
 def build_example_inputs(
     B: int,
@@ -59,9 +48,6 @@ def main():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(args.device)
-
-    PPOReactiveModel, src = maybe_import_model()
-    print(f"[INFO] PPOReactiveModel {src}")
 
     # Build model
     model = PPOReactiveModel(
@@ -156,7 +142,6 @@ def main():
     else:
         print("\n[DONE] Some buckets failed. See logs above for the first error per bucket.")
         print("      Tips:")
-        print("       • Keep model in eval() (done).")
         print("       • Use --strict False (default here).")
         print("       • Ensure any SDPA/backend context is set at init, not inside forward.")
         print("       • If a particular op is unexportable, tiny rewrites (e.g., boolean masks, no Python branching) help.")
