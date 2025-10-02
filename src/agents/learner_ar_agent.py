@@ -17,7 +17,14 @@ from src.model.ppo_reactive_model import PPOReactiveModel
 from src.model.ppo_reactive_model_script import PPOReactiveModelScript
 
 __all__ = ["LearnerAutoregressiveAgent", "build_model_from_state"]
-
+EXPECTED_MODEL_ARGS = {
+            "obs_sequence",
+            "action_sequence",
+            "agent_types",
+            "positions",
+            "action_masks",
+            "padding_mask",
+        }
 
 class LearnerAutoregressiveAgent:
     """Wrapper that keeps learner state on the target training device."""
@@ -75,8 +82,13 @@ class LearnerAutoregressiveAgent:
             else:
                 model_input[key] = value
 
+        filtered_model_input = {
+            k: v for k, v in model_input.items() if k in EXPECTED_MODEL_ARGS
+        }
+        
         with torch.inference_mode():
-            action_logits, _, state_values = self.model(**model_input)
+            model_outputs = self.model(**filtered_model_input)
+            action_logits, _, state_values = model_outputs[:3]
 
         valid_lengths = model_input["valid_lengths"].long()
         if valid_lengths.numel() == 0:

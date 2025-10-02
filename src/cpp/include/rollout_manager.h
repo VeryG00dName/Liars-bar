@@ -83,12 +83,7 @@ public:
                         const std::vector<int>& training_policy_ids,
                         int max_batch_envs = -1,
                         uint32_t seed = 0,
-                        const std::vector<int>& cpp_bots = {},
-                        const std::vector<int>& latest_historical_agents = {},
-                        const std::vector<int>& active_shadow_agents = {},
-                        double front_mass = 0.0,
-                        double shadow_mass = 0.0,
-                        const std::vector<int>& weighted_opponents = {},
+                        const std::vector<int>& opponent_labels = {},
                         const std::vector<double>& opponent_weights = {});
 
     std::unordered_map<int, std::vector<PolicyRequest>> collect_requests_for_inference();
@@ -159,10 +154,6 @@ private:
     std::vector<std::vector<int>> build_roles(int batch_size,
                                               int num_players,
                                               const std::vector<int>& training_policy_ids,
-                                              const std::vector<int>& front_agents,
-                                              const std::vector<int>& shadow_agents,
-                                              double front_mass,
-                                              double shadow_mass,
                                               const std::vector<int>& weighted_opponents,
                                               const std::vector<double>& opponent_weights);
     EpisodeTracker new_episode_tracker(int env_idx, const std::vector<int>& roles);

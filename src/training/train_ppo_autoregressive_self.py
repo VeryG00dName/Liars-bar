@@ -973,11 +973,8 @@ def train_generation(
     rollout_manager = PPOVecRolloutManager(
         policy_map,
         device,
-        pool_manager=pool_manager,
         rng=(rng or _GLOBAL_RNG),
     )
-
-    rollout_manager.mark_training_policy(training_policy_id, getattr(learner, "label", training_policy_id))
 
     cpp_bot_names = {
         0: "Classic",
@@ -995,7 +992,6 @@ def train_generation(
             continue
         try:
             rollout_manager.cpp_manager.register_cpp_bot(label, name)
-            rollout_manager.register_cpp_native_policy(label, label)
             registered_cpp_bots.append(label)
         except Exception as exc:
             logging.exception(
@@ -1030,7 +1026,6 @@ def train_generation(
 
         try:
             rollout_manager.cpp_manager.load_historical_model(policy_id, str(traced_path))
-            rollout_manager.register_historical_cpp_policy(policy_id, policy_id)
             loaded_historical_labels.append(policy_id)
         except Exception as exc:
             logging.exception(
@@ -1043,7 +1038,7 @@ def train_generation(
         sorted(loaded_historical_labels),
     )
 
-    rollout_manager.set_opponent_pool(pool_manager.pool)
+    # Opponent pool is managed locally for sampling; no manager sync needed.
     stats_manager = OpponentStatsManager(pool_manager)
 
     # 4. MAIN TRAINING LOOP
@@ -1340,7 +1335,7 @@ def train_generation(
         cull_frequency = max(1, int(getattr(config, "CULL_FREQUENCY", 5)))
         if regression_records and (update % cull_frequency == 0):
             _perform_generational_culling(pool_manager, stats_manager, training_policy_id)
-            rollout_manager.set_opponent_pool(pool_manager.pool)
+            # Opponent pool is managed locally for sampling; no manager sync needed.
         if device.type == "cuda" and FORCE_CUDA_SYNC_FOR_TIMING:
             torch.cuda.synchronize()
         t_opt_end = time.time()
@@ -1613,7 +1608,7 @@ def train_generation(
             torch.save({"model_state_dict": to_save.state_dict()}, path)
 
     _perform_generational_culling(pool_manager, stats_manager, training_policy_id)
-    rollout_manager.set_opponent_pool(pool_manager.pool)
+    # Opponent pool is managed locally for sampling; no manager sync needed.
 
     # 5. FINALIZE AND SAVE
     final_path_pth = os.path.join(run_ckpt_dir, "final.pth")
