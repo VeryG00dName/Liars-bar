@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import time
 import os
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from itertools import combinations
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -55,33 +56,6 @@ class SchedulerConfig:
     pair_coverage_target: int = 64
     degree_cap_margin: int = 2
     max_candidate_quartets: int = 4096
-
-
-@dataclass
-class LeagueStoppingConfig:
-    conservative_stability_k: int = 5
-    enable_global: bool = True
-    global_mu_threshold: float = 0.02
-    global_sigma_threshold: float = 0.02
-    global_consecutive: int = 2
-    # Optional absolute-σ stopping: stop when average σ is small enough
-    # If None, this criterion is disabled.
-    avg_sigma_threshold: Optional[float] = None
-    # Compute the average σ over top-k (by conservative). If None, use all players.
-    avg_sigma_top_k: Optional[int] = None
-    # Require this many consecutive batches below threshold.
-    avg_sigma_consecutive: int = 1
-    # If True and avg-σ criterion is met, stop immediately (ignore other criteria)
-    avg_sigma_sufficient: bool = False
-
-
-@dataclass
-class LeagueTracker:
-    conservative_order: Tuple[int, ...] | None = None
-    conservative_streak: int = 0
-    global_streak: int = 0
-    previous_mu_sigma: Dict[int, Tuple[float, float]] = field(default_factory=dict)
-    avg_sigma_streak: int = 0
 
 
 def parse_run_specs(specs: List[str]) -> Dict[str, List[str]]:
@@ -197,20 +171,9 @@ class PairStatistics:
 
 def _pair_key(a: int, b: int) -> Tuple[int, int]:
     return (a, b) if a < b else (b, a)
-
-
-def _pair_interest(stat: Optional[PairStatistics]) -> float:
-    if stat is None:
-        return 1.0
-    win_rate = stat.win_rate()
-    balance = 1.0 - abs(win_rate - 0.5) * 2.0
-    return stat.confidence_width() + balance
-
-
 def _quartet_objective(
     quartet: Tuple[int, int, int, int],
     pair_stats: Dict[Tuple[int, int], PairStatistics],
-    coverage_complete: bool,
     player_usage: Dict[int, int],
     min_usage: int,
     rng: np.random.Generator,
@@ -219,10 +182,7 @@ def _quartet_objective(
         _pair_key(a, b)
         for a, b in combinations(quartet, 2)
     ]
-    if not coverage_complete:
-        base = sum(pair_stats.get(key, PairStatistics()).games for key in pair_keys)
-    else:
-        base = -sum(_pair_interest(pair_stats.get(key)) for key in pair_keys)
+    base = sum(pair_stats.get(key, PairStatistics()).games for key in pair_keys)
     usage_penalty = sum(max(0, player_usage.get(pid, 0) - min_usage) for pid in quartet)
     jitter = float(rng.random()) * 1e-6
     return base + usage_penalty * 1e3 + jitter
@@ -231,7 +191,6 @@ def _quartet_objective(
 def _pick_next_quartet(
     candidates: Sequence[Tuple[int, int, int, int]],
     pair_stats: Dict[Tuple[int, int], PairStatistics],
-    coverage_complete: bool,
     player_usage: Dict[int, int],
     base_cap: int,
     rng: np.random.Generator,
@@ -255,7 +214,6 @@ def _pick_next_quartet(
             score = _quartet_objective(
                 quartet,
                 pair_stats,
-                coverage_complete,
                 player_usage,
                 min_usage,
                 rng,
@@ -275,7 +233,6 @@ def _pick_next_quartet(
         score = _quartet_objective(
             quartet,
             pair_stats,
-            coverage_complete,
             player_usage,
             min_usage,
             rng,
@@ -292,7 +249,6 @@ def schedule_quartets(
     scheduler: SchedulerConfig,
     quartets_needed: int,
     player_usage: Dict[int, int],
-    coverage_complete: bool,
     rng: np.random.Generator,
 ) -> Tuple[List[Tuple[int, int, int, int]], Dict[int, int]]:
     if len(player_ids) < 4 or quartets_needed <= 0:
@@ -306,7 +262,7 @@ def schedule_quartets(
     for _ in range(quartets_needed):
         min_usage = min(usage.values()) if usage else 0
         base_cap = min_usage + scheduler.degree_cap_margin
-        quartet = _pick_next_quartet(candidates, pair_stats, coverage_complete, usage, base_cap, rng)
+        quartet = _pick_next_quartet(candidates, pair_stats, usage, base_cap, rng)
         if quartet is None:
             break
         selected.append(quartet)
@@ -319,91 +275,12 @@ def schedule_quartets(
     return selected, usage
 
 
-def evaluate_league_stopping(
-    players: Dict[int, Dict[str, Any]],
-    tracker: LeagueTracker,
-    config: LeagueStoppingConfig,
-) -> Tuple[bool, Dict[str, bool]]:
-    statuses: Dict[str, bool] = {}
-
-    conservative_order = tuple(
-        pid
-        for pid, _ in sorted(
-            players.items(), key=lambda item: item[1].get("conservative", 0.0), reverse=True
-        )
-    )
-    if tracker.conservative_order == conservative_order:
-        tracker.conservative_streak += 1
-    else:
-        tracker.conservative_order = conservative_order
-        tracker.conservative_streak = 1 if conservative_order else 0
-    statuses["conservative_stability"] = (
-        tracker.conservative_streak >= config.conservative_stability_k and bool(conservative_order)
-    )
-
-    if config.enable_global:
-        mu_changes: List[float] = []
-        sigma_changes: List[float] = []
-        for pid, meta in players.items():
-            prev_mu, prev_sigma = tracker.previous_mu_sigma.get(
-                pid, (meta.get("mu", 0.0), meta.get("sigma", 0.0))
-            )
-            mu_changes.append(abs(meta.get("mu", 0.0) - prev_mu))
-            sigma_changes.append(abs(meta.get("sigma", 0.0) - prev_sigma))
-            tracker.previous_mu_sigma[pid] = (meta.get("mu", 0.0), meta.get("sigma", 0.0))
-        mean_mu = sum(mu_changes) / len(mu_changes) if mu_changes else 0.0
-        mean_sigma = sum(sigma_changes) / len(sigma_changes) if sigma_changes else 0.0
-        if mean_mu <= config.global_mu_threshold and mean_sigma <= config.global_sigma_threshold:
-            tracker.global_streak += 1
-        else:
-            tracker.global_streak = 0
-        statuses["global_convergence"] = tracker.global_streak >= config.global_consecutive
-    else:
-        tracker.previous_mu_sigma = {
-            pid: (meta.get("mu", 0.0), meta.get("sigma", 0.0)) for pid, meta in players.items()
-        }
-        tracker.global_streak = 0
-        statuses["global_convergence"] = False
-
-    # Optional: absolute average-σ stopping (over all or top-k by conservative)
-    if config.avg_sigma_threshold is not None:
-        ordered = sorted(
-            players.items(), key=lambda item: item[1].get("conservative", 0.0), reverse=True
-        )
-        if config.avg_sigma_top_k is not None and config.avg_sigma_top_k > 0:
-            ordered = ordered[: config.avg_sigma_top_k]
-        sigmas = [meta.get("sigma", 0.0) for _, meta in ordered]
-        mean_sigma = (sum(sigmas) / len(sigmas)) if sigmas else 0.0
-        if mean_sigma <= float(config.avg_sigma_threshold):
-            tracker.avg_sigma_streak += 1
-        else:
-            tracker.avg_sigma_streak = 0
-        statuses["avg_sigma_below"] = tracker.avg_sigma_streak >= max(1, int(config.avg_sigma_consecutive))
-    else:
-        tracker.avg_sigma_streak = 0
-        statuses["avg_sigma_below"] = False
-
-    # Base requirement remains conservative rank stability; combine with others if enabled.
-    satisfied = statuses["conservative_stability"]
-    if config.enable_global:
-        satisfied = satisfied and statuses.get("global_convergence", False)
-    if config.avg_sigma_threshold is not None:
-        satisfied = satisfied and statuses.get("avg_sigma_below", False)
-    # Allow avg-σ alone to be sufficient, if requested
-    if config.avg_sigma_threshold is not None and config.avg_sigma_sufficient:
-        if statuses.get("avg_sigma_below", False):
-            satisfied = True
-    return satisfied, statuses
-
-
 def run_active_league(
     eval_manager: "lb.EvalManager",
     players: Dict[int, Dict[str, Any]],
     scheduler: SchedulerConfig,
     stopping: MatchStoppingConfig,
-    league_stop: LeagueStoppingConfig,
     track_experts: bool = False,
-    max_batches: int = 200,
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
     pairwise_counts: Dict[Tuple[int, int], int] = defaultdict(int)
     pairwise_wins: Dict[Tuple[int, int], int] = defaultdict(int)
@@ -414,35 +291,37 @@ def run_active_league(
         for a, b in combinations(players.keys(), 2)
     ]
     quartets_per_batch = max(1, scheduler.batch_size // stopping.games_per_match)
-    games_per_batch = quartets_per_batch * stopping.games_per_match
-    tracker = LeagueTracker()
     scoreboard_file = "tournament_scoreboard.json"
     historical_scoreboard = load_scoreboard(scoreboard_file)
-    total_steps = max_batches * games_per_batch
-    progress_ui = RichProgressScoreboard(total_steps=total_steps, players=players)
+    # Progress bar tracks coverage toward target: (#pairs * games_per_pair_target)
+    n_players_total = len(players)
+    n_pairs_total = max(0, n_players_total * (n_players_total - 1) // 2)
+    total_coverage_units = max(1, n_pairs_total * scheduler.pair_coverage_target)
+    progress_ui = RichProgressScoreboard(total_steps=total_coverage_units, players=players)
     rng = np.random.default_rng(SEED)
 
     expert_data: Dict[int, Dict[str, Any]] = defaultdict(dict)
 
     batch_idx = 0
-    league_finished = False
     coverage_complete = False
+    start_time = time.perf_counter()
+    total_games_done = 0
+    coverage_done = 0
 
-    while not league_finished and batch_idx < max_batches:
+    while not coverage_complete:
         quartets, updated_usage = schedule_quartets(
             sorted(players.keys()),
             pair_stats,
             scheduler,
             quartets_per_batch,
             player_usage,
-            coverage_complete,
             rng,
         )
         if not quartets:
             break
         player_usage = updated_usage
         batch_seed = int(rng.integers(0, 2**31 - 1, dtype=np.int64))
-        results_list, h2h_counts, h2h_wins, _ = run_batched_lineups(
+        results_list, h2h_counts, h2h_wins, total_games = run_batched_lineups(
             eval_manager,
             [list(q) for q in quartets],
             num_games_per_match=stopping.games_per_match,
@@ -450,6 +329,7 @@ def run_active_league(
             track_experts=track_experts,
             base_seed=batch_seed,
         )
+        total_games_done += int(total_games)
 
         if len(results_list) != len(quartets):
             raise RuntimeError(
@@ -461,15 +341,33 @@ def run_active_league(
         for k, v in h2h_wins.items():
             pairwise_wins[k] += v
 
+        # Compute coverage increment per unordered pair BEFORE mutating pair_stats.
+        # Use the maximum of oriented counts to avoid double-counting (a,b) and (b,a).
+        per_pair_delta: Dict[Tuple[int, int], int] = defaultdict(int)
+        for (a, b), delta in h2h_counts.items():
+            key = _pair_key(a, b)
+            if int(delta) > per_pair_delta[key]:
+                per_pair_delta[key] = int(delta)
+        batch_coverage_increment = 0
+        for key, delta in per_pair_delta.items():
+            prev_games = pair_stats.get(key, PairStatistics()).games
+            remaining = max(0, scheduler.pair_coverage_target - prev_games)
+            if remaining > 0 and delta > 0:
+                batch_coverage_increment += min(delta, remaining)
+
+        # Update pair statistics with this batch's results.
         batch_players = sorted({pid for quartet in quartets for pid in quartet})
         for a, b in combinations(batch_players, 2):
             key = _pair_key(a, b)
-            games = h2h_counts.get((a, b), 0)
+            # Count once per pair: take the max of oriented counts to avoid double-counting.
+            games = max(h2h_counts.get((a, b), 0), h2h_counts.get((b, a), 0))
             if games == 0:
                 continue
             stat = pair_stats.setdefault(key, PairStatistics())
-            stat.games += games
-            stat.wins_first += h2h_wins.get((a, b), 0)
+            stat.games += int(games)
+            # Wins for the normalized first member: only count orientation (a,b) where a<b
+            wins_first = h2h_wins.get((a, b), 0)
+            stat.wins_first += int(wins_first)
 
         for quartet, results in zip(quartets, results_list):
             ranks = ranks_from_results(results)
@@ -482,27 +380,43 @@ def run_active_league(
                     key = players[pid]["player_id"]
                     expert_data[key].update(data if isinstance(data, dict) else {"summary": data})
 
-            games_played = max((stats.get("num_games", 0) for stats in results.values()), default=0)
+            # Refresh scoreboard frequently without advancing coverage progress here.
             differences = compare_scoreboards(historical_scoreboard, players)
+            elapsed = max(1e-6, time.perf_counter() - start_time)
+            games_per_sec = float(total_games_done) / elapsed
             progress_ui.update(
-                increment=games_played,
+                increment=0,
                 differences=differences,
                 description=f"Batch {batch_idx + 1} quartet {quartet}",
+                games_per_sec=games_per_sec,
             )
 
-        if not coverage_complete:
-            coverage_complete = all(
-                pair_stats.get(pair, PairStatistics()).games >= scheduler.pair_coverage_target
-                for pair in all_pairs
+        # Advance coverage progress once per batch by the amount that counts toward the target.
+        if batch_coverage_increment > 0:
+            elapsed = max(1e-6, time.perf_counter() - start_time)
+            games_per_sec = float(total_games_done) / elapsed
+            advance = int(min(batch_coverage_increment, max(0, total_coverage_units - coverage_done)))
+            coverage_done += advance
+            progress_ui.update(
+                increment=advance,
+                differences=None,
+                description=f"Coverage {min(coverage_done, total_coverage_units)}/{total_coverage_units}",
+                games_per_sec=games_per_sec,
             )
-            if coverage_complete:
-                print(
-                    f"[INFO] Coverage phase complete: every pair reached "
-                    f"{scheduler.pair_coverage_target} games. Switching to refinement."
-                )
+
+        coverage_complete = all(
+            pair_stats.get(pair, PairStatistics()).games >= scheduler.pair_coverage_target
+            for pair in all_pairs
+        )
+        if not coverage_complete and coverage_done >= total_coverage_units:
+            coverage_complete = True
+        if coverage_complete:
+            print(
+                f"[INFO] Pair coverage complete: every pair reached "
+                f"{scheduler.pair_coverage_target} games."
+            )
 
         batch_idx += 1
-        league_finished, _ = evaluate_league_stopping(players, tracker, league_stop)
 
     progress_ui.close()
     save_scoreboard(scoreboard_file, players)
@@ -512,14 +426,6 @@ def run_active_league(
         if count > 0:
             wins = pairwise_wins.get(pair, 0)
             h2h_rates[pair] = wins / count
-    # Coverage summary for diagnostics
-    try:
-        n_players = len(players)
-        possible_pairs = max(1, n_players * (n_players - 1))
-        coverage = (len(h2h_rates) / possible_pairs) * 100.0
-        print(f"[INFO] H2H coverage: {len(h2h_rates)}/{possible_pairs} pairs ({coverage:.1f}%) with at least one game.")
-    except Exception:
-        pass
     try:
         plot_agent_heatmap(h2h_rates, players, title="Head-to-Head Win Rates (round-level)")
     except Exception as exc:
@@ -554,21 +460,6 @@ def main() -> None:
         help="Target number of games to schedule per batch (used to derive quartets per batch).",
     )
     parser.add_argument(
-        "--quartets-per-batch",
-        type=int,
-        default=None,
-        help=(
-            "Deprecated: if provided, overrides --batch-size by setting batch size to"
-            " quartets_per_batch × games_per_quartet."
-        ),
-    )
-    parser.add_argument(
-        "--max-batches",
-        type=int,
-        default=200,
-        help="Safety cap on the number of scheduling batches to run.",
-    )
-    parser.add_argument(
         "--track-experts",
         action="store_true",
         help="Collect MoE expert activation summaries when supported by agents.",
@@ -579,56 +470,18 @@ def main() -> None:
         default="final_scoreboard.csv",
         help="Path to write the final scoreboard CSV (set empty to skip).",
     )
-    # Conservative rank stability and global convergence controls
     parser.add_argument(
-        "--conservative-stability-k",
-        type=int,
-        default=5,
-        help="Batches the conservative order must remain unchanged before stopping.",
-    )
-    group_global = parser.add_mutually_exclusive_group()
-    group_global.add_argument(
-        "--enable-global-stop",
-        dest="enable_global_stop",
+        "--fair",
         action="store_true",
-        help="Require global μ/σ convergence to stop (default).",
-    )
-    group_global.add_argument(
-        "--disable-global-stop",
-        dest="enable_global_stop",
-        action="store_false",
-        help="Do not require global μ/σ convergence to stop.",
-    )
-    parser.set_defaults(enable_global_stop=True)
-    # Optional absolute-σ stopping controls
-    parser.add_argument(
-        "--stop-avg-sigma",
-        type=float,
-        default=2,
-        help="Stop when average σ (over all or top-k) is at or below this value.",
-    )
-    parser.add_argument(
-        "--stop-avg-sigma-top-k",
-        type=int,
-        default=None,
-        help="When using --stop-avg-sigma, compute the average over the top-k by conservative score.",
-    )
-    parser.add_argument(
-        "--stop-avg-sigma-consecutive",
-        type=int,
-        default=1,
-        help="Require this many consecutive batches below the average-σ threshold.",
-    )
-    parser.add_argument(
-        "--stop-avg-sigma-alone",
-        action="store_true",
-        help="If set, avg-σ condition alone is sufficient to stop (ignores conservative/global).",
+        help=(
+            "Only load generations up to the highest shared generation across all run names."
+        ),
     )
     parser.add_argument(
         "--pair-coverage-target",
         type=int,
         default=64,
-        help="Target number of games per pair before switching to the refinement phase.",
+        help="Number of games per pair required; the tournament stops once every pair meets it.",
     )
     parser.add_argument(
         "--degree-cap-margin",
@@ -651,17 +504,20 @@ def main() -> None:
     else:
         cpp_bot_labels = parse_cpp_labels(args.cpp_bots)
 
-    eval_manager, players = load_evaluation_policies(run_specs, cpp_bot_labels, device)
+    eval_manager, players = load_evaluation_policies(
+        run_specs,
+        cpp_bot_labels,
+        device,
+        fair=args.fair,
+    )
     num_players = config.NUM_PLAYERS
     if len(players) < num_players:
         raise ValueError(
             f"Need at least {num_players} agents to run the tournament; got {len(players)}."
         )
 
-    if args.quartets_per_batch is not None:
-        batch_size = max(1, args.quartets_per_batch) * max(1, args.games_per_quartet)
-    else:
-        batch_size = max(1, args.batch_size)
+
+    batch_size = max(1, args.batch_size)
 
     stopping = MatchStoppingConfig(games_per_match=args.games_per_quartet)
     batch_size = max(batch_size, stopping.games_per_match)
@@ -671,23 +527,12 @@ def main() -> None:
         degree_cap_margin=max(0, args.degree_cap_margin),
         max_candidate_quartets=max(0, args.max_candidate_quartets),
     )
-    league_stop = LeagueStoppingConfig(
-        conservative_stability_k=args.conservative_stability_k,
-        enable_global=bool(args.enable_global_stop),
-        avg_sigma_threshold=args.stop_avg_sigma,
-        avg_sigma_top_k=args.stop_avg_sigma_top_k,
-        avg_sigma_consecutive=args.stop_avg_sigma_consecutive,
-        avg_sigma_sufficient=args.stop_avg_sigma_alone,
-    )
-
     expert_data, baseline_scoreboard = run_active_league(
         eval_manager,
         players,
         scheduler=scheduler,
         stopping=stopping,
-        league_stop=league_stop,
-        track_experts=args.track_experts,
-        max_batches=args.max_batches,
+        track_experts=args.track_experts
     )
 
     final_differences = compare_scoreboards(baseline_scoreboard, players)

@@ -218,6 +218,8 @@ def load_evaluation_policies(
     run_specs: Dict[str, List[str]],
     cpp_bot_labels: List[int],
     device: torch.device,
+    *,
+    fair: bool = False,
 ) -> Tuple["lb.EvalManager", Dict[int, Dict[str, Any]]]:
     """Load TorchScript policies and register C++ bots with the evaluation manager."""
 
@@ -257,11 +259,32 @@ def load_evaluation_policies(
         player_id = f"cpp_bot_{cpp_label}_{name}"
         metadata[policy_id] = _initial_metadata(policy_id, player_id, cpp_label, is_cpp_bot=True)
 
+    fair_limit: Optional[int] = None
+    if fair and len(run_specs) > 1:
+        numeric_limits: List[int] = []
+        for run_name in run_specs:
+            available = _discover_generations(run_name)
+            numeric = [int(g) for g in available if g.isdigit()]
+            if not numeric:
+                numeric_limits = []
+                break
+            numeric_limits.append(max(numeric))
+        if numeric_limits:
+            fair_limit = min(numeric_limits)
+            print(
+                f"[INFO] Fair mode active: limiting generations to ≤ {fair_limit} across runs."
+            )
+
     for run_name, gen_specs in run_specs.items():
         if any(g.upper() == "ALL" for g in gen_specs):
             gens_to_load = _discover_generations(run_name)
         else:
             gens_to_load = list(gen_specs)
+
+        if fair_limit is not None:
+            gens_to_load = [
+                g for g in gens_to_load if (not g.isdigit()) or int(g) <= fair_limit
+            ]
 
         for gen_spec in gens_to_load:
             base_dir = Path(config.CHECKPOINT_DIR) / run_name / f"gen_{gen_spec}"
