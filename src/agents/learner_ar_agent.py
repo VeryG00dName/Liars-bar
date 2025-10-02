@@ -87,14 +87,6 @@ class LearnerAutoregressiveAgent:
 
         filtered_model_input = {k: v for k, v in model_input.items() if k in EXPECTED_MODEL_ARGS}
 
-        # --- mark batch dim dynamic exactly once (before the very first traced call) ---
-        if not getattr(self, "_rollout_batch_marked_dynamic", False):
-            for t in filtered_model_input.values():
-                if torch.is_tensor(t) and t.dim() >= 1:
-                    torch._dynamo.mark_dynamic(t, 0, min=1, max=512)
-            self._rollout_batch_marked_dynamic = True
-        # -------------------------------------------------------------------------------
-
         with torch.inference_mode():
             action_logits, _, state_values = self.model(**filtered_model_input)[:3]
 
