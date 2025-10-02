@@ -1,12 +1,8 @@
 # src/model/ppo_reactive_model.py
 
+import torch
+import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
-from torch.nn.attention import sdpa_kernel, SDPBackend
-sdpa_math_only = sdpa_kernel(backends=[SDPBackend.MATH])
-with sdpa_math_only:
-    # build & compile inside the context (or at least the first forward)
-    import torch
-    import torch.nn as nn
     
 class PPOReactiveModel(nn.Module):
     """
