@@ -33,6 +33,7 @@ class LearnerAutoregressiveAgent:
         self.device = device
         self.player_id = player_id
         self.model: Optional[torch.nn.Module] = None
+        self.train_model: Optional[torch.nn.Module] = None
         self.label: int = -1
         self.max_seq_length: Optional[int] = None
         self._last_inputs: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
@@ -50,9 +51,9 @@ class LearnerAutoregressiveAgent:
         self.reset()
 
     def compute_actions(
-        self,
-        tensor_inputs: Dict[str, torch.Tensor],
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+            self,
+            tensor_inputs: Dict[str, torch.Tensor],
+        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         if self.model is None:
             raise RuntimeError("LearnerAutoregressiveAgent model has not been initialized.")
 
@@ -63,13 +64,16 @@ class LearnerAutoregressiveAgent:
         if not torch.is_tensor(valid_lengths_source):
             valid_lengths_source = torch.as_tensor(valid_lengths_source)
         max_len = int(valid_lengths_source.max().item()) if valid_lengths_source.numel() > 0 else 1
-        bucket_boundaries = [16, 32, 64, 128, 160, 192, 256]
+
+        # keep L static via buckets; B will be dynamic (first call only)
+        bucket_boundaries = [32, 64, 160, 256]
         target_pad_len = max_len
         for boundary in bucket_boundaries:
             if max_len <= boundary:
                 target_pad_len = boundary
                 break
 
+        # Slice to bucket length and move to device
         model_input: Dict[str, torch.Tensor] = {}
         for key, value in tensor_inputs.items():
             if torch.is_tensor(value):
@@ -81,18 +85,24 @@ class LearnerAutoregressiveAgent:
             else:
                 model_input[key] = value
 
-        filtered_model_input = {
-            k: v for k, v in model_input.items() if k in EXPECTED_MODEL_ARGS
-        }
-        
+        filtered_model_input = {k: v for k, v in model_input.items() if k in EXPECTED_MODEL_ARGS}
+
+        # --- mark batch dim dynamic exactly once (before the very first traced call) ---
+        if not getattr(self, "_rollout_batch_marked_dynamic", False):
+            for t in filtered_model_input.values():
+                if torch.is_tensor(t) and t.dim() >= 1:
+                    torch._dynamo.mark_dynamic(t, 0, min=1, max=512)
+            self._rollout_batch_marked_dynamic = True
+        # -------------------------------------------------------------------------------
+
         with torch.inference_mode():
-            model_outputs = self.model(**filtered_model_input)
-            action_logits, _, state_values = model_outputs[:3]
+            action_logits, _, state_values = self.model(**filtered_model_input)[:3]
 
         valid_lengths = model_input["valid_lengths"].long()
         if valid_lengths.numel() == 0:
             empty = np.array([], dtype=np.float32)
             return empty.astype(np.uint8), empty, empty
+
         rows = torch.arange(valid_lengths.shape[0], device=self.device)
         last_idx = (valid_lengths - 1).clamp_min(0)
 

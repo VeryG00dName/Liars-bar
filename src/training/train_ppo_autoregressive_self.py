@@ -1,5 +1,6 @@
 # src/training/train_ppo_autoregressive_self.py
 
+import copy
 import os, logging, warnings
 import json
 import math
@@ -529,7 +530,6 @@ def train_generation(
     # 2. INITIALIZE LEARNER AND OPPONENTS
     if learner is None:
         if warm_start_path:
-            # If a path IS provided, load/clone
             logging.info(f"Loading learner from warm_start_path: {warm_start_path}")
             cache_key = f"ckpt:{os.path.abspath(warm_start_path)}"
             if agent_cache is not None and cache_key in agent_cache:
@@ -537,33 +537,74 @@ def train_generation(
             else:
                 base_agent = _load_agent_from_checkpoint(warm_start_path, 'main', device)
                 if agent_cache is not None:
-                    agent_cache[cache_key] = base_agent  # keep a copy of the base
+                    agent_cache[cache_key] = base_agent  # keep a copy of the base wrapper
                 learner = _clone_agent_from_agent(base_agent, device)
         else:
-            # If no path is provided, create a new agent from scratch
+            # fresh wrapper + model
             learner = _create_new_agent('main', device)
     else:
-        # Ensure learner is on the correct device
+        # ensure wrapper's model on correct device
         learner.model = learner.model.to(device)
+
     learner.device = device
 
-    if hasattr(torch, "compile"):
-        base_model = getattr(learner.model, "_orig_mod", learner.model)
-        if learner.model is base_model:
-            try:
-                learner.model = torch.compile(base_model)
-            except Exception as exc:
-                logging.warning(f"torch.compile failed for learner model: {exc}")
-                learner.model = base_model
+    # ---------------------------------------------------------------------
+    # 1) Clone JUST THE MODEL (before compiling anything) for TRAINING
+    # ---------------------------------------------------------------------
+    # At this point, learner.model is guaranteed to be an uncompiled nn.Module
+    try:
+        train_model = copy.deepcopy(learner.model).to(device)
+    except Exception as exc:
+        logging.warning(f"Deepcopy of model failed; falling back to state_dict clone: {exc}")
+        # Fallback: rebuild a new module of the same class and load weights
+        # (Assumes your model has a .config or compatible constructor; adjust if needed)
+        train_model = type(learner.model)(**getattr(learner.model, "config", {})).to(device)
+        train_model.load_state_dict(learner.model.state_dict(), strict=True)
 
-    learner.model.train()
+    # ---------------------------------------------------------------------
+    # 2) Compile TRAIN model (static shapes; best kernels)
+    # ---------------------------------------------------------------------
+    if hasattr(torch, "compile"):
+        try:
+            compiled_train = torch.compile(train_model, dynamic=False, mode="max-autotune")
+            learner.train_model = compiled_train  # expose alongside rollout wrapper
+        except Exception as exc:
+            logging.warning(f"torch.compile (train) failed; using eager training model: {exc}")
+            learner.train_model = train_model
+    else:
+        learner.train_model = train_model
+
+    # Put training model in train mode by default (caller can toggle as needed)
+    learner.train_model.train()
+
+    # ---------------------------------------------------------------------
+    # 3) Compile ROLLOUT model inside the wrapper (reduce-overhead)
+    #    NOTE: compute_actions will call mark_dynamic(batch_dim) on first use.
+    # ---------------------------------------------------------------------
+    if hasattr(torch, "compile"):
+        # If the wrapper might already hold a compiled module, get the underlying orig mod
+        rollout_base = getattr(learner.model, "_orig_mod", learner.model)
+        if learner.model is rollout_base:
+            try:
+                # Keep eval here; rollout uses inference + cudagraph-friendly graph
+                rollout_base.eval()
+                learner.model = torch.compile(rollout_base, dynamic=False, mode="reduce-overhead")
+            except Exception as exc:
+                logging.warning(f"torch.compile (rollout) failed; using eager rollout model: {exc}")
+                learner.model = rollout_base
+    else:
+        # leave as eager if torch.compile unavailable
+        learner.model = learner.model
+
+    # Rollout wrapper stays in eval; compute_actions runs under torch.inference_mode()
+    learner.model.eval()
 
     # Create two lists to hold parameters for weight decay and no weight decay
     decay_params = []
     no_decay_params = []
 
     # Iterate through all named parameters of the model
-    for name, param in learner.model.named_parameters():
+    for name, param in learner.train_model.model.named_parameters():
         if not param.requires_grad:
             continue
         
@@ -583,11 +624,11 @@ def train_generation(
         lr=float(config.LEARNING_RATE),
     )
     scaler = amp.GradScaler(enabled=(device.type == "cuda"))
-    all_params = list(learner.model.parameters())
+    all_params = list(learner.train_model.model.parameters())
 
     # Check if the model has an opponent action head to separate its parameters
-    if hasattr(learner.model, 'opp_action_head'):
-        opp_head_params = list(learner.model.opp_action_head.parameters())
+    if hasattr(learner.train_model.model, 'opp_action_head'):
+        opp_head_params = list(learner.train_model.model.opp_action_head.parameters())
         opp_head_param_ids = {id(p) for p in opp_head_params}
         
         # Main parameters are everything EXCEPT the opponent head
@@ -703,7 +744,7 @@ def train_generation(
     for update in range(1, max_updates + 1):
         # -------- Rollout --------
         t0 = time.time()
-        learner.model.eval()
+        learner.model.load_state_dict(learner.train_model.state_dict(), strict=True)
         
         # Set the number of games to collect for the update.
         games_to_collect = episodes_per_update
@@ -773,7 +814,6 @@ def train_generation(
         buffer_token_total = sum(item[0].get("_token_count", 0) for item in ep_buffer)
         
         # -------- Optimize (aggregate metrics) --------
-        learner.model.train()
         agg = {"total_loss": 0.0}
         n_batches = 0
         opt_tokens_processed = 0
@@ -1070,7 +1110,7 @@ def train_generation(
 
         if update % int(config.CHECKPOINT_INTERVAL) == 0:
             path = os.path.join(run_ckpt_dir, f"update_{update}.pth")
-            to_save = getattr(learner.model, "_orig_mod", learner.model)
+            to_save = getattr(learner.train_model, "_orig_mod", learner.train_model)
             torch.save({"model_state_dict": to_save.state_dict()}, path)
 
     # 5. FINALIZE AND SAVE
@@ -1078,7 +1118,7 @@ def train_generation(
     final_path_pt = os.path.join(run_ckpt_dir, "final_traced.pt")
 
     # Save the standard PyTorch state_dict
-    model_to_save = getattr(learner.model, "_orig_mod", learner.model)
+    model_to_save = getattr(learner.train_model, "_orig_mod", learner.train_model)
     torch.save({"model_state_dict": model_to_save.state_dict()}, final_path_pth)
     logging.info(f"Saved standard PyTorch checkpoint to {final_path_pth}")
 
