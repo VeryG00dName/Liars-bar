@@ -150,7 +150,6 @@ class PPOVecRolloutManager:
                     raise RuntimeError(f"No policy object for id: {policy_id}")
 
                 tensors_payload = payload.get("tensors")
-                request_entries = payload.get("requests", [])
 
                 if tensors_payload and hasattr(agent, "compute_actions"):
                     if policy_id not in training_policy_set:

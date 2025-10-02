@@ -4,10 +4,11 @@ import copy
 import os, logging, warnings
 import json
 import math
+from collections import defaultdict
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Callable, Tuple, Sequence
+from typing import Dict, Any, List, Optional, Callable, Tuple, Sequence, DefaultDict
 from numpy.random import Generator
 import random
 import numpy as np
@@ -503,11 +504,8 @@ def train_generation(
     master_run_name: str,
     pool_manager: OpponentPoolManager,
     max_updates: int = 100,
-    # New: pass a preloaded/compiled learner or a warm_start_path for backward-compat
     learner: Optional[LearnerAutoregressiveAgent] = None,
     warm_start_path: Optional[str] = None,
-    # New: cache for already loaded opponents/agents to avoid reloading
-    agent_cache: Optional[Dict[str, LearnerAutoregressiveAgent]] = None,
     rng: Optional[Generator] = None,
     collect_metrics: bool = False,
     metrics_callback: Optional[Callable[[int, Dict[str, Any]], None]] = None,
@@ -527,84 +525,80 @@ def train_generation(
     logging.info(f"--- Starting Training Run: '{run_name}' ---")
     logging.info(f"    TensorBoard Log Dir: {run_log_dir}")
     
-    # 2. INITIALIZE LEARNER AND OPPONENTS
+    # =====================================================================
+    # 2. INITIALIZE LEARNER AND COMPILE DUAL MODELS (IF NOT ALREADY DONE)
+    # =====================================================================
+    compile_fn = getattr(torch, "compile", None)
+
     if learner is None:
+        # ---- This block runs ONLY when creating a new agent from scratch or disk ----
+        
+        # 2.1. Create or load the base LearnerAutoregressiveAgent
         if warm_start_path:
-            logging.info(f"Loading learner from warm_start_path: {warm_start_path}")
-            cache_key = f"ckpt:{os.path.abspath(warm_start_path)}"
-            if agent_cache is not None and cache_key in agent_cache:
-                learner = _clone_agent_from_agent(agent_cache[cache_key], device)
-            else:
-                base_agent = _load_agent_from_checkpoint(warm_start_path, 'main', device)
-                if agent_cache is not None:
-                    agent_cache[cache_key] = base_agent  # keep a copy of the base wrapper
-                learner = _clone_agent_from_agent(base_agent, device)
+            logging.info(f"Initializing learner from warm_start_path: {warm_start_path}")
+            # Note: _load_agent_from_checkpoint should not compile the model.
+            learner = _load_agent_from_checkpoint(warm_start_path, 'main', device)
         else:
-            # fresh wrapper + model
+            logging.info("Initializing a new learner from scratch.")
             learner = _create_new_agent('main', device)
-    else:
-        # ensure wrapper's model on correct device
-        learner.model = learner.model.to(device)
 
-    learner.device = device
+        learner.device = device
+        learner.model.to(device) # Ensure base model is on the right device before copying
 
-    # ---------------------------------------------------------------------
-    # 1) Clone JUST THE MODEL (before compiling anything) for TRAINING
-    # ---------------------------------------------------------------------
-    # At this point, learner.model is guaranteed to be an uncompiled nn.Module
-    try:
-        train_model = copy.deepcopy(learner.model).to(device)
-    except Exception as exc:
-        logging.warning(f"Deepcopy of model failed; falling back to state_dict clone: {exc}")
-        # Fallback: rebuild a new module of the same class and load weights
-        # (Assumes your model has a .config or compatible constructor; adjust if needed)
-        train_model = type(learner.model)(**getattr(learner.model, "config", {})).to(device)
-        train_model.load_state_dict(learner.model.state_dict(), strict=True)
-
-    # ---------------------------------------------------------------------
-    # 2) Compile TRAIN model (static shapes; best kernels)
-    # ---------------------------------------------------------------------
-    if hasattr(torch, "compile"):
+        # 2.2. Create the separate TRAINING model
+        logging.info("Creating a separate model for training.")
         try:
-            compiled_train = torch.compile(train_model, dynamic=False, mode="max-autotune")
-            learner.train_model = compiled_train  # expose alongside rollout wrapper
+            train_model = copy.deepcopy(learner.model)
         except Exception as exc:
-            logging.warning(f"torch.compile (train) failed; using eager training model: {exc}")
-            learner.train_model = train_model
-    else:
-        learner.train_model = train_model
+            logging.warning(f"Deepcopy failed; falling back to state_dict clone: {exc}")
+            train_model = type(learner.model)(**getattr(learner.model, "config", {})).to(device)
+            train_model.load_state_dict(learner.model.state_dict())
 
-    # Put training model in train mode by default (caller can toggle as needed)
-    learner.train_model.train()
-
-    # ---------------------------------------------------------------------
-    # 3) Compile ROLLOUT model inside the wrapper (reduce-overhead)
-    #    NOTE: compute_actions will call mark_dynamic(batch_dim) on first use.
-    # ---------------------------------------------------------------------
-    if hasattr(torch, "compile"):
-        # If the wrapper might already hold a compiled module, get the underlying orig mod
-        rollout_base = getattr(learner.model, "_orig_mod", learner.model)
-        if learner.model is rollout_base:
+        # 2.3. Compile the TRAINING model (for static shapes)
+        if compile_fn:
             try:
-                # Keep eval here; rollout uses inference + cudagraph-friendly graph
-                rollout_base.eval()
-                learner.model = torch.compile(rollout_base, dynamic=False, mode="reduce-overhead")
+                logging.info("Compiling training model (mode='max-autotune')...")
+                compiled_train = compile_fn(train_model, dynamic=False, mode="max-autotune")
+                learner.train_model = compiled_train
             except Exception as exc:
-                logging.warning(f"torch.compile (rollout) failed; using eager rollout model: {exc}")
-                learner.model = rollout_base
-    else:
-        # leave as eager if torch.compile unavailable
-        learner.model = learner.model
+                logging.warning(f"torch.compile (train) failed; using eager model: {exc}")
+                learner.train_model = train_model
+        else:
+            learner.train_model = train_model
+        learner.train_model.train()
 
-    # Rollout wrapper stays in eval; compute_actions runs under torch.inference_mode()
-    learner.model.eval()
+        # 2.4. Compile the ROLLOUT model (for dynamic batch sizes)
+        # This modifies the learner's own .model attribute in-place.
+        rollout_base = getattr(learner.model, "_orig_mod", learner.model)
+        if compile_fn and learner.model is rollout_base:
+            try:
+                logging.info("Compiling rollout model (mode='reduce-overhead')...")
+                rollout_base.eval()
+                learner.model = compile_fn(rollout_base, dynamic=False, mode="reduce-overhead")
+            except Exception as exc:
+                logging.warning(f"torch.compile (rollout) failed; using eager model: {exc}")
+        learner.model.eval()
+
+    else:
+        # ---- This block runs for subsequent generations (gen > 1) ----
+        # The 'learner' object is passed in, already containing compiled models.
+        # We just need to ensure they are on the correct device.
+        logging.info("Received a pre-initialized learner. Ensuring models are on the correct device.")
+        learner.device = device
+        try:
+            if hasattr(learner, "model") and learner.model is not None:
+                learner.model.to(device)
+            if hasattr(learner, "train_model") and learner.train_model is not None:
+                learner.train_model.to(device)
+        except Exception as exc:
+            logging.warning(f"Failed to move one of the compiled models to device '{device}': {exc}")
 
     # Create two lists to hold parameters for weight decay and no weight decay
     decay_params = []
     no_decay_params = []
 
     # Iterate through all named parameters of the model
-    for name, param in learner.train_model.model.named_parameters():
+    for name, param in learner.train_model.named_parameters():
         if not param.requires_grad:
             continue
         
@@ -624,11 +618,11 @@ def train_generation(
         lr=float(config.LEARNING_RATE),
     )
     scaler = amp.GradScaler(enabled=(device.type == "cuda"))
-    all_params = list(learner.train_model.model.parameters())
+    all_params = list(learner.train_model.parameters())
 
     # Check if the model has an opponent action head to separate its parameters
-    if hasattr(learner.train_model.model, 'opp_action_head'):
-        opp_head_params = list(learner.train_model.model.opp_action_head.parameters())
+    if hasattr(learner.train_model, 'opp_action_head'):
+        opp_head_params = list(learner.train_model.opp_action_head.parameters())
         opp_head_param_ids = {id(p) for p in opp_head_params}
         
         # Main parameters are everything EXCEPT the opponent head
@@ -737,9 +731,10 @@ def train_generation(
     
     # The buffer stores tuples of (data, age)
     max_data_age = int(getattr(config, "OFFPOLICY_EP_BUFFER_MULT", 4))
-    ep_buffer: List[Tuple[Dict[str, Any], int]] = [] 
+    ep_buffer: List[Tuple[Dict[str, Any], int]] = []
 
     collected_updates: List[Dict[str, Any]] = []
+    optimizer_waitlists: DefaultDict[int, List[Dict[str, Any]]] = defaultdict(list)
 
     for update in range(1, max_updates + 1):
         # -------- Rollout --------
@@ -849,16 +844,31 @@ def train_generation(
                 bucket_len = _select_bucket_length(tokens)
                 bucket_to_indices.setdefault(bucket_len, []).append(idx)
 
-            minibatch_target = int(getattr(config, "PPO_MINIBATCH_SIZE", len(batch_eps)))
-            minibatch_size = max(1, min(minibatch_target, len(batch_eps)))
+            minibatch_size = int(getattr(config, "PPO_MINIBATCH_SIZE", len(batch_eps)))
+            if minibatch_size <= 0:
+                minibatch_size = len(batch_eps)
+            minibatch_size = max(1, minibatch_size)
 
-            bucket_batches: List[List[int]] = []
-            for indices in bucket_to_indices.values():
+            bucket_batches: List[Tuple[int, List[Dict[str, Any]]]] = []
+            for bucket_len, indices in bucket_to_indices.items():
                 if not indices:
                     continue
                 random.shuffle(indices)
-                for start in range(0, len(indices), minibatch_size):
-                    bucket_batches.append(indices[start : start + minibatch_size])
+
+                ready_eps: List[Dict[str, Any]] = []
+                if optimizer_waitlists[bucket_len]:
+                    ready_eps.extend(optimizer_waitlists[bucket_len])
+                    optimizer_waitlists[bucket_len] = []
+
+                ready_eps.extend(batch_eps[i] for i in indices)
+
+                while len(ready_eps) >= minibatch_size:
+                    group = ready_eps[:minibatch_size]
+                    bucket_batches.append((bucket_len, list(group)))
+                    del ready_eps[:minibatch_size]
+
+                if ready_eps:
+                    optimizer_waitlists[bucket_len].extend(ready_eps)
 
             if not bucket_batches:
                 continue
@@ -875,9 +885,9 @@ def train_generation(
             group_count = 0
             processed_minibatches = 0
 
-            for indices in bucket_batches:
-                mini_eps = [batch_eps[i] for i in indices]
-                mini_cpu = _collate_batch(mini_eps)
+            for bucket_len, mini_eps in bucket_batches:
+                assert len(mini_eps) == minibatch_size
+                mini_cpu = _collate_batch(mini_eps, L_max=bucket_len)
                 valid_lengths_cpu = mini_cpu.get("mi", {}).get("valid_lengths")
                 if isinstance(valid_lengths_cpu, torch.Tensor):
                     opt_tokens_processed += int(valid_lengths_cpu.sum().item())
@@ -931,6 +941,13 @@ def train_generation(
                     group_count = 0
 
                 del mini_gpu, mini_cpu
+
+        waitlisted_by_bucket = {
+            bucket_len: len(eps)
+            for bucket_len, eps in optimizer_waitlists.items()
+            if eps
+        }
+        skipped_waitlist_total = sum(waitlisted_by_bucket.values())
 
         if device.type == "cuda" and FORCE_CUDA_SYNC_FOR_TIMING:
             torch.cuda.synchronize()
@@ -1014,6 +1031,10 @@ def train_generation(
             "shadow_labels": list(shadow_labels),
             "front_probability": float(front_weight_share),
             "shadow_probability": float(shadow_weight_share),
+            "optimizer_waitlisted_episodes": skipped_waitlist_total,
+            "optimizer_waitlisted_buckets": {
+                int(bucket_len): count for bucket_len, count in waitlisted_by_bucket.items()
+            },
         }
 
         if collect_metrics:
@@ -1041,6 +1062,12 @@ def train_generation(
         writer.add_scalar("Value/ClipFrac", avg.get("value_clip_frac", 0.0), update)
         writer.add_scalar("Value_DCP/ClipFrac", avg.get("dcp_value_clip_frac", 0.0), update)
         writer.add_scalar("Diag/ReturnStdEMA", getattr(config, "RET_STD_EMA", 1.0), update)
+        writer.add_scalar("Optimizer/WaitlistedEpisodes", skipped_waitlist_total, update)
+        writer.add_scalar(
+            "Optimizer/ActiveWaitlistBuckets",
+            len(waitlisted_by_bucket),
+            update,
+        )
         # Rollout stats
         writer.add_scalar("Rollout/WinRate", win_rate, update)
         # Sort once (same criterion you use below)
@@ -1152,6 +1179,7 @@ def train_generation(
 
     result: Dict[str, Any] = {
         "run_name": run_name,
+        "final_model": learner,
         "final_model_path": final_path_pth,
     }
     if collect_metrics:
@@ -1179,19 +1207,17 @@ if __name__ == "__main__":
     logging.info(f"Starting master self-play run: {master_run_name}")
 
     pool_manager = OpponentPoolManager(args.pool_file)
-    # Keep agents/models in memory across generations
-    agent_cache: Dict[str, LearnerAutoregressiveAgent] = {}
     initial_sl_path = None if args.no_sl else args.sl_path
     # --- Step 1: Bootstrap Generation 1 (if it doesn't exist) ---
+    result = {} 
     gen1_name = "gen_1"
     if not any(gen1_name in agent['name'] for agent in pool_manager.pool):
         logging.info("="*20 + " Training Generation 1 (Bootstrap) " + "="*20)
-        train_generation(
+        result = train_generation(
             run_name=gen1_name,
             master_run_name=master_run_name,
             pool_manager=pool_manager,
             warm_start_path=initial_sl_path,
-            agent_cache=agent_cache,
             rng=_GLOBAL_RNG,
         )
 
@@ -1202,7 +1228,7 @@ if __name__ == "__main__":
     
     for gen in range(latest_gen_num, args.max_gens + 1):
         logging.info(f"\n{'='*20} Starting Generation {gen} {'='*20}\n")
-        
+        new_learner = result['final_model'] if result else None
         # --- Optional: Inject a Challenger ---
         if args.challenger_freq > 0 and gen % args.challenger_freq == 0:
             challenger_name = f"challenger_for_gen_{gen}"
@@ -1213,7 +1239,6 @@ if __name__ == "__main__":
                     master_run_name=master_run_name,
                     pool_manager=pool_manager,
                     warm_start_path=initial_sl_path,
-                    agent_cache=agent_cache,
                     rng=_GLOBAL_RNG,
                 )
         
@@ -1226,19 +1251,17 @@ if __name__ == "__main__":
 
         # Reuse compiled previous-gen model from cache if available, to avoid disk I/O
         prev_ckpt_key = f"ckpt:{os.path.abspath(prev_gen_def['path'])}"
-        if prev_ckpt_key not in agent_cache:
-            # Load once into cache (no compile)
-            agent_cache[prev_ckpt_key] = _load_agent_from_checkpoint(prev_gen_def['path'], 'main', torch.device(getattr(config, "DEVICE", "cuda" if torch.cuda.is_available() else "cpu")))
 
         # Clone from cached prev champion for the new learner
         device = torch.device(getattr(config, "DEVICE", "cuda" if torch.cuda.is_available() else "cpu"))
-        new_learner = _clone_agent_from_agent(agent_cache[prev_ckpt_key], device)
 
-        train_generation(
+        result = train_generation(
             run_name=f"gen_{gen}",
             master_run_name=master_run_name,
             pool_manager=pool_manager,
             learner=new_learner,
-            agent_cache=agent_cache,
+            warm_start_path=prev_gen_def['path'],
             rng=_GLOBAL_RNG,
         )
+        new_learner = result['final_model']
+        
