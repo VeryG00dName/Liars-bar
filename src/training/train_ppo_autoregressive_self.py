@@ -683,8 +683,8 @@ def train_generation(
         # 2.3. Compile the TRAINING model (for static shapes)
         if compile_fn:
             try:
-                logging.info("Compiling training model (mode='max-autotune')...")
-                compiled_train = compile_fn(train_model, dynamic=False, mode="max-autotune-no-cudagraphs")
+                logging.info("Compiling training model (mode='reduce-overhead')...")
+                compiled_train = compile_fn(train_model, dynamic=False, mode="reduce-overhead",fullgraph=False)
                 learner.train_model = compiled_train
             except Exception as exc:
                 logging.warning(f"torch.compile (train) failed; using eager model: {exc}")
