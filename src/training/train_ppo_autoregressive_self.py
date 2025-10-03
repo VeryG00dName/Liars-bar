@@ -531,7 +531,7 @@ def train_generation(
         if compile_fn:
             try:
                 logging.info("Compiling training model (mode='reduce-overhead')...")
-                compiled_train = compile_fn(train_model, dynamic=False, mode="reduce-overhead",fullgraph=False)
+                compiled_train = compile_fn(train_model, dynamic=False, mode="reduce-overhead",fullgraph=False,options={"triton.cudagraphs": False},)
                 learner.train_model = compiled_train
             except Exception as exc:
                 logging.warning(f"torch.compile (train) failed; using eager model: {exc}")
@@ -560,7 +560,6 @@ def train_generation(
                 compiled_rollout = compile_fn(
                     rollout_model,
                     dynamic=True,
-                    mode="reduce-overhead",fullgraph=False
                 )
             except Exception as exc:
                 logging.warning(
