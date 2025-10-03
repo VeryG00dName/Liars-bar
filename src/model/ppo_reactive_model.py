@@ -1,7 +1,5 @@
 # src/model/ppo_reactive_model.py
-import os
-for var in ("TORCH_LOGS", "TRITON_LOGGING", "TORCH_COMPILE_DEBUG"):
-    os.environ.pop(var, None)
+
 from torch.utils.checkpoint import checkpoint
 from torch.nn.attention import sdpa_kernel, SDPBackend
 sdpa_math_only = sdpa_kernel(backends=[SDPBackend.MATH])

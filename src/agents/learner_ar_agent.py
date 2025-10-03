@@ -4,9 +4,6 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List, Optional, Tuple
-import os
-for var in ("TORCH_LOGS", "TRITON_LOGGING", "TORCH_COMPILE_DEBUG"):
-    os.environ.pop(var, None)
 import numpy as np
 import torch
 
