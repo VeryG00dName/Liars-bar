@@ -580,7 +580,7 @@ def train_generation(
             if hasattr(learner, "train_model") and learner.train_model is not None:
                 learner.train_model.to(device)
             if hasattr(learner, "rollout_model") and learner.rollout_model is not None:
-                getattr(learner.rollout_model, "_orig_mod", learner.rollout_model).to(device)
+                learner.rollout_model.to(device)
         except Exception as exc:
             logging.warning(f"Failed to move one of the compiled models to device '{device}': {exc}")
 
