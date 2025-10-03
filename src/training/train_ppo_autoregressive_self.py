@@ -65,7 +65,7 @@ USE_HELDOUT_AGENT = bool(getattr(config, "USE_HELDOUT_AGENT", True))
 # SECTION 1: HELPER CLASSES AND FUNCTIONS
 # ==============================================================================
 
-PAD_BUCKET_BOUNDARIES = [64, 128, 256, 320]
+PAD_BUCKET_BOUNDARIES = [64, 128, 192, 256, 384, 480]
 
 
 def _select_bucket_length(length: int) -> int:
@@ -530,8 +530,8 @@ def train_generation(
         # 2.3. Compile the TRAINING model (for static shapes)
         if compile_fn:
             try:
-                logging.info("Compiling training model (mode='reduce-overhead')...")
-                compiled_train = compile_fn(train_model, dynamic=False, mode="reduce-overhead",fullgraph=False,options={"triton.cudagraphs": False},)
+                logging.info("Compiling training model (dynamic=False)...")
+                compiled_train = compile_fn(train_model, dynamic=False)
                 learner.train_model = compiled_train
             except Exception as exc:
                 logging.warning(f"torch.compile (train) failed; using eager model: {exc}")
@@ -555,7 +555,7 @@ def train_generation(
         if compile_fn:
             try:
                 logging.info(
-                    "Compiling rollout model (mode='reduce-overhead', dynamic=True)..."
+                    "Compiling rollout model (dynamic=True)..."
                 )
                 compiled_rollout = compile_fn(
                     rollout_model,

@@ -16,6 +16,7 @@
 #include <torch/torch.h>
 
 #include "bots.h"
+#include "torch_utils.h"
 
 namespace {
 const torch::Device kInferenceDevice = torch::kCUDA;
@@ -476,93 +477,10 @@ PreparedBatch RolloutManager::prepare_training_batch(const std::vector<PolicyReq
         max_allowed = std::max<int64_t>(1, static_cast<int64_t>(it_limit->second));
     }
 
-    int64_t max_len = 1;
+    int64_t pad_len = 1;
     for (const auto& req : requests) {
         const int64_t len = std::max<int64_t>(1, std::min<int64_t>(req.valid_len, max_allowed));
-        max_len = std::max(max_len, len);
-    }
-
-    auto opts_float_cpu = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
-    auto opts_long_cpu = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
-    auto opts_bool_cpu = torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU);
-
-    auto obs_sequence = torch::zeros({batch_size, max_len, OBS_DIM}, opts_float_cpu);
-    auto action_sequence = torch::zeros({batch_size, max_len}, opts_long_cpu);
-    auto agent_types = torch::zeros({batch_size, max_len}, opts_long_cpu);
-    auto positions = torch::zeros({batch_size, max_len}, opts_long_cpu);
-    auto action_masks = torch::zeros({batch_size, max_len, 7}, opts_bool_cpu);
-    auto padding_mask = torch::zeros({batch_size, max_len}, opts_bool_cpu);
-    auto valid_lengths = torch::zeros({batch_size}, opts_long_cpu);
-    auto env_indices = torch::zeros({batch_size}, opts_long_cpu);
-    auto seat_indices = torch::zeros({batch_size}, opts_long_cpu);
-
-    for (int64_t b = 0; b < batch_size; ++b) {
-        const auto& req = requests[static_cast<size_t>(b)];
-        const int64_t requested_len = std::max<int64_t>(0, std::min<int64_t>(req.valid_len, max_allowed));
-        const int64_t used_len = std::max<int64_t>(1, requested_len);
-
-        valid_lengths[b] = used_len;
-        env_indices[b] = static_cast<int64_t>(req.env);
-        seat_indices[b] = static_cast<int64_t>(req.seat);
-
-        float* obs_ptr = obs_sequence[b].data_ptr<float>();
-        int64_t* act_ptr = action_sequence[b].data_ptr<int64_t>();
-        int64_t* agent_ptr = agent_types[b].data_ptr<int64_t>();
-        int64_t* pos_ptr = positions[b].data_ptr<int64_t>();
-        bool* mask_ptr = action_masks[b].data_ptr<bool>();
-
-        const float* req_obs_ptr = req.obs_sequence.empty() ? nullptr : req.obs_sequence.data();
-        const int64_t* req_action_ptr = req.action_sequence.empty() ? nullptr : req.action_sequence.data();
-        const int64_t* req_agent_ptr = req.agent_type_sequence.empty() ? nullptr : req.agent_type_sequence.data();
-        const int64_t* req_pos_ptr = req.position_sequence.empty() ? nullptr : req.position_sequence.data();
-        const uint8_t* req_mask_ptr = req.action_mask_sequence.empty() ? nullptr : req.action_mask_sequence.data();
-
-        const int64_t obs_rows = req_obs_ptr ? static_cast<int64_t>(req.obs_sequence.size()) / OBS_DIM : 0;
-        const int64_t mask_rows = req_mask_ptr ? static_cast<int64_t>(req.action_mask_sequence.size()) / 7 : 0;
-        const int64_t action_rows = req_action_ptr ? static_cast<int64_t>(req.action_sequence.size()) : 0;
-        const int64_t agent_rows = req_agent_ptr ? static_cast<int64_t>(req.agent_type_sequence.size()) : 0;
-        const int64_t pos_rows = req_pos_ptr ? static_cast<int64_t>(req.position_sequence.size()) : 0;
-
-        for (int64_t t = 0; t < requested_len; ++t) {
-            float* dst_obs = obs_ptr + t * OBS_DIM;
-            if (req_obs_ptr && t < obs_rows) {
-                std::memcpy(dst_obs, req_obs_ptr + t * OBS_DIM, sizeof(float) * OBS_DIM);
-            } else {
-                std::memset(dst_obs, 0, sizeof(float) * OBS_DIM);
-            }
-
-            act_ptr[t] = (req_action_ptr && t < action_rows) ? req_action_ptr[t] : 0;
-            agent_ptr[t] = (req_agent_ptr && t < agent_rows) ? req_agent_ptr[t] : 0;
-            pos_ptr[t] = (req_pos_ptr && t < pos_rows) ? req_pos_ptr[t] : t;
-
-            bool* step_mask = mask_ptr + t * 7;
-            if (req_mask_ptr && t < mask_rows) {
-                const uint8_t* src_mask = req_mask_ptr + t * 7;
-                for (int j = 0; j < 7; ++j) {
-                    step_mask[j] = src_mask[j] != 0;
-                }
-            } else {
-                for (int j = 0; j < 7; ++j) {
-                    step_mask[j] = false;
-                }
-            }
-        }
-
-        if (requested_len == 0) {
-            bool* step_mask = mask_ptr;
-            for (int j = 0; j < 7; ++j) {
-                step_mask[j] = req.mask[j] != 0;
-            }
-        }
-
-        for (int64_t t = requested_len; t < used_len; ++t) {
-            pos_ptr[t] = t;
-        }
-
-        bool* pad_ptr = padding_mask[b].data_ptr<bool>();
-        for (int64_t t = used_len; t < max_len; ++t) {
-            pad_ptr[t] = true;
-        }
+        pad_len = std::max(pad_len, len);
     }
 
     torch::Device target_device = training_device_;
@@ -570,15 +488,193 @@ PreparedBatch RolloutManager::prepare_training_batch(const std::vector<PolicyReq
         target_device = torch::Device(torch::kCPU);
     }
 
-    batch.obs_sequence = obs_sequence.to(target_device, /*non_blocking=*/false, /*copy=*/true);
-    batch.action_sequence = action_sequence.to(target_device, false, true);
-    batch.agent_types = agent_types.to(target_device, false, true);
-    batch.positions = positions.to(target_device, false, true);
-    batch.action_masks = action_masks.to(target_device, false, true);
-    batch.padding_mask = padding_mask.to(target_device, false, true);
-    batch.valid_lengths = valid_lengths.to(target_device, false, true);
-    batch.env_indices = env_indices.to(target_device, false, true);
-    batch.seat_indices = seat_indices.to(target_device, false, true);
+    auto float_opts_device = torch::TensorOptions().dtype(torch::kFloat32).device(target_device);
+    auto long_opts_device = torch::TensorOptions().dtype(torch::kInt64).device(target_device);
+    auto bool_opts_device = torch::TensorOptions().dtype(torch::kBool).device(target_device);
+
+    batch.obs_sequence = torch::zeros({batch_size, pad_len, OBS_DIM}, float_opts_device);
+    batch.action_sequence = torch::zeros({batch_size, pad_len}, long_opts_device);
+    batch.agent_types = torch::zeros({batch_size, pad_len}, long_opts_device);
+    batch.positions = torch::zeros({batch_size, pad_len}, long_opts_device);
+    batch.action_masks = torch::zeros({batch_size, pad_len, 7}, bool_opts_device);
+    batch.padding_mask = torch::zeros({batch_size, pad_len}, bool_opts_device);
+    batch.valid_lengths = torch::zeros({batch_size}, long_opts_device);
+    batch.env_indices = torch::zeros({batch_size}, long_opts_device);
+    batch.seat_indices = torch::zeros({batch_size}, long_opts_device);
+
+    std::vector<int64_t> valid_lengths_host(static_cast<size_t>(batch_size), 1);
+    std::vector<int64_t> env_indices_host(static_cast<size_t>(batch_size), 0);
+    std::vector<int64_t> seat_indices_host(static_cast<size_t>(batch_size), 0);
+
+    const bool use_cuda = target_device.is_cuda();
+    auto float_opts_cpu = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+    auto long_opts_cpu = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+    auto bool_opts_cpu = torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU);
+
+    for (int64_t b = 0; b < batch_size; ++b) {
+        const auto& req = requests[static_cast<size_t>(b)];
+        const int64_t requested_len = std::max<int64_t>(0, std::min<int64_t>(req.valid_len, max_allowed));
+        const int64_t clamped_len = std::min<int64_t>(requested_len, pad_len);
+        const int64_t used_len = std::max<int64_t>(1, clamped_len);
+
+        valid_lengths_host[static_cast<size_t>(b)] = used_len;
+        env_indices_host[static_cast<size_t>(b)] = static_cast<int64_t>(req.env);
+        seat_indices_host[static_cast<size_t>(b)] = static_cast<int64_t>(req.seat);
+
+        const float* req_obs_ptr = req.obs_sequence.empty() ? nullptr : req.obs_sequence.data();
+        const int64_t* req_action_ptr =
+            req.action_sequence.empty() ? nullptr : req.action_sequence.data();
+        const int64_t* req_agent_ptr =
+            req.agent_type_sequence.empty() ? nullptr : req.agent_type_sequence.data();
+        const int64_t* req_pos_ptr =
+            req.position_sequence.empty() ? nullptr : req.position_sequence.data();
+        const uint8_t* req_mask_ptr =
+            req.action_mask_sequence.empty() ? nullptr : req.action_mask_sequence.data();
+
+        const int64_t obs_rows =
+            req_obs_ptr ? static_cast<int64_t>(req.obs_sequence.size()) / OBS_DIM : 0;
+        const int64_t mask_rows =
+            req_mask_ptr ? static_cast<int64_t>(req.action_mask_sequence.size()) / 7 : 0;
+        const int64_t action_rows =
+            req_action_ptr ? static_cast<int64_t>(req.action_sequence.size()) : 0;
+        const int64_t agent_rows =
+            req_agent_ptr ? static_cast<int64_t>(req.agent_type_sequence.size()) : 0;
+        const int64_t pos_rows =
+            req_pos_ptr ? static_cast<int64_t>(req.position_sequence.size()) : 0;
+
+        if (use_cuda) {
+            std::vector<float> obs_buffer(static_cast<size_t>(pad_len * OBS_DIM), 0.0f);
+            std::vector<int64_t> action_buffer(static_cast<size_t>(pad_len), 0);
+            std::vector<int64_t> agent_buffer(static_cast<size_t>(pad_len), 0);
+            std::vector<int64_t> pos_buffer(static_cast<size_t>(pad_len), 0);
+            std::vector<uint8_t> mask_buffer(static_cast<size_t>(pad_len * 7), 0);
+            std::vector<uint8_t> pad_buffer(static_cast<size_t>(pad_len), 0);
+
+            for (int64_t t = 0; t < clamped_len; ++t) {
+                float* dst_obs = obs_buffer.data() + static_cast<size_t>(t) * OBS_DIM;
+                if (req_obs_ptr && t < obs_rows) {
+                    std::memcpy(dst_obs, req_obs_ptr + t * OBS_DIM, sizeof(float) * OBS_DIM);
+                } else {
+                    std::memset(dst_obs, 0, sizeof(float) * OBS_DIM);
+                }
+
+                action_buffer[static_cast<size_t>(t)] =
+                    (req_action_ptr && t < action_rows) ? req_action_ptr[t] : 0;
+                agent_buffer[static_cast<size_t>(t)] =
+                    (req_agent_ptr && t < agent_rows) ? req_agent_ptr[t] : 0;
+                pos_buffer[static_cast<size_t>(t)] =
+                    (req_pos_ptr && t < pos_rows) ? req_pos_ptr[t] : t;
+
+                uint8_t* step_mask = mask_buffer.data() + static_cast<size_t>(t) * 7;
+                if (req_mask_ptr && t < mask_rows) {
+                    const uint8_t* src_mask = req_mask_ptr + t * 7;
+                    for (int j = 0; j < 7; ++j) {
+                        step_mask[j] = src_mask[j] != 0 ? 1 : 0;
+                    }
+                } else {
+                    for (int j = 0; j < 7; ++j) {
+                        step_mask[j] = 0;
+                    }
+                }
+            }
+
+            if (requested_len <= 0) {
+                uint8_t* step_mask = mask_buffer.data();
+                for (int j = 0; j < 7; ++j) {
+                    step_mask[j] = req.mask[j] != 0 ? 1 : 0;
+                }
+            }
+
+            for (int64_t t = clamped_len; t < used_len; ++t) {
+                pos_buffer[static_cast<size_t>(t)] = t;
+            }
+
+            for (int64_t t = used_len; t < pad_len; ++t) {
+                pad_buffer[static_cast<size_t>(t)] = 1;
+            }
+
+            auto obs_cpu = torch::from_blob(obs_buffer.data(), {pad_len, OBS_DIM}, float_opts_cpu);
+            batch.obs_sequence[b].copy_(obs_cpu, /*non_blocking=*/false);
+
+            auto action_cpu = torch::from_blob(action_buffer.data(), {pad_len}, long_opts_cpu);
+            batch.action_sequence[b].copy_(action_cpu, false);
+
+            auto agent_cpu = torch::from_blob(agent_buffer.data(), {pad_len}, long_opts_cpu);
+            batch.agent_types[b].copy_(agent_cpu, false);
+
+            auto pos_cpu = torch::from_blob(pos_buffer.data(), {pad_len}, long_opts_cpu);
+            batch.positions[b].copy_(pos_cpu, false);
+
+            auto mask_cpu = torch::from_blob(reinterpret_cast<bool*>(mask_buffer.data()),
+                                             {pad_len, 7},
+                                             bool_opts_cpu);
+            batch.action_masks[b].copy_(mask_cpu, false);
+
+            auto pad_cpu = torch::from_blob(reinterpret_cast<bool*>(pad_buffer.data()),
+                                            {pad_len},
+                                            bool_opts_cpu);
+            batch.padding_mask[b].copy_(pad_cpu, false);
+        } else {
+            float* obs_ptr = batch.obs_sequence[b].data_ptr<float>();
+            int64_t* act_ptr = batch.action_sequence[b].data_ptr<int64_t>();
+            int64_t* agent_ptr = batch.agent_types[b].data_ptr<int64_t>();
+            int64_t* pos_ptr = batch.positions[b].data_ptr<int64_t>();
+            bool* mask_ptr = batch.action_masks[b].data_ptr<bool>();
+            bool* pad_ptr = batch.padding_mask[b].data_ptr<bool>();
+
+            for (int64_t t = 0; t < clamped_len; ++t) {
+                float* dst_obs = obs_ptr + t * OBS_DIM;
+                if (req_obs_ptr && t < obs_rows) {
+                    std::memcpy(dst_obs, req_obs_ptr + t * OBS_DIM, sizeof(float) * OBS_DIM);
+                } else {
+                    std::memset(dst_obs, 0, sizeof(float) * OBS_DIM);
+                }
+
+                act_ptr[t] = (req_action_ptr && t < action_rows) ? req_action_ptr[t] : 0;
+                agent_ptr[t] = (req_agent_ptr && t < agent_rows) ? req_agent_ptr[t] : 0;
+                pos_ptr[t] = (req_pos_ptr && t < pos_rows) ? req_pos_ptr[t] : t;
+
+                bool* step_mask = mask_ptr + t * 7;
+                if (req_mask_ptr && t < mask_rows) {
+                    const uint8_t* src_mask = req_mask_ptr + t * 7;
+                    for (int j = 0; j < 7; ++j) {
+                        step_mask[j] = src_mask[j] != 0;
+                    }
+                } else {
+                    for (int j = 0; j < 7; ++j) {
+                        step_mask[j] = false;
+                    }
+                }
+            }
+
+            if (requested_len <= 0) {
+                bool* step_mask = mask_ptr;
+                for (int j = 0; j < 7; ++j) {
+                    step_mask[j] = req.mask[j] != 0;
+                }
+            }
+
+            for (int64_t t = clamped_len; t < used_len; ++t) {
+                pos_ptr[t] = t;
+            }
+
+            for (int64_t t = used_len; t < pad_len; ++t) {
+                pad_ptr[t] = true;
+            }
+        }
+    }
+
+    auto valid_lengths_tensor =
+        torch::from_blob(valid_lengths_host.data(), {batch_size}, long_opts_cpu);
+    batch.valid_lengths.copy_(valid_lengths_tensor, /*non_blocking=*/false);
+
+    auto env_indices_tensor =
+        torch::from_blob(env_indices_host.data(), {batch_size}, long_opts_cpu);
+    batch.env_indices.copy_(env_indices_tensor, false);
+
+    auto seat_indices_tensor =
+        torch::from_blob(seat_indices_host.data(), {batch_size}, long_opts_cpu);
+    batch.seat_indices.copy_(seat_indices_tensor, false);
 
     return batch;
 }
@@ -692,7 +788,7 @@ std::vector<uint8_t> RolloutManager::run_historical_inference(torch::jit::Module
 
     torch::NoGradGuard no_grad;
 
-    static const std::array<int64_t, 4> kBucketBounds{{64, 128, 256, 320}};
+    static const std::array<int64_t, 4> kBucketBounds{{32, 64, 96, 128, 192, 256, 480}};
     const int64_t max_limit = std::max<int64_t>(1, static_cast<int64_t>(default_max_sequence_length_));
     auto select_bucket = [&](int64_t length) -> int64_t {
         const int64_t clamped = std::max<int64_t>(1, std::min<int64_t>(length, max_limit));
@@ -713,100 +809,23 @@ std::vector<uint8_t> RolloutManager::run_historical_inference(torch::jit::Module
 
     std::vector<uint8_t> chosen(requests.size(), 0);
 
-    auto opts_float_cpu = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
-    auto opts_long_cpu = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
-    auto opts_bool_cpu = torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU);
     auto opts_long_device = torch::TensorOptions().dtype(torch::kInt64).device(kInferenceDevice);
 
-    for (const auto& [target_pad_len_raw, indices] : bucket_indices) {
+    for (const auto& [target_pad_len, indices] : bucket_indices) {
         if (indices.empty()) {
             continue;
         }
-        const int64_t target_pad_len = std::min<int64_t>(target_pad_len_raw, max_limit);
         const int64_t batch_size = static_cast<int64_t>(indices.size());
 
-        auto obs_sequence = torch::zeros({batch_size, target_pad_len, OBS_DIM}, opts_float_cpu);
-        auto action_sequence = torch::zeros({batch_size, target_pad_len}, opts_long_cpu);
-        auto agent_types = torch::zeros({batch_size, target_pad_len}, opts_long_cpu);
-        auto positions = torch::zeros({batch_size, target_pad_len}, opts_long_cpu);
-        auto action_masks = torch::zeros({batch_size, target_pad_len, 7}, opts_bool_cpu);
-        auto padding_mask = torch::zeros({batch_size, target_pad_len}, opts_bool_cpu);
-        auto valid_lengths = torch::zeros({batch_size}, opts_long_cpu);
-
-        for (int64_t b = 0; b < batch_size; ++b) {
-            const auto& req = requests[indices[static_cast<size_t>(b)]];
-            const int64_t requested_len = std::max<int64_t>(0, std::min<int64_t>(req.valid_len, target_pad_len));
-            const int64_t used_len = std::max<int64_t>(1, requested_len);
-
-            valid_lengths[b] = used_len;
-
-            float* obs_ptr = obs_sequence[b].data_ptr<float>();
-            int64_t* act_ptr = action_sequence[b].data_ptr<int64_t>();
-            int64_t* agent_ptr = agent_types[b].data_ptr<int64_t>();
-            int64_t* pos_ptr = positions[b].data_ptr<int64_t>();
-            bool* mask_ptr = action_masks[b].data_ptr<bool>();
-
-            const float* req_obs_ptr = req.obs_sequence.empty() ? nullptr : req.obs_sequence.data();
-            const int64_t* req_action_ptr = req.action_sequence.empty() ? nullptr : req.action_sequence.data();
-            const int64_t* req_agent_ptr = req.agent_type_sequence.empty() ? nullptr : req.agent_type_sequence.data();
-            const int64_t* req_pos_ptr = req.position_sequence.empty() ? nullptr : req.position_sequence.data();
-            const uint8_t* req_mask_ptr = req.action_mask_sequence.empty() ? nullptr : req.action_mask_sequence.data();
-
-            const int64_t obs_rows = req_obs_ptr ? static_cast<int64_t>(req.obs_sequence.size()) / OBS_DIM : 0;
-            const int64_t mask_rows = req_mask_ptr ? static_cast<int64_t>(req.action_mask_sequence.size()) / 7 : 0;
-            const int64_t action_rows = req_action_ptr ? static_cast<int64_t>(req.action_sequence.size()) : 0;
-            const int64_t agent_rows = req_agent_ptr ? static_cast<int64_t>(req.agent_type_sequence.size()) : 0;
-            const int64_t pos_rows = req_pos_ptr ? static_cast<int64_t>(req.position_sequence.size()) : 0;
-
-            for (int64_t t = 0; t < requested_len; ++t) {
-                float* dst_obs = obs_ptr + t * OBS_DIM;
-                if (req_obs_ptr && t < obs_rows) {
-                    std::memcpy(dst_obs, req_obs_ptr + t * OBS_DIM, sizeof(float) * OBS_DIM);
-                } else {
-                    std::memset(dst_obs, 0, sizeof(float) * OBS_DIM);
-                }
-
-                act_ptr[t] = (req_action_ptr && t < action_rows) ? req_action_ptr[t] : 0;
-                agent_ptr[t] = (req_agent_ptr && t < agent_rows) ? req_agent_ptr[t] : 0;
-                pos_ptr[t] = (req_pos_ptr && t < pos_rows) ? req_pos_ptr[t] : t;
-
-                bool* step_mask = mask_ptr + t * 7;
-                if (req_mask_ptr && t < mask_rows) {
-                    const uint8_t* src_mask = req_mask_ptr + t * 7;
-                    for (int j = 0; j < 7; ++j) {
-                        step_mask[j] = src_mask[j] != 0;
-                    }
-                } else {
-                    for (int j = 0; j < 7; ++j) {
-                        step_mask[j] = false;
-                    }
-                }
-            }
-
-            if (requested_len == 0) {
-                bool* step_mask = mask_ptr;
-                for (int j = 0; j < 7; ++j) {
-                    step_mask[j] = req.mask[j] != 0;
-                }
-            }
-
-            for (int64_t t = requested_len; t < used_len; ++t) {
-                pos_ptr[t] = t;
-            }
-
-            bool* pad_ptr = padding_mask[b].data_ptr<bool>();
-            for (int64_t t = used_len; t < target_pad_len; ++t) {
-                pad_ptr[t] = true;
-            }
-        }
-
-        obs_sequence = obs_sequence.to(kInferenceDevice);
-        action_sequence = action_sequence.to(kInferenceDevice);
-        agent_types = agent_types.to(kInferenceDevice);
-        positions = positions.to(kInferenceDevice);
-        action_masks = action_masks.to(kInferenceDevice);
-        padding_mask = padding_mask.to(kInferenceDevice);
-        auto valid_lengths_device = valid_lengths.to(kInferenceDevice);
+        auto tensor_batch =
+            prepare_inference_batch(requests, target_pad_len, kInferenceDevice, indices);
+        auto& obs_sequence = tensor_batch.obs_sequence;
+        auto& action_sequence = tensor_batch.action_sequence;
+        auto& agent_types = tensor_batch.agent_types;
+        auto& positions = tensor_batch.positions;
+        auto& action_masks = tensor_batch.action_masks;
+        auto& padding_mask = tensor_batch.padding_mask;
+        auto valid_lengths_device = tensor_batch.valid_lengths;
 
         std::vector<torch::jit::IValue> inputs;
         inputs.reserve(6);

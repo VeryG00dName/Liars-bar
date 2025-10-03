@@ -69,7 +69,7 @@ class LearnerAutoregressiveAgent:
         if self.max_seq_length is not None:
             max_len = min(max_len, int(self.max_seq_length))
 
-        bucket_boundaries = [64, 128, 256, 320]
+        bucket_boundaries = [32, 64, 96, 128, 192, 256, 480]
         target_pad_len = max_len
         for boundary in bucket_boundaries:
             if max_len <= boundary:

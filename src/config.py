@@ -21,7 +21,7 @@ TRANSFORMER_CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "transformer_classifi
 HISTORICAL_MODEL_DIR = PLAYERS_DIR
 
 # Optional: path to a supervised/teacher checkpoint used for warm start / teacher KL
-SL_TEACHER_CKPT = r"/mnt/l/Coding_Projects/Liars_bar_2/Liars-bar/checkpoints/autoreg_20251002_205930/autoreg_model_final.pth"
+SL_TEACHER_CKPT = r"/mnt/l/Coding_Projects/Liars_bar_2/Liars-bar/checkpoints/autoreg_20251002_232450/autoreg_model_final.pth"
 
 # ============================
 # Directory Preparation
@@ -184,7 +184,7 @@ NUM_OPPONENT_CLASSES = 10
 OPPONENT_INPUT_DIM = 4
 OPPONENT_HIDDEN_DIM = 128
 OPPONENT_LEARNING_RATE = 1e-4
-MAX_SEQUENCE_LENGTH = 320
+MAX_SEQUENCE_LENGTH = 480
 
 # Neural Network Configuration
 HIDDEN_DIM = 256
