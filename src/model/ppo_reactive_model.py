@@ -51,7 +51,7 @@ class PPOReactiveModel(nn.Module):
         # === Input Encoders ===
         self.obs_encoder = nn.Sequential(
             nn.Linear(obs_dim, hidden_dim), nn.LayerNorm(hidden_dim),
-            nn.GELU(), nn.Dropout(dropout_rate)
+            nn.GELU()
         )
         self.act_kind_embedding = nn.Embedding(3, hidden_dim, padding_idx=0)
         self.count_embedding = nn.Embedding(5, hidden_dim, padding_idx=self.count_pad)

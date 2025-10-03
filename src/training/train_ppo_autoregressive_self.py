@@ -559,7 +559,7 @@ def train_generation(
                 )
                 compiled_rollout = compile_fn(
                     rollout_model,
-                    dynamic=True,
+                    dynamic=True
                 )
             except Exception as exc:
                 logging.warning(

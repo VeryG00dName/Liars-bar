@@ -28,7 +28,7 @@ class PPOReactiveModelScript(nn.Module):
                  num_heads: int = 4,
                  num_layers: int = 2,
                  dropout_rate: float = 0.1,
-                 max_seq_length: int = 256,
+                 max_seq_length: int = 480,
                  num_agent_types: int = 4):
         super().__init__()
         self.obs_dim = obs_dim
@@ -46,7 +46,7 @@ class PPOReactiveModelScript(nn.Module):
         # === Input Encoders ===
         self.obs_encoder = nn.Sequential(
             nn.Linear(obs_dim, hidden_dim), nn.LayerNorm(hidden_dim),
-            nn.GELU(), nn.Dropout(dropout_rate)
+            nn.GELU()
         )
         self.act_kind_embedding = nn.Embedding(3, hidden_dim, padding_idx=0)
         self.count_embedding = nn.Embedding(5, hidden_dim, padding_idx=self.count_pad)
