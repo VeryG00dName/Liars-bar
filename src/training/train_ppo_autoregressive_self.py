@@ -3,6 +3,8 @@
 import copy
 import os, logging, warnings, contextlib
 import json
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", "/mnt/l/Coding_Projects/Liars_bar_2/Liars-bar/persistent_cache/inductor")
+os.environ.setdefault("TRITON_CACHE_DIR",        "/mnt/l/Coding_Projects/Liars_bar_2/Liars-bar/persistent_cache/triton")
 import math
 from collections import defaultdict
 import time
@@ -181,7 +183,18 @@ def _warmup_model(
                 continue
             try:
                 inputs = _build_warmup_inputs(module, int(batch_size), int(seq_len), device)
-                with torch.set_grad_enabled(run_backward):
+                autocast_enabled = device.type == "cuda"
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(torch.set_grad_enabled(run_backward))
+                    if not run_backward:
+                        stack.enter_context(torch.inference_mode())
+                    stack.enter_context(
+                        amp.autocast(
+                            device_type=device.type,
+                            dtype=torch.float16,
+                            enabled=autocast_enabled,
+                        )
+                    )
                     outputs = module(**inputs)
                     if run_backward:
                         tensors: List[torch.Tensor] = []

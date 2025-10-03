@@ -7,6 +7,7 @@ import time
 
 import numpy as np
 import torch
+import torch.amp as amp
 
 from src.misc import lb
 from src import config
@@ -154,9 +155,17 @@ class PPOVecRolloutManager:
                 if tensors_payload and hasattr(agent, "compute_actions"):
                     if policy_id not in training_policy_set:
                         raise RuntimeError(f"Received tensor payload for non-training policy {policy_id}.")
-                    
+
                     start = time.perf_counter()
-                    actions, log_probs, values = agent.compute_actions(tensors_payload)
+                    autocast_enabled = self.device.type == "cuda"
+                    with torch.inference_mode():
+                        autocast_ctx = amp.autocast(
+                            device_type=self.device.type,
+                            dtype=torch.float16,
+                            enabled=autocast_enabled,
+                        )
+                        with autocast_ctx:
+                            actions, log_probs, values = agent.compute_actions(tensors_payload)
                     duration = time.perf_counter() - start
                     _record_model_call(policy_id, duration)
                 else:

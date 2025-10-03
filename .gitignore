@@ -189,3 +189,4 @@ CODING_GUIDELINES.md
 *.png
 *.data
 *.dot
+/persistent_cache

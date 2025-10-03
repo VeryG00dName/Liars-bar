@@ -6,6 +6,7 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
+import torch.amp as amp
 
 from src import config
 from src.model.model_factory import ModelFactory as MFactoryUtil
@@ -102,8 +103,15 @@ class LearnerAutoregressiveAgent:
 
         filtered_model_input = {k: v for k, v in model_input.items() if k in EXPECTED_MODEL_ARGS}
 
+        autocast_enabled = self.device.type == "cuda"
         with torch.inference_mode():
-            action_logits, _, state_values = inference_model(**filtered_model_input)[:3]
+            with amp.autocast(
+                device_type=self.device.type,
+                dtype=torch.float16,
+                enabled=autocast_enabled,
+            ):
+                forward_out = inference_model(**filtered_model_input)
+        action_logits, _, state_values = forward_out[:3]
 
         valid_lengths = model_input["valid_lengths"].long()
         if valid_lengths.numel() == 0:
