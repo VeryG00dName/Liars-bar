@@ -56,12 +56,6 @@ struct EpisodeTracker {
     std::unordered_map<int, SeatTrajectory> training_seats;
 };
 
-struct PendingStepData {
-    float log_prob{0.0f};
-    float value{0.0f};
-    int penalties_used{0};
-};
-
 struct PreparedBatch {
     torch::Tensor obs_sequence;
     torch::Tensor action_sequence;
@@ -147,7 +141,6 @@ private:
     std::unordered_map<int, int> policy_max_sequence_length_;
 
     std::vector<EpisodeTracker> episodes_;
-    std::unordered_map<uint64_t, PendingStepData> pending_step_data_;
     std::vector<TrajectoryData> completed_buffer_;
     std::unordered_map<int, std::shared_ptr<torch::jit::Module>> historical_models_;
     std::unordered_map<int, CppBotRegistryEntry> cpp_bot_registry_;
@@ -170,7 +163,6 @@ private:
     void finalize_episode(EpisodeTracker& tracker);
     void mark_training_env_inactive(int env_idx);
     void finalize_seat(EpisodeTracker& tracker, SeatTrajectory& seat_tracker, Env& env);
-    uint64_t pending_key(int env_idx, int seat) const;
     std::vector<uint8_t> run_historical_inference(torch::jit::Module& module,
                                                   const std::vector<PolicyRequest>& requests);
     std::vector<uint8_t> run_cpp_bot(int policy_id, const std::vector<PolicyRequest>& requests);

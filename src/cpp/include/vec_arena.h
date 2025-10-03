@@ -8,7 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
-static constexpr int DEFAULT_MAX_LEN = 255;
+static constexpr int DEFAULT_MAX_LEN = 480;
 static constexpr int OBS_DIM = 2 + (Env::MAX_PLAYERS - 1) + Env::MAX_PLAYERS; // newerest dim
 
 struct PolicyRequest {

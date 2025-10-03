@@ -7,7 +7,6 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
-#include <map>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -134,7 +133,6 @@ void RolloutManager::start_rollouts(int num_episodes,
         training_policy_id_set_.insert(id);
     }
     completed_buffer_.clear();
-    pending_step_data_.clear();
     weighted_opponent_labels_ = opponent_labels;
     weighted_opponent_weights_ = opponent_weights;
 
@@ -379,14 +377,19 @@ void RolloutManager::submit_inference_results_array(int policy_id,
                     seat_tracker.data.our_action[step_idx] = static_cast<int>(actions[i]);
                 }
 
-                PendingStepData pending{};
-                pending.log_prob = (has_log_probs ? log_probs[i] : 0.0f);
-                pending.value = (has_values ? values[i] : 0.0f);
+                const float log_prob_value = has_log_probs ? log_probs[i] : 0.0f;
+                const float value_value = has_values ? values[i] : 0.0f;
+                int penalties_used = 0;
                 if (env_idx >= 0 && env_idx < static_cast<int>(arena_.envs.size()) &&
                     seat >= 0 && seat < arena_.envs[env_idx].num_players()) {
-                    pending.penalties_used = static_cast<int>(arena_.envs[env_idx].penalties[seat]);
+                    penalties_used = static_cast<int>(arena_.envs[env_idx].penalties[seat]);
                 }
-                pending_step_data_[pending_key(env_idx, seat)] = pending;
+
+                if (step_idx >= 0 && step_idx < static_cast<int>(seat_tracker.data.log_prob.size())) {
+                    seat_tracker.data.log_prob[step_idx] = log_prob_value;
+                    seat_tracker.data.value[step_idx] = value_value;
+                    seat_tracker.data.penalties_used[step_idx] = penalties_used;
+                }
             }
         }
     }
@@ -717,17 +720,6 @@ void RolloutManager::finalize_seat(EpisodeTracker& tracker, SeatTrajectory& seat
 
     update_penalty_rewards(seat_tracker, env.penalties);
 
-    auto it_pending = pending_step_data_.find(pending_key(tracker.env_idx, seat_tracker.seat));
-    if (it_pending != pending_step_data_.end()) {
-        const int idx = seat_tracker.last_training_step_idx;
-        if (idx >= 0 && idx < static_cast<int>(seat_tracker.data.log_prob.size())) {
-            seat_tracker.data.log_prob[idx] = it_pending->second.log_prob;
-            seat_tracker.data.value[idx] = it_pending->second.value;
-            seat_tracker.data.penalties_used[idx] = it_pending->second.penalties_used;
-        }
-        pending_step_data_.erase(it_pending);
-    }
-
     int our_last_step_idx = -1;
     for (int i = static_cast<int>(seat_tracker.data.agent_id.size()) - 1; i >= 0; --i) {
         if (seat_tracker.data.agent_id[i] == seat_tracker.seat) {
@@ -771,11 +763,6 @@ void RolloutManager::finalize_seat(EpisodeTracker& tracker, SeatTrajectory& seat
     }
 }
 
-uint64_t RolloutManager::pending_key(int env_idx, int seat) const {
-    return (static_cast<uint64_t>(static_cast<uint32_t>(env_idx)) << 32) ^
-           static_cast<uint32_t>(seat & 0xFFFFFFFF);
-}
-
 bool RolloutManager::is_training_policy(int policy_id) const {
     return training_policy_id_set_.find(policy_id) != training_policy_id_set_.end();
 }
@@ -788,22 +775,23 @@ std::vector<uint8_t> RolloutManager::run_historical_inference(torch::jit::Module
 
     torch::NoGradGuard no_grad;
 
-    static const std::array<int64_t, 4> kBucketBounds{{32, 64, 96, 128, 192, 256, 480}};
+    constexpr std::array<int64_t, 7> kBucketBounds{{32, 64, 96, 128, 192, 256, 480}};
     const int64_t max_limit = std::max<int64_t>(1, static_cast<int64_t>(default_max_sequence_length_));
-    auto select_bucket = [&](int64_t length) -> int64_t {
+
+    auto select_bucket_index = [&](int64_t length) -> size_t {
         const int64_t clamped = std::max<int64_t>(1, std::min<int64_t>(length, max_limit));
-        for (int64_t bound : kBucketBounds) {
-            if (clamped <= bound) {
-                return std::min<int64_t>(bound, max_limit);
+        for (size_t i = 0; i < kBucketBounds.size(); ++i) {
+            if (clamped <= kBucketBounds[i]) {
+                return i;
             }
         }
-        return std::min<int64_t>(max_limit, kBucketBounds.back());
+        return kBucketBounds.size() - 1;
     };
 
-    std::map<int64_t, std::vector<size_t>> bucket_indices;
+    std::array<std::vector<size_t>, kBucketBounds.size()> bucket_indices{};
     for (size_t idx = 0; idx < requests.size(); ++idx) {
         const auto& req = requests[idx];
-        const int64_t bucket = select_bucket(req.valid_len);
+        const size_t bucket = select_bucket_index(req.valid_len);
         bucket_indices[bucket].push_back(idx);
     }
 
@@ -811,11 +799,14 @@ std::vector<uint8_t> RolloutManager::run_historical_inference(torch::jit::Module
 
     auto opts_long_device = torch::TensorOptions().dtype(torch::kInt64).device(kInferenceDevice);
 
-    for (const auto& [target_pad_len, indices] : bucket_indices) {
+    for (size_t bucket_idx = 0; bucket_idx < bucket_indices.size(); ++bucket_idx) {
+        const auto& indices = bucket_indices[bucket_idx];
         if (indices.empty()) {
             continue;
         }
         const int64_t batch_size = static_cast<int64_t>(indices.size());
+        const int64_t target_pad_len =
+            std::min<int64_t>(kBucketBounds[bucket_idx], max_limit);
 
         auto tensor_batch =
             prepare_inference_batch(requests, target_pad_len, kInferenceDevice, indices);
@@ -1149,18 +1140,7 @@ void RolloutManager::log_rewards_and_dones() {
                     if (!seat_tracker.active) {
                         continue;
                     }
-                    if (seat_tracker.seat == actor) {
-                        auto it_pending = pending_step_data_.find(pending_key(tracker.env_idx, seat_tracker.seat));
-                        if (it_pending != pending_step_data_.end()) {
-                            const int idx = seat_tracker.last_training_step_idx;
-                            if (idx >= 0 && idx < static_cast<int>(seat_tracker.data.log_prob.size())) {
-                                seat_tracker.data.log_prob[idx] = it_pending->second.log_prob;
-                                seat_tracker.data.value[idx] = it_pending->second.value;
-                                seat_tracker.data.penalties_used[idx] = it_pending->second.penalties_used;
-                            }
-                            pending_step_data_.erase(it_pending);
-                        }
-                    } else {
+                    if (seat_tracker.seat != actor) {
                         const int idx = append_opponent_step(seat_tracker, actor);
                         if (idx >= 0 && idx < static_cast<int>(seat_tracker.data.opp_target_action.size())) {
                             seat_tracker.data.opp_target_action[idx] = static_cast<int>(entry.action);
