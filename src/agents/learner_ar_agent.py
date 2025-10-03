@@ -62,46 +62,10 @@ class LearnerAutoregressiveAgent:
         if "valid_lengths" not in tensor_inputs or "action_masks" not in tensor_inputs:
             raise RuntimeError("Tensor payload missing required keys for inference.")
 
-        valid_lengths_source = tensor_inputs["valid_lengths"]
-        if not torch.is_tensor(valid_lengths_source):
-            valid_lengths_source = torch.as_tensor(valid_lengths_source)
-        max_len = int(valid_lengths_source.max().item()) if valid_lengths_source.numel() > 0 else 1
-        if self.max_seq_length is not None:
-            max_len = min(max_len, int(self.max_seq_length))
-
-        bucket_boundaries = [32, 64, 96, 128, 192, 256, 480]
-        target_pad_len = max_len
-        for boundary in bucket_boundaries:
-            if max_len <= boundary:
-                target_pad_len = boundary
-                break
-
-        if self.max_seq_length is not None and target_pad_len > int(self.max_seq_length):
-            target_pad_len = int(self.max_seq_length)
-
-        # Slice/pad to bucket length and move to device
-        model_input: Dict[str, torch.Tensor] = {}
-        for key, value in tensor_inputs.items():
-            if torch.is_tensor(value):
-                tensor_value = value
-                if tensor_value.dim() >= 2:
-                    seq_limit = min(tensor_value.shape[1], target_pad_len)
-                    tensor_value = tensor_value[:, :seq_limit].contiguous()
-                    if tensor_value.shape[1] < target_pad_len:
-                        pad_shape = (tensor_value.shape[0], target_pad_len, *tensor_value.shape[2:])
-                        if key == "padding_mask":
-                            fill_value = True
-                        elif key == "action_masks":
-                            fill_value = False
-                        else:
-                            fill_value = 0
-                        padded = tensor_value.new_full(pad_shape, fill_value)
-                        length = tensor_value.shape[1]
-                        padded[:, :length] = tensor_value
-                        tensor_value = padded
-                model_input[key] = tensor_value.to(self.device, non_blocking=True)
-            else:
-                model_input[key] = value
+        model_input = {
+            k: v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v
+            for k, v in tensor_inputs.items()
+        }
 
         filtered_model_input = {k: v for k, v in model_input.items() if k in EXPECTED_MODEL_ARGS}
 
