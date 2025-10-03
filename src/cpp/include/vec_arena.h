@@ -8,7 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
-static constexpr int MAX_LEN = 255;
+static constexpr int DEFAULT_MAX_LEN = 255;
 static constexpr int OBS_DIM = 2 + (Env::MAX_PLAYERS - 1) + Env::MAX_PLAYERS; // newerest dim
 
 struct PolicyRequest {
@@ -31,10 +31,11 @@ struct PolicyRequest {
 };
 
 struct VecArena {
-	// Config
-	int B = 0;
-	int n_players = 4;
-	uint32_t base_seed = 0;
+        // Config
+        int B = 0;
+        int n_players = 4;
+        uint32_t base_seed = 0;
+        int max_sequence_length = DEFAULT_MAX_LEN;
 	// State
 	std::vector<Env> envs;
 	std::vector<uint8_t> done;                   // per-env terminal flag
@@ -48,6 +49,7 @@ struct VecArena {
 	// ---- API ----
         void reset(int B_, int n_players_, uint32_t seed0);
         void set_roles(const std::vector<std::vector<int>>& policy_ids_per_env);
+        void set_max_sequence_length(int max_len);
 
         // Advance everything until any POLICY seat needs an action.
         // Returns grouped requests per policy_id.

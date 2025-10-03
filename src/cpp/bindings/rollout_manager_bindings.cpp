@@ -108,7 +108,7 @@ void bind_rollout_manager(py::module_& m) {
                 }
                 payload["requests"] = req_list;
                 if (self.is_training_policy(policy_id) && !req_vec.empty()) {
-                    auto prepared = self.prepare_training_batch(req_vec);
+                    auto prepared = self.prepare_training_batch(req_vec, policy_id);
                     payload["tensors"] = prepared_batch_to_dict(prepared);
                 } else {
                     payload["tensors"] = py::none();
@@ -185,5 +185,9 @@ void bind_rollout_manager(py::module_& m) {
              py::arg("policy_id"),
              py::arg("name"))
         .def("set_training_device", &RolloutManager::set_training_device,
-             py::arg("device"));
+             py::arg("device"))
+        .def("set_max_sequence_length", &RolloutManager::set_max_sequence_length,
+             py::arg("max_seq_length"))
+        .def("set_policy_max_sequence_length", &RolloutManager::set_policy_max_sequence_length,
+             py::arg("policy_id"), py::arg("max_seq_length"));
 }

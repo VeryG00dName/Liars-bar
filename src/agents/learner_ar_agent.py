@@ -34,7 +34,7 @@ class LearnerAutoregressiveAgent:
         self.player_id = player_id
         self.model: Optional[torch.nn.Module] = None
         self.train_model: Optional[torch.nn.Module] = None
-        self.rollout: Dict[int, torch.nn.Module] = {}
+        self.rollout_model: Optional[torch.nn.Module] = None
         self.label: int = -1
         self.max_seq_length: Optional[int] = None
         self._last_inputs: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
@@ -48,7 +48,7 @@ class LearnerAutoregressiveAgent:
     def load_from_state_dict(self, model_state_dict: Dict[str, torch.Tensor]) -> None:
         model = build_model_from_state(model_state_dict, self.device)
         self.model = model
-        self.rollout.clear()
+        self.rollout_model = None
         self.max_seq_length = getattr(model, "max_seq_length", None)
         self.reset()
 
@@ -56,7 +56,7 @@ class LearnerAutoregressiveAgent:
             self,
             tensor_inputs: Dict[str, torch.Tensor],
         ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        if self.model is None:
+        if self.rollout_model is None:
             raise RuntimeError("LearnerAutoregressiveAgent model has not been initialized.")
 
         if "valid_lengths" not in tensor_inputs or "action_masks" not in tensor_inputs:
@@ -66,16 +66,18 @@ class LearnerAutoregressiveAgent:
         if not torch.is_tensor(valid_lengths_source):
             valid_lengths_source = torch.as_tensor(valid_lengths_source)
         max_len = int(valid_lengths_source.max().item()) if valid_lengths_source.numel() > 0 else 1
+        if self.max_seq_length is not None:
+            max_len = min(max_len, int(self.max_seq_length))
 
-        # keep L static via buckets; B will be dynamic (first call only)
-        bucket_boundaries = [32, 64, 160, 256]
+        bucket_boundaries = [64, 128, 256, 320]
         target_pad_len = max_len
         for boundary in bucket_boundaries:
             if max_len <= boundary:
                 target_pad_len = boundary
                 break
 
-        inference_model = self._select_inference_model(target_pad_len)
+        if self.max_seq_length is not None and target_pad_len > int(self.max_seq_length):
+            target_pad_len = int(self.max_seq_length)
 
         # Slice/pad to bucket length and move to device
         model_input: Dict[str, torch.Tensor] = {}
@@ -110,7 +112,7 @@ class LearnerAutoregressiveAgent:
                 dtype=torch.float16,
                 enabled=autocast_enabled,
             ):
-                forward_out = inference_model(**filtered_model_input)
+                forward_out = self.rollout_model(**filtered_model_input)
         action_logits, _, state_values = forward_out[:3]
 
         valid_lengths = model_input["valid_lengths"].long()
@@ -218,23 +220,6 @@ class LearnerAutoregressiveAgent:
 
             self._last_inputs[(env_idx, seat_idx)] = snapshot
 
-    def _select_inference_model(self, target_pad_len: int) -> torch.nn.Module:
-        if self.rollout:
-            model = self.rollout.get(target_pad_len)
-            if model is None:
-                # Fallback to the closest larger bucket if available
-                larger_lengths = sorted(length for length in self.rollout if length >= target_pad_len)
-                if larger_lengths:
-                    model = self.rollout[larger_lengths[0]]
-                else:
-                    model = next(iter(self.rollout.values()))
-            if model is not None:
-                return model
-
-        if self.model is None:
-            raise RuntimeError("LearnerAutoregressiveAgent model has not been initialized.")
-        return self.model
-
     def sync_rollout_models(self) -> None:
         if self.train_model is None:
             return
@@ -245,8 +230,8 @@ class LearnerAutoregressiveAgent:
         if self.model is not None:
             self.model.load_state_dict(state, strict=True)
 
-        for compiled in self.rollout.values():
-            target = getattr(compiled, "_orig_mod", compiled)
+        if self.rollout_model is not None:
+            target = getattr(self.rollout_model, "_orig_mod", self.rollout_model)
             target.load_state_dict(state, strict=True)
 
 
@@ -318,7 +303,7 @@ class LearnerAutoregressiveAgent:
         self.model.load_state_dict(model_state_dict, strict=False)
 
         self.model.eval()
-        self.rollout.clear()
+        self.rollout_model = None
         self.reset()
 
 def build_model_from_state(

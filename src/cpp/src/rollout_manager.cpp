@@ -115,6 +115,7 @@ RolloutManager::RolloutManager()
             "CUDA is not available, but the RolloutManager requires it for historical agent inference.");
     }
     training_device_ = torch::cuda::is_available() ? torch::Device(torch::kCUDA) : torch::Device(torch::kCPU);
+    arena_.set_max_sequence_length(default_max_sequence_length_);
 }
 
 void RolloutManager::start_rollouts(int num_episodes,
@@ -443,16 +444,41 @@ void RolloutManager::register_cpp_bot(int policy_id, const std::string& bot_name
     }
 }
 
-PreparedBatch RolloutManager::prepare_training_batch(const std::vector<PolicyRequest>& requests) const {
+void RolloutManager::set_max_sequence_length(int max_len) {
+    if (max_len <= 0) {
+        max_len = 1;
+    }
+    default_max_sequence_length_ = max_len;
+    arena_.set_max_sequence_length(max_len);
+}
+
+void RolloutManager::set_policy_max_sequence_length(int policy_id, int max_len) {
+    if (policy_id < 0) {
+        return;
+    }
+    if (max_len <= 0) {
+        max_len = 1;
+    }
+    policy_max_sequence_length_[policy_id] = max_len;
+}
+
+PreparedBatch RolloutManager::prepare_training_batch(const std::vector<PolicyRequest>& requests,
+                                                     int policy_id) const {
     PreparedBatch batch;
     if (requests.empty()) {
         return batch;
     }
 
     const int64_t batch_size = static_cast<int64_t>(requests.size());
+    int64_t max_allowed = std::max<int64_t>(1, default_max_sequence_length_);
+    auto it_limit = policy_max_sequence_length_.find(policy_id);
+    if (it_limit != policy_max_sequence_length_.end()) {
+        max_allowed = std::max<int64_t>(1, static_cast<int64_t>(it_limit->second));
+    }
+
     int64_t max_len = 1;
     for (const auto& req : requests) {
-        const int64_t len = std::max<int64_t>(1, std::min<int64_t>(req.valid_len, MAX_LEN));
+        const int64_t len = std::max<int64_t>(1, std::min<int64_t>(req.valid_len, max_allowed));
         max_len = std::max(max_len, len);
     }
 
@@ -472,7 +498,7 @@ PreparedBatch RolloutManager::prepare_training_batch(const std::vector<PolicyReq
 
     for (int64_t b = 0; b < batch_size; ++b) {
         const auto& req = requests[static_cast<size_t>(b)];
-        const int64_t requested_len = std::max<int64_t>(0, std::min<int64_t>(req.valid_len, max_len));
+        const int64_t requested_len = std::max<int64_t>(0, std::min<int64_t>(req.valid_len, max_allowed));
         const int64_t used_len = std::max<int64_t>(1, requested_len);
 
         valid_lengths[b] = used_len;
@@ -666,15 +692,16 @@ std::vector<uint8_t> RolloutManager::run_historical_inference(torch::jit::Module
 
     torch::NoGradGuard no_grad;
 
-    static const std::array<int64_t, 4> kBucketBounds{{32, 64, 160, 256}};
+    static const std::array<int64_t, 4> kBucketBounds{{64, 128, 256, 320}};
+    const int64_t max_limit = std::max<int64_t>(1, static_cast<int64_t>(default_max_sequence_length_));
     auto select_bucket = [&](int64_t length) -> int64_t {
-        const int64_t clamped = std::max<int64_t>(1, std::min<int64_t>(length, MAX_LEN));
+        const int64_t clamped = std::max<int64_t>(1, std::min<int64_t>(length, max_limit));
         for (int64_t bound : kBucketBounds) {
             if (clamped <= bound) {
-                return std::min<int64_t>(bound, MAX_LEN);
+                return std::min<int64_t>(bound, max_limit);
             }
         }
-        return std::min<int64_t>(static_cast<int64_t>(MAX_LEN), kBucketBounds.back());
+        return std::min<int64_t>(max_limit, kBucketBounds.back());
     };
 
     std::map<int64_t, std::vector<size_t>> bucket_indices;
@@ -695,7 +722,7 @@ std::vector<uint8_t> RolloutManager::run_historical_inference(torch::jit::Module
         if (indices.empty()) {
             continue;
         }
-        const int64_t target_pad_len = std::min<int64_t>(target_pad_len_raw, MAX_LEN);
+        const int64_t target_pad_len = std::min<int64_t>(target_pad_len_raw, max_limit);
         const int64_t batch_size = static_cast<int64_t>(indices.size());
 
         auto obs_sequence = torch::zeros({batch_size, target_pad_len, OBS_DIM}, opts_float_cpu);

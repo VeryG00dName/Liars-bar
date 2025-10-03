@@ -1,7 +1,7 @@
 # src/training/train_ppo_autoregressive_self.py
 
 import copy
-import os, logging, warnings, contextlib
+import os, logging, warnings
 import json
 os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", "/mnt/l/Coding_Projects/Liars_bar_2/Liars-bar/persistent_cache/inductor")
 os.environ.setdefault("TRITON_CACHE_DIR",        "/mnt/l/Coding_Projects/Liars_bar_2/Liars-bar/persistent_cache/triton")
@@ -10,30 +10,12 @@ from collections import defaultdict
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Callable, Tuple, Sequence, DefaultDict
+from typing import Dict, Any, List, Optional, Callable, Tuple, DefaultDict
 from numpy.random import Generator
 import random
 import numpy as np
 import argparse
 
-@contextlib.contextmanager
-def silence_autotune():
-    # Strong silencer: catches Python prints *and* native writes
-    devnull = open(os.devnull, "w")
-    old_stdout_fd = os.dup(1)
-    old_stderr_fd = os.dup(2)
-    try:
-        with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
-            os.dup2(devnull.fileno(), 1)  # redirect C-level fd 1
-            os.dup2(devnull.fileno(), 2)  # redirect C-level fd 2
-            yield
-    finally:
-        os.dup2(old_stdout_fd, 1)
-        os.dup2(old_stderr_fd, 2)
-        os.close(old_stdout_fd)
-        os.close(old_stderr_fd)
-        devnull.close()
-        
 # Quiet Torch compile logs
 os.environ.pop("TORCH_LOGS", None)           # disable extra compile logs
 os.environ.setdefault("TORCHDYNAMO_VERBOSE", "0")
@@ -75,150 +57,6 @@ SEED = int(getattr(config, "SEED", 42))
 set_seed(SEED)
 _GLOBAL_RNG = np.random.default_rng(SEED)
 
-PAD_BUCKET_BOUNDARIES = [32, 64, 160, 256]
-
-
-def _select_bucket_length(length: int) -> int:
-    for boundary in PAD_BUCKET_BOUNDARIES:
-        if length <= boundary:
-            return boundary
-    return int(length)
-
-
-def _get_base_model(module: torch.nn.Module) -> torch.nn.Module:
-    """Return the underlying (uncompiled) module for metadata access."""
-    return getattr(module, "_orig_mod", module)
-
-def _build_warmup_inputs(
-    module: torch.nn.Module,
-    batch_size: int,
-    seq_len: int,
-    device: torch.device,
-) -> Dict[str, torch.Tensor]:
-    base = _get_base_model(module)
-    obs_dim = 9
-    action_dim = 7
-    agent_type_count = 4
-    max_len = 256
-    effective_len = min(int(seq_len), max_len)
-    if effective_len <= 0:
-        effective_len = 1
-
-    param_dtype = torch.float32
-    try:
-        first_param = next(base.parameters())
-        param_dtype = first_param.dtype
-    except StopIteration:
-        pass
-
-    obs_sequence = torch.randn(
-        batch_size,
-        effective_len,
-        obs_dim,
-        device=device,
-        dtype=param_dtype,
-    )
-    action_sequence = torch.randint(
-        0,
-        max(action_dim, 1),
-        (batch_size, effective_len),
-        device=device,
-        dtype=torch.long,
-    )
-    agent_types = torch.randint(
-        0,
-        max(agent_type_count, 1),
-        (batch_size, effective_len),
-        device=device,
-        dtype=torch.long,
-    )
-    positions = torch.arange(effective_len, device=device, dtype=torch.long).unsqueeze(0)
-    if batch_size > 1:
-        positions = positions.expand(batch_size, -1).contiguous()
-    action_masks = torch.ones(
-        batch_size,
-        effective_len,
-        action_dim,
-        device=device,
-        dtype=torch.bool,
-    )
-    padding_mask = torch.zeros(
-        batch_size,
-        effective_len,
-        device=device,
-        dtype=torch.bool,
-    )
-    valid_lengths = torch.full(
-        (batch_size,),
-        effective_len,
-        device=device,
-        dtype=torch.long,
-    )
-
-    return {
-        "obs_sequence": obs_sequence,
-        "action_sequence": action_sequence,
-        "agent_types": agent_types,
-        "positions": positions,
-        "action_masks": action_masks,
-        "padding_mask": padding_mask,
-        "valid_lengths": valid_lengths,
-    }
-
-
-def _warmup_model(
-    module: torch.nn.Module,
-    *,
-    lengths: Sequence[int],
-    batch_sizes: Sequence[int],
-    device: torch.device,
-    description: str,
-    run_backward: bool = False,
-) -> None:
-    if module is None:
-        return
-    for seq_len in lengths:
-        for batch_size in batch_sizes:
-            if batch_size <= 0:
-                continue
-            try:
-                inputs = _build_warmup_inputs(module, int(batch_size), int(seq_len), device)
-                autocast_enabled = device.type == "cuda"
-                with contextlib.ExitStack() as stack:
-                    stack.enter_context(torch.set_grad_enabled(run_backward))
-                    if not run_backward:
-                        stack.enter_context(torch.inference_mode())
-                    stack.enter_context(
-                        amp.autocast(
-                            device_type=device.type,
-                            dtype=torch.float16,
-                            enabled=autocast_enabled,
-                        )
-                    )
-                    outputs = module(**inputs)
-                    if run_backward:
-                        tensors: List[torch.Tensor] = []
-                        if isinstance(outputs, torch.Tensor):
-                            tensors = [outputs]
-                        elif isinstance(outputs, (list, tuple)):
-                            tensors = [o for o in outputs if torch.is_tensor(o)]
-                        else:
-                            tensors = []
-                        total = None
-                        for tensor in tensors:
-                            if tensor.requires_grad:
-                                total = tensor.sum() if total is None else total + tensor.sum()
-                        if total is not None and total.requires_grad:
-                            total.backward()
-                            base = _get_base_model(module)
-                            base.zero_grad(set_to_none=True)
-                if FORCE_CUDA_SYNC_FOR_TIMING and device.type == "cuda":
-                    torch.cuda.synchronize(device)
-            except Exception as exc:
-                logging.warning(
-                    f"Warm-up failed for {description} (B={batch_size}, L={seq_len}): {exc}"
-                )
-
 FORCE_CUDA_SYNC_FOR_TIMING = bool(getattr(config, "FORCE_CUDA_SYNC_FOR_TIMING", False))
 USE_HELDOUT_AGENT = bool(getattr(config, "USE_HELDOUT_AGENT", True))
 
@@ -226,6 +64,15 @@ USE_HELDOUT_AGENT = bool(getattr(config, "USE_HELDOUT_AGENT", True))
 # ==============================================================================
 # SECTION 1: HELPER CLASSES AND FUNCTIONS
 # ==============================================================================
+
+PAD_BUCKET_BOUNDARIES = [64, 128, 256, 320]
+
+
+def _select_bucket_length(length: int) -> int:
+    for boundary in PAD_BUCKET_BOUNDARIES:
+        if length <= boundary:
+            return boundary
+    return int(length)
 
 class OpponentPoolManager:
     """Manages the opponent_pool.json file for persistent population state."""
@@ -668,8 +515,8 @@ def train_generation(
             learner = _create_new_agent('main', device)
 
         learner.device = device
-        learner.model.to(device) # Ensure base model is on the right device before copying
-        learner.rollout = {}
+        learner.model.to(device)  # Ensure base model is on the right device before copying
+        learner.rollout_model = None
 
         # 2.2. Create the separate TRAINING model
         logging.info("Creating a separate model for training.")
@@ -693,57 +540,34 @@ def train_generation(
             learner.train_model = train_model
         learner.train_model.train()
 
-        train_batch_size = max(1, int(getattr(config, "PPO_MINIBATCH_SIZE", 1)))
-        with silence_autotune():
-            _warmup_model(
-                learner.train_model,
-                lengths=PAD_BUCKET_BOUNDARIES,
-                batch_sizes=[train_batch_size],
-                device=device,
-                description="train model",
-                run_backward=True,
-            )
+        # 2.4. Create and compile a single ROLLOUT model that supports dynamic sequence lengths
+        try:
+            rollout_model = copy.deepcopy(learner.model)
+        except Exception as exc:
+            logging.warning(f"Deepcopy failed for rollout model; recreating: {exc}")
+            rollout_model = type(learner.model)(**getattr(learner.model, "config", {}))
+        rollout_model.load_state_dict(learner.model.state_dict(), strict=False)
 
-        # 2.4. Create and compile dedicated ROLLOUT models (bucketed by sequence length)
-        rollout_state = learner.model.state_dict()
-        rollout_second_bs = min(train_batch_size, max(2, train_batch_size // 4 or 1))
-        rollout_batch_sizes = [1, rollout_second_bs]
-        for bucket_len in PAD_BUCKET_BOUNDARIES:
+        rollout_model = rollout_model.to(device)
+        rollout_model.eval()
+
+        compiled_rollout = rollout_model
+        if compile_fn:
             try:
-                rollout_model = copy.deepcopy(learner.model)
-            except Exception as exc:
-                logging.warning(f"Deepcopy failed for rollout model (L={bucket_len}); recreating: {exc}")
-                rollout_model = type(learner.model)(**getattr(learner.model, "config", {}))
-            rollout_model.load_state_dict(rollout_state, strict=False)
-
-            rollout_model = rollout_model.to(device)
-            rollout_model.eval()
-
-            compiled_rollout = rollout_model
-            if compile_fn:
-                try:
-                    logging.info(
-                        f"Compiling rollout model for length {bucket_len} (mode='reduce-overhead', dynamic=True)..."
-                    )
-                    compiled_rollout = compile_fn(
-                        rollout_model,
-                        dynamic=True,
-                        mode="reduce-overhead",
-                    )
-                except Exception as exc:
-                    logging.warning(
-                        f"torch.compile (rollout L={bucket_len}) failed; using eager model: {exc}"
-                    )
-
-            learner.rollout[bucket_len] = compiled_rollout
-            with silence_autotune():
-                _warmup_model(
-                    compiled_rollout,
-                    lengths=[bucket_len],
-                    batch_sizes=rollout_batch_sizes,
-                    device=device,
-                    description=f"rollout model (L={bucket_len})",
+                logging.info(
+                    "Compiling rollout model (mode='reduce-overhead', dynamic=True)..."
                 )
+                compiled_rollout = compile_fn(
+                    rollout_model,
+                    dynamic=True,
+                    mode="reduce-overhead",fullgraph=False
+                )
+            except Exception as exc:
+                logging.warning(
+                    f"torch.compile (rollout) failed; using eager model: {exc}"
+                )
+
+        learner.rollout_model = compiled_rollout
 
     else:
         # ---- This block runs for subsequent generations (gen > 1) ----
@@ -756,9 +580,8 @@ def train_generation(
                 learner.model.to(device)
             if hasattr(learner, "train_model") and learner.train_model is not None:
                 learner.train_model.to(device)
-            if hasattr(learner, "rollout") and isinstance(learner.rollout, dict):
-                for compiled in learner.rollout.values():
-                    getattr(compiled, "_orig_mod", compiled).to(device)
+            if hasattr(learner, "rollout_model") and learner.rollout_model is not None:
+                getattr(learner.rollout_model, "_orig_mod", learner.rollout_model).to(device)
         except Exception as exc:
             logging.warning(f"Failed to move one of the compiled models to device '{device}': {exc}")
 

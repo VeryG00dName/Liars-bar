@@ -18,10 +18,11 @@ void VecArena::fill_mask_for_current(const Env& e, uint8_t m[7]) {
 void VecArena::prepare_ai_sequence(const Env& e, int ai_seat, PolicyRequest& out) const {
     const int n_players = e.num_players();
     const int total = static_cast<int>(e.game_history.size());
-    const int start = std::max(0, total - (MAX_LEN - 1));
+    const int capped_max = std::max(1, max_sequence_length);
+    const int start = std::max(0, total - (capped_max - 1));
     const int history_span = std::max(0, total - start);
-    const int max_history = std::min(MAX_LEN - 1, history_span);
-    const int max_valid = std::max(1, std::min(MAX_LEN, history_span + 1));
+    const int max_history = std::min(capped_max - 1, history_span);
+    const int max_valid = std::max(1, std::min(capped_max, history_span + 1));
 
     out.obs_sequence.resize(static_cast<size_t>(max_valid) * OBS_DIM);
     out.action_sequence.resize(max_valid);
@@ -115,6 +116,14 @@ void VecArena::reset(int B_, int n_players_, uint32_t seed0) {
     pending.clear();
 
     for (int b = 0; b < B; ++b) envs[b].reset(n_players, seed0 + (uint32_t)b);
+}
+
+void VecArena::set_max_sequence_length(int max_len) {
+    if (max_len <= 0) {
+        max_sequence_length = 1;
+    } else {
+        max_sequence_length = max_len;
+    }
 }
 
 void VecArena::set_roles(const std::vector<std::vector<int>>& policy_ids_per_env) {

@@ -989,7 +989,7 @@ def main():
     parser.add_argument("--device", type=str, default='cuda', help="Device to use (cuda/cpu)")
     parser.add_argument("--max-files", type=int, default=None, help="Maximum number of data files to load")
     parser.add_argument("--max-samples", type=int, default=1770000, help="Maximum number of samples to load")
-    parser.add_argument("--max-seq-length", type=int, default=256, help="Maximum sequence length to process")
+    parser.add_argument("--max-seq-length", type=int, default=320, help="Maximum sequence length to process")
     parser.add_argument("--resume-from", type=str, default=None, help="Path to checkpoint to resume from")
     
     args = parser.parse_args()

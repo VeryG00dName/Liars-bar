@@ -35,6 +35,8 @@ class PPOVecRolloutManager:
             self.cpp_manager.set_training_device(str(device))
         except AttributeError:
             pass
+
+        self._sync_cpp_max_sequence_lengths()
         
         self._last_model_call_stats: Dict[int, Dict[str, float]] = {}
 
@@ -51,6 +53,43 @@ class PPOVecRolloutManager:
                     "Failed to reset policy %s",
                     getattr(policy, "player_id", "<unknown>"),
                 )
+
+    def _sync_cpp_max_sequence_lengths(self) -> None:
+        try:
+            set_default = getattr(self.cpp_manager, "set_max_sequence_length")
+        except AttributeError:
+            return
+
+        max_lengths: List[int] = []
+        try:
+            policy_setter = getattr(self.cpp_manager, "set_policy_max_sequence_length")
+        except AttributeError:
+            policy_setter = None
+
+        for policy_id, policy in self.policies.items():
+            max_seq = getattr(policy, "max_seq_length", None)
+            if max_seq is None:
+                continue
+            try:
+                max_seq_int = int(max_seq)
+            except (TypeError, ValueError):
+                continue
+            if max_seq_int <= 0:
+                continue
+            max_lengths.append(max_seq_int)
+            if policy_setter is not None:
+                try:
+                    policy_setter(int(policy_id), max_seq_int)
+                except Exception:
+                    logging.exception(
+                        "Failed to set policy-specific max sequence length for policy %s", policy_id
+                    )
+
+        fallback = max(max_lengths) if max_lengths else int(getattr(config, "MAX_SEQUENCE_LENGTH", 1))
+        try:
+            set_default(int(fallback))
+        except Exception:
+            logging.exception("Failed to set default max sequence length on rollout manager")
 
     @staticmethod
     def _prepare_requests(raw_requests: List[Any]) -> List[Any]:
@@ -128,7 +167,9 @@ class PPOVecRolloutManager:
         training_policy_set = set(training_policy_list)
 
         seed = int(self.rng.integers(0, 2**31))
-        
+
+        self._sync_cpp_max_sequence_lengths()
+
         self.rollout_manager.start_rollouts(
             num_episodes=num_episodes,
             num_players=num_players,

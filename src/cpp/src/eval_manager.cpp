@@ -381,9 +381,10 @@ std::vector<uint8_t> EvalManager::run_model(torch::jit::Module& module,
     torch::NoGradGuard no_grad;
 
     const int64_t batch_size = static_cast<int64_t>(requests.size());
+    const int64_t max_limit = std::max<int64_t>(1, static_cast<int64_t>(arena_.max_sequence_length));
     int64_t max_len = 1;
     for (const auto& req : requests) {
-        const int64_t len = std::max<int64_t>(1, std::min<int64_t>(req.valid_len, MAX_LEN));
+        const int64_t len = std::max<int64_t>(1, std::min<int64_t>(req.valid_len, max_limit));
         max_len = std::max(max_len, len);
     }
 
@@ -401,7 +402,7 @@ std::vector<uint8_t> EvalManager::run_model(torch::jit::Module& module,
 
     for (int64_t b = 0; b < batch_size; ++b) {
         const auto& req = requests[static_cast<size_t>(b)];
-        const int64_t requested_len = std::max<int64_t>(0, std::min<int64_t>(req.valid_len, max_len));
+        const int64_t requested_len = std::max<int64_t>(0, std::min<int64_t>(req.valid_len, max_limit));
         const int64_t used_len = std::max<int64_t>(1, requested_len);
 
         valid_lengths[b] = used_len;

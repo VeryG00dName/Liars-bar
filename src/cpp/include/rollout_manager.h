@@ -106,8 +106,11 @@ public:
     void load_historical_model(int policy_id, const std::string& path);
     void register_cpp_bot(int policy_id, const std::string& bot_name);
 
-    PreparedBatch prepare_training_batch(const std::vector<PolicyRequest>& requests) const;
+    PreparedBatch prepare_training_batch(const std::vector<PolicyRequest>& requests,
+                                         int policy_id) const;
     void set_training_device(const std::string& device_str);
+    void set_max_sequence_length(int max_len);
+    void set_policy_max_sequence_length(int policy_id, int max_len);
     int training_policy_id() const {
         return training_policy_ids_.empty() ? -1 : training_policy_ids_.front();
     }
@@ -140,6 +143,8 @@ private:
     std::unordered_set<int> training_policy_id_set_{};
     std::mt19937 rng_;
     torch::Device training_device_{torch::kCPU};
+    int default_max_sequence_length_{DEFAULT_MAX_LEN};
+    std::unordered_map<int, int> policy_max_sequence_length_;
 
     std::vector<EpisodeTracker> episodes_;
     std::unordered_map<uint64_t, PendingStepData> pending_step_data_;
