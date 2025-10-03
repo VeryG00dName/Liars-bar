@@ -1,12 +1,8 @@
 # src/model/ppo_reactive_model.py
 
 from torch.utils.checkpoint import checkpoint
-from torch.nn.attention import sdpa_kernel, SDPBackend
-sdpa_math_only = sdpa_kernel(backends=[SDPBackend.MATH])
-with sdpa_math_only:
-    # build & compile inside the context (or at least the first forward)
-    import torch
-    import torch.nn as nn
+import torch
+import torch.nn as nn
     
 class PPOReactiveModel(nn.Module):
     """
@@ -71,9 +67,9 @@ class PPOReactiveModel(nn.Module):
         # === Transformer Backbone ===
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim, nhead=num_heads, dim_feedforward=hidden_dim * 4,
-            dropout=dropout_rate, activation='gelu', batch_first=True, norm_first=True
+            dropout=dropout_rate, activation='gelu', batch_first=True
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer=encoder_layer, num_layers=num_layers, enable_nested_tensor=False)
+        self.transformer = nn.TransformerEncoder(encoder_layer=encoder_layer, num_layers=num_layers)
 
         # Policy and Value heads
         self.action_head     = nn.Linear(hidden_dim, action_dim)
