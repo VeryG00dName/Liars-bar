@@ -1,7 +1,7 @@
 # src/training/train_ppo_autoregressive_self.py
 
 import copy
-import os, logging, warnings
+import os, logging, warnings, contextlib
 import json
 import math
 from collections import defaultdict
@@ -13,6 +13,25 @@ from numpy.random import Generator
 import random
 import numpy as np
 import argparse
+
+@contextlib.contextmanager
+def silence_autotune():
+    # Strong silencer: catches Python prints *and* native writes
+    devnull = open(os.devnull, "w")
+    old_stdout_fd = os.dup(1)
+    old_stderr_fd = os.dup(2)
+    try:
+        with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+            os.dup2(devnull.fileno(), 1)  # redirect C-level fd 1
+            os.dup2(devnull.fileno(), 2)  # redirect C-level fd 2
+            yield
+    finally:
+        os.dup2(old_stdout_fd, 1)
+        os.dup2(old_stderr_fd, 2)
+        os.close(old_stdout_fd)
+        os.close(old_stderr_fd)
+        devnull.close()
+        
 # Quiet Torch compile logs
 os.environ.pop("TORCH_LOGS", None)           # disable extra compile logs
 os.environ.setdefault("TORCHDYNAMO_VERBOSE", "0")
@@ -62,6 +81,130 @@ def _select_bucket_length(length: int) -> int:
         if length <= boundary:
             return boundary
     return int(length)
+
+
+def _get_base_model(module: torch.nn.Module) -> torch.nn.Module:
+    """Return the underlying (uncompiled) module for metadata access."""
+    return getattr(module, "_orig_mod", module)
+
+def _build_warmup_inputs(
+    module: torch.nn.Module,
+    batch_size: int,
+    seq_len: int,
+    device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    base = _get_base_model(module)
+    obs_dim = 9
+    action_dim = 7
+    agent_type_count = 4
+    max_len = 256
+    effective_len = min(int(seq_len), max_len)
+    if effective_len <= 0:
+        effective_len = 1
+
+    param_dtype = torch.float32
+    try:
+        first_param = next(base.parameters())
+        param_dtype = first_param.dtype
+    except StopIteration:
+        pass
+
+    obs_sequence = torch.randn(
+        batch_size,
+        effective_len,
+        obs_dim,
+        device=device,
+        dtype=param_dtype,
+    )
+    action_sequence = torch.randint(
+        0,
+        max(action_dim, 1),
+        (batch_size, effective_len),
+        device=device,
+        dtype=torch.long,
+    )
+    agent_types = torch.randint(
+        0,
+        max(agent_type_count, 1),
+        (batch_size, effective_len),
+        device=device,
+        dtype=torch.long,
+    )
+    positions = torch.arange(effective_len, device=device, dtype=torch.long).unsqueeze(0)
+    if batch_size > 1:
+        positions = positions.expand(batch_size, -1).contiguous()
+    action_masks = torch.ones(
+        batch_size,
+        effective_len,
+        action_dim,
+        device=device,
+        dtype=torch.bool,
+    )
+    padding_mask = torch.zeros(
+        batch_size,
+        effective_len,
+        device=device,
+        dtype=torch.bool,
+    )
+    valid_lengths = torch.full(
+        (batch_size,),
+        effective_len,
+        device=device,
+        dtype=torch.long,
+    )
+
+    return {
+        "obs_sequence": obs_sequence,
+        "action_sequence": action_sequence,
+        "agent_types": agent_types,
+        "positions": positions,
+        "action_masks": action_masks,
+        "padding_mask": padding_mask,
+        "valid_lengths": valid_lengths,
+    }
+
+
+def _warmup_model(
+    module: torch.nn.Module,
+    *,
+    lengths: Sequence[int],
+    batch_sizes: Sequence[int],
+    device: torch.device,
+    description: str,
+    run_backward: bool = False,
+) -> None:
+    if module is None:
+        return
+    for seq_len in lengths:
+        for batch_size in batch_sizes:
+            if batch_size <= 0:
+                continue
+            try:
+                inputs = _build_warmup_inputs(module, int(batch_size), int(seq_len), device)
+                with torch.set_grad_enabled(run_backward):
+                    outputs = module(**inputs)
+                    if run_backward:
+                        tensors: List[torch.Tensor] = []
+                        if isinstance(outputs, torch.Tensor):
+                            tensors = [outputs]
+                        elif isinstance(outputs, (list, tuple)):
+                            tensors = [o for o in outputs if torch.is_tensor(o)]
+                        else:
+                            tensors = []
+                        total = None
+                        for tensor in tensors:
+                            if tensor.requires_grad:
+                                total = tensor.sum() if total is None else total + tensor.sum()
+                        if total is not None and total.requires_grad:
+                            total.backward()
+                            base = _get_base_model(module)
+                            base.zero_grad(set_to_none=True)
+                if FORCE_CUDA_SYNC_FOR_TIMING and device.type == "cuda":
+                    torch.cuda.synchronize(device)
+            except Exception as exc:
+                logging.warning(
+                    f"Warm-up failed for {description} (B={batch_size}, L={seq_len}): {exc}"
+                )
 
 FORCE_CUDA_SYNC_FOR_TIMING = bool(getattr(config, "FORCE_CUDA_SYNC_FOR_TIMING", False))
 USE_HELDOUT_AGENT = bool(getattr(config, "USE_HELDOUT_AGENT", True))
@@ -372,36 +515,6 @@ def _load_agent_from_checkpoint(
     agent.load_from_state_dict(state_dict)
     return agent
 
-def _clone_agent_from_agent(src_agent: LearnerAutoregressiveAgent,
-                            device: torch.device) -> LearnerAutoregressiveAgent:
-    """Clone an agent using the exact same path as checkpoint loading:
-    build a fresh agent and load via load_models_from_checkpoint with an
-    in-memory state_dict. This avoids architecture inference and stays
-    robust to naming/wrapping changes (e.g., _orig_mod, compile)."""
-    if src_agent is None or src_agent.model is None:
-        raise ValueError("Source agent/model is None; cannot clone.")
-
-    # get the unwrapped model for a clean state_dict (handles torch.compile)
-    src_model = getattr(src_agent.model, "_orig_mod", src_agent.model)
-    # take a CPU copy of the tensors to be device-agnostic
-    src_state = {k: v.detach().cpu() for k, v in src_model.state_dict().items()}
-
-    # make a fresh agent and load exactly like _load_agent_from_checkpoint
-    clone = LearnerAutoregressiveAgent(device, f"clone_of_{src_agent.player_id}")
-    clone.load_from_state_dict(src_state)
-
-    # bookkeeping to mirror the source
-    clone.label = getattr(src_agent, "label", -1)
-    clone.max_seq_length = getattr(src_agent, "max_seq_length", getattr(clone, "max_seq_length", None))
-
-    # ensure correct device/mode
-    if hasattr(clone, "model") and clone.model is not None:
-        clone.model.to(device)
-        clone.model.eval()   # rollouts should be in eval mode by default
-
-    return clone
-
-
 def _episode_token_count(episode: Dict[str, Any]) -> int:
     """Return the number of autoregressive tokens contained in an episode."""
     model_input = episode.get("model_input")
@@ -567,8 +680,21 @@ def train_generation(
             learner.train_model = train_model
         learner.train_model.train()
 
+        train_batch_size = max(1, int(getattr(config, "PPO_MINIBATCH_SIZE", 1)))
+        with silence_autotune():
+            _warmup_model(
+                learner.train_model,
+                lengths=PAD_BUCKET_BOUNDARIES,
+                batch_sizes=[train_batch_size],
+                device=device,
+                description="train model",
+                run_backward=True,
+            )
+
         # 2.4. Create and compile dedicated ROLLOUT models (bucketed by sequence length)
         rollout_state = learner.model.state_dict()
+        rollout_second_bs = min(train_batch_size, max(2, train_batch_size // 4 or 1))
+        rollout_batch_sizes = [1, rollout_second_bs]
         for bucket_len in PAD_BUCKET_BOUNDARIES:
             try:
                 rollout_model = copy.deepcopy(learner.model)
@@ -597,8 +723,14 @@ def train_generation(
                     )
 
             learner.rollout[bucket_len] = compiled_rollout
-
-        learner.model.eval()
+            with silence_autotune():
+                _warmup_model(
+                    compiled_rollout,
+                    lengths=[bucket_len],
+                    batch_sizes=rollout_batch_sizes,
+                    device=device,
+                    description=f"rollout model (L={bucket_len})",
+                )
 
     else:
         # ---- This block runs for subsequent generations (gen > 1) ----
