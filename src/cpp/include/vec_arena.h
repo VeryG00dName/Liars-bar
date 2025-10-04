@@ -36,6 +36,7 @@ struct VecArena {
         int n_players = 4;
         uint32_t base_seed = 0;
         int max_sequence_length = DEFAULT_MAX_LEN;
+        std::unordered_map<int, int> policy_max_sequence_lengths;
 	// State
 	std::vector<Env> envs;
 	std::vector<uint8_t> done;                   // per-env terminal flag
@@ -50,6 +51,7 @@ struct VecArena {
         void reset(int B_, int n_players_, uint32_t seed0);
         void set_roles(const std::vector<std::vector<int>>& policy_ids_per_env);
         void set_max_sequence_length(int max_len);
+        void set_policy_max_sequence_length(int policy_id, int max_len);
 
         // Advance everything until any POLICY seat needs an action.
         // Returns grouped requests per policy_id.
@@ -66,6 +68,7 @@ private:
 	// Helpers
         static uint8_t first_valid(const uint8_t mask[7]);
         static void fill_mask_for_current(const Env& e, uint8_t m[7]);
-        void prepare_ai_sequence(const Env& e, int ai_seat, PolicyRequest& out) const;
+        void prepare_ai_sequence(const Env& e, int ai_seat, int seq_cap, PolicyRequest& out) const;
         void advance_env_until_policy_or_done(int env_index, std::unordered_map<int, std::vector<PolicyRequest>>& out);
+        int max_sequence_length_for_policy(int policy_id) const;
 };

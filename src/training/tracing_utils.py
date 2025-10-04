@@ -2,7 +2,9 @@
 
 import logging
 from pathlib import Path
+
 import torch
+
 from src import config
 from src.agents.learner_ar_agent import LearnerAutoregressiveAgent
 
@@ -27,6 +29,7 @@ def _build_example_inputs(model: torch.nn.Module, device: torch.device):
 
 def trace_model_from_checkpoint(checkpoint_path: str, output_path: str, device: torch.device):
     """Loads a .pth checkpoint, traces it, and saves it as a .pt file."""
+    metadata_path = Path(str(output_path) + ".max_seq_length")
     try:
         agent = LearnerAutoregressiveAgent(device=device, player_id="tracer", compile=True)
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -36,14 +39,23 @@ def trace_model_from_checkpoint(checkpoint_path: str, output_path: str, device: 
         model_to_trace = getattr(agent.model, "_orig_mod", agent.model)
         model_to_trace.eval()
 
-        example_inputs = _build_example_inputs(model_to_trace, device)
-
         with torch.no_grad():
             scripted_model = torch.jit.script(model_to_trace)
             traced_model = torch.jit.freeze(scripted_model)
         # Save to CPU for portability
         traced_model_cpu = traced_model.to("cpu")
         torch.jit.save(traced_model_cpu, output_path)
+
+        max_seq_length = int(getattr(model_to_trace, "max_seq_length", 0) or 0)
+        try:
+            if max_seq_length > 0:
+                metadata_path.write_text(f"{max_seq_length}\n")
+            else:
+                metadata_path.write_text("")
+        except Exception:
+            logging.warning(
+                "Unable to persist max_seq_length metadata alongside %s", output_path, exc_info=True
+            )
         logging.info(f"Successfully traced model from {checkpoint_path} to {output_path}")
         return True
     except Exception as e:
@@ -52,6 +64,7 @@ def trace_model_from_checkpoint(checkpoint_path: str, output_path: str, device: 
         # attempt to load an invalid TorchScript file on subsequent runs.
         try:
             Path(output_path).unlink(missing_ok=True)
+            metadata_path.unlink(missing_ok=True)
         except Exception:
             logging.debug(
                 "Unable to clean up incomplete TorchScript artifact at %s", output_path,

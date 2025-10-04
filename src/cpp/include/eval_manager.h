@@ -81,6 +81,7 @@ private:
     int inference_batch_size_{128};
     std::mt19937 rng_;
     std::unordered_map<int, std::shared_ptr<torch::jit::Module>> models_;
+    std::unordered_map<int, int> policy_max_sequence_lengths_;
     std::unordered_map<int, CppBotRegistryEntry> cpp_bot_registry_;
 
     std::vector<uint8_t> run_model(torch::jit::Module& module,

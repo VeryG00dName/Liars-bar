@@ -4,6 +4,8 @@
 #include <array>
 #include <cctype>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <numeric>
@@ -18,6 +20,65 @@
 namespace {
 
 const torch::Device kInferenceDevice = torch::kCUDA;
+
+std::filesystem::path metadata_path_for_model(const std::string& model_path) {
+    std::filesystem::path path(model_path);
+    path += ".max_seq_length";
+    return path;
+}
+
+int read_max_seq_length_from_file(const std::filesystem::path& metadata_path) {
+    if (metadata_path.empty()) {
+        return -1;
+    }
+    std::ifstream stream(metadata_path);
+    if (!stream.is_open()) {
+        return -1;
+    }
+    int value = -1;
+    stream >> value;
+    if (!stream.good() || value <= 0) {
+        return -1;
+    }
+    return value;
+}
+
+int fallback_max_seq_length_from_path(const std::string& path) {
+    std::string lower;
+    lower.reserve(path.size());
+    for (char c : path) {
+        lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+
+    size_t pos = lower.find("test");
+    while (pos != std::string::npos) {
+        size_t idx = pos + 4;
+        if (idx < lower.size() && std::isdigit(static_cast<unsigned char>(lower[idx]))) {
+            int value = 0;
+            bool found_digit = false;
+            while (idx < lower.size() && std::isdigit(static_cast<unsigned char>(lower[idx]))) {
+                value = value * 10 + (lower[idx] - '0');
+                ++idx;
+                found_digit = true;
+            }
+            if (found_digit) {
+                return (value <= 62) ? 256 : 480;
+            }
+        }
+        pos = lower.find("test", pos + 4);
+    }
+
+    return 480;
+}
+
+int infer_max_seq_length_for_model(const std::string& model_path) {
+    auto metadata_path = metadata_path_for_model(model_path);
+    int from_file = read_max_seq_length_from_file(metadata_path);
+    if (from_file > 0) {
+        return from_file;
+    }
+    return fallback_max_seq_length_from_path(model_path);
+}
 
 std::mt19937::result_type seed_with_optional(uint32_t seed) {
     if (seed != 0) {
@@ -136,6 +197,9 @@ void EvalManager::load_model(int policy_id, const std::string& path) {
         module->to(kInferenceDevice);
         module->eval();
         models_[policy_id] = std::move(module);
+        int max_seq_length = infer_max_seq_length_for_model(path);
+        policy_max_sequence_lengths_[policy_id] = max_seq_length;
+        arena_.set_policy_max_sequence_length(policy_id, max_seq_length);
     } catch (const c10::Error& err) {
         std::cerr << "[EvalManager] Failed to load TorchScript module from '" << path
                   << "': " << err.what_without_backtrace() << std::endl;

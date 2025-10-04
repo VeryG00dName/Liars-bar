@@ -68,11 +68,14 @@ class PPOReactiveModelScript(nn.Module):
 
         # === Output heads ===
         # Policy and Value heads
-        self.action_head     = nn.Linear(hidden_dim, action_dim)
-        self.value_head      = nn.Linear(hidden_dim, 1)
+        self.action_head        = nn.Linear(hidden_dim, action_dim)
+        self.reward_stream_head = nn.Linear(hidden_dim, 1)
+
+        # Win-probability head
+        self.win_prob_head      = nn.Linear(hidden_dim, 1)
 
         # Opponent action head
-        self.opp_action_head = nn.Linear(hidden_dim, action_dim)
+        self.opp_action_head    = nn.Linear(hidden_dim, action_dim)
 
     # -------------------------- utils --------------------------
     def _decompose_actions(self, action_sequence: torch.Tensor, padding_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -105,7 +108,7 @@ class PPOReactiveModelScript(nn.Module):
                 positions: torch.Tensor,
                 action_masks: torch.Tensor,
                 padding_mask: torch.Tensor,
-                valid_lengths: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                valid_lengths: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
         encoded_inputs = self._encode_inputs(obs_sequence, action_sequence, agent_types, positions, padding_mask)
 
@@ -125,7 +128,8 @@ class PPOReactiveModelScript(nn.Module):
         )
 
         action_logits = self.action_head(transformer_output)
-        state_values  = self.value_head(transformer_output)
+        state_values = self.reward_stream_head(transformer_output)
+        win_logits = self.win_prob_head(transformer_output)
         opp_logits = self.opp_action_head(transformer_output)
 
-        return action_logits, opp_logits, state_values
+        return action_logits, opp_logits, state_values, win_logits

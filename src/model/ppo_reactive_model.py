@@ -1,5 +1,6 @@
 # src/model/ppo_reactive_model.py
 
+from typing import Optional, Tuple
 from torch.utils.checkpoint import checkpoint
 import torch
 import torch.nn as nn
@@ -71,12 +72,16 @@ class PPOReactiveModel(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer=encoder_layer, num_layers=num_layers)
 
+        # === Output heads ===
         # Policy and Value heads
-        self.action_head     = nn.Linear(hidden_dim, action_dim)
-        self.value_head      = nn.Linear(hidden_dim, 1)
+        self.action_head        = nn.Linear(hidden_dim, action_dim)
+        self.reward_stream_head = nn.Linear(hidden_dim, 1)
+
+        # Win-probability head
+        self.win_prob_head      = nn.Linear(hidden_dim, 1)
 
         # Opponent action head
-        self.opp_action_head = nn.Linear(hidden_dim, action_dim)
+        self.opp_action_head    = nn.Linear(hidden_dim, action_dim)
     # -------------------------- utils --------------------------
 
     @torch.no_grad()
@@ -112,8 +117,7 @@ class PPOReactiveModel(nn.Module):
         positions,
         action_masks,
         padding_mask,
-        valid_lengths=None,
-    ):
+        valid_lengths: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
         encoded_inputs = self._encode_inputs(obs_sequence, action_sequence, agent_types, positions, padding_mask)
 
@@ -156,7 +160,8 @@ class PPOReactiveModel(nn.Module):
             )
 
         action_logits = self.action_head(transformer_output)
-        state_values  = self.value_head(transformer_output)
+        state_values = self.reward_stream_head(transformer_output)
+        win_logits = self.win_prob_head(transformer_output)
         opp_logits = self.opp_action_head(transformer_output)
         # Apply action mask for our turns
         neg = torch.tensor(
@@ -171,4 +176,4 @@ class PPOReactiveModel(nn.Module):
             action_logits = torch.where(invalid, neg, action_logits)
 
 
-        return action_logits, opp_logits, state_values
+        return action_logits, opp_logits, state_values, win_logits

@@ -190,3 +190,4 @@ CODING_GUIDELINES.md
 *.data
 *.dot
 /persistent_cache
+*.max_seq_length

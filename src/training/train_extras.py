@@ -902,6 +902,7 @@ GAE_LAMBDA        = float(getattr(config, "GAE_LAMBDA", 0.98))
 VALUE_WEIGHT      = float(getattr(config, "VALUE_WEIGHT", 1.0))
 AUX_OPP_WEIGHT    = float(getattr(config, "AUX_OPP_WEIGHT", 0.5))
 BC_KL_WEIGHT      = float(getattr(config, "BC_KL_WEIGHT", 0.002))
+WIN_PROB_WEIGHT   = float(getattr(config, "WIN_PROB_WEIGHT", 1.0))
 
 # --- Stakes-Based Value Clipping Hyperparameters ---
 EPS_V                  = float(getattr(config, "EPS_V", 0.9))
@@ -1204,7 +1205,7 @@ def _dictionary_regularizers(
 def _temporarily_freeze_heads(model: torch.nn.Module):
     params: List[Tuple[torch.nn.Parameter, bool]] = []
     try:
-        for name in ("action_head", "value_head", "opp_action_head"):
+        for name in ("action_head", "reward_stream_head", "value_head", "win_prob_head", "opp_action_head"):
             module = getattr(model, name, None)
             if module is None:
                 continue
@@ -1240,19 +1241,79 @@ def _single_pass_ppo(
     action_logits = outs[0]
     opp_logits = outs[1] if len(outs) > 1 else None
     values_full = outs[2].squeeze(-1).to(torch.float32)
-    embedding_tuple = outs[3] if len(outs) > 3 else None
+
+    win_logits: Optional[torch.Tensor] = None
+    embedding_tuple = None
+    if len(outs) > 3:
+        candidate = outs[3]
+        if (
+            isinstance(candidate, torch.Tensor)
+            and candidate.dim() >= 2
+            and candidate.size(-1) == 1
+        ):
+            win_logits = candidate.squeeze(-1).to(torch.float32)
+            if len(outs) > 4:
+                embedding_tuple = outs[4]
+        else:
+            embedding_tuple = candidate
+            if len(outs) > 4:
+                # Preserve backwards compatibility with models that pack embedding info later
+                # by only taking the first additional tuple if present.
+                extra = outs[4]
+                if embedding_tuple is None and isinstance(extra, tuple):
+                    embedding_tuple = extra
 
     B, T = our_idx.shape
     A = action_logits.size(-1)
     device = values_full.device
+    L = values_full.size(1)
 
-    logits_at = action_logits.gather(1, our_idx.unsqueeze(-1).expand(-1, -1, A))
+    padding_mask = mi.get("padding_mask")
+    if padding_mask is None:
+        raise KeyError("'padding_mask' missing from model inputs for PPO loss computation")
+    padding_mask = padding_mask.to(torch.bool)
+    valid_mask = ~padding_mask
+
+    rewards_full = batch.get("rewards_full")
+    if rewards_full is None:
+        raise KeyError("Batch is missing 'rewards_full' required for universal GAE")
+    rewards_full = rewards_full.to(device=device, dtype=torch.float32)
+    if rewards_full.size(1) != L:
+        rewards_full = rewards_full[:, :L]
+    rewards_full = rewards_full * valid_mask.to(rewards_full.dtype)
+
+    next_values_full = torch.zeros_like(values_full)
+    next_valid_mask = torch.zeros_like(valid_mask)
+    if L > 1:
+        next_values_full[:, :-1] = values_full[:, 1:]
+        next_valid_mask[:, :-1] = valid_mask[:, 1:]
+
+    delta_full = rewards_full + GAMMA * next_values_full * next_valid_mask.to(torch.float32) - values_full
+    delta_full = delta_full * valid_mask.to(delta_full.dtype)
+
+    advantages_full = torch.zeros_like(values_full)
+    lastgaelam = torch.zeros((B,), device=device, dtype=torch.float32)
+    gamma_lam = GAMMA * GAE_LAMBDA
+    for t in range(L - 1, -1, -1):
+        mask_t = valid_mask[:, t]
+        if not mask_t.any():
+            advantages_full[:, t] = 0.0
+            continue
+        cont_mask = next_valid_mask[:, t].to(torch.float32)
+        lastgaelam = delta_full[:, t] + gamma_lam * lastgaelam * cont_mask
+        lastgaelam = torch.where(mask_t, lastgaelam, torch.zeros_like(lastgaelam))
+        advantages_full[:, t] = lastgaelam
+
+    returns_full = advantages_full + values_full
+
+    idx_clamped = our_idx.clamp(0, max(L - 1, 0))
+    logits_at = action_logits.gather(1, idx_clamped.unsqueeze(-1).expand(-1, -1, A))
 
     def _neg_inf_like(x: torch.Tensor) -> torch.Tensor:
         return torch.tensor(torch.finfo(x.dtype).min, dtype=x.dtype, device=x.device)
 
     if our_action_mask is not None:
-        step_mask_full = our_action_mask.gather(1, our_idx.unsqueeze(-1).expand(-1, -1, A))
+        step_mask_full = our_action_mask.gather(1, idx_clamped.unsqueeze(-1).expand(-1, -1, A))
         invalid_rows = (~step_mask_full).all(dim=-1)
         if invalid_rows.any():
             fb_cols = logits_at[invalid_rows].argmax(dim=-1)
@@ -1263,44 +1324,16 @@ def _single_pass_ppo(
     logits_at = torch.nan_to_num(
         logits_at, nan=0.0, posinf=0.0, neginf=float(torch.finfo(logits_at.dtype).min)
     )
-    values_at = values_full.gather(1, our_idx)
+
+    values_at = torch.take_along_dim(values_full, idx_clamped, dim=1)
+    advantages_at = torch.take_along_dim(advantages_full, idx_clamped, dim=1)
+    returns_at = torch.take_along_dim(returns_full, idx_clamped, dim=1)
+
     values_at = torch.nan_to_num(values_at, nan=0.0, posinf=0.0, neginf=0.0)
+    advantages_at = advantages_at.where(our_mask, torch.zeros_like(advantages_at))
+    returns_at = returns_at.where(our_mask, torch.zeros_like(returns_at))
 
-    rewards = rewards.where(our_mask, torch.zeros_like(rewards))
-
-    next_idx = torch.zeros_like(our_idx)
-    if T > 1:
-        next_idx[:, :-1] = our_idx[:, 1:]
-    L = values_full.size(1)
-    idx_safe = next_idx.clamp(0, max(L - 1, 0))
-    next_values = torch.take_along_dim(values_full, idx_safe, dim=1)
-
-    has_next = torch.zeros_like(our_mask)
-    if T > 1:
-        has_next[:, :-1] = our_mask[:, 1:]
-    has_next = has_next & our_mask
-
-    gap_steps = (next_idx - our_idx).clamp_min(1).to(torch.float32)
-    gap_steps = torch.where(has_next, gap_steps, torch.zeros_like(gap_steps))
-    log_gamma = math.log(GAMMA)
-    log_lam = math.log(GAE_LAMBDA)
-    gamma_gap = torch.where(has_next, torch.exp(log_gamma * gap_steps), torch.zeros_like(gap_steps))
-    lam_gap = torch.where(has_next, torch.exp(log_lam * gap_steps), torch.zeros_like(gap_steps))
-
-    next_values = torch.where(has_next, next_values, torch.zeros_like(next_values))
-    delta = rewards + gamma_gap * next_values - values_at
-    delta = delta.where(our_mask, torch.zeros_like(delta))
-    discount = gamma_gap * lam_gap
-
-    advantages = torch.zeros_like(values_at)
-    lastgaelam = torch.zeros((B,), device=device, dtype=torch.float32)
-    for t in reversed(range(T)):
-        lastgaelam = delta[:, t] + discount[:, t] * lastgaelam
-        lastgaelam = torch.where(our_mask[:, t], lastgaelam, torch.zeros_like(lastgaelam))
-        advantages[:, t] = lastgaelam
-    returns = advantages + values_at
-
-    adv_norm = _normalize_advantages(advantages, step_mask)
+    adv_norm = _normalize_advantages(advantages_at, step_mask)
 
     dist = torch.distributions.Categorical(logits=logits_at)
     actions_for_log_prob = actions.masked_fill(~our_mask, 0)
@@ -1313,13 +1346,13 @@ def _single_pass_ppo(
     ratio = log_ratio.exp()
     clipped_std = torch.clamp(ratio, 1.0 - EPS_CLIP, 1.0 + EPS_CLIP)
     clipped_neg = torch.clamp(ratio, 1.0 - EPS_CLIP, TRINAL_DELTA1)
-    r_clipped = torch.where(advantages < 0, clipped_neg, clipped_std)
+    r_clipped = torch.where(advantages_at < 0, clipped_neg, clipped_std)
     surr1 = ratio * adv_norm
     surr2 = r_clipped * adv_norm
     policy_loss = -_masked_mean(torch.min(surr1, surr2), step_mask)
 
     with torch.no_grad():
-        neg_mask = (advantages < 0) & step_mask
+        neg_mask = (advantages_at < 0) & step_mask
         trinal_clip_neg_frac = ((ratio > (1.0 + EPS_CLIP)) & neg_mask).float()
         denom_neg = neg_mask.float().sum().clamp_min(1.0)
         trinal_clip_neg_frac = trinal_clip_neg_frac.sum() / denom_neg
@@ -1329,16 +1362,11 @@ def _single_pass_ppo(
     approx_kl = _masked_mean(old_logp - new_logp, step_mask)
     clipfrac = _masked_mean(((ratio - 1.0).abs() > EPS_CLIP).float(), step_mask)
 
-    if step_mask.any():
-        value_loss, vclip_frac = _value_loss_with_stakes_clip_public(
-            v_pred=values_at[step_mask],
-            returns=returns[step_mask],
-            action_ids=actions[step_mask],
-            penalties_used=penalties_used[step_mask].long(),
-        )
+    if valid_mask.any():
+        value_loss = F.mse_loss(values_full[valid_mask], returns_full[valid_mask])
     else:
         value_loss = torch.zeros((), device=device)
-        vclip_frac = torch.zeros((), device=device)
+    vclip_frac = torch.zeros((), device=device)
 
     total = policy_loss + VALUE_WEIGHT * value_loss + entropy_loss
 
@@ -1379,6 +1407,65 @@ def _single_pass_ppo(
     if AUX_OPP_WEIGHT > 0.0:
         total = total + AUX_OPP_WEIGHT * opp_loss
 
+    win_prob_loss = torch.zeros((), device=device)
+    win_prob_accuracy = torch.zeros((), device=device)
+    confidence_delta_full_win = torch.zeros((), device=device)
+    confidence_delta_half_win = torch.zeros((), device=device)
+    confidence_at_middle_win = torch.zeros((), device=device)
+    confidence_delta_full_loss = torch.zeros((), device=device)
+    confidence_delta_half_loss = torch.zeros((), device=device)
+    confidence_at_middle_loss = torch.zeros((), device=device)
+
+    if win_logits is not None and win_logits.numel() > 0:
+        if win_logits.size(1) != L:
+            win_logits = win_logits[:, :L]
+        win_target_episode = batch.get("win")
+        if win_target_episode is None:
+            raise KeyError("Batch missing 'win' target required for win-probability head")
+        win_target_episode = win_target_episode.to(device=device, dtype=torch.float32)
+        win_target_full = win_target_episode.unsqueeze(1).expand_as(win_logits)
+
+        win_prob_loss_unmasked = F.binary_cross_entropy_with_logits(
+            win_logits, win_target_full, reduction="none"
+        )
+        win_prob_loss = _masked_mean(win_prob_loss_unmasked, valid_mask)
+        total = total + WIN_PROB_WEIGHT * win_prob_loss
+
+        with torch.no_grad():
+            win_probs = torch.sigmoid(win_logits)
+            preds = (win_probs > 0.5).to(torch.float32)
+            correct_preds = (preds == win_target_full).to(torch.float32)
+            win_prob_accuracy = _masked_mean(correct_preds, valid_mask)
+
+            valid_lengths = mi.get("valid_lengths")
+            if valid_lengths is not None and win_probs.size(1) > 0:
+                vl = valid_lengths.to(device=device)
+                has_steps = vl > 0
+                safe_len = torch.clamp(vl - 1, min=0)
+                mid_idx = (vl // 2).clamp(min=0)
+                first_idx = torch.zeros_like(safe_len)
+
+                gather_dim = 1
+                def _gather_probs(idxs: torch.Tensor) -> torch.Tensor:
+                    idxs = idxs.clamp(max=win_probs.size(1) - 1)
+                    return torch.gather(win_probs, gather_dim, idxs.unsqueeze(1)).squeeze(1)
+
+                prob_at_first = _gather_probs(first_idx)
+                prob_at_middle = _gather_probs(mid_idx)
+                prob_at_last = _gather_probs(safe_len)
+
+                win_mask = (win_target_episode == 1).to(torch.bool) & has_steps
+                loss_mask = (win_target_episode == 0).to(torch.bool) & has_steps
+
+                if win_mask.any():
+                    confidence_delta_full_win = (prob_at_last - prob_at_first)[win_mask].mean()
+                    confidence_delta_half_win = (prob_at_last - prob_at_middle)[win_mask].mean()
+                    confidence_at_middle_win = prob_at_middle[win_mask].mean()
+                if loss_mask.any():
+                    confidence_delta_full_loss = (prob_at_last - prob_at_first)[loss_mask].mean()
+                    confidence_delta_half_loss = (prob_at_last - prob_at_middle)[loss_mask].mean()
+                    confidence_at_middle_loss = prob_at_middle[loss_mask].mean()
+
     bc_kl = torch.zeros((), device=device)
     if (BC_KL_WEIGHT > 0.0) and (sl_teacher is not None) and step_mask.any():
         with torch.no_grad():
@@ -1410,6 +1497,14 @@ def _single_pass_ppo(
         "opp_loss": opp_loss.detach(),
         "opp_action_acc": opp_acc.detach(),
         "bc_kl": bc_kl.detach(),
+        "win_prob_loss": win_prob_loss.detach(),
+        "win_prob_accuracy": win_prob_accuracy.detach(),
+        "win_prob_confidence_delta_full_win": confidence_delta_full_win.detach(),
+        "win_prob_confidence_delta_half_win": confidence_delta_half_win.detach(),
+        "win_prob_confidence_at_middle_win": confidence_at_middle_win.detach(),
+        "win_prob_confidence_delta_full_loss": confidence_delta_full_loss.detach(),
+        "win_prob_confidence_delta_half_loss": confidence_delta_half_loss.detach(),
+        "win_prob_confidence_at_middle_loss": confidence_at_middle_loss.detach(),
     }
 
     return total, metrics, embedding_tuple
@@ -1547,11 +1642,11 @@ def _collate_batch(
 
     Outputs:
       mi: dict with only time-major tensors (dim>=2) padded to L_pad, plus 'valid_lengths' [B]
-      our_idx [B,T], mask [B,T], actions [B,T], old_logp [B,T], rewards [B,T],
+      our_idx [B,T], mask [B,T], actions [B,T], old_logp [B,T], rewards [B,T], rewards_full [B,L_pad],
       penalties_used [B,T], our_action_mask [B,L_pad,A] or None,
       opp_idx [B,To], opp_targets [B,To], opp_have_label [B,To]
       opp_last_token_idx [B,num_opponents], opp_last_token_is_adjacent [B,num_opponents]
-      padding_mask [B,L_pad] (True where padded)
+      padding_mask [B,L_pad] (True where padded), win [B]
     """
     IGN = int(ignore_index)
     B = len(episodes)
@@ -1769,6 +1864,7 @@ def _collate_batch(
     actions    = _pm(torch.full((B, T), IGN, dtype=torch.long))
     old_logp   = _pm(torch.zeros((B, T),  dtype=torch.float32))
     rewards    = _pm(torch.zeros((B, T),  dtype=torch.float32))
+    rewards_full = _pm(torch.zeros((B, L_pad), dtype=torch.float32))
     pen_used   = _pm(torch.zeros((B, T),  dtype=torch.long))
 
     # Opponent action supervision (unchanged)
@@ -1784,6 +1880,9 @@ def _collate_batch(
     opp_last_token_idx = torch.full((B, num_opponents), -1, dtype=torch.long)
     opp_last_token_is_adjacent = torch.zeros((B, num_opponents), dtype=torch.bool)
     heldout_episode_mask = _pm(torch.tensor(heldout_flags, dtype=torch.bool))
+    win_tensor = torch.zeros(B, dtype=torch.float32)
+    if pin_memory:
+        win_tensor = win_tensor.pin_memory()
 
     def _int_array(seq: Any, invalid_fill: int = -1) -> np.ndarray:
         if seq is None:
@@ -1840,6 +1939,12 @@ def _collate_batch(
                 if idx != training_seat
             )
 
+        reward_seq_full = _float_array(ep.get("reward"))
+        if reward_seq_full.size > 0 and L_pad > 0:
+            reward_len = min(reward_seq_full.shape[0], L_pad)
+            if reward_len > 0:
+                rewards_full[b, :reward_len] = torch.from_numpy(reward_seq_full[:reward_len])
+
         # ===== OUR timeline =====
         our_ep_idx = np.nonzero(agent_id_seq == training_seat)[0]
         max_steps = min(T, our_ep_idx.size, int(our_counts[b].item())) if our_counts.numel() > 0 else 0
@@ -1862,7 +1967,7 @@ def _collate_batch(
             old_logp[b, :max_steps] = torch.from_numpy(lp_dest)
 
             # Rewards
-            rw_src = _float_array(ep.get("reward"))
+            rw_src = reward_seq_full
             rw_dest = np.zeros(max_steps, dtype=np.float32)
             if rw_src.size > 0:
                 valid_rw = steps < rw_src.shape[0]
@@ -1954,6 +2059,8 @@ def _collate_batch(
             opp_targets[b, :M_fill] = torch.from_numpy(tgt_dest)
             opp_have_label[b, :M_fill] = torch.from_numpy(have_dest)
 
+        win_tensor[b] = float(ep.get("win", 0))
+
     return {
         "mi": mi_batch,
         "our_idx": our_idx,
@@ -1961,6 +2068,7 @@ def _collate_batch(
         "actions": actions,
         "old_logp": old_logp,
         "rewards": rewards,
+        "rewards_full": rewards_full,
         "penalties_used": pen_used,
         "our_action_mask": our_action_mask,
         "opp_idx":        opp_idx,
@@ -1970,7 +2078,8 @@ def _collate_batch(
         "opp_seat_ids": _pm(opp_seat_ids),
         "opp_last_token_idx": _pm(opp_last_token_idx),
         "opp_last_token_is_adjacent": _pm(opp_last_token_is_adjacent),
-        "heldout_episode_mask": heldout_episode_mask
+        "heldout_episode_mask": heldout_episode_mask,
+        "win": _pm(win_tensor),
     }
 
 def _to_device_batch(batch_cpu: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
@@ -1985,6 +2094,7 @@ def _to_device_batch(batch_cpu: Dict[str, Any], device: torch.device) -> Dict[st
         "actions":         batch_cpu["actions"].to(device, non_blocking=True),
         "old_logp":        batch_cpu["old_logp"].to(device, non_blocking=True),
         "rewards":         batch_cpu["rewards"].to(device, non_blocking=True),
+        "rewards_full":   batch_cpu["rewards_full"].to(device, non_blocking=True),
         "penalties_used":  batch_cpu["penalties_used"].to(device, non_blocking=True),
         "our_action_mask": oam_dev,
         # Opponent action supervision
@@ -1995,6 +2105,7 @@ def _to_device_batch(batch_cpu: Dict[str, Any], device: torch.device) -> Dict[st
         "opp_seat_ids":      batch_cpu["opp_seat_ids"].to(device, non_blocking=True),
         "opp_last_token_idx": batch_cpu["opp_last_token_idx"].to(device, non_blocking=True),
         "opp_last_token_is_adjacent": batch_cpu["opp_last_token_is_adjacent"].to(device, non_blocking=True),
-        "heldout_episode_mask": batch_cpu["heldout_episode_mask"].to(device, non_blocking=True)
+        "heldout_episode_mask": batch_cpu["heldout_episode_mask"].to(device, non_blocking=True),
+        "win": batch_cpu["win"].to(device, non_blocking=True),
     }
     return out

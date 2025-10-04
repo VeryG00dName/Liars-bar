@@ -62,6 +62,43 @@ CPP_BOT_LABEL_TO_NAME = {
 }
 
 
+def _infer_traced_max_seq_length(traced_path: Path) -> int:
+    meta_path = Path(str(traced_path) + ".max_seq_length")
+    if meta_path.exists():
+        try:
+            raw_text = meta_path.read_text().strip()
+        except OSError:
+            raw_text = ""
+        if raw_text:
+            first_line = raw_text.splitlines()[0].strip()
+            try:
+                value = int(first_line)
+            except ValueError:
+                value = 0
+            if value > 0:
+                return value
+
+    lowered = str(traced_path).lower()
+    search_start = 0
+    while True:
+        idx = lowered.find("test", search_start)
+        if idx == -1:
+            break
+        pos = idx + 4
+        if pos < len(lowered) and lowered[pos].isdigit():
+            value = 0
+            found_digit = False
+            while pos < len(lowered) and lowered[pos].isdigit():
+                value = value * 10 + int(lowered[pos])
+                pos += 1
+                found_digit = True
+            if found_digit:
+                return 256 if value <= 62 else 480
+        search_start = idx + 4
+
+    return 480
+
+
 @dataclass
 class RatingEntry:
     """Container for a TrueSkill rating."""
@@ -318,10 +355,13 @@ def load_evaluation_policies(
             policy_id = next_neural_policy_id
             next_neural_policy_id += 1
 
+            max_seq_length = _infer_traced_max_seq_length(traced_path)
+
             eval_manager.load_model(policy_id, str(traced_path))
             entry = _initial_metadata(policy_id, player_id, label, is_cpp_bot=False)
             entry["checkpoint_path"] = str(checkpoint_path)
             entry["traced_path"] = str(traced_path)
+            entry["max_seq_length"] = max_seq_length
             metadata[policy_id] = entry
 
     return eval_manager, metadata

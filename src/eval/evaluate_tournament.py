@@ -87,27 +87,6 @@ def parse_cpp_labels(arg: str) -> List[int]:
         labels.append(int(item.strip()))
     return labels
 
-
-def run_adaptive_quartet(
-    eval_manager: "lb.EvalManager",
-    quartet: Sequence[int],
-    stopping: MatchStoppingConfig,
-    seed: int,
-    track_experts: bool = False,
-) -> Tuple[Dict[int, Dict[str, Any]], Dict[Tuple[int, int], int], Dict[Tuple[int, int], int], int]:
-    games_to_play = max(stopping.games_per_match, MIN_GAMES_PER_MATCH)
-    results_list, total_counts, total_wins, total_games = run_batched_lineups(
-        eval_manager,
-        [list(quartet)],
-        num_games_per_match=games_to_play,
-        num_players_in_env=len(quartet),
-        track_experts=track_experts,
-        base_seed=seed,
-    )
-    results = results_list[0] if results_list else {}
-    return results, total_counts, total_wins, total_games
-
-
 def ranks_from_results(results: Dict[int, Dict[str, Any]]) -> List[Tuple[int, int]]:
     ordered = sorted(results.items(), key=lambda item: item[1]["total_wins"], reverse=True)
     ranks: Dict[int, int] = {}
