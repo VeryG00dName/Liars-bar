@@ -1,4 +1,3 @@
-# src/training/train_extras.py
 """Training utility helpers shared across scripts."""
 
 import os
