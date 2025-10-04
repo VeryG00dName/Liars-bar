@@ -8,10 +8,6 @@ class PPOReactiveModelScript(nn.Module):
     A simplified, monolithic autoregressive model for PPO that operates
     reactively based on the full game history.
 
-    This architecture removes the explicit `StrategyDictionary` and FiLM
-    layers. Instead, it relies on a powerful transformer backbone to directly
-    process the sequence of observations and actions. The policy and value
-
     This version is specifically designed to be compatible with torch.jit.script
     for deployment as a fast historical agent in C++.
     
@@ -53,6 +49,20 @@ class PPOReactiveModelScript(nn.Module):
         self.table_flag_embedding = nn.Embedding(4, hidden_dim, padding_idx=self.tflag_pad)
         self.agent_embedding = nn.Embedding(num_agent_types, hidden_dim)
         self.position_embedding = nn.Embedding(max_seq_length, hidden_dim)
+        
+        # === Gating Layers (Independent) ===
+        def make_gate_net(h_dim: int):
+            return nn.Sequential(
+                nn.Linear(h_dim, h_dim),
+                nn.Tanh(),
+                nn.Linear(h_dim, h_dim),
+                nn.Sigmoid()
+            )
+
+        self.gate_obs = make_gate_net(hidden_dim)
+        self.gate_action = make_gate_net(hidden_dim)
+        self.gate_agent = make_gate_net(hidden_dim)
+        self.gate_position = make_gate_net(hidden_dim)
 
         # === Factorization Look-up Tables ===
         self.register_buffer("lut_act_kind",   torch.tensor([1,1,1,1,1,1,2,1,1,1,0], dtype=torch.long))
@@ -67,14 +77,9 @@ class PPOReactiveModelScript(nn.Module):
         self.transformer = nn.TransformerEncoder(encoder_layer=encoder_layer, num_layers=num_layers)
 
         # === Output heads ===
-        # Policy and Value heads
         self.action_head        = nn.Linear(hidden_dim, action_dim)
         self.reward_stream_head = nn.Linear(hidden_dim, 1)
-
-        # Win-probability head
         self.win_prob_head      = nn.Linear(hidden_dim, 1)
-
-        # Opponent action head
         self.opp_action_head    = nn.Linear(hidden_dim, action_dim)
 
     # -------------------------- utils --------------------------
@@ -91,13 +96,27 @@ class PPOReactiveModelScript(nn.Module):
         return act_kind, count, tflag
 
     def _encode_inputs(self, obs_sequence: torch.Tensor, action_sequence: torch.Tensor, agent_types: torch.Tensor, positions: torch.Tensor, padding_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        # Get individual embeddings
+        obs_embed = self.obs_encoder(obs_sequence)
         act_kind_ids, count_ids, table_flag_ids = self._decompose_actions(action_sequence, padding_mask)
-        combined = (self.obs_encoder(obs_sequence) +
-                    self.act_kind_embedding(act_kind_ids) +
-                    self.count_embedding(count_ids) +
-                    self.table_flag_embedding(table_flag_ids) +
-                    self.agent_embedding(agent_types) +
-                    self.position_embedding(positions))
+        action_embed = (self.act_kind_embedding(act_kind_ids) +
+                        self.count_embedding(count_ids) +
+                        self.table_flag_embedding(table_flag_ids))
+        agent_embed = self.agent_embedding(agent_types)
+        position_embed = self.position_embedding(positions)
+
+        # Compute independent gates for each embedding
+        g_obs = self.gate_obs(obs_embed)
+        g_action = self.gate_action(action_embed)
+        g_agent = self.gate_agent(agent_embed)
+        g_position = self.gate_position(position_embed)
+
+        # Apply gates and sum to combine embeddings
+        fused = (g_obs * obs_embed +
+                    g_action * action_embed +
+                    g_agent * agent_embed +
+                    g_position * position_embed)
+        combined = nn.functional.layer_norm(fused, (self.hidden_dim,))
         return combined
 
     # -------------------------- forward --------------------------
@@ -114,7 +133,6 @@ class PPOReactiveModelScript(nn.Module):
 
         T = encoded_inputs.size(1)
         causal_mask = self.causal_bool_mask_full[:T, :T]
-        # JIT is strict about devices, ensure mask is on the same device
         if causal_mask.device != encoded_inputs.device:
             causal_mask = causal_mask.to(encoded_inputs.device)
         
