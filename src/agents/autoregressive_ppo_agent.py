@@ -1,352 +1,352 @@
 # src/agents/autoregressive_ppo_agent.py
-import torch
-import torch.nn.functional as F
-import numpy as np
-import logging
-from typing import Optional, Dict, Any, List
+"""Inference-time agent for autoregressive PPO checkpoints.
 
+This implementation focuses on the *reactive* PPO architecture introduced in
+``src/model/ppo_reactive_model.py`` while keeping backwards compatibility with
+older fused/legacy checkpoints.  The agent reconstructs the model directly from
+an on-disk state dict, rebuilds the game history into the autoregressive format
+expected by the model, and exposes a ``get_action`` helper for the environment.
+
+The model predicts both the policy logits and an auxiliary win-probability logit
+for the acting player.  The GUI uses the exposed ``get_last_expert_info`` method
+so that we can surface win probabilities to the user.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import torch
+
+from src import config
 from src.agents.base_agent import BaseAgent
+from src.model.model_factory import ModelFactory as MFactoryUtil
 from src.model.ppo_autoregressive_model import PPOAutoregressiveModel
 from src.model.ppo_fused_model import PPOFusedModel
-from src.model.model_factory import ModelFactory as MFactoryUtil
-from src import config
+from src.model.ppo_reactive_model import PPOReactiveModel
+
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class ExpertInfo:
+    """Container for auxiliary model outputs from the last forward pass."""
+
+    win_probability: Optional[float] = None
+    state_value: Optional[float] = None
+
+
 class PPOAutoregressiveAgent(BaseAgent):
-    """
-    Agent using the PPOAutoregressiveAgent for action prediction.
-    This model internally predicts opponent beliefs and uses a unified
-    architecture for all agents in the sequence.
-    """
-    CARD_COUNT_MAPPING = {1: 7, 2: 8, 3: 9}  # count -> extended action idx
+    """Agent that serves PPO autoregressive/reactive checkpoints."""
+
+    HIDDEN_TOKEN_MAPPING = {1: 7, 2: 8, 3: 9}
+    PAD_TOKEN = 10
 
     def __init__(self, device: torch.device, player_id: str):
         super().__init__(device, player_id)
-        self.model: Optional[PPOAutoregressiveModel] = None
 
-        # --- Model dimensions (inferred during loading) ---
-        self.obs_dim: Optional[int] = 9
-        self.action_dim: int = 7 # Standard actions
-        self.extended_action_dim: Optional[int] = 9
-        self.hidden_dim: Optional[int] = 256
+        self.model: Optional[torch.nn.Module] = None
+
+        # Model dimensions (determined at load time)
+        self.obs_dim: Optional[int] = None
+        self.action_dim: Optional[int] = None
+        self.hidden_dim: Optional[int] = None
         self.max_seq_length: Optional[int] = None
-        self.belief_dim: Optional[int] = 7 # Inferred from the model's belief head
-        self._mask_by_step = {}
-        # --- Runtime state ---
+
+        # Runtime state
         self.sequence_history: List[Dict[str, Any]] = []
-        self.env_agent_id_map: Optional[Dict[str, int]] = None # Maps env_id to 0 (self), 1 (opp0), 2 (opp1), 3 (opp2)
-        self._last_expert_info: Optional[Dict[str, Any]] = None
+        self.env_agent_id_map: Optional[Dict[str, int]] = None
+        self._mask_by_step: Dict[int, List[int]] = {}
+        self._last_expert_info: ExpertInfo = ExpertInfo()
 
-    def reset(self):
-        """Resets sequence history and internal state for a new game."""
-        self.sequence_history = []
+    # ------------------------------------------------------------------
+    # Utilities
+    # ------------------------------------------------------------------
+    def reset(self) -> None:
+        """Reset cached history and helper state for a new game."""
+        self.sequence_history.clear()
         self.env_agent_id_map = None
-        self._last_expert_info = None
         self._mask_by_step.clear()
+        self._last_expert_info = ExpertInfo()
 
-    def set_model(self, model):
-        """A simple method to assign the model to the agent."""
-        self.model = model
+    def set_model(self, model: torch.nn.Module) -> None:
+        """Assign an already-constructed model to the agent."""
+        self.model = model.to(self.device)
         self.model.eval()
 
-    def load_models_from_checkpoint(self, checkpoint: Dict[str, Any], agent_key: str):
-        """
-        Load model state dict, automatically detect the architecture (legacy, fused),
-        and re-instantiate the correct model class using inferred dimensions.
-        This version correctly handles the `use_shared_belief_head` flag for the
-        legacy PPOAutoregressiveModel.
-        """
+    # ------------------------------------------------------------------
+    # Model loading helpers
+    # ------------------------------------------------------------------
+    def _infer_transformer_layers(self, state_dict: Dict[str, torch.Tensor]) -> int:
+        """Infer the number of transformer layers from the serialized weights."""
+        prefix = "transformer.layers."
+        layer_indices = {
+            int(key.split(".")[2])
+            for key in state_dict
+            if key.startswith(prefix) and key[len(prefix) :].split(".")[0].isdigit()
+        }
+        if not layer_indices:
+            return 2
+        return max(layer_indices) + 1
+
+    def _build_model(self, model_state_dict: Dict[str, torch.Tensor]) -> torch.nn.Module:
+        """Instantiate the correct model class using inferred dimensions."""
+        if MFactoryUtil.is_reactive_model(model_state_dict):
+            ModelClass = PPOReactiveModel
+        elif MFactoryUtil.is_fused_model(model_state_dict):
+            ModelClass = PPOFusedModel
+        elif MFactoryUtil.is_ppo_autoregressive_model(model_state_dict):
+            ModelClass = PPOAutoregressiveModel
+        else:
+            raise ValueError("Unsupported PPO checkpoint format for autoregressive agent.")
+
+        inferred_obs_dim = MFactoryUtil.get_input_dim_from_state_dict(model_state_dict, "obs_encoder.0")
+        action_head_prefix = "action_head.2" if "action_head.2.weight" in model_state_dict else "action_head"
+        inferred_action_dim = MFactoryUtil.get_output_dim_from_state_dict(model_state_dict, action_head_prefix)
+        inferred_hidden_dim = MFactoryUtil.get_hidden_dim_from_state_dict(model_state_dict, "obs_encoder.0")
+        inferred_max_seq = model_state_dict.get("position_embedding.weight").shape[0]
+        inferred_agent_types = model_state_dict.get("agent_embedding.weight")
+        inferred_num_agent_types = inferred_agent_types.shape[0] if inferred_agent_types is not None else 4
+        inferred_num_layers = self._infer_transformer_layers(model_state_dict)
+        inferred_num_heads = max(1, inferred_hidden_dim // 64)
+
+        extra_kwargs: Dict[str, Any] = {
+            "num_heads": inferred_num_heads,
+            "num_layers": inferred_num_layers,
+            "max_seq_length": inferred_max_seq,
+        }
+
+        if ModelClass is PPOFusedModel:
+            bricks_tensor = next(
+                (tensor for key, tensor in model_state_dict.items() if key.endswith("strategy_dictionary.bricks")),
+                None,
+            )
+            if bricks_tensor is not None:
+                num_bricks, brick_dim = bricks_tensor.shape
+            else:
+                num_bricks = getattr(config, "NUM_BRICKS", 32)
+                brick_dim = getattr(config, "BRICK_DIM", 32)
+            extra_kwargs.update({"num_bricks": int(num_bricks), "brick_dim": int(brick_dim)})
+        elif ModelClass is PPOReactiveModel:
+            extra_kwargs.update({"num_agent_types": inferred_num_agent_types})
+
+        model = ModelClass(
+            obs_dim=inferred_obs_dim,
+            action_dim=inferred_action_dim,
+            hidden_dim=inferred_hidden_dim,
+            **extra_kwargs,
+        ).to(self.device)
+
+        model.load_state_dict(model_state_dict, strict=False)
+
+        # Cache dimensions for later tensor construction
+        self.obs_dim = inferred_obs_dim
+        self.action_dim = inferred_action_dim
+        self.hidden_dim = inferred_hidden_dim
+        self.max_seq_length = inferred_max_seq
+
+        return model
+
+    def load_models_from_checkpoint(self, checkpoint: Dict[str, Any], agent_key: str) -> None:
+        """Load the serialized model weights for the requested agent."""
         if "policy_nets" not in checkpoint or agent_key not in checkpoint["policy_nets"]:
             raise ValueError(f"Checkpoint missing model state for agent '{agent_key}' in 'policy_nets'.")
 
         model_state_dict = checkpoint["policy_nets"][agent_key]
-
-        # --- ARCHITECTURE AND FLAG DETECTION ---
-        ModelClass = None
-        model_kwargs = {} # Arguments for the model constructor
-
-        is_fused = MFactoryUtil.is_fused_model(model_state_dict)
-        if is_fused:
-            logger.debug(f"[{self.player_id}] Detected PPOFusedModel architecture.")
-            ModelClass = PPOFusedModel
-            # The fused model doesn't use the use_shared_belief_head flag
-
-        elif MFactoryUtil.is_ppo_autoregressive_model(model_state_dict):
-            logger.debug(f"[{self.player_id}] Detected legacy PPOAutoregressiveModel architecture.")
-            ModelClass = PPOAutoregressiveModel
-            
-            # CRITICAL: Detect which belief head style the legacy model uses
-            use_shared = 'belief_head_shared.weight' in model_state_dict
-            model_kwargs['use_shared_belief_head'] = use_shared
-            logger.debug(f"[{self.player_id}] Inferred use_shared_belief_head={use_shared}")
-        else:
-            raise ValueError(f"The model state for '{agent_key}' is not a valid PPO model.")
-        inferred_belief_dim = None
-        # --- INFERENCE LOGIC (Common to both) ---
-        try:
-            inferred_obs_dim = MFactoryUtil.get_input_dim_from_state_dict(model_state_dict, 'obs_encoder.0')
-            inferred_action_dim = MFactoryUtil.get_output_dim_from_state_dict(model_state_dict, 'action_head')
-            inferred_hidden_dim = MFactoryUtil.get_hidden_dim_from_state_dict(model_state_dict, 'obs_encoder.0')
-            
-            # Infer belief_dim from whichever head exists
-            if 'belief_head_shared.weight' in model_state_dict:
-                inferred_belief_dim = MFactoryUtil.get_output_dim_from_state_dict(model_state_dict, 'belief_head_shared')
-            elif 'belief_head_op0.weight' in model_state_dict:
-                 inferred_belief_dim = MFactoryUtil.get_output_dim_from_state_dict(model_state_dict, 'belief_head_op0')
-
-            inferred_max_seq = model_state_dict.get('position_embedding.weight').shape[0]
-        except Exception as e:
-            logger.error(f"Failed to infer dimensions for {self.player_id}: {e}", exc_info=True)
-            raise
-
-        self.max_seq_length = inferred_max_seq - 1
-        
-        # Instantiate the correct ModelClass with the correct kwargs
-        if is_fused:
-            bricks_tensor = None
-            for key, tensor in model_state_dict.items():
-                if key.endswith("strategy_dictionary.bricks"):
-                    bricks_tensor = tensor
-                    break
-
-            inferred_num_bricks = None
-            inferred_brick_dim = None
-
-            if bricks_tensor is not None:
-                inferred_num_bricks, inferred_brick_dim = bricks_tensor.shape
-            else:
-                activation_w = model_state_dict.get("strategy_dictionary.activation_encoder.2.weight")
-                activation_b = model_state_dict.get("strategy_dictionary.activation_encoder.2.bias")
-                opp_head_w = model_state_dict.get("opp_action_head.weight")
-                belief_head_w = model_state_dict.get("belief_head.weight")
-
-                if activation_w is not None:
-                    inferred_num_bricks = activation_w.shape[0]
-                    inferred_brick_dim = activation_w.shape[1]
-                elif activation_b is not None:
-                    inferred_num_bricks = activation_b.shape[0]
-
-                if opp_head_w is not None:
-                    inferred_brick_dim = opp_head_w.shape[1]
-                elif belief_head_w is not None:
-                    inferred_brick_dim = belief_head_w.shape[1]
-
-            if inferred_num_bricks is None:
-                inferred_num_bricks = getattr(config, "NUM_BRICKS", 32) or 32
-            if inferred_brick_dim is None:
-                inferred_brick_dim = getattr(config, "BRICK_DIM", 32) or 32
-
-            model_kwargs["num_bricks"] = int(inferred_num_bricks)
-            model_kwargs["brick_dim"] = int(inferred_brick_dim)
-
-        self.model = ModelClass(
-            obs_dim=9,
-            action_dim=7,
-            belief_dim=64,
-            hidden_dim=256,
-            max_seq_length=256,
-            **model_kwargs  # Pass specific args like use_shared_belief_head here
-        ).to(self.device)
-
-        try:
-            self.model.load_state_dict(model_state_dict, strict=True)
-        except RuntimeError as e:
-            logger.error(f"Failed to load state dict for {self.player_id}: {e}", exc_info=True)
-            raise
-
+        self.model = self._build_model(model_state_dict)
         self.model.eval()
         self.reset()
-        logger.info(f"Successfully loaded PPOAutoregressiveModel for agent {self.player_id}.")
+        logger.info("Loaded autoregressive PPO model for %s", self.player_id)
 
-    def _revealed_token_from_play(self, e):
-        """
-        Map a revealed Play to 0..5 (table/non-table × count).
-        - table:   1..3 -> 0..2
-        - non-table: 1..3 -> 3..5
-        """
-        cnt = int(e.get("count") or 1)
-        cat = e.get("card_category", "table")
-        base = 0 if cat == "table" else 3
-        return base + (cnt - 1)
+    # ------------------------------------------------------------------
+    # History helpers
+    # ------------------------------------------------------------------
+    def _revealed_token_from_play(self, event: Dict[str, Any]) -> int:
+        count = int(event.get("count") or 1)
+        category = event.get("card_category", "table")
+        base = 0 if category == "table" else 3
+        return base + (count - 1)
 
-    def _rebuild_history_from_gh(self, env, me):
-        """
-        Build a history where:
-        - Our plays are 0..5
-        - Opponent plays are hidden 7/8/9
-        - Challenge is 6
-        - No retro rewrite of the previous token.
-        """
-        gh = list(getattr(env, "game_history", []))
-        seq = []
+    def _rebuild_history_from_gh(self, env, me: str) -> List[Dict[str, Any]]:
+        """Rebuild the history sequence expected by the autoregressive model."""
+        history = []
+        game_history = list(getattr(env, "game_history", []))
 
-        HIDDEN_MAP = {1: 7, 2: 8, 3: 9}
+        for entry in game_history:
+            actor = entry.get("player")
+            action_type = entry.get("action_type")
+            step = int(entry.get("step"))
+            obs = entry.get("observations", {}).get(me, [0.0] * (self.obs_dim or 0))
 
-        for i, e in enumerate(gh):
-            a_type = e.get("action_type")
-            actor  = e.get("player")
-            step   = int(e.get("step"))
-            obs = e.get('observations', {}).get(me, [0.0]*9)
-            # Pull cached mask for OUR rows; zeros otherwise
             if actor == me and step in self._mask_by_step:
                 mask = self._mask_by_step[step]
             else:
-                mask = [0]   * int(self.action_dim)
+                mask = [0] * int(self.action_dim or 0)
 
-            if a_type == "Play":
-                cnt = int(e.get("count") or 1)
-
+            if action_type == "Play":
+                count = int(entry.get("count") or 1)
                 if actor == me:
-                    # Our own play is always revealed (0..5)
-                    action = self._revealed_token_from_play(e)
+                    token = self._revealed_token_from_play(entry)
                 else:
-                    # Opponent play stays hidden in the token stream (7/8/9)
-                    action = HIDDEN_MAP.get(cnt, 7)
+                    token = self.HIDDEN_TOKEN_MAPPING.get(count, 7)
+            elif action_type == "Challenge":
+                token = 6
+            else:
+                continue
 
-                seq.append({
+            history.append(
+                {
                     "agent_id_env": actor,
-                    "action": action,
+                    "action": token,
                     "observation": obs,
-                    "action_mask": mask if actor == me else [0] * int(self.action_dim)
-                })
+                    "action_mask": mask if actor == me else [0] * int(self.action_dim or 0),
+                }
+            )
 
-            elif a_type == "Challenge":
-                seq.append({
-                    "agent_id_env": actor,
-                    "action": 6,
-                    "observation": obs,
-                    "action_mask": mask if actor == me else [0] * int(self.action_dim)
-                })
-
-        return seq
+        return history
 
     def _prepare_model_input(self, history: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        """Prepares tensors for the autoregressive model, matching the training format."""
-        PAD = 10 # action pad
+        if self.obs_dim is None or self.action_dim is None or self.max_seq_length is None:
+            raise RuntimeError("Model dimensions are not initialised. Call load_models_from_checkpoint first.")
 
         filtered = list(history)
+        raw_actions = [step.get("action", self.PAD_TOKEN) for step in filtered]
+        input_actions = [self.PAD_TOKEN] + raw_actions[:-1]
 
-        # 1) Actions (left-shifted inputs)
-        raw_actions  = [step.get("action", PAD) for step in filtered]
-        input_actions = [PAD] + raw_actions[:-1]
+        current_len = len(filtered)
+        max_len = int(self.max_seq_length)
+        valid_len = min(current_len, max_len)
 
-        # 2) Length handling
-        current_seq_len = len(filtered)
-        max_len = self.max_seq_length
-        valid_len = min(current_seq_len, max_len)
-        if current_seq_len > max_len:
-            filtered      = filtered[-max_len:]
+        if current_len > max_len:
+            filtered = filtered[-max_len:]
             input_actions = input_actions[-max_len:]
+            current_len = valid_len
 
-        # 3) Allocate tensors
-        obs_seq         = torch.zeros((1, valid_len, self.obs_dim), dtype=torch.float32, device=self.device)
-        action_seq      = torch.zeros((1, valid_len), dtype=torch.long, device=self.device)
-        agent_type_seq  = torch.ones ((1, valid_len), dtype=torch.long, device=self.device)  # default to opponent
-        pos_seq         = torch.arange(valid_len, dtype=torch.long, device=self.device).unsqueeze(0)
+        obs_seq = torch.zeros((1, valid_len, self.obs_dim), dtype=torch.float32, device=self.device)
+        action_seq = torch.zeros((1, valid_len), dtype=torch.long, device=self.device)
+        agent_seq = torch.zeros((1, valid_len), dtype=torch.long, device=self.device)
+        pos_seq = torch.arange(valid_len, dtype=torch.long, device=self.device).unsqueeze(0)
         action_mask_seq = torch.zeros((1, valid_len, self.action_dim), dtype=torch.bool, device=self.device)
-        padding_mask    = torch.zeros(1, valid_len, dtype=torch.bool, device=self.device)     # no padding here
+        padding_mask = torch.zeros((1, valid_len), dtype=torch.bool, device=self.device)
 
-        # 4) Populate
-        for i, step_data in enumerate(filtered):
-            agent_type = self.env_agent_id_map[step_data["agent_id_env"]]
-            agent_type_seq[0, i] = agent_type
-            action_seq[0, i]     = input_actions[i]
-            obs_np = np.array(step_data["observation"], dtype=np.float32)
-            obs_seq[0, i] = torch.from_numpy(obs_np)
-            
+        for idx, step in enumerate(filtered):
+            agent_env_id = step["agent_id_env"]
+            agent_type = self.env_agent_id_map[agent_env_id]
+            agent_seq[0, idx] = agent_type
+            action_seq[0, idx] = input_actions[idx]
+
+            obs_np = np.asarray(step.get("observation", []), dtype=np.float32)
+            if obs_np.size != self.obs_dim:
+                if obs_np.size < self.obs_dim:
+                    obs_np = np.pad(obs_np, (0, self.obs_dim - obs_np.size))
+                else:
+                    obs_np = obs_np[: self.obs_dim]
+            obs_seq[0, idx] = torch.from_numpy(obs_np)
+
             if agent_type == 0:
-                # Our turn: real mask
-                mask_np = np.array(step_data.get("action_mask", [0]*self.action_dim), dtype=bool)
-                action_mask_seq[0, i] = torch.from_numpy(mask_np)
+                mask_np = np.asarray(step.get("action_mask", [0] * self.action_dim), dtype=bool)
+                if mask_np.size != self.action_dim:
+                    if mask_np.size < self.action_dim:
+                        mask_np = np.pad(mask_np, (0, self.action_dim - mask_np.size), constant_values=False)
+                    else:
+                        mask_np = mask_np[: self.action_dim]
+                action_mask_seq[0, idx] = torch.from_numpy(mask_np)
 
         return {
-            'obs_sequence':   obs_seq,
-            'action_sequence':action_seq,
-            'agent_types':    agent_type_seq,
-            'positions':      pos_seq,
-            'action_masks':   action_mask_seq,
-            'padding_mask':   padding_mask,
-            'valid_lengths':  torch.tensor([valid_len], device=self.device)
+            "obs_sequence": obs_seq,
+            "action_sequence": action_seq,
+            "agent_types": agent_seq,
+            "positions": pos_seq,
+            "action_masks": action_mask_seq,
+            "padding_mask": padding_mask,
+            "valid_lengths": torch.tensor([valid_len], dtype=torch.long, device=self.device),
         }
 
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
     def get_action(
         self,
         env,
         agent_id_env: str,
-        observation: Dict[str, Any] = None,
-        info: Dict[str, Any] = None,
+        observation: Optional[Dict[str, Any]] = None,
+        info: Optional[Dict[str, Any]] = None,
         cheat_expert_index: Optional[Any] = None,
-        training: bool = False
+        training: bool = False,
     ):
         if self.model is None:
             raise RuntimeError(f"AR-PPO model not loaded for player {self.player_id}")
 
         if len(env.players_hands[agent_id_env]) == 5 and all(p == 0 for p in env.penalties.values()):
             self.reset()
-            logger.debug(f"Agent {self.player_id}: New game detected, history cleared.")
+            logger.debug("%s detected a new game. Clearing history.", self.player_id)
 
         if self.env_agent_id_map is None:
-            turn_order_list = list(env.agents)
-            my_index = turn_order_list.index(agent_id_env)
-            relative_order = turn_order_list[my_index:] + turn_order_list[:my_index]
-            self.env_agent_id_map = {player_id: relative_pos for relative_pos, player_id in enumerate(relative_order)}
-        gh = list(getattr(env, "game_history", []))
-        next_step = (gh[-1]["step"] + 1) if gh else 1
-        PAD = 0
-        # Cache OUR obs/mask for the step that will be written to GH after env.step()
+            turn_order = list(env.agents)
+            my_index = turn_order.index(agent_id_env)
+            rel_order = turn_order[my_index:] + turn_order[:my_index]
+            self.env_agent_id_map = {pid: idx for idx, pid in enumerate(rel_order)}
+
+        game_history = list(getattr(env, "game_history", []))
+        next_step = (game_history[-1]["step"] + 1) if game_history else 1
+
+        if info is None:
+            _, _, _, _, info = env.last()
+
         obs_curr = env.observe(agent_id_env, newerest=True)[agent_id_env]
-
         if len(obs_curr) == 7:
-            arr = np.asarray(obs_curr)
+            obs_arr = np.asarray(obs_curr)
+            padded = np.full(9, 0, dtype=obs_arr.dtype)
+            padded[:4] = obs_arr[:4]
+            padded[5:8] = obs_arr[4:]
+            obs_curr = padded
 
-            out = np.full(9, PAD, dtype=arr.dtype)
-            out[:4] = arr[:4]
-            out[5:8] = arr[4:]
-            obs_curr = out
-        _, _, _, _, info = env.last()
-        self._mask_by_step[next_step] = list(info.get("action_mask", [0]*self.action_dim))
+        self._mask_by_step[next_step] = list(info.get("action_mask", [0] * int(self.action_dim or 7)))
 
-        # 1) rebuild everything up-to-now
         self.sequence_history = self._rebuild_history_from_gh(env, agent_id_env)
+        self.sequence_history.append(
+            {
+                "agent_id_env": agent_id_env,
+                "observation": obs_curr,
+                "action_mask": list(info.get("action_mask", [0] * int(self.action_dim or 7))),
+            }
+        )
 
-        # 3) append the current (not-yet-in-GH) row for the model to act on
-        self.sequence_history.append({
-            "agent_id_env": agent_id_env,
-            "observation": obs_curr,
-            "action_mask": list(info.get("action_mask", [0]*self.action_dim)),
-        })
-
-        # 4) run model, write chosen action to the last row
         model_input = self._prepare_model_input(self.sequence_history)
-        
-        action_logits, _, state_values, _ = self.model(**model_input)
-         # --- Process Outputs for the Current Timestep ---
-        last_step_idx = model_input['valid_lengths'][0].item() - 1
-        logits = action_logits[0, last_step_idx]
-        value = state_values[0, last_step_idx]
+        with torch.no_grad():
+            action_logits, opp_logits, state_values, win_logits = self.model(**model_input)
 
-        # Get belief predictions for each opponent
-        #b0 = belief0[0, last_step_idx]
-        #b1 = belief1[0, last_step_idx]
-        #b2 = belief2[0, last_step_idx]
-        
-        mask_t = torch.tensor(info["action_mask"], dtype=torch.bool, device=self.device)
-        masked_logits = logits.masked_fill(~mask_t, float("-inf"))
+        last_idx = model_input["valid_lengths"][0].item() - 1
+        logits = action_logits[0, last_idx]
+        value = state_values[0, last_idx]
+        win_logit = win_logits[0, last_idx]
 
-         # --- Select Action and Return All Data ---
+        mask_tensor = torch.tensor(info["action_mask"], dtype=torch.bool, device=self.device)
+        masked_logits = logits.masked_fill(~mask_tensor, float("-inf"))
+
         if training:
             dist = torch.distributions.Categorical(logits=masked_logits)
-            action = dist.sample()
-            log_prob = dist.log_prob(action)
-            self.sequence_history[-1]["action"] = int(action.item())
-            # Return all 7 values
-            return action.item(), log_prob.item(), value.item()
-        else: # Evaluation mode
-            action = torch.argmax(masked_logits).item()
-            self.sequence_history[-1]["action"] = int(action)
-            return action
-        
-    def get_last_expert_info(self):
-        """Returns the most recent internal belief predictions."""
+            action_tensor = dist.sample()
+            log_prob = dist.log_prob(action_tensor)
+            action = int(action_tensor.item())
+            self.sequence_history[-1]["action"] = action
+            self._last_expert_info = ExpertInfo(
+                win_probability=float(torch.sigmoid(win_logit).item()),
+                state_value=float(value.item()),
+            )
+            return action, float(log_prob.item()), float(value.item())
+
+        action = int(torch.argmax(masked_logits).item())
+        self.sequence_history[-1]["action"] = action
+        self._last_expert_info = ExpertInfo(
+            win_probability=float(torch.sigmoid(win_logit).item()),
+            state_value=float(value.item()),
+        )
+        return action
+
+    def get_last_expert_info(self) -> ExpertInfo:
+        """Expose auxiliary outputs from the last ``get_action`` call."""
         return self._last_expert_info
