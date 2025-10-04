@@ -57,7 +57,6 @@ set_seed(SEED)
 _GLOBAL_RNG = np.random.default_rng(SEED)
 
 FORCE_CUDA_SYNC_FOR_TIMING = bool(getattr(config, "FORCE_CUDA_SYNC_FOR_TIMING", False))
-USE_HELDOUT_AGENT = bool(getattr(config, "USE_HELDOUT_AGENT", True))
 
 
 # ==============================================================================
