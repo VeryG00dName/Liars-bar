@@ -31,7 +31,7 @@ logger = logging.getLogger("PlayVsAI")
 class PlayVsAIGUI:
     """Tkinter-based UI for playing against autoregressive PPO agents."""
 
-    CHECKPOINT_RELATIVE_PATH = os.path.join("checkpoints", "test67", "gen_16", "final.pth")
+    CHECKPOINT_RELATIVE_PATH = os.path.join("checkpoints", "test68", "gen_16", "final.pth")
 
     def __init__(self, root):
         self.root = root
@@ -93,7 +93,7 @@ class PlayVsAIGUI:
     def create_checkpoint_panel(self):
         frame = ttk.LabelFrame(self.root, text="Checkpoint", padding=10)
         frame.pack(fill=tk.X, padx=10, pady=5)
-        checkpoint_display = "checkpoints\\test67\\gen_16\\final.pth"
+        checkpoint_display = "checkpoints\\test8\\gen_16\\final.pth"
         ttk.Label(frame, text=f"Using checkpoint: {checkpoint_display}").pack(anchor=tk.W)
         ttk.Label(frame, textvariable=self.checkpoint_status_var).pack(anchor=tk.W, pady=(6, 0))
 
@@ -251,11 +251,8 @@ class PlayVsAIGUI:
             return False
         me = self.human_agent_id
 
-        human_out = (
-            env.terminations.get(me, False) or
-            env.truncations.get(me, False) or
-            env.round_eliminated.get(me, False)
-        )
+        human_out = env.terminations.get(me, False)
+
 
         # Also stop if all agents terminated (game ended)
         everyone_out = all(env.terminations.get(a, False) or env.truncations.get(a, False)
