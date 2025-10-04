@@ -726,9 +726,13 @@ def train_generation(
 
     collected_updates: List[Dict[str, Any]] = []
     optimizer_waitlists: DefaultDict[int, List[Dict[str, Any]]] = defaultdict(list)
+    bucket_stats: DefaultDict[int, Dict[str, float]] = defaultdict(
+        lambda: {"count": 0, "total_time": 0.0, "total_size": 0}
+    )
 
     for update in range(1, max_updates + 1):
         # -------- Rollout --------
+        bucket_stats.clear()
         t0 = time.time()
         learner.sync_rollout_models()
         
@@ -877,6 +881,7 @@ def train_generation(
             processed_minibatches = 0
 
             for bucket_len, mini_eps in bucket_batches:
+                bucket_start_time = time.perf_counter()
                 assert len(mini_eps) == minibatch_size
                 mini_cpu = _collate_batch(mini_eps, L_max=bucket_len)
                 valid_lengths_cpu = mini_cpu.get("mi", {}).get("valid_lengths")
@@ -933,11 +938,41 @@ def train_generation(
 
                 del mini_gpu, mini_cpu
 
+                bucket_duration = time.perf_counter() - bucket_start_time
+                stats = bucket_stats[bucket_len]
+                stats["count"] += 1
+                stats["total_time"] += bucket_duration
+                stats["total_size"] += len(mini_eps)
+
         waitlisted_by_bucket = {
             bucket_len: len(eps)
             for bucket_len, eps in optimizer_waitlists.items()
             if eps
         }
+
+        bucket_stats_summary: Dict[int, Dict[str, float]] = {}
+        for bucket_len, stats in bucket_stats.items():
+            count = int(stats.get("count", 0))
+            if count <= 0:
+                continue
+            total_time = float(stats.get("total_time", 0.0))
+            total_size = int(stats.get("total_size", 0))
+            avg_time = total_time / count if count else 0.0
+            avg_size = total_size / count if count else 0.0
+            time_per_episode_ms = (
+                (total_time / total_size) * 1000.0 if total_size > 0 else 0.0
+            )
+
+            bucket_stats_summary[int(bucket_len)] = {
+                "count": count,
+                "total_time": total_time,
+                "total_size": total_size,
+                "avg_time": avg_time,
+                "avg_size": avg_size,
+                "time_per_episode_ms": time_per_episode_ms,
+            }
+
+        bucket_stats.clear()
         skipped_waitlist_total = sum(waitlisted_by_bucket.values())
 
         if device.type == "cuda" and FORCE_CUDA_SYNC_FOR_TIMING:
@@ -1026,6 +1061,7 @@ def train_generation(
             "optimizer_waitlisted_buckets": {
                 int(bucket_len): count for bucket_len, count in waitlisted_by_bucket.items()
             },
+            "optimizer_bucket_stats": bucket_stats_summary,
         }
 
         if collect_metrics:
@@ -1059,6 +1095,23 @@ def train_generation(
             len(waitlisted_by_bucket),
             update,
         )
+
+        for bucket_len, stats in bucket_stats_summary.items():
+            writer.add_scalar(
+                f"Optimize/Bucket_{bucket_len}/TotalTimeSec",
+                stats["total_time"],
+                update,
+            )
+            writer.add_scalar(
+                f"Optimize/Bucket_{bucket_len}/TotalEpisodeCount",
+                stats["total_size"],
+                update,
+            )
+            writer.add_scalar(
+                f"Optimize/Bucket_{bucket_len}/TimePerEpisodeMs",
+                stats["time_per_episode_ms"],
+                update,
+            )
         # Rollout stats
         writer.add_scalar("Rollout/WinRate", win_rate, update)
         # Sort once (same criterion you use below)
