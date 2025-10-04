@@ -1645,6 +1645,7 @@ def _collate_batch(
       our_idx [B,T], mask [B,T], actions [B,T], old_logp [B,T], rewards [B,T], rewards_full [B,L_pad],
       penalties_used [B,T], our_action_mask [B,L_pad,A] or None,
       opp_idx [B,To], opp_targets [B,To], opp_have_label [B,To]
+          (opponent turns plus our turns that follow a non-6 opponent action)
       opp_last_token_idx [B,num_opponents], opp_last_token_is_adjacent [B,num_opponents]
       padding_mask [B,L_pad] (True where padded), win [B]
     """
@@ -1734,13 +1735,9 @@ def _collate_batch(
 
     valid_token_mask = ~padding_mask
     our_token_mask_full = (agent_types == 0) & valid_token_mask
-    opp_token_mask_full = (agent_types != 0) & valid_token_mask
-
     our_counts = our_token_mask_full.sum(dim=1)
-    opp_counts = opp_token_mask_full.sum(dim=1)
 
     T = int(our_counts.max().item()) if our_counts.numel() > 0 else 0
-    To = int(opp_counts.max().item()) if opp_counts.numel() > 0 else 0
 
     if L_pad > 0:
         token_idx = token_range.unsqueeze(0).expand(B, -1)
@@ -1770,7 +1767,122 @@ def _collate_batch(
         return sorted_idx, slot_mask
 
     our_idx_tensor, our_mask_tensor = _mk_idx(our_token_mask_full, our_counts, T)
-    opp_idx_tensor, _ = _mk_idx(opp_token_mask_full, opp_counts, To)
+
+    def _int_array(seq: Any, invalid_fill: int = -1) -> np.ndarray:
+        if seq is None:
+            return np.empty(0, dtype=np.int64)
+        if isinstance(seq, np.ndarray):
+            arr = seq
+        elif torch.is_tensor(seq):
+            arr = seq.detach().cpu().numpy()
+        else:
+            arr = np.asarray(seq)
+        if arr.dtype == np.object_:
+            flat = [
+                invalid_fill
+                if (x is None or (isinstance(x, float) and np.isnan(x)))
+                else int(x)
+                for x in arr.tolist()
+            ]
+            arr = np.asarray(flat, dtype=np.int64)
+        else:
+            arr = arr.astype(np.int64, copy=False)
+        return arr.reshape(-1)
+
+    def _float_array(seq: Any) -> np.ndarray:
+        if seq is None:
+            return np.empty(0, dtype=np.float32)
+        if isinstance(seq, np.ndarray):
+            arr = seq
+        elif torch.is_tensor(seq):
+            arr = seq.detach().cpu().numpy()
+        else:
+            arr = np.asarray(seq)
+        if arr.dtype == np.object_:
+            arr = np.asarray(
+                [0.0 if (x is None or (isinstance(x, float) and np.isnan(x))) else float(x) for x in arr.tolist()],
+                dtype=np.float32,
+            )
+        else:
+            arr = arr.astype(np.float32, copy=False)
+        return arr.reshape(-1)
+
+    # Build opponent supervision indices/labels. On opponent turns, the label is the
+    # current opponent action. On our turns, if the immediately preceding turn was an
+    # opponent and the recorded action was not ``6``, we supervise the opponent action
+    # head to predict that previous action.
+    opp_index_lists: List[List[int]] = []
+    opp_target_lists: List[List[int]] = []
+    opp_have_lists: List[List[bool]] = []
+
+    for ep in episodes:
+        training_seat = int(ep.get("training_agent_seat", -1))
+        agent_id_seq = _int_array(ep.get("agent_id"), invalid_fill=-1)
+        opp_target_seq = _int_array(ep.get("opp_target_action"), invalid_fill=-1)
+
+        seq_len = min(int(agent_id_seq.shape[0]), L_pad) if agent_id_seq.size > 0 else 0
+        idxs: List[int] = []
+        targets: List[int] = []
+        haves: List[bool] = []
+
+        for t in range(seq_len):
+            agent_id = int(agent_id_seq[t])
+            if agent_id == training_seat:
+                prev_t = t - 1
+                if prev_t < 0:
+                    continue
+                if prev_t >= agent_id_seq.shape[0]:
+                    continue
+                prev_agent = int(agent_id_seq[prev_t])
+                if prev_agent == training_seat:
+                    continue
+                if prev_t >= opp_target_seq.shape[0]:
+                    continue
+                prev_action = int(opp_target_seq[prev_t])
+                if prev_action < 0 or prev_action == 6:
+                    continue
+                idxs.append(t)
+                targets.append(prev_action)
+                haves.append(True)
+            else:
+                idxs.append(t)
+                if t < opp_target_seq.shape[0]:
+                    act = int(opp_target_seq[t])
+                    if act >= 0:
+                        targets.append(act)
+                        haves.append(True)
+                    else:
+                        targets.append(IGN)
+                        haves.append(False)
+                else:
+                    targets.append(IGN)
+                    haves.append(False)
+
+        opp_index_lists.append(idxs)
+        opp_target_lists.append(targets)
+        opp_have_lists.append(haves)
+
+    opp_counts_list = [len(idxs) for idxs in opp_index_lists]
+    To = max(opp_counts_list) if opp_counts_list else 0
+
+    if To > 0:
+        opp_idx_tensor = torch.zeros((B, To), dtype=torch.long)
+        opp_targets_tensor = torch.full((B, To), IGN, dtype=torch.long)
+        opp_have_tensor = torch.zeros((B, To), dtype=torch.bool)
+        for b, (idxs, targets, haves) in enumerate(zip(opp_index_lists, opp_target_lists, opp_have_lists)):
+            if not idxs:
+                continue
+            count = len(idxs)
+            opp_idx_tensor[b, :count] = torch.tensor(idxs, dtype=torch.long)
+            if targets:
+                opp_targets_tensor[b, :count] = torch.tensor(targets, dtype=torch.long)
+            if haves:
+                opp_have_tensor[b, :count] = torch.tensor(haves, dtype=torch.bool)
+    else:
+        opp_idx_tensor = torch.zeros((B, 0), dtype=torch.long)
+        opp_targets_tensor = torch.zeros((B, 0), dtype=torch.long)
+        opp_have_tensor = torch.zeros((B, 0), dtype=torch.bool)
+
 
     # Optional legality mask for OUR steps; we'll zero it past each valid length
     our_action_mask = None
@@ -1867,10 +1979,10 @@ def _collate_batch(
     rewards_full = _pm(torch.zeros((B, L_pad), dtype=torch.float32))
     pen_used   = _pm(torch.zeros((B, T),  dtype=torch.long))
 
-    # Opponent action supervision (unchanged)
+    # Opponent action supervision tensors (built from recorded timelines)
     opp_idx        = _pm(opp_idx_tensor)
-    opp_targets    = _pm(torch.full((B, To), IGN, dtype=torch.long))
-    opp_have_label = _pm(torch.zeros((B, To),  dtype=torch.bool))
+    opp_targets    = _pm(opp_targets_tensor)
+    opp_have_label = _pm(opp_have_tensor)
 
     if our_action_mask is not None:
         our_action_mask = _pm(our_action_mask)
@@ -1883,45 +1995,6 @@ def _collate_batch(
     win_tensor = torch.zeros(B, dtype=torch.float32)
     if pin_memory:
         win_tensor = win_tensor.pin_memory()
-
-    def _int_array(seq: Any, invalid_fill: int = -1) -> np.ndarray:
-        if seq is None:
-            return np.empty(0, dtype=np.int64)
-        if isinstance(seq, np.ndarray):
-            arr = seq
-        elif torch.is_tensor(seq):
-            arr = seq.detach().cpu().numpy()
-        else:
-            arr = np.asarray(seq)
-        if arr.dtype == np.object_:
-            flat = [
-                invalid_fill
-                if (x is None or (isinstance(x, float) and np.isnan(x)))
-                else int(x)
-                for x in arr.tolist()
-            ]
-            arr = np.asarray(flat, dtype=np.int64)
-        else:
-            arr = arr.astype(np.int64, copy=False)
-        return arr.reshape(-1)
-
-    def _float_array(seq: Any) -> np.ndarray:
-        if seq is None:
-            return np.empty(0, dtype=np.float32)
-        if isinstance(seq, np.ndarray):
-            arr = seq
-        elif torch.is_tensor(seq):
-            arr = seq.detach().cpu().numpy()
-        else:
-            arr = np.asarray(seq)
-        if arr.dtype == np.object_:
-            arr = np.asarray(
-                [0.0 if (x is None or (isinstance(x, float) and np.isnan(x))) else float(x) for x in arr.tolist()],
-                dtype=np.float32,
-            )
-        else:
-            arr = arr.astype(np.float32, copy=False)
-        return arr.reshape(-1)
 
     # -------- fill from episodes (only real steps) --------
     for b, ep in enumerate(episodes):
@@ -1998,9 +2071,8 @@ def _collate_batch(
             actions[b, :max_steps] = torch.from_numpy(act_dest)
 
         # ===== OPP timeline =====
-        opp_ep_idx = np.nonzero(agent_id_seq != training_seat)[0]
-        M_fill = min(To, opp_ep_idx.size, int(opp_counts[b].item())) if opp_counts.numel() > 0 else 0
-        if M_fill > 0:
+        opp_count = len(opp_index_lists[b])
+        if opp_count > 0:
             # Episode metadata we already saved
             player_labels = tuple(ep.get("player_labels", ()))  # absolute seat -> label
 
@@ -2019,8 +2091,6 @@ def _collate_batch(
                 if lbl != IGN:
                     opp_labels_by_seat[b, j] = lbl
                 seat_pos_map[seat_idx] = j
-
-            steps = opp_ep_idx[:M_fill]
 
             if seat_pos_map and agent_id_seq.size > 0 and L_pad > 0 and training_seat >= 0:
                 seq_len = int(agent_id_seq.shape[0])
@@ -2042,22 +2112,6 @@ def _collate_batch(
                         adjacent = (next_agent == training_seat)
                     if adjacent:
                         opp_last_token_is_adjacent[b, col] = True
-
-            tgt_src = _int_array(ep.get("opp_target_action"), invalid_fill=-1)
-            tgt_dest = np.full(M_fill, IGN, dtype=np.int64)
-            have_dest = np.zeros(M_fill, dtype=np.bool_)
-            if tgt_src.size > 0:
-                valid_tgt = steps < tgt_src.shape[0]
-                if np.any(valid_tgt):
-                    sel = tgt_src[steps[valid_tgt]]
-                    valid_vals = sel >= 0
-                    if np.any(valid_vals):
-                        idx = np.nonzero(valid_tgt)[0][valid_vals]
-                        tgt_dest[idx] = sel[valid_vals]
-                        have_dest[idx] = True
-
-            opp_targets[b, :M_fill] = torch.from_numpy(tgt_dest)
-            opp_have_label[b, :M_fill] = torch.from_numpy(have_dest)
 
         win_tensor[b] = float(ep.get("win", 0))
 
