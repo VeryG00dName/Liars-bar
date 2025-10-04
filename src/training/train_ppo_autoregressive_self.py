@@ -40,13 +40,12 @@ from src.model.ppo_reactive_model import PPOReactiveModel
 from src.agents.learner_ar_agent import LearnerAutoregressiveAgent
 from src.training.vec_ppo_rollout import PPOVecRolloutManager
 from src.training.tracing_utils import trace_model_from_checkpoint
-from src.training.train_extras import (
+from src.training.ppo_extras import (
     _collate_batch,
     _to_device_batch,
     ppo_losses_batched,
     set_seed
 )
-import src.training.train_extras as train_extras
 
 def _silence_torch_symbolic_logs():
     for name in ("torch.fx.experimental.symbolic_shapes", "torch._dynamo.symbolic_shapes", "torch._dynamo", "torch._inductor"):

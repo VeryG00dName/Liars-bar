@@ -28,7 +28,7 @@ from src import config
 from src.model.ppo_autoregressive_model import PPOAutoregressiveModel
 from src.agents.batch_autoregressive_ppo_agent import BatchPPOAutoregressiveAgent
 from src.training.vec_ppo_rollout import PPOVecRolloutManager
-from src.training.train_extras import _collate_batch, _to_device_batch, ppo_losses_batched
+from src.training.ppo_extras import _collate_batch, _to_device_batch, ppo_losses_batched
 
 def _silence_torch_symbolic_logs():
     for name in (

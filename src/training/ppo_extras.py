@@ -1,0 +1,411 @@
+# src/training/ppo_extras.py
+
+import random
+from typing import Any, Dict, List, Optional, Tuple
+
+import os
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from src import config
+
+
+def set_seed(seed: int = 42) -> None:
+    """Configure deterministic behaviour across Python, NumPy, and Torch."""
+    os.environ.setdefault("PYTHONHASHSEED", str(seed))
+
+    random.seed(seed)
+    np.random.seed(seed)
+
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    if hasattr(torch.backends, "cudnn") and hasattr(torch.backends.cudnn, "allow_tf32"):
+        torch.backends.cudnn.allow_tf32 = False
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda.matmul, "allow_tf32"):
+        torch.backends.cuda.matmul.allow_tf32 = False
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda.matmul, "allow_fp16_reduced_precision_reduction"):
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction"):
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+
+    torch.set_float32_matmul_precision("medium")
+
+    if hasattr(torch.backends, "cuda"):
+        if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+            torch.backends.cuda.enable_flash_sdp(False)
+        if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+        if hasattr(torch.backends.cuda, "enable_math_sdp"):
+            torch.backends.cuda.enable_math_sdp(True)
+
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
+# Expected model_input keys collated during batching.
+_COLLATE_EXPECTED_MI_KEYS: Tuple[str, ...] = (
+    "action_masks",
+    "action_sequence",
+    "agent_types",
+    "obs_sequence",
+    "positions",
+)
+
+
+EPS_CLIP          = float(getattr(config, "EPS_CLIP", 0.2))
+ENT_COEF          = float(getattr(config, "INIT_ENTROPY_COEF", 0.005))
+TRINAL_DELTA1     = float(getattr(config, "TRINAL_DELTA1", 1.8))
+GAMMA             = float(getattr(config, "GAMMA", 0.974))
+GAE_LAMBDA        = float(getattr(config, "GAE_LAMBDA", 0.98))
+
+# --- Loss Function Weights ---
+VALUE_WEIGHT      = float(getattr(config, "VALUE_WEIGHT", 0.5))
+AUX_OPP_WEIGHT    = float(getattr(config, "AUX_OPP_WEIGHT", 1.0))
+WIN_PROB_WEIGHT   = float(getattr(config, "WIN_PROB_WEIGHT", 0.25))
+BC_KL_WEIGHT      = float(getattr(config, "BC_KL_WEIGHT", 0.0)) # Default to off
+
+
+# ---------------------- Batched PPO loss (graph-safe) ----------------------
+def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    w = mask.to(x.dtype)
+    denom = w.sum().clamp_min(1.0)
+    return (x * w).sum() / denom
+
+
+def _normalize_advantages(advantages: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    w = mask.to(advantages.dtype)
+    denom = w.sum()
+    if denom.item() == 0:
+        return torch.zeros_like(advantages)
+    mean = (advantages * w).sum() / denom
+    var = ((advantages - mean).pow(2) * w).sum() / denom
+    std = torch.sqrt(var + 1e-8)
+    norm = (advantages - mean) / (std + 1e-8)
+    return norm * w
+
+def _safe_mean_masked(tensor: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Calculate mean over a masked tensor, returning 0.0 for an empty mask."""
+    if mask.any():
+        return tensor[mask].mean()
+    return torch.zeros((), device=tensor.device, dtype=tensor.dtype)
+
+def _single_pass_ppo(
+    outs: Tuple[Any, ...],
+    *,
+    batch: Dict[str, torch.Tensor],
+    mi: Dict[str, torch.Tensor],
+    our_idx: torch.Tensor,
+    our_mask: torch.Tensor,
+    actions: torch.Tensor,
+    old_logp: torch.Tensor,
+    our_action_mask: Optional[torch.Tensor],
+    step_mask: torch.Tensor,
+    episode_mask: torch.Tensor,
+    sl_teacher: Optional[torch.nn.Module]
+) -> Tuple[
+    torch.Tensor,
+    Dict[str, torch.Tensor],
+    Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+]:
+    action_logits, opp_logits, values_full, win_logits = outs[0], outs[1], outs[2].squeeze(-1).to(torch.float32), outs[3].squeeze(-1).to(torch.float32)
+
+    B, T = our_idx.shape
+    A = action_logits.size(-1)
+    device = values_full.device
+    L = values_full.size(1)
+
+    padding_mask = mi["padding_mask"].to(torch.bool)
+    valid_mask = ~padding_mask
+
+    rewards_full = batch["rewards_full"].to(device=device, dtype=torch.float32)
+    
+    # --- Universal GAE Calculation ---
+    next_values_full = torch.zeros_like(values_full)
+    next_valid_mask = torch.zeros_like(valid_mask)
+    if L > 1:
+        next_values_full[:, :-1] = values_full[:, 1:]
+        next_valid_mask[:, :-1] = valid_mask[:, 1:]
+
+    delta_full = rewards_full + GAMMA * next_values_full * next_valid_mask.to(torch.float32) - values_full
+    delta_full = delta_full * valid_mask.to(delta_full.dtype)
+
+    advantages_full = torch.zeros_like(values_full)
+    lastgaelam = torch.zeros((B,), device=device, dtype=torch.float32)
+    gamma_lam = GAMMA * GAE_LAMBDA
+    for t in range(L - 1, -1, -1):
+        mask_t = valid_mask[:, t]
+        cont_mask = next_valid_mask[:, t].to(torch.float32)
+        lastgaelam = delta_full[:, t] + gamma_lam * lastgaelam * cont_mask
+        lastgaelam = torch.where(mask_t, lastgaelam, torch.zeros_like(lastgaelam))
+        advantages_full[:, t] = lastgaelam
+
+    returns_full = advantages_full + values_full
+
+    # --- Policy Loss Calculation (on our steps only) ---
+    idx_clamped = our_idx.clamp(0, max(L - 1, 0))
+    logits_at = torch.take_along_dim(action_logits, idx_clamped.unsqueeze(-1).expand(-1, -1, A), dim=1)
+    advantages_at = torch.take_along_dim(advantages_full, idx_clamped, dim=1)
+
+    adv_norm = _normalize_advantages(advantages_at, step_mask)
+
+    dist = torch.distributions.Categorical(logits=logits_at)
+    actions_for_log_prob = actions.masked_fill(~our_mask, 0)
+    new_logp = dist.log_prob(actions_for_log_prob).to(torch.float32)
+    entropy = dist.entropy().to(torch.float32)
+
+    log_ratio = (new_logp - old_logp).clamp(min=-60.0, max=60.0)
+    ratio = log_ratio.exp()
+    surr1 = ratio * adv_norm
+    surr2 = torch.clamp(ratio, 1.0 - EPS_CLIP, 1.0 + EPS_CLIP) * adv_norm
+    policy_loss = -_masked_mean(torch.min(surr1, surr2), step_mask)
+    
+    ent_mean = _masked_mean(entropy, step_mask)
+    entropy_loss = -ent_mean * ENT_COEF
+    
+    # --- Value Loss (on all valid steps) ---
+    if valid_mask.any():
+        value_loss = F.mse_loss(values_full[valid_mask], returns_full[valid_mask])
+    else:
+        value_loss = torch.zeros((), device=device)
+
+    # --- Total PPO Loss ---
+    total = policy_loss + VALUE_WEIGHT * value_loss + entropy_loss
+
+    # --- Opponent Action Loss ---
+    opp_loss = torch.zeros((), device=device)
+    opp_acc = torch.zeros((), device=device)
+    opp_idx = batch["opp_idx"]
+    opp_targets = batch["opp_targets"]
+    opp_have_label = batch["opp_have_label"]
+    if AUX_OPP_WEIGHT > 0.0 and opp_logits is not None:
+        B_sel, To, A_opp = opp_logits.shape
+        opp_sel = torch.take_along_dim(opp_logits, opp_idx.unsqueeze(-1).expand(-1, -1, A_opp), dim=1)
+        
+        w = (opp_have_label & episode_mask.unsqueeze(1)).to(torch.float32)
+        opp_loss = _masked_mean(
+            F.cross_entropy(opp_sel.reshape(-1, A_opp), opp_targets.reshape(-1), ignore_index=-100, reduction="none").view_as(opp_targets),
+            w
+        )
+        total += AUX_OPP_WEIGHT * opp_loss
+        with torch.no_grad():
+            pred = opp_sel.argmax(dim=-1)
+            opp_acc = _masked_mean(((pred == opp_targets) & opp_have_label).float(), w)
+            
+    # --- Win Probability Loss ---
+    win_prob_loss = torch.zeros((), device=device)
+    if WIN_PROB_WEIGHT > 0.0 and win_logits is not None:
+        win_target_episode = batch["win"].to(device=device, dtype=torch.float32)
+        win_target_full = win_target_episode.unsqueeze(1).expand_as(win_logits)
+
+        win_prob_loss_unmasked = F.binary_cross_entropy_with_logits(win_logits, win_target_full, reduction="none")
+        win_prob_loss = _masked_mean(win_prob_loss_unmasked, valid_mask)
+        total += WIN_PROB_WEIGHT * win_prob_loss
+
+    # --- Metrics calculation ---
+    metrics: Dict[str, torch.Tensor] = {}
+    with torch.no_grad():
+        metrics["policy_loss"] = policy_loss.detach()
+        metrics["value_loss"] = value_loss.detach()
+        metrics["entropy"] = ent_mean.detach()
+        metrics["approx_kl"] = _masked_mean(old_logp - new_logp, step_mask).detach()
+        metrics["clip_fraction"] = _masked_mean(((ratio - 1.0).abs() > EPS_CLIP).float(), step_mask).detach()
+        metrics["opp_loss"] = opp_loss.detach()
+        metrics["opp_action_acc"] = opp_acc.detach()
+        metrics["win_prob_loss"] = win_prob_loss.detach()
+
+        if win_logits is not None:
+            win_probs = torch.sigmoid(win_logits)
+            preds = (win_probs > 0.5).to(torch.float32)
+            correct_preds = (preds == win_target_full).to(torch.float32)
+            metrics["win_prob_accuracy"] = _masked_mean(correct_preds, valid_mask).detach()
+
+            vl = mi["valid_lengths"].to(device=device)
+            has_steps = vl > 0
+            last_idx = (vl - 1).clamp(min=0)
+            mid_idx = (vl // 2).clamp(min=0)
+            
+            prob_at_first = win_probs[:, 0]
+            prob_at_middle = torch.gather(win_probs, 1, mid_idx.unsqueeze(1)).squeeze(1)
+            prob_at_last = torch.gather(win_probs, 1, last_idx.unsqueeze(1)).squeeze(1)
+
+            win_mask = (win_target_episode == 1) & has_steps
+            loss_mask = (win_target_episode == 0) & has_steps
+
+            metrics["win_prob_confidence_delta_full_win"] = _safe_mean_masked(prob_at_last - prob_at_first, win_mask).detach()
+            metrics["win_prob_confidence_delta_half_win"] = _safe_mean_masked(prob_at_last - prob_at_middle, win_mask).detach()
+            metrics["win_prob_confidence_at_middle_win"] = _safe_mean_masked(prob_at_middle, win_mask).detach()
+            metrics["win_prob_confidence_delta_full_loss"] = _safe_mean_masked(prob_at_last - prob_at_first, loss_mask).detach()
+            metrics["win_prob_confidence_delta_half_loss"] = _safe_mean_masked(prob_at_last - prob_at_middle, loss_mask).detach()
+            metrics["win_prob_confidence_at_middle_loss"] = _safe_mean_masked(prob_at_middle, loss_mask).detach()
+
+    return total, metrics
+
+def ppo_losses_batched(
+    model: torch.nn.Module,
+    batch: Dict[str, torch.Tensor],
+    sl_teacher: Optional[torch.nn.Module] = None,
+    *,
+    update_num: int = 0,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """
+    Batched PPO objective. This version is simplified and does not contain
+    the old compositional pressure (DCP) or dictionary regularization logic.
+    """
+    mi = batch["mi"]
+    our_idx = batch["our_idx"].long()
+    our_mask = batch["mask"].bool()
+    actions = batch["actions"].long()
+    old_logp = batch["old_logp"].float()
+    
+    episode_mask = torch.ones(our_idx.size(0), dtype=torch.bool, device=our_idx.device)
+    step_mask = our_mask
+
+    total_loss, metrics = _single_pass_ppo(
+        model(**mi),
+        batch=batch,
+        mi=mi,
+        our_idx=our_idx,
+        our_mask=our_mask,
+        actions=actions,
+        old_logp=old_logp,
+        our_action_mask=batch.get("our_action_mask"),
+        step_mask=step_mask,
+        episode_mask=episode_mask,
+        sl_teacher=sl_teacher,
+    )
+
+    metrics["total_loss"] = total_loss.detach()
+    return total_loss, metrics
+
+
+def _collate_batch(
+    episodes: List[Dict[str, Any]],
+    L_max: Optional[int] = None,
+    pin_memory: bool = False,
+    ignore_index: int = -100,
+) -> Dict[str, torch.Tensor]:
+    """
+    CPU-side collation for the reactive PPO model.
+    """
+    IGN = int(ignore_index)
+    B = len(episodes)
+    if B == 0:
+        raise ValueError("Empty batch.")
+
+    raw_lens: List[int] = [ep.get("model_input", {}).get("valid_lengths", [0])[0] for ep in episodes]
+    L_pad = int(L_max) if L_max is not None else (max(raw_lens) if raw_lens else 0)
+
+    # --- Build batched model inputs ('mi') ---
+    mi_batch: Dict[str, torch.Tensor] = {}
+    for k in _COLLATE_EXPECTED_MI_KEYS:
+        vs = [ep.get("model_input", {}).get(k) for ep in episodes]
+        if any(v is None for v in vs): continue
+        
+        first = vs[0]
+        out_shape = list(first.shape)
+        out_shape[0], out_shape[1] = B, L_pad
+        cat = torch.zeros(out_shape, dtype=first.dtype)
+
+        for b, v in enumerate(vs):
+            Lb = min(v.shape[1], L_pad)
+            if Lb > 0: cat[b, :Lb].copy_(v[0, :Lb])
+        mi_batch[k] = cat.pin_memory() if pin_memory else cat
+
+    valid_lengths = torch.tensor([min(l, L_pad) for l in raw_lens], dtype=torch.long)
+    mi_batch["valid_lengths"] = valid_lengths.pin_memory() if pin_memory else valid_lengths
+    
+    token_range = torch.arange(L_pad, dtype=torch.long)
+    padding_mask = token_range.unsqueeze(0) >= valid_lengths.unsqueeze(1)
+    mi_batch["padding_mask"] = padding_mask.pin_memory() if pin_memory else padding_mask
+
+    agent_types = mi_batch["agent_types"].long()
+    valid_token_mask = ~padding_mask
+    our_token_mask_full = (agent_types == 0) & valid_token_mask
+    our_counts = our_token_mask_full.sum(dim=1)
+    T = int(our_counts.max().item()) if our_counts.numel() > 0 else 0
+
+    def _mk_idx(mask: torch.Tensor, counts: torch.Tensor, max_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        if max_len == 0: return torch.zeros((B, 0), dtype=torch.long), torch.zeros((B, 0), dtype=torch.bool)
+        sorted_idx = torch.sort(torch.where(mask, token_range.unsqueeze(0), L_pad), dim=1).values[:, :max_len]
+        slot_mask = torch.arange(max_len, dtype=torch.long).unsqueeze(0) < counts.unsqueeze(1)
+        return sorted_idx, slot_mask.bool()
+
+    our_idx, our_mask = _mk_idx(our_token_mask_full, our_counts, T)
+
+    # --- Build Opponent Supervision Tensors ---
+    opp_index_lists: List[List[int]] = [[] for _ in range(B)]
+    opp_target_lists: List[List[int]] = [[] for _ in range(B)]
+
+    for b, ep in enumerate(episodes):
+        training_seat = ep["training_agent_seat"]
+        agent_ids = ep["agent_id"]
+        opp_targets_full = ep["opp_target_action"]
+        seq_len = min(len(agent_ids), L_pad)
+
+        for t in range(seq_len):
+            if agent_ids[t] != training_seat: # Opponent's turn
+                opp_index_lists[b].append(t)
+                opp_target_lists[b].append(opp_targets_full[t] if t < len(opp_targets_full) and opp_targets_full[t] >= 0 else IGN)
+            elif t > 0 and agent_ids[t-1] != training_seat: # Our turn, following an opponent
+                prev_action = opp_targets_full[t-1] if (t-1) < len(opp_targets_full) else -1
+                if prev_action >= 0 and prev_action != 6:
+                    opp_index_lists[b].append(t)
+                    opp_target_lists[b].append(prev_action)
+    
+    To = max(len(l) for l in opp_index_lists) if opp_index_lists else 0
+    opp_idx = torch.zeros((B, To), dtype=torch.long)
+    opp_targets = torch.full((B, To), IGN, dtype=torch.long)
+    for b in range(B):
+        count = len(opp_index_lists[b])
+        if count > 0:
+            opp_idx[b, :count] = torch.tensor(opp_index_lists[b])
+            opp_targets[b, :count] = torch.tensor(opp_target_lists[b])
+    opp_have_label = opp_targets != IGN
+
+    # --- Allocate and Fill Main PPO Tensors ---
+    actions = torch.full((B, T), IGN, dtype=torch.long)
+    old_logp = torch.zeros((B, T), dtype=torch.float32)
+    rewards_full = torch.zeros((B, L_pad), dtype=torch.float32)
+    win = torch.tensor([ep.get("win", 0) for ep in episodes], dtype=torch.float32)
+
+    for b, ep in enumerate(episodes):
+        our_steps = (ep["agent_id"] == ep["training_agent_seat"]).nonzero()[0]
+        max_steps = min(T, len(our_steps))
+        if max_steps == 0: continue
+        steps = our_steps[:max_steps]
+        
+        actions[b, :max_steps] = torch.from_numpy(ep["our_action"][steps])
+        old_logp[b, :max_steps] = torch.from_numpy(ep["log_prob"][steps])
+        
+        reward_len = min(len(ep["reward"]), L_pad)
+        if reward_len > 0:
+            rewards_full[b, :reward_len] = torch.from_numpy(ep["reward"][:reward_len])
+    
+    batch = {
+        "mi": mi_batch, "our_idx": our_idx, "mask": our_mask,
+        "actions": actions, "old_logp": old_logp, "rewards_full": rewards_full,
+        "opp_idx": opp_idx, "opp_targets": opp_targets, "opp_have_label": opp_have_label,
+        "win": win,
+    }
+    if pin_memory:
+        for k, v in batch.items():
+            if k != "mi": v.pin_memory()
+            
+    return batch
+
+def _to_device_batch(batch_cpu: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
+    """Move a collated CPU batch (with nested 'mi' dict) to device."""
+    batch_gpu = {
+        k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v
+        for k, v in batch_cpu.items()
+        if k != "mi"
+    }
+    batch_gpu["mi"] = {
+        k: v.to(device, non_blocking=True) for k, v in batch_cpu["mi"].items()
+    }
+    return batch_gpu
