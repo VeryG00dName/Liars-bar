@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 from typing import Optional
-
-from .ppo_reactive_model_base import PPOReactiveModelBase
+import torch
+import torch.nn as nn
+from src.model.ppo_reactive_model_base import PPOReactiveModelBase
 
 
 class PPOReactiveModelScript(PPOReactiveModelBase):
-    """Inference variant that reuses the shared PPO reactive model base."""
+    """
+    Inference variant that reuses the shared PPO reactive model base.
+    Its forward pass is inherited directly and is JIT-compatible.
+    """
 
     def __init__(
         self,

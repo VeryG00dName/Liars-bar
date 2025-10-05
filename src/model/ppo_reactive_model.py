@@ -1,12 +1,12 @@
 # src/model/ppo_reactive_model.py
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from .ppo_reactive_model_base import PPOReactiveModelBase
+from src.model.ppo_reactive_model_base import PPOReactiveModelBase, MoETransformerEncoderLayer
 
 
 class PPOReactiveModel(PPOReactiveModelBase):
@@ -71,9 +71,10 @@ class PPOReactiveModel(PPOReactiveModelBase):
         gate_logits_list = []
         routing: Dict[str, torch.Tensor] = {}
 
-        for layer in self.transformer.layers:
-            def layer_forward(inp: torch.Tensor, layer=layer):
-                output, layer_routing = layer(
+        def create_custom_forward(module: MoETransformerEncoderLayer):
+            def custom_forward(*inputs):
+                inp = inputs[0]
+                output, layer_routing = module(
                     inp,
                     src_mask=causal_mask,
                     src_key_padding_mask=key_padding,
@@ -84,13 +85,12 @@ class PPOReactiveModel(PPOReactiveModelBase):
                     layer_routing.get("topk_indices"),
                     layer_routing.get("topk_scores"),
                 )
+            return custom_forward
 
-            try:
-                hidden, gate_logit, topk_indices, topk_scores = checkpoint(
-                    layer_forward, hidden, use_reentrant=False
-                )
-            except TypeError:
-                hidden, gate_logit, topk_indices, topk_scores = checkpoint(layer_forward, hidden)
+        for layer in self.transformer.layers:
+            hidden, gate_logit, topk_indices, topk_scores = checkpoint(
+                create_custom_forward(layer), hidden, use_reentrant=False
+            )
 
             gate_logits_list.append(gate_logit)
             routing = {
@@ -99,16 +99,21 @@ class PPOReactiveModel(PPOReactiveModelBase):
                 "topk_scores": topk_scores,
             }
 
-        transformer_output = (
-            self.transformer.norm(hidden)
-            if getattr(self.transformer, "norm", None) is not None
-            else hidden
-        )
+        transformer_output = self.transformer.norm(hidden) if self.transformer.norm is not None else hidden
         
         gate_logits_tensor = self._stack_gate_logits(gate_logits_list, transformer_output)
         
         return transformer_output, gate_logits_tensor, routing
         
+    def _stack_gate_logits(self, gate_logits_list: List[torch.Tensor], ref_tensor: torch.Tensor) -> torch.Tensor:
+         return (
+            torch.stack(gate_logits_list, dim=0)
+            if gate_logits_list
+            else ref_tensor.new_zeros(
+                0, ref_tensor.size(0), ref_tensor.size(1), self.num_experts
+            )
+        )
+
     def forward(
         self,
         obs_sequence: torch.Tensor,
@@ -126,34 +131,32 @@ class PPOReactiveModel(PPOReactiveModelBase):
         torch.Tensor,
         Dict[str, torch.Tensor],
     ]:
-        encoded_inputs, causal_mask, key_padding = self._prepare_inputs(
-            obs_sequence,
-            action_sequence,
-            agent_types,
-            positions,
-            padding_mask,
+        # 1. Prepare inputs by calling methods from the base class
+        encoded_inputs = self._encode_inputs(
+            obs_sequence, action_sequence, agent_types, positions, padding_mask
         )
+        causal_mask, key_padding = self._prepare_masks(encoded_inputs, padding_mask)
 
-        if (
-            self.training
-            and self.use_gradient_checkpointing
-            and hasattr(self.transformer, "layers")
-        ):
+        # 2. Run transformer (with or without checkpointing)
+        if self.training and self.use_gradient_checkpointing:
             transformer_output, gate_logits_tensor, routing = self._forward_with_gradient_checkpointing(
                 encoded_inputs, causal_mask, key_padding
             )
         else:
+            # Call the base class's run_transformer method
             transformer_output, gate_logits_list, routing = self._run_transformer(
                 encoded_inputs,
                 causal_mask=causal_mask,
                 key_padding=key_padding,
             )
             gate_logits_tensor = self._stack_gate_logits(gate_logits_list, transformer_output)
-
+        
+        # 3. Get head outputs by calling the base class's method
         action_logits, opp_logits, state_values, win_logits = self._head_outputs(
             transformer_output, routing
         )
         
+        # 4. Apply training-specific masking
         action_logits = self._apply_action_mask(action_logits, agent_types, action_masks)
         
         return (

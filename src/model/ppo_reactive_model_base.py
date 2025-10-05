@@ -1,13 +1,6 @@
 # src/model/ppo_reactive_model_base.py
 
-"""Shared PPO reactive model components.
-
-This module centralises the architecture that is common between the
-training and inference versions of the PPO reactive model.  Both
-variants inherit from :class:`PPOReactiveModelBase` to ensure the
-transformer backbone, mixture-of-experts blocks, and the core forward
-pass remain perfectly aligned.
-"""
+"""Shared PPO reactive model components."""
 
 from __future__ import annotations
 
@@ -20,6 +13,7 @@ import torch.nn as nn
 
 __all__ = [
     "PPOReactiveModelBase",
+    "MoETransformerEncoderLayer"
 ]
 
 
@@ -57,8 +51,14 @@ class TopKMoELayer(nn.Module):
         topk_scores, topk_indices = torch.topk(gate_probs, self.top_k, dim=-1)
         topk_weights = topk_scores / topk_scores.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
-        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=2)
-        gather_index = topk_indices.unsqueeze(-1).expand(*topk_indices.shape, self.hidden_dim)
+        expert_outs: List[torch.Tensor] = []
+        for expert in self.experts:
+            expert_outs.append(expert(x))
+        expert_outputs = torch.stack(expert_outs, dim=2)
+
+        bsz, tsz, ksz = topk_indices.shape
+        gather_index = topk_indices.unsqueeze(-1).expand(bsz, tsz, ksz, self.hidden_dim)
+        
         topk_outputs = torch.gather(expert_outputs, 2, gather_index)
         combined = (topk_outputs * topk_weights.unsqueeze(-1)).sum(dim=2)
 
@@ -166,8 +166,6 @@ class PPOReactiveModelBase(nn.Module):
         expert_ffn_dim: Optional[int] = None,
     ) -> None:
         super().__init__()
-        self.obs_dim = obs_dim
-        self.action_dim = action_dim
         self.hidden_dim = hidden_dim
         self.max_seq_length = max_seq_length
         self.num_experts = num_experts
@@ -238,7 +236,7 @@ class PPOReactiveModelBase(nn.Module):
         self.opp_action_heads = make_head(action_dim)
 
     # -------------------------- utils --------------------------
-    @torch.no_grad()
+    # NOTE: Avoid @torch.no_grad() on scripted methods; TorchScript can’t script it.
     def _decompose_actions(
         self,
         action_sequence: torch.Tensor,
@@ -286,15 +284,15 @@ class PPOReactiveModelBase(nn.Module):
         )
         combined = nn.functional.layer_norm(fused, (self.hidden_dim,))
         return combined
-    
+
     def _prepare_masks(
         self, encoded_inputs: torch.Tensor, padding_mask: Optional[torch.Tensor]
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         T = encoded_inputs.size(1)
         causal_mask = self.causal_bool_mask_full[:T, :T].to(encoded_inputs.device)
-        key_padding = None
+        key_padding = torch.jit.annotate(Optional[torch.Tensor], None)
         if padding_mask is not None:
-            key_padding = padding_mask.bool().contiguous()
+            key_padding = padding_mask.to(dtype=torch.bool).contiguous()
         return causal_mask, key_padding
 
     def _run_transformer(
@@ -309,71 +307,91 @@ class PPOReactiveModelBase(nn.Module):
             src_key_padding_mask=key_padding,
         )
 
-    def _combine_heads(
+    # --------- TorchScript-safe helpers that read ModuleLists via self ---------
+    def _stack_action_heads(self, transformer_output: torch.Tensor) -> torch.Tensor:
+        outs = torch.jit.annotate(List[torch.Tensor], [])
+        for _, head in enumerate(self.action_heads):  # iterate attribute, not index with i
+            outs.append(head(transformer_output))
+        return torch.stack(outs, dim=2)
+
+    def _stack_reward_heads(self, transformer_output: torch.Tensor) -> torch.Tensor:
+        outs = torch.jit.annotate(List[torch.Tensor], [])
+        for _, head in enumerate(self.reward_stream_heads):
+            outs.append(head(transformer_output))
+        return torch.stack(outs, dim=2)
+
+    def _stack_win_heads(self, transformer_output: torch.Tensor) -> torch.Tensor:
+        outs = torch.jit.annotate(List[torch.Tensor], [])
+        for _, head in enumerate(self.win_prob_heads):
+            outs.append(head(transformer_output))
+        return torch.stack(outs, dim=2)
+
+    def _stack_opp_heads(self, transformer_output: torch.Tensor) -> torch.Tensor:
+        outs = torch.jit.annotate(List[torch.Tensor], [])
+        for _, head in enumerate(self.opp_action_heads):
+            outs.append(head(transformer_output))
+        return torch.stack(outs, dim=2)
+
+    def _reduce_heads(
         self,
-        heads: nn.ModuleList,
+        stacked: torch.Tensor,                      # [B, T, H, D]
+        final_indices: Optional[torch.Tensor],      # [B, T, K] or None
+        final_scores: Optional[torch.Tensor],       # [B, T, K] or None
+    ) -> torch.Tensor:
+        if final_indices is None or final_scores is None:
+            return stacked.mean(dim=2)              # [B, T, D]
+        bsz, tsz, ksz = final_indices.shape
+        out_dim = stacked.size(-1)
+        gather_idx = final_indices.unsqueeze(-1).expand(bsz, tsz, ksz, out_dim)  # [B,T,K,D]
+        top_outputs = torch.gather(stacked, 2, gather_idx)                        # [B,T,K,D]
+        return (top_outputs * final_scores.unsqueeze(-1)).sum(dim=2)              # [B,T,D]
+
+    def _combine_action_heads(
+        self,
         transformer_output: torch.Tensor,
         final_indices: Optional[torch.Tensor],
         final_scores: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        all_outputs = torch.stack([head(transformer_output) for head in heads], dim=2)
-        if final_indices is None or final_scores is None:
-            return all_outputs.mean(dim=2)
-        gather_idx = final_indices.unsqueeze(-1).expand(*final_indices.shape, all_outputs.size(-1))
-        top_outputs = torch.gather(all_outputs, 2, gather_idx)
-        return (top_outputs * final_scores.unsqueeze(-1)).sum(dim=2)
+        stacked = self._stack_action_heads(transformer_output)
+        return self._reduce_heads(stacked, final_indices, final_scores)
 
-    def _forward_core(
+    def _combine_reward_heads(
         self,
-        obs_sequence: torch.Tensor,
-        action_sequence: torch.Tensor,
-        agent_types: torch.Tensor,
-        positions: torch.Tensor,
-        action_masks: Optional[torch.Tensor],
-        padding_mask: Optional[torch.Tensor],
-        valid_lengths: Optional[torch.Tensor] = None,
-    ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        Dict[str, torch.Tensor],
-    ]:
-        del action_masks, valid_lengths  # Unused in the shared core logic.
+        transformer_output: torch.Tensor,
+        final_indices: Optional[torch.Tensor],
+        final_scores: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        stacked = self._stack_reward_heads(transformer_output)
+        return self._reduce_heads(stacked, final_indices, final_scores)
 
-        encoded_inputs = self._encode_inputs(
-            obs_sequence, action_sequence, agent_types, positions, padding_mask
-        )
+    def _combine_win_heads(
+        self,
+        transformer_output: torch.Tensor,
+        final_indices: Optional[torch.Tensor],
+        final_scores: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        stacked = self._stack_win_heads(transformer_output)
+        return self._reduce_heads(stacked, final_indices, final_scores)
 
-        causal_mask, key_padding = self._prepare_masks(encoded_inputs, padding_mask)
+    def _combine_opp_heads(
+        self,
+        transformer_output: torch.Tensor,
+        final_indices: Optional[torch.Tensor],
+        final_scores: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        stacked = self._stack_opp_heads(transformer_output)
+        return self._reduce_heads(stacked, final_indices, final_scores)
 
-        transformer_output, gate_logits, routing = self._run_transformer(
-            encoded_inputs,
-            causal_mask=causal_mask,
-            key_padding=key_padding,
-        )
+    def _head_outputs(self, transformer_output: torch.Tensor, routing: Dict[str, torch.Tensor]):
+        final_indices = torch.jit.annotate(Optional[torch.Tensor], routing.get("topk_indices"))
+        final_scores = torch.jit.annotate(Optional[torch.Tensor], routing.get("topk_scores"))
 
-        final_indices = routing.get("topk_indices")
-        final_scores = routing.get("topk_scores")
+        action_logits = self._combine_action_heads(transformer_output, final_indices, final_scores)
+        state_values  = self._combine_reward_heads(transformer_output, final_indices, final_scores)
+        win_logits    = self._combine_win_heads(transformer_output, final_indices, final_scores)
+        opp_logits    = self._combine_opp_heads(transformer_output, final_indices, final_scores)
+        return action_logits, opp_logits, state_values, win_logits
 
-        action_logits = self._combine_heads(self.action_heads, transformer_output, final_indices, final_scores)
-        state_values = self._combine_heads(
-            self.reward_stream_heads, transformer_output, final_indices, final_scores
-        )
-        win_logits = self._combine_heads(self.win_prob_heads, transformer_output, final_indices, final_scores)
-        opp_logits = self._combine_heads(self.opp_action_heads, transformer_output, final_indices, final_scores)
-
-        gate_logits_tensor = (
-            torch.stack(gate_logits, dim=0)
-            if gate_logits
-            else transformer_output.new_zeros(
-                0, transformer_output.size(0), transformer_output.size(1), self.num_experts
-            )
-        )
-
-        return action_logits, opp_logits, state_values, win_logits, gate_logits_tensor, routing
-        
     # -------------------------- forward --------------------------
     def forward(
         self,
@@ -383,42 +401,30 @@ class PPOReactiveModelBase(nn.Module):
         positions: torch.Tensor,
         action_masks: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
-        valid_lengths: Optional[torch.Tensor] = None,
-        *,
-        return_aux: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        Dict[str, torch.Tensor],
-    ]:
-        (
-            action_logits,
-            opp_logits,
-            state_values,
-            win_logits,
-            gate_logits_tensor,
-            routing,
-        ) = self._forward_core(
-            obs_sequence,
-            action_sequence,
-            agent_types,
-            positions,
-            action_masks,
-            padding_mask,
-            valid_lengths,
+        valid_lengths: Optional[torch.Tensor] = None
+    ):
+        # obs_sequence: [B, T, obs_dim]
+        # action_sequence: [B, T]
+        # agent_types: [B, T]
+        # positions: [B, T]
+        encoded_inputs = self._encode_inputs(
+            obs_sequence=obs_sequence,
+            action_sequence=action_sequence,
+            agent_types=agent_types,
+            positions=positions,
+            padding_mask=padding_mask,
         )
 
-        if return_aux:
-            return (
-                action_logits,
-                opp_logits,
-                state_values,
-                win_logits,
-                gate_logits_tensor,
-                routing,
-            )
+        causal_mask, key_padding = self._prepare_masks(encoded_inputs, padding_mask)
+
+        transformer_output, _, routing = self._run_transformer(
+            encoded_inputs,
+            causal_mask=causal_mask,
+            key_padding=key_padding,
+        )
+
+        action_logits, opp_logits, state_values, win_logits = self._head_outputs(
+            transformer_output, routing
+        )
 
         return action_logits, opp_logits, state_values, win_logits

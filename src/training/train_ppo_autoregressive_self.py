@@ -29,6 +29,11 @@ warnings.filterwarnings(
     message=".*does not have a deterministic implementation.*",
     category=UserWarning,
 )
+warnings.filterwarnings(
+    "ignore",
+    message=".*torch.cpu.amp.autocast.* is deprecated.*",
+    category=FutureWarning,
+)
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from torch.nn.utils import clip_grad_norm_
@@ -65,7 +70,7 @@ FORCE_CUDA_SYNC_FOR_TIMING = bool(getattr(config, "FORCE_CUDA_SYNC_FOR_TIMING", 
 
 PAD_BUCKET_BOUNDARIES = [64, 128, 192, 256, 384, 480]
 MAX_ENVS_PER_CALL = 512
-COVERAGE_FLOOR = 16
+COVERAGE_FLOOR = 32
 FRONTIER_FOCUS_COUNTS = [128, 96, 64, 32]
 
 
@@ -160,10 +165,6 @@ class OpponentPoolManager:
         self._save(self.pool)
         print(f"Added '{name}' to pool with label {next_label}.")
 
-    # Legacy no-op: status is no longer tracked.
-    def set_status(self, label: int, status: str, *, save: bool = True) -> None:
-        return
-
     def get_entries(self, *, include_cpp: bool = True) -> List[Dict[str, Any]]:
         entries: List[Dict[str, Any]] = []
         for entry in self.pool:
@@ -171,37 +172,6 @@ class OpponentPoolManager:
                 continue
             entries.append(entry)
         return entries
-
-    def build_sampling_weights(
-        self,
-        pressure_scores: Dict[int, float],
-        *,
-        exclude_label: Optional[int] = None,
-    ) -> Tuple[List[int], List[float]]:
-        labels: List[int] = []
-        weights: List[float] = []
-        exclude = int(exclude_label) if exclude_label is not None else None
-        for entry in self.pool:
-            label = entry.get("label")
-            if label is None:
-                continue
-            try:
-                label_int = int(label)
-            except Exception:
-                continue
-            if exclude is not None and label_int == exclude:
-                continue
-            base_weight = entry.get("sampling_weight", 1.0)
-            try:
-                base = float(base_weight)
-            except Exception:
-                base = 1.0
-            pressure = pressure_scores.get(label_int)
-            if pressure is not None:
-                base = pressure
-            labels.append(label_int)
-            weights.append(base)
-        return labels, weights
 
 def _build_floor_focus_curriculum(
     pool_manager: OpponentPoolManager,
@@ -213,72 +183,85 @@ def _build_floor_focus_curriculum(
     self_play_count: Optional[int] = None,
     allowed_opponent_labels: Optional[set] = None,
 ) -> List[List[int]]:
-    focus_counts = focus_counts or [128, 96, 64, 32]
+    """
+    Builds a list of opponent triplets for a rollout using a quota-based system.
+
+    This ensures that each opponent is played against a specific number of times,
+    providing a "floor" of coverage for all agents and a "focus" on recent agents.
+    """
+    focus_counts = focus_counts if focus_counts is not None else [128, 96, 64, 32]
     self_play_count = coverage_floor if self_play_count is None else self_play_count
 
+    # --- 1. Get all eligible opponent labels ---
     entries = pool_manager.get_entries(include_cpp=True)
-    all_labels = [int(e["label"]) for e in entries if e.get("label") is not None]
+    all_labels = {int(e["label"]) for e in entries if e.get("label") is not None}
+
     if allowed_opponent_labels is not None:
         allowed = {int(x) for x in allowed_opponent_labels}
-        # Keep training label regardless (for self-play); filter opponents to allowed
-        all_labels = [lbl for lbl in all_labels if (lbl in allowed) or (lbl == training_label)]
-    opponent_labels = [lbl for lbl in all_labels if lbl != training_label]
-
-    triplets: List[List[int]] = []
+        # Filter opponents, but always keep the training agent for self-play calculations
+        all_labels = {lbl for lbl in all_labels if (lbl in allowed) or (lbl == training_label)}
+    
+    opponent_labels = sorted([lbl for lbl in all_labels if lbl != training_label])
 
     if not opponent_labels:
-        fallback = [training_label, training_label, training_label]
-        triplets.extend([fallback for _ in range(max(coverage_floor, 1))])
-        return triplets
+        # Fallback if there are no opponents in the pool (e.g., first run ever)
+        fallback_triplet = [training_label, training_label, training_label]
+        return [fallback_triplet for _ in range(max(self_play_count, 1))]
 
-    def _sample_two(exclude: Optional[set] = None) -> Tuple[int, int]:
-        exclude = exclude or set()
-        pool = [lbl for lbl in opponent_labels if lbl not in exclude]
-        if not pool:
-            pool = opponent_labels
-        first = int(rng.choice(pool))
-        pool_second = [lbl for lbl in opponent_labels if lbl not in exclude and lbl != first]
-        if not pool_second:
-            pool_second = [lbl for lbl in opponent_labels if lbl != first] or opponent_labels
-        second = int(rng.choice(pool_second))
-        return first, second
+    # --- 2. Calculate the Quotas for each opponent ---
+    quotas: Dict[int, int] = {}
 
-    floor_pairs = max(coverage_floor // 2, 1)
-    for label in opponent_labels:
-        for _ in range(floor_pairs):
-            other1, other2 = _sample_two({label})
-            triplets.append([label, other1, other2])
-            triplets.append([other1, label, other2])
+    # Quota for the learner (self-play)
+    quotas[training_label] = self_play_count
 
+    # Quotas for "Focus" opponents (most recent agents)
     recent_entries = [
         e for e in entries
-        if e.get("type") != "cpp_bot" and e.get("label") not in {None, training_label}
+        if e.get("type") != "cpp_bot" and int(e["label"]) in opponent_labels
     ]
-    if allowed_opponent_labels is not None:
-        allowed = {int(x) for x in allowed_opponent_labels}
-        recent_entries = [e for e in recent_entries if int(e["label"]) in allowed]
-    recent_entries = recent_entries[-len(focus_counts):]
-    recent_entries.reverse()
-    for idx, count in enumerate(focus_counts):
-        if idx >= len(recent_entries):
+    # Sort by label to get the most recent ones
+    recent_entries.sort(key=lambda e: int(e["label"]), reverse=True)
+
+    focused_labels = set()
+    for i, count in enumerate(focus_counts):
+        if i >= len(recent_entries):
             break
-        label = int(recent_entries[idx]["label"])
-        focus_pairs = max(count // 2, 1)
-        for _ in range(focus_pairs):
-            other1, other2 = _sample_two({label})
-            triplets.append([label, other1, other2])
-            triplets.append([other1, label, other2])
+        label = int(recent_entries[i]["label"])
+        quotas[label] = count
+        focused_labels.add(label)
 
-    self_play_iters = max(int(self_play_count), 0)
-    for _ in range(self_play_iters):
-        other1, other2 = _sample_two()
-        triplets.append([training_label, other1, other2])
+    # Quotas for "Floor" opponents (everyone else)
+    for label in opponent_labels:
+        if label not in focused_labels:
+            quotas[label] = coverage_floor
 
+    # --- 3. Build the shuffled pool of opponent slots ---
+    slot_pool: List[int] = []
+    for label, count in quotas.items():
+        slot_pool.extend([label] * count)
+
+    rng.shuffle(slot_pool)
+
+    # --- 4. Create triplets from the shuffled pool ---
+    triplets: List[List[int]] = []
+    i = 0
+    while i < len(slot_pool):
+        chunk = slot_pool[i : i + 3]
+        if len(chunk) == 3:
+            triplets.append(chunk)
+        else:
+            # Handle the remainder: fill with random opponents
+            num_needed = 3 - len(chunk)
+            for _ in range(num_needed):
+                chunk.append(int(rng.choice(opponent_labels)))
+            triplets.append(chunk)
+        i += 3
+        
+    # --- 5. Final shuffle of the triplets themselves ---
     if triplets:
-        order = rng.permutation(len(triplets))
-        triplets = [triplets[int(i)] for i in order]
+        rng.shuffle(triplets)
+        
     return triplets
-
 
 def _create_new_agent(agent_type: str, device: torch.device) -> LearnerAutoregressiveAgent:
     """Creates a new agent and its corresponding model."""
@@ -575,7 +558,7 @@ def train_generation(
         f"Assigned training policy id {training_policy_id}; existing opponent labels: {sorted(existing_labels)}"
     )
 
-    # 3. INITIALIZE ROLLOUT MANAGER
+     # 3. INITIALIZE ROLLOUT MANAGER
     rollout_manager = PPOVecRolloutManager(
         policy_map,
         device,
@@ -604,7 +587,9 @@ def train_generation(
                 f"Failed to register native C++ bot '{name}' (label {label}) with rollout manager: {exc}"
             )
 
+    # Load historical agents from the opponent pool into the C++ manager
     loaded_historical_labels: List[int] = []
+    pool_was_updated = False
     for agent_def in pool_manager.pool:
         if agent_def.get('type') == 'cpp_bot':
             continue
@@ -614,22 +599,49 @@ def train_generation(
             continue
 
         policy_id = int(label)
-        traced_path = agent_def.get('path_pt')
-
-        if traced_path and not os.path.exists(traced_path):
-            traced_path = None
-
-        if not traced_path and agent_def.get('path'):
-            traced_candidate = _find_traced_artifact_for_checkpoint(agent_def['path'])
-            if traced_candidate is not None and traced_candidate.exists():
-                traced_path = str(traced_candidate)
-
-        if not traced_path:
+        
+        # Standard .pth checkpoint path is the source of truth
+        checkpoint_path = agent_def.get('path')
+        if not checkpoint_path or not os.path.exists(checkpoint_path):
             logging.warning(
-                f"Skipping historical opponent label {policy_id}: missing TorchScript trace."
+                f"Skipping historical opponent '{agent_def.get('name', policy_id)}': source .pth checkpoint not found at '{checkpoint_path}'"
             )
             continue
 
+        # Check for an existing, valid TorchScript path
+        traced_path = agent_def.get('path_pt')
+        if traced_path and os.path.exists(traced_path):
+            # Path exists, we are good to go.
+            pass
+        else:
+            # TorchScript path is missing or invalid, let's try to generate it.
+            logging.info(
+                f"TorchScript trace for agent '{agent_def.get('name', policy_id)}' not found. Generating it now..."
+            )
+            
+            # Define the output path for the new .pt file
+            pth_path_obj = Path(checkpoint_path)
+            new_traced_path = str(pth_path_obj.with_suffix('.pt'))
+            
+            # Call the tracing utility
+            traced_success = trace_model_from_checkpoint(checkpoint_path, new_traced_path, device)
+            
+            if traced_success:
+                logging.info(f"Successfully generated trace at '{new_traced_path}'")
+                traced_path = new_traced_path
+                # Update the agent definition in the pool manager
+                agent_def['path_pt'] = new_traced_path
+                pool_was_updated = True
+            else:
+                logging.error(
+                    f"Failed to generate TorchScript trace for agent '{agent_def.get('name', policy_id)}'. Skipping."
+                )
+                traced_path = None
+
+        if not traced_path:
+            continue
+
+        # Now, load the (potentially newly created) model into the C++ manager
         try:
             rollout_manager.cpp_manager.load_historical_model(policy_id, str(traced_path))
             loaded_historical_labels.append(policy_id)
@@ -637,6 +649,12 @@ def train_generation(
             logging.exception(
                 f"Failed to load traced historical policy {policy_id} from {traced_path}: {exc}"
             )
+
+    # If we generated any new traces, save the updated opponent pool file
+    if pool_was_updated:
+        logging.info("Saving updated opponent pool with new TorchScript paths...")
+        pool_manager.save()
+
 
     logging.info(
         "Native C++ bots registered: %s; historical TorchScript policies loaded: %s",

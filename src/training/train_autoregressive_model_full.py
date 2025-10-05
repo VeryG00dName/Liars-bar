@@ -20,22 +20,11 @@ import torch.optim as optim
 import torch.amp as amp
 from torch.utils.data import Dataset, DataLoader, Sampler
 from tqdm import tqdm
-from typing import List
+from typing import List, Tuple
 from torch.utils.tensorboard import SummaryWriter
-from src.model.ppo_reactive_model import PPOReactiveModel
+from src.model.ppo_reactive_model_single import PPOReactiveModelSingle
 from src import config
 from src.training.train_extras import set_seed
-
-# Define hardcoded opponent labels consistent with other training scripts
-HARD_CODED_LABELS = {
-    "GreedyCardSpammer": 1,
-    "StrategicChallenger": 4,
-    "TableNonTableAgent": 6,
-    "Classic": 0,
-    "TableFirstConservativeChallenger": 5,
-    "SelectiveTableConservativeChallenger": 3,
-    "RandomAgent": 2
-}
 
 def setup_logging(log_file=None, level=logging.INFO):
     """Configure logging for the training script."""
@@ -59,105 +48,6 @@ def setup_logging(log_file=None, level=logging.INFO):
         logger.addHandler(file_handler)
     
     return logger
-
-def create_opponent_mapping(data_dir, use_cache=True, cache_file="opponent_mapping_cache.pkl"):
-    """Create mapping of opponent names to indices.
-    
-    Uses caching for efficiency and samples data files rather than loading them completely.
-    
-    Args:
-        data_dir: Directory containing data files
-        use_cache: Whether to try loading from cache file first
-        cache_file: Path to cache file
-    
-    Returns:
-        Dictionary mapping opponent names to indices
-    """
-    opponent_mapping = HARD_CODED_LABELS.copy()
-    cache_path = os.path.join(data_dir, cache_file)
-    if use_cache and os.path.exists(cache_path):
-        try:
-            print(f"Loading opponent mapping from cache: {cache_path}")
-            with open(cache_path, 'rb') as f:
-                cached_mapping = pickle.load(f)
-                cached_mapping.update(opponent_mapping)
-                opponent_mapping = cached_mapping
-                print(f"Loaded {len(opponent_mapping)} opponent types from cache")
-                return opponent_mapping
-        except Exception as e:
-            print(f"Error loading opponent mapping cache: {e}")
-    
-    print("Scanning data files for opponent types (using sampling for efficiency)...")
-    all_opponent_names = set()
-    data_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) 
-                  if f.endswith('.pkl') and "ps_autoreg_data" in f]
-    
-    if not data_files:
-        print("No ps_autoreg_data files found, scanning all pickle files")
-        data_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) 
-                     if f.endswith('.pkl')]
-    
-    for data_file in tqdm(data_files, desc="Scanning data files"):
-        try:
-            with open(data_file, 'rb') as f:
-                f.seek(0, 2)
-                file_size = f.tell()
-                f.seek(0)
-                if file_size > 10 * 1024 * 1024:
-                    # Large file - sample some sequences
-                    data = pickle.load(f)
-                    if isinstance(data, list):
-                        max_samples = min(100, len(data))
-                        sequences = random.sample(data, max_samples)
-                        
-                        for sequence in sequences:
-                            labels = sequence.get('opponent_labels') if isinstance(sequence, dict) else None
-                            if labels:
-                                all_opponent_names.update(labels.values())
-                            elif 'sequence' in sequence:
-                                for step in sequence['sequence']:
-                                    if 'belief' in step:
-                                        all_opponent_names.update(step['belief'])
-                    else:
-                        print(f"Warning: {os.path.basename(data_file)} does not contain a list of sequences")
-                else:
-                    # Small file - load everything
-                    data = pickle.load(f)
-                    if isinstance(data, list):
-                        for sequence in data:
-                            labels = sequence.get('opponent_labels') if isinstance(sequence, dict) else None
-                            if labels:
-                                all_opponent_names.update(labels.values())
-                            elif 'sequence' in sequence:
-                                for step in sequence['sequence']:
-                                    if 'belief' in step:
-                                        all_opponent_names.update(step['belief'])
-                    else:
-                        print(f"Warning: {os.path.basename(data_file)} does not contain a list of sequences")
-        except Exception as e:
-            print(f"Error scanning {os.path.basename(data_file)}: {e}")
-    
-    next_idx = max(opponent_mapping.values()) + 1 if opponent_mapping else 0
-    new_types = []
-    
-    for name in sorted(all_opponent_names):
-        if name not in opponent_mapping:
-            opponent_mapping[name] = next_idx
-            new_types.append(name)
-            next_idx += 1
-    
-    print(f"Found {len(new_types)} new opponent types")
-    if new_types:
-        print("New types:", new_types)
-    
-    try:
-        with open(cache_path, 'wb') as f:
-            pickle.dump(opponent_mapping, f)
-        print(f"Saved opponent mapping cache to {cache_path}")
-    except Exception as e:
-        print(f"Error saving opponent mapping cache: {e}")
-    
-    return opponent_mapping
 
 class BucketSampler(Sampler):
     """Group sequences of similar length into batches."""
@@ -274,43 +164,42 @@ class AutoregressiveGameDataset(Dataset):
         sequence = round_data["sequence"]
         seq_len = len(sequence)
 
+        # Map atomic actions (0-6) to decomposed action representations (7-10) for input
         TRANSFORM_MAP = {0: 7, 3: 7, 1: 8, 4: 8, 2: 9, 5: 9}
 
         raw_actions = []
         raw_target_actions = []
+        agent_type_list = []
+        
         for step in sequence:
-            is_train = step["agent_id"] == 0
-            if "action" in step:
-                a = step["action"]
-                b = a
-            if not is_train and a != 6:
-                b = TRANSFORM_MAP.get(a, a)
-            raw_target_actions.append(a)
-            raw_actions.append(b)
+            agent_id = int(step.get("agent_id", 0))
+            action = int(step.get("action", 6))
+            
+            agent_type_list.append(agent_id)
+            raw_target_actions.append(action)
 
-        PAD = 10
-        input_actions = [PAD] + raw_actions[:-1]
-        target_actions = raw_target_actions.copy()
+            # Transform opponent actions for input sequence
+            is_our_turn = (agent_id == 0)
+            if not is_our_turn and action != 6:
+                input_action = TRANSFORM_MAP.get(action, action)
+            else:
+                input_action = action
+            raw_actions.append(input_action)
+
+        PAD_ACTION = 10
+        input_actions = [PAD_ACTION] + raw_actions[:-1]
+        target_actions = raw_target_actions
 
         obs_list = []
         action_mask_list = []
-        agent_type_list = []
         position_list = []
 
-        # Prefer the per-game seat->label mapping; fall back to legacy per-step belief lists.
-        opponent_labels = round_data.get("opponent_labels")
-        seat_label_indices = {}
-        if opponent_labels:
-            seat_label_indices = {
-                int(seat): self.opponent_mapping.get(name, 0)
-                for seat, name in opponent_labels.items()
-            }
-
-        belief_targets = []
+        # --- New Opponent Supervision Logic ---
+        opp_target_actions = []
+        opp_target_mask = []
 
         for i, step in enumerate(sequence):
             agent_id = int(step.get("agent_id", 0))
-            agent_type_list.append(agent_id)
             position_list.append(i)
 
             obs = np.array(step.get("observation", np.zeros(9, np.float32)), dtype=np.float32)
@@ -321,14 +210,27 @@ class AutoregressiveGameDataset(Dataset):
             else:
                 action_mask_list.append([0] * 7)
 
-            if not opponent_labels and "belief" in step:
-                names = step["belief"]
-                seat_label_indices.update({
-                    idx + 1: self.opponent_mapping.get(name, 0)
-                    for idx, name in enumerate(names)
-                })
-
-            belief_targets.append(seat_label_indices.get(agent_id, 0))
+            # Determine opponent supervision target for this step
+            is_our_turn = (agent_id == 0)
+            if not is_our_turn:
+                # On an opponent's turn, the target is their current action
+                opp_target_actions.append(target_actions[i])
+                opp_target_mask.append(True)
+            elif i > 0:
+                # On our turn, the target is the previous opponent's action
+                prev_agent_id = agent_type_list[i-1]
+                prev_action = target_actions[i-1]
+                if prev_agent_id != 0 and prev_action != 6:
+                    opp_target_actions.append(prev_action)
+                    opp_target_mask.append(True)
+                else:
+                    # No valid previous opponent action to predict
+                    opp_target_actions.append(-100) # ignore_index
+                    opp_target_mask.append(False)
+            else:
+                # First step of the game, no previous action
+                opp_target_actions.append(-100)
+                opp_target_mask.append(False)
 
         obs_tensor = torch.tensor(np.stack(obs_list), dtype=torch.float32)
         action_tensor = torch.tensor(input_actions, dtype=torch.long)
@@ -336,37 +238,25 @@ class AutoregressiveGameDataset(Dataset):
         mask_tensor = torch.tensor(np.array(action_mask_list), dtype=torch.bool)
         agent_type_tensor = torch.tensor(agent_type_list, dtype=torch.long)
         position_tensor = torch.tensor(position_list, dtype=torch.long)
-
-        belief_tensor = None
-        if opponent_labels is not None or seat_label_indices:
-            belief_tensor = torch.tensor(np.array(belief_targets, dtype=np.int64), dtype=torch.long)
-
-        attention_mask = torch.triu(
-            torch.ones(seq_len, seq_len, dtype=torch.bool),
-            diagonal=1,
-        )
+        
+        opp_target_actions_tensor = torch.tensor(opp_target_actions, dtype=torch.long)
+        opp_target_mask_tensor = torch.tensor(opp_target_mask, dtype=torch.bool)
 
         seq_dict = {
-            "obs": obs_tensor,
-            "action": action_tensor,
+            "obs_sequence": obs_tensor,
+            "action_sequence": action_tensor,
             "target_action": target_tensor,
-            "action_mask": mask_tensor,
-            "agent_type": agent_type_tensor,
-            "position": position_tensor,
-            "attention_mask": attention_mask,
+            "action_masks": mask_tensor,
+            "agent_types": agent_type_tensor,
+            "positions": position_tensor,
             "length": seq_len,
-            "round_id": round_data.get("round_id", round_data.get("game_id", None)),
-            "belief": belief_tensor,
+            "opp_target_actions": opp_target_actions_tensor,
+            "opp_target_mask": opp_target_mask_tensor,
         }
 
         return seq_dict
 
 def collate_variable_length_sequences(batch):
-    """
-    Custom collate function for batching variable-length sequences.
-    Pads to the max length in the batch and returns masks. Tensors are
-    created on the same device as the input tensors.
-    """
     if not batch:
         return {}
 
@@ -374,53 +264,31 @@ def collate_variable_length_sequences(batch):
     batch_size = len(batch)
     
     first_seq = batch[0]
-    device = first_seq['obs'].device
-    obs_dim = first_seq['obs'].shape[1]
-    belief_example = first_seq.get('belief')
+    device = first_seq['obs_sequence'].device
+    obs_dim = first_seq['obs_sequence'].shape[1]
 
-    batched_obs = torch.zeros(batch_size, max_seq_len, obs_dim, device=device)
-    batched_action = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
-    batched_target_action = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
-    batched_action_mask = torch.zeros(batch_size, max_seq_len, 7, dtype=torch.bool, device=device)
-    batched_agent_type = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
-    batched_position = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
-    padding_mask = torch.ones(batch_size, max_seq_len, dtype=torch.bool, device=device)
+    # Initialize all required tensors
+    batched = {
+        "obs_sequence": torch.zeros(batch_size, max_seq_len, obs_dim, device=device, dtype=torch.float32),
+        "action_sequence": torch.zeros(batch_size, max_seq_len, device=device, dtype=torch.long),
+        "target_action": torch.zeros(batch_size, max_seq_len, device=device, dtype=torch.long),
+        "action_masks": torch.zeros(batch_size, max_seq_len, 7, device=device, dtype=torch.bool),
+        "agent_types": torch.zeros(batch_size, max_seq_len, device=device, dtype=torch.long),
+        "positions": torch.zeros(batch_size, max_seq_len, device=device, dtype=torch.long),
+        "opp_target_actions": torch.full((batch_size, max_seq_len), -100, device=device, dtype=torch.long),
+        "opp_target_mask": torch.zeros(batch_size, max_seq_len, device=device, dtype=torch.bool),
+        "padding_mask": torch.ones(batch_size, max_seq_len, device=device, dtype=torch.bool),
+    }
 
-    if belief_example is not None:
-        if belief_example.dim() == 1:
-            batched_belief = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
-        else:
-            trailing = belief_example.shape[1:]
-            batched_belief = torch.zeros((batch_size, max_seq_len) + trailing, dtype=torch.long, device=device)
-    else:
-        batched_belief = None
-
-    round_ids = []
     for i, seq in enumerate(batch):
         seq_len = seq["length"]
-        batched_obs[i, :seq_len] = seq["obs"]
-        batched_action[i, :seq_len] = seq["action"]
-        batched_target_action[i, :seq_len] = seq["target_action"]
-        batched_action_mask[i, :seq_len] = seq["action_mask"]
-        if batched_belief is not None and seq["belief"] is not None:
-            batched_belief[i, :seq_len] = seq["belief"]
-        batched_agent_type[i, :seq_len] = seq["agent_type"]
-        batched_position[i, :seq_len] = seq["position"]
-        padding_mask[i, :seq_len] = False
-        round_ids.append(seq["round_id"])
+        for key, tensor in seq.items():
+            if key in batched and torch.is_tensor(tensor):
+                batched[key][i, :seq_len] = tensor
+        
+        batched["padding_mask"][i, :seq_len] = False
 
-    batch_dict = {
-        "obs": batched_obs,
-        "action": batched_action,
-        "target_action": batched_target_action,
-        "action_mask": batched_action_mask,
-        "agent_type": batched_agent_type,
-        "position": batched_position,
-        "padding_mask": padding_mask,
-        "round_ids": round_ids,
-        "belief": batched_belief,
-    }
-    return batch_dict
+    return batched
 
 
 def move_batch_to_device(batch, device):
@@ -569,120 +437,48 @@ def load_autoreg_data(data_dir, max_files=None, max_samples=None):
     return all_rounds
 
 def calculate_autoregressive_loss(
-    self_logits,
-    opp_logits,
-    target_actions,
-    agent_types,
-    padding_mask,
-    value_pred=None,
-    value_target=None,
-    *,
-    activations: torch.Tensor | None = None,
-    bricks: torch.Tensor | None = None,
-):
+    self_logits: torch.Tensor,
+    opp_logits: torch.Tensor,
+    target_actions: torch.Tensor,
+    agent_types: torch.Tensor,
+    padding_mask: torch.Tensor,
+    opp_target_mask: torch.Tensor,
+    opp_target_actions: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Simplified loss calculation for supervised learning.
+    - self_loss: Cross-entropy for our agent's turns.
+    - opp_loss: Cross-entropy for opponent turns AND predicting previous opponent action on our turns.
+    """
     device = self_logits.device
-    valid  = (~padding_mask).bool()
+    valid_mask = ~padding_mask
 
-    # Masks
-    our_mask = valid & (agent_types == 0)
-    opp_mask = valid & (agent_types != 0)
-
-    # Counts (effective sample sizes)
-    n_self   = int(our_mask.sum().item())
-    n_opp    = int(opp_mask.sum().item())
-    n_value  = int(valid.sum().item())
-    n_total  = max(n_self + n_opp, 1)
-
-    # === Policy losses (means over their own samples) ===
-    if n_self > 0:
+    # --- Self (Policy) Loss ---
+    our_mask = valid_mask & (agent_types == 0)
+    if our_mask.any():
         self_loss = F.cross_entropy(
-            self_logits[our_mask].reshape(-1, self_logits.size(-1)),
-            target_actions[our_mask].reshape(-1)
+            self_logits[our_mask],
+            target_actions[our_mask],
         )
     else:
         self_loss = torch.tensor(0.0, device=device)
 
-    if n_opp > 0:
+    # --- Opponent Loss (Consolidated) ---
+    # This now includes opponent turns and our turns where we predict the previous action.
+    if opp_target_mask.any():
         opp_loss = F.cross_entropy(
-            opp_logits[opp_mask].reshape(-1, opp_logits.size(-1)),
-            target_actions[opp_mask].reshape(-1)
+            opp_logits[opp_target_mask],
+            opp_target_actions[opp_target_mask],
+            ignore_index=-100, # Use ignore_index for safety
         )
     else:
         opp_loss = torch.tensor(0.0, device=device)
 
-    # === Value loss (mean over valid steps) ===
-    if (value_pred is not None) and (value_target is not None) and (n_value > 0):
-        value_loss = F.mse_loss(value_pred[valid], value_target[valid])
-    else:
-        value_loss = torch.tensor(0.0, device=device)
+    # --- Total Loss ---
+    # In SL, we typically weight these equally unless there's a specific reason not to.
+    total_loss = self_loss + opp_loss
 
-    # === Adaptive weights based on effective sample amounts ===
-    # Our-turns got rarer going 3P->4P; keep self & belief influence stable by ~1/p(our_turn).
-    # Use empirical p_our_hat for robustness to padding/truncation.
-    p_our_hat = n_self / max(n_total, 1)
-    inv_p_our = 1.0 / max(p_our_hat, 1e-6)
-
-    self_w   = inv_p_our                # e.g., ~num_players if batches are balanced
-    opp_w    = 1.0                      # keep opponents at 1.0 (tune if needed)
-    value_w  = 1.0                      # value stays at 1.0 by default
-
-    # === New regularization losses for Sparse Dictionary ===
-    l1_sparsity_loss = torch.tensor(0.0, device=device)
-    usage_balance_loss = torch.tensor(0.0, device=device)
-    brick_diversity_loss = torch.tensor(0.0, device=device)
-
-    if activations is not None and activations.numel() > 0:
-        # Opponent-only activations: [N_opp, K]
-        if opp_mask.any():
-            opp_acts = activations[opp_mask]  # shape [N, K]
-            # L1 sparsity over opponent steps
-            l1_sparsity_loss = opp_acts.abs().mean()
-
-            # Usage balance: KL divergence from uniform over bricks
-            # Compute mean activation per brick, normalize to a distribution
-            per_brick = opp_acts.sum(dim=0)
-            eps = 1e-8
-            p = per_brick / (per_brick.sum() + eps)
-            K = p.numel()
-            if K > 0:
-                uniform = torch.full_like(p, 1.0 / K)
-                # KL(p || u) = sum p * (log p - log u)
-                usage_balance_loss = (p * (torch.log(p + eps) - torch.log(uniform + eps))).sum()
-
-    if bricks is not None and bricks.numel() > 0:
-        # Encourage diversity by penalizing cosine similarity between different bricks
-        Bk = bricks
-        Bn = F.normalize(Bk, dim=1)  # [K, D]
-        sim = (Bn @ Bn.t())          # [K, K]
-        K = sim.size(0)
-        if K > 1:
-            eye = torch.eye(K, device=sim.device, dtype=sim.dtype)
-            off_diag = (sim - eye)
-            brick_diversity_loss = (off_diag.pow(2).sum()) / (K * (K - 1))
-
-    # Weights from config (fallback defaults if missing)
-    w_l1 = float(getattr(config, "L1_SPARSITY_WEIGHT", 0.01))
-    w_usage = float(getattr(config, "USAGE_BALANCE_WEIGHT", 1.0))
-    w_div = float(getattr(config, "BRICK_DIVERSITY_WEIGHT", 1.0))
-
-    total = (
-        self_w * self_loss
-        + opp_w * opp_loss
-        + value_w * value_loss
-        + w_l1 * l1_sparsity_loss
-        + w_usage * usage_balance_loss
-        + w_div * brick_diversity_loss
-    )
-
-    return (
-        total,
-        self_loss,
-        opp_loss,
-        value_loss,
-        l1_sparsity_loss,
-        usage_balance_loss,
-        brick_diversity_loss,
-    )
+    return total_loss, self_loss, opp_loss
 
 def compute_accuracy(logits, targets, mask=None):
     """
@@ -714,7 +510,6 @@ def compute_accuracy(logits, targets, mask=None):
 
 def train_autoregressive_model(
     data_dir,
-    num_opponent_types=None,
     hidden_dim=256,
     learning_rate=1e-4,
     batch_size=512,
@@ -727,7 +522,7 @@ def train_autoregressive_model(
     max_seq_length=480,
     resume_from=None
 ):
-    """Train the AutoregressiveGameModel on sequence data with a single action head."""
+    """Train the clonable dense model on sequence data."""
 
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -737,19 +532,11 @@ def train_autoregressive_model(
     log_dir = log_dir or os.path.join("logs", f"autoreg_{timestamp}")
     os.makedirs(log_dir, exist_ok=True)
     logger = setup_logging(os.path.join(log_dir, "training.log"))
-    logger.info(f"Starting AutoregressiveGameModel training with device: {device}")
+    logger.info(f"Starting Supervised Learning with device: {device}")
     writer = SummaryWriter(log_dir=log_dir)
-
-    opponent_mapping = create_opponent_mapping(data_dir)
-    logger.info(f"Created opponent mapping with {len(opponent_mapping)} types")
-    if num_opponent_types is None:
-        num_opponent_types = max(opponent_mapping.values()) + 1
-        logger.info(f"Setting num_opponent_types to {num_opponent_types}")
 
     full_dataset = AutoregressiveGameDataset(
         data_dir=data_dir,
-        opponent_mapping=opponent_mapping,
-        num_opponent_types=num_opponent_types,
         max_files=max_files,
         max_samples=max_samples,
     )
@@ -771,20 +558,19 @@ def train_autoregressive_model(
     )
 
     sample = next(iter(train_loader))
-    obs_dim = sample['obs'].shape[2]
+    obs_dim = sample['obs_sequence'].shape[2]
     action_dim = 7
     logger.info(f"Model dimensions: obs_dim={obs_dim}, action_dim={action_dim}")
 
-    # Main autoregressive model that outputs embeddings
-    model = PPOReactiveModel(
+    model = PPOReactiveModelSingle(
         obs_dim=obs_dim,
         action_dim=action_dim,
         hidden_dim=hidden_dim,
-        num_heads=hidden_dim//64,
+        num_heads=4, # Assuming hidden_dim // 64
         num_layers=2,
         dropout_rate=0.1,
         max_seq_length=max_seq_length,
-        num_agent_types=4,
+        num_agent_types=4, # 0=self, 1,2,3=opponents
     ).to(device)
 
     pt_dtype = torch.float16 if device.type == 'cuda' else torch.bfloat16
@@ -794,7 +580,7 @@ def train_autoregressive_model(
     logger.info(f"Total parameters: {total_params}, Trainable parameters: {trainable_params}")
     
     scaler = amp.GradScaler(device=device, enabled=(device.type == 'cuda'))
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5, fused=False)
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
     start_epoch, best_train_loss = 0, float('inf')
@@ -810,49 +596,35 @@ def train_autoregressive_model(
         epoch_start = time.time()
         model.train()
 
-        # reset metrics
-        train_total_loss   = 0.0
-        train_self_loss    = 0.0
-        train_opp_loss     = 0.0
-        train_value_loss   = 0.0
-        train_batches      = 0
-        train_agent_acc    = 0.0
+        train_total_loss = 0.0
+        train_self_loss = 0.0
+        train_opp_loss = 0.0
+        train_batches = 0
+        train_agent_acc = 0.0
         train_opponent_acc = 0.0
-        # New regularization aggregators
-        train_l1_loss      = 0.0
-        train_usage_loss   = 0.0
-        train_diversity_loss = 0.0
 
         train_progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Train)", leave=False)
         for batch in train_progress:
             batch = move_batch_to_device(batch, device)
             with amp.autocast(device_type=device.type, dtype=pt_dtype):
-                outs = model(
-                    obs_sequence=batch['obs'],
-                    action_sequence=batch['action'],
-                    agent_types=batch['agent_type'],
-                    positions=batch['position'],
-                    action_masks=batch['action_mask'],
+                # Model now only returns action_logits and opp_logits
+                self_logits, opp_logits = model(
+                    obs_sequence=batch['obs_sequence'],
+                    action_sequence=batch['action_sequence'],
+                    agent_types=batch['agent_types'],
+                    positions=batch['positions'],
+                    action_masks=batch['action_masks'],
                     padding_mask=batch['padding_mask'],
                 )
-                self_logits, opp_logits, value_pred = outs
 
-                (
-                    total_loss,
-                    self_loss,
-                    opp_loss,
-                    value_loss,
-                    l1_loss,
-                    usage_loss,
-                    diversity_loss,
-                ) = calculate_autoregressive_loss(
+                total_loss, self_loss, opp_loss = calculate_autoregressive_loss(
                     self_logits=self_logits,
                     opp_logits=opp_logits,
                     target_actions=batch['target_action'],
-                    agent_types=batch['agent_type'],
+                    agent_types=batch['agent_types'],
                     padding_mask=batch['padding_mask'],
-                    value_pred=value_pred,
-                    value_target=None,
+                    opp_target_mask=batch['opp_target_mask'],
+                    opp_target_actions=batch['opp_target_actions'],
                 )
 
             optimizer.zero_grad()
@@ -862,66 +634,44 @@ def train_autoregressive_model(
             scaler.step(optimizer)
             scaler.update()
 
-            # accumulate losses
             train_total_loss += total_loss.item()
             train_self_loss  += self_loss.item()
             train_opp_loss   += opp_loss.item()
-            train_value_loss += value_loss.item()
-            train_l1_loss     += float(l1_loss.item() if torch.is_tensor(l1_loss) else l1_loss)
-            train_usage_loss  += float(usage_loss.item() if torch.is_tensor(usage_loss) else usage_loss)
-            train_diversity_loss += float(diversity_loss.item() if torch.is_tensor(diversity_loss) else diversity_loss)
             train_batches    += 1
 
-            # compute accuracies
-            our_mask = (batch['agent_type'] == 0) & (~batch['padding_mask'])  # Agent turns
-            opp_mask = ((batch['agent_type'] == 1) | (batch['agent_type'] == 2) | (batch['agent_type'] == 3)) & (~batch['padding_mask'])
-
-            agent_acc    = compute_accuracy(self_logits, batch['target_action'], our_mask)
-            opponent_acc = compute_accuracy(opp_logits,  batch['target_action'], opp_mask)
-            train_agent_acc    += agent_acc
+            our_mask = (batch['agent_types'] == 0) & (~batch['padding_mask'])
+            agent_acc = compute_accuracy(self_logits, batch['target_action'], our_mask)
+            opponent_acc = compute_accuracy(opp_logits, batch['opp_target_actions'], batch['opp_target_mask'])
+            train_agent_acc += agent_acc
             train_opponent_acc += opponent_acc
 
             train_progress.set_postfix({
-                'tot': total_loss.item(),
-                'self': self_loss.item(),
-                'opp': opp_loss.item(),
+                'loss': total_loss.item(),
+                'self_acc': agent_acc,
+                'opp_acc': opponent_acc,
             })
 
-        # average metrics
-        train_total_loss   /= train_batches
-        train_self_loss    /= train_batches
-        train_opp_loss     /= train_batches
-        train_value_loss   /= train_batches
-        train_agent_acc    /= train_batches
+        train_total_loss /= train_batches
+        train_self_loss /= train_batches
+        train_opp_loss /= train_batches
+        train_agent_acc /= train_batches
         train_opponent_acc /= train_batches
-        train_l1_loss      /= train_batches
-        train_usage_loss   /= train_batches
-        train_diversity_loss /= train_batches
 
-        # scheduler step
         scheduler.step(train_total_loss)
         epoch_time = time.time() - epoch_start
 
-        # print summary
         logger.info(
             f"Epoch {epoch+1}/{num_epochs} (Time: {epoch_time:.2f}s)\n"
             f"  Train - Loss: {train_total_loss:.6f}, Self: {train_self_loss:.6f}, Opp: {train_opp_loss:.6f}, "
-            f"Agent Acc: {train_agent_acc:.4f}, Opp Acc: {train_opponent_acc:.4f}, "
-            f"L1: {train_l1_loss:.6f}, Usage: {train_usage_loss:.6f}, Diversity: {train_diversity_loss:.6f}"
+            f"Agent Acc: {train_agent_acc:.4f}, Opp Acc: {train_opponent_acc:.4f}"
         )
 
-        # log to TensorBoard
-        writer.add_scalar("Loss/Train/Total",  train_total_loss, epoch)
-        writer.add_scalar("Loss/Train/Self",   train_self_loss, epoch)
-        writer.add_scalar("Loss/Train/Opp",    train_opp_loss, epoch)
-        writer.add_scalar("Loss/Train/Value",  train_value_loss, epoch)
-        writer.add_scalar("Loss/Train/L1_Sparsity", train_l1_loss, epoch)
-        writer.add_scalar("Loss/Train/Usage_Balance", train_usage_loss, epoch)
-        writer.add_scalar("Loss/Train/Brick_Diversity", train_diversity_loss, epoch)
-        writer.add_scalar("Acc/Train/Agent",   train_agent_acc, epoch)
-        writer.add_scalar("Acc/Train/Opponent",train_opponent_acc, epoch)
+        writer.add_scalar("Loss/Train/Total", train_total_loss, epoch)
+        writer.add_scalar("Loss/Train/Self", train_self_loss, epoch)
+        writer.add_scalar("Loss/Train/Opp", train_opp_loss, epoch)
+        writer.add_scalar("Acc/Train/Agent", train_agent_acc, epoch)
+        writer.add_scalar("Acc/Train/Opponent", train_opponent_acc, epoch)
 
-        # Save model if train loss improved
         if train_total_loss < best_train_loss:
             best_train_loss = train_total_loss
             checkpoint_path = os.path.join(checkpoint_dir, f"autoreg_model_best.pth")
@@ -930,16 +680,9 @@ def train_autoregressive_model(
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'train_loss': train_total_loss,
-                'opponent_mapping': opponent_mapping,
-                'num_opponent_types': num_opponent_types,
-                'obs_dim': obs_dim,
-                'belief_dim': num_opponent_types,
-                'action_dim': action_dim,
-                'hidden_dim': hidden_dim
             }, checkpoint_path)
             logger.info(f"  Saved new best model with train loss: {train_total_loss:.6f}")
         
-        # Save periodic checkpoint
         if (epoch + 1) % 10 == 0 or epoch == num_epochs - 1:
             checkpoint_path = os.path.join(checkpoint_dir, f"autoreg_model_epoch_{epoch+1}.pth")
             torch.save({
@@ -947,39 +690,23 @@ def train_autoregressive_model(
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'train_loss': train_total_loss,
-                'opponent_mapping': opponent_mapping,
-                'num_opponent_types': num_opponent_types,
-                'obs_dim': obs_dim,
-                'belief_dim': num_opponent_types,
-                'action_dim': action_dim,
-                'hidden_dim': hidden_dim
             }, checkpoint_path)
             logger.info(f"  Saved checkpoint at epoch {epoch+1}")
             
-    # Save final model
     final_path = os.path.join(checkpoint_dir, "autoreg_model_final.pth")
     torch.save({
         'epoch': num_epochs - 1,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'train_loss': train_total_loss,
-        'opponent_mapping': opponent_mapping,
-        'num_opponent_types': num_opponent_types,
-        'obs_dim': obs_dim,
-        'belief_dim': num_opponent_types,
-        'action_dim': action_dim,
-        'hidden_dim': hidden_dim
     }, final_path)
     logger.info(f"Saved final model to {final_path}")
     
     writer.close()
-    
-    return model, opponent_mapping
 
 def main():
     parser = argparse.ArgumentParser(description="Train AutoregressiveGameModel using PS-generated sequence data")
     parser.add_argument("--data-dir", type=str, default="./ps_autoreg_data", help="Directory containing PS data files")
-    parser.add_argument("--num-opponent-types", type=int, default=None, help="Number of opponent types (auto-detected if None)")
     parser.add_argument("--hidden-dim", type=int, default=256, help="Hidden dimension for the model")
     parser.add_argument("--learning-rate", type=float, default=5e-5, help="Learning rate")
     parser.add_argument("--batch-size", type=int, default=512, help="Batch size")
@@ -999,9 +726,8 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    model, opponent_mapping = train_autoregressive_model(
+    train_autoregressive_model(
         data_dir=args.data_dir,
-        num_opponent_types=args.num_opponent_types,
         hidden_dim=args.hidden_dim,
         learning_rate=args.learning_rate,
         batch_size=args.batch_size,

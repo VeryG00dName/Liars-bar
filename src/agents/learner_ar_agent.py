@@ -279,17 +279,7 @@ def build_model_from_state(
     This function is polymorphic and can identify and build either a
     PPOFusedModel or a PPOReactiveModel.
     """
-    # --- START OF MODIFICATIONS ---
-    if MFactoryUtil.is_reactive_model(model_state_dict):
-        ModelClass = PPOReactiveModel
-    elif MFactoryUtil.is_fused_model(model_state_dict):
-        ModelClass = PPOFusedModel
-    elif MFactoryUtil.is_ppo_autoregressive_model(model_state_dict):
-        ModelClass = PPOAutoregressiveModel
-    else:
-        # Default fallback or raise an error
-        logging.warning("Could not definitively identify model type from state_dict. Defaulting to PPOFusedModel.")
-        ModelClass = PPOFusedModel
+    ModelClass = PPOReactiveModel
     # --- END OF MODIFICATIONS ---
 
     try:
