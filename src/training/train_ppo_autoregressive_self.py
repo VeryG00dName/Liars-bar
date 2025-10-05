@@ -211,12 +211,17 @@ def _build_floor_focus_curriculum(
     coverage_floor: int = 16,
     focus_counts: Optional[List[int]] = None,
     self_play_count: Optional[int] = None,
+    allowed_opponent_labels: Optional[set] = None,
 ) -> List[List[int]]:
     focus_counts = focus_counts or [128, 96, 64, 32]
     self_play_count = coverage_floor if self_play_count is None else self_play_count
 
     entries = pool_manager.get_entries(include_cpp=True)
     all_labels = [int(e["label"]) for e in entries if e.get("label") is not None]
+    if allowed_opponent_labels is not None:
+        allowed = {int(x) for x in allowed_opponent_labels}
+        # Keep training label regardless (for self-play); filter opponents to allowed
+        all_labels = [lbl for lbl in all_labels if (lbl in allowed) or (lbl == training_label)]
     opponent_labels = [lbl for lbl in all_labels if lbl != training_label]
 
     triplets: List[List[int]] = []
@@ -249,6 +254,9 @@ def _build_floor_focus_curriculum(
         e for e in entries
         if e.get("type") != "cpp_bot" and e.get("label") not in {None, training_label}
     ]
+    if allowed_opponent_labels is not None:
+        allowed = {int(x) for x in allowed_opponent_labels}
+        recent_entries = [e for e in recent_entries if int(e["label"]) in allowed]
     recent_entries = recent_entries[-len(focus_counts):]
     recent_entries.reverse()
     for idx, count in enumerate(focus_counts):
@@ -664,6 +672,8 @@ def train_generation(
         # remaining seats using explicit triplets built below.
         training_ids_for_rollout = [training_policy_id]
 
+        # Only schedule opponents that are available in the C++ manager (native bots or traced historicals)
+        available_opponents = set(registered_cpp_bots) | set(loaded_historical_labels)
         triplet_list = _build_floor_focus_curriculum(
             pool_manager,
             training_policy_id,
@@ -671,6 +681,7 @@ def train_generation(
             coverage_floor=COVERAGE_FLOOR,
             focus_counts=FRONTIER_FOCUS_COUNTS,
             self_play_count=COVERAGE_FLOOR,
+            allowed_opponent_labels=available_opponents,
         )
 
         current_episode_target = len(triplet_list)

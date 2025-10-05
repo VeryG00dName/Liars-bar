@@ -97,8 +97,16 @@ class PPOReactiveModelScript(nn.Module):
                 gate_probs = torch.softmax(gate_logits, dim=-1)
                 top_scores, top_indices = torch.topk(gate_probs, self.top_k, dim=-1)
                 top_weights = top_scores / top_scores.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-                expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=2)
-                gather_idx = top_indices.unsqueeze(-1).expand(*top_indices.shape, self.hidden_dim)
+                # Build expert outputs by iterating ModuleList (TorchScript supports this)
+                outs: List[torch.Tensor] = []
+                for expert in self.experts:
+                    outs.append(expert(x))
+                expert_outputs = torch.stack(outs, dim=2)
+                # TorchScript cannot unpack tensor.shape with varargs; use explicit sizes
+                bsz = top_indices.size(0)
+                tsz = top_indices.size(1)
+                ksz = top_indices.size(2)
+                gather_idx = top_indices.unsqueeze(-1).expand(bsz, tsz, ksz, self.hidden_dim)
                 top_outputs = torch.gather(expert_outputs, 2, gather_idx)
                 combined = (top_outputs * top_weights.unsqueeze(-1)).sum(dim=2)
                 routing = {
@@ -209,20 +217,81 @@ class PPOReactiveModelScript(nn.Module):
             output, routing = layer(output, causal_mask, key_padding)
         transformer_output = self.transformer_norm(output)
 
-        final_indices = routing.get("topk_indices")
-        final_scores = routing.get("topk_scores")
+        # Routing tensors are always provided by the final MoE layer
+        final_indices = routing["topk_indices"]
+        final_scores = routing["topk_scores"]
 
-        def combine_head(heads: nn.ModuleList) -> torch.Tensor:
-            all_outputs = torch.stack([head(transformer_output) for head in heads], dim=2)
-            if final_indices is None or final_scores is None:
-                return all_outputs.mean(dim=2)
-            gather_idx = final_indices.unsqueeze(-1).expand(*final_indices.shape, all_outputs.size(-1))
-            top_outputs = torch.gather(all_outputs, 2, gather_idx)
-            return (top_outputs * final_scores.unsqueeze(-1)).sum(dim=2)
-
-        action_logits = combine_head(self.action_heads)
-        state_values = combine_head(self.reward_stream_heads)
-        win_logits = combine_head(self.win_prob_heads)
-        opp_logits = combine_head(self.opp_action_heads)
+        action_logits = self._combine_action_heads(transformer_output, final_indices, final_scores)
+        state_values = self._combine_reward_heads(transformer_output, final_indices, final_scores)
+        win_logits = self._combine_winprob_heads(transformer_output, final_indices, final_scores)
+        opp_logits = self._combine_opp_heads(transformer_output, final_indices, final_scores)
 
         return action_logits, opp_logits, state_values, win_logits
+
+    @torch.jit.export
+    def _combine_action_heads(
+        self,
+        transformer_output: torch.Tensor,
+        final_indices: torch.Tensor,
+        final_scores: torch.Tensor,
+    ) -> torch.Tensor:
+        outs: List[torch.Tensor] = []
+        for head in self.action_heads:
+            outs.append(head(transformer_output))
+        all_outputs = torch.stack(outs, dim=2)
+        gather_idx = final_indices.unsqueeze(-1).expand(
+            final_indices.size(0), final_indices.size(1), final_indices.size(2), all_outputs.size(-1)
+        )
+        top_outputs = torch.gather(all_outputs, 2, gather_idx)
+        return (top_outputs * final_scores.unsqueeze(-1)).sum(dim=2)
+
+    @torch.jit.export
+    def _combine_reward_heads(
+        self,
+        transformer_output: torch.Tensor,
+        final_indices: torch.Tensor,
+        final_scores: torch.Tensor,
+    ) -> torch.Tensor:
+        outs: List[torch.Tensor] = []
+        for head in self.reward_stream_heads:
+            outs.append(head(transformer_output))
+        all_outputs = torch.stack(outs, dim=2)
+        gather_idx = final_indices.unsqueeze(-1).expand(
+            final_indices.size(0), final_indices.size(1), final_indices.size(2), all_outputs.size(-1)
+        )
+        top_outputs = torch.gather(all_outputs, 2, gather_idx)
+        return (top_outputs * final_scores.unsqueeze(-1)).sum(dim=2)
+
+    @torch.jit.export
+    def _combine_winprob_heads(
+        self,
+        transformer_output: torch.Tensor,
+        final_indices: torch.Tensor,
+        final_scores: torch.Tensor,
+    ) -> torch.Tensor:
+        outs: List[torch.Tensor] = []
+        for head in self.win_prob_heads:
+            outs.append(head(transformer_output))
+        all_outputs = torch.stack(outs, dim=2)
+        gather_idx = final_indices.unsqueeze(-1).expand(
+            final_indices.size(0), final_indices.size(1), final_indices.size(2), all_outputs.size(-1)
+        )
+        top_outputs = torch.gather(all_outputs, 2, gather_idx)
+        return (top_outputs * final_scores.unsqueeze(-1)).sum(dim=2)
+
+    @torch.jit.export
+    def _combine_opp_heads(
+        self,
+        transformer_output: torch.Tensor,
+        final_indices: torch.Tensor,
+        final_scores: torch.Tensor,
+    ) -> torch.Tensor:
+        outs: List[torch.Tensor] = []
+        for head in self.opp_action_heads:
+            outs.append(head(transformer_output))
+        all_outputs = torch.stack(outs, dim=2)
+        gather_idx = final_indices.unsqueeze(-1).expand(
+            final_indices.size(0), final_indices.size(1), final_indices.size(2), all_outputs.size(-1)
+        )
+        top_outputs = torch.gather(all_outputs, 2, gather_idx)
+        return (top_outputs * final_scores.unsqueeze(-1)).sum(dim=2)
