@@ -1,10 +1,137 @@
 # src/model/ppo_reactive_model.py
 
-from typing import Optional, Tuple
-from torch.utils.checkpoint import checkpoint
+import copy
+from typing import Dict, List, Optional, Tuple
+
 import torch
 import torch.nn as nn
-    
+
+
+def _make_moe_ffn(hidden_dim: int, expert_ffn_dim: int, dropout: float) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Linear(hidden_dim, expert_ffn_dim),
+        nn.GELU(),
+        nn.Dropout(dropout),
+        nn.Linear(expert_ffn_dim, hidden_dim),
+        nn.Dropout(dropout),
+    )
+
+
+class TopKMoELayer(nn.Module):
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_experts: int,
+        top_k: int,
+        expert_ffn_dim: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.gate = nn.Linear(hidden_dim, num_experts)
+        self.experts = nn.ModuleList(
+            [_make_moe_ffn(hidden_dim, expert_ffn_dim, dropout) for _ in range(num_experts)]
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        gate_logits = self.gate(x)
+        gate_probs = torch.softmax(gate_logits, dim=-1)
+        topk_scores, topk_indices = torch.topk(gate_probs, self.top_k, dim=-1)
+        topk_weights = topk_scores / topk_scores.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=2)
+        gather_index = topk_indices.unsqueeze(-1).expand(
+            *topk_indices.shape, self.hidden_dim
+        )
+        topk_outputs = torch.gather(expert_outputs, 2, gather_index)
+        combined = (topk_outputs * topk_weights.unsqueeze(-1)).sum(dim=2)
+
+        routing_info = {
+            "gate_logits": gate_logits,
+            "topk_indices": topk_indices,
+            "topk_scores": topk_weights,
+        }
+        return combined, routing_info
+
+
+class MoETransformerEncoderLayer(nn.Module):
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        dropout: float,
+        num_experts: int,
+        top_k: int,
+        expert_ffn_dim: int,
+        activation: str = "gelu",
+        layer_norm_eps: float = 1e-5,
+    ) -> None:
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(hidden_dim, eps=layer_norm_eps)
+        self.norm2 = nn.LayerNorm(hidden_dim, eps=layer_norm_eps)
+        self.moe = TopKMoELayer(
+            hidden_dim=hidden_dim,
+            num_experts=num_experts,
+            top_k=top_k,
+            expert_ffn_dim=expert_ffn_dim,
+            dropout=dropout,
+        )
+    def forward(
+        self,
+        src: torch.Tensor,
+        src_mask: Optional[torch.Tensor] = None,
+        src_key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        attn_output, _ = self.self_attn(
+            src,
+            src,
+            src,
+            attn_mask=src_mask,
+            key_padding_mask=src_key_padding_mask,
+            need_weights=False,
+        )
+        src = self.norm1(src + self.dropout1(attn_output))
+        moe_output, routing = self.moe(src)
+        src = self.norm2(src + self.dropout2(moe_output))
+        return src, routing
+
+
+class MoETransformerEncoder(nn.Module):
+    def __init__(self, layer: MoETransformerEncoderLayer, num_layers: int) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList([copy.deepcopy(layer) for _ in range(num_layers)])
+        self.norm = nn.LayerNorm(layer.self_attn.embed_dim)
+
+    def forward(
+        self,
+        src: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        src_key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor], Dict[str, torch.Tensor]]:
+        gate_logits: List[torch.Tensor] = []
+        routing: Dict[str, torch.Tensor] = {}
+        output = src
+        for layer in self.layers:
+            output, routing = layer(
+                output,
+                src_mask=mask,
+                src_key_padding_mask=src_key_padding_mask,
+            )
+            gate_logits.append(routing["gate_logits"])
+        output = self.norm(output)
+        return output, gate_logits, routing
+
+
 class PPOReactiveModel(nn.Module):
     """
     A simplified, monolithic autoregressive model for PPO that operates
@@ -20,6 +147,9 @@ class PPOReactiveModel(nn.Module):
                  max_seq_length=480,
                  num_agent_types=4,
                  *,
+                 num_experts: int = 8,
+                 top_k: int = 2,
+                 expert_ffn_dim: Optional[int] = None,
                  use_gradient_checkpointing: bool = False):
         super().__init__()
         self.obs_dim = obs_dim
@@ -27,6 +157,9 @@ class PPOReactiveModel(nn.Module):
         self.hidden_dim = hidden_dim
         self.max_seq_length = max_seq_length
         self.use_gradient_checkpointing = bool(use_gradient_checkpointing)
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.expert_ffn_dim = expert_ffn_dim or hidden_dim * 2
         self.count_pad = 4
         self.tflag_pad = 3
         
@@ -66,17 +199,23 @@ class PPOReactiveModel(nn.Module):
         self.register_buffer("lut_table_flag", torch.tensor([1,1,1,2,2,2,0,0,0,0,3], dtype=torch.long))
 
         # === Transformer Backbone ===
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim, nhead=num_heads, dim_feedforward=hidden_dim * 4,
-            dropout=dropout_rate, activation='gelu', batch_first=True
+        base_layer = MoETransformerEncoderLayer(
+            hidden_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout_rate,
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            expert_ffn_dim=self.expert_ffn_dim,
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer=encoder_layer, num_layers=num_layers)
+        self.transformer = MoETransformerEncoder(base_layer, num_layers=num_layers)
 
-        # === Output heads ===
-        self.action_head        = nn.Linear(hidden_dim, action_dim)
-        self.reward_stream_head = nn.Linear(hidden_dim, 1)
-        self.win_prob_head      = nn.Linear(hidden_dim, 1)
-        self.opp_action_head    = nn.Linear(hidden_dim, action_dim)
+        def make_head(out_dim: int) -> nn.ModuleList:
+            return nn.ModuleList([nn.Linear(hidden_dim, out_dim) for _ in range(self.num_experts)])
+
+        self.action_heads = make_head(action_dim)
+        self.reward_stream_heads = make_head(1)
+        self.win_prob_heads = make_head(1)
+        self.opp_action_heads = make_head(action_dim)
 
     # -------------------------- utils --------------------------
     @torch.no_grad()
@@ -137,33 +276,29 @@ class PPOReactiveModel(nn.Module):
         if padding_mask is not None:
             key_padding = padding_mask.bool().contiguous().clone()
         
-        if self.training and self.use_gradient_checkpointing:
-            def create_custom_forward(module):
-                def custom_forward(*inputs):
-                    return module(inputs[0], mask=causal_mask, src_key_padding_mask=key_padding, is_causal=True)
-                return custom_forward
+        transformer_output, gate_logits, routing = self.transformer(
+            encoded_inputs,
+            mask=causal_mask,
+            src_key_padding_mask=key_padding,
+        )
 
-            transformer_output = encoded_inputs
-            for layer in self.transformer.layers:
-                transformer_output = checkpoint(
-                    create_custom_forward(layer),
-                    transformer_output,
-                    use_reentrant=False
-                )
-            if self.transformer.norm:
-                transformer_output = self.transformer.norm(transformer_output)
-        else:
-            transformer_output = self.transformer(
-                encoded_inputs,
-                mask=causal_mask,
-                src_key_padding_mask=key_padding,
-                is_causal=True
+        final_indices = routing.get("topk_indices")
+        final_scores = routing.get("topk_scores")
+
+        def combine_head(heads: nn.ModuleList) -> torch.Tensor:
+            all_outputs = torch.stack([head(transformer_output) for head in heads], dim=2)
+            if final_indices is None or final_scores is None:
+                return all_outputs.mean(dim=2)
+            gather_idx = final_indices.unsqueeze(-1).expand(
+                *final_indices.shape, all_outputs.size(-1)
             )
+            top_outputs = torch.gather(all_outputs, 2, gather_idx)
+            return (top_outputs * final_scores.unsqueeze(-1)).sum(dim=2)
 
-        action_logits = self.action_head(transformer_output)
-        state_values = self.reward_stream_head(transformer_output)
-        win_logits = self.win_prob_head(transformer_output)
-        opp_logits = self.opp_action_head(transformer_output)
+        action_logits = combine_head(self.action_heads)
+        state_values = combine_head(self.reward_stream_heads)
+        win_logits = combine_head(self.win_prob_heads)
+        opp_logits = combine_head(self.opp_action_heads)
 
         neg = torch.tensor(
             torch.finfo(action_logits.dtype).min / 4.0,
@@ -175,4 +310,7 @@ class PPOReactiveModel(nn.Module):
             invalid   = (~action_masks.bool()) & our_turns
             action_logits = torch.where(invalid, neg, action_logits)
 
-        return action_logits, opp_logits, state_values, win_logits
+        gate_logits_tensor = torch.stack(gate_logits, dim=0) if gate_logits else transformer_output.new_zeros(
+            0, transformer_output.size(0), transformer_output.size(1), self.num_experts
+        )
+        return action_logits, opp_logits, state_values, win_logits, gate_logits_tensor, routing

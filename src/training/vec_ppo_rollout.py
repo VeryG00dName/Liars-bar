@@ -137,8 +137,7 @@ class PPOVecRolloutManager:
         num_players: int,
         training_policy_ids: Sequence[int],
         max_batch_envs: Optional[int] = None,
-        opponent_labels: Optional[Sequence[int]] = None,
-        opponent_weights: Optional[Sequence[float]] = None,
+        opponent_triplets: Optional[Sequence[Sequence[int]]] = None,
     ) -> List[Dict[str, Any]]:
         self._reset_policy_state()
         self._last_model_call_stats = {}
@@ -160,14 +159,18 @@ class PPOVecRolloutManager:
 
         self._sync_cpp_max_sequence_lengths()
 
+        triplets_arg: List[List[int]] = []
+        if opponent_triplets:
+            for triplet in opponent_triplets:
+                triplets_arg.append([int(x) for x in triplet])
+
         self.rollout_manager.start_rollouts(
             num_episodes=num_episodes,
             num_players=num_players,
             training_policy_ids=training_policy_list,
             max_batch_envs=max_batch_envs or -1,
             seed=seed,
-            opponent_labels=opponent_labels or [],
-            opponent_weights=opponent_weights or [],
+            opponent_triplets=triplets_arg,
         )
 
         while True:

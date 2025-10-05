@@ -68,6 +68,7 @@ VALUE_WEIGHT      = float(getattr(config, "VALUE_WEIGHT", 0.5))
 AUX_OPP_WEIGHT    = float(getattr(config, "AUX_OPP_WEIGHT", 1.0))
 WIN_PROB_WEIGHT   = float(getattr(config, "WIN_PROB_WEIGHT", 0.25))
 BC_KL_WEIGHT      = float(getattr(config, "BC_KL_WEIGHT", 0.0)) # Default to off
+MOE_LB_WEIGHT     = float(getattr(config, "MOE_LB_WEIGHT", 0.0))
 
 
 # ---------------------- Batched PPO loss (graph-safe) ----------------------
@@ -112,7 +113,14 @@ def _single_pass_ppo(
     Dict[str, torch.Tensor],
     Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
 ]:
-    action_logits, opp_logits, values_full, win_logits = outs[0], outs[1], outs[2].squeeze(-1).to(torch.float32), outs[3].squeeze(-1).to(torch.float32)
+    action_logits = outs[0]
+    opp_logits = outs[1]
+    values_full = outs[2].squeeze(-1).to(torch.float32)
+    win_logits = outs[3].squeeze(-1).to(torch.float32)
+    gate_logits_tensor = outs[4] if len(outs) > 4 else None
+    routing_info = outs[5] if len(outs) > 5 else {}
+    if isinstance(gate_logits_tensor, list):
+        gate_logits_tensor = torch.stack(gate_logits_tensor, dim=0)
 
     B, T = our_idx.shape
     A = action_logits.size(-1)
@@ -176,6 +184,18 @@ def _single_pass_ppo(
     # --- Total PPO Loss ---
     total = policy_loss + VALUE_WEIGHT * value_loss + entropy_loss
 
+    moe_info: Dict[str, torch.Tensor] = {}
+    if isinstance(gate_logits_tensor, torch.Tensor) and gate_logits_tensor.numel() > 0:
+        gate_logits_stack = gate_logits_tensor.to(device=device)
+        gate_probs = torch.softmax(gate_logits_stack, dim=-1)
+        usage = gate_probs.mean(dim=(0, 1, 2))
+        moe_info["gate_logits"] = gate_logits_stack.detach()
+        moe_info["probabilities"] = gate_probs.detach()
+        moe_info["usage"] = usage.detach()
+        if MOE_LB_WEIGHT > 0.0:
+            load_balance_loss = (usage * usage).sum()
+            total = total + MOE_LB_WEIGHT * load_balance_loss
+
     # --- Opponent Action Loss ---
     opp_loss = torch.zeros((), device=device)
     opp_acc = torch.zeros((), device=device)
@@ -217,7 +237,9 @@ def _single_pass_ppo(
         metrics["opp_loss"] = opp_loss.detach()
         metrics["opp_action_acc"] = opp_acc.detach()
         metrics["win_prob_loss"] = win_prob_loss.detach()
-
+        metrics["moe_load_balance"] = load_balance_loss.detach()
+        metrics["moe_usage_entropy"] = (-(usage * (usage + 1e-8).log()).sum()).detach()
+        
         if win_logits is not None:
             win_probs = torch.sigmoid(win_logits)
             preds = (win_probs > 0.5).to(torch.float32)
@@ -243,7 +265,8 @@ def _single_pass_ppo(
             metrics["win_prob_confidence_delta_half_loss"] = _safe_mean_masked(prob_at_last - prob_at_middle, loss_mask).detach()
             metrics["win_prob_confidence_at_middle_loss"] = _safe_mean_masked(prob_at_middle, loss_mask).detach()
 
-    return total, metrics
+    moe_info["routing"] = routing_info
+    return total, metrics, moe_info
 
 def ppo_losses_batched(
     model: torch.nn.Module,
@@ -251,7 +274,7 @@ def ppo_losses_batched(
     sl_teacher: Optional[torch.nn.Module] = None,
     *,
     update_num: int = 0,
-) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
     """
     Batched PPO objective. This version is simplified and does not contain
     the old compositional pressure (DCP) or dictionary regularization logic.
@@ -265,7 +288,7 @@ def ppo_losses_batched(
     episode_mask = torch.ones(our_idx.size(0), dtype=torch.bool, device=our_idx.device)
     step_mask = our_mask
 
-    total_loss, metrics = _single_pass_ppo(
+    total_loss, metrics, moe_info = _single_pass_ppo(
         model(**mi),
         batch=batch,
         mi=mi,
@@ -280,7 +303,7 @@ def ppo_losses_batched(
     )
 
     metrics["total_loss"] = total_loss.detach()
-    return total_loss, metrics
+    return total_loss, metrics, moe_info
 
 
 def _collate_batch(
@@ -373,24 +396,49 @@ def _collate_batch(
     rewards_full = torch.zeros((B, L_pad), dtype=torch.float32)
     win = torch.tensor([ep.get("win", 0) for ep in episodes], dtype=torch.float32)
 
+    num_players = max((len(ep.get("player_labels", [])) for ep in episodes), default=0)
+    if num_players <= 0:
+        num_players = int(getattr(config, "NUM_PLAYERS", 4))
+    player_labels_tensor = torch.full((B, num_players), -1, dtype=torch.long)
+    agent_id_seq = torch.zeros((B, L_pad), dtype=torch.long)
+    training_seat_tensor = torch.zeros((B,), dtype=torch.long)
+
     for b, ep in enumerate(episodes):
         our_steps = (ep["agent_id"] == ep["training_agent_seat"]).nonzero()[0]
         max_steps = min(T, len(our_steps))
         if max_steps == 0: continue
         steps = our_steps[:max_steps]
-        
+
         actions[b, :max_steps] = torch.from_numpy(ep["our_action"][steps])
         old_logp[b, :max_steps] = torch.from_numpy(ep["log_prob"][steps])
-        
+
         reward_len = min(len(ep["reward"]), L_pad)
         if reward_len > 0:
             rewards_full[b, :reward_len] = torch.from_numpy(ep["reward"][:reward_len])
-    
+
+        labels = ep.get("player_labels", [])
+        for seat_idx, label in enumerate(labels[:num_players]):
+            try:
+                player_labels_tensor[b, seat_idx] = int(label)
+            except Exception:
+                continue
+        try:
+            training_seat_tensor[b] = int(ep.get("training_agent_seat", 0))
+        except Exception:
+            training_seat_tensor[b] = 0
+
+        seq_len = min(len(ep.get("agent_id", [])), L_pad)
+        if seq_len > 0:
+            agent_id_seq[b, :seq_len] = torch.from_numpy(ep["agent_id"][:seq_len])
+
     batch = {
         "mi": mi_batch, "our_idx": our_idx, "mask": our_mask,
         "actions": actions, "old_logp": old_logp, "rewards_full": rewards_full,
         "opp_idx": opp_idx, "opp_targets": opp_targets, "opp_have_label": opp_have_label,
         "win": win,
+        "player_labels": player_labels_tensor,
+        "agent_id_seq": agent_id_seq,
+        "training_seat": training_seat_tensor,
     }
     if pin_memory:
         for k, v in batch.items():

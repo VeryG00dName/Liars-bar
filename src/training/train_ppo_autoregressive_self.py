@@ -64,6 +64,9 @@ FORCE_CUDA_SYNC_FOR_TIMING = bool(getattr(config, "FORCE_CUDA_SYNC_FOR_TIMING", 
 # ==============================================================================
 
 PAD_BUCKET_BOUNDARIES = [64, 128, 192, 256, 384, 480]
+MAX_ENVS_PER_CALL = 512
+COVERAGE_FLOOR = 16
+FRONTIER_FOCUS_COUNTS = [128, 96, 64, 32]
 
 
 def _select_bucket_length(length: int) -> int:
@@ -71,6 +74,12 @@ def _select_bucket_length(length: int) -> int:
         if length <= boundary:
             return boundary
     return int(length)
+
+
+def _chunked(seq: List[Any], size: int) -> List[List[Any]]:
+    if size <= 0:
+        return [list(seq)]
+    return [seq[i : i + size] for i in range(0, len(seq), size)]
 
 class OpponentPoolManager:
     """Manages the opponent_pool.json file for persistent population state."""
@@ -194,157 +203,74 @@ class OpponentPoolManager:
             weights.append(base)
         return labels, weights
 
-
-def _build_front_shadow_sampling(
+def _build_floor_focus_curriculum(
     pool_manager: OpponentPoolManager,
     training_label: int,
+    rng: np.random.Generator,
     *,
-    latest_k: Optional[int] = None,
-) -> Tuple[List[int], List[float], List[int], List[int]]:
-    """Return sampling labels/weights using front/shadow split with training agent downweighted by 0.5 in front."""
-    latest = latest_k if latest_k is not None else getattr(config, "LATEST_K", 4)
-    try:
-        latest = int(latest)
-    except Exception:
-        latest = 0
-    latest = max(latest, 0)
+    coverage_floor: int = 16,
+    focus_counts: Optional[List[int]] = None,
+    self_play_count: Optional[int] = None,
+) -> List[List[int]]:
+    focus_counts = focus_counts or [128, 96, 64, 32]
+    self_play_count = coverage_floor if self_play_count is None else self_play_count
 
-    front_prob = float(getattr(config, "FRONT_P_ADJUSTED", 0.75))
-    shadow_prob = float(getattr(config, "SHADOW_P_NEW", 0.25))
+    entries = pool_manager.get_entries(include_cpp=True)
+    all_labels = [int(e["label"]) for e in entries if e.get("label") is not None]
+    opponent_labels = [lbl for lbl in all_labels if lbl != training_label]
 
-    try:
-        training_label_int = int(training_label)
-    except Exception:
-        training_label_int = training_label
+    triplets: List[List[int]] = []
 
-    active_entries = [entry for entry in pool_manager.pool if isinstance(entry, dict)]
+    if not opponent_labels:
+        fallback = [training_label, training_label, training_label]
+        triplets.extend([fallback for _ in range(max(coverage_floor, 1))])
+        return triplets
 
-    historical_labels: List[int] = []
-    shadow_candidates: List[int] = []
-    for entry in active_entries:
-        label = entry.get("label")
-        if label is None:
-            continue
-        try:
-            label_int = int(label)
-        except Exception:
-            continue
-        if label_int == training_label_int:
-            continue
-        if entry.get("type") == "cpp_bot":
-            shadow_candidates.append(label_int)
-        else:
-            historical_labels.append(label_int)
+    def _sample_two(exclude: Optional[set] = None) -> Tuple[int, int]:
+        exclude = exclude or set()
+        pool = [lbl for lbl in opponent_labels if lbl not in exclude]
+        if not pool:
+            pool = opponent_labels
+        first = int(rng.choice(pool))
+        pool_second = [lbl for lbl in opponent_labels if lbl not in exclude and lbl != first]
+        if not pool_second:
+            pool_second = [lbl for lbl in opponent_labels if lbl != first] or opponent_labels
+        second = int(rng.choice(pool_second))
+        return first, second
 
-    front_hist = historical_labels[-latest:] if latest > 0 else []
+    floor_pairs = max(coverage_floor // 2, 1)
+    for label in opponent_labels:
+        for _ in range(floor_pairs):
+            other1, other2 = _sample_two({label})
+            triplets.append([label, other1, other2])
+            triplets.append([other1, label, other2])
 
-    def _unique(seq: List[int]) -> List[int]:
-        seen = set()
-        out: List[int] = []
-        for item in seq:
-            if item in seen:
-                continue
-            seen.add(item)
-            out.append(item)
-        return out
-
-    front_labels = _unique(front_hist)
-    if training_label_int is not None and training_label_int not in front_labels:
-        front_labels.append(training_label_int)
-
-    remaining_historical = [
-        lab for lab in historical_labels if lab not in front_labels and lab != training_label_int
+    recent_entries = [
+        e for e in entries
+        if e.get("type") != "cpp_bot" and e.get("label") not in {None, training_label}
     ]
-    shadow_labels = _unique(shadow_candidates + remaining_historical)
+    recent_entries = recent_entries[-len(focus_counts):]
+    recent_entries.reverse()
+    for idx, count in enumerate(focus_counts):
+        if idx >= len(recent_entries):
+            break
+        label = int(recent_entries[idx]["label"])
+        focus_pairs = max(count // 2, 1)
+        for _ in range(focus_pairs):
+            other1, other2 = _sample_two({label})
+            triplets.append([label, other1, other2])
+            triplets.append([other1, label, other2])
 
-    if not front_labels and not shadow_labels:
-        if training_label_int is not None:
-            return [training_label_int], [1.0], front_labels, shadow_labels
-        return [], [], front_labels, shadow_labels
+    self_play_iters = max(int(self_play_count), 0)
+    for _ in range(self_play_iters):
+        other1, other2 = _sample_two()
+        triplets.append([training_label, other1, other2])
 
-    total_front = len(front_labels)
-    total_shadow = len(shadow_labels)
+    if triplets:
+        order = rng.permutation(len(triplets))
+        triplets = [triplets[int(i)] for i in order]
+    return triplets
 
-    adj_front_prob = front_prob if total_front > 0 else 0.0
-    adj_shadow_prob = shadow_prob if total_shadow > 0 else 0.0
-
-    total_prob = adj_front_prob + adj_shadow_prob
-    if total_prob <= 0.0:
-        if total_front > 0 and total_shadow == 0:
-            adj_front_prob = 1.0
-        elif total_shadow > 0 and total_front == 0:
-            adj_shadow_prob = 1.0
-        elif total_front > 0 and total_shadow > 0:
-            adj_front_prob = adj_shadow_prob = 0.5
-        total_prob = adj_front_prob + adj_shadow_prob
-
-    if total_prob <= 0.0:
-        labels = front_labels + shadow_labels
-        weights = [1.0 / len(labels) for _ in labels]
-        return labels, weights, front_labels, shadow_labels
-
-    front_share = adj_front_prob / total_prob
-    shadow_share = adj_shadow_prob / total_prob
-
-    labels: List[int] = []
-    weights: List[float] = []
-
-    # --- Front weighting with 0.5 downweight for training agent ---
-    train_in_front = training_label_int in front_labels if training_label_int is not None else False
-    other_front_labels = [lab for lab in front_labels if lab != training_label_int] if train_in_front else front_labels[:]
-
-    leftover_front_for_shadow = 0.0
-
-    if total_front > 0:
-        if train_in_front:
-            k = len(other_front_labels)
-            if k == 0:
-                # Only training agent in front: give it 0.5 of the front share,
-                # push the remaining 0.5 of front share into shadow.
-                train_w = front_share * 0.5
-                leftover_front_for_shadow = front_share - train_w  # = front_share * 0.5
-                # Emit in original order
-                for lab in front_labels:
-                    if lab == training_label_int:
-                        labels.append(lab)
-                        weights.append(train_w)
-            else:
-                # Training agent gets half the per-label chance of the others, normalized within front.
-                denom = k + 0.5  # k others at 1.0 each + training at 0.5
-                per_other = front_share / denom
-                train_w = 0.5 * per_other
-                for lab in front_labels:
-                    if lab == training_label_int:
-                        labels.append(lab)
-                        weights.append(train_w)
-                    else:
-                        labels.append(lab)
-                        weights.append(per_other)
-        else:
-            # No training label in front (unlikely, but keep behavior sane): uniform over front.
-            per_front = front_share / max(total_front, 1)
-            for lab in front_labels:
-                labels.append(lab)
-                weights.append(per_front)
-
-    # --- Shadow weighting (plus any leftover front share when only training was in front) ---
-    if total_shadow > 0:
-        shadow_total_share = shadow_share + leftover_front_for_shadow
-        per_shadow = shadow_total_share / max(total_shadow, 1)
-        for lab in shadow_labels:
-            labels.append(lab)
-            weights.append(per_shadow)
-
-    # If no shadow and only training existed, make it 1.0 to avoid under-summing.
-    if sum(weights) == 0.0 and training_label_int is not None:
-        return [training_label_int], [1.0], front_labels, shadow_labels
-
-    # Final tiny normalization to protect against float drift
-    weight_sum = sum(weights)
-    if weight_sum > 0:
-        weights = [w / weight_sum for w in weights]
-
-    return labels, weights, front_labels, shadow_labels
 
 def _create_new_agent(agent_type: str, device: torch.device) -> LearnerAutoregressiveAgent:
     """Creates a new agent and its corresponding model."""
@@ -713,7 +639,7 @@ def train_generation(
     # Opponent pool is managed locally for sampling; no manager sync needed.
 
     # 4. MAIN TRAINING LOOP
-    episodes_per_update = int(config.EPISODES_PER_UPDATE)
+    base_episodes_per_update = int(config.EPISODES_PER_UPDATE)
     k_epochs = int(config.K_EPOCHS)
     max_batch_envs = int(getattr(config, "EPISODES_PER_UPDATE", 512))
     num_players = int(getattr(config, "NUM_PLAYERS", 4))
@@ -733,55 +659,47 @@ def train_generation(
         bucket_stats.clear()
         t0 = time.time()
         learner.sync_rollout_models()
-        
-        # Set the number of games to collect for the update.
-        games_to_collect = episodes_per_update
 
         # Guarantee at least one learner seat per game. The C++ backend will fill the
-        # remaining seats by sampling from the weighted opponent pool.
+        # remaining seats using explicit triplets built below.
         training_ids_for_rollout = [training_policy_id]
 
-        # Build the front/shadow sampling distribution for this rollout.
-        front_weight_share = 0.0
-        shadow_weight_share = 0.0
-
-        (
-            opp_labels_all,
-            opp_weights_all,
-            front_labels,
-            shadow_labels,
-        ) = _build_front_shadow_sampling(pool_manager, training_policy_id)
-
-        if opp_labels_all:
-            opp_labels_arg = opp_labels_all
-            if opp_weights_all:
-                opp_weights_arg = opp_weights_all
-                if front_labels:
-                    front_weight_share = sum(opp_weights_all[: len(front_labels)])
-                if shadow_labels:
-                    shadow_weight_share = sum(opp_weights_all[len(front_labels) :])
-            else:
-                opp_weights_arg = None
-        else:
-            opp_labels_arg = None
-            opp_weights_arg = None
-
-        new_eps = rollout_manager.collect_episodes(
-            num_episodes=games_to_collect,
-            num_players=num_players,
-            training_policy_ids=training_ids_for_rollout,
-            max_batch_envs=max_batch_envs,
-            opponent_labels=opp_labels_arg,
-            opponent_weights=opp_weights_arg,
+        triplet_list = _build_floor_focus_curriculum(
+            pool_manager,
+            training_policy_id,
+            rng or _GLOBAL_RNG,
+            coverage_floor=COVERAGE_FLOOR,
+            focus_counts=FRONTIER_FOCUS_COUNTS,
+            self_play_count=COVERAGE_FLOOR,
         )
-        
+
+        current_episode_target = len(triplet_list)
+        if current_episode_target <= 0:
+            logging.warning("No opponent triplets generated for update %d. Skipping.", update)
+            continue
+
+        new_eps: List[Dict[str, Any]] = []
+        for chunk in _chunked(triplet_list, MAX_ENVS_PER_CALL):
+            if not chunk:
+                continue
+            chunk_eps = rollout_manager.collect_episodes(
+                num_episodes=len(chunk),
+                num_players=num_players,
+                training_policy_ids=training_ids_for_rollout,
+                max_batch_envs=max_batch_envs,
+                opponent_triplets=chunk,
+            )
+            new_eps.extend(chunk_eps)
+
         if device.type == "cuda" and FORCE_CUDA_SYNC_FOR_TIMING:
             torch.cuda.synchronize()
         t_roll = time.time()
-        
+
         if not new_eps:
             logging.warning(f"Update {update}: No episodes collected. Skipping.")
             continue
+
+        effective_episodes_per_update = max(current_episode_target, base_episodes_per_update, 1)
 
         rollout_tokens = 0
         for ep in new_eps:
@@ -805,6 +723,11 @@ def train_generation(
         agg = {"total_loss": 0.0}
         n_batches = 0
         opt_tokens_processed = 0
+        num_experts = int(getattr(learner.train_model, "num_experts", 0))
+        opponent_expert_affinity: DefaultDict[int, torch.Tensor]
+        opponent_expert_affinity = defaultdict(
+            lambda: torch.zeros(num_experts, dtype=torch.float32)
+        )
 
         for _ in range(k_epochs):
             if not ep_buffer:
@@ -817,7 +740,7 @@ def train_generation(
             num_to_sample = math.ceil(len(ep_buffer) * sampling_fraction)
             
             # Ensure we always sample at least a standard batch size's worth of trajectories
-            num_to_sample = max(num_to_sample, episodes_per_update) 
+            num_to_sample = max(num_to_sample, effective_episodes_per_update)
             
             # And never more than what's available in the buffer
             num_to_sample = min(num_to_sample, len(ep_buffer))
@@ -889,7 +812,7 @@ def train_generation(
                 mini_gpu = _to_device_batch(mini_cpu, device)
 
                 with amp.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == "cuda")):
-                    total_loss, metrics = ppo_losses_batched(
+                    total_loss, metrics, moe_info = ppo_losses_batched(
                         learner.train_model,
                         mini_gpu,
                         sl_teacher=None,
@@ -908,6 +831,48 @@ def train_generation(
                         agg[k] = agg.get(k, 0.0) + float(v.detach().cpu())
                     except Exception:
                         pass
+
+                moe_probs = moe_info.get("probabilities") if isinstance(moe_info, dict) else None
+                if (
+                    moe_probs is not None
+                    and isinstance(moe_probs, torch.Tensor)
+                    and moe_probs.numel() > 0
+                    and num_experts > 0
+                ):
+                    final_layer_probs = moe_probs[-1]
+                    valid_lengths = mini_gpu["mi"].get("valid_lengths")
+                    agent_ids = mini_gpu.get("agent_id_seq")
+                    training_seats = mini_gpu.get("training_seat")
+                    player_labels = mini_gpu.get("player_labels")
+                    if (
+                        isinstance(valid_lengths, torch.Tensor)
+                        and isinstance(agent_ids, torch.Tensor)
+                        and isinstance(training_seats, torch.Tensor)
+                        and isinstance(player_labels, torch.Tensor)
+                    ):
+                        B_local = final_layer_probs.shape[0]
+                        for b_idx in range(B_local):
+                            valid_len = int(valid_lengths[b_idx].item()) if valid_lengths.numel() > b_idx else final_layer_probs.shape[1]
+                            valid_len = min(valid_len, final_layer_probs.shape[1])
+                            if valid_len <= 0:
+                                continue
+                            train_seat = int(training_seats[b_idx].item()) if training_seats.numel() > b_idx else 0
+                            actor_seq = agent_ids[b_idx, :valid_len].long()
+                            opp_mask = actor_seq != train_seat
+                            if not torch.any(opp_mask):
+                                continue
+                            opp_probs = final_layer_probs[b_idx, :valid_len][opp_mask]
+                            opp_actors = actor_seq[opp_mask]
+                            opp_labels = player_labels[b_idx, opp_actors.clamp_min(0).clamp_max(player_labels.shape[1] - 1)]
+                            unique_labels = torch.unique(opp_labels)
+                            for label in unique_labels:
+                                label_int = int(label.item())
+                                if label_int < 0:
+                                    continue
+                                mask = opp_labels == label
+                                affinity = opp_probs[mask].sum(dim=0).detach().cpu()
+                                if affinity.numel() == num_experts:
+                                    opponent_expert_affinity[label_int] += affinity
 
                 n_batches += 1
 
@@ -1009,27 +974,14 @@ def train_generation(
                 totals[1] += 1.0
 
         candidate_labels = set()
-        if opp_labels_arg:
-            try:
-                candidate_labels.update(int(lab) for lab in opp_labels_arg if lab is not None)
-            except Exception:
-                candidate_labels.update(lab for lab in opp_labels_arg if lab is not None)
-        else:
-            try:
-                for entry in pool_manager.get_entries(include_cpp=True):
-                    lab = entry.get("label")
-                    if lab is None:
-                        continue
-                    try:
-                        candidate_labels.add(int(lab))
-                    except Exception:
-                        candidate_labels.add(lab)
-            except Exception:
-                pass
-        try:
-            candidate_labels.add(int(training_policy_id))
-        except Exception:
-            candidate_labels.add(training_policy_id)
+        for trip in triplet_list:
+            for lab in trip:
+                try:
+                    candidate_labels.add(int(lab))
+                except Exception:
+                    continue
+        candidate_labels.add(int(training_policy_id))
+        unique_opponent_count = max(len(candidate_labels) - 1, 0)
 
         for lab in candidate_labels:
             per_opponent_totals.setdefault(lab, [0.0, 0.0])
@@ -1046,15 +998,19 @@ def train_generation(
             per_opponent_win_rates[label_key] = wins_vs / total
             per_opponent_episode_counts[label_key] = total
 
+        preferred_experts_summary = {
+            label: int(usage.argmax().item()) if usage.numel() > 0 else -1
+            for label, usage in opponent_expert_affinity.items()
+        }
+
         update_summary = {
             "update": update,
             "win_rate": win_rate,
             "per_opponent_win_rates": per_opponent_win_rates,
             "per_opponent_episode_counts": per_opponent_episode_counts,
-            "front_labels": list(front_labels),
-            "shadow_labels": list(shadow_labels),
-            "front_probability": float(front_weight_share),
-            "shadow_probability": float(shadow_weight_share),
+            "curriculum_triplets": current_episode_target,
+            "curriculum_unique_opponents": unique_opponent_count,
+            "preferred_experts": preferred_experts_summary,
             "optimizer_waitlisted_episodes": skipped_waitlist_total,
             "optimizer_waitlisted_buckets": {
                 int(bucket_len): count for bucket_len, count in waitlisted_by_bucket.items()
@@ -1083,12 +1039,37 @@ def train_generation(
         writer.add_scalar("Policy/TrinalClipNegFrac", avg.get("trinal_clip_neg_frac", 0.0), update)
         writer.add_scalar("Value/ClipFrac", avg.get("value_clip_frac", 0.0), update)
         writer.add_scalar("Diag/ReturnStdEMA", getattr(config, "RET_STD_EMA", 1.0), update)
+        writer.add_scalar("MoE/LoadBalance", avg.get("moe_load_balance", 0.0), update)
+        writer.add_scalar("MoE/UsageEntropy", avg.get("moe_usage_entropy", 0.0), update)
+        writer.add_scalar("Curriculum/TripletCount", current_episode_target, update)
+        writer.add_scalar("Curriculum/UniqueOpponents", unique_opponent_count, update)
         writer.add_scalar("Optimizer/WaitlistedEpisodes", skipped_waitlist_total, update)
         writer.add_scalar(
             "Optimizer/ActiveWaitlistBuckets",
             len(waitlisted_by_bucket),
             update,
         )
+
+        usage_sums = {label: float(usage.sum().item()) for label, usage in opponent_expert_affinity.items() if usage.numel() > 0}
+        top_usage_labels = [label for label, _ in sorted(usage_sums.items(), key=lambda kv: kv[1], reverse=True)[:3]]
+
+        for label, usage in opponent_expert_affinity.items():
+            if usage.numel() == 0:
+                continue
+            preferred_idx = int(usage.argmax().item())
+            writer.add_scalar(f"ExpertAffinity/Opponent_{label}_Prefers", preferred_idx, update)
+
+        for label in top_usage_labels:
+            usage = opponent_expert_affinity.get(label)
+            if usage is None or usage.sum().item() <= 0:
+                continue
+            norm = usage / usage.sum().clamp_min(1e-6)
+            for expert_idx in range(norm.shape[0]):
+                writer.add_scalar(
+                    f"ExpertAffinity/Opponent_{label}/Expert_{expert_idx}",
+                    float(norm[expert_idx].item()),
+                    update,
+                )
 
         for bucket_len, stats in bucket_stats_summary.items():
             writer.add_scalar(
@@ -1144,8 +1125,6 @@ def train_generation(
         writer.add_scalar("Buffer/Size", len(ep_buffer), update)
         writer.add_scalar("Buffer/Tokens", buffer_token_total, update)
         writer.add_scalar("Acc/OpponentAction", avg.get("opp_action_acc", 0.0), update)
-
-        writer.add_scalar("OpponentSampling/shadow_group_size", len(shadow_labels), update)
 
         model_call_stats = rollout_manager.get_last_model_call_stats()
 

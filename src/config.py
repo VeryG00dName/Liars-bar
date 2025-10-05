@@ -99,6 +99,7 @@ WIN_PROB_WEIGHT        = 0.25      # win probability head weight
 L1_SPARSITY_WEIGHT     = 0.01
 USAGE_BALANCE_WEIGHT   = 1.0
 BRICK_DIVERSITY_WEIGHT = 1.0
+MOE_LB_WEIGHT          = 0.05
 # ============================
 # Teacher KL / Behavior Cloning Leash
 # ============================

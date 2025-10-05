@@ -124,7 +124,8 @@ void RolloutManager::start_rollouts(int num_episodes,
                                     int max_batch_envs,
                                     uint32_t seed,
                                     const std::vector<int>& opponent_labels,
-                                    const std::vector<double>& opponent_weights) {
+                                    const std::vector<double>& opponent_weights,
+                                    const std::vector<std::vector<int>>& opponent_triplets) {
     target_episodes_ = num_episodes * std::max(1, num_players);
     num_players_ = num_players;
     training_policy_ids_ = training_policy_ids;
@@ -135,8 +136,9 @@ void RolloutManager::start_rollouts(int num_episodes,
     completed_buffer_.clear();
     weighted_opponent_labels_ = opponent_labels;
     weighted_opponent_weights_ = opponent_weights;
+    fixed_opponent_triplets_ = opponent_triplets;
 
-    const int batch_guess = (arena_.B > 0) ? arena_.B : num_episodes;
+    const int batch_guess = num_episodes;
     if (max_batch_envs > 0) {
         batch_size_ = std::min(batch_guess, max_batch_envs);
     } else {
@@ -150,11 +152,35 @@ void RolloutManager::start_rollouts(int num_episodes,
 
     arena_.reset(batch_size_, num_players_, rng_());
 
-    auto roles = build_roles(batch_size_,
+    std::vector<std::vector<int>> roles;
+    if (!fixed_opponent_triplets_.empty()) {
+        roles.assign(batch_size_, std::vector<int>(num_players_, training_policy_id()));
+        const size_t training_count = training_policy_ids_.empty() ? 1 : training_policy_ids_.size();
+        std::vector<int> training_ids = training_policy_ids_;
+        if (training_ids.empty()) {
+            training_ids.push_back(training_policy_id());
+        }
+        for (int env_idx = 0; env_idx < batch_size_; ++env_idx) {
+            std::vector<int> env_roles(num_players_, training_ids.front());
+            for (size_t seat = 0; seat < training_count && seat < env_roles.size(); ++seat) {
+                env_roles[seat] = training_ids[seat % training_ids.size()];
+            }
+            const auto& triplet = fixed_opponent_triplets_[env_idx % fixed_opponent_triplets_.size()];
+            for (size_t seat = training_count; seat < env_roles.size(); ++seat) {
+                size_t trip_idx = seat - training_count;
+                if (trip_idx < triplet.size()) {
+                    env_roles[seat] = triplet[trip_idx];
+                }
+            }
+            roles[env_idx] = std::move(env_roles);
+        }
+    } else {
+        roles = build_roles(batch_size_,
                              num_players_,
                              training_policy_ids_,
                              weighted_opponent_labels_,
                              weighted_opponent_weights_);
+    }
     arena_.set_roles(roles);
 
     episodes_.clear();

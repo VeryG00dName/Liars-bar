@@ -95,7 +95,8 @@ void bind_rollout_manager(py::module_& m) {
              py::arg("max_batch_envs"),
              py::arg("seed"),
              py::arg("opponent_labels") = std::vector<int>{},
-             py::arg("opponent_weights") = std::vector<double>{})
+             py::arg("opponent_weights") = std::vector<double>{},
+             py::arg("opponent_triplets") = std::vector<std::vector<int>>{})
         
         .def("collect_requests_for_inference", [](RolloutManager& self) {
             auto grouped = self.collect_requests_for_inference();

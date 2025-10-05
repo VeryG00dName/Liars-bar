@@ -173,7 +173,7 @@ def train(
             optimizer.zero_grad()
             
             with amp.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == "cuda")):
-                total_loss, metrics = ppo_losses_batched(
+                total_loss, metrics, _ = ppo_losses_batched(
                     model,
                     batch_gpu,
                     sl_teacher=sl_teacher,

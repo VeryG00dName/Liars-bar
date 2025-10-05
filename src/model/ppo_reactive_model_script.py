@@ -1,7 +1,8 @@
 # src/model/ppo_reactive_model_script.py
+import copy
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 class PPOReactiveModelScript(nn.Module):
     """
@@ -69,18 +70,82 @@ class PPOReactiveModelScript(nn.Module):
         self.register_buffer("lut_count",      torch.tensor([1,2,3,1,2,3,0,1,2,3,4], dtype=torch.long))
         self.register_buffer("lut_table_flag", torch.tensor([1,1,1,2,2,2,0,0,0,0,3], dtype=torch.long))
 
-        # === Transformer Backbone ===
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim, nhead=num_heads, dim_feedforward=hidden_dim * 4,
-            dropout=dropout_rate, activation='gelu', batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer=encoder_layer, num_layers=num_layers)
+        expert_ffn_dim = hidden_dim * 2
+        self.num_experts = 8
+        self.top_k = 2
 
-        # === Output heads ===
-        self.action_head        = nn.Linear(hidden_dim, action_dim)
-        self.reward_stream_head = nn.Linear(hidden_dim, 1)
-        self.win_prob_head      = nn.Linear(hidden_dim, 1)
-        self.opp_action_head    = nn.Linear(hidden_dim, action_dim)
+        class ScriptTopKMoE(nn.Module):
+            def __init__(self, hidden_dim: int, expert_dim: int, num_experts: int, top_k: int, dropout: float):
+                super().__init__()
+                self.hidden_dim = hidden_dim
+                self.num_experts = num_experts
+                self.top_k = top_k
+                self.gate = nn.Linear(hidden_dim, num_experts)
+                experts: List[nn.Module] = []
+                for _ in range(num_experts):
+                    experts.append(nn.Sequential(
+                        nn.Linear(hidden_dim, expert_dim),
+                        nn.GELU(),
+                        nn.Dropout(dropout),
+                        nn.Linear(expert_dim, hidden_dim),
+                        nn.Dropout(dropout),
+                    ))
+                self.experts = nn.ModuleList(experts)
+
+            def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+                gate_logits = self.gate(x)
+                gate_probs = torch.softmax(gate_logits, dim=-1)
+                top_scores, top_indices = torch.topk(gate_probs, self.top_k, dim=-1)
+                top_weights = top_scores / top_scores.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+                expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=2)
+                gather_idx = top_indices.unsqueeze(-1).expand(*top_indices.shape, self.hidden_dim)
+                top_outputs = torch.gather(expert_outputs, 2, gather_idx)
+                combined = (top_outputs * top_weights.unsqueeze(-1)).sum(dim=2)
+                routing = {
+                    "gate_logits": gate_logits,
+                    "topk_indices": top_indices,
+                    "topk_scores": top_weights,
+                }
+                return combined, routing
+
+        class ScriptMoEEncoderLayer(nn.Module):
+            def __init__(self, hidden_dim: int, nhead: int, dropout: float, num_experts: int, top_k: int, expert_dim: int):
+                super().__init__()
+                self.self_attn = nn.MultiheadAttention(hidden_dim, nhead, dropout=dropout, batch_first=True)
+                self.dropout1 = nn.Dropout(dropout)
+                self.dropout2 = nn.Dropout(dropout)
+                self.norm1 = nn.LayerNorm(hidden_dim)
+                self.norm2 = nn.LayerNorm(hidden_dim)
+                self.moe = ScriptTopKMoE(hidden_dim, expert_dim, num_experts, top_k, dropout)
+
+            def forward(self, src: torch.Tensor, src_mask: Optional[torch.Tensor], src_key_padding_mask: Optional[torch.Tensor]):
+                attn_output, _ = self.self_attn(
+                    src,
+                    src,
+                    src,
+                    attn_mask=src_mask,
+                    key_padding_mask=src_key_padding_mask,
+                    need_weights=False,
+                )
+                src = self.norm1(src + self.dropout1(attn_output))
+                moe_output, routing = self.moe(src)
+                src = self.norm2(src + self.dropout2(moe_output))
+                return src, routing
+
+        base_layer = ScriptMoEEncoderLayer(hidden_dim, num_heads, dropout_rate, self.num_experts, self.top_k, expert_ffn_dim)
+        layers: List[nn.Module] = []
+        for _ in range(num_layers):
+            layers.append(copy.deepcopy(base_layer))
+        self.transformer_layers = nn.ModuleList(layers)
+        self.transformer_norm = nn.LayerNorm(hidden_dim)
+
+        def make_head(out_dim: int) -> nn.ModuleList:
+            return nn.ModuleList([nn.Linear(hidden_dim, out_dim) for _ in range(self.num_experts)])
+
+        self.action_heads = make_head(action_dim)
+        self.reward_stream_heads = make_head(1)
+        self.win_prob_heads = make_head(1)
+        self.opp_action_heads = make_head(action_dim)
 
     # -------------------------- utils --------------------------
     def _decompose_actions(self, action_sequence: torch.Tensor, padding_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -138,16 +203,26 @@ class PPOReactiveModelScript(nn.Module):
         
         key_padding = padding_mask.to(torch.bool)
         
-        transformer_output = self.transformer(
-            encoded_inputs,
-            mask=causal_mask,
-            src_key_padding_mask=key_padding,
-            is_causal=True
-        )
+        routing: Dict[str, torch.Tensor] = {}
+        output = encoded_inputs
+        for layer in self.transformer_layers:
+            output, routing = layer(output, causal_mask, key_padding)
+        transformer_output = self.transformer_norm(output)
 
-        action_logits = self.action_head(transformer_output)
-        state_values = self.reward_stream_head(transformer_output)
-        win_logits = self.win_prob_head(transformer_output)
-        opp_logits = self.opp_action_head(transformer_output)
+        final_indices = routing.get("topk_indices")
+        final_scores = routing.get("topk_scores")
+
+        def combine_head(heads: nn.ModuleList) -> torch.Tensor:
+            all_outputs = torch.stack([head(transformer_output) for head in heads], dim=2)
+            if final_indices is None or final_scores is None:
+                return all_outputs.mean(dim=2)
+            gather_idx = final_indices.unsqueeze(-1).expand(*final_indices.shape, all_outputs.size(-1))
+            top_outputs = torch.gather(all_outputs, 2, gather_idx)
+            return (top_outputs * final_scores.unsqueeze(-1)).sum(dim=2)
+
+        action_logits = combine_head(self.action_heads)
+        state_values = combine_head(self.reward_stream_heads)
+        win_logits = combine_head(self.win_prob_heads)
+        opp_logits = combine_head(self.opp_action_heads)
 
         return action_logits, opp_logits, state_values, win_logits

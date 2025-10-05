@@ -78,7 +78,8 @@ public:
                         int max_batch_envs = -1,
                         uint32_t seed = 0,
                         const std::vector<int>& opponent_labels = {},
-                        const std::vector<double>& opponent_weights = {});
+                        const std::vector<double>& opponent_weights = {},
+                        const std::vector<std::vector<int>>& opponent_triplets = {});
 
     std::unordered_map<int, std::vector<PolicyRequest>> collect_requests_for_inference();
 
@@ -148,6 +149,7 @@ private:
     std::vector<int> active_training_counts_;
     std::vector<int> weighted_opponent_labels_;
     std::vector<double> weighted_opponent_weights_;
+    std::vector<std::vector<int>> fixed_opponent_triplets_;
 
     std::vector<std::vector<int>> build_roles(int batch_size,
                                               int num_players,
