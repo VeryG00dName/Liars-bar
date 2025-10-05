@@ -42,7 +42,7 @@ SEED = int(getattr(config, "SEED", 42))
 set_seed(SEED)
 
 MIN_GAMES_PER_MATCH = 1
-MAX_GAMES_PER_MATCH = 3
+MAX_GAMES_PER_MATCH = 1
 
 
 @dataclass

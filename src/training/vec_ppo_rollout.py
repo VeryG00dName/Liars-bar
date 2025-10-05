@@ -85,21 +85,11 @@ class PPOVecRolloutManager:
                         "Failed to set policy-specific max sequence length for policy %s", policy_id
                     )
 
-        fallback = max(max_lengths) if max_lengths else int(getattr(config, "MAX_SEQUENCE_LENGTH", 1))
+        fallback = max(max_lengths) if max_lengths else int(getattr(config, "MAX_SEQUENCE_LENGTH", 480))
         try:
             set_default(int(fallback))
         except Exception:
             logging.exception("Failed to set default max sequence length on rollout manager")
-
-    @staticmethod
-    def _prepare_requests(raw_requests: List[Any]) -> List[Any]:
-        prepared: List[Any] = []
-        for req in raw_requests:
-            if isinstance(req, dict):
-                prepared.append(SimpleNamespace(**req))
-            else:
-                prepared.append(req) # Assumes it's a pybind object or SimpleNamespace
-        return prepared
 
     def _convert_completed_episode(self, traj: lb.TrajectoryData) -> Dict[str, Any]:
         player_policy_ids = list(traj.player_policy_ids)
