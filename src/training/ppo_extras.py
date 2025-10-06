@@ -308,7 +308,7 @@ def ppo_losses_batched(
 def _collate_batch(
     episodes: List[Dict[str, Any]],
     *,
-    L_pad: Optional[int] = None,          # if None: max timeline length across eps
+    L_max: Optional[int] = None,          # if None: max timeline length across eps
     T_cap: Optional[int] = None,          # if None: max #our steps across eps
     To_cap: Optional[int] = None,         # if None: max #opp steps across eps
     default_num_players: int = 4,
@@ -319,9 +319,9 @@ def _collate_batch(
     Invariants this function guarantees (what your losses expect):
       - action streams (ours/opps) are compressed-by-actor and copied sequentially (no reindexing).
       - our_idx / opp_idx are *timeline indices* (0..L-1) pointing into the sequence dim of logits.
-      - rewards_full / agent_id_seq are padded to L_pad.
+      - rewards_full / agent_id_seq are padded to L_max.
       - opp_have_label is a per-opponent-step mask (True when an acting seat has a known label).
-      - mi contains padded model inputs + padding_mask [B, L_pad] and valid_lengths [B].
+      - mi contains padded model inputs + padding_mask [B, L_max] and valid_lengths [B].
     """
     B = len(episodes)
     if B == 0:
@@ -331,7 +331,7 @@ def _collate_batch(
     Ls = [len(ep.get("agent_id", ())) for ep in episodes]
     Ts = [len(ep.get("our_action", ())) for ep in episodes]
     Tos = [len(ep.get("opp_target_action", ())) for ep in episodes]
-    L_pad = int(max(Ls)) if L_pad is None else int(L_pad)
+    L_max = int(max(Ls)) if L_max is None else int(L_max)
     T = int(max(Ts)) if T_cap is None else int(min(max(Ts), T_cap))
     To = int(max(Tos)) if To_cap is None else int(min(max(Tos), To_cap))
 
@@ -350,8 +350,8 @@ def _collate_batch(
     opp_idx         = torch.zeros((B, To), dtype=torch.long)
     opp_have_label  = torch.zeros((B, To), dtype=torch.bool)
 
-    rewards_full    = torch.zeros((B, L_pad), dtype=torch.float32)
-    agent_id_seq    = torch.zeros((B, L_pad), dtype=torch.long)
+    rewards_full    = torch.zeros((B, L_max), dtype=torch.float32)
+    agent_id_seq    = torch.zeros((B, L_max), dtype=torch.long)
 
     player_labels_tensor = torch.full((B, num_players), -1, dtype=torch.long)
     training_seat_tensor = torch.zeros((B,), dtype=torch.long)
@@ -359,7 +359,7 @@ def _collate_batch(
 
     # mi (model inputs) batch – we always provide padding_mask & valid_lengths
     mi_batch: Dict[str, torch.Tensor] = {
-        "padding_mask": torch.ones((B, L_pad), dtype=torch.bool),
+        "padding_mask": torch.ones((B, L_max), dtype=torch.bool),
         "valid_lengths": torch.zeros((B,), dtype=torch.long),
     }
 
@@ -371,7 +371,7 @@ def _collate_batch(
     mi_keys = sorted(mi_keys)
 
     # For each key, infer shape from the first non-empty sample and preallocate.
-    # We assume time-major arrays (leading dim = timeline length) should be padded to L_pad.
+    # We assume time-major arrays (leading dim = timeline length) should be padded to L_max.
     # Non time-major arrays are stacked along batch without padding.
     inferred: Dict[str, Tuple[Tuple[int, ...], bool, torch.dtype]] = {}
     for k in mi_keys:
@@ -385,7 +385,7 @@ def _collate_batch(
         ex = torch.as_tensor(example)
         is_time_major = (ex.dim() >= 1 and ex.shape[0] in set(Ls) and ex.shape[0] > 0)
         if is_time_major:
-            out_shape = (B, L_pad, *ex.shape[1:])
+            out_shape = (B, L_max, *ex.shape[1:])
         else:
             out_shape = (B, *ex.shape)
         inferred[k] = (out_shape, is_time_major, ex.dtype)
@@ -398,7 +398,7 @@ def _collate_batch(
     for b, ep in enumerate(episodes):
         agent_id_full = np.asarray(ep.get("agent_id", ()), dtype=np.int64)
         L_here_full = len(agent_id_full)
-        L_here = min(L_here_full, L_pad)
+        L_here = min(L_here_full, L_max)
 
         # timeline copy & masks
         if L_here > 0:
@@ -423,7 +423,7 @@ def _collate_batch(
             except Exception:
                 pass
 
-        # steps (clip indices to L_pad to keep them in-bounds)
+        # steps (clip indices to L_max to keep them in-bounds)
         if L_here_full > 0:
             our_steps_all = np.flatnonzero(agent_id_full == train_seat)
             opp_steps_all = np.flatnonzero(agent_id_full != train_seat)
