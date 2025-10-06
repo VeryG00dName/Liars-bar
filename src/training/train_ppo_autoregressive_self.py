@@ -767,6 +767,7 @@ def train_generation(
     k_epochs = int(config.K_EPOCHS)
     max_batch_envs = int(getattr(config, "EPISODES_PER_UPDATE", 512))
     num_players = int(getattr(config, "NUM_PLAYERS", 4))
+    num_experts = int(getattr(learner.train_model, "num_experts", 0))
     
     # The buffer stores tuples of (data, age)
     max_data_age = int(getattr(config, "OFFPOLICY_EP_BUFFER_MULT", 4))
@@ -783,6 +784,11 @@ def train_generation(
         bucket_stats.clear()
         t0 = time.time()
         learner.sync_rollout_models()
+
+        opponent_expert_affinity: DefaultDict[int, torch.Tensor]
+        opponent_expert_affinity = defaultdict(
+            lambda: torch.zeros(num_experts, dtype=torch.float32)
+        )
 
         # Guarantee at least one learner seat per game. The C++ backend will fill the
         # remaining seats using explicit triplets built below.
@@ -847,11 +853,6 @@ def train_generation(
         agg = {"total_loss": 0.0}
         n_batches = 0
         opt_tokens_processed = 0
-        num_experts = int(getattr(learner.train_model, "num_experts", 0))
-        opponent_expert_affinity: DefaultDict[int, torch.Tensor]
-        opponent_expert_affinity = defaultdict(
-            lambda: torch.zeros(num_experts, dtype=torch.float32)
-        )
 
         for _ in range(k_epochs):
             if not ep_buffer:
@@ -964,39 +965,58 @@ def train_generation(
                     and num_experts > 0
                 ):
                     final_layer_probs = moe_probs[-1]
-                    valid_lengths = mini_gpu["mi"].get("valid_lengths")
+                    padding_mask = mini_gpu["mi"].get("padding_mask")
                     agent_ids = mini_gpu.get("agent_id_seq")
                     training_seats = mini_gpu.get("training_seat")
                     player_labels = mini_gpu.get("player_labels")
                     if (
-                        isinstance(valid_lengths, torch.Tensor)
+                        isinstance(padding_mask, torch.Tensor)
                         and isinstance(agent_ids, torch.Tensor)
                         and isinstance(training_seats, torch.Tensor)
                         and isinstance(player_labels, torch.Tensor)
+                        and final_layer_probs.dim() == 3
                     ):
-                        B_local = final_layer_probs.shape[0]
-                        for b_idx in range(B_local):
-                            valid_len = int(valid_lengths[b_idx].item()) if valid_lengths.numel() > b_idx else final_layer_probs.shape[1]
-                            valid_len = min(valid_len, final_layer_probs.shape[1])
-                            if valid_len <= 0:
-                                continue
-                            train_seat = int(training_seats[b_idx].item()) if training_seats.numel() > b_idx else 0
-                            actor_seq = agent_ids[b_idx, :valid_len].long()
-                            opp_mask = actor_seq != train_seat
-                            if not torch.any(opp_mask):
-                                continue
-                            opp_probs = final_layer_probs[b_idx, :valid_len][opp_mask]
-                            opp_actors = actor_seq[opp_mask]
-                            opp_labels = player_labels[b_idx, opp_actors.clamp_min(0).clamp_max(player_labels.shape[1] - 1)]
-                            unique_labels = torch.unique(opp_labels)
-                            for label in unique_labels:
-                                label_int = int(label.item())
-                                if label_int < 0:
-                                    continue
-                                mask = opp_labels == label
-                                affinity = opp_probs[mask].sum(dim=0).detach().cpu()
-                                if affinity.numel() == num_experts:
-                                    opponent_expert_affinity[label_int] += affinity
+                        valid_mask = ~padding_mask
+                        seat_valid = (
+                            (agent_ids >= 0)
+                            & (agent_ids < player_labels.shape[1])
+                        )
+                        safe_agent_ids = agent_ids.masked_fill(~seat_valid, 0)
+                        opponent_labels_per_token = (
+                            player_labels.unsqueeze(1)
+                            .expand(-1, safe_agent_ids.shape[1], -1)
+                            .gather(2, safe_agent_ids.unsqueeze(-1))
+                            .squeeze(-1)
+                        )
+                        opponent_labels_per_token = opponent_labels_per_token.masked_fill(~seat_valid, -1)
+                        is_opponent_turn = (
+                            (agent_ids != training_seats.unsqueeze(1))
+                            & valid_mask
+                        )
+                        max_label_val = int(player_labels.max().item()) if player_labels.numel() > 0 else -1
+                        if max_label_val >= 0 and final_layer_probs.shape[-1] == num_experts:
+                            max_label = max_label_val + 1
+                            affinity_accumulator = final_layer_probs.new_zeros(
+                                (max_label, num_experts)
+                            )
+                            flat_mask = is_opponent_turn
+                            flat_labels = opponent_labels_per_token[flat_mask]
+                            flat_probs = final_layer_probs[flat_mask]
+                            if flat_labels.numel() > 0:
+                                valid_label_mask = flat_labels >= 0
+                                flat_labels = flat_labels[valid_label_mask]
+                                flat_probs = flat_probs[valid_label_mask]
+                                if flat_labels.numel() > 0:
+                                    scatter_index = flat_labels.unsqueeze(-1).expand(-1, num_experts)
+                                    affinity_accumulator.scatter_add_(0, scatter_index, flat_probs)
+                                    affinity_cpu = affinity_accumulator.detach().cpu()
+                                    row_mask = affinity_cpu.sum(dim=1) > 0
+                                    if row_mask.any():
+                                        label_indices = torch.nonzero(row_mask, as_tuple=False).view(-1)
+                                        for label_idx in label_indices:
+                                            label_int = int(label_idx.item())
+                                            addition = affinity_cpu[label_int].to(torch.float32)
+                                            opponent_expert_affinity[label_int] += addition
 
                 n_batches += 1
 
@@ -1122,27 +1142,27 @@ def train_generation(
             per_opponent_win_rates[label_key] = wins_vs / total
             per_opponent_episode_counts[label_key] = total
 
-        preferred_experts_summary = {
-            label: int(usage.argmax().item()) if usage.numel() > 0 else -1
-            for label, usage in opponent_expert_affinity.items()
-        }
-
-        update_summary = {
-            "update": update,
-            "win_rate": win_rate,
-            "per_opponent_win_rates": per_opponent_win_rates,
-            "per_opponent_episode_counts": per_opponent_episode_counts,
-            "curriculum_triplets": current_episode_target,
-            "curriculum_unique_opponents": unique_opponent_count,
-            "preferred_experts": preferred_experts_summary,
-            "optimizer_waitlisted_episodes": skipped_waitlist_total,
-            "optimizer_waitlisted_buckets": {
-                int(bucket_len): count for bucket_len, count in waitlisted_by_bucket.items()
-            },
-            "optimizer_bucket_stats": bucket_stats_summary,
-        }
-
         if collect_metrics:
+            preferred_experts_summary = {
+                label: int(usage.argmax().item()) if usage.numel() > 0 else -1
+                for label, usage in opponent_expert_affinity.items()
+            }
+
+            update_summary = {
+                "update": update,
+                "win_rate": win_rate,
+                "per_opponent_win_rates": per_opponent_win_rates,
+                "per_opponent_episode_counts": per_opponent_episode_counts,
+                "curriculum_triplets": current_episode_target,
+                "curriculum_unique_opponents": unique_opponent_count,
+                "preferred_experts": preferred_experts_summary,
+                "optimizer_waitlisted_episodes": skipped_waitlist_total,
+                "optimizer_waitlisted_buckets": {
+                    int(bucket_len): count for bucket_len, count in waitlisted_by_bucket.items()
+                },
+                "optimizer_bucket_stats": bucket_stats_summary,
+            }
+
             collected_updates.append(update_summary)
 
         writer.add_scalar("Loss/Total", avg.get("total_loss", 0.0), update)
@@ -1174,7 +1194,11 @@ def train_generation(
             update,
         )
 
-        usage_sums = {label: float(usage.sum().item()) for label, usage in opponent_expert_affinity.items() if usage.numel() > 0}
+        usage_sums = {
+            label: float(usage.sum().item())
+            for label, usage in opponent_expert_affinity.items()
+            if usage.numel() > 0
+        }
         top_usage_labels = [label for label, _ in sorted(usage_sums.items(), key=lambda kv: kv[1], reverse=True)[:3]]
 
         for label, usage in opponent_expert_affinity.items():
