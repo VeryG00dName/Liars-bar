@@ -38,9 +38,6 @@ ensure_dirs()
 # Environment Configuration
 # ============================
 NUM_PLAYERS = 4
-RENDER_MODE = None  # Set to 'human' to enable rendering
-USE_WRAPPER = False
-USE_TRANSFORMER_MEMORY = True
 
 DEFAULT_SCORING_PARAMS = {
     "play_reward_per_card": 0,
@@ -75,19 +72,12 @@ GAE_LAMBDA = 0.98
 EPS_CLIP = 0.2
 K_EPOCHS = 2
 MAX_NORM = 0.3
-ENCODER_MAX_NORM = 0.2
 # Gradient optimisation controls
 PPO_MINIBATCH_SIZE = 128
 GRAD_ACCUM_STEPS = EPISODES_PER_UPDATE//PPO_MINIBATCH_SIZE
 USE_GRADIENT_CHECKPOINTING = True
 # Coefficients
 INIT_ENTROPY_COEF = 0.005
-
-# Opponent sampling configuration
-SHADOW_P_NEW = 0.25
-FRONT_P_ADJUSTED = 1.0 - SHADOW_P_NEW
-CPP_BOT_MAX_LABEL = 6
-LATEST_K = 4
 
 # ============================
 # Auxiliary Loss Weights
@@ -132,6 +122,39 @@ STAKES_CLIP_MIN = 0.5        # clamp multiplier min
 STAKES_CLIP_MAX = 3.5        # clamp multiplier max
 
 # ============================
+# Mega-Batch Curriculum Configuration
+# ============================
+
+# --- Sizing & Batching ---
+# The base number of games to play against each "floor" opponent.
+COVERAGE_FLOOR = 32
+# The base number of games to play against the learner itself.
+SELF_PLAY_COUNT = 32
+# The base number of games against the top K most recent opponents.
+# Used for initial size estimation before proportional scaling.
+FRONTIER_FOCUS_COUNTS = [128, 96, 64, 32]
+# The number of environments to run in parallel in a single C++ call.
+MAX_ENVS_PER_CALL = 512
+# When rounding the total triplets to a multiple of MAX_ENVS_PER_CALL,
+# if the number of triplets to add is <= this threshold, we round up. Otherwise, round down.
+ROUND_UP_OVERAGE_THRESHOLD = 48
+
+# --- Proportional Budgeting ---
+# The target fraction of total opponent slots dedicated to the "focus" group.
+FOCUS_FRACTION = 0.25
+# The target fraction of total opponent slots dedicated to self-play.
+SELF_PLAY_FRACTION = 0.05
+# The "floor" group (all other opponents) will get the remaining fraction:
+# 1.0 - FOCUS_FRACTION - SELF_PLAY_FRACTION (i.e., 70% with these defaults).
+
+# --- Focus Group Internal Weighting ---
+# Determines how the FOCUS_FRACTION is split among the top K recent agents.
+# A geometric decay: weight for rank i is (decay^i). i=0 is the most recent.
+# A value of 0.5 means the 2nd most recent gets 50% of the budget of the 1st,
+# the 3rd gets 25%, etc.
+FOCUS_RANK_DECAY = 0.65
+
+# ============================
 # Logging and Checkpointing
 # ============================
 CULL_INTERVAL = 20001
@@ -162,6 +185,7 @@ TOTAL_PLAYERS = 12
 SEED = 42
 DEVICE = "cuda"
 FORCE_CUDA_SYNC_FOR_TIMING = True
+CPP_BOT_MAX_LABEL = 6
 # ============================
 # Depreated, kept for compatiblty
 # ============================
@@ -169,6 +193,10 @@ NUM_EPISODES = 40000
 UPDATE_STEPS = 3
 AUX_LOSS_WEIGHT = 1
 
+
+RENDER_MODE = None  # Set to 'human' to enable rendering
+USE_WRAPPER = False
+USE_TRANSFORMER_MEMORY = True
 # Opponent Model Configuration
 NUM_OPPONENT_CLASSES = 10
 OPPONENT_INPUT_DIM = 4

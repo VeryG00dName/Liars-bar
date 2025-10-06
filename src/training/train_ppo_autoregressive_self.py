@@ -10,7 +10,7 @@ from collections import defaultdict
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Counter, Dict, Any, List, Optional, Callable, Tuple, DefaultDict
+from typing import Counter, Dict, Any, List, Optional, Callable, Set, Tuple, DefaultDict
 from numpy.random import Generator
 import random
 import numpy as np
@@ -178,187 +178,188 @@ def _build_floor_focus_curriculum(
     training_label: int,
     rng: np.random.Generator,
     *,
-    coverage_floor: int = 16,
-    focus_counts: Optional[List[int]] = None,
-    self_play_count: Optional[int] = None,
-    allowed_opponent_labels: Optional[set] = None,
-    # --- new knobs ---
-    env_batch_size: int = 512,
-    round_up_overage_threshold: int = 30,   # if rounding up adds <= this many triplets, round up; else round down
-    focus_downweight: float = 0.3,          # downweight for “most recent” labels when adding extra games
-    diversity_alpha: float = 0.3,           # stronger -> more penalty for already-popular labels when adding
+    allowed_opponent_labels: Optional[Set[int]] = None,
 ) -> List[List[int]]:
     """
-    Builds a list of opponent triplets for a rollout using a quota-based system, then
-    adjusts the final number of triplets to align with the env batch size.
-
-    - If total triplets is < env_batch_size, we "pump up" with diverse triplets.
-    - Otherwise, we round to the nearest multiple of env_batch_size:
-        * round up if the extra needed is <= round_up_overage_threshold
-        * else round down (drop excess triplets)
-    - Extra triplets favor diversity and downweight the most recent (focus) labels.
+    Builds opponent triplets with proportional quotas and strict batch alignment,
+    with all tuning parameters driven by the central config file.
     """
-    focus_counts = focus_counts if focus_counts is not None else [128, 96, 64, 32]
-    self_play_count = coverage_floor if self_play_count is None else self_play_count
+    # ---------- 0) Load knobs from config and gather labels ----------
+    
+    # Legacy knobs for baseline sizing
+    coverage_floor = int(config.COVERAGE_FLOOR)
+    focus_counts = list(config.FRONTIER_FOCUS_COUNTS)
+    self_play_count = int(config.SELF_PLAY_COUNT)
 
-    # --- 1. Get all eligible opponent labels ---
+    # Batching and rounding
+    env_batch_size = int(config.MAX_ENVS_PER_CALL)
+    round_up_overage_threshold = int(config.ROUND_UP_OVERAGE_THRESHOLD)
+
+    # Proportional allocation
+    focus_fraction = float(config.FOCUS_FRACTION)
+    self_play_fraction = float(config.SELF_PLAY_FRACTION)
+
+    # Focus group internal weighting
+    focus_rank_decay = float(config.FOCUS_RANK_DECAY)
+    
     entries = pool_manager.get_entries(include_cpp=True)
     all_labels = {int(e["label"]) for e in entries if e.get("label") is not None}
 
     if allowed_opponent_labels is not None:
         allowed = {int(x) for x in allowed_opponent_labels}
-        # Keep training agent unconditionally for self-play
         all_labels = {lbl for lbl in all_labels if (lbl in allowed) or (lbl == training_label)}
 
     opponent_labels = sorted([lbl for lbl in all_labels if lbl != training_label])
 
-    if not opponent_labels:
-        # Fallback if there are no opponents in the pool (e.g., first run ever)
-        fallback_triplet = [training_label, training_label, training_label]
-        # Ensure we at least fill one batch if possible
-        min_triplets = max(self_play_count, env_batch_size // 1 if env_batch_size > 0 else 1)
-        return [fallback_triplet for _ in range(min_triplets)]
-
-    # --- 2. Calculate the Quotas for each opponent ---
-    quotas: Dict[int, int] = {}
-
-    # Quota for the learner (self-play)
-    quotas[training_label] = self_play_count
-
-    # Quotas for "Focus" opponents (most recent agents)
     recent_entries = [
         e for e in entries
-        if e.get("type") != "cpp_bot" and int(e["label"]) in opponent_labels
+        if e.get("type") != "cpp_bot"
+        and e.get("label") is not None
+        and int(e["label"]) in opponent_labels
     ]
-    # Sort by label to get the most recent ones (assuming larger label == more recent)
     recent_entries.sort(key=lambda e: int(e["label"]), reverse=True)
 
-    focused_labels = set()
-    for i, count in enumerate(focus_counts):
-        if i >= len(recent_entries):
-            break
-        label = int(recent_entries[i]["label"])
-        quotas[label] = count
-        focused_labels.add(label)
+    K = min(len(focus_counts), len(recent_entries))
+    focus_labels = [int(recent_entries[i]["label"]) for i in range(K)]
+    focus_set = set(focus_labels)
+    floor_labels = [lbl for lbl in opponent_labels if lbl not in focus_set]
 
-    # Quotas for "Floor" opponents (everyone else)
-    for label in opponent_labels:
-        if label not in focused_labels:
-            quotas[label] = coverage_floor
+    # ---------- 1) BASE slots from legacy knobs ----------
+    base_slots_focus = sum(focus_counts[:K]) if K > 0 else 0
+    base_slots_floor = coverage_floor * len(floor_labels)
+    base_slots = self_play_count + base_slots_focus + base_slots_floor
 
-    # --- 3. Build the shuffled pool of opponent slots ---
+    if not opponent_labels:
+        base_triplets = math.ceil(max(1, self_play_count) / 3)
+        final_total_triplets = _round_to_env_batches(base_triplets, env_batch_size, round_up_overage_threshold)
+        slot_pool = [training_label] * (final_total_triplets * 3)
+        rng.shuffle(slot_pool)
+        return _slots_to_triplets(slot_pool)
+
+    # ---------- 2-4) Base -> Final Total Slots ----------
+    base_triplets = math.ceil(max(1, base_slots) / 3)
+    final_total_triplets = _round_to_env_batches(base_triplets, env_batch_size, round_up_overage_threshold)
+    final_total_slots = final_total_triplets * 3
+
+    # ---------- 5) Proportional Quota Calculation ----------
+    focus_f = max(0.0, focus_fraction)
+    self_f = max(0.0, self_play_fraction)
+    floor_f = max(0.0, 1.0 - focus_f - self_f)
+
+    groups = []
+    proportions = []
+    
+    if self_f > 0.0:
+        groups.append([training_label])
+        proportions.append(self_f)
+    if K > 0 and focus_f > 0.0:
+        groups.append(focus_labels)
+        proportions.append(focus_f)
+    if len(floor_labels) > 0 and floor_f > 0.0:
+        groups.append(floor_labels)
+        proportions.append(floor_f)
+
+    total_prop = sum(proportions)
+    if total_prop <= 0.0:
+        proportions = [1.0]
+        groups = [[training_label]]
+    else:
+        proportions = [p / total_prop for p in proportions]
+
+    per_label_weights: Dict[int, float] = {}
+    for grp, prop in zip(groups, proportions):
+        is_focus_group = grp == focus_labels and K > 0
+        is_self_play_group = len(grp) == 1 and grp[0] == training_label
+        
+        if is_self_play_group:
+            per_label_weights[training_label] = per_label_weights.get(training_label, 0.0) + prop
+        elif is_focus_group:
+            d = min(max(focus_rank_decay, 0.0), 1.0)
+            raw_weights = [d ** i for i in range(K)]
+            s = sum(raw_weights)
+            if s <= 0.0: raw_weights, s = [1.0] + [0.0] * (K - 1), 1.0
+            
+            focus_norm = [w / s for w in raw_weights]
+            for lbl, share in zip(focus_labels, focus_norm):
+                per_label_weights[lbl] = per_label_weights.get(lbl, 0.0) + prop * share
+        else: # Floor group
+            if len(grp) > 0:
+                share_per_label = prop / len(grp)
+                for lbl in grp:
+                    per_label_weights[lbl] = per_label_weights.get(lbl, 0.0) + share_per_label
+
+    quotas = _allocate_integer_counts(final_total_slots, per_label_weights, rng)
+
+    # ---------- 6) Build pool -> triplets ----------
     slot_pool: List[int] = []
-    for label, count in quotas.items():
-        slot_pool.extend([label] * count)
+    for lbl, cnt in quotas.items():
+        if cnt > 0:
+            slot_pool.extend([lbl] * cnt)
+    
+    # Adjust for any rounding mismatches
+    diff = final_total_slots - len(slot_pool)
+    if diff != 0:
+        all_labels_for_pad = list(per_label_weights.keys()) or [training_label]
+        for _ in range(abs(diff)):
+            if diff > 0:
+                slot_pool.append(int(rng.choice(all_labels_for_pad)))
+            elif slot_pool:
+                slot_pool.pop()
 
     rng.shuffle(slot_pool)
-
-    # --- 4. Create triplets from the shuffled pool ---
-    triplets: List[List[int]] = []
-    i = 0
-    while i < len(slot_pool):
-        chunk = slot_pool[i : i + 3]
-        if len(chunk) == 3:
-            triplets.append(chunk)
-        else:
-            # Handle the remainder: fill with random opponents
-            num_needed = 3 - len(chunk)
-            for _ in range(num_needed):
-                chunk.append(int(rng.choice(opponent_labels)))
-            triplets.append(chunk)
-        i += 3
-
-    # --- 5. Final shuffle of the triplets themselves ---
-    if triplets:
-        rng.shuffle(triplets)
-
-    # --- 6. Round to env batch size, pumping up if needed and ensuring diversity ---
-    def _label_counts_from_triplets(trips: List[List[int]]) -> Counter:
-        c = Counter()
-        for t in trips:
-            for lbl in t:
-                c[lbl] += 1
-        return c
-
-    def _sampling_weights(counts: Counter) -> np.ndarray:
-        """Compute per-label weights that prefer underrepresented labels and downweight recent ones."""
-        labels_all = [training_label] + opponent_labels
-        weights = []
-        total_tokens = sum(counts.values()) if counts else 1
-        # token-based frequency per label
-        for lbl in labels_all:
-            freq = counts[lbl] / max(1, total_tokens)
-            # Base weight inversely related to current frequency (diversity pressure)
-            # (1 + freq)^{-alpha} in [~1, smaller] range
-            w = (1.0 / (1.0 + freq)) ** max(0.0, diversity_alpha)
-            # Downweight focused/recent labels a bit so they don't dominate the “pump”
-            if lbl in focused_labels:
-                w *= max(0.0, min(1.0, focus_downweight))
-            # Avoid zeroing out completely
-            weights.append(max(1e-8, w))
-        return np.array(weights, dtype=np.float64)
-
-    def _sample_label(rng: np.random.Generator, counts: Counter) -> int:
-        labels_all = [training_label] + opponent_labels
-        w = _sampling_weights(counts)
-        w = w / w.sum()
-        idx = int(rng.choice(len(labels_all), p=w))
-        return labels_all[idx]
-
-    def _make_diverse_triplet(rng: np.random.Generator, counts: Counter) -> List[int]:
-        # Sample up to we get at least 2 distinct labels; fallback after a few tries.
-        for _ in range(5):
-            a = _sample_label(rng, counts)
-            counts[a] += 1
-            b = _sample_label(rng, counts)
-            counts[b] += 1
-            # Encourage diversity for the third pick
-            if a == b:
-                # Force third to differ if possible
-                labels_all = [training_label] + opponent_labels
-                options = [x for x in labels_all if x != a]
-                c = int(rng.choice(options))
-            else:
-                c = _sample_label(rng, counts)
-            # Ensure at least two distinct labels
-            if len({a, b, c}) >= 2:
-                counts[c] += 1
-                return [a, b, c]
-            # rollback counts and retry
-            counts[a] -= 1
-            counts[b] -= 1
-        # Fallback: just sample three (may duplicate)
-        return [ _sample_label(rng, counts) for _ in range(3) ]
-
-    total = len(triplets)
-
-    # If we're below one full batch, we must pump up to at least one batch.
-    if total < env_batch_size:
-        add_needed = env_batch_size - total
-        counts = _label_counts_from_triplets(triplets)
-        for _ in range(add_needed):
-            triplets.append(_make_diverse_triplet(rng, counts))
-        rng.shuffle(triplets)
-        total = len(triplets)
-
-    # Now round to the nearest multiple of env_batch_size.
-    remainder = total % env_batch_size
-    if remainder != 0:
-        round_down = remainder
-        round_up = env_batch_size - remainder
-
-        if round_up <= round_up_overage_threshold:
-            # Round UP: add 'round_up' triplets, diversely
-            counts = _label_counts_from_triplets(triplets)
-            for _ in range(round_up):
-                triplets.append(_make_diverse_triplet(rng, counts))
-            rng.shuffle(triplets)
-        else:
-            # Round DOWN: drop the last 'round_down' triplets
-            # (since triplets are already shuffled, truncation is unbiased)
-            triplets = triplets[: total - round_down]
-
+    triplets = _slots_to_triplets(slot_pool)
+    rng.shuffle(triplets)
     return triplets
+
+
+# ---------- curriculum helpers ----------
+
+def _round_to_env_batches(base_triplets: int, env_batch_size: int, overage_threshold: int) -> int:
+    if env_batch_size <= 0:
+        return max(1, base_triplets)
+    if base_triplets < env_batch_size:
+        return env_batch_size
+    remainder = base_triplets % env_batch_size
+    if remainder == 0:
+        return base_triplets
+    round_down = remainder
+    round_up = env_batch_size - remainder
+    if round_up <= max(0, int(overage_threshold)):
+        return base_triplets + round_up
+    else:
+        return base_triplets - round_down
+
+
+def _allocate_integer_counts(total: int, weights: Dict[int, float], rng: np.random.Generator) -> Dict[int, int]:
+    if total <= 0:
+        return {k: 0 for k in weights.keys()}
+
+    items = [(lbl, max(0.0, w)) for lbl, w in weights.items()]
+    s = sum(w for _, w in items)
+    if s <= 0.0:
+        items = [(lbl, 1.0) for lbl, _ in items]
+        s = float(len(items))
+
+    raw = [(lbl, (w / s) * total) for lbl, w in items]
+    floors = {lbl: int(math.floor(x)) for lbl, x in raw}
+    used = sum(floors.values())
+    remain = total - used
+
+    fracs = []
+    for lbl, x in raw:
+        frac = x - math.floor(x)
+        fracs.append((frac, rng.random(), lbl))  # rng tie-break
+    fracs.sort(reverse=True)
+
+    for i in range(remain):
+        _, _, lbl = fracs[i]
+        floors[lbl] += 1
+
+    return floors
+
+
+def _slots_to_triplets(slot_pool: List[int]) -> List[List[int]]:
+    return [[slot_pool[i], slot_pool[i + 1], slot_pool[i + 2]] for i in range(0, len(slot_pool), 3)]
 
 def _create_new_agent(agent_type: str, device: torch.device) -> LearnerAutoregressiveAgent:
     """Creates a new agent and its corresponding model."""
@@ -793,9 +794,6 @@ def train_generation(
             pool_manager,
             training_policy_id,
             rng or _GLOBAL_RNG,
-            coverage_floor=COVERAGE_FLOOR,
-            focus_counts=FRONTIER_FOCUS_COUNTS,
-            self_play_count=COVERAGE_FLOOR,
             allowed_opponent_labels=available_opponents,
         )
 
@@ -805,7 +803,7 @@ def train_generation(
             continue
 
         new_eps: List[Dict[str, Any]] = []
-        for chunk in _chunked(triplet_list, MAX_ENVS_PER_CALL):
+        for chunk in _chunked(triplet_list, config.MAX_ENVS_PER_CALL):
             if not chunk:
                 continue
             chunk_eps = rollout_manager.collect_episodes(
@@ -930,7 +928,7 @@ def train_generation(
             for bucket_len, mini_eps in bucket_batches:
                 bucket_start_time = time.perf_counter()
                 assert len(mini_eps) == minibatch_size
-                mini_cpu = _collate_batch(mini_eps, L_max=bucket_len)
+                mini_cpu = _collate_batch(mini_eps, L_max=bucket_len, pin_memory=True)
                 valid_lengths_cpu = mini_cpu.get("mi", {}).get("valid_lengths")
                 if isinstance(valid_lengths_cpu, torch.Tensor):
                     opt_tokens_processed += int(valid_lengths_cpu.sum().item())
