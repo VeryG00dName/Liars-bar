@@ -10,7 +10,7 @@ from collections import defaultdict
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Callable, Tuple, DefaultDict
+from typing import Counter, Dict, Any, List, Optional, Callable, Tuple, DefaultDict
 from numpy.random import Generator
 import random
 import numpy as np
@@ -174,7 +174,7 @@ class OpponentPoolManager:
         return entries
 
 def _build_floor_focus_curriculum(
-    pool_manager: OpponentPoolManager,
+    pool_manager: "OpponentPoolManager",
     training_label: int,
     rng: np.random.Generator,
     *,
@@ -182,12 +182,21 @@ def _build_floor_focus_curriculum(
     focus_counts: Optional[List[int]] = None,
     self_play_count: Optional[int] = None,
     allowed_opponent_labels: Optional[set] = None,
+    # --- new knobs ---
+    env_batch_size: int = 512,
+    round_up_overage_threshold: int = 30,   # if rounding up adds <= this many triplets, round up; else round down
+    focus_downweight: float = 0.3,          # downweight for “most recent” labels when adding extra games
+    diversity_alpha: float = 0.3,           # stronger -> more penalty for already-popular labels when adding
 ) -> List[List[int]]:
     """
-    Builds a list of opponent triplets for a rollout using a quota-based system.
+    Builds a list of opponent triplets for a rollout using a quota-based system, then
+    adjusts the final number of triplets to align with the env batch size.
 
-    This ensures that each opponent is played against a specific number of times,
-    providing a "floor" of coverage for all agents and a "focus" on recent agents.
+    - If total triplets is < env_batch_size, we "pump up" with diverse triplets.
+    - Otherwise, we round to the nearest multiple of env_batch_size:
+        * round up if the extra needed is <= round_up_overage_threshold
+        * else round down (drop excess triplets)
+    - Extra triplets favor diversity and downweight the most recent (focus) labels.
     """
     focus_counts = focus_counts if focus_counts is not None else [128, 96, 64, 32]
     self_play_count = coverage_floor if self_play_count is None else self_play_count
@@ -198,15 +207,17 @@ def _build_floor_focus_curriculum(
 
     if allowed_opponent_labels is not None:
         allowed = {int(x) for x in allowed_opponent_labels}
-        # Filter opponents, but always keep the training agent for self-play calculations
+        # Keep training agent unconditionally for self-play
         all_labels = {lbl for lbl in all_labels if (lbl in allowed) or (lbl == training_label)}
-    
+
     opponent_labels = sorted([lbl for lbl in all_labels if lbl != training_label])
 
     if not opponent_labels:
         # Fallback if there are no opponents in the pool (e.g., first run ever)
         fallback_triplet = [training_label, training_label, training_label]
-        return [fallback_triplet for _ in range(max(self_play_count, 1))]
+        # Ensure we at least fill one batch if possible
+        min_triplets = max(self_play_count, env_batch_size // 1 if env_batch_size > 0 else 1)
+        return [fallback_triplet for _ in range(min_triplets)]
 
     # --- 2. Calculate the Quotas for each opponent ---
     quotas: Dict[int, int] = {}
@@ -219,7 +230,7 @@ def _build_floor_focus_curriculum(
         e for e in entries
         if e.get("type") != "cpp_bot" and int(e["label"]) in opponent_labels
     ]
-    # Sort by label to get the most recent ones
+    # Sort by label to get the most recent ones (assuming larger label == more recent)
     recent_entries.sort(key=lambda e: int(e["label"]), reverse=True)
 
     focused_labels = set()
@@ -256,11 +267,97 @@ def _build_floor_focus_curriculum(
                 chunk.append(int(rng.choice(opponent_labels)))
             triplets.append(chunk)
         i += 3
-        
+
     # --- 5. Final shuffle of the triplets themselves ---
     if triplets:
         rng.shuffle(triplets)
-        
+
+    # --- 6. Round to env batch size, pumping up if needed and ensuring diversity ---
+    def _label_counts_from_triplets(trips: List[List[int]]) -> Counter:
+        c = Counter()
+        for t in trips:
+            for lbl in t:
+                c[lbl] += 1
+        return c
+
+    def _sampling_weights(counts: Counter) -> np.ndarray:
+        """Compute per-label weights that prefer underrepresented labels and downweight recent ones."""
+        labels_all = [training_label] + opponent_labels
+        weights = []
+        total_tokens = sum(counts.values()) if counts else 1
+        # token-based frequency per label
+        for lbl in labels_all:
+            freq = counts[lbl] / max(1, total_tokens)
+            # Base weight inversely related to current frequency (diversity pressure)
+            # (1 + freq)^{-alpha} in [~1, smaller] range
+            w = (1.0 / (1.0 + freq)) ** max(0.0, diversity_alpha)
+            # Downweight focused/recent labels a bit so they don't dominate the “pump”
+            if lbl in focused_labels:
+                w *= max(0.0, min(1.0, focus_downweight))
+            # Avoid zeroing out completely
+            weights.append(max(1e-8, w))
+        return np.array(weights, dtype=np.float64)
+
+    def _sample_label(rng: np.random.Generator, counts: Counter) -> int:
+        labels_all = [training_label] + opponent_labels
+        w = _sampling_weights(counts)
+        w = w / w.sum()
+        idx = int(rng.choice(len(labels_all), p=w))
+        return labels_all[idx]
+
+    def _make_diverse_triplet(rng: np.random.Generator, counts: Counter) -> List[int]:
+        # Sample up to we get at least 2 distinct labels; fallback after a few tries.
+        for _ in range(5):
+            a = _sample_label(rng, counts)
+            counts[a] += 1
+            b = _sample_label(rng, counts)
+            counts[b] += 1
+            # Encourage diversity for the third pick
+            if a == b:
+                # Force third to differ if possible
+                labels_all = [training_label] + opponent_labels
+                options = [x for x in labels_all if x != a]
+                c = int(rng.choice(options))
+            else:
+                c = _sample_label(rng, counts)
+            # Ensure at least two distinct labels
+            if len({a, b, c}) >= 2:
+                counts[c] += 1
+                return [a, b, c]
+            # rollback counts and retry
+            counts[a] -= 1
+            counts[b] -= 1
+        # Fallback: just sample three (may duplicate)
+        return [ _sample_label(rng, counts) for _ in range(3) ]
+
+    total = len(triplets)
+
+    # If we're below one full batch, we must pump up to at least one batch.
+    if total < env_batch_size:
+        add_needed = env_batch_size - total
+        counts = _label_counts_from_triplets(triplets)
+        for _ in range(add_needed):
+            triplets.append(_make_diverse_triplet(rng, counts))
+        rng.shuffle(triplets)
+        total = len(triplets)
+
+    # Now round to the nearest multiple of env_batch_size.
+    remainder = total % env_batch_size
+    if remainder != 0:
+        round_down = remainder
+        round_up = env_batch_size - remainder
+
+        if round_up <= round_up_overage_threshold:
+            # Round UP: add 'round_up' triplets, diversely
+            counts = _label_counts_from_triplets(triplets)
+            for _ in range(round_up):
+                triplets.append(_make_diverse_triplet(rng, counts))
+            rng.shuffle(triplets)
+        else:
+            # Round DOWN: drop the last 'round_down' triplets
+            # (since triplets are already shuffled, truncation is unbiased)
+            triplets = triplets[: total - round_down]
+
     return triplets
 
 def _create_new_agent(agent_type: str, device: torch.device) -> LearnerAutoregressiveAgent:
@@ -621,7 +718,7 @@ def train_generation(
             
             # Define the output path for the new .pt file
             pth_path_obj = Path(checkpoint_path)
-            new_traced_path = str(pth_path_obj.with_suffix('.pt'))
+            new_traced_path = str(pth_path_obj.with_name(f"{pth_path_obj.stem}_traced.pt"))
             
             # Call the tracing utility
             traced_success = trace_model_from_checkpoint(checkpoint_path, new_traced_path, device)
