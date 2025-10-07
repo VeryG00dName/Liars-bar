@@ -372,13 +372,14 @@ def run_active_league(
 
         # Advance coverage progress once per batch by the amount that counts toward the target.
         if batch_coverage_increment > 0:
+            differences = compare_scoreboards(historical_scoreboard, players)
             elapsed = max(1e-6, time.perf_counter() - start_time)
             games_per_sec = float(total_games_done) / elapsed
             advance = int(min(batch_coverage_increment, max(0, total_coverage_units - coverage_done)))
             coverage_done += advance
             progress_ui.update(
                 increment=advance,
-                differences=None,
+                differences=differences,
                 description=f"Coverage {min(coverage_done, total_coverage_units)}/{total_coverage_units}",
                 games_per_sec=games_per_sec,
             )
