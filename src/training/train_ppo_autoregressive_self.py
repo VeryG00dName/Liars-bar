@@ -767,7 +767,7 @@ def train_generation(
     k_epochs = int(config.K_EPOCHS)
     max_batch_envs = int(getattr(config, "EPISODES_PER_UPDATE", 512))
     num_players = int(getattr(config, "NUM_PLAYERS", 4))
-    num_experts = int(getattr(learner.train_model, "num_experts", 0))
+    num_experts = int(getattr(learner.train_model, "num_experts", 8))
     
     # The buffer stores tuples of (data, age)
     max_data_age = int(getattr(config, "OFFPOLICY_EP_BUFFER_MULT", 4))
@@ -1194,28 +1194,34 @@ def train_generation(
             update,
         )
 
-        usage_sums = {
-            label: float(usage.sum().item())
-            for label, usage in opponent_expert_affinity.items()
-            if usage.numel() > 0
-        }
-        top_usage_labels = [label for label, _ in sorted(usage_sums.items(), key=lambda kv: kv[1], reverse=True)[:3]]
-
         for label, usage in opponent_expert_affinity.items():
             if usage.numel() == 0:
                 continue
             preferred_idx = int(usage.argmax().item())
             writer.add_scalar(f"ExpertAffinity/Opponent_{label}_Prefers", preferred_idx, update)
 
-        for label in top_usage_labels:
+        # Top-3 experts per label, labels are ints and already in numeric order
+        for label in sorted(opponent_expert_affinity):
             usage = opponent_expert_affinity.get(label)
-            if usage is None or usage.sum().item() <= 0:
+            if usage is None or usage.numel() == 0:
                 continue
-            norm = usage / usage.sum().clamp_min(1e-6)
-            for expert_idx in range(norm.shape[0]):
+
+            total = float(usage.sum().item())
+            if total <= 0:
+                continue
+
+            # Normalized share per expert (ranking identical to raw usage)
+            norm = usage / max(total, 1e-6)
+
+            k = min(3, usage.shape[0])
+            # Top-k by raw usage, returned in descending order
+            top_vals, top_idx = torch.topk(usage, k=k, largest=True, sorted=True)
+
+            # Log: 0's top1, 0's top2, 0's top3, then 1's top1, ...
+            for idx in top_idx.tolist():
                 writer.add_scalar(
-                    f"ExpertAffinity/Opponent_{label}/Expert_{expert_idx}",
-                    float(norm[expert_idx].item()),
+                    f"ExpertAffinity/Opponent_{label}/Expert_{idx}",
+                    float(norm[idx].item()),
                     update,
                 )
 
