@@ -59,9 +59,9 @@ _COLLATE_EXPECTED_MI_KEYS: Tuple[str, ...] = (
 
 EPS_CLIP          = float(getattr(config, "EPS_CLIP", 0.2))
 ENT_COEF          = float(getattr(config, "INIT_ENTROPY_COEF", 0.005))
-TRINAL_DELTA1     = float(getattr(config, "TRINAL_DELTA1", 1.8))
 GAMMA             = float(getattr(config, "GAMMA", 0.974))
 GAE_LAMBDA        = float(getattr(config, "GAE_LAMBDA", 0.98))
+VALUE_CLIP_RANGE  = float(getattr(config, "VALUE_CLIP_RANGE", EPS_CLIP))
 
 # --- Loss Function Weights ---
 VALUE_WEIGHT      = float(getattr(config, "VALUE_WEIGHT", 0.5))
@@ -131,6 +131,7 @@ def _single_pass_ppo(
     valid_mask = ~padding_mask
 
     rewards_full = batch["rewards_full"].to(device=device, dtype=torch.float32)
+    old_values_full = batch["old_values_full"].to(device=device, dtype=torch.float32)
     
     # --- Universal GAE Calculation ---
     next_values_full = torch.zeros_like(values_full)
@@ -176,15 +177,19 @@ def _single_pass_ppo(
     entropy_loss = -ent_mean * ENT_COEF
     
     # --- Value Loss (on all valid steps) ---
-    if valid_mask.any():
-        value_loss = F.mse_loss(values_full[valid_mask], returns_full[valid_mask])
-    else:
-        value_loss = torch.zeros((), device=device)
+    value_diff = values_full - old_values_full
+    value_clipped = old_values_full + value_diff.clamp(-VALUE_CLIP_RANGE, VALUE_CLIP_RANGE)
+    value_loss_unclipped = (values_full - returns_full).pow(2)
+    value_loss_clipped = (value_clipped - returns_full).pow(2)
+    value_loss_tensor = torch.max(value_loss_unclipped, value_loss_clipped)
+    value_loss = _masked_mean(value_loss_tensor, valid_mask)
 
     # --- Total PPO Loss ---
     total = policy_loss + VALUE_WEIGHT * value_loss + entropy_loss
 
     moe_info: Dict[str, torch.Tensor] = {}
+    load_balance_loss = torch.zeros((), device=device)
+    usage = torch.zeros((1,), device=device)
     if isinstance(gate_logits_tensor, torch.Tensor) and gate_logits_tensor.numel() > 0:
         gate_logits_stack = gate_logits_tensor.to(device=device)
         gate_probs = torch.softmax(gate_logits_stack, dim=-1)
@@ -234,6 +239,7 @@ def _single_pass_ppo(
         metrics["entropy"] = ent_mean.detach()
         metrics["approx_kl"] = _masked_mean(old_logp - new_logp, step_mask).detach()
         metrics["clip_fraction"] = _masked_mean(((ratio - 1.0).abs() > EPS_CLIP).float(), step_mask).detach()
+        metrics["value_clip_frac"] = _masked_mean((value_diff.abs() > VALUE_CLIP_RANGE).float(), valid_mask).detach()
         metrics["opp_loss"] = opp_loss.detach()
         metrics["opp_action_acc"] = opp_acc.detach()
         metrics["win_prob_loss"] = win_prob_loss.detach()
@@ -427,6 +433,7 @@ def _collate_batch(
     actions = torch.full((B, T), IGN, dtype=torch.long)
     old_logp = torch.zeros((B, T), dtype=torch.float32)
     rewards_full = torch.zeros((B, L_pad), dtype=torch.float32)
+    old_values_full = torch.zeros((B, L_pad), dtype=torch.float32)
 
     for b, ep in enumerate(episodes):
         # gather per-step labels exactly at our_idx (only for valid slots)
@@ -443,6 +450,11 @@ def _collate_batch(
         rlen = min(len(r), L_pad)
         if rlen > 0:
             rewards_full[b, :rlen] = torch.from_numpy(r[:rlen])
+
+        v = ep.get("value")
+        vlen = min(len(v), L_pad) if v is not None else 0
+        if vlen > 0:
+            old_values_full[b, :vlen] = torch.from_numpy(v[:vlen])
 
     # --- optional our_action_mask from mi['action_mask'] if present ---
     our_action_mask = None
@@ -501,6 +513,7 @@ def _collate_batch(
         "actions": actions,
         "old_logp": old_logp,
         "rewards_full": rewards_full,
+        "old_values_full": old_values_full,
         "opp_idx": opp_idx,
         "opp_targets": opp_targets,
         "opp_have_label": opp_have_label,

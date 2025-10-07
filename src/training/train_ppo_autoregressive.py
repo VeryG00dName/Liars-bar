@@ -230,7 +230,6 @@ def train(
         writer.add_scalar("Policy/Entropy", avg.get("entropy", 0.0), update)
         writer.add_scalar("Policy/ApproxKL", avg.get("approx_kl", 0.0), update)
         writer.add_scalar("Policy/ClipFraction", avg.get("clip_fraction", 0.0), update)
-        writer.add_scalar("Policy/TrinalClipNegFrac", avg.get("trinal_clip_neg_frac", 0.0), update)
         writer.add_scalar("Value/ClipFrac", avg.get("value_clip_frac", 0.0), update)
         writer.add_scalar("Diag/ReturnStdEMA", config.RET_STD_EMA, update)
 

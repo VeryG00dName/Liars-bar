@@ -31,11 +31,7 @@ struct TrajectoryData {
     std::vector<float> log_prob;
     std::vector<float> value;
     std::vector<double> reward;
-    std::vector<uint8_t> done;
     std::vector<int> opp_target_action;
-    std::vector<int> penalties_used;
-
-    double episode_return{0.0};
     int win{0};
 };
 

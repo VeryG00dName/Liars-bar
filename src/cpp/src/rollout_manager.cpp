@@ -405,16 +405,10 @@ void RolloutManager::submit_inference_results_array(int policy_id,
 
                 const float log_prob_value = has_log_probs ? log_probs[i] : 0.0f;
                 const float value_value = has_values ? values[i] : 0.0f;
-                int penalties_used = 0;
-                if (env_idx >= 0 && env_idx < static_cast<int>(arena_.envs.size()) &&
-                    seat >= 0 && seat < arena_.envs[env_idx].num_players()) {
-                    penalties_used = static_cast<int>(arena_.envs[env_idx].penalties[seat]);
-                }
 
                 if (step_idx >= 0 && step_idx < static_cast<int>(seat_tracker.data.log_prob.size())) {
                     seat_tracker.data.log_prob[step_idx] = log_prob_value;
                     seat_tracker.data.value[step_idx] = value_value;
-                    seat_tracker.data.penalties_used[step_idx] = penalties_used;
                 }
             }
         }
@@ -687,9 +681,6 @@ void RolloutManager::finalize_seat(EpisodeTracker& tracker, SeatTrajectory& seat
     if (our_last_step_idx >= 0 && our_last_step_idx < static_cast<int>(seat_tracker.data.reward.size())) {
         seat_tracker.data.reward[our_last_step_idx] += is_winner ? 1.0 : -1.0;
     }
-
-    seat_tracker.data.episode_return =
-        std::accumulate(seat_tracker.data.reward.begin(), seat_tracker.data.reward.end(), 0.0);
 
     completed_buffer_.push_back(std::move(seat_tracker.data));
     seat_tracker.data = TrajectoryData{};
@@ -1015,9 +1006,7 @@ int RolloutManager::append_training_step(SeatTrajectory& seat_tracker) {
     seat_tracker.data.log_prob.push_back(0.0f);
     seat_tracker.data.value.push_back(0.0f);
     seat_tracker.data.reward.push_back(0.0);
-    seat_tracker.data.done.push_back(0);
     seat_tracker.data.opp_target_action.push_back(-1);
-    seat_tracker.data.penalties_used.push_back(0);
     const int idx = static_cast<int>(seat_tracker.data.agent_id.size()) - 1;
     seat_tracker.last_training_step_idx = idx;
     return idx;
@@ -1029,9 +1018,7 @@ int RolloutManager::append_opponent_step(SeatTrajectory& seat_tracker, int seat)
     seat_tracker.data.log_prob.push_back(0.0f);
     seat_tracker.data.value.push_back(0.0f);
     seat_tracker.data.reward.push_back(0.0);
-    seat_tracker.data.done.push_back(0);
     seat_tracker.data.opp_target_action.push_back(-1);
-    seat_tracker.data.penalties_used.push_back(0);
     return static_cast<int>(seat_tracker.data.agent_id.size()) - 1;
 }
 

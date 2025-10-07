@@ -79,10 +79,7 @@ void bind_rollout_manager(py::module_& m) {
         .def_readonly("log_prob", &TrajectoryData::log_prob)
         .def_readonly("value", &TrajectoryData::value)
         .def_readonly("reward", &TrajectoryData::reward)
-        .def_readonly("done", &TrajectoryData::done)
         .def_readonly("opp_target_action", &TrajectoryData::opp_target_action)
-        .def_readonly("penalties_used", &TrajectoryData::penalties_used)
-        .def_readonly("episode_return", &TrajectoryData::episode_return)
         .def_readonly("win", &TrajectoryData::win);
 
     py::class_<RolloutManager>(m, "RolloutManager")

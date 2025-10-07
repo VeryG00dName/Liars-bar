@@ -122,11 +122,8 @@ class PPOVecRolloutManager:
             "log_prob": np.asarray(traj.log_prob, dtype=np.float32),
             "value": np.asarray(traj.value, dtype=np.float32),
             "reward": np.asarray(traj.reward, dtype=np.float32),
-            "done": np.asarray(traj.done, dtype=np.bool_),
             "opp_target_action": np.asarray(traj.opp_target_action, dtype=np.int32),
-            "penalties_used": np.asarray(traj.penalties_used, dtype=np.int32),
             "model_input": model_input,
-            "episode_return": float(traj.episode_return),
             "win": int(traj.win),
             "winner_label": training_label if int(traj.win) else None,
         }
