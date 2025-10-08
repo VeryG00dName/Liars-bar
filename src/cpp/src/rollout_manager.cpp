@@ -13,6 +13,7 @@
 #include <unordered_set>
 
 #include <torch/torch.h>
+#include <torch/nn/functional.h>
 
 #include "bots.h"
 #include "torch_utils.h"
@@ -133,6 +134,7 @@ void RolloutManager::start_rollouts(int num_episodes,
     for (int id : training_policy_ids_) {
         training_policy_id_set_.insert(id);
     }
+    kv_cache_.clear();
     completed_buffer_.clear();
     weighted_opponent_labels_ = opponent_labels;
     weighted_opponent_weights_ = opponent_weights;
@@ -311,7 +313,7 @@ std::unordered_map<int, std::vector<PolicyRequest>> RolloutManager::collect_requ
         if (model_it != historical_models_.end() && model_it->second) {
             bool success = false;
             try {
-                auto actions = run_historical_inference(*model_it->second, *best_requests);
+                auto actions = run_historical_inference(policy_id, *model_it->second, *best_requests);
                 arena_.submit_actions(best_policy, actions);
                 success = true;
             } catch (const std::exception& ex) {
@@ -444,6 +446,7 @@ void RolloutManager::load_historical_model(int policy_id, const std::string& pat
         module->to(kInferenceDevice);
         module->eval();
         historical_models_[policy_id] = std::move(module);
+        kv_cache_.erase(policy_id);
     } catch (const c10::Error& err) {
         std::cerr << "[RolloutManager] Failed to load TorchScript module from '" << path
                   << "': " << err.what_without_backtrace() << std::endl;
@@ -703,7 +706,8 @@ bool RolloutManager::is_training_policy(int policy_id) const {
     return training_policy_id_set_.find(policy_id) != training_policy_id_set_.end();
 }
 
-std::vector<uint8_t> RolloutManager::run_historical_inference(torch::jit::Module& module,
+std::vector<uint8_t> RolloutManager::run_historical_inference(int policy_id,
+                                                              torch::jit::Module& module,
                                                               const std::vector<PolicyRequest>& requests) {
     if (requests.empty()) {
         return {};
@@ -732,6 +736,7 @@ std::vector<uint8_t> RolloutManager::run_historical_inference(torch::jit::Module
     }
 
     std::vector<uint8_t> chosen(requests.size(), 0);
+    auto& cache_map = kv_cache_[policy_id];
 
     auto opts_long_device = torch::TensorOptions().dtype(torch::kInt64).device(kInferenceDevice);
 
@@ -744,73 +749,255 @@ std::vector<uint8_t> RolloutManager::run_historical_inference(torch::jit::Module
         const int64_t target_pad_len =
             std::min<int64_t>(kBucketBounds[bucket_idx], max_limit);
 
-        auto tensor_batch =
-            prepare_inference_batch(requests, target_pad_len, kInferenceDevice, indices);
-        auto& obs_sequence = tensor_batch.obs_sequence;
-        auto& action_sequence = tensor_batch.action_sequence;
-        auto& agent_types = tensor_batch.agent_types;
-        auto& positions = tensor_batch.positions;
-        auto& action_masks = tensor_batch.action_masks;
-        auto& padding_mask = tensor_batch.padding_mask;
-        auto valid_lengths_device = tensor_batch.valid_lengths;
+        std::vector<size_t> without_cache;
+        std::vector<size_t> with_cache;
+        std::vector<CacheEntry> cached_entries;
+        without_cache.reserve(indices.size());
+        with_cache.reserve(indices.size());
+        cached_entries.reserve(indices.size());
 
-        std::vector<torch::jit::IValue> inputs;
-        inputs.reserve(6);
-        inputs.emplace_back(obs_sequence);
-        inputs.emplace_back(action_sequence);
-        inputs.emplace_back(agent_types);
-        inputs.emplace_back(positions);
-        inputs.emplace_back(action_masks);
-        inputs.emplace_back(padding_mask);
-
-        auto outputs = module.forward(inputs).toTuple();
-        if (!outputs || outputs->elements().size() < 3) {
-            throw std::runtime_error("Historical model returned unexpected output shape");
-        }
-
-        auto action_logits = outputs->elements()[0].toTensor().contiguous();
-        (void)outputs->elements()[2].toTensor();
-
-        auto batch_indices = torch::arange(batch_size, opts_long_device);
-        auto last_indices = (valid_lengths_device - 1).clamp_min(0);
-        auto last_logits = action_logits.index({batch_indices, last_indices}).contiguous();
-        auto last_masks = action_masks.index({batch_indices, last_indices}).contiguous();
-
-        auto has_legal = last_masks.any(1);
-        if (!has_legal.all().item<bool>()) {
-            auto fallback_indices = has_legal.logical_not().nonzero().flatten();
-            for (int64_t i = 0; i < fallback_indices.size(0); ++i) {
-                const int64_t row = fallback_indices[i].item<int64_t>();
-                auto mask_row_tensor = last_masks.select(0, row);
-                mask_row_tensor.fill_(false);
-                bool assigned = false;
-                const auto& req = requests[indices[static_cast<size_t>(row)]];
-                for (int j = 0; j < 7; ++j) {
-                    if (req.mask[j]) {
-                        mask_row_tensor.index_put_({j}, true);
-                        assigned = true;
-                    }
-                }
-                if (!assigned) {
-                    mask_row_tensor.fill_(true);
-                }
-                last_logits.select(0, row).fill_(0.0f);
+        for (size_t idx_local = 0; idx_local < indices.size(); ++idx_local) {
+            size_t global_idx = indices[idx_local];
+            const auto& req = requests[global_idx];
+            if (req.env < 0 || req.seat < 0) {
+                without_cache.push_back(global_idx);
+                continue;
+            }
+            uint64_t key = seat_cache_key(req.env, req.seat);
+            if (req.valid_len <= 1) {
+                cache_map.erase(key);
+            }
+            auto cache_it = cache_map.find(key);
+            if (cache_it == cache_map.end()) {
+                without_cache.push_back(global_idx);
+            } else {
+                with_cache.push_back(global_idx);
+                cached_entries.push_back(cache_it->second);
             }
         }
 
-        last_logits.masked_fill_(~last_masks, -std::numeric_limits<float>::infinity());
+        auto process_group = [&](const std::vector<size_t>& subset,
+                                 const std::vector<CacheEntry>* cache_list) {
+            if (subset.empty()) {
+                return c10::IValue();
+            }
 
-        auto probs = torch::softmax(last_logits, /*dim=*/1);
-        auto actions_tensor = torch::multinomial(probs, /*num_samples=*/1);
-        actions_tensor = actions_tensor.squeeze(-1).to(torch::kCPU);
+            auto batch = prepare_inference_batch(requests, target_pad_len, kInferenceDevice, subset);
 
-        auto actions_ptr = actions_tensor.data_ptr<int64_t>();
-        for (int64_t b = 0; b < batch_size; ++b) {
-            chosen[indices[static_cast<size_t>(b)]] = static_cast<uint8_t>(actions_ptr[b]);
+            std::vector<c10::IValue> inputs;
+            inputs.reserve(8);
+            inputs.emplace_back(batch.obs_sequence);
+            inputs.emplace_back(batch.action_sequence);
+            inputs.emplace_back(batch.agent_types);
+            inputs.emplace_back(batch.positions);
+            inputs.emplace_back(batch.action_masks);
+            inputs.emplace_back(batch.padding_mask);
+            inputs.emplace_back(batch.valid_lengths);
+            if (cache_list && !cache_list->empty()) {
+                inputs.emplace_back(stack_kv_cache(*cache_list, kInferenceDevice));
+            } else {
+                inputs.emplace_back(c10::IValue());
+            }
+
+            auto outputs = module.get_method("forward_with_kv_cache")(inputs).toTuple();
+            if (!outputs || outputs->elements().size() < 5) {
+                throw std::runtime_error("Historical model returned unexpected output shape");
+            }
+
+            auto action_logits = outputs->elements()[0].toTensor().contiguous();
+            auto new_cache = outputs->elements()[4];
+
+            auto batch_size_local = static_cast<int64_t>(subset.size());
+            auto batch_indices_local = torch::arange(batch_size_local, opts_long_device);
+            auto last_indices_local = (batch.valid_lengths - 1).clamp_min(0);
+            auto last_logits = action_logits.index({batch_indices_local, last_indices_local}).contiguous();
+            auto last_masks = batch.action_masks.index({batch_indices_local, last_indices_local}).contiguous();
+
+            auto has_legal = last_masks.any(1);
+            if (!has_legal.all().item<bool>()) {
+                auto fallback_indices = has_legal.logical_not().nonzero().flatten();
+                for (int64_t i = 0; i < fallback_indices.size(0); ++i) {
+                    const int64_t row = fallback_indices[i].item<int64_t>();
+                    auto mask_row_tensor = last_masks.select(0, row);
+                    mask_row_tensor.fill_(false);
+                    bool assigned = false;
+                    const auto& req = requests[subset[static_cast<size_t>(row)]];
+                    for (int j = 0; j < 7; ++j) {
+                        if (req.mask[j]) {
+                            mask_row_tensor.index_put_({j}, true);
+                            assigned = true;
+                        }
+                    }
+                    if (!assigned) {
+                        mask_row_tensor.fill_(true);
+                    }
+                    last_logits.select(0, row).fill_(0.0f);
+                }
+            }
+
+            last_logits.masked_fill_(~last_masks, -std::numeric_limits<float>::infinity());
+
+            auto probs = torch::softmax(last_logits, /*dim=*/1);
+            auto actions_tensor = torch::multinomial(probs, /*num_samples=*/1);
+            actions_tensor = actions_tensor.squeeze(-1).to(torch::kCPU);
+
+            auto actions_ptr = actions_tensor.data_ptr<int64_t>();
+            for (int64_t b = 0; b < batch_size_local; ++b) {
+                chosen[subset[static_cast<size_t>(b)]] = static_cast<uint8_t>(actions_ptr[b]);
+            }
+
+            return new_cache;
+        };
+
+        auto cache_none = process_group(without_cache, nullptr);
+        if (!without_cache.empty()) {
+            update_kv_cache(policy_id, without_cache, requests, cache_none);
+        }
+
+        if (!with_cache.empty()) {
+            auto cache_value = process_group(with_cache, &cached_entries);
+            update_kv_cache(policy_id, with_cache, requests, cache_value);
         }
     }
 
     return chosen;
+}
+
+uint64_t RolloutManager::seat_cache_key(int env, int seat) {
+    uint64_t env_part = static_cast<uint64_t>(static_cast<uint32_t>(env));
+    uint64_t seat_part = static_cast<uint64_t>(static_cast<uint32_t>(seat));
+    return (env_part << 32) | seat_part;
+}
+
+c10::IValue RolloutManager::stack_kv_cache(const std::vector<CacheEntry>& caches,
+                                           const torch::Device& device) {
+    if (caches.empty()) {
+        return c10::IValue();
+    }
+
+    size_t num_layers = caches.front().size();
+    c10::List<c10::IValue> stacked;
+    stacked.reserve(num_layers);
+
+    for (size_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
+        std::vector<torch::Tensor> keys;
+        std::vector<torch::Tensor> values;
+        std::vector<torch::Tensor> lengths;
+        int64_t max_len = 0;
+        for (const auto& cache : caches) {
+            const auto& dict_ivalue = cache[layer_idx];
+            auto dict = dict_ivalue.toGenericDict();
+            auto key_tensor = dict.at("key").toTensor().to(device);
+            auto value_tensor = dict.at("value").toTensor().to(device);
+            auto length_tensor = dict.at("lengths").toTensor().to(device);
+            max_len = std::max<int64_t>(max_len, key_tensor.size(2));
+            keys.push_back(key_tensor);
+            values.push_back(value_tensor);
+            lengths.push_back(length_tensor);
+        }
+
+        std::vector<torch::Tensor> padded_keys;
+        std::vector<torch::Tensor> padded_values;
+        padded_keys.reserve(keys.size());
+        padded_values.reserve(values.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            auto key_tensor = keys[i];
+            auto value_tensor = values[i];
+            int64_t pad_len = max_len - key_tensor.size(2);
+            if (pad_len > 0) {
+                key_tensor = torch::nn::functional::pad(
+                    key_tensor, torch::nn::functional::PadFuncOptions({0, 0, 0, pad_len}));
+                value_tensor = torch::nn::functional::pad(
+                    value_tensor, torch::nn::functional::PadFuncOptions({0, 0, 0, pad_len}));
+            }
+            padded_keys.push_back(key_tensor);
+            padded_values.push_back(value_tensor);
+        }
+
+        auto stacked_key = torch::cat(padded_keys, 0);
+        auto stacked_value = torch::cat(padded_values, 0);
+        auto stacked_lengths = torch::cat(lengths, 0);
+
+        c10::Dict<std::string, torch::Tensor> dict;
+        dict.insert("key", stacked_key);
+        dict.insert("value", stacked_value);
+        dict.insert("lengths", stacked_lengths);
+        stacked.emplace_back(dict);
+    }
+
+    return c10::IValue(stacked);
+}
+
+void RolloutManager::update_kv_cache(int policy_id,
+                                     const std::vector<size_t>& indices,
+                                     const std::vector<PolicyRequest>& requests,
+                                     const c10::IValue& cache_ivalue) {
+    if (indices.empty() || cache_ivalue.isNone()) {
+        return;
+    }
+
+    auto cache_list = cache_ivalue.toList();
+    if (cache_list.size() == 0) {
+        return;
+    }
+
+    auto& cache_map = kv_cache_[policy_id];
+    int max_allowed = default_max_sequence_length_;
+    auto it_limit = policy_max_sequence_length_.find(policy_id);
+    if (it_limit != policy_max_sequence_length_.end()) {
+        max_allowed = std::max(1, it_limit->second);
+    }
+
+    size_t num_layers = cache_list.size();
+    auto lengths_tensor = cache_list.get(0).toGenericDict().at("lengths").toTensor();
+    int64_t batch_size = lengths_tensor.size(0);
+
+    for (int64_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+        if (static_cast<size_t>(batch_idx) >= indices.size()) {
+            break;
+        }
+        size_t request_idx = indices[static_cast<size_t>(batch_idx)];
+        const auto& req = requests[request_idx];
+        if (req.env < 0 || req.seat < 0) {
+            continue;
+        }
+        uint64_t key = seat_cache_key(req.env, req.seat);
+        CacheEntry entry;
+        entry.reserve(num_layers);
+
+        for (size_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
+            auto dict = cache_list.get(layer_idx).toGenericDict();
+            auto key_tensor = dict.at("key").toTensor().select(0, batch_idx).unsqueeze(0).detach();
+            auto value_tensor = dict.at("value").toTensor().select(0, batch_idx).unsqueeze(0).detach();
+            auto length_tensor = dict.at("lengths").toTensor().select(0, batch_idx).unsqueeze(0).detach();
+
+            int64_t seq_len = length_tensor.item<int64_t>();
+            if (seq_len <= 0) {
+                seq_len = 0;
+            }
+            if (seq_len > max_allowed) {
+                int64_t start = seq_len - max_allowed;
+                key_tensor = key_tensor.narrow(2, start, max_allowed).contiguous();
+                value_tensor = value_tensor.narrow(2, start, max_allowed).contiguous();
+                seq_len = max_allowed;
+                length_tensor = torch::tensor({seq_len}, torch::TensorOptions().dtype(torch::kLong));
+            } else {
+                length_tensor = torch::tensor({seq_len}, torch::TensorOptions().dtype(torch::kLong));
+            }
+
+            key_tensor = key_tensor.cpu().contiguous();
+            value_tensor = value_tensor.cpu().contiguous();
+            length_tensor = length_tensor.cpu();
+
+            c10::Dict<std::string, torch::Tensor> layer_dict;
+            layer_dict.insert("key", key_tensor);
+            layer_dict.insert("value", value_tensor);
+            layer_dict.insert("lengths", length_tensor);
+            entry.push_back(c10::IValue(layer_dict));
+        }
+
+        cache_map[key] = std::move(entry);
+    }
 }
 
 std::vector<uint8_t> RolloutManager::run_cpp_bot(int policy_id, const std::vector<PolicyRequest>& requests) {

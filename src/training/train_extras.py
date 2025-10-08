@@ -83,7 +83,7 @@ def apply_determinism_settings(level: str) -> Dict[str, Any]:
             torch.backends.cuda.enable_math_sdp(True)
         if hasattr(torch, "set_float32_matmul_precision"):
             try:
-                torch.set_float32_matmul_precision("highest")
+                torch.set_float32_matmul_precision("high")
             except Exception:
                 pass
     elif lvl == "full":
@@ -102,7 +102,7 @@ def apply_determinism_settings(level: str) -> Dict[str, Any]:
             torch.backends.cuda.enable_math_sdp(True)
         if hasattr(torch, "set_float32_matmul_precision"):
             try:
-                torch.set_float32_matmul_precision("highest")
+                torch.set_float32_matmul_precision("high")
             except Exception:
                 pass
 

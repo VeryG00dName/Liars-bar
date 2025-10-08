@@ -1,10 +1,10 @@
 # src/model/ppo_reactive_model_script.py
 from __future__ import annotations
 
-from typing import Optional
+from typing import List, Optional
 import torch
 import torch.nn as nn
-from src.model.ppo_reactive_model_base import PPOReactiveModelBase
+from src.model.ppo_reactive_model_base import AttentionCacheEntry, PPOReactiveModelBase
 
 
 class PPOReactiveModelScript(PPOReactiveModelBase):
@@ -40,4 +40,27 @@ class PPOReactiveModelScript(PPOReactiveModelBase):
             num_experts=num_experts,
             top_k=top_k,
             expert_ffn_dim=expert_ffn_dim,
+        )
+
+    @torch.jit.export
+    def forward_with_kv_cache(
+        self,
+        obs_sequence: torch.Tensor,
+        action_sequence: torch.Tensor,
+        agent_types: torch.Tensor,
+        positions: torch.Tensor,
+        action_masks: Optional[torch.Tensor] = None,
+        padding_mask: Optional[torch.Tensor] = None,
+        valid_lengths: Optional[torch.Tensor] = None,
+        kv_cache: Optional[List[AttentionCacheEntry]] = None,
+    ):
+        return super().forward_with_kv_cache(
+            obs_sequence=obs_sequence,
+            action_sequence=action_sequence,
+            agent_types=agent_types,
+            positions=positions,
+            action_masks=action_masks,
+            padding_mask=padding_mask,
+            valid_lengths=valid_lengths,
+            kv_cache=kv_cache,
         )

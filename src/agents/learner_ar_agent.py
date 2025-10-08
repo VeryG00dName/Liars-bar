@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.amp as amp
+import torch.nn.functional as F
 
 from src import config
 from src.model.model_factory import ModelFactory as MFactoryUtil
@@ -14,6 +15,7 @@ from src.model.ppo_autoregressive_model import PPOAutoregressiveModel
 from src.model.ppo_fused_model import PPOFusedModel
 # --- NEW IMPORT ---
 from src.model.ppo_reactive_model import PPOReactiveModel
+from src.model.ppo_reactive_model_base import AttentionCacheEntry
 from src.model.ppo_reactive_model_script import PPOReactiveModelScript
 
 __all__ = ["LearnerAutoregressiveAgent", "build_model_from_state"]
@@ -38,9 +40,11 @@ class LearnerAutoregressiveAgent:
         self.label: int = -1
         self.max_seq_length: Optional[int] = None
         self._last_inputs: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
+        self._kv_cache: Dict[Tuple[int, int], List[AttentionCacheEntry]] = {}
         self.compile = compile
     def reset(self) -> None:
         self._last_inputs.clear()
+        self._kv_cache.clear()
 
     def pop_last_model_input(self, env_idx: int, my_seat: int):
         return self._last_inputs.pop((env_idx, my_seat), None)
@@ -91,8 +95,10 @@ class LearnerAutoregressiveAgent:
                 dtype=torch.float16,
                 enabled=autocast_enabled,
             ):
-                forward_out = self.rollout_model(**filtered_model_input)
-        action_logits, _, state_values = forward_out[:3]
+                logits_last, mask_last, values_last = self._forward_with_optional_cache(
+                    filtered_model_input,
+                    model_input,
+                )
 
         valid_lengths = model_input["valid_lengths"].long()
         if valid_lengths.numel() == 0:
@@ -102,9 +108,9 @@ class LearnerAutoregressiveAgent:
         rows = torch.arange(valid_lengths.shape[0], device=self.device)
         last_idx = (valid_lengths - 1).clamp_min(0)
 
-        logits_last = action_logits[rows, last_idx, :].clone()
-        values_last = state_values[rows, last_idx].squeeze(-1)
-        step_mask = model_input["action_masks"][rows, last_idx, :]
+        logits_last = logits_last.clone()
+        values_last = values_last.clone()
+        step_mask = mask_last.clone()
         logits_last = logits_last.masked_fill(~step_mask, float("-inf"))
 
         dist = torch.distributions.Categorical(logits=logits_last)
@@ -120,6 +126,144 @@ class LearnerAutoregressiveAgent:
         self._record_last_inputs(env_indices, seat_indices, model_input)
 
         return actions_np, log_probs_np, values_np
+
+    def _forward_with_optional_cache(
+        self,
+        filtered_inputs: Dict[str, torch.Tensor],
+        full_inputs: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.rollout_model is None:
+            raise RuntimeError("Rollout model is not initialized")
+
+        model = self.rollout_model
+        # Delegate to model-level rollout cache handling when available.
+        if hasattr(model, "forward_rollout"):
+            logits_last, mask_last, values_last, updated_cache = model.forward_rollout(
+                filtered_inputs,
+                full_inputs,
+                kv_cache_map=self._kv_cache,
+            )
+            self._kv_cache = updated_cache
+            return logits_last, mask_last, values_last
+
+        # Fallback to local handling (e.g., scripted model without helper)
+        obs_sequence = filtered_inputs["obs_sequence"]
+        action_masks = filtered_inputs["action_masks"]
+        valid_lengths = full_inputs.get("valid_lengths")
+        if not isinstance(valid_lengths, torch.Tensor):
+            valid_lengths = torch.as_tensor(valid_lengths, device=self.device)
+        valid_lengths = valid_lengths.to(self.device).long()
+
+        batch_size = obs_sequence.size(0)
+        action_dim = action_masks.size(-1)
+        logits_last = torch.empty((batch_size, action_dim), device=self.device)
+        mask_last = torch.empty((batch_size, action_dim), dtype=torch.bool, device=self.device)
+        values_last = torch.empty((batch_size,), device=self.device)
+
+        outputs = model.forward_with_kv_cache(
+            obs_sequence=filtered_inputs["obs_sequence"],
+            action_sequence=filtered_inputs["action_sequence"],
+            agent_types=filtered_inputs["agent_types"],
+            positions=filtered_inputs["positions"],
+            action_masks=filtered_inputs["action_masks"],
+            padding_mask=filtered_inputs["padding_mask"],
+            valid_lengths=valid_lengths,
+            kv_cache=None,
+        )
+        action_logits, _, state_values, _, _ = outputs
+        last_indices = (valid_lengths - 1).clamp_min(0)
+        for i in range(batch_size):
+            last_pos = int(last_indices[i].item())
+            logits_last[i] = action_logits[i, last_pos]
+            mask_last[i] = action_masks[i, last_pos]
+            values_last[i] = state_values[i, last_pos, 0]
+        return logits_last, mask_last, values_last
+
+    def _stack_kv_cache(
+        self,
+        caches: List[List[AttentionCacheEntry]],
+        device: torch.device,
+    ) -> List[AttentionCacheEntry]:
+        if not caches:
+            return []
+
+        num_layers = len(caches[0])
+        stacked: List[AttentionCacheEntry] = []
+        for layer_idx in range(num_layers):
+            layer_keys: List[torch.Tensor] = []
+            layer_values: List[torch.Tensor] = []
+            layer_lengths: List[torch.Tensor] = []
+            max_len = 0
+            for cache in caches:
+                entry = cache[layer_idx]
+                key_tensor = entry["key"].to(device)
+                value_tensor = entry["value"].to(device)
+                length_tensor = entry["lengths"].to(device)
+                max_len = max(max_len, key_tensor.size(2))
+                layer_keys.append(key_tensor)
+                layer_values.append(value_tensor)
+                layer_lengths.append(length_tensor)
+
+            padded_keys: List[torch.Tensor] = []
+            padded_values: List[torch.Tensor] = []
+            for key_tensor, value_tensor in zip(layer_keys, layer_values):
+                pad_len = max_len - key_tensor.size(2)
+                if pad_len > 0:
+                    key_tensor = F.pad(key_tensor, (0, 0, 0, pad_len))
+                    value_tensor = F.pad(value_tensor, (0, 0, 0, pad_len))
+                padded_keys.append(key_tensor)
+                padded_values.append(value_tensor)
+
+            stacked.append(
+                {
+                    "key": torch.cat(padded_keys, dim=0),
+                    "value": torch.cat(padded_values, dim=0),
+                    "lengths": torch.cat(layer_lengths, dim=0),
+                }
+            )
+
+        return stacked
+
+    def _update_kv_cache(
+        self,
+        keys: List[Optional[Tuple[int, int]]],
+        caches: List[AttentionCacheEntry],
+    ) -> None:
+        if not keys or not caches:
+            return
+
+        num_layers = len(caches)
+        batch_size = caches[0]["key"].size(0)
+        for batch_idx in range(batch_size):
+            key = keys[batch_idx] if batch_idx < len(keys) else None
+            if key is None:
+                continue
+            per_cache: List[AttentionCacheEntry] = []
+            for layer_idx in range(num_layers):
+                layer_entry = caches[layer_idx]
+                key_tensor = layer_entry["key"][batch_idx : batch_idx + 1].detach().cpu()
+                value_tensor = layer_entry["value"][batch_idx : batch_idx + 1].detach().cpu()
+                length_tensor = layer_entry["lengths"][batch_idx : batch_idx + 1].detach().cpu()
+                seq_len = int(length_tensor[0].item())
+                max_allowed = self.max_seq_length or seq_len
+                if seq_len > max_allowed:
+                    start = seq_len - max_allowed
+                    key_tensor = key_tensor[..., start:, :].contiguous()
+                    value_tensor = value_tensor[..., start:, :].contiguous()
+                    length_tensor = torch.clamp(length_tensor - start, max=max_allowed)
+                    seq_len = max_allowed
+                else:
+                    length_tensor = torch.clamp(length_tensor, max=max_allowed)
+                key_tensor = key_tensor[..., :seq_len, :].contiguous()
+                value_tensor = value_tensor[..., :seq_len, :].contiguous()
+                per_cache.append(
+                    {
+                        "key": key_tensor,
+                        "value": value_tensor,
+                        "lengths": length_tensor,
+                    }
+                )
+            self._kv_cache[key] = per_cache
 
     def _record_last_inputs(
         self,
@@ -198,6 +342,10 @@ class LearnerAutoregressiveAgent:
             }
 
             self._last_inputs[(env_idx, seat_idx)] = snapshot
+
+            if (env_idx, seat_idx) in self._kv_cache:
+                # Reset cache when we record a new full snapshot (episode restart).
+                self._kv_cache.pop((env_idx, seat_idx), None)
 
     def sync_rollout_models(self) -> None:
         if self.train_model is None:

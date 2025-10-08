@@ -126,6 +126,8 @@ private:
         std::unordered_map<uint64_t, std::unique_ptr<CppBotBase>> instances;
     };
 
+    using CacheEntry = std::vector<c10::IValue>;
+
     VecArena arena_;
     int target_episodes_{0};
     int batch_size_{0};
@@ -141,6 +143,7 @@ private:
     std::vector<TrajectoryData> completed_buffer_;
     std::unordered_map<int, std::shared_ptr<torch::jit::Module>> historical_models_;
     std::unordered_map<int, CppBotRegistryEntry> cpp_bot_registry_;
+    std::unordered_map<int, std::unordered_map<uint64_t, CacheEntry>> kv_cache_;
     std::vector<uint8_t> training_env_inactive_;
     std::vector<int> active_training_counts_;
     std::vector<int> weighted_opponent_labels_;
@@ -161,11 +164,18 @@ private:
     void finalize_episode(EpisodeTracker& tracker);
     void mark_training_env_inactive(int env_idx);
     void finalize_seat(EpisodeTracker& tracker, SeatTrajectory& seat_tracker, Env& env);
-    std::vector<uint8_t> run_historical_inference(torch::jit::Module& module,
+    std::vector<uint8_t> run_historical_inference(int policy_id,
+                                                  torch::jit::Module& module,
                                                   const std::vector<PolicyRequest>& requests);
     std::vector<uint8_t> run_cpp_bot(int policy_id, const std::vector<PolicyRequest>& requests);
     static CppBotKind parse_cpp_bot_kind(const std::string& name);
     std::unique_ptr<CppBotBase> make_cpp_bot_instance(CppBotKind kind,
                                                       const PolicyRequest& request);
+    static uint64_t seat_cache_key(int env, int seat);
+    c10::IValue stack_kv_cache(const std::vector<CacheEntry>& caches, const torch::Device& device);
+    void update_kv_cache(int policy_id,
+                         const std::vector<size_t>& indices,
+                         const std::vector<PolicyRequest>& requests,
+                         const c10::IValue& cache_ivalue);
 };
 

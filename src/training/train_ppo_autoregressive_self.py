@@ -21,8 +21,6 @@ os.environ.pop("TORCH_LOGS", None)           # disable extra compile logs
 os.environ.setdefault("TORCHDYNAMO_VERBOSE", "0")
 os.environ.setdefault("TORCH_COMPILE_DEBUG", "0")
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-# Deterministic cuBLAS workspace requirement for CUDA
-os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
 # Hide symbolic_shapes warnings printed via warnings module (belt-and-suspenders)
 warnings.filterwarnings(
     "ignore",
@@ -61,7 +59,6 @@ _silence_torch_symbolic_logs()
 SEED = int(getattr(config, "SEED", 42))
 set_seed(SEED)
 _GLOBAL_RNG = np.random.default_rng(SEED)
-apply_determinism_settings("none")
 
 FORCE_CUDA_SYNC_FOR_TIMING = bool(getattr(config, "FORCE_CUDA_SYNC_FOR_TIMING", False))
 
@@ -1385,7 +1382,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     apply_determinism_settings(args.determinism_level)
-
+    import torch
     master_run_name = args.master_run_name or f"selfplay_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     logging.info(f"Starting master self-play run: {master_run_name}")
 
