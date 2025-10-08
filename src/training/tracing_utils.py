@@ -11,22 +11,6 @@ from src.agents.learner_ar_agent import LearnerAutoregressiveAgent
 # This is a simplified version of the logic from trace_models.py,
 # designed to be called as a library function.
 
-def _build_example_inputs(model: torch.nn.Module, device: torch.device):
-    """Constructs deterministic example tensors for tracing."""
-    max_len = int(getattr(model, "max_seq_length"))
-    seq_len = min(max_len, 256) # Use a longer sequence for better generalization
-    obs_dim = int(getattr(model, "obs_dim"))
-    action_dim = int(getattr(model, "action_dim", 7))
-
-    return {
-        "obs_sequence": torch.zeros(1, seq_len, obs_dim, dtype=torch.float32, device=device),
-        "action_sequence": torch.zeros(1, seq_len, dtype=torch.long, device=device),
-        "agent_types": torch.zeros(1, seq_len, dtype=torch.long, device=device),
-        "positions": torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0),
-        "action_masks": torch.zeros(1, seq_len, action_dim, dtype=torch.bool, device=device),
-        "padding_mask": torch.zeros(1, seq_len, dtype=torch.bool, device=device),
-    }
-
 def trace_model_from_checkpoint(checkpoint_path: str, output_path: str, device: torch.device):
     """Loads a .pth checkpoint, traces it, and saves it as a .pt file."""
     metadata_path = Path(str(output_path) + ".max_seq_length")

@@ -79,14 +79,7 @@ class PPOReactiveModelSingle(PPOReactiveModelBase):
         action_masks: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
         valid_lengths: Optional[torch.Tensor] = None,
-    ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        Optional[torch.Tensor],
-        Optional[Dict[str, torch.Tensor]],
-    ]:
+    ):
         # 1. Prepare inputs using inherited methods from the base class
         encoded_inputs = self._encode_inputs(
             obs_sequence, action_sequence, agent_types, positions, padding_mask
@@ -102,8 +95,6 @@ class PPOReactiveModelSingle(PPOReactiveModelBase):
 
         # 3. Get outputs from the single, dense heads
         action_logits = self.action_head(transformer_output)
-        state_values = self.reward_stream_head(transformer_output)
-        win_logits = self.win_prob_head(transformer_output)
         opp_logits = self.opp_action_head(transformer_output)
 
         # 4. (Optional) Apply action mask if provided, useful for SL training
@@ -117,5 +108,4 @@ class PPOReactiveModelSingle(PPOReactiveModelBase):
             invalid = (~action_masks.bool()) & our_turns
             action_logits = torch.where(invalid, neg, action_logits)
 
-        # 5. Return with a consistent signature, providing None for MoE-specific outputs
-        return action_logits, opp_logits
+        return action_logits, opp_logits, None, None, None, None

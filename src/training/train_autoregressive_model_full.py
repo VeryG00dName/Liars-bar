@@ -608,7 +608,7 @@ def train_autoregressive_model(
             batch = move_batch_to_device(batch, device)
             with amp.autocast(device_type=device.type, dtype=pt_dtype):
                 # Model now only returns action_logits and opp_logits
-                self_logits, opp_logits = model(
+                self_logits, opp_logits,_,_,_,_ = model(
                     obs_sequence=batch['obs_sequence'],
                     action_sequence=batch['action_sequence'],
                     agent_types=batch['agent_types'],

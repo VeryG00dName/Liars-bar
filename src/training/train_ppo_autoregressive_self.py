@@ -69,10 +69,6 @@ FORCE_CUDA_SYNC_FOR_TIMING = bool(getattr(config, "FORCE_CUDA_SYNC_FOR_TIMING", 
 # ==============================================================================
 
 PAD_BUCKET_BOUNDARIES = [64, 128, 192, 256, 384, 480]
-MAX_ENVS_PER_CALL = 512
-COVERAGE_FLOOR = 32
-FRONTIER_FOCUS_COUNTS = [128, 96, 64, 32]
-
 
 def _select_bucket_length(length: int) -> int:
     for boundary in PAD_BUCKET_BOUNDARIES:
