@@ -51,6 +51,7 @@ from src.training.ppo_extras import (
     ppo_losses_batched,
     set_seed
 )
+from src.training.train_extras import apply_determinism_settings
 
 def _silence_torch_symbolic_logs():
     for name in ("torch.fx.experimental.symbolic_shapes", "torch._dynamo.symbolic_shapes", "torch._dynamo", "torch._inductor"):
@@ -60,6 +61,7 @@ _silence_torch_symbolic_logs()
 SEED = int(getattr(config, "SEED", 42))
 set_seed(SEED)
 _GLOBAL_RNG = np.random.default_rng(SEED)
+apply_determinism_settings("none")
 
 FORCE_CUDA_SYNC_FOR_TIMING = bool(getattr(config, "FORCE_CUDA_SYNC_FOR_TIMING", False))
 
@@ -363,7 +365,7 @@ def _create_new_agent(agent_type: str, device: torch.device) -> LearnerAutoregre
     if agent_type == 'main':
         model = PPOReactiveModel(
             obs_dim=9,
-            use_gradient_checkpointing=bool(getattr(config, "USE_GRADIENT_CHECKPOINTING", False)),
+            use_gradient_checkpointing=True,
         )
     else:  # Future branches (e.g., exploiter) can be added here.
         raise ValueError(f"Unknown agent type for creation: {agent_type}")
@@ -881,16 +883,22 @@ def train_generation(
                 bucket_len = _select_bucket_length(tokens)
                 bucket_to_indices.setdefault(bucket_len, []).append(idx)
 
-            minibatch_size = int(getattr(config, "PPO_MINIBATCH_SIZE", len(batch_eps)))
-            if minibatch_size <= 0:
-                minibatch_size = len(batch_eps)
-            minibatch_size = max(1, minibatch_size)
+            bucket_minibatch_map = getattr(config, "PPO_MINIBATCH_SIZE_BUCKET_MAP", {})
+            default_minibatch_size = int(getattr(config, "PPO_MINIBATCH_SIZE", len(batch_eps)))
+            if default_minibatch_size <= 0:
+                default_minibatch_size = len(batch_eps)
+            default_minibatch_size = max(1, default_minibatch_size)
 
-            bucket_batches: List[Tuple[int, List[Dict[str, Any]]]] = []
+            bucket_batches: List[Tuple[int, List[Dict[str, Any]], int]] = []
             for bucket_len, indices in bucket_to_indices.items():
                 if not indices:
                     continue
                 random.shuffle(indices)
+
+                bucket_minibatch_size = int(bucket_minibatch_map.get(bucket_len, default_minibatch_size))
+                if bucket_minibatch_size <= 0:
+                    bucket_minibatch_size = len(batch_eps)
+                bucket_minibatch_size = max(1, bucket_minibatch_size)
 
                 ready_eps: List[Dict[str, Any]] = []
                 if optimizer_waitlists[bucket_len]:
@@ -899,10 +907,10 @@ def train_generation(
 
                 ready_eps.extend(batch_eps[i] for i in indices)
 
-                while len(ready_eps) >= minibatch_size:
-                    group = ready_eps[:minibatch_size]
-                    bucket_batches.append((bucket_len, list(group)))
-                    del ready_eps[:minibatch_size]
+                while len(ready_eps) >= bucket_minibatch_size:
+                    group = ready_eps[:bucket_minibatch_size]
+                    bucket_batches.append((bucket_len, list(group), bucket_minibatch_size))
+                    del ready_eps[:bucket_minibatch_size]
 
                 if ready_eps:
                     optimizer_waitlists[bucket_len].extend(ready_eps)
@@ -922,9 +930,9 @@ def train_generation(
             group_count = 0
             processed_minibatches = 0
 
-            for bucket_len, mini_eps in bucket_batches:
+            for bucket_len, mini_eps, bucket_minibatch_size in bucket_batches:
                 bucket_start_time = time.perf_counter()
-                assert len(mini_eps) == minibatch_size
+                assert len(mini_eps) == bucket_minibatch_size
                 mini_cpu = _collate_batch(mini_eps, L_max=bucket_len, pin_memory=True)
                 valid_lengths_cpu = mini_cpu.get("mi", {}).get("valid_lengths")
                 if isinstance(valid_lengths_cpu, torch.Tensor):
@@ -932,7 +940,8 @@ def train_generation(
 
                 mini_gpu = _to_device_batch(mini_cpu, device)
 
-                with amp.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == "cuda")):
+                autocast_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
+                with amp.autocast(device_type=device.type, dtype=autocast_dtype, enabled=True):
                     total_loss, metrics, moe_info = ppo_losses_batched(
                         learner.train_model,
                         mini_gpu,
@@ -1366,8 +1375,17 @@ if __name__ == "__main__":
     parser.add_argument("--challenger-freq", type=int, default=0, help="Inject a challenger from SL every N generations. Set to 0 to disable.")
     parser.add_argument("--master-run-name", type=str, default=None, help="Overall name for the self-play experiment folder.")
     parser.add_argument("--no-sl", action="store_true", help="Start generation 1 from scratch, without SL warm-start.")
+    parser.add_argument(
+        "--determinism-level",
+        type=str,
+        choices=("none", "high", "full"),
+        default="none",
+        help="Configure PyTorch determinism knobs; defaults to the fastest ('none').",
+    )
     args = parser.parse_args()
-    
+
+    apply_determinism_settings(args.determinism_level)
+
     master_run_name = args.master_run_name or f"selfplay_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     logging.info(f"Starting master self-play run: {master_run_name}")
 

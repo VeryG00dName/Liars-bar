@@ -36,7 +36,7 @@ from src.eval.evaluate_utils import (
     run_batched_lineups,
     save_scoreboard,
 )
-from src.training.train_extras import set_seed
+from src.training.train_extras import apply_determinism_settings, set_seed
 
 SEED = int(getattr(config, "SEED", 42))
 set_seed(SEED)
@@ -475,7 +475,16 @@ def main() -> None:
         default=4096,
         help="Limit the number of candidate quartets considered when scheduling (0 disables).",
     )
+    parser.add_argument(
+        "--determinism-level",
+        type=str,
+        choices=("none", "high", "full"),
+        default="none",
+        help="Configure PyTorch determinism for tournament inference.",
+    )
     args = parser.parse_args()
+
+    apply_determinism_settings(args.determinism_level)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     run_specs = parse_run_specs(args.eval_runs)

@@ -69,7 +69,22 @@ class LearnerAutoregressiveAgent:
 
         filtered_model_input = {k: v for k, v in model_input.items() if k in EXPECTED_MODEL_ARGS}
 
-        autocast_enabled = self.device.type == "cuda"
+        valid_lengths_source = tensor_inputs.get("valid_lengths")
+        if isinstance(valid_lengths_source, torch.Tensor):
+            valid_lengths_cpu = valid_lengths_source.detach().cpu().to(torch.long)
+        else:
+            valid_lengths_cpu = torch.as_tensor(valid_lengths_source, dtype=torch.long)
+        if valid_lengths_cpu.ndim == 0:
+            batch_size = 1
+            max_seq_len = int(valid_lengths_cpu.item())
+        else:
+            batch_size = int(valid_lengths_cpu.shape[0])
+            max_seq_len = int(valid_lengths_cpu.max().item()) if valid_lengths_cpu.numel() > 0 else 0
+
+        autocast_enabled = (
+            self.device.type == "cuda"
+            and (batch_size >= 128 or max_seq_len >= 128)
+        )
         with torch.inference_mode():
             with amp.autocast(
                 device_type=self.device.type,

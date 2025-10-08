@@ -4,6 +4,7 @@ import random
 from typing import Any, Dict, List, Optional, Tuple
 
 import os
+import random
 
 import numpy as np
 import torch
@@ -13,7 +14,7 @@ from src import config
 
 
 def set_seed(seed: int = 42) -> None:
-    """Configure deterministic behaviour across Python, NumPy, and Torch."""
+    """Seed Python, NumPy and Torch without forcing deterministic backends."""
     os.environ.setdefault("PYTHONHASHSEED", str(seed))
 
     random.seed(seed)
@@ -23,29 +24,6 @@ def set_seed(seed: int = 42) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    if hasattr(torch.backends, "cudnn") and hasattr(torch.backends.cudnn, "allow_tf32"):
-        torch.backends.cudnn.allow_tf32 = False
-    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda.matmul, "allow_tf32"):
-        torch.backends.cuda.matmul.allow_tf32 = False
-    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda.matmul, "allow_fp16_reduced_precision_reduction"):
-        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
-    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction"):
-        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
-
-    torch.set_float32_matmul_precision("medium")
-
-    if hasattr(torch.backends, "cuda"):
-        if hasattr(torch.backends.cuda, "enable_flash_sdp"):
-            torch.backends.cuda.enable_flash_sdp(False)
-        if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
-            torch.backends.cuda.enable_mem_efficient_sdp(False)
-        if hasattr(torch.backends.cuda, "enable_math_sdp"):
-            torch.backends.cuda.enable_math_sdp(True)
-
-    torch.use_deterministic_algorithms(True, warn_only=True)
 
 # Expected model_input keys collated during batching.
 _COLLATE_EXPECTED_MI_KEYS: Tuple[str, ...] = (

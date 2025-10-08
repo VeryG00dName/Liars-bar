@@ -30,6 +30,7 @@ import pandas as pd
 import torch
 from src.model.ppo_reactive_model import PPOReactiveModel
 from src.model.ppo_reactive_model_script import PPOReactiveModelScript
+from src.training.train_extras import apply_determinism_settings, capture_backend_state
 DEVICE = torch.device("cuda")
 # Suppress specific FutureWarning from torch.utils.checkpoint about CPU AMP autocast
 warnings.filterwarnings(
@@ -84,88 +85,6 @@ def _get_autocast_context():
         return torch.amp.autocast  # type: ignore[attr-defined]
     return torch.cuda.amp.autocast  # type: ignore[return-value]
 autocast_context = _get_autocast_context()
-def apply_determinism_settings(level: str) -> Dict[str, Any]:
-    """Apply global determinism knobs and return the resulting state."""
-    lvl = level.lower()
-    if lvl not in {"none", "high", "full"}:
-        raise ValueError(f"Unknown determinism level: {level}")
-    # Reset to permissive defaults before applying the requested policy.
-    torch.use_deterministic_algorithms(False)
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cudnn.deterministic = False
-    if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
-        torch.backends.cuda.matmul.allow_tf32 = True
-    if hasattr(torch.backends.cudnn, "allow_tf32"):
-        torch.backends.cudnn.allow_tf32 = True
-    if hasattr(torch.backends.cuda, "enable_flash_sdp"):
-        torch.backends.cuda.enable_flash_sdp(True)
-    if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
-        torch.backends.cuda.enable_mem_efficient_sdp(True)
-    if hasattr(torch.backends.cuda, "enable_math_sdp"):
-        torch.backends.cuda.enable_math_sdp(True)
-    # Default to fastest matmul precision when not requesting determinism.
-    if hasattr(torch, "set_float32_matmul_precision"):
-        try:
-            torch.set_float32_matmul_precision("high")  # enable TF32 on Ampere+
-        except Exception:
-            pass
-
-    if lvl == "high":
-        torch.use_deterministic_algorithms(True, warn_only=True)
-        torch.backends.cudnn.benchmark = False
-        if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
-            torch.backends.cuda.matmul.allow_tf32 = False
-        if hasattr(torch.backends.cudnn, "allow_tf32"):
-            torch.backends.cudnn.allow_tf32 = False
-        if hasattr(torch.backends.cuda, "enable_flash_sdp"):
-            torch.backends.cuda.enable_flash_sdp(False)
-        if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
-            torch.backends.cuda.enable_mem_efficient_sdp(False)
-        if hasattr(torch.backends.cuda, "enable_math_sdp"):
-            torch.backends.cuda.enable_math_sdp(True)
-        if hasattr(torch, "set_float32_matmul_precision"):
-            try:
-                torch.set_float32_matmul_precision("highest")  # disable TF32 matmuls
-            except Exception:
-                pass
-    elif lvl == "full":
-        torch.use_deterministic_algorithms(True, warn_only=False)
-        torch.backends.cudnn.benchmark = False
-        torch.backends.cudnn.deterministic = True
-        if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
-            torch.backends.cuda.matmul.allow_tf32 = False
-        if hasattr(torch.backends.cudnn, "allow_tf32"):
-            torch.backends.cudnn.allow_tf32 = False
-        if hasattr(torch.backends.cuda, "enable_flash_sdp"):
-            torch.backends.cuda.enable_flash_sdp(False)
-        if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
-            torch.backends.cuda.enable_mem_efficient_sdp(False)
-        if hasattr(torch.backends.cuda, "enable_math_sdp"):
-            torch.backends.cuda.enable_math_sdp(True)
-        if hasattr(torch, "set_float32_matmul_precision"):
-            try:
-                torch.set_float32_matmul_precision("highest")  # disable TF32 matmuls
-            except Exception:
-                pass
-    return capture_backend_state()
-def capture_backend_state() -> Dict[str, Any]:
-    """Snapshot the relevant backend flags for reporting."""
-    state = {
-        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
-        "cudnn_benchmark": torch.backends.cudnn.benchmark,
-        "cudnn_deterministic": torch.backends.cudnn.deterministic,
-    }
-    if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
-        state["matmul_allow_tf32"] = torch.backends.cuda.matmul.allow_tf32
-    if hasattr(torch.backends.cudnn, "allow_tf32"):
-        state["cudnn_allow_tf32"] = torch.backends.cudnn.allow_tf32
-    if hasattr(torch.backends.cuda, "flash_sdp_enabled"):
-        state["flash_sdp"] = torch.backends.cuda.flash_sdp_enabled()
-    if hasattr(torch.backends.cuda, "mem_efficient_sdp_enabled"):
-        state["mem_efficient_sdp"] = torch.backends.cuda.mem_efficient_sdp_enabled()
-    if hasattr(torch.backends.cuda, "math_sdp_enabled"):
-        state["math_sdp"] = torch.backends.cuda.math_sdp_enabled()
-    return state
 def generate_fixtures(config: BenchmarkConfig, *, seed: int = 2024) -> Dict[str, torch.Tensor]:
     """Create deterministic synthetic inputs for the requested batch/seq length."""
     if config.seq_len > config.max_seq_length:
