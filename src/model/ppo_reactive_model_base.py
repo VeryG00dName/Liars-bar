@@ -18,12 +18,7 @@ __all__ = [
 ]
 
 
-class AttentionCacheEntry(TypedDict):
-    """Serialized attention cache for TorchScript compatibility."""
-
-    key: torch.Tensor
-    value: torch.Tensor
-    lengths: torch.Tensor
+AttentionCacheEntry = Dict[str, torch.Tensor]
 
 
 class SelfAttentionWithCache(nn.Module):
@@ -67,20 +62,25 @@ class SelfAttentionWithCache(nn.Module):
         new_k = self._shape(self.k_proj(x))
         new_v = self._shape(self.v_proj(x))
 
+        # --- THIS IS THE FIX ---
+        # Initialize variables to None to ensure they are always defined
+        # for the JIT compiler, regardless of the 'cache' branch.
+        past_k: Optional[torch.Tensor] = None
+        past_v: Optional[torch.Tensor] = None
+        past_lengths: Optional[torch.Tensor] = None
+
         if cache is not None:
-            past_k = cache.get("key")
-            past_v = cache.get("value")
-            past_lengths = cache.get("lengths")
-        else:
-            past_k = None
-            past_v = None
-            past_lengths = None
+            past_k = cache["key"]
+            past_v = cache["value"]
+            past_lengths = cache["lengths"]
+        # The 'else' part is now handled by the initialization above.
 
         if past_k is None:
             combined_k = new_k
             combined_v = new_v
             past_len = 0
         else:
+            assert past_v is not None
             past_len = int(past_k.size(2))
             combined_k = torch.cat([past_k, new_k], dim=2)
             combined_v = torch.cat([past_v, new_v], dim=2)
@@ -270,7 +270,7 @@ class MoETransformerEncoder(nn.Module):
         new_caches: List[AttentionCacheEntry] = []
         output = src
         for idx, layer in enumerate(self.layers):
-            layer_cache = None
+            layer_cache = torch.jit.annotate(Optional[AttentionCacheEntry], None)
             if kv_cache is not None and idx < len(kv_cache):
                 layer_cache = kv_cache[idx]
             output, routing, updated_cache = layer(
@@ -583,16 +583,21 @@ class PPOReactiveModelBase(nn.Module):
         new_lengths: torch.Tensor,
         fill_value: float = 0.0,
     ) -> torch.Tensor:
-        batch, total_len = tensor.shape[0], tensor.shape[1]
-        device = tensor.device
+        batch = int(tensor.size(0))
+        total_len = int(tensor.size(1))
+
         chunk_lengths = (new_lengths - prev_lengths).clamp_min(0)
         max_chunk = int(chunk_lengths.max().item())
-        if tensor.dim() == 2:
-            trailing_shape: Tuple[int, ...] = ()
-        else:
-            trailing_shape = tuple(tensor.shape[2:])
-        out_shape = (batch, max_chunk) + trailing_shape
+
+        # Build output shape as a List[int] (TorchScript-friendly)
+        out_shape: List[int] = [batch, max_chunk]
+        dim = int(tensor.dim())
+        if dim > 2:
+            for d in range(2, dim):
+                out_shape.append(int(tensor.size(d)))
+
         chunk = tensor.new_full(out_shape, fill_value)
+
         for i in range(batch):
             start = int(prev_lengths[i].item())
             end = int(new_lengths[i].item())
@@ -602,8 +607,13 @@ class PPOReactiveModelBase(nn.Module):
             length = min(max_chunk, end - start)
             if length <= 0:
                 continue
-            chunk_slice = tensor[i, start : start + length]
-            chunk[i, :length] = chunk_slice
+
+            # Slice and copy the new tokens for this batch element
+            if dim == 2:
+                chunk[i, :length] = tensor[i, start:start + length]
+            else:
+                chunk[i, :length, ...] = tensor[i, start:start + length, ...]
+
         return chunk
 
     def _build_chunk_padding(
@@ -622,7 +632,8 @@ class PPOReactiveModelBase(nn.Module):
                 continue
             padding[i, :length] = False
         return padding
-
+    
+    @torch.jit.export
     def forward_with_kv_cache(
         self,
         obs_sequence: torch.Tensor,
@@ -683,9 +694,9 @@ class PPOReactiveModelBase(nn.Module):
             return zeros_actions, zeros_opp, zeros_values, zeros_win, kv_cache
 
         obs_chunk = self._slice_new_tokens(obs_sequence, prev_lengths, new_lengths)
-        action_chunk = self._slice_new_tokens(action_sequence, prev_lengths, new_lengths, fill_value=0)
-        agent_chunk = self._slice_new_tokens(agent_types, prev_lengths, new_lengths, fill_value=0)
-        position_chunk = self._slice_new_tokens(positions, prev_lengths, new_lengths, fill_value=0)
+        action_chunk   = self._slice_new_tokens(action_sequence, prev_lengths, new_lengths, fill_value=0.0)
+        agent_chunk    = self._slice_new_tokens(agent_types,     prev_lengths, new_lengths, fill_value=0.0)
+        position_chunk = self._slice_new_tokens(positions,       prev_lengths, new_lengths, fill_value=0.0)
         if padding_mask is not None:
             padding_chunk = self._slice_new_tokens(
                 padding_mask,

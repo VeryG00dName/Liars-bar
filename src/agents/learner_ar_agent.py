@@ -1,493 +1,73 @@
-"""Learner autoregressive PPO agent utilities."""
+"""Utilities for loading learner PPO autoregressive models."""
 
 from __future__ import annotations
 
-import logging
-from typing import Any, Dict, List, Optional, Tuple
-import numpy as np
+from typing import Any, Dict, Optional
+
 import torch
-import torch.amp as amp
-import torch.nn.functional as F
 
 from src import config
 from src.model.model_factory import ModelFactory as MFactoryUtil
-from src.model.ppo_autoregressive_model import PPOAutoregressiveModel
-from src.model.ppo_fused_model import PPOFusedModel
-# --- NEW IMPORT ---
 from src.model.ppo_reactive_model import PPOReactiveModel
-from src.model.ppo_reactive_model_base import AttentionCacheEntry
 from src.model.ppo_reactive_model_script import PPOReactiveModelScript
 
 __all__ = ["LearnerAutoregressiveAgent", "build_model_from_state"]
-EXPECTED_MODEL_ARGS = {
-            "obs_sequence",
-            "action_sequence",
-            "agent_types",
-            "positions",
-            "action_masks",
-            "padding_mask",
-        }
+
 
 class LearnerAutoregressiveAgent:
-    """Wrapper that keeps learner state on the target training device."""
+    """Lightweight wrapper that keeps track of training state on a device."""
 
     def __init__(self, device: torch.device, player_id: str, compile: bool = False):
         self.device = device
         self.player_id = player_id
         self.model: Optional[torch.nn.Module] = None
         self.train_model: Optional[torch.nn.Module] = None
-        self.rollout_model: Optional[torch.nn.Module] = None
         self.label: int = -1
         self.max_seq_length: Optional[int] = None
-        self._last_inputs: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
-        self._kv_cache: Dict[Tuple[int, int], List[AttentionCacheEntry]] = {}
         self.compile = compile
-    def reset(self) -> None:
-        self._last_inputs.clear()
-        self._kv_cache.clear()
 
-    def pop_last_model_input(self, env_idx: int, my_seat: int):
-        return self._last_inputs.pop((env_idx, my_seat), None)
+    # ------------------------------------------------------------------
+    # Lifecycle helpers
+    # ------------------------------------------------------------------
+    def reset(self) -> None:
+        """No-op retained for compatibility with existing rollout code."""
 
     def load_from_state_dict(self, model_state_dict: Dict[str, torch.Tensor]) -> None:
-        model = build_model_from_state(model_state_dict, self.device)
-        self.model = model
-        self.rollout_model = None
+        """Instantiate ``self.model`` from a serialized state_dict."""
+
+        model = self.build_model_from_state(model_state_dict, self.device)
+        self.model = model.to(self.device)
+        self.model.eval()
         self.max_seq_length = getattr(model, "max_seq_length", None)
-        self.reset()
 
-    def compute_actions(
-            self,
-            tensor_inputs: Dict[str, torch.Tensor],
-        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        if self.rollout_model is None:
-            raise RuntimeError("LearnerAutoregressiveAgent model has not been initialized.")
 
-        if "valid_lengths" not in tensor_inputs or "action_masks" not in tensor_inputs:
-            raise RuntimeError("Tensor payload missing required keys for inference.")
-
-        model_input = {
-            k: v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v
-            for k, v in tensor_inputs.items()
-        }
-
-        filtered_model_input = {k: v for k, v in model_input.items() if k in EXPECTED_MODEL_ARGS}
-
-        valid_lengths_source = tensor_inputs.get("valid_lengths")
-        if isinstance(valid_lengths_source, torch.Tensor):
-            valid_lengths_cpu = valid_lengths_source.detach().cpu().to(torch.long)
-        else:
-            valid_lengths_cpu = torch.as_tensor(valid_lengths_source, dtype=torch.long)
-        if valid_lengths_cpu.ndim == 0:
-            batch_size = 1
-            max_seq_len = int(valid_lengths_cpu.item())
-        else:
-            batch_size = int(valid_lengths_cpu.shape[0])
-            max_seq_len = int(valid_lengths_cpu.max().item()) if valid_lengths_cpu.numel() > 0 else 0
-
-        autocast_enabled = (
-            self.device.type == "cuda"
-            and (batch_size >= 128 or max_seq_len >= 128)
-        )
-        with torch.inference_mode():
-            with amp.autocast(
-                device_type=self.device.type,
-                dtype=torch.float16,
-                enabled=autocast_enabled,
-            ):
-                logits_last, mask_last, values_last = self._forward_with_optional_cache(
-                    filtered_model_input,
-                    model_input,
-                )
-
-        valid_lengths = model_input["valid_lengths"].long()
-        if valid_lengths.numel() == 0:
-            empty = np.array([], dtype=np.float32)
-            return empty.astype(np.uint8), empty, empty
-
-        rows = torch.arange(valid_lengths.shape[0], device=self.device)
-        last_idx = (valid_lengths - 1).clamp_min(0)
-
-        logits_last = logits_last.clone()
-        values_last = values_last.clone()
-        step_mask = mask_last.clone()
-        logits_last = logits_last.masked_fill(~step_mask, float("-inf"))
-
-        dist = torch.distributions.Categorical(logits=logits_last)
-        actions_t = dist.sample()
-        log_probs_t = dist.log_prob(actions_t).to(torch.float32)
-
-        actions_np = actions_t.detach().cpu().numpy().astype(np.uint8)
-        log_probs_np = log_probs_t.detach().cpu().numpy().astype(np.float32)
-        values_np = values_last.detach().cpu().numpy().astype(np.float32)
-
-        env_indices = model_input.get("env_indices")
-        seat_indices = model_input.get("seat_indices")
-        self._record_last_inputs(env_indices, seat_indices, model_input)
-
-        return actions_np, log_probs_np, values_np
-
-    def _forward_with_optional_cache(
+    def build_model_from_state(
         self,
-        filtered_inputs: Dict[str, torch.Tensor],
-        full_inputs: Dict[str, torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.rollout_model is None:
-            raise RuntimeError("Rollout model is not initialized")
-
-        model = self.rollout_model
-        # Delegate to model-level rollout cache handling when available.
-        if hasattr(model, "forward_rollout"):
-            logits_last, mask_last, values_last, updated_cache = model.forward_rollout(
-                filtered_inputs,
-                full_inputs,
-                kv_cache_map=self._kv_cache,
-            )
-            self._kv_cache = updated_cache
-            return logits_last, mask_last, values_last
-
-        # Fallback to local handling (e.g., scripted model without helper)
-        obs_sequence = filtered_inputs["obs_sequence"]
-        action_masks = filtered_inputs["action_masks"]
-        valid_lengths = full_inputs.get("valid_lengths")
-        if not isinstance(valid_lengths, torch.Tensor):
-            valid_lengths = torch.as_tensor(valid_lengths, device=self.device)
-        valid_lengths = valid_lengths.to(self.device).long()
-
-        batch_size = obs_sequence.size(0)
-        action_dim = action_masks.size(-1)
-        logits_last = torch.empty((batch_size, action_dim), device=self.device)
-        mask_last = torch.empty((batch_size, action_dim), dtype=torch.bool, device=self.device)
-        values_last = torch.empty((batch_size,), device=self.device)
-
-        outputs = model.forward_with_kv_cache(
-            obs_sequence=filtered_inputs["obs_sequence"],
-            action_sequence=filtered_inputs["action_sequence"],
-            agent_types=filtered_inputs["agent_types"],
-            positions=filtered_inputs["positions"],
-            action_masks=filtered_inputs["action_masks"],
-            padding_mask=filtered_inputs["padding_mask"],
-            valid_lengths=valid_lengths,
-            kv_cache=None,
-        )
-        action_logits, _, state_values, _, _ = outputs
-        last_indices = (valid_lengths - 1).clamp_min(0)
-        for i in range(batch_size):
-            last_pos = int(last_indices[i].item())
-            logits_last[i] = action_logits[i, last_pos]
-            mask_last[i] = action_masks[i, last_pos]
-            values_last[i] = state_values[i, last_pos, 0]
-        return logits_last, mask_last, values_last
-
-    def _stack_kv_cache(
-        self,
-        caches: List[List[AttentionCacheEntry]],
+        model_state_dict: Dict[str, torch.Tensor],
         device: torch.device,
-    ) -> List[AttentionCacheEntry]:
-        if not caches:
-            return []
+    ) -> torch.nn.Module:
+        """Reconstruct a learner model from a serialized state_dict."""
 
-        num_layers = len(caches[0])
-        stacked: List[AttentionCacheEntry] = []
-        for layer_idx in range(num_layers):
-            layer_keys: List[torch.Tensor] = []
-            layer_values: List[torch.Tensor] = []
-            layer_lengths: List[torch.Tensor] = []
-            max_len = 0
-            for cache in caches:
-                entry = cache[layer_idx]
-                key_tensor = entry["key"].to(device)
-                value_tensor = entry["value"].to(device)
-                length_tensor = entry["lengths"].to(device)
-                max_len = max(max_len, key_tensor.size(2))
-                layer_keys.append(key_tensor)
-                layer_values.append(value_tensor)
-                layer_lengths.append(length_tensor)
-
-            padded_keys: List[torch.Tensor] = []
-            padded_values: List[torch.Tensor] = []
-            for key_tensor, value_tensor in zip(layer_keys, layer_values):
-                pad_len = max_len - key_tensor.size(2)
-                if pad_len > 0:
-                    key_tensor = F.pad(key_tensor, (0, 0, 0, pad_len))
-                    value_tensor = F.pad(value_tensor, (0, 0, 0, pad_len))
-                padded_keys.append(key_tensor)
-                padded_values.append(value_tensor)
-
-            stacked.append(
-                {
-                    "key": torch.cat(padded_keys, dim=0),
-                    "value": torch.cat(padded_values, dim=0),
-                    "lengths": torch.cat(layer_lengths, dim=0),
-                }
-            )
-
-        return stacked
-
-    def _update_kv_cache(
-        self,
-        keys: List[Optional[Tuple[int, int]]],
-        caches: List[AttentionCacheEntry],
-    ) -> None:
-        if not keys or not caches:
-            return
-
-        num_layers = len(caches)
-        batch_size = caches[0]["key"].size(0)
-        for batch_idx in range(batch_size):
-            key = keys[batch_idx] if batch_idx < len(keys) else None
-            if key is None:
-                continue
-            per_cache: List[AttentionCacheEntry] = []
-            for layer_idx in range(num_layers):
-                layer_entry = caches[layer_idx]
-                key_tensor = (
-                    layer_entry["key"][batch_idx : batch_idx + 1].detach().clone()
-                )
-                value_tensor = (
-                    layer_entry["value"][batch_idx : batch_idx + 1].detach().clone()
-                )
-                length_tensor = (
-                    layer_entry["lengths"][batch_idx : batch_idx + 1].detach().clone()
-                )
-                seq_len = int(length_tensor[0].item())
-                max_allowed = self.max_seq_length or seq_len
-                if seq_len > max_allowed:
-                    start = seq_len - max_allowed
-                    key_tensor = key_tensor[..., start:, :].contiguous()
-                    value_tensor = value_tensor[..., start:, :].contiguous()
-                    length_tensor = torch.clamp(length_tensor - start, max=max_allowed)
-                    seq_len = max_allowed
-                else:
-                    length_tensor = torch.clamp(length_tensor, max=max_allowed)
-                key_tensor = key_tensor[..., :seq_len, :].contiguous()
-                value_tensor = value_tensor[..., :seq_len, :].contiguous()
-                per_cache.append(
-                    {
-                        "key": key_tensor,
-                        "value": value_tensor,
-                        "lengths": length_tensor,
-                    }
-                )
-            self._kv_cache[key] = per_cache
-
-    def _record_last_inputs(
-        self,
-        env_indices: Optional[Any],
-        seat_indices: Optional[Any],
-        model_input: Dict[str, torch.Tensor],
-    ) -> None:
-        if env_indices is None or seat_indices is None:
-            return
-
-        if isinstance(env_indices, torch.Tensor):
-            env_tensor = env_indices.detach().cpu().to(torch.long)
-        else:
-            env_tensor = torch.as_tensor(env_indices, dtype=torch.long)
-
-        if isinstance(seat_indices, torch.Tensor):
-            seat_tensor = seat_indices.detach().cpu().to(torch.long)
-        else:
-            seat_tensor = torch.as_tensor(seat_indices, dtype=torch.long)
-
-        valid_lengths_t = model_input.get("valid_lengths")
-        obs_tensor = model_input.get("obs_sequence")
-        action_tensor = model_input.get("action_sequence")
-        agent_tensor = model_input.get("agent_types")
-        position_tensor = model_input.get("positions")
-        mask_tensor = model_input.get("action_masks")
-        padding_tensor = model_input.get("padding_mask")
-
-        if not all(isinstance(t, torch.Tensor) for t in (
-            valid_lengths_t,
-            obs_tensor,
-            action_tensor,
-            agent_tensor,
-            position_tensor,
-            mask_tensor,
-            padding_tensor,
-        )):
-            return
-
-        if obs_tensor.dim() < 3 or mask_tensor.dim() < 3:
-            return
-
-        obs_cpu = obs_tensor.detach().cpu()
-        action_cpu = action_tensor.detach().cpu()
-        agent_cpu = agent_tensor.detach().cpu()
-        position_cpu = position_tensor.detach().cpu()
-        mask_cpu = mask_tensor.detach().cpu()
-        padding_cpu = padding_tensor.detach().cpu()
-        valid_lengths_cpu = valid_lengths_t.detach().cpu().to(torch.long)
-
-        batch_size = valid_lengths_cpu.shape[0]
-        for idx in range(batch_size):
-            if idx >= env_tensor.numel() or idx >= seat_tensor.numel():
-                break
-
-            env_idx = int(env_tensor[idx].item())
-            seat_idx = int(seat_tensor[idx].item())
-            used_len = int(valid_lengths_cpu[idx].item())
-            used_len = max(used_len, 1)
-
-            obs_slice = obs_cpu[idx : idx + 1, :used_len].clone()
-            action_slice = action_cpu[idx : idx + 1, :used_len].clone()
-            agent_slice = agent_cpu[idx : idx + 1, :used_len].clone()
-            position_slice = position_cpu[idx : idx + 1, :used_len].clone()
-            mask_slice = mask_cpu[idx : idx + 1, :used_len].clone()
-            padding_slice = padding_cpu[idx : idx + 1, :used_len].clone()
-
-            snapshot = {
-                "obs_sequence": obs_slice,
-                "action_sequence": action_slice,
-                "agent_types": agent_slice,
-                "positions": position_slice,
-                "action_masks": mask_slice,
-                "padding_mask": padding_slice,
-                "valid_lengths": torch.tensor([used_len], dtype=torch.long),
-            }
-
-            self._last_inputs[(env_idx, seat_idx)] = snapshot
-
-            if (env_idx, seat_idx) in self._kv_cache:
-                # Reset cache when we record a new full snapshot (episode restart).
-                self._kv_cache.pop((env_idx, seat_idx), None)
-
-    def sync_rollout_models(self) -> None:
-        if self.train_model is None:
-            return
-
-        source = getattr(self.train_model, "_orig_mod", self.train_model)
-        state = source.state_dict()
-
-        if self.model is not None:
-            self.model.load_state_dict(state, strict=True)
-
-        if self.rollout_model is not None:
-            target = getattr(self.rollout_model, "_orig_mod", self.rollout_model)
-            target.load_state_dict(state, strict=True)
-
-
-    def load_models_from_checkpoint(self, checkpoint: Dict[str, Any], agent_key: str):
-        """
-        Load model state dict, automatically detect the architecture (reactive, fused, legacy),
-        and re-instantiate the correct model class using inferred dimensions.
-        """
-        if "policy_nets" not in checkpoint or agent_key not in checkpoint["policy_nets"]:
-            raise ValueError(f"Checkpoint missing model state for agent '{agent_key}' in 'policy_nets'.")
-
-        model_state_dict = checkpoint["policy_nets"][agent_key]
-
-        # --- NEW, ROBUST ARCHITECTURE DETECTION ---
         if self.compile:
             ModelClass = PPOReactiveModelScript
-        elif MFactoryUtil.is_reactive_model(model_state_dict):
-            ModelClass = PPOReactiveModel
-        elif MFactoryUtil.is_fused_model(model_state_dict):
-            ModelClass = PPOFusedModel
-        elif MFactoryUtil.is_ppo_autoregressive_model(model_state_dict):
-            ModelClass = PPOAutoregressiveModel
         else:
-            ModelClass = PPOFusedModel
-        
-        # Infer dimensions that are common to all architectures
-        inferred_obs_dim = MFactoryUtil.get_input_dim_from_state_dict(model_state_dict, 'obs_encoder.0')
-        
-        # Handle different head structures (MLP vs. Linear)
-        action_head_prefix = "action_head.2" if "action_head.2.weight" in model_state_dict else "action_head"
-        inferred_action_dim = MFactoryUtil.get_output_dim_from_state_dict(model_state_dict, action_head_prefix)
-        
-        inferred_hidden_dim = MFactoryUtil.get_hidden_dim_from_state_dict(model_state_dict, 'obs_encoder.0')
-        inferred_max_seq = model_state_dict.get('position_embedding.weight').shape[0]
-        num_heads = inferred_hidden_dim // 64
+            ModelClass = PPOReactiveModel
 
-
-        self.max_seq_length = inferred_max_seq
-
-        # --- NEW, CONDITIONAL KWARGS FOR FUSED MODEL ---
-        extra_kwargs: Dict[str, Any] = {}
-        if ModelClass is PPOFusedModel:
-            bricks_tensor = None
-            for key, tensor in model_state_dict.items():
-                if key.endswith("strategy_dictionary.bricks"):
-                    bricks_tensor = tensor
-                    break
-            if bricks_tensor is not None:
-                num_bricks, brick_dim = bricks_tensor.shape
-                extra_kwargs["num_bricks"] = num_bricks
-                extra_kwargs["brick_dim"] = brick_dim
-            else:
-                extra_kwargs["num_bricks"] = getattr(config, "NUM_BRICKS", 32)
-                extra_kwargs["brick_dim"] = getattr(config, "BRICK_DIM", 32)
-
-        # Instantiate the CORRECT ModelClass with all inferred parameters
-        self.model = ModelClass(
-            obs_dim=inferred_obs_dim,
-            action_dim=inferred_action_dim,
-            hidden_dim=inferred_hidden_dim,
-            num_heads=num_heads,
-            max_seq_length=inferred_max_seq,
-            **extra_kwargs,
-        ).to(self.device)
-
-            # Use strict=False to handle cases where an agent is loaded into a
-            # slightly different architecture (e.g., a reactive model into a fused
-            # one, where some keys won't match). This is useful for analysis.
-        self.model.load_state_dict(model_state_dict, strict=False)
-
-        self.model.eval()
-        self.rollout_model = None
-        self.reset()
-
-def build_model_from_state(
-    model_state_dict: Dict[str, torch.Tensor],
-    device: torch.device,
-) -> torch.nn.Module:
-    """
-    Reconstruct a learner model from a serialized state dict.
-    This function is polymorphic and can identify and build either a
-    PPOFusedModel or a PPOReactiveModel.
-    """
-    ModelClass = PPOReactiveModel
-    # --- END OF MODIFICATIONS ---
-
-    try:
         inferred_obs_dim = MFactoryUtil.get_input_dim_from_state_dict(model_state_dict, "obs_encoder.0")
-        # For action_head, we need to check which type of head exists. Reactive has a multi-layer one.
         action_head_prefix = "action_head.2" if "action_head.2.weight" in model_state_dict else "action_head"
         inferred_action_dim = MFactoryUtil.get_output_dim_from_state_dict(model_state_dict, action_head_prefix)
         inferred_hidden_dim = MFactoryUtil.get_hidden_dim_from_state_dict(model_state_dict, "obs_encoder.0")
         inferred_max_seq = model_state_dict.get("position_embedding.weight").shape[0]
         num_heads = inferred_hidden_dim // 64
-    except Exception as exc:
-        logging.error("Failed to infer model dimensions: %s", exc, exc_info=True)
-        raise
 
-    # --- START OF MODIFICATIONS ---
-    extra_kwargs: Dict[str, Any] = {}
-    # Only populate strategy dictionary kwargs if we are building a Fused model
-    if ModelClass is PPOFusedModel:
-        bricks_tensor = None
-        for key, tensor in model_state_dict.items():
-            if key.endswith("strategy_dictionary.bricks"):
-                bricks_tensor = tensor
-                break
-        if bricks_tensor is not None:
-            extra_kwargs["num_bricks"], extra_kwargs["brick_dim"] = bricks_tensor.shape
-        else:
-            # Fallback for older fused models that might not have the dictionary
-            extra_kwargs["num_bricks"] = getattr(config, "NUM_BRICKS", 32)
-            extra_kwargs["brick_dim"] = getattr(config, "BRICK_DIM", 32)
+        model = ModelClass(
+            obs_dim=inferred_obs_dim,
+            action_dim=inferred_action_dim,
+            hidden_dim=inferred_hidden_dim,
+            num_heads=num_heads,
+            max_seq_length=inferred_max_seq,
+        ).to(device)
 
-    model = ModelClass(
-        obs_dim=inferred_obs_dim,
-        action_dim=inferred_action_dim,
-        hidden_dim=inferred_hidden_dim,
-        num_heads=num_heads,
-        max_seq_length=inferred_max_seq,
-        **extra_kwargs,
-    ).to(device)
-
-    model.load_state_dict(model_state_dict, strict=False)
-    model.eval()
-    return model
+        model.load_state_dict(model_state_dict, strict=False)
+        model.eval()
+        return model

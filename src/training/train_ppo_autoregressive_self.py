@@ -9,7 +9,6 @@ import math
 from collections import defaultdict
 import time
 from datetime import datetime
-from pathlib import Path
 from typing import Counter, Dict, Any, List, Optional, Callable, Set, Tuple, DefaultDict
 from numpy.random import Generator
 import random
@@ -40,6 +39,7 @@ import torch.amp as amp
 from src.misc import lb
 from src import config
 from src.model.ppo_reactive_model import PPOReactiveModel
+from src.model.ppo_reactive_model_script import PPOReactiveModelScript
 from src.agents.learner_ar_agent import LearnerAutoregressiveAgent
 from src.training.vec_ppo_rollout import PPOVecRolloutManager
 from src.training.tracing_utils import trace_model_from_checkpoint
@@ -80,6 +80,37 @@ def _chunked(seq: List[Any], size: int) -> List[List[Any]]:
     if size <= 0:
         return [list(seq)]
     return [seq[i : i + size] for i in range(0, len(seq), size)]
+
+
+def _build_script_model_from_training_model(model: torch.nn.Module) -> PPOReactiveModelScript:
+    base = getattr(model, "_orig_mod", model)
+
+    if not isinstance(base, PPOReactiveModel):
+        raise TypeError(
+            "PPOReactiveModelScript export currently expects a PPOReactiveModel training module"
+        )
+
+    obs_linear = base.obs_encoder[0]
+    action_head = base.action_heads[0]
+    transformer_layer = base.transformer.layers[0]
+
+    script_model = PPOReactiveModelScript(
+        obs_dim=getattr(obs_linear, "in_features"),
+        action_dim=getattr(action_head, "out_features"),
+        hidden_dim=base.hidden_dim,
+        num_heads=transformer_layer.self_attn.num_heads,
+        num_layers=len(base.transformer.layers),
+        dropout_rate=transformer_layer.dropout1.p,
+        max_seq_length=base.max_seq_length,
+        num_agent_types=base.agent_embedding.num_embeddings,
+        num_experts=base.num_experts,
+        top_k=base.top_k,
+        expert_ffn_dim=base.expert_ffn_dim,
+    )
+
+    script_model.load_state_dict(base.state_dict(), strict=False)
+    script_model.eval()
+    return script_model
 
 class OpponentPoolManager:
     """Manages the opponent_pool.json file for persistent population state."""
@@ -434,47 +465,6 @@ def _prepare_episode_for_buffer(episode: Dict[str, Any]) -> Dict[str, Any]:
 
     return episode
 
-def _find_traced_artifact_for_checkpoint(checkpoint_path: str) -> Optional[Path]:
-    """Return the TorchScript trace produced by ``train_utils.py`` if it exists."""
-
-    ckpt_path = Path(os.path.abspath(checkpoint_path))
-    candidate = ckpt_path.with_name(f"{ckpt_path.stem}_traced.pt")
-    if candidate.exists():
-        return candidate
-
-    index_path = ckpt_path.parent / "traced_index.json"
-    if index_path.exists():
-        try:
-            entries = json.loads(index_path.read_text())
-        except json.JSONDecodeError:
-            entries = []
-
-        if isinstance(entries, dict):
-            entries = [entries]
-
-        resolved_ckpt = str(ckpt_path.resolve(strict=False))
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-
-            traced_name = entry.get("traced_module")
-            if not traced_name:
-                continue
-
-            traced_candidate = (ckpt_path.parent / traced_name).resolve(strict=False)
-            if not traced_candidate.exists():
-                continue
-
-            source = entry.get("source_checkpoint")
-            if not source:
-                return traced_candidate
-
-            if source == resolved_ckpt or source == str(ckpt_path) or source.endswith(ckpt_path.name):
-                return traced_candidate
-
-    return candidate if candidate.exists() else None
-
-
 # ==============================================================================
 # SECTION 2: THE CORE TRAIN FUNCTION
 # ==============================================================================
@@ -524,7 +514,6 @@ def train_generation(
 
         learner.device = device
         learner.model.to(device)  # Ensure base model is on the right device before copying
-        learner.rollout_model = None
 
         # 2.2. Create the separate TRAINING model
         logging.info("Creating a separate model for training.")
@@ -548,34 +537,6 @@ def train_generation(
             learner.train_model = train_model
         learner.train_model.train()
 
-        # 2.4. Create and compile a single ROLLOUT model that supports dynamic sequence lengths
-        try:
-            rollout_model = copy.deepcopy(learner.model)
-        except Exception as exc:
-            logging.warning(f"Deepcopy failed for rollout model; recreating: {exc}")
-            rollout_model = type(learner.model)(**getattr(learner.model, "config", {}))
-        rollout_model.load_state_dict(learner.model.state_dict(), strict=False)
-
-        rollout_model = rollout_model.to(device)
-        rollout_model.eval()
-
-        compiled_rollout = rollout_model
-        if compile_fn:
-            try:
-                logging.info(
-                    "Compiling rollout model (dynamic=True)..."
-                )
-                compiled_rollout = compile_fn(
-                    rollout_model,
-                    dynamic=True
-                )
-            except Exception as exc:
-                logging.warning(
-                    f"torch.compile (rollout) failed; using eager model: {exc}"
-                )
-
-        learner.rollout_model = compiled_rollout
-
     else:
         # ---- This block runs for subsequent generations (gen > 1) ----
         # The 'learner' object is passed in, already containing compiled models.
@@ -587,8 +548,6 @@ def train_generation(
                 learner.model.to(device)
             if hasattr(learner, "train_model") and learner.train_model is not None:
                 learner.train_model.to(device)
-            if hasattr(learner, "rollout_model") and learner.rollout_model is not None:
-                learner.rollout_model.to(device)
         except Exception as exc:
             logging.warning(f"Failed to move one of the compiled models to device '{device}': {exc}")
 
@@ -660,10 +619,9 @@ def train_generation(
 
     architecture_path = os.path.join(run_ckpt_dir, "rollout_architecture.pt")
     try:
-        rollout_module = getattr(learner.rollout_model, "_orig_mod", learner.rollout_model)
-        rollout_module = rollout_module.eval()
+        script_model = _build_script_model_from_training_model(learner.train_model)
         with torch.inference_mode():
-            scripted = torch.jit.script(rollout_module)
+            scripted = torch.jit.script(script_model)
             scripted = torch.jit.freeze(scripted)
         scripted_cpu = scripted.to("cpu")
         torch.jit.save(scripted_cpu, architecture_path)
@@ -698,7 +656,6 @@ def train_generation(
 
     # Load historical agents from the opponent pool into the C++ manager
     loaded_historical_labels: List[int] = []
-    pool_was_updated = False
     for agent_def in pool_manager.pool:
         if agent_def.get('type') == 'cpp_bot':
             continue
@@ -708,7 +665,7 @@ def train_generation(
             continue
 
         policy_id = int(label)
-        
+
         # Standard .pth checkpoint path is the source of truth
         checkpoint_path = agent_def.get('path')
         if not checkpoint_path or not os.path.exists(checkpoint_path):
@@ -717,49 +674,13 @@ def train_generation(
             )
             continue
 
-        # Check for an existing, valid TorchScript path
-        traced_path = agent_def.get('path_pt')
-        if traced_path and os.path.exists(traced_path):
-            # Path exists, we are good to go.
-            pass
-        else:
-            # TorchScript path is missing or invalid, let's try to generate it.
-            logging.info(
-                f"TorchScript trace for agent '{agent_def.get('name', policy_id)}' not found. Generating it now..."
-            )
-            
-            # Define the output path for the new .pt file
-            pth_path_obj = Path(checkpoint_path)
-            new_traced_path = str(pth_path_obj.with_name(f"{pth_path_obj.stem}_traced.pt"))
-            
-            # Call the tracing utility
-            traced_success = trace_model_from_checkpoint(checkpoint_path, new_traced_path, device)
-            
-            if traced_success:
-                logging.info(f"Successfully generated trace at '{new_traced_path}'")
-                traced_path = new_traced_path
-                # Update the agent definition in the pool manager
-                agent_def['path_pt'] = new_traced_path
-                pool_was_updated = True
-            else:
-                logging.error(
-                    f"Failed to generate TorchScript trace for agent '{agent_def.get('name', policy_id)}'. Skipping."
-                )
-                traced_path = None
-
-        # Now, load the (potentially newly created) model into the C++ manager
         try:
             rollout_manager.cpp_manager.load_policy_weights(policy_id, checkpoint_path)
             loaded_historical_labels.append(policy_id)
         except Exception as exc:
             logging.exception(
-                f"Failed to load traced historical policy {policy_id} from {traced_path}: {exc}"
+                f"Failed to load historical policy {policy_id} from {checkpoint_path}: {exc}"
             )
-
-    # If we generated any new traces, save the updated opponent pool file
-    if pool_was_updated:
-        logging.info("Saving updated opponent pool with new TorchScript paths...")
-        pool_manager.save()
 
 
     logging.info(
@@ -791,7 +712,6 @@ def train_generation(
         # -------- Rollout --------
         bucket_stats.clear()
         t0 = time.time()
-        learner.sync_rollout_models()
 
         opponent_expert_affinity: DefaultDict[int, torch.Tensor]
         opponent_expert_affinity = defaultdict(
@@ -820,10 +740,10 @@ def train_generation(
         for chunk in _chunked(triplet_list, config.MAX_ENVS_PER_CALL):
             if not chunk:
                 continue
-            rollout_module = getattr(learner.rollout_model, "_orig_mod", learner.rollout_model)
+            train_module = getattr(learner.train_model, "_orig_mod", learner.train_model)
             learner_state_dict = {
                 key: tensor.detach().cpu()
-                for key, tensor in rollout_module.state_dict().items()
+                for key, tensor in train_module.state_dict().items()
             }
             rollout_manager.cpp_manager.update_learner_weights(
                 training_policy_id, learner_state_dict
