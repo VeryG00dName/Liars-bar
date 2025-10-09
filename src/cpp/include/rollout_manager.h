@@ -77,24 +77,13 @@ public:
                         const std::vector<double>& opponent_weights = {},
                         const std::vector<std::vector<int>>& opponent_triplets = {});
 
-    std::unordered_map<int, std::vector<PolicyRequest>> collect_requests_for_inference();
-
-    void submit_inference_results(int policy_id,
-                                  const std::vector<uint8_t>& actions,
-                                  const std::vector<float>& log_probs = {},
-                                  const std::vector<float>& values = {});
-
-    void submit_inference_results_array(int policy_id,
-                                        const uint8_t* actions,
-                                        size_t action_count,
-                                        const float* log_probs,
-                                        size_t log_prob_count,
-                                        const float* values,
-                                        size_t value_count);
-
     std::vector<TrajectoryData> get_completed_episodes();
+    bool run_rollouts_step();
+    bool all_episodes_complete() const;
 
-    void load_historical_model(int policy_id, const std::string& path);
+    void load_model_architecture(const std::string& path);
+    void load_policy_weights(int policy_id, const std::string& path);
+    void update_learner_weights(int policy_id, c10::Dict<c10::IValue, c10::IValue> state_dict);
     void register_cpp_bot(int policy_id, const std::string& bot_name);
 
     PreparedBatch prepare_training_batch(const std::vector<PolicyRequest>& requests,
@@ -141,7 +130,8 @@ private:
 
     std::vector<EpisodeTracker> episodes_;
     std::vector<TrajectoryData> completed_buffer_;
-    std::unordered_map<int, std::shared_ptr<torch::jit::Module>> historical_models_;
+    std::shared_ptr<torch::jit::Module> jit_module_;
+    std::unordered_map<int, c10::Dict<c10::IValue, c10::IValue>> policy_weights_;
     std::unordered_map<int, CppBotRegistryEntry> cpp_bot_registry_;
     std::unordered_map<int, std::unordered_map<uint64_t, CacheEntry>> kv_cache_;
     std::vector<uint8_t> training_env_inactive_;
@@ -164,9 +154,6 @@ private:
     void finalize_episode(EpisodeTracker& tracker);
     void mark_training_env_inactive(int env_idx);
     void finalize_seat(EpisodeTracker& tracker, SeatTrajectory& seat_tracker, Env& env);
-    std::vector<uint8_t> run_historical_inference(int policy_id,
-                                                  torch::jit::Module& module,
-                                                  const std::vector<PolicyRequest>& requests);
     std::vector<uint8_t> run_cpp_bot(int policy_id, const std::vector<PolicyRequest>& requests);
     static CppBotKind parse_cpp_bot_kind(const std::string& name);
     std::unique_ptr<CppBotBase> make_cpp_bot_instance(CppBotKind kind,
@@ -177,5 +164,10 @@ private:
                          const std::vector<size_t>& indices,
                          const std::vector<PolicyRequest>& requests,
                          const c10::IValue& cache_ivalue);
+    void apply_inference_results(int policy_id,
+                                 const std::vector<uint8_t>& actions,
+                                 const std::vector<float>& log_probs,
+                                 const std::vector<float>& values);
+    c10::Dict<c10::IValue, c10::IValue> pack_weights_for_batch(const std::vector<int>& policy_ids) const;
 };
 

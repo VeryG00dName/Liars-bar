@@ -57,7 +57,6 @@ class SelfAttentionWithCache(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        *,
         attn_mask: Optional[torch.Tensor] = None,
         key_padding_mask: Optional[torch.Tensor] = None,
         cache: Optional[AttentionCacheEntry] = None,

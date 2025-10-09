@@ -658,6 +658,22 @@ def train_generation(
         rng=(rng or _GLOBAL_RNG),
     )
 
+    architecture_path = os.path.join(run_ckpt_dir, "rollout_architecture.pt")
+    try:
+        rollout_module = getattr(learner.rollout_model, "_orig_mod", learner.rollout_model)
+        rollout_module = rollout_module.eval()
+        with torch.inference_mode():
+            scripted = torch.jit.script(rollout_module)
+            scripted = torch.jit.freeze(scripted)
+        scripted_cpu = scripted.to("cpu")
+        torch.jit.save(scripted_cpu, architecture_path)
+        rollout_manager.cpp_manager.load_model_architecture(architecture_path)
+    except Exception as exc:
+        logging.exception(
+            "Failed to export rollout architecture to %s: %s", architecture_path, exc
+        )
+        raise
+
     cpp_bot_names = {
         0: "Classic",
         1: "GreedyCardSpammer",
@@ -731,12 +747,9 @@ def train_generation(
                 )
                 traced_path = None
 
-        if not traced_path:
-            continue
-
         # Now, load the (potentially newly created) model into the C++ manager
         try:
-            rollout_manager.cpp_manager.load_historical_model(policy_id, str(traced_path))
+            rollout_manager.cpp_manager.load_policy_weights(policy_id, checkpoint_path)
             loaded_historical_labels.append(policy_id)
         except Exception as exc:
             logging.exception(
@@ -807,6 +820,14 @@ def train_generation(
         for chunk in _chunked(triplet_list, config.MAX_ENVS_PER_CALL):
             if not chunk:
                 continue
+            rollout_module = getattr(learner.rollout_model, "_orig_mod", learner.rollout_model)
+            learner_state_dict = {
+                key: tensor.detach().cpu()
+                for key, tensor in rollout_module.state_dict().items()
+            }
+            rollout_manager.cpp_manager.update_learner_weights(
+                training_policy_id, learner_state_dict
+            )
             chunk_eps = rollout_manager.collect_episodes(
                 num_episodes=len(chunk),
                 num_players=num_players,

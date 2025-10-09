@@ -7,7 +7,6 @@ import time
 
 import numpy as np
 import torch
-import torch.amp as amp
 
 from src.misc import lb
 from src import config
@@ -138,19 +137,8 @@ class PPOVecRolloutManager:
     ) -> List[Dict[str, Any]]:
         self._reset_policy_state()
         self._last_model_call_stats = {}
-        model_call_stats: Dict[int, Dict[str, float]] = {}
-
-        def _record_model_call(policy_id: int, duration: float) -> None:
-            stats = model_call_stats.setdefault(
-                int(policy_id), {"count": 0, "total_time": 0.0, "min": float('inf'), "max": 0.0}
-            )
-            stats["count"] += 1
-            stats["total_time"] += duration
-            stats["min"] = min(stats["min"], duration)
-            stats["max"] = max(stats["max"], duration)
 
         training_policy_list = [int(pid) for pid in training_policy_ids]
-        training_policy_set = set(training_policy_list)
 
         seed = int(self.rng.integers(0, 2**31))
 
@@ -170,51 +158,12 @@ class PPOVecRolloutManager:
             opponent_triplets=triplets_arg,
         )
 
-        while True:
-            requests_by_policy = self.rollout_manager.collect_requests_for_inference()
-            if not requests_by_policy:
-                break
-
-            for policy_id_raw, payload in requests_by_policy.items():
-                policy_id = int(policy_id_raw)
-                agent = self.policies.get(policy_id)
-                if not agent:
-                    raise RuntimeError(f"No policy object for id: {policy_id}")
-
-                tensors_payload = payload.get("tensors")
-
-                if tensors_payload and hasattr(agent, "compute_actions"):
-                    if policy_id not in training_policy_set:
-                        raise RuntimeError(f"Received tensor payload for non-training policy {policy_id}.")
-
-                    start = time.perf_counter()
-                    autocast_enabled = self.device.type == "cuda"
-                    with torch.inference_mode():
-                        autocast_ctx = amp.autocast(
-                            device_type=self.device.type,
-                            dtype=torch.float16,
-                            enabled=autocast_enabled,
-                        )
-                        with autocast_ctx:
-                            actions, log_probs, values = agent.compute_actions(tensors_payload)
-                    duration = time.perf_counter() - start
-                    _record_model_call(policy_id, duration)
-                else:
-                    raise RuntimeError(f"non training agent asked to run inference id: {policy_id}")
-
-                self.rollout_manager.submit_inference_results(
-                    policy_id,
-                    np.ascontiguousarray(actions, dtype=np.uint8),
-                    np.ascontiguousarray(log_probs, dtype=np.float32) if log_probs is not None else None,
-                    np.ascontiguousarray(values, dtype=np.float32) if values is not None else None,
-                )
+        while not self.rollout_manager.all_episodes_complete():
+            self.rollout_manager.run_rollouts_step()
 
         completed = self.rollout_manager.get_completed_episodes()
         episodes = [self._convert_completed_episode(traj) for traj in completed]
 
-        self._last_model_call_stats = {
-            pid: {"count": s["count"], "total_time": s["total_time"], "min": s["min"], "max": s["max"]}
-            for pid, s in model_call_stats.items()
-        }
+        self._last_model_call_stats = {}
 
         return episodes
