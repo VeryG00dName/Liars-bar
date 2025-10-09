@@ -14,6 +14,7 @@
 
 #include <torch/torch.h>
 #include <torch/nn/functional.h>
+#include <ATen/core/ivalue.h>
 
 #include "bots.h"
 #include "torch_utils.h"
@@ -581,7 +582,7 @@ c10::IValue EvalManager::stack_kv_cache(const std::vector<CacheEntry>& caches,
     }
 
     size_t num_layers = caches.front().size();
-    c10::List<c10::IValue> stacked;
+    auto stacked = c10::impl::GenericList(c10::AnyType::get());
     stacked.reserve(num_layers);
 
     for (size_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
@@ -627,10 +628,10 @@ c10::IValue EvalManager::stack_kv_cache(const std::vector<CacheEntry>& caches,
         dict.insert("key", stacked_key);
         dict.insert("value", stacked_value);
         dict.insert("lengths", stacked_lengths);
-        stacked.emplace_back(dict);
+        stacked.push_back(c10::IValue(dict));
     }
 
-    return c10::IValue(stacked);
+    return c10::IValue(std::move(stacked));
 }
 
 void EvalManager::update_kv_cache(int policy_id,
@@ -672,27 +673,30 @@ void EvalManager::update_kv_cache(int policy_id,
 
         for (size_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
             auto dict = cache_list.get(layer_idx).toGenericDict();
-            auto key_tensor = dict.at("key").toTensor().select(0, batch_idx).unsqueeze(0).detach();
-            auto value_tensor = dict.at("value").toTensor().select(0, batch_idx).unsqueeze(0).detach();
-            auto length_tensor = dict.at("lengths").toTensor().select(0, batch_idx).unsqueeze(0).detach();
+            auto key_tensor =
+                dict.at("key").toTensor().select(0, batch_idx).unsqueeze(0).detach().clone();
+            auto value_tensor =
+                dict.at("value").toTensor().select(0, batch_idx).unsqueeze(0).detach().clone();
+            auto length_tensor =
+                dict.at("lengths").toTensor().select(0, batch_idx).unsqueeze(0).detach().clone();
 
             int64_t seq_len = length_tensor.item<int64_t>();
-            if (seq_len <= 0) {
-                seq_len = 0;
-            }
-            if (seq_len > max_allowed) {
-                int64_t start = seq_len - max_allowed;
-                key_tensor = key_tensor.narrow(2, start, max_allowed).contiguous();
-                value_tensor = value_tensor.narrow(2, start, max_allowed).contiguous();
-                seq_len = max_allowed;
-                length_tensor = torch::tensor({seq_len}, torch::TensorOptions().dtype(torch::kLong));
-            } else {
-                length_tensor = torch::tensor({seq_len}, torch::TensorOptions().dtype(torch::kLong));
+            seq_len = std::max<int64_t>(seq_len, 0);
+            int64_t target_len = std::min<int64_t>(seq_len, max_allowed);
+            int64_t start = seq_len - target_len;
+            if (start < 0) {
+                start = 0;
             }
 
-            key_tensor = key_tensor.cpu().contiguous();
-            value_tensor = value_tensor.cpu().contiguous();
-            length_tensor = length_tensor.cpu();
+            if (target_len < key_tensor.size(2)) {
+                key_tensor = key_tensor.narrow(2, start, target_len).contiguous();
+                value_tensor = value_tensor.narrow(2, start, target_len).contiguous();
+            }
+
+            key_tensor = key_tensor.contiguous();
+            value_tensor = value_tensor.contiguous();
+            length_tensor = length_tensor.contiguous();
+            length_tensor.fill_(target_len);
 
             c10::Dict<std::string, torch::Tensor> layer_dict;
             layer_dict.insert("key", key_tensor);

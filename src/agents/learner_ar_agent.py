@@ -241,9 +241,15 @@ class LearnerAutoregressiveAgent:
             per_cache: List[AttentionCacheEntry] = []
             for layer_idx in range(num_layers):
                 layer_entry = caches[layer_idx]
-                key_tensor = layer_entry["key"][batch_idx : batch_idx + 1].detach().cpu()
-                value_tensor = layer_entry["value"][batch_idx : batch_idx + 1].detach().cpu()
-                length_tensor = layer_entry["lengths"][batch_idx : batch_idx + 1].detach().cpu()
+                key_tensor = (
+                    layer_entry["key"][batch_idx : batch_idx + 1].detach().clone()
+                )
+                value_tensor = (
+                    layer_entry["value"][batch_idx : batch_idx + 1].detach().clone()
+                )
+                length_tensor = (
+                    layer_entry["lengths"][batch_idx : batch_idx + 1].detach().clone()
+                )
                 seq_len = int(length_tensor[0].item())
                 max_allowed = self.max_seq_length or seq_len
                 if seq_len > max_allowed:
