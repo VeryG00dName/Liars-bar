@@ -212,19 +212,29 @@ bool RolloutManager::run_rollouts_step() {
         throw std::runtime_error("RolloutManager::run_rollouts_step called without a loaded model architecture");
     }
 
-    // Process C++ bots first
+    // Process C++ bots first (deep-copy requests to avoid dangling references)
     while (true) {
+        // Deep-copy bot requests out of arena_.pending so modifications won't invalidate
+        std::vector<std::pair<int, std::vector<PolicyRequest>>> bot_requests_to_process;
         const auto& pending = arena_.collect_requests();
         if (pending.empty()) break;
-        bool progressed_bot = false;
+
+        bool has_bots = false;
         for (const auto& kv : pending) {
             if (cpp_bot_registry_.find(kv.first) != cpp_bot_registry_.end()) {
-                auto actions = run_cpp_bot(kv.first, kv.second);
-                arena_.submit_actions(kv.first, actions);
-                progressed_bot = true;
+                // Deep copy the vector of requests
+                bot_requests_to_process.emplace_back(kv.first, kv.second);
+                has_bots = true;
             }
         }
-        if (!progressed_bot) break;
+
+        if (!has_bots) break;
+
+        for (const auto& kv : bot_requests_to_process) {
+            auto actions = run_cpp_bot(kv.first, kv.second);
+            arena_.submit_actions(kv.first, actions);
+        }
+
         log_rewards_and_dones();
     }
 
@@ -243,7 +253,6 @@ bool RolloutManager::run_rollouts_step() {
             all_policy_ids.insert(all_policy_ids.end(), kv.second.size(), kv.first);
         }
     }
-
     if (all_requests.empty()) {
         return all_episodes_complete();
     }
@@ -266,6 +275,7 @@ bool RolloutManager::run_rollouts_step() {
         inputs.emplace_back(batch.padding_mask);
 
         auto result = method(inputs);
+
         auto tuple = result.toTuple();
         auto action_logits = tuple->elements()[0].toTensor();
         auto state_values = tuple->elements()[2].toTensor();
@@ -291,7 +301,10 @@ bool RolloutManager::run_rollouts_step() {
         probs = probs / probs_sum.clamp_min(1e-8);
 
         auto actions_tensor = torch::multinomial(probs, 1).squeeze(-1);
-        auto log_probs_tensor = torch::log_softmax(masked_logits, -1).gather(-1, actions_tensor.unsqueeze(-1)).squeeze(-1);
+
+        auto log_probs_tensor = torch::log_softmax(masked_logits, -1)
+                                    .gather(-1, actions_tensor.unsqueeze(-1))
+                                    .squeeze(-1);
 
         auto actions_cpu = actions_tensor.to(torch::kCPU, false, true).to(torch::kUInt8).contiguous();
         auto log_probs_cpu = log_probs_tensor.to(torch::kCPU, false, true).to(torch::kFloat32).contiguous();
@@ -325,7 +338,11 @@ bool RolloutManager::run_rollouts_step() {
         // Loop over the map we just built, which is guaranteed to have consistent keys
         for (const auto& kv : requests_map) {
             int policy_id = kv.first;
-            apply_inference_results(policy_id, kv.second, actions_to_submit.at(policy_id), log_probs_map.at(policy_id), values_map.at(policy_id));
+            apply_inference_results(policy_id,
+                                    kv.second,
+                                    actions_to_submit.at(policy_id),
+                                    log_probs_map.at(policy_id),
+                                    values_map.at(policy_id));
         }
     }
 
