@@ -33,6 +33,13 @@ struct TrajectoryData {
     std::vector<double> reward;
     std::vector<int> opp_target_action;
     int win{0};
+    
+    int valid_len{0};
+    std::vector<float> obs_sequence;
+    std::vector<int64_t> action_sequence;
+    std::vector<int64_t> agent_type_sequence;
+    std::vector<int64_t> position_sequence;
+    std::vector<uint8_t> action_mask_sequence;
 };
 
 struct SeatTrajectory {

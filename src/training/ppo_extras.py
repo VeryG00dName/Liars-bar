@@ -315,7 +315,7 @@ def _collate_batch(
     raw_lens: List[int] = []
     for b, ep in enumerate(episodes):
         mi_ep = ep["model_input"]  # required: hard fail if missing
-        if "valid_lengths" not in mi_ep:
+        if not mi_ep["valid_lengths"]:
             raise KeyError(f"episodes[{b}]['model_input']['valid_lengths'] missing")
         vl = mi_ep["valid_lengths"]
         if isinstance(vl, torch.Tensor):
