@@ -39,10 +39,12 @@ import torch.amp as amp
 from src.misc import lb
 from src import config
 from src.model.ppo_reactive_model import PPOReactiveModel
-from src.model.ppo_reactive_model_script import PPOReactiveModelScript
 from src.agents.learner_ar_agent import LearnerAutoregressiveAgent
 from src.training.vec_ppo_rollout import PPOVecRolloutManager
-from src.training.tracing_utils import trace_model_from_checkpoint
+from src.training.tracing_utils import (
+    trace_model_from_checkpoint,
+    build_script_model_from_training_model,
+)
 from src.training.ppo_extras import (
     _collate_batch,
     _to_device_batch,
@@ -63,6 +65,13 @@ _GLOBAL_RNG = np.random.default_rng(SEED)
 FORCE_CUDA_SYNC_FOR_TIMING = bool(getattr(config, "FORCE_CUDA_SYNC_FOR_TIMING", False))
 
 
+def _clone_state_dict_to_cpu(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    return {
+        key: tensor.detach().to("cpu").clone()
+        for key, tensor in state_dict.items()
+    }
+
+
 # ==============================================================================
 # SECTION 1: HELPER CLASSES AND FUNCTIONS
 # ==============================================================================
@@ -81,36 +90,6 @@ def _chunked(seq: List[Any], size: int) -> List[List[Any]]:
         return [list(seq)]
     return [seq[i : i + size] for i in range(0, len(seq), size)]
 
-
-def _build_script_model_from_training_model(model: torch.nn.Module) -> PPOReactiveModelScript:
-    base = getattr(model, "_orig_mod", model)
-
-    if not isinstance(base, PPOReactiveModel):
-        raise TypeError(
-            "PPOReactiveModelScript export currently expects a PPOReactiveModel training module"
-        )
-
-    obs_linear = base.obs_encoder[0]
-    action_head = base.action_heads[0]
-    transformer_layer = base.transformer.layers[0]
-
-    script_model = PPOReactiveModelScript(
-        obs_dim=getattr(obs_linear, "in_features"),
-        action_dim=getattr(action_head, "out_features"),
-        hidden_dim=base.hidden_dim,
-        num_heads=transformer_layer.self_attn.num_heads,
-        num_layers=len(base.transformer.layers),
-        dropout_rate=transformer_layer.dropout1.p,
-        max_seq_length=base.max_seq_length,
-        num_agent_types=base.agent_embedding.num_embeddings,
-        num_experts=base.num_experts,
-        top_k=base.top_k,
-        expert_ffn_dim=base.expert_ffn_dim,
-    )
-
-    script_model.load_state_dict(base.state_dict(), strict=False)
-    script_model.eval()
-    return script_model
 
 class OpponentPoolManager:
     """Manages the opponent_pool.json file for persistent population state."""
@@ -619,10 +598,12 @@ def train_generation(
 
     architecture_path = os.path.join(run_ckpt_dir, "rollout_architecture.pt")
     try:
-        script_model = _build_script_model_from_training_model(learner.train_model)
+        script_model = build_script_model_from_training_model(learner.train_model)
         with torch.inference_mode():
             scripted = torch.jit.script(script_model)
-            scripted = torch.jit.freeze(scripted)
+            scripted = torch.jit.freeze(
+                scripted, preserved_attrs=["forward", "forward_packed"]
+            )
         scripted_cpu = scripted.to("cpu")
         torch.jit.save(scripted_cpu, architecture_path)
         rollout_manager.cpp_manager.load_model_architecture(architecture_path)
@@ -741,10 +722,7 @@ def train_generation(
             if not chunk:
                 continue
             train_module = getattr(learner.train_model, "_orig_mod", learner.train_model)
-            learner_state_dict = {
-                key: tensor.detach().cpu()
-                for key, tensor in train_module.state_dict().items()
-            }
+            learner_state_dict = _clone_state_dict_to_cpu(train_module.state_dict())
             rollout_manager.cpp_manager.update_learner_weights(
                 training_policy_id, learner_state_dict
             )
@@ -1250,7 +1228,8 @@ def train_generation(
         if update % int(config.CHECKPOINT_INTERVAL) == 0:
             path = os.path.join(run_ckpt_dir, f"update_{update}.pth")
             to_save = getattr(learner.train_model, "_orig_mod", learner.train_model)
-            torch.save({"model_state_dict": to_save.state_dict()}, path)
+            cpu_state = _clone_state_dict_to_cpu(to_save.state_dict())
+            torch.save({"model_state_dict": cpu_state}, path)
 
     # 5. FINALIZE AND SAVE
     final_path_pth = os.path.join(run_ckpt_dir, "final.pth")
@@ -1258,7 +1237,8 @@ def train_generation(
 
     # Save the standard PyTorch state_dict
     model_to_save = getattr(learner.train_model, "_orig_mod", learner.train_model)
-    torch.save({"model_state_dict": model_to_save.state_dict()}, final_path_pth)
+    final_state = _clone_state_dict_to_cpu(model_to_save.state_dict())
+    torch.save({"model_state_dict": final_state}, final_path_pth)
     logging.info(f"Saved standard PyTorch checkpoint to {final_path_pth}")
 
 
@@ -1385,4 +1365,3 @@ if __name__ == "__main__":
             rng=_GLOBAL_RNG,
         )
         new_learner = result['final_model']
-        

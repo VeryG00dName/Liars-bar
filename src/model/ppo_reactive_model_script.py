@@ -85,9 +85,14 @@ class PPOReactiveModelScript(PPOReactiveModelBase):
         num_experts = self._num_experts
         top_k = self._top_k
 
-        act_kind_ids = self.lut_act_kind[action_sequence.long()]
-        count_ids = self.lut_count[action_sequence.long()]
-        table_flag_ids = self.lut_table_flag[action_sequence.long()]
+        device = action_sequence.device
+        lut_act_kind_dev = self.lut_act_kind.to(device)
+        lut_count_dev = self.lut_count.to(device)
+        lut_table_flag_dev = self.lut_table_flag.to(device)
+        
+        act_kind_ids = lut_act_kind_dev[action_sequence.long()]
+        count_ids = lut_count_dev[action_sequence.long()]
+        table_flag_ids = lut_table_flag_dev[action_sequence.long()]
 
         if padding_mask is not None:
             padding_bool = padding_mask.to(dtype=torch.bool)
