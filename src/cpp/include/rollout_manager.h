@@ -77,6 +77,15 @@ public:
                         const std::vector<double>& opponent_weights = {},
                         const std::vector<std::vector<int>>& opponent_triplets = {});
 
+    // Consolidated helper to run rollouts end-to-end
+    std::vector<TrajectoryData> get_rollouts(
+        int num_episodes,
+        int num_players,
+        const std::vector<int>& training_policy_ids,
+        int max_batch_envs,
+        uint32_t seed,
+        const std::vector<std::vector<int>>& opponent_triplets);
+
     std::vector<TrajectoryData> get_completed_episodes();
     bool run_rollouts_step();
     bool all_episodes_complete() const;
@@ -165,6 +174,7 @@ private:
                          const std::vector<PolicyRequest>& requests,
                          const c10::IValue& cache_ivalue);
     void apply_inference_results(int policy_id,
+                                 const std::vector<PolicyRequest>& requests,
                                  const std::vector<uint8_t>& actions,
                                  const std::vector<float>& log_probs,
                                  const std::vector<float>& values);

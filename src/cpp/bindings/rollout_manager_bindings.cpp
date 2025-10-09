@@ -38,6 +38,15 @@ void bind_rollout_manager(py::module_& m) {
     py::class_<RolloutManager>(m, "RolloutManager")
         .def(py::init<>())
 
+        // Consolidated helper to run and collect rollouts in one call
+        .def("get_rollouts", &RolloutManager::get_rollouts,
+             py::arg("num_episodes"),
+             py::arg("num_players"),
+             py::arg("training_policy_ids"),
+             py::arg("max_batch_envs"),
+             py::arg("seed"),
+             py::arg("opponent_triplets"))
+
         .def("start_rollouts", &RolloutManager::start_rollouts,
              py::arg("num_episodes"),
              py::arg("num_players"),

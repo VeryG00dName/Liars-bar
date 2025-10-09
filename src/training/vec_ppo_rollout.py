@@ -149,7 +149,7 @@ class PPOVecRolloutManager:
             for triplet in opponent_triplets:
                 triplets_arg.append([int(x) for x in triplet])
 
-        self.rollout_manager.start_rollouts(
+        completed_trajectories = self.rollout_manager.get_rollouts(
             num_episodes=num_episodes,
             num_players=num_players,
             training_policy_ids=training_policy_list,
@@ -158,11 +158,7 @@ class PPOVecRolloutManager:
             opponent_triplets=triplets_arg,
         )
 
-        while not self.rollout_manager.all_episodes_complete():
-            self.rollout_manager.run_rollouts_step()
-
-        completed = self.rollout_manager.get_completed_episodes()
-        episodes = [self._convert_completed_episode(traj) for traj in completed]
+        episodes = [self._convert_completed_episode(traj) for traj in completed_trajectories]
 
         self._last_model_call_stats = {}
 

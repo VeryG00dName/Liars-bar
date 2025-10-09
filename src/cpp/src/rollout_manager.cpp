@@ -209,8 +209,7 @@ bool RolloutManager::run_rollouts_step() {
     log_rewards_and_dones();
 
     if (!jit_module_) {
-        throw std::runtime_error(
-            "RolloutManager::run_rollouts_step called without a loaded model architecture");
+        throw std::runtime_error("RolloutManager::run_rollouts_step called without a loaded model architecture");
     }
 
     // Process C++ bots first
@@ -272,8 +271,7 @@ bool RolloutManager::run_rollouts_step() {
         auto state_values = tuple->elements()[2].toTensor();
 
         const int64_t B = action_logits.size(0);
-        auto lengths =
-            batch.valid_lengths.to(kInferenceDevice, false, true).to(torch::kLong).clamp_min(1);
+        auto lengths = batch.valid_lengths.to(kInferenceDevice, false, true).to(torch::kLong).clamp_min(1);
         auto last_indices = (lengths - 1).to(kInferenceDevice);
         auto arange_opts = torch::TensorOptions().dtype(torch::kLong).device(kInferenceDevice);
         auto batch_indices = torch::arange(B, arange_opts);
@@ -286,20 +284,17 @@ bool RolloutManager::run_rollouts_step() {
         auto final_masks = batch.action_masks.index(indices_vec);
         auto values_tensor = state_values.index(indices_vec).squeeze(-1);
 
-        auto masked_logits =
-            final_logits.masked_fill(final_masks.logical_not(), -std::numeric_limits<float>::infinity());
+        auto masked_logits = final_logits.masked_fill(final_masks.logical_not(), -std::numeric_limits<float>::infinity());
         auto probs = torch::softmax(masked_logits, -1);
         probs.nan_to_num_(0.0, 0.0, 1.0);
         auto probs_sum = probs.sum(-1, true);
         probs = probs / probs_sum.clamp_min(1e-8);
 
         auto actions_tensor = torch::multinomial(probs, 1).squeeze(-1);
-        auto log_probs_tensor =
-            torch::log_softmax(masked_logits, -1).gather(-1, actions_tensor.unsqueeze(-1)).squeeze(-1);
+        auto log_probs_tensor = torch::log_softmax(masked_logits, -1).gather(-1, actions_tensor.unsqueeze(-1)).squeeze(-1);
 
         auto actions_cpu = actions_tensor.to(torch::kCPU, false, true).to(torch::kUInt8).contiguous();
-        auto log_probs_cpu =
-            log_probs_tensor.to(torch::kCPU, false, true).to(torch::kFloat32).contiguous();
+        auto log_probs_cpu = log_probs_tensor.to(torch::kCPU, false, true).to(torch::kFloat32).contiguous();
         auto values_cpu = values_tensor.to(torch::kCPU, false, true).to(torch::kFloat32).contiguous();
 
         const auto* actions_ptr = actions_cpu.data_ptr<uint8_t>();
@@ -307,16 +302,18 @@ bool RolloutManager::run_rollouts_step() {
         const auto* values_ptr = values_cpu.data_ptr<float>();
 
         std::unordered_map<int, std::vector<uint8_t>> actions_to_submit;
-        std::unordered_map<int, std::vector<float>> log_probs_to_apply;
-        std::unordered_map<int, std::vector<float>> values_to_apply;
+        std::unordered_map<int, std::vector<float>> log_probs_map;
+        std::unordered_map<int, std::vector<float>> values_map;
+        std::unordered_map<int, std::vector<PolicyRequest>> requests_map;
 
         const int64_t N = actions_cpu.size(0);
         for (int64_t i = 0; i < N; ++i) {
             const int policy_id = policy_ids_in_batch[static_cast<size_t>(i)];
             actions_to_submit[policy_id].push_back(actions_ptr[i]);
             if (is_training_policy(policy_id)) {
-                log_probs_to_apply[policy_id].push_back(log_probs_ptr[i]);
-                values_to_apply[policy_id].push_back(values_ptr[i]);
+                log_probs_map[policy_id].push_back(log_probs_ptr[i]);
+                values_map[policy_id].push_back(values_ptr[i]);
+                requests_map[policy_id].push_back(all_requests[i]);
             }
         }
 
@@ -325,12 +322,10 @@ bool RolloutManager::run_rollouts_step() {
             arena_.submit_actions(policy_id, kv.second);
         }
 
-        for (const auto& kv : log_probs_to_apply) {
+        // Loop over the map we just built, which is guaranteed to have consistent keys
+        for (const auto& kv : requests_map) {
             int policy_id = kv.first;
-            apply_inference_results(policy_id,
-                                    actions_to_submit[policy_id],
-                                    log_probs_to_apply[policy_id],
-                                    values_to_apply[policy_id]);
+            apply_inference_results(policy_id, kv.second, actions_to_submit.at(policy_id), log_probs_map.at(policy_id), values_map.at(policy_id));
         }
     }
 
@@ -363,6 +358,32 @@ bool RolloutManager::all_episodes_complete() const {
         if (!tracker.done) return false;
     }
     return true;
+}
+
+std::vector<TrajectoryData> RolloutManager::get_rollouts(
+    int num_episodes,
+    int num_players,
+    const std::vector<int>& training_policy_ids,
+    int max_batch_envs,
+    uint32_t seed,
+    const std::vector<std::vector<int>>& opponent_triplets) {
+    // Initialize and start rollouts using fixed opponent triplets
+    start_rollouts(num_episodes,
+                   num_players,
+                   training_policy_ids,
+                   max_batch_envs,
+                   seed,
+                   /*opponent_labels=*/{},
+                   /*opponent_weights=*/{},
+                   opponent_triplets);
+
+    // Step the environment until all episodes complete
+    while (!all_episodes_complete()) {
+        run_rollouts_step();
+    }
+
+    // Collect and return completed episodes
+    return get_completed_episodes();
 }
 
 void RolloutManager::load_model_architecture(const std::string& path) {
@@ -484,20 +505,25 @@ bool RolloutManager::is_training_policy(int policy_id) const {
 }
 
 void RolloutManager::apply_inference_results(int policy_id,
+                                             const std::vector<PolicyRequest>& requests,
                                              const std::vector<uint8_t>& actions,
                                              const std::vector<float>& log_probs,
                                              const std::vector<float>& values) {
     if (!is_training_policy(policy_id)) return;
-    const auto& reqs = arena_.pending.at(policy_id);
-    for (size_t i = 0; i < reqs.size(); ++i) {
-        const auto& req = reqs[i];
+    
+    // The requests are now passed in directly
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const auto& req = requests[i];
         if (req.env < 0 || req.env >= batch_size_) continue;
+
         EpisodeTracker& ep = episodes_[req.env];
         auto it = ep.training_seats.find(req.seat);
         if (it == ep.training_seats.end()) continue;
+
         SeatTrajectory& seat_tracker = it->second;
         int step_idx = append_training_step(seat_tracker);
         if (step_idx < 0) continue;
+
         seat_tracker.data.our_action[step_idx] = static_cast<int>(actions[i]);
         seat_tracker.data.log_prob[step_idx] = log_probs[i];
         seat_tracker.data.value[step_idx] = values[i];
