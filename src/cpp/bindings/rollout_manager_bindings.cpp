@@ -8,6 +8,7 @@
 namespace py = pybind11;
 
 namespace {
+// Helper to convert a Python dictionary of tensors to a C++ IValue dictionary.
 c10::Dict<c10::IValue, c10::IValue> py_weights_to_ivalue_dict(const py::dict& weights) {
     c10::Dict<c10::IValue, c10::IValue> dict(c10::StringType::get(), c10::TensorType::get());
     dict.reserve(weights.size());
@@ -22,6 +23,7 @@ c10::Dict<c10::IValue, c10::IValue> py_weights_to_ivalue_dict(const py::dict& we
 } // namespace
 
 void bind_rollout_manager(py::module_& m) {
+    // Bind the TrajectoryData struct so Python can read its fields.
     py::class_<TrajectoryData>(m, "TrajectoryData")
         .def_readonly("env_index", &TrajectoryData::env_index)
         .def_readonly("training_policy_id", &TrajectoryData::training_policy_id)
@@ -41,10 +43,11 @@ void bind_rollout_manager(py::module_& m) {
         .def_readonly("position_sequence", &TrajectoryData::position_sequence)
         .def_readonly("action_mask_sequence", &TrajectoryData::action_mask_sequence);
 
+    // Bind the RolloutManager class and its public methods.
     py::class_<RolloutManager>(m, "RolloutManager")
         .def(py::init<>())
 
-        // Consolidated helper to run and collect rollouts in one call
+        // The primary method used by Python to run rollouts.
         .def("get_rollouts", &RolloutManager::get_rollouts,
              py::arg("num_episodes"),
              py::arg("num_players"),
@@ -53,6 +56,7 @@ void bind_rollout_manager(py::module_& m) {
              py::arg("seed"),
              py::arg("opponent_triplets"))
 
+        // Low-level methods for manual stepping (kept for potential debugging).
         .def("start_rollouts", &RolloutManager::start_rollouts,
              py::arg("num_episodes"),
              py::arg("num_players"),
@@ -65,6 +69,8 @@ void bind_rollout_manager(py::module_& m) {
         .def("run_rollouts_step", &RolloutManager::run_rollouts_step)
         .def("all_episodes_complete", &RolloutManager::all_episodes_complete)
         .def("get_completed_episodes", &RolloutManager::get_completed_episodes)
+
+        // Methods for loading models and bots.
         .def("load_model_architecture", &RolloutManager::load_model_architecture,
              py::arg("path"))
         .def("load_policy_weights", &RolloutManager::load_policy_weights,
@@ -82,6 +88,8 @@ void bind_rollout_manager(py::module_& m) {
              },
              py::arg("policy_id"),
              py::arg("name"))
+        
+        // Configuration setters.
         .def("set_training_device", &RolloutManager::set_training_device,
              py::arg("device"))
         .def("set_max_sequence_length", &RolloutManager::set_max_sequence_length,

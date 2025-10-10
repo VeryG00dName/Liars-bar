@@ -14,26 +14,33 @@
 
 #include <torch/script.h>
 
+// Base class for simple, stateless C++ bots.
 class CppBotBase {
 public:
     virtual ~CppBotBase() = default;
     virtual uint8_t act(const PolicyRequest& request, VecArena& arena) = 0;
 };
 
+// Holds all data for a single completed trajectory from one agent's perspective.
 struct TrajectoryData {
     int env_index{-1};
     int training_policy_id{-1};
     int training_agent_seat{-1};
     std::vector<int> player_policy_ids;
 
+    // Sparse, step-by-step data (length = total game steps).
     std::vector<int> agent_id;
-    std::vector<int> our_action;
-    std::vector<float> log_prob;
-    std::vector<float> value;
     std::vector<double> reward;
     std::vector<int> opp_target_action;
+    std::vector<float> value;
+    
+    // Dense data, only for steps taken by this agent.
+    std::vector<int> our_action;
+    std::vector<float> log_prob;
+    
     int win{0};
     
+    // Sequences for the autoregressive model input.
     int valid_len{0};
     std::vector<float> obs_sequence;
     std::vector<int64_t> action_sequence;
@@ -42,49 +49,28 @@ struct TrajectoryData {
     std::vector<uint8_t> action_mask_sequence;
 };
 
+// Tracks the state of a single training agent within an episode.
 struct SeatTrajectory {
     int seat{-1};
     int policy_id{-1};
     bool active{false};
-    int last_training_step_idx{-1};
     std::array<uint8_t, Env::MAX_PLAYERS> last_penalties{};
     TrajectoryData data;
 };
 
+// Tracks the overall state of a single episode/environment.
 struct EpisodeTracker {
     int env_idx{-1};
     bool done{false};
     int last_history_len{0};
-    int last_processed_history_len{0};
     std::unordered_map<int, SeatTrajectory> training_seats;
-};
-
-struct PreparedBatch {
-    torch::Tensor obs_sequence;
-    torch::Tensor action_sequence;
-    torch::Tensor agent_types;
-    torch::Tensor positions;
-    torch::Tensor action_masks;
-    torch::Tensor padding_mask;
-    torch::Tensor valid_lengths;
-    torch::Tensor env_indices;
-    torch::Tensor seat_indices;
 };
 
 class RolloutManager {
 public:
     RolloutManager();
 
-    void start_rollouts(int num_episodes,
-                        int num_players,
-                        const std::vector<int>& training_policy_ids,
-                        int max_batch_envs = -1,
-                        uint32_t seed = 0,
-                        const std::vector<int>& opponent_labels = {},
-                        const std::vector<double>& opponent_weights = {},
-                        const std::vector<std::vector<int>>& opponent_triplets = {});
-
-    // Consolidated helper to run rollouts end-to-end
+    // High-level function to run a batch of rollouts from start to finish.
     std::vector<TrajectoryData> get_rollouts(
         int num_episodes,
         int num_players,
@@ -93,27 +79,34 @@ public:
         uint32_t seed,
         const std::vector<std::vector<int>>& opponent_triplets);
 
-    std::vector<TrajectoryData> get_completed_episodes();
+    // Low-level API for stepping through rollouts manually (used by get_rollouts).
+    void start_rollouts(int num_episodes,
+                        int num_players,
+                        const std::vector<int>& training_policy_ids,
+                        int max_batch_envs = -1,
+                        uint32_t seed = 0,
+                        const std::vector<int>& opponent_labels = {},
+                        const std::vector<double>& opponent_weights = {},
+                        const std::vector<std::vector<int>>& opponent_triplets = {});
     bool run_rollouts_step();
     bool all_episodes_complete() const;
+    std::vector<TrajectoryData> get_completed_episodes();
 
+    // Configuration and setup.
     void load_model_architecture(const std::string& path);
     void load_policy_weights(int policy_id, const std::string& path);
     void update_learner_weights(int policy_id, c10::Dict<c10::IValue, c10::IValue> state_dict);
     void register_cpp_bot(int policy_id, const std::string& bot_name);
-
-    PreparedBatch prepare_training_batch(const std::vector<PolicyRequest>& requests,
-                                         int policy_id) const;
     void set_training_device(const std::string& device_str);
     void set_max_sequence_length(int max_len);
     void set_policy_max_sequence_length(int policy_id, int max_len);
     void set_inference_batch_size(int size);
+
+    bool is_training_policy(int policy_id) const;
+    const std::vector<int>& training_policy_ids() const { return training_policy_ids_; }
     int training_policy_id() const {
         return training_policy_ids_.empty() ? -1 : training_policy_ids_.front();
     }
-    const std::vector<int>& training_policy_ids() const { return training_policy_ids_; }
-    bool is_training_policy(int policy_id) const;
-
     const torch::Device& training_device() const { return training_device_; }
 
 private:
@@ -148,37 +141,26 @@ private:
     std::shared_ptr<torch::jit::Module> jit_module_;
     std::unordered_map<int, c10::Dict<c10::IValue, c10::IValue>> policy_weights_;
     std::unordered_map<int, CppBotRegistryEntry> cpp_bot_registry_;
-    std::vector<uint8_t> training_env_inactive_;
-    std::vector<int> active_training_counts_;
-    std::vector<int> weighted_opponent_labels_;
-    std::vector<double> weighted_opponent_weights_;
-    std::vector<std::vector<int>> fixed_opponent_triplets_;
+    
+    int inference_batch_size_{256};
 
-    std::vector<std::vector<int>> build_roles(int batch_size,
-                                              int num_players,
-                                              const std::vector<int>& training_policy_ids,
-                                              const std::vector<int>& weighted_opponents,
-                                              const std::vector<double>& opponent_weights);
+    // Helper functions for the rollout loop.
     EpisodeTracker new_episode_tracker(int env_idx, const std::vector<int>& roles);
-    int append_training_step(SeatTrajectory& seat_tracker);
-    int append_opponent_step(SeatTrajectory& seat_tracker, int seat);
-    void update_penalty_rewards(SeatTrajectory& seat_tracker,
-                                const std::array<uint8_t, Env::MAX_PLAYERS>& penalties);
-    void log_rewards_and_dones();
+    void append_step(SeatTrajectory& seat_tracker, const HistoryEntry& h);
+    void append_new_history_entries();
+    void maybe_finalize_episodes();
     void finalize_episode(EpisodeTracker& tracker);
-    void mark_training_env_inactive(int env_idx);
-    void finalize_seat(EpisodeTracker& tracker, SeatTrajectory& seat_tracker, Env& env);
+    
     std::vector<uint8_t> run_cpp_bot(int policy_id, const std::vector<PolicyRequest>& requests);
     static CppBotKind parse_cpp_bot_kind(const std::string& name);
     std::unique_ptr<CppBotBase> make_cpp_bot_instance(CppBotKind kind,
                                                       const PolicyRequest& request);
+    
     void apply_inference_results(int policy_id,
                                  const std::vector<PolicyRequest>& requests,
                                  const std::vector<uint8_t>& actions,
                                  const std::vector<float>& log_probs,
                                  const std::vector<float>& values);
+    
     c10::Dict<c10::IValue, c10::IValue> pack_weights_for_batch(const std::vector<int>& policy_ids) const;
-
-    int inference_batch_size_{256};
 };
-

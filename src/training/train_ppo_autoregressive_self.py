@@ -14,7 +14,7 @@ from numpy.random import Generator
 import random
 import numpy as np
 import argparse
-os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+
 # Quiet Torch compile logs
 os.environ.pop("TORCH_LOGS", None)           # disable extra compile logs
 os.environ.setdefault("TORCHDYNAMO_VERBOSE", "0")

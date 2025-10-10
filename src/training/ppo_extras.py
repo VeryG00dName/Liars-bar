@@ -134,6 +134,9 @@ def _single_pass_ppo(
     returns_full = advantages_full + values_full
 
     # --- Policy Loss Calculation (on our steps only) ---
+    # NEW: Sanitize our_idx to prevent out-of-bounds access in take_along_dim
+    our_idx = our_idx.masked_fill(~our_mask, 0)
+    
     logits_at = torch.take_along_dim(action_logits, our_idx.unsqueeze(-1).expand(-1, -1, A), dim=1)
     advantages_at = torch.take_along_dim(advantages_full, our_idx, dim=1)
 
@@ -382,11 +385,10 @@ def _collate_batch(
     padding_mask = token_range.unsqueeze(0) >= valid_lengths.unsqueeze(1)  # [B,L]
     mi_batch["padding_mask"] = padding_mask.pin_memory() if pin_memory else padding_mask
 
-    valid_token_mask = ~padding_mask  # [B,L]
-
     # --- build agent_id_seq & training_seat first (needed for our_idx) ---
     agent_id_seq = torch.zeros((B, L_pad), dtype=torch.long)
     training_seat_tensor = torch.zeros((B,), dtype=torch.long)
+    agent_id_lens = torch.zeros(B, dtype=torch.long) # NEW: track true length
 
     num_players = max((len(ep.get("player_labels", [])) for ep in episodes), default=0)
     if num_players <= 0:
@@ -396,29 +398,29 @@ def _collate_batch(
     win = torch.tensor([int(ep.get("win", 0)) for ep in episodes], dtype=torch.float32)
 
     for b, ep in enumerate(episodes):
-        # training seat
         try:
             training_seat_tensor[b] = int(ep["training_agent_seat"])
         except Exception:
             raise ValueError(f"episodes[{b}]['training_agent_seat'] invalid")
 
-        # agent_id sequence
         ag = ep["agent_id"]
+        agent_id_lens[b] = len(ag) # NEW: store true length
         seq_len = min(len(ag), L_pad)
         if seq_len > 0:
             agent_id_seq[b, :seq_len] = torch.from_numpy(ag[:seq_len])
 
-        # player labels (optional but deterministic)
         labels = ep.get("player_labels", [])
         for seat_idx, label in enumerate(labels[:num_players]):
             try:
                 player_labels_tensor[b, seat_idx] = int(label)
             except Exception:
-                # hardcoded logic: if present but bad, set -1 (explicit)
                 player_labels_tensor[b, seat_idx] = -1
 
     # --- our indices/mask strictly from (agent_id == training_seat) ---
-    our_token_mask_full = (agent_id_seq == training_seat_tensor.unsqueeze(1)) & valid_token_mask  # [B,L]
+    # NEW: Create a mask based on the TRUE length of agent_id, not the model_input length
+    agent_id_valid_mask = token_range.unsqueeze(0) < agent_id_lens.unsqueeze(1)
+    
+    our_token_mask_full = (agent_id_seq == training_seat_tensor.unsqueeze(1)) & agent_id_valid_mask  # [B,L]
     our_counts = our_token_mask_full.sum(dim=1)  # [B]
     T = int(our_counts.max().item()) if our_counts.numel() > 0 else 0
 
@@ -427,12 +429,11 @@ def _collate_batch(
             zL = torch.zeros((B, 0), dtype=torch.long)
             zM = torch.zeros((B, 0), dtype=torch.bool)
             return zL, zM
-        # sort indices by time; push False to the end via fill with L_pad then sort
-        sorted_idx = torch.sort(torch.where(mask, token_range.unsqueeze(0), 0), dim=1).values[:, :max_len]
+        sorted_idx = torch.sort(torch.where(mask, token_range.unsqueeze(0), L_pad), dim=1).values[:, :max_len]
         slot_mask = torch.arange(max_len, dtype=torch.long).unsqueeze(0) < counts.unsqueeze(1)
         return sorted_idx, slot_mask.bool()
 
-    our_idx, our_mask = _mk_idx(our_token_mask_full, our_counts, T)  # [B,T], [B,T]
+    our_idx, our_mask = _mk_idx(our_token_mask_full, our_counts, T)
 
     # --- allocate & fill main PPO tensors ---
     actions = torch.full((B, T), IGN, dtype=torch.long)
@@ -441,22 +442,36 @@ def _collate_batch(
     old_values_full = torch.zeros((B, L_pad), dtype=torch.float32)
 
     for b, ep in enumerate(episodes):
-        # gather per-step labels exactly at our_idx (only for valid slots)
         count = int(our_counts[b].item())
         if count > 0:
-            # We still need idx for the action_mask, but not for oa/olp
-            idx = our_idx[b, :count].tolist()
-            
             oa = ep["our_action"]
             olp = ep["log_prob"]
 
-            # `oa` and `olp` are already filtered. Just take the first `count` elements.
-            # We must also ensure their length is at least `count`.
             if len(oa) < count or len(olp) < count:
-                raise ValueError(
+                import pprint
+                pretty_printer = pprint.PrettyPrinter(indent=2, width=120)
+                
+                debug_info = {
+                    "batch_index": b,
+                    "python_expected_count": count,
+                    "cpp_provided_our_action_len": len(oa),
+                    "cpp_provided_log_prob_len": len(olp),
+                    "training_agent_seat": ep.get("training_agent_seat"),
+                    "full_agent_id_sequence": ep.get("agent_id").tolist(),
+                    "our_action_from_cpp": oa.tolist(),
+                    "log_prob_from_cpp": olp.tolist(),
+                    "rewards_from_cpp": ep.get("reward").tolist(),
+                    "values_from_cpp": ep.get("value").tolist(),
+                    "opp_target_actions": ep.get("opp_target_action").tolist(),
+                }
+
+                error_message = (
                     f"Episode {b} has mismatch: expected at least {count} actions/log_probs, "
-                    f"but got {len(oa)}/{len(olp)}"
+                    f"but got {len(oa)}/{len(olp)}\n"
+                    "--- RAW EPISODE DATA DUMP ---\n"
+                    f"{pretty_printer.pformat(debug_info)}"
                 )
+                raise ValueError(error_message)
 
             actions[b, :count] = torch.from_numpy(oa[:count])
             old_logp[b, :count] = torch.from_numpy(olp[:count])
@@ -487,7 +502,7 @@ def _collate_batch(
         if pin_memory:
             our_action_mask = our_action_mask.pin_memory()
 
-    # --- Opponent supervision tensors (keep logic identical, but tidy) ---
+    # --- Opponent supervision tensors ---
     opp_index_lists: List[List[int]] = [[] for _ in range(B)]
     opp_target_lists: List[List[int]] = [[] for _ in range(B)]
 
@@ -504,7 +519,7 @@ def _collate_batch(
                 tgt = opp_targets_full[t] if (t < len(opp_targets_full) and opp_targets_full[t] >= 0) else IGN
                 opp_index_lists[b].append(t)
                 opp_target_lists[b].append(tgt)
-            # our step immediately after opponent (optionally supervise previous opp action)
+            # our step immediately after opponent supervise previous opp action
             elif t > 0 and agent_ids[t - 1] != training_seat:
                 prev_action = opp_targets_full[t - 1] if (t - 1) < len(opp_targets_full) else -1
                 if prev_action >= 0 and prev_action != 6:

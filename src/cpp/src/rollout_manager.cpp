@@ -25,9 +25,10 @@
 #include "torch_utils.h"
 
 namespace {
-// ... (Anonymous namespace with bot wrappers remains the same) ...
+// Global device for TorchScript model inference.
 const torch::Device kInferenceDevice = torch::kCUDA;
 
+// Helper to generate a seed, using a random device if the provided seed is 0.
 std::mt19937::result_type seed_with_optional(uint32_t seed) {
     if (seed != 0) {
         return static_cast<std::mt19937::result_type>(seed);
@@ -36,6 +37,7 @@ std::mt19937::result_type seed_with_optional(uint32_t seed) {
     return static_cast<std::mt19937::result_type>(rd());
 }
 
+// Wrappers to adapt the C++ bot implementations to the CppBotBase interface.
 class ClassicBot : public CppBotBase {
 public:
     ClassicBot() : bot_("bot") {}
@@ -111,7 +113,6 @@ RolloutManager::RolloutManager() : rng_(seed_with_optional(0)) {
     arena_.set_max_sequence_length(default_max_sequence_length_);
 }
 
-// ... (start_rollouts, run_rollouts_step, etc. are correct from the previous step, only helpers below change)
 void RolloutManager::start_rollouts(
     int num_episodes,
     int num_players,
@@ -121,7 +122,7 @@ void RolloutManager::start_rollouts(
     const std::vector<int>& opponent_labels,
     const std::vector<double>& opponent_weights,
     const std::vector<std::vector<int>>& opponent_triplets) {
-    target_episodes_ = num_episodes; // num_episodes from Python is the target number of games
+    target_episodes_ = num_episodes;
     num_players_ = num_players;
     training_policy_ids_ = training_policy_ids;
     training_policy_id_set_.clear();
@@ -142,40 +143,40 @@ void RolloutManager::start_rollouts(
     rng_.seed(seed_with_optional(seed));
     arena_.reset(batch_size_, num_players_, rng_());
 
+    // Set up agent roles for each game in the batch.
     std::vector<std::vector<int>> roles(batch_size_, std::vector<int>(num_players_));
     if (!opponent_triplets.empty()) {
         for (int i = 0; i < batch_size_; ++i) {
-            std::vector<int> lineup = {training_policy_ids_[0]};
+            std::vector<int> lineup = {training_policy_ids_[0]}; // Assume at least one learner.
             const auto& triplet = opponent_triplets[i % opponent_triplets.size()];
             lineup.insert(lineup.end(), triplet.begin(), triplet.end());
             std::shuffle(lineup.begin(), lineup.end(), rng_);
             roles[i] = lineup;
         }
     } else {
-       // Fallback logic if needed, for now assume triplets are always provided
+       // Fallback logic if explicit triplets are not provided (not used in current scripts).
     }
     arena_.set_roles(roles);
 
+    // Initialize trackers for each episode.
     episodes_.clear();
     episodes_.resize(batch_size_);
     for (int i = 0; i < batch_size_; ++i) {
         episodes_[i] = new_episode_tracker(i, roles[i]);
     }
 
+    // Clear any state from previous runs in C++ bot instances.
     for (auto& kv : cpp_bot_registry_) {
         kv.second.instances.clear();
     }
 }
 
-// THIS FUNCTION IS CORRECT FROM THE PREVIOUS STEP, KEEP IT AS IS
 bool RolloutManager::run_rollouts_step() {
-    log_rewards_and_dones();
-
     if (!jit_module_) {
         throw std::runtime_error("RolloutManager::run_rollouts_step called without a loaded model architecture");
     }
 
-    // Process C++ bots first (deep-copy requests to avoid dangling references)
+    // Greedily process all pending actions for C++ bots until only AI agents need to act.
     while (true) {
         std::vector<std::pair<int, std::vector<PolicyRequest>>> bot_requests_to_process;
         const auto& pending = arena_.collect_requests();
@@ -188,23 +189,22 @@ bool RolloutManager::run_rollouts_step() {
                 has_bots = true;
             }
         }
-
         if (!has_bots) break;
 
         for (const auto& kv : bot_requests_to_process) {
             auto actions = run_cpp_bot(kv.first, kv.second);
             arena_.submit_actions(kv.first, actions);
+            append_new_history_entries();
         }
-
-        log_rewards_and_dones();
     }
 
     const auto& pending = arena_.collect_requests();
     if (pending.empty()) {
-        log_rewards_and_dones();
+        maybe_finalize_episodes();
         return all_episodes_complete();
     }
 
+    // Collect all pending requests for AI agents.
     std::vector<PolicyRequest> all_requests;
     std::vector<int> all_policy_ids;
     for (const auto& kv : pending) {
@@ -214,6 +214,7 @@ bool RolloutManager::run_rollouts_step() {
         }
     }
     if (all_requests.empty()) {
+        maybe_finalize_episodes();
         return all_episodes_complete();
     }
 
@@ -227,6 +228,7 @@ bool RolloutManager::run_rollouts_step() {
     size_t offset = 0;
     const size_t batch_limit = static_cast<size_t>(std::max(1, inference_batch_size_));
 
+    // Run model inference in batches.
     while (offset < total_requests) {
         const size_t end = std::min(total_requests, offset + batch_limit);
         std::vector<PolicyRequest> request_chunk(all_requests.begin() + static_cast<std::ptrdiff_t>(offset),
@@ -295,6 +297,7 @@ bool RolloutManager::run_rollouts_step() {
         offset = end;
     }
 
+    // Group results by policy ID.
     std::unordered_map<int, std::vector<uint8_t>> actions_to_submit;
     std::unordered_map<int, std::vector<float>> log_probs_map;
     std::unordered_map<int, std::vector<float>> values_map;
@@ -310,10 +313,17 @@ bool RolloutManager::run_rollouts_step() {
         }
     }
 
+    // Correct Main Logic Sequence for Multi-Learner
+    
+    // 1. Submit actions for ALL AI policies to advance the environment state.
     for (const auto& kv : actions_to_submit) {
         arena_.submit_actions(kv.first, kv.second);
     }
 
+    // 2. Log the history entries that were just created by submitting actions.
+    append_new_history_entries();
+
+    // 3. Apply the inference results (logp, value) for ALL training policies.
     for (const auto& kv : requests_map) {
         int policy_id = kv.first;
         apply_inference_results(policy_id,
@@ -323,32 +333,54 @@ bool RolloutManager::run_rollouts_step() {
                                 values_map.at(policy_id));
     }
 
-    log_rewards_and_dones();
+    // 4. Check for and finalize any completed episodes.
+    maybe_finalize_episodes();
+
     return all_episodes_complete();
 }
 
-
-// Unified function to add a step's data to the trajectory.
-// All per-step vectors are grown here to ensure they always have the same size.
-void RolloutManager::append_step(SeatTrajectory& seat_tracker, int seat, int action) {
-    seat_tracker.data.agent_id.push_back(seat);
+// Appends placeholder data for a single step to a trajectory.
+void RolloutManager::append_step(SeatTrajectory& seat_tracker, const HistoryEntry& h) {
+    seat_tracker.data.agent_id.push_back(h.player);
     seat_tracker.data.reward.push_back(0.0);
-    seat_tracker.data.opp_target_action.push_back(action); // Store the actual action taken
+    seat_tracker.data.opp_target_action.push_back(h.action); 
 
-    // For sparse PPO data, push placeholders. They will be overwritten later if it's our turn.
+    // Placeholders to be filled by apply_inference_results if it was this agent's turn.
     seat_tracker.data.our_action.push_back(-1);
     seat_tracker.data.log_prob.push_back(0.0f);
     seat_tracker.data.value.push_back(0.0f);
 }
 
+// Iterates through all environments and processes any new history entries.
+void RolloutManager::append_new_history_entries() {
+    for (int b = 0; b < batch_size_; ++b) {
+        EpisodeTracker& ep = episodes_[b];
+        if (ep.done) continue;
+        Env& env = arena_.envs[b];
 
+        const int total_history = env.get_total_history_entries();
+        if (total_history > ep.last_history_len) {
+            for (auto& pair : ep.training_seats) {
+                SeatTrajectory& st = pair.second;
+                if (!st.active) continue;
+
+                for (int i = ep.last_history_len; i < total_history; ++i) {
+                    append_step(st, env.game_history[i]);
+                }
+            }
+            ep.last_history_len = total_history;
+        }
+    }
+}
+
+// Fills the most recent placeholder in a trajectory with the model's output.
 void RolloutManager::apply_inference_results(int policy_id,
                                              const std::vector<PolicyRequest>& requests,
                                              const std::vector<uint8_t>& actions,
                                              const std::vector<float>& log_probs,
                                              const std::vector<float>& values) {
     if (!is_training_policy(policy_id)) return;
-    
+
     for (size_t i = 0; i < requests.size(); ++i) {
         const auto& req = requests[i];
         if (req.env < 0 || req.env >= batch_size_) continue;
@@ -358,48 +390,50 @@ void RolloutManager::apply_inference_results(int policy_id,
         if (it == ep.training_seats.end()) continue;
 
         SeatTrajectory& seat_tracker = it->second;
-        
-        // Overwrite placeholders in the dense vectors at the correct index
-        if (seat_tracker.last_step_idx >= 0 &&
-            static_cast<size_t>(seat_tracker.last_step_idx) < seat_tracker.data.value.size()) {
 
-            seat_tracker.data.our_action[seat_tracker.last_step_idx] = static_cast<int>(actions[i]);
-            seat_tracker.data.log_prob[seat_tracker.last_step_idx] = log_probs[i];
-            seat_tracker.data.value[seat_tracker.last_step_idx] = values[i];
+        // Search backwards to find the last placeholder for this agent and fill it.
+        for (int j = static_cast<int>(seat_tracker.data.agent_id.size()) - 1; j >= 0; --j) {
+            if (seat_tracker.data.agent_id[j] == req.seat && seat_tracker.data.our_action[j] == -1) {
+                seat_tracker.data.our_action[j] = static_cast<int>(actions[i]);
+                seat_tracker.data.log_prob[j] = log_probs[i];
+                seat_tracker.data.value[j] = values[i];
+                break; 
+            }
         }
     }
 }
 
-void RolloutManager::log_rewards_and_dones() {
+// Checks all environments for termination conditions and finalizes if needed.
+void RolloutManager::maybe_finalize_episodes() {
     for (int b = 0; b < batch_size_; ++b) {
         EpisodeTracker& ep = episodes_[b];
         if (ep.done) continue;
         Env& env = arena_.envs[b];
-        const int total_history = env.get_total_history_entries();
-        if (total_history <= ep.last_history_len) continue;
 
-        for (auto& pair : ep.training_seats) {
-            SeatTrajectory& st = pair.second;
-            if (!st.active) continue;
-
-            // Process new history entries
-            for (int i = ep.last_history_len; i < total_history; ++i) {
-                const auto& h = env.game_history[i];
-                append_step(st, h.player, h.action);
-
-                // If this step was our agent's turn, record its index in the dense vectors
-                // so `apply_inference_results` knows where to write the model output.
-                if (h.player == st.seat) {
-                    st.last_step_idx = static_cast<int>(st.data.agent_id.size()) - 1;
+        // Check for early termination if all learners are out.
+        bool any_learner_alive = false;
+        if (!ep.training_seats.empty()) {
+            for (const auto& pair : ep.training_seats) {
+                const SeatTrajectory& st = pair.second;
+                if (env.terminations[st.seat] == 0) {
+                    any_learner_alive = true;
+                    break;
                 }
             }
+        } else {
+            any_learner_alive = true; // No learners to track, so don't terminate early.
         }
-        ep.last_history_len = total_history;
-        if (arena_.done[b]) {
-            finalize_episode(ep);
+
+        // Finalize if the game is naturally over OR if all learners are eliminated.
+        if (arena_.done[b] || !any_learner_alive) {
+            if (!ep.done) {
+                arena_.done[b] = 1;
+                finalize_episode(ep);
+            }
         }
     }
 }
+
 
 void RolloutManager::finalize_episode(EpisodeTracker& tracker) {
     if (tracker.done) return;
@@ -417,7 +451,7 @@ void RolloutManager::finalize_episode(EpisodeTracker& tracker) {
     for (auto& pair : tracker.training_seats) {
         SeatTrajectory& st = pair.second;
         if (st.active) {
-            // Apply win/loss reward to the very last step in the dense trajectory
+            // Apply win/loss reward to the last step of the trajectory.
             if (!st.data.reward.empty()) {
                 if (alive_count == 1 && winner == st.seat) {
                     st.data.reward.back() += 1.0;
@@ -427,7 +461,24 @@ void RolloutManager::finalize_episode(EpisodeTracker& tracker) {
                 }
             }
            
-            // Prepare the final model inputs for Python
+            // Filter sparse data into dense format for Python.
+            std::vector<int> dense_our_action;
+            std::vector<float> dense_log_prob;
+            
+            dense_our_action.reserve(st.data.our_action.size() / num_players_ + 1);
+            dense_log_prob.reserve(st.data.log_prob.size() / num_players_ + 1);
+
+            for (size_t i = 0; i < st.data.our_action.size(); ++i) {
+                if (st.data.our_action[i] != -1) {
+                    dense_our_action.push_back(st.data.our_action[i]);
+                    dense_log_prob.push_back(st.data.log_prob[i]);
+                }
+            }
+            st.data.our_action = std::move(dense_our_action);
+            st.data.log_prob = std::move(dense_log_prob);
+
+            
+            // Prepare the final model input sequences for Python.
             PolicyRequest final_request;
             int seq_cap = arena_.max_sequence_length_for_policy(st.policy_id);
             arena_.prepare_ai_sequence(env, st.seat, seq_cap, final_request);
@@ -446,15 +497,7 @@ void RolloutManager::finalize_episode(EpisodeTracker& tracker) {
 }
 
 std::vector<TrajectoryData> RolloutManager::get_completed_episodes() {
-    log_rewards_and_dones();
-    for (auto& tracker : episodes_) {
-        if (!tracker.done && tracker.env_idx >= 0 &&
-            tracker.env_idx < static_cast<int>(arena_.done.size())) {
-            if (arena_.done[tracker.env_idx]) {
-                finalize_episode(tracker);
-            }
-        }
-    }
+    maybe_finalize_episodes();
     std::vector<TrajectoryData> out;
     if (!completed_buffer_.empty()) {
         out.swap(completed_buffer_);
@@ -464,12 +507,14 @@ std::vector<TrajectoryData> RolloutManager::get_completed_episodes() {
     }
     return out;
 }
+
 bool RolloutManager::all_episodes_complete() const {
     for (const auto& tracker : episodes_) {
         if (!tracker.done) return false;
     }
     return true;
 }
+
 std::vector<TrajectoryData> RolloutManager::get_rollouts(
     int num_episodes,
     int num_players,
@@ -492,6 +537,7 @@ std::vector<TrajectoryData> RolloutManager::get_rollouts(
 
     return get_completed_episodes();
 }
+
 void RolloutManager::load_model_architecture(const std::string& path) {
     try {
         auto module = std::make_shared<torch::jit::Module>(torch::jit::load(path));
@@ -504,6 +550,7 @@ void RolloutManager::load_model_architecture(const std::string& path) {
         throw;
     }
 }
+
 void RolloutManager::load_policy_weights(int policy_id, const std::string& path) {
     try {
         std::ifstream in(path, std::ios::binary);
@@ -538,7 +585,7 @@ void RolloutManager::load_policy_weights(int policy_id, const std::string& path)
             out.insert(c10::IValue(key), c10::IValue(std::move(t)));
         }
 
-        policy_weights_[policy_id] = c10::Dict<c10::IValue, c10::IValue>(out);
+        policy_weights_.insert_or_assign(policy_id, c10::Dict<c10::IValue, c10::IValue>(out));
     } catch (const c10::Error& err) {
         std::cerr << "[RolloutManager] Failed to load state_dict from '" << path
                   << "': " << err.what_without_backtrace() << std::endl;
@@ -549,9 +596,11 @@ void RolloutManager::load_policy_weights(int policy_id, const std::string& path)
         throw;
     }
 }
+
 void RolloutManager::update_learner_weights(int policy_id, c10::Dict<c10::IValue, c10::IValue> state_dict) {
-    policy_weights_[policy_id] = std::move(state_dict);
+    policy_weights_.insert_or_assign(policy_id, std::move(state_dict));
 }
+
 void RolloutManager::register_cpp_bot(int policy_id, const std::string& bot_name) {
     try {
         CppBotKind kind = parse_cpp_bot_kind(bot_name);
@@ -564,22 +613,26 @@ void RolloutManager::register_cpp_bot(int policy_id, const std::string& bot_name
         throw;
     }
 }
+
 void RolloutManager::set_max_sequence_length(int max_len) {
     if (max_len <= 0) max_len = 1;
     default_max_sequence_length_ = max_len;
     arena_.set_max_sequence_length(max_len);
 }
+
 void RolloutManager::set_policy_max_sequence_length(int policy_id, int max_len) {
     if (policy_id < 0) return;
     if (max_len <= 0) max_len = 1;
     policy_max_sequence_length_[policy_id] = max_len;
 }
+
 void RolloutManager::set_inference_batch_size(int size) {
     if (size <= 0) {
         throw std::invalid_argument("inference_batch_size must be positive");
     }
     inference_batch_size_ = size;
 }
+
 void RolloutManager::set_training_device(const std::string& device_str) {
     if (device_str == "cuda" && torch::cuda::is_available()) {
         training_device_ = torch::kCUDA;
@@ -587,9 +640,11 @@ void RolloutManager::set_training_device(const std::string& device_str) {
         training_device_ = torch::kCPU;
     }
 }
+
 bool RolloutManager::is_training_policy(int policy_id) const {
     return training_policy_id_set_.count(policy_id) > 0;
 }
+
 c10::Dict<c10::IValue, c10::IValue> RolloutManager::pack_weights_for_batch(
     const std::vector<int>& policy_ids) const {
     c10::Dict<c10::IValue, c10::IValue> packed(c10::StringType::get(), c10::TensorType::get());
@@ -627,6 +682,7 @@ c10::Dict<c10::IValue, c10::IValue> RolloutManager::pack_weights_for_batch(
     }
     return packed;
 }
+
 std::vector<uint8_t> RolloutManager::run_cpp_bot(int policy_id, const std::vector<PolicyRequest>& requests) {
     if (requests.empty()) return {};
     auto it = cpp_bot_registry_.find(policy_id);
@@ -647,6 +703,7 @@ std::vector<uint8_t> RolloutManager::run_cpp_bot(int policy_id, const std::vecto
     }
     return actions;
 }
+
 RolloutManager::CppBotKind RolloutManager::parse_cpp_bot_kind(const std::string& name) {
     std::string lower;
     lower.reserve(name.size());
@@ -662,6 +719,7 @@ RolloutManager::CppBotKind RolloutManager::parse_cpp_bot_kind(const std::string&
     if (lower == "tablenontableagent") return CppBotKind::TableNonTableAgent;
     throw std::invalid_argument("Unknown C++ bot name: " + name);
 }
+
 std::unique_ptr<CppBotBase> RolloutManager::make_cpp_bot_instance(
     RolloutManager::CppBotKind kind, const PolicyRequest& request) {
     switch (kind) {
@@ -678,24 +736,7 @@ std::unique_ptr<CppBotBase> RolloutManager::make_cpp_bot_instance(
     }
     throw std::runtime_error("Unhandled C++ bot kind");
 }
-std::vector<std::vector<int>> RolloutManager::build_roles(
-    int batch_size,
-    int num_players,
-    const std::vector<int>& training_ids,
-    const std::vector<int>& opponent_labels,
-    const std::vector<double>& opponent_weights) {
-    std::vector<std::vector<int>> roles(batch_size, std::vector<int>(num_players));
-    std::discrete_distribution<> opp_dist(opponent_weights.begin(), opponent_weights.end());
-    std::uniform_int_distribution<> seat_dist(0, num_players - 1);
-    for (int b = 0; b < batch_size; ++b) {
-        for (int p = 0; p < num_players; ++p) {
-            roles[b][p] = opponent_labels[opp_dist(rng_)];
-        }
-        int seat = seat_dist(rng_);
-        roles[b][seat] = training_ids[rng_() % training_ids.size()];
-    }
-    return roles;
-}
+
 EpisodeTracker RolloutManager::new_episode_tracker(int env_idx, const std::vector<int>& roles) {
     EpisodeTracker tracker;
     tracker.env_idx = env_idx;
