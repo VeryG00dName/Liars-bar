@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from src.model.ppo_reactive_model_base import AttentionCacheEntry, PPOReactiveModelBase
+from src.model.ppo_reactive_model_base import PPOReactiveModelBase
 
 # --- JIT-compatible helper functions moved to module level ---
 def _batched_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:

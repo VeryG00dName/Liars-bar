@@ -102,14 +102,16 @@ class PPOVecRolloutManager:
         )
 
         model_input = None
-        training_agent = self.policies.get(int(traj.training_policy_id))
-        if training_agent and hasattr(training_agent, "pop_last_model_input"):
-            model_input_raw = training_agent.pop_last_model_input(
-                int(traj.env_index), training_seat
-            )
-            if model_input_raw is None:
-                raise RuntimeError(f"Missing final model input for env {traj.env_index}, seat {training_seat}")
-            model_input = {k: v.cpu() if torch.is_tensor(v) else v for k, v in model_input_raw.items()}
+        if traj.valid_len > 0:
+            obs_dim = len(traj.obs_sequence) // traj.valid_len
+            model_input = {
+                "obs_sequence": torch.tensor(np.array(traj.obs_sequence, dtype=np.float32)).reshape(1, traj.valid_len, obs_dim),
+                "action_sequence": torch.tensor(traj.action_sequence, dtype=torch.long).reshape(1, -1),
+                "agent_types": torch.tensor(traj.agent_type_sequence, dtype=torch.long).reshape(1, -1),
+                "positions": torch.tensor(traj.position_sequence, dtype=torch.long).reshape(1, -1),
+                "action_masks": torch.tensor(np.array(traj.action_mask_sequence, dtype=np.uint8), dtype=torch.bool).reshape(1, traj.valid_len, 7),
+                "valid_lengths": torch.tensor([traj.valid_len], dtype=torch.long),
+            }
 
         return {
             "training_agent_seat": training_seat,

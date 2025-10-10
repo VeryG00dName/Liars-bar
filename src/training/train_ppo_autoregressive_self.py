@@ -14,7 +14,7 @@ from numpy.random import Generator
 import random
 import numpy as np
 import argparse
-
+os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 # Quiet Torch compile logs
 os.environ.pop("TORCH_LOGS", None)           # disable extra compile logs
 os.environ.setdefault("TORCHDYNAMO_VERBOSE", "0")
@@ -596,13 +596,19 @@ def train_generation(
         rng=(rng or _GLOBAL_RNG),
     )
 
+    try:
+        inference_batch = int(getattr(config, "PPO_INFERENCE_BATCH_SIZE", 256))
+        rollout_manager.cpp_manager.set_inference_batch_size(max(1, inference_batch))
+    except AttributeError:
+        logging.debug("Rollout manager does not support setting inference batch size")
+
     architecture_path = os.path.join(run_ckpt_dir, "rollout_architecture.pt")
     try:
         script_model = build_script_model_from_training_model(learner.train_model)
         with torch.inference_mode():
             scripted = torch.jit.script(script_model)
             scripted = torch.jit.freeze(
-                scripted, preserved_attrs=["forward", "forward_packed"]
+                scripted, preserved_attrs=["forward_packed"]
             )
         scripted_cpu = scripted.to("cpu")
         torch.jit.save(scripted_cpu, architecture_path)

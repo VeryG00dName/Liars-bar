@@ -14,15 +14,11 @@ import torch.nn as nn
 __all__ = [
     "PPOReactiveModelBase",
     "MoETransformerEncoderLayer",
-    "AttentionCacheEntry",
 ]
 
 
-AttentionCacheEntry = Dict[str, torch.Tensor]
-
-
-class SelfAttentionWithCache(nn.Module):
-    """Multi-head self-attention that supports key/value caching."""
+class SelfAttention(nn.Module):
+    """Multi-head self-attention."""
 
     def __init__(self, embed_dim: int, num_heads: int, dropout: float) -> None:
         super().__init__()
@@ -54,95 +50,35 @@ class SelfAttentionWithCache(nn.Module):
         x: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
         key_padding_mask: Optional[torch.Tensor] = None,
-        cache: Optional[AttentionCacheEntry] = None,
-    ) -> Tuple[torch.Tensor, AttentionCacheEntry]:
-        """Run attention, optionally using a key/value cache."""
-
+    ) -> torch.Tensor:
         q = self._shape(self.q_proj(x))
-        new_k = self._shape(self.k_proj(x))
-        new_v = self._shape(self.v_proj(x))
+        k = self._shape(self.k_proj(x))
+        v = self._shape(self.v_proj(x))
 
-        # --- THIS IS THE FIX ---
-        # Initialize variables to None to ensure they are always defined
-        # for the JIT compiler, regardless of the 'cache' branch.
-        past_k: Optional[torch.Tensor] = None
-        past_v: Optional[torch.Tensor] = None
-        past_lengths: Optional[torch.Tensor] = None
-
-        if cache is not None:
-            past_k = cache["key"]
-            past_v = cache["value"]
-            past_lengths = cache["lengths"]
-        # The 'else' part is now handled by the initialization above.
-
-        if past_k is None:
-            combined_k = new_k
-            combined_v = new_v
-            past_len = 0
-        else:
-            assert past_v is not None
-            past_len = int(past_k.size(2))
-            combined_k = torch.cat([past_k, new_k], dim=2)
-            combined_v = torch.cat([past_v, new_v], dim=2)
-
-        total_len = combined_k.size(2)
         B, H, T, _ = q.shape
-
-        attn_weights = torch.matmul(q, combined_k.transpose(-2, -1)) * self._norm_factor
-
-        if past_lengths is not None and past_len > 0:
-            past_positions = torch.arange(past_len, device=attn_weights.device)
-            mask = past_positions.view(1, 1, 1, past_len) >= past_lengths.view(B, 1, 1, 1)
-            attn_weights[..., :past_len] = attn_weights[..., :past_len].masked_fill(
-                mask, float("-inf")
-            )
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self._norm_factor
 
         if key_padding_mask is not None:
-            # key_padding_mask has shape [B, T_chunk]; apply it to the last
-            # T_chunk columns (new chunk) using broadcast without changing
-            # element count: [B, 1, 1, T_chunk].
-            chunk_mask = key_padding_mask.view(B, 1, 1, key_padding_mask.size(-1))
-            attn_weights[..., past_len:] = attn_weights[..., past_len:].masked_fill(
-                chunk_mask, float("-inf")
-            )
+            if key_padding_mask.dim() != 2:
+                raise ValueError("key_padding_mask must be of shape [B, T]")
+            padding_mask = key_padding_mask.view(B, 1, 1, key_padding_mask.size(-1))
+            attn_weights = attn_weights.masked_fill(padding_mask, float("-inf"))
 
         if attn_mask is not None:
             if attn_mask.dim() != 2 or attn_mask.size(0) != T:
                 raise ValueError("attn_mask must be of shape [T, T]")
-            causal_mask = attn_mask
-            if causal_mask.dtype == torch.bool:
-                mask_tensor = causal_mask.unsqueeze(0).unsqueeze(0)
-                attn_weights[..., past_len:] = attn_weights[..., past_len:].masked_fill(
-                    mask_tensor, float("-inf")
-                )
+            if attn_mask.dtype == torch.bool:
+                mask_tensor = attn_mask.unsqueeze(0).unsqueeze(0)
+                attn_weights = attn_weights.masked_fill(mask_tensor, float("-inf"))
             else:
-                attn_weights[..., past_len:] = attn_weights[..., past_len:] + causal_mask.unsqueeze(0).unsqueeze(0)
+                attn_weights = attn_weights + attn_mask.unsqueeze(0).unsqueeze(0)
 
         attn_probs = torch.softmax(attn_weights, dim=-1)
         attn_probs = nn.functional.dropout(attn_probs, p=self.dropout, training=self.training)
-        context = torch.matmul(attn_probs, combined_v)
+        context = torch.matmul(attn_probs, v)
 
         output = self.out_proj(self._combine(context))
-
-        if past_lengths is not None:
-            base_lengths = past_lengths.to(torch.long)
-        else:
-            base_lengths = torch.full((B,), past_len, dtype=torch.long, device=output.device)
-
-        if key_padding_mask is not None:
-            chunk_lengths = (~key_padding_mask).sum(dim=1).to(torch.long)
-        else:
-            chunk_lengths = torch.full((B,), T, dtype=torch.long, device=output.device)
-
-        updated_lengths = base_lengths + chunk_lengths
-
-        updated_cache: AttentionCacheEntry = {
-            "key": combined_k.detach(),
-            "value": combined_v.detach(),
-            "lengths": updated_lengths.detach(),
-        }
-
-        return output, updated_cache
+        return output
 
 
 def _make_moe_ffn(hidden_dim: int, expert_ffn_dim: int, dropout: float) -> nn.Sequential:
@@ -211,7 +147,7 @@ class MoETransformerEncoderLayer(nn.Module):
         layer_norm_eps: float = 1e-5,
     ) -> None:
         super().__init__()
-        self.self_attn = SelfAttentionWithCache(
+        self.self_attn = SelfAttention(
             embed_dim=hidden_dim,
             num_heads=num_heads,
             dropout=dropout,
@@ -233,18 +169,16 @@ class MoETransformerEncoderLayer(nn.Module):
         src: torch.Tensor,
         src_mask: Optional[torch.Tensor] = None,
         src_key_padding_mask: Optional[torch.Tensor] = None,
-        kv_cache: Optional[AttentionCacheEntry] = None,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], AttentionCacheEntry]:
-        attn_output, updated_cache = self.self_attn(
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        attn_output = self.self_attn(
             src,
             attn_mask=src_mask,
             key_padding_mask=src_key_padding_mask,
-            cache=kv_cache,
         )
         src = self.norm1(src + self.dropout1(attn_output))
         moe_output, routing = self.moe(src)
         src = self.norm2(src + self.dropout2(moe_output))
-        return src, routing, updated_cache
+        return src, routing
 
 
 class MoETransformerEncoder(nn.Module):
@@ -258,31 +192,23 @@ class MoETransformerEncoder(nn.Module):
         src: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         src_key_padding_mask: Optional[torch.Tensor] = None,
-        kv_cache: Optional[List[AttentionCacheEntry]] = None,
     ) -> Tuple[
         torch.Tensor,
         List[torch.Tensor],
         Dict[str, torch.Tensor],
-        List[AttentionCacheEntry],
     ]:
         gate_logits: List[torch.Tensor] = []
         routing: Dict[str, torch.Tensor] = {}
-        new_caches: List[AttentionCacheEntry] = []
         output = src
-        for idx, layer in enumerate(self.layers):
-            layer_cache = torch.jit.annotate(Optional[AttentionCacheEntry], None)
-            if kv_cache is not None and idx < len(kv_cache):
-                layer_cache = kv_cache[idx]
-            output, routing, updated_cache = layer(
+        for layer in self.layers:
+            output, routing = layer(
                 output,
                 src_mask=mask,
                 src_key_padding_mask=src_key_padding_mask,
-                kv_cache=layer_cache,
             )
             gate_logits.append(routing["gate_logits"])
-            new_caches.append(updated_cache)
         output = self.norm(output)
-        return output, gate_logits, routing, new_caches
+        return output, gate_logits, routing
 
 
 class PPOReactiveModelBase(nn.Module):
@@ -438,18 +364,15 @@ class PPOReactiveModelBase(nn.Module):
         encoded_inputs: torch.Tensor,
         causal_mask: torch.Tensor,
         key_padding: Optional[torch.Tensor],
-        kv_cache: Optional[List[AttentionCacheEntry]] = None,
     ) -> Tuple[
         torch.Tensor,
         List[torch.Tensor],
         Dict[str, torch.Tensor],
-        List[AttentionCacheEntry],
     ]:
         return self.transformer(
             encoded_inputs,
             mask=causal_mask,
             src_key_padding_mask=key_padding,
-            kv_cache=kv_cache,
         )
 
     # --------- TorchScript-safe helpers that read ModuleLists via self ---------
@@ -563,7 +486,7 @@ class PPOReactiveModelBase(nn.Module):
 
         causal_mask, key_padding = self._prepare_masks(encoded_inputs, padding_mask)
 
-        transformer_output, _, routing, _ = self._run_transformer(
+        transformer_output, _, routing = self._run_transformer(
             encoded_inputs,
             causal_mask=causal_mask,
             key_padding=key_padding,
@@ -576,159 +499,4 @@ class PPOReactiveModelBase(nn.Module):
 
         return action_logits, opp_logits, state_values, win_logits
 
-    def _slice_new_tokens(
-        self,
-        tensor: torch.Tensor,
-        prev_lengths: torch.Tensor,
-        new_lengths: torch.Tensor,
-        fill_value: float = 0.0,
-    ) -> torch.Tensor:
-        batch = int(tensor.size(0))
-        total_len = int(tensor.size(1))
 
-        chunk_lengths = (new_lengths - prev_lengths).clamp_min(0)
-        max_chunk = int(chunk_lengths.max().item())
-
-        # Build output shape as a List[int] (TorchScript-friendly)
-        out_shape: List[int] = [batch, max_chunk]
-        dim = int(tensor.dim())
-        if dim > 2:
-            for d in range(2, dim):
-                out_shape.append(int(tensor.size(d)))
-
-        chunk = tensor.new_full(out_shape, fill_value)
-
-        for i in range(batch):
-            start = int(prev_lengths[i].item())
-            end = int(new_lengths[i].item())
-            if start >= end or start >= total_len:
-                continue
-            end = min(end, total_len)
-            length = min(max_chunk, end - start)
-            if length <= 0:
-                continue
-
-            # Slice and copy the new tokens for this batch element
-            if dim == 2:
-                chunk[i, :length] = tensor[i, start:start + length]
-            else:
-                chunk[i, :length, ...] = tensor[i, start:start + length, ...]
-
-        return chunk
-
-    def _build_chunk_padding(
-        self,
-        prev_lengths: torch.Tensor,
-        new_lengths: torch.Tensor,
-    ) -> torch.Tensor:
-        chunk_lengths = (new_lengths - prev_lengths).clamp_min(0)
-        max_chunk = int(chunk_lengths.max().item())
-        padding = torch.ones(
-            (prev_lengths.size(0), max_chunk), dtype=torch.bool, device=prev_lengths.device
-        )
-        for i in range(prev_lengths.size(0)):
-            length = int(chunk_lengths[i].item())
-            if length <= 0:
-                continue
-            padding[i, :length] = False
-        return padding
-    
-    @torch.jit.export
-    def forward_with_kv_cache(
-        self,
-        obs_sequence: torch.Tensor,
-        action_sequence: torch.Tensor,
-        agent_types: torch.Tensor,
-        positions: torch.Tensor,
-        action_masks: Optional[torch.Tensor] = None,
-        padding_mask: Optional[torch.Tensor] = None,
-        valid_lengths: Optional[torch.Tensor] = None,
-        kv_cache: Optional[List[AttentionCacheEntry]] = None,
-    ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        List[AttentionCacheEntry],
-    ]:
-        if kv_cache is None or len(kv_cache) == 0:
-            encoded_inputs = self._encode_inputs(
-                obs_sequence=obs_sequence,
-                action_sequence=action_sequence,
-                agent_types=agent_types,
-                positions=positions,
-                padding_mask=padding_mask,
-            )
-
-            causal_mask, key_padding = self._prepare_masks(encoded_inputs, padding_mask)
-
-            transformer_output, _, routing, new_cache = self._run_transformer(
-                encoded_inputs,
-                causal_mask=causal_mask,
-                key_padding=key_padding,
-            )
-
-            action_logits, opp_logits, state_values, win_logits = self._head_outputs(
-                transformer_output,
-                routing,
-            )
-
-            return action_logits, opp_logits, state_values, win_logits, new_cache
-
-        if valid_lengths is None:
-            raise ValueError("valid_lengths is required when using kv_cache")
-
-        new_lengths = valid_lengths.to(torch.long).contiguous()
-        prev_lengths = kv_cache[0]["lengths"].to(new_lengths.device)
-
-        if torch.all(new_lengths <= prev_lengths):
-            batch_size = obs_sequence.size(0)
-            action_dim = self.action_heads[0].out_features
-            opp_dim = self.opp_action_heads[0].out_features
-            value_dim = self.reward_stream_heads[0].out_features
-            win_dim = self.win_prob_heads[0].out_features
-            zeros_actions = obs_sequence.new_zeros((batch_size, 0, action_dim))
-            zeros_opp = obs_sequence.new_zeros((batch_size, 0, opp_dim))
-            zeros_values = obs_sequence.new_zeros((batch_size, 0, value_dim))
-            zeros_win = obs_sequence.new_zeros((batch_size, 0, win_dim))
-            return zeros_actions, zeros_opp, zeros_values, zeros_win, kv_cache
-
-        obs_chunk = self._slice_new_tokens(obs_sequence, prev_lengths, new_lengths)
-        action_chunk   = self._slice_new_tokens(action_sequence, prev_lengths, new_lengths, fill_value=0.0)
-        agent_chunk    = self._slice_new_tokens(agent_types,     prev_lengths, new_lengths, fill_value=0.0)
-        position_chunk = self._slice_new_tokens(positions,       prev_lengths, new_lengths, fill_value=0.0)
-        if padding_mask is not None:
-            padding_chunk = self._slice_new_tokens(
-                padding_mask,
-                prev_lengths,
-                new_lengths,
-                fill_value=True,
-            )
-        else:
-            padding_chunk = None
-
-        chunk_padding_mask = self._build_chunk_padding(prev_lengths, new_lengths)
-
-        encoded_inputs = self._encode_inputs(
-            obs_sequence=obs_chunk,
-            action_sequence=action_chunk,
-            agent_types=agent_chunk,
-            positions=position_chunk,
-            padding_mask=chunk_padding_mask,
-        )
-
-        causal_mask, key_padding = self._prepare_masks(encoded_inputs, chunk_padding_mask)
-
-        transformer_output, _, routing, new_cache = self._run_transformer(
-            encoded_inputs,
-            causal_mask=causal_mask,
-            key_padding=key_padding,
-            kv_cache=kv_cache,
-        )
-
-        action_logits, opp_logits, state_values, win_logits = self._head_outputs(
-            transformer_output,
-            routing,
-        )
-
-        return action_logits, opp_logits, state_values, win_logits, new_cache

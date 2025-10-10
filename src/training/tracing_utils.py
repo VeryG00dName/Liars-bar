@@ -59,7 +59,7 @@ def trace_model_from_checkpoint(checkpoint_path: str, output_path: str, device: 
         with torch.no_grad():
             scripted_model = torch.jit.script(script_model)
             traced_model = torch.jit.freeze(
-                scripted_model, preserved_attrs=["forward", "forward_packed"]
+                scripted_model, preserved_attrs=["forward_packed"]
             )
         # Save to CPU for portability
         traced_model_cpu = traced_model.to("cpu")

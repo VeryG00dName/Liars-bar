@@ -76,8 +76,6 @@ private:
         std::unordered_map<uint64_t, std::unique_ptr<CppBotBase>> instances;
     };
 
-    using CacheEntry = std::vector<c10::IValue>;
-
     VecArena arena_;
     int max_env_batch_{512};
     int inference_batch_size_{128};
@@ -85,7 +83,6 @@ private:
     std::unordered_map<int, std::shared_ptr<torch::jit::Module>> models_;
     std::unordered_map<int, int> policy_max_sequence_lengths_;
     std::unordered_map<int, CppBotRegistryEntry> cpp_bot_registry_;
-    std::unordered_map<int, std::unordered_map<uint64_t, CacheEntry>> kv_cache_;
 
     std::vector<uint8_t> run_model(int policy_id,
                                    torch::jit::Module& module,
@@ -94,11 +91,5 @@ private:
     static CppBotKind parse_cpp_bot_kind(const std::string& name);
     std::unique_ptr<CppBotBase> make_cpp_bot_instance(CppBotKind kind,
                                                       const PolicyRequest& request);
-    static uint64_t seat_cache_key(int env, int seat);
-    c10::IValue stack_kv_cache(const std::vector<CacheEntry>& caches, const torch::Device& device);
-    void update_kv_cache(int policy_id,
-                         const std::vector<size_t>& indices,
-                         const std::vector<PolicyRequest>& requests,
-                         const c10::IValue& cache_ivalue);
 };
 

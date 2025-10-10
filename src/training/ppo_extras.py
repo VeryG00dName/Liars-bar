@@ -134,18 +134,45 @@ def _single_pass_ppo(
     returns_full = advantages_full + values_full
 
     # --- Policy Loss Calculation (on our steps only) ---
-    idx_clamped = our_idx.clamp(0, max(L - 1, 0))
-    logits_at = torch.take_along_dim(action_logits, idx_clamped.unsqueeze(-1).expand(-1, -1, A), dim=1)
-    advantages_at = torch.take_along_dim(advantages_full, idx_clamped, dim=1)
+    logits_at = torch.take_along_dim(action_logits, our_idx.unsqueeze(-1).expand(-1, -1, A), dim=1)
+    advantages_at = torch.take_along_dim(advantages_full, our_idx, dim=1)
 
     adv_norm = _normalize_advantages(advantages_at, step_mask)
 
     dist = torch.distributions.Categorical(logits=logits_at)
     actions_for_log_prob = actions.masked_fill(~our_mask, 0)
+    # --- START AGGRESSIVE DEBUGGING BLOCK ---
+    # Check for out-of-bounds actions just before the log_prob call
+    # We only care about values where the mask is True
+    valid_actions = actions_for_log_prob[our_mask]
+    if valid_actions.numel() > 0:
+        min_action, max_action = valid_actions.min().item(), valid_actions.max().item()
+        
+        # The action dimension 'A' is 7. Valid indices are 0 through 6.
+        if min_action < 0 or max_action >= A:
+            print("--- FATAL: INVALID ACTION DETECTED ---")
+            print(f"Action dim (A): {A}")
+            print(f"Detected action bounds on this GPU: min={min_action}, max={max_action}")
+            
+            # Find the exact location of the bad action
+            bad_indices_mask = (actions_for_log_prob >= A) | (actions_for_log_prob < 0)
+            bad_indices_mask = bad_indices_mask & our_mask # Only look at unmasked values
+            bad_locations = bad_indices_mask.nonzero()
+            
+            print("Locations (batch_idx, agent_step_idx):")
+            for loc in bad_locations:
+                b, t = loc.tolist()
+                action_val = actions[b, t].item()
+                print(f"  Batch item {b}, agent step {t} -> Action: {action_val}")
+
+            # Raise a clean Python exception with this information
+            raise IndexError(f"Invalid action index detected before log_prob: max={max_action}, min={min_action}. Action dim is {A}.")
+    # --- END AGGRESSIVE DEBUGGING BLOCK ---
+
     new_logp = dist.log_prob(actions_for_log_prob).to(torch.float32)
     entropy = dist.entropy().to(torch.float32)
 
-    log_ratio = (new_logp - old_logp).clamp(min=-60.0, max=60.0)
+    log_ratio = (new_logp - old_logp.to(torch.float32)).clamp(min=-60.0, max=60.0)
     ratio = log_ratio.exp()
     surr1 = ratio * adv_norm
     surr2 = torch.clamp(ratio, 1.0 - EPS_CLIP, 1.0 + EPS_CLIP) * adv_norm
@@ -401,7 +428,7 @@ def _collate_batch(
             zM = torch.zeros((B, 0), dtype=torch.bool)
             return zL, zM
         # sort indices by time; push False to the end via fill with L_pad then sort
-        sorted_idx = torch.sort(torch.where(mask, token_range.unsqueeze(0), token_range.new_full((1, L_pad), L_pad)), dim=1).values[:, :max_len]
+        sorted_idx = torch.sort(torch.where(mask, token_range.unsqueeze(0), 0), dim=1).values[:, :max_len]
         slot_mask = torch.arange(max_len, dtype=torch.long).unsqueeze(0) < counts.unsqueeze(1)
         return sorted_idx, slot_mask.bool()
 
@@ -417,11 +444,22 @@ def _collate_batch(
         # gather per-step labels exactly at our_idx (only for valid slots)
         count = int(our_counts[b].item())
         if count > 0:
+            # We still need idx for the action_mask, but not for oa/olp
             idx = our_idx[b, :count].tolist()
+            
             oa = ep["our_action"]
             olp = ep["log_prob"]
-            actions[b, :count] = torch.from_numpy(oa[idx])
-            old_logp[b, :count] = torch.from_numpy(olp[idx])
+
+            # `oa` and `olp` are already filtered. Just take the first `count` elements.
+            # We must also ensure their length is at least `count`.
+            if len(oa) < count or len(olp) < count:
+                raise ValueError(
+                    f"Episode {b} has mismatch: expected at least {count} actions/log_probs, "
+                    f"but got {len(oa)}/{len(olp)}"
+                )
+
+            actions[b, :count] = torch.from_numpy(oa[:count])
+            old_logp[b, :count] = torch.from_numpy(olp[:count])
 
         # rewards (prefix up to L_pad)
         r = ep["reward"]

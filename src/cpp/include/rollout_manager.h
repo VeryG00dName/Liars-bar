@@ -107,6 +107,7 @@ public:
     void set_training_device(const std::string& device_str);
     void set_max_sequence_length(int max_len);
     void set_policy_max_sequence_length(int policy_id, int max_len);
+    void set_inference_batch_size(int size);
     int training_policy_id() const {
         return training_policy_ids_.empty() ? -1 : training_policy_ids_.front();
     }
@@ -131,8 +132,6 @@ private:
         std::unordered_map<uint64_t, std::unique_ptr<CppBotBase>> instances;
     };
 
-    using CacheEntry = std::vector<c10::IValue>;
-
     VecArena arena_;
     int target_episodes_{0};
     int batch_size_{0};
@@ -149,7 +148,6 @@ private:
     std::shared_ptr<torch::jit::Module> jit_module_;
     std::unordered_map<int, c10::Dict<c10::IValue, c10::IValue>> policy_weights_;
     std::unordered_map<int, CppBotRegistryEntry> cpp_bot_registry_;
-    std::unordered_map<int, std::unordered_map<uint64_t, CacheEntry>> kv_cache_;
     std::vector<uint8_t> training_env_inactive_;
     std::vector<int> active_training_counts_;
     std::vector<int> weighted_opponent_labels_;
@@ -174,17 +172,13 @@ private:
     static CppBotKind parse_cpp_bot_kind(const std::string& name);
     std::unique_ptr<CppBotBase> make_cpp_bot_instance(CppBotKind kind,
                                                       const PolicyRequest& request);
-    static uint64_t seat_cache_key(int env, int seat);
-    c10::IValue stack_kv_cache(const std::vector<CacheEntry>& caches, const torch::Device& device);
-    void update_kv_cache(int policy_id,
-                         const std::vector<size_t>& indices,
-                         const std::vector<PolicyRequest>& requests,
-                         const c10::IValue& cache_ivalue);
     void apply_inference_results(int policy_id,
                                  const std::vector<PolicyRequest>& requests,
                                  const std::vector<uint8_t>& actions,
                                  const std::vector<float>& log_probs,
                                  const std::vector<float>& values);
     c10::Dict<c10::IValue, c10::IValue> pack_weights_for_batch(const std::vector<int>& policy_ids) const;
+
+    int inference_batch_size_{256};
 };
 

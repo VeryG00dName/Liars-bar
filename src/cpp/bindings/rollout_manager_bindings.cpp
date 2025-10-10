@@ -33,7 +33,13 @@ void bind_rollout_manager(py::module_& m) {
         .def_readonly("value", &TrajectoryData::value)
         .def_readonly("reward", &TrajectoryData::reward)
         .def_readonly("opp_target_action", &TrajectoryData::opp_target_action)
-        .def_readonly("win", &TrajectoryData::win);
+        .def_readonly("win", &TrajectoryData::win)
+        .def_readonly("valid_len", &TrajectoryData::valid_len)
+        .def_readonly("obs_sequence", &TrajectoryData::obs_sequence)
+        .def_readonly("action_sequence", &TrajectoryData::action_sequence)
+        .def_readonly("agent_type_sequence", &TrajectoryData::agent_type_sequence)
+        .def_readonly("position_sequence", &TrajectoryData::position_sequence)
+        .def_readonly("action_mask_sequence", &TrajectoryData::action_mask_sequence);
 
     py::class_<RolloutManager>(m, "RolloutManager")
         .def(py::init<>())
@@ -81,5 +87,7 @@ void bind_rollout_manager(py::module_& m) {
         .def("set_max_sequence_length", &RolloutManager::set_max_sequence_length,
              py::arg("max_seq_length"))
         .def("set_policy_max_sequence_length", &RolloutManager::set_policy_max_sequence_length,
-             py::arg("policy_id"), py::arg("max_seq_length"));
+             py::arg("policy_id"), py::arg("max_seq_length"))
+        .def("set_inference_batch_size", &RolloutManager::set_inference_batch_size,
+             py::arg("batch_size"));
 }

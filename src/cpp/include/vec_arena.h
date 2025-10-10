@@ -64,11 +64,12 @@ struct VecArena {
 	// Observation dimensionality for newerest
 	int obs_dim() const { return 2 + (n_players - 1) + n_players; }
 
+        int max_sequence_length_for_policy(int policy_id) const;
+        void prepare_ai_sequence(const Env& e, int ai_seat, int seq_cap, PolicyRequest& out) const;
+
 private:
 	// Helpers
         static uint8_t first_valid(const uint8_t mask[7]);
         static void fill_mask_for_current(const Env& e, uint8_t m[7]);
-        void prepare_ai_sequence(const Env& e, int ai_seat, int seq_cap, PolicyRequest& out) const;
         void advance_env_until_policy_or_done(int env_index, std::unordered_map<int, std::vector<PolicyRequest>>& out);
-        int max_sequence_length_for_policy(int policy_id) const;
 };
