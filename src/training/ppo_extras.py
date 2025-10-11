@@ -144,33 +144,6 @@ def _single_pass_ppo(
 
     dist = torch.distributions.Categorical(logits=logits_at)
     actions_for_log_prob = actions.masked_fill(~our_mask, 0)
-    # --- START AGGRESSIVE DEBUGGING BLOCK ---
-    # Check for out-of-bounds actions just before the log_prob call
-    # We only care about values where the mask is True
-    valid_actions = actions_for_log_prob[our_mask]
-    if valid_actions.numel() > 0:
-        min_action, max_action = valid_actions.min().item(), valid_actions.max().item()
-        
-        # The action dimension 'A' is 7. Valid indices are 0 through 6.
-        if min_action < 0 or max_action >= A:
-            print("--- FATAL: INVALID ACTION DETECTED ---")
-            print(f"Action dim (A): {A}")
-            print(f"Detected action bounds on this GPU: min={min_action}, max={max_action}")
-            
-            # Find the exact location of the bad action
-            bad_indices_mask = (actions_for_log_prob >= A) | (actions_for_log_prob < 0)
-            bad_indices_mask = bad_indices_mask & our_mask # Only look at unmasked values
-            bad_locations = bad_indices_mask.nonzero()
-            
-            print("Locations (batch_idx, agent_step_idx):")
-            for loc in bad_locations:
-                b, t = loc.tolist()
-                action_val = actions[b, t].item()
-                print(f"  Batch item {b}, agent step {t} -> Action: {action_val}")
-
-            # Raise a clean Python exception with this information
-            raise IndexError(f"Invalid action index detected before log_prob: max={max_action}, min={min_action}. Action dim is {A}.")
-    # --- END AGGRESSIVE DEBUGGING BLOCK ---
 
     new_logp = dist.log_prob(actions_for_log_prob).to(torch.float32)
     entropy = dist.entropy().to(torch.float32)

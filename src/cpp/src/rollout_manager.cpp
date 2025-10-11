@@ -105,7 +105,9 @@ private:
 
 // --- RolloutManager Implementation ---
 
-RolloutManager::RolloutManager() : rng_(seed_with_optional(0)) {
+RolloutManager::RolloutManager()
+    : rng_(seed_with_optional(0)),
+      policy_weights_stacked_cache_(c10::StringType::get(), c10::TensorType::get()) {
     if (!torch::cuda::is_available()) {
         throw std::runtime_error("CUDA is not available.");
     }
@@ -236,8 +238,31 @@ bool RolloutManager::run_rollouts_step() {
         std::vector<int> policy_chunk(all_policy_ids.begin() + static_cast<std::ptrdiff_t>(offset),
                                       all_policy_ids.begin() + static_cast<std::ptrdiff_t>(end));
 
-        auto batch = prepare_inference_batch(request_chunk, kInferenceDevice);
-        auto weights = pack_weights_for_batch(policy_chunk);
+        constexpr std::array<int64_t, 7> kBucketBounds{{32, 64, 96, 128, 192, 256, 480}};
+        const int64_t max_policy_len = std::max<int64_t>(
+            1, static_cast<int64_t>(default_max_sequence_length_));
+
+        int64_t max_len_in_batch = 0;
+        for (const auto& req : request_chunk) {
+            max_len_in_batch = std::max<int64_t>(max_len_in_batch, req.valid_len);
+        }
+        max_len_in_batch = std::max<int64_t>(1, max_len_in_batch);
+
+        int64_t target_pad_len = max_policy_len;
+        for (const auto& bound : kBucketBounds) {
+            if (max_len_in_batch <= bound) {
+                target_pad_len = bound;
+                break;
+            }
+        }
+        target_pad_len = std::min(target_pad_len, max_policy_len);
+
+        std::vector<size_t> indices(request_chunk.size());
+        std::iota(indices.begin(), indices.end(), size_t{0});
+        auto batch = prepare_inference_batch(
+            request_chunk, target_pad_len, kInferenceDevice, indices);
+        // Use unified GPU cache for fast weight access
+        auto weights = get_packed_weights_from_cache(policy_chunk);
         
         const auto target_dtype = torch::kBFloat16;
         batch.obs_sequence = batch.obs_sequence.to(target_dtype);
@@ -616,6 +641,9 @@ void RolloutManager::load_policy_weights(int policy_id, const std::string& path)
         }
 
         policy_weights_.insert_or_assign(policy_id, c10::Dict<c10::IValue, c10::IValue>(out));
+
+        // Roster changed; rebuild the unified GPU cache.
+        rebuild_policy_cache();
     } catch (const c10::Error& err) {
         std::cerr << "[RolloutManager] Failed to load state_dict from '" << path
                   << "': " << err.what_without_backtrace() << std::endl;
@@ -628,7 +656,31 @@ void RolloutManager::load_policy_weights(int policy_id, const std::string& path)
 }
 
 void RolloutManager::update_learner_weights(int policy_id, c10::Dict<c10::IValue, c10::IValue> state_dict) {
-    policy_weights_.insert_or_assign(policy_id, std::move(state_dict));
+    // 1) Update master CPU copy
+    policy_weights_.insert_or_assign(policy_id, state_dict);
+
+    // 2) Try to update the corresponding slice in the GPU cache
+    auto it = policy_id_to_cache_idx_.find(policy_id);
+    if (it == policy_id_to_cache_idx_.end()) {
+        // New learner unseen in cache: rebuild cache fully.
+        rebuild_policy_cache();
+        return;
+    }
+    const int cache_idx = it->second;
+    const auto target_dtype = torch::kBFloat16;
+
+    for (const auto& kv : state_dict) {
+        const c10::IValue& key = kv.key();
+        torch::Tensor learner_tensor = kv.value().toTensor();
+        if (learner_tensor.is_floating_point()) {
+            learner_tensor = learner_tensor.to(target_dtype);
+        }
+        learner_tensor = learner_tensor.to(kInferenceDevice, /*non_blocking=*/true, /*copy=*/false);
+
+        // Fetch stacked cache tensor and update slice in-place
+        torch::Tensor stacked_tensor = policy_weights_stacked_cache_.at(key).toTensor();
+        stacked_tensor[cache_idx].copy_(learner_tensor, /*non_blocking=*/true);
+    }
 }
 
 void RolloutManager::register_cpp_bot(int policy_id, const std::string& bot_name) {
@@ -709,6 +761,59 @@ c10::Dict<c10::IValue, c10::IValue> RolloutManager::pack_weights_for_batch(
         }
         stacked = stacked.to(kInferenceDevice, false, true);
         packed.insert(c10::IValue(key), c10::IValue(stacked));
+    }
+    return packed;
+}
+
+// --- Unified GPU weights cache ---
+void RolloutManager::rebuild_policy_cache() {
+    // Reset cache state
+    policy_weights_stacked_cache_ = c10::Dict<c10::IValue, c10::IValue>(c10::StringType::get(), c10::TensorType::get());
+    policy_id_to_cache_idx_.clear();
+    cached_policy_ids_.clear();
+
+    // Collect and sort policy IDs to form a canonical order
+    cached_policy_ids_.reserve(policy_weights_.size());
+    for (const auto& kv : policy_weights_) {
+        cached_policy_ids_.push_back(kv.first);
+    }
+    if (cached_policy_ids_.empty()) {
+        return;
+    }
+    std::sort(cached_policy_ids_.begin(), cached_policy_ids_.end());
+
+    // Map policy_id -> index in stacked tensors
+    for (size_t i = 0; i < cached_policy_ids_.size(); ++i) {
+        policy_id_to_cache_idx_[cached_policy_ids_[i]] = static_cast<int>(i);
+    }
+
+    // Build the stacked GPU cache using the existing packing logic
+    policy_weights_stacked_cache_ = pack_weights_for_batch(cached_policy_ids_);
+}
+
+c10::Dict<c10::IValue, c10::IValue> RolloutManager::get_packed_weights_from_cache(
+    const std::vector<int>& policy_ids) const {
+    c10::Dict<c10::IValue, c10::IValue> packed(c10::StringType::get(), c10::TensorType::get());
+    if (policy_ids.empty()) return packed;
+
+    // Build index tensor mapping requested policies -> cache rows
+    std::vector<int64_t> indices;
+    indices.reserve(policy_ids.size());
+    for (int pid : policy_ids) {
+        auto it = policy_id_to_cache_idx_.find(pid);
+        if (it == policy_id_to_cache_idx_.end()) {
+            throw std::runtime_error("Policy ID not found in cache: " + std::to_string(pid));
+        }
+        indices.push_back(static_cast<int64_t>(it->second));
+    }
+    auto index_tensor = torch::tensor(indices, torch::TensorOptions().dtype(torch::kLong).device(kInferenceDevice));
+
+    // Slice each cached parameter tensor
+    for (const auto& kv : policy_weights_stacked_cache_) {
+        const c10::IValue& key = kv.key();
+        const torch::Tensor& cached_stack = kv.value().toTensor();
+        auto slices = cached_stack.index_select(0, index_tensor);
+        packed.insert(key, slices);
     }
     return packed;
 }

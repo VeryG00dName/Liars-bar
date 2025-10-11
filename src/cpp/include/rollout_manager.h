@@ -165,4 +165,16 @@ private:
                                  const std::vector<float>& values);
     
     c10::Dict<c10::IValue, c10::IValue> pack_weights_for_batch(const std::vector<int>& policy_ids) const;
+
+    // --- Unified GPU cache for policy weights ---
+    // Stacked, GPU-ready tensors for all currently loaded policies.
+    c10::Dict<c10::IValue, c10::IValue> policy_weights_stacked_cache_;
+    // Mapping from policy_id -> index in the stacked cache tensors
+    std::unordered_map<int, int> policy_id_to_cache_idx_{};
+    // The ordered list of policy IDs used to build the cache
+    std::vector<int> cached_policy_ids_{};
+
+    void rebuild_policy_cache();
+    c10::Dict<c10::IValue, c10::IValue> get_packed_weights_from_cache(
+        const std::vector<int>& policy_ids) const;
 };

@@ -25,6 +25,37 @@ def _batched_embedding(weight: torch.Tensor, indices: torch.Tensor) -> torch.Ten
     return torch.gather(weight, 1, expanded_indices)
 
 
+def _combine_heads_vectorized(
+    prefix: str,
+    transformer_output: torch.Tensor,
+    final_topk_indices: Optional[torch.Tensor],
+    final_topk_scores: Optional[torch.Tensor],
+    weights: Dict[str, torch.Tensor],
+    num_experts: int,
+) -> torch.Tensor:
+    # Stack expert head weights
+    head_w_list = [weights[f"{prefix}.{i}.weight"].unsqueeze(1) for i in range(num_experts)]  # [B,1,D_out,D_in]
+    head_b_list = [weights[f"{prefix}.{i}.bias"].unsqueeze(1) for i in range(num_experts)]    # [B,1,D_out]
+    all_head_w = torch.cat(head_w_list, dim=1)  # [B,E,D_out,D_in]
+    all_head_b = torch.cat(head_b_list, dim=1)  # [B,E,D_out]
+
+    B_h, E_h, D_out, D_in_h = all_head_w.shape
+    T_h = transformer_output.size(1)
+
+    x_BE = transformer_output.unsqueeze(2).expand(B_h, T_h, E_h, D_in_h).reshape(B_h * E_h, T_h, D_in_h)
+    W_BE = all_head_w.reshape(B_h * E_h, D_out, D_in_h)
+    b_BE = all_head_b.reshape(B_h * E_h, D_out)
+    out_BE = torch.bmm(x_BE, W_BE.transpose(1, 2)) + b_BE.unsqueeze(1)  # [BE,T,D_out]
+    head_out = out_BE.view(B_h, T_h, E_h, D_out)
+
+    if final_topk_indices is None or final_topk_scores is None:
+        return head_out.mean(dim=2)
+
+    gather_idx = final_topk_indices.unsqueeze(-1).expand(-1, -1, -1, D_out)
+    top_outputs = torch.gather(head_out, 2, gather_idx)
+    return (top_outputs * final_topk_scores.unsqueeze(-1)).sum(dim=2)
+
+
 class PPOReactiveModelScript(PPOReactiveModelBase):
     """
     Inference variant that reuses the shared PPO reactive model base.
@@ -199,14 +230,46 @@ class PPOReactiveModelScript(PPOReactiveModelBase):
             denom = topk_scores.sum(dim=-1, keepdim=True).clamp_min(1e-6)
             topk_weights = topk_scores / denom
 
-            expert_outputs = torch.jit.annotate(List[torch.Tensor], [])
-            for expert_idx in range(num_experts):
-                hidden = _batched_linear(x, weights[f"transformer.layers.{layer_idx}.moe.experts.{expert_idx}.0.weight"], weights[f"transformer.layers.{layer_idx}.moe.experts.{expert_idx}.0.bias"])
-                hidden = F.gelu(hidden)
-                expert_out = _batched_linear(hidden, weights[f"transformer.layers.{layer_idx}.moe.experts.{expert_idx}.3.weight"], weights[f"transformer.layers.{layer_idx}.moe.experts.{expert_idx}.3.bias"])
-                expert_outputs.append(expert_out)
+            # Vectorized experts: stack weights across experts and compute in one pass
+            w1_list = [
+                weights[f"transformer.layers.{layer_idx}.moe.experts.{i}.0.weight"].unsqueeze(1)
+                for i in range(num_experts)
+            ]  # each [B,1,D_ffn,D_in]
+            b1_list = [
+                weights[f"transformer.layers.{layer_idx}.moe.experts.{i}.0.bias"].unsqueeze(1)
+                for i in range(num_experts)
+            ]  # each [B,1,D_ffn]
+            w2_list = [
+                weights[f"transformer.layers.{layer_idx}.moe.experts.{i}.3.weight"].unsqueeze(1)
+                for i in range(num_experts)
+            ]  # each [B,1,D_in,D_ffn]
+            b2_list = [
+                weights[f"transformer.layers.{layer_idx}.moe.experts.{i}.3.bias"].unsqueeze(1)
+                for i in range(num_experts)
+            ]  # each [B,1,D_in]
 
-            experts_stacked = torch.stack(expert_outputs, dim=2)
+            all_w1 = torch.cat(w1_list, dim=1)  # [B,E,D_ffn,D_in]
+            all_b1 = torch.cat(b1_list, dim=1)  # [B,E,D_ffn]
+            all_w2 = torch.cat(w2_list, dim=1)  # [B,E,D_in,D_ffn]
+            all_b2 = torch.cat(b2_list, dim=1)  # [B,E,D_in]
+
+            B = x.size(0)
+            T_local = x.size(1)
+            E = num_experts
+            D_in = x.size(2)
+            D_ffn = all_w1.size(2)
+
+            # Flatten (B,E) and use bmm for efficient batched matmul
+            x_BE = x.unsqueeze(2).expand(B, T_local, E, D_in).reshape(B * E, T_local, D_in)
+            w1_BE = all_w1.reshape(B * E, D_ffn, D_in)
+            b1_BE = all_b1.reshape(B * E, D_ffn)
+            hidden_BE = torch.bmm(x_BE, w1_BE.transpose(1, 2)) + b1_BE.unsqueeze(1)  # [BE,T,D_ffn]
+            hidden_BE = F.gelu(hidden_BE)
+
+            w2_BE = all_w2.reshape(B * E, D_in, D_ffn)
+            b2_BE = all_b2.reshape(B * E, D_in)
+            out_BE = torch.bmm(hidden_BE, w2_BE.transpose(1, 2)) + b2_BE.unsqueeze(1)  # [BE,T,D_in]
+            experts_stacked = out_BE.view(B, T_local, E, D_in)  # [B,T,E,D_in]
             gather_index = topk_indices.unsqueeze(-1).expand(-1, -1, -1, hidden_dim)
             topk_selected = torch.gather(experts_stacked, 2, gather_index)
             moe_output = (topk_selected * topk_weights.unsqueeze(-1)).sum(dim=2)
@@ -223,62 +286,19 @@ class PPOReactiveModelScript(PPOReactiveModelBase):
             weights["transformer.norm.bias"],
         )
 
-        # --- Output Heads (inlined) ---
-        # Action Heads
-        action_head_outputs = torch.jit.annotate(List[torch.Tensor], [])
-        for expert_idx in range(num_experts):
-            action_head_outputs.append(
-                _batched_linear(transformer_output, weights[f"action_heads.{expert_idx}.weight"], weights[f"action_heads.{expert_idx}.bias"])
-            )
-        action_heads_stacked = torch.stack(action_head_outputs, dim=2)
-        if final_topk_indices is None or final_topk_scores is None:
-            action_logits = action_heads_stacked.mean(dim=2)
-        else:
-            gather_index_act = final_topk_indices.unsqueeze(-1).expand(-1, -1, -1, action_heads_stacked.size(-1))
-            top_outputs_act = torch.gather(action_heads_stacked, 2, gather_index_act)
-            action_logits = (top_outputs_act * final_topk_scores.unsqueeze(-1)).sum(dim=2)
-
-        # Opponent Action Heads
-        opp_head_outputs = torch.jit.annotate(List[torch.Tensor], [])
-        for expert_idx in range(num_experts):
-            opp_head_outputs.append(
-                _batched_linear(transformer_output, weights[f"opp_action_heads.{expert_idx}.weight"], weights[f"opp_action_heads.{expert_idx}.bias"])
-            )
-        opp_heads_stacked = torch.stack(opp_head_outputs, dim=2)
-        if final_topk_indices is None or final_topk_scores is None:
-            opp_logits = opp_heads_stacked.mean(dim=2)
-        else:
-            gather_index_opp = final_topk_indices.unsqueeze(-1).expand(-1, -1, -1, opp_heads_stacked.size(-1))
-            top_outputs_opp = torch.gather(opp_heads_stacked, 2, gather_index_opp)
-            opp_logits = (top_outputs_opp * final_topk_scores.unsqueeze(-1)).sum(dim=2)
-
-        # Value Heads
-        value_head_outputs = torch.jit.annotate(List[torch.Tensor], [])
-        for expert_idx in range(num_experts):
-            value_head_outputs.append(
-                _batched_linear(transformer_output, weights[f"reward_stream_heads.{expert_idx}.weight"], weights[f"reward_stream_heads.{expert_idx}.bias"])
-            )
-        value_heads_stacked = torch.stack(value_head_outputs, dim=2)
-        if final_topk_indices is None or final_topk_scores is None:
-            state_values = value_heads_stacked.mean(dim=2)
-        else:
-            gather_index_val = final_topk_indices.unsqueeze(-1).expand(-1, -1, -1, value_heads_stacked.size(-1))
-            top_outputs_val = torch.gather(value_heads_stacked, 2, gather_index_val)
-            state_values = (top_outputs_val * final_topk_scores.unsqueeze(-1)).sum(dim=2)
-
-        # Win Prob Heads
-        win_head_outputs = torch.jit.annotate(List[torch.Tensor], [])
-        for expert_idx in range(num_experts):
-            win_head_outputs.append(
-                _batched_linear(transformer_output, weights[f"win_prob_heads.{expert_idx}.weight"], weights[f"win_prob_heads.{expert_idx}.bias"])
-            )
-        win_heads_stacked = torch.stack(win_head_outputs, dim=2)
-        if final_topk_indices is None or final_topk_scores is None:
-            win_logits = win_heads_stacked.mean(dim=2)
-        else:
-            gather_index_win = final_topk_indices.unsqueeze(-1).expand(-1, -1, -1, win_heads_stacked.size(-1))
-            top_outputs_win = torch.gather(win_heads_stacked, 2, gather_index_win)
-            win_logits = (top_outputs_win * final_topk_scores.unsqueeze(-1)).sum(dim=2)
+        # --- Output Heads (vectorized) ---
+        action_logits = _combine_heads_vectorized(
+            "action_heads", transformer_output, final_topk_indices, final_topk_scores, weights, num_experts
+        )
+        opp_logits = _combine_heads_vectorized(
+            "opp_action_heads", transformer_output, final_topk_indices, final_topk_scores, weights, num_experts
+        )
+        state_values = _combine_heads_vectorized(
+            "reward_stream_heads", transformer_output, final_topk_indices, final_topk_scores, weights, num_experts
+        )
+        win_logits = _combine_heads_vectorized(
+            "win_prob_heads", transformer_output, final_topk_indices, final_topk_scores, weights, num_experts
+        )
 
         return (
             action_logits,
