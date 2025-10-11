@@ -110,33 +110,37 @@ def _single_pass_ppo(
     old_values_full = batch["old_values_full"].to(device=device, dtype=torch.float32)
     
     # --- Universal GAE Calculation ---
-    next_values_full = torch.zeros_like(values_full)
-    next_valid_mask = torch.zeros_like(valid_mask)
-    if L > 1:
-        next_values_full[:, :-1] = values_full[:, 1:]
-        next_valid_mask[:, :-1] = valid_mask[:, 1:]
+    with torch.no_grad(): # GAE calculation should not contribute to the gradient
+        next_values_full = torch.zeros_like(old_values_full)
+        next_valid_mask = torch.zeros_like(valid_mask)
+        if L > 1:
+            # Use the OLD values from the rollout for the next state value
+            next_values_full[:, :-1] = old_values_full[:, 1:]
+            next_valid_mask[:, :-1] = valid_mask[:, 1:]
 
-    delta_full = rewards_full + GAMMA * next_values_full * next_valid_mask.to(torch.float32) - values_full
-    delta_full = delta_full * valid_mask.to(delta_full.dtype)
+        # Calculate the TD error (delta) using the OLD values from the rollout
+        delta_full = rewards_full + GAMMA * next_values_full * next_valid_mask.to(torch.float32) - old_values_full
+        delta_full = delta_full * valid_mask.to(delta_full.dtype)
 
-    advantages_full = torch.zeros_like(values_full)
-    lastgaelam = torch.zeros((B,), device=device, dtype=torch.float32)
-    gamma_lam = GAMMA * GAE_LAMBDA
-    for t in range(L - 1, -1, -1):
-        mask_t = valid_mask[:, t]
-        cont_mask = next_valid_mask[:, t].to(torch.float32)
-        lastgaelam = delta_full[:, t] + gamma_lam * lastgaelam * cont_mask
-        lastgaelam = torch.where(mask_t, lastgaelam, torch.zeros_like(lastgaelam))
-        advantages_full[:, t] = lastgaelam
+        advantages_full = torch.zeros_like(old_values_full)
+        lastgaelam = torch.zeros((B,), device=device, dtype=torch.float32)
+        gamma_lam = GAMMA * GAE_LAMBDA
+        for t in range(L - 1, -1, -1):
+            mask_t = valid_mask[:, t]
+            cont_mask = next_valid_mask[:, t].to(torch.float32)
+            lastgaelam = delta_full[:, t] + gamma_lam * lastgaelam * cont_mask
+            lastgaelam = torch.where(mask_t, lastgaelam, torch.zeros_like(lastgaelam))
+            advantages_full[:, t] = lastgaelam
 
-    returns_full = advantages_full + values_full
+        # The returns for the value function are the advantages plus the OLD values
+        returns_full = advantages_full + old_values_full
 
     # --- Policy Loss Calculation (on our steps only) ---
     # NEW: Sanitize our_idx to prevent out-of-bounds access in take_along_dim
-    our_idx = our_idx.masked_fill(~our_mask, 0)
+    idx_clamped = our_idx.clamp(0, max(L - 1, 0))
     
-    logits_at = torch.take_along_dim(action_logits, our_idx.unsqueeze(-1).expand(-1, -1, A), dim=1)
-    advantages_at = torch.take_along_dim(advantages_full, our_idx, dim=1)
+    logits_at = torch.take_along_dim(action_logits, idx_clamped.unsqueeze(-1).expand(-1, -1, A), dim=1)
+    advantages_at = torch.take_along_dim(advantages_full, idx_clamped, dim=1)
 
     adv_norm = _normalize_advantages(advantages_at, step_mask)
 
