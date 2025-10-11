@@ -84,7 +84,6 @@ def _single_pass_ppo(
     old_logp: torch.Tensor,
     step_mask: torch.Tensor,
     episode_mask: torch.Tensor,
-    update_num: int = 0
 ) -> Tuple[
     torch.Tensor,
     Dict[str, torch.Tensor],
@@ -145,37 +144,6 @@ def _single_pass_ppo(
     actions_for_log_prob = actions.masked_fill(~our_mask, 0)
 
     new_logp = dist.log_prob(actions_for_log_prob).to(torch.float32)
-    
-     # ==========================================================
-    # ### START OF DIAGNOSTIC BLOCK ###
-    # ==========================================================
-    # This will run on the first K-epoch of every PPO update.
-    if update_num == 0: 
-        with torch.no_grad():
-            logp_diff = torch.abs(old_logp - new_logp)
-            valid_diff = logp_diff[step_mask] # Only compare valid steps
-
-            if valid_diff.numel() > 0:
-                avg_abs_diff = valid_diff.mean().item()
-                max_abs_diff = valid_diff.max().item()
-                
-                tolerance = 1e-3
-                mismatch_pct = (valid_diff > tolerance).float().mean().item() * 100
-
-                # Use logging to make the output clear
-                print("\n" + "="*50 +
-                             "\n--- MODEL CONSISTENCY DIAGNOSTIC (Epoch 0) ---" +
-                             f"\n    - Avg Absolute Difference in log_prob: {avg_abs_diff:.6f}" +
-                             f"\n    - Max Absolute Difference in log_prob: {max_abs_diff:.6f}" +
-                             f"\n    - Mismatch Percentage (> {tolerance} diff): {mismatch_pct:.2f}%")
-                if mismatch_pct > 5.0:
-                    print("    - VERDICT: Significant mismatch detected. Rollout and training models are inconsistent.")
-                else:
-                    print("    - VERDICT: Models appear consistent.")
-                print("="*50 + "\n")
-    # ========================================================
-    # ### END OF DIAGNOSTIC BLOCK ###
-    # ========================================================
     
     entropy = dist.entropy().to(torch.float32)
 
@@ -288,10 +256,7 @@ def _single_pass_ppo(
 
 def ppo_losses_batched(
     model: torch.nn.Module,
-    batch: Dict[str, torch.Tensor],
-    sl_teacher: Optional[torch.nn.Module] = None,
-    *,
-    update_num: int = 0,
+    batch: Dict[str, torch.Tensor]
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
     """
     Batched PPO objective. This version is simplified and does not contain
@@ -314,8 +279,7 @@ def ppo_losses_batched(
         actions=actions,
         old_logp=old_logp,
         step_mask=our_mask,
-        episode_mask=episode_mask,
-        update_num=update_num
+        episode_mask=episode_mask
     )
 
     metrics["total_loss"] = total_loss.detach()

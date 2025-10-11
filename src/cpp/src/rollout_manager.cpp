@@ -539,9 +539,6 @@ std::vector<TrajectoryData> RolloutManager::get_completed_episodes() {
     std::vector<TrajectoryData> out;
     if (!completed_buffer_.empty()) {
         out.swap(completed_buffer_);
-        if (target_episodes_ > 0 && out.size() > static_cast<size_t>(target_episodes_)) {
-            out.resize(static_cast<size_t>(target_episodes_));
-        }
     }
     return out;
 }

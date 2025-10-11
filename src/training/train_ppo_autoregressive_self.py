@@ -774,7 +774,7 @@ def train_generation(
         n_batches = 0
         opt_tokens_processed = 0
         
-        for test in range(k_epochs):
+        for _ in range(k_epochs):
             if not ep_buffer:
                 continue
 
@@ -868,8 +868,7 @@ def train_generation(
                 with amp.autocast(device_type=device.type, dtype=autocast_dtype, enabled=True):
                     total_loss, metrics, moe_info = ppo_losses_batched(
                         learner.train_model,
-                        mini_gpu,
-                        update_num=test,
+                        mini_gpu
                     )
 
                 loss_denom = max(group_target, 1)

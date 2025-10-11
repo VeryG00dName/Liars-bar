@@ -24,36 +24,19 @@ def _batched_embedding(weight: torch.Tensor, indices: torch.Tensor) -> torch.Ten
     expanded_indices = indices.unsqueeze(-1).expand(-1, -1, weight.size(-1))
     return torch.gather(weight, 1, expanded_indices)
 
-
-def _combine_heads_vectorized(
-    prefix: str,
-    transformer_output: torch.Tensor,
-    final_topk_indices: Optional[torch.Tensor],
-    final_topk_scores: Optional[torch.Tensor],
-    weights: Dict[str, torch.Tensor],
-    num_experts: int,
-) -> torch.Tensor:
-    # Stack expert head weights
-    head_w_list = [weights[f"{prefix}.{i}.weight"].unsqueeze(1) for i in range(num_experts)]  # [B,1,D_out,D_in]
-    head_b_list = [weights[f"{prefix}.{i}.bias"].unsqueeze(1) for i in range(num_experts)]    # [B,1,D_out]
-    all_head_w = torch.cat(head_w_list, dim=1)  # [B,E,D_out,D_in]
-    all_head_b = torch.cat(head_b_list, dim=1)  # [B,E,D_out]
-
-    B_h, E_h, D_out, D_in_h = all_head_w.shape
-    T_h = transformer_output.size(1)
-
-    x_BE = transformer_output.unsqueeze(2).expand(B_h, T_h, E_h, D_in_h).reshape(B_h * E_h, T_h, D_in_h)
-    W_BE = all_head_w.reshape(B_h * E_h, D_out, D_in_h)
-    b_BE = all_head_b.reshape(B_h * E_h, D_out)
-    out_BE = torch.bmm(x_BE, W_BE.transpose(1, 2)) + b_BE.unsqueeze(1)  # [BE,T,D_out]
-    head_out = out_BE.view(B_h, T_h, E_h, D_out)
-
-    if final_topk_indices is None or final_topk_scores is None:
-        return head_out.mean(dim=2)
-
-    gather_idx = final_topk_indices.unsqueeze(-1).expand(-1, -1, -1, D_out)
-    top_outputs = torch.gather(head_out, 2, gather_idx)
-    return (top_outputs * final_topk_scores.unsqueeze(-1)).sum(dim=2)
+def _reduce_heads(
+            stacked: torch.Tensor,
+            final_indices: Optional[torch.Tensor],
+            final_scores: Optional[torch.Tensor],
+        ) -> torch.Tensor:
+            if final_indices is None or final_scores is None:
+                return stacked.mean(dim=2)
+            
+            bsz, tsz, ksz = final_indices.shape
+            out_dim = stacked.size(-1)
+            gather_idx = final_indices.unsqueeze(-1).expand(bsz, tsz, ksz, out_dim)
+            top_outputs = torch.gather(stacked, 2, gather_idx)
+            return (top_outputs * final_scores.unsqueeze(-1)).sum(dim=2)
 
 
 class PPOReactiveModelScript(PPOReactiveModelBase):
@@ -134,6 +117,7 @@ class PPOReactiveModelScript(PPOReactiveModelBase):
             count_ids = torch.where(padding_bool, count_pad, count_ids)
             table_flag_ids = torch.where(padding_bool, tflag_pad, table_flag_ids)
 
+        # --- Encoders / Embeddings ---
         obs_encoded = _batched_linear(
             obs_sequence,
             weights["obs_encoder.0.weight"],
@@ -154,34 +138,42 @@ class PPOReactiveModelScript(PPOReactiveModelBase):
         agent_embed = _batched_embedding(weights["agent_embedding.weight"], agent_types.long())
         position_embed = _batched_embedding(weights["position_embedding.weight"], positions.long())
 
+        # === START OF FIX ===
+        # Process non-observation embeddings before gating & fusion
+        act_embed_processed = F.gelu(act_embed)
+        agent_embed_processed = F.gelu(agent_embed)
+        position_embed_processed = F.gelu(position_embed)
+
         # --- Gating (inlined) ---
         hidden_g_obs = _batched_linear(obs_encoded, weights["gate_obs.0.weight"], weights["gate_obs.0.bias"])
         hidden_g_obs = torch.tanh(hidden_g_obs)
         g_obs = _batched_linear(hidden_g_obs, weights["gate_obs.2.weight"], weights["gate_obs.2.bias"])
         g_obs = torch.sigmoid(g_obs)
 
-        hidden_g_action = _batched_linear(act_embed, weights["gate_action.0.weight"], weights["gate_action.0.bias"])
+        hidden_g_action = _batched_linear(act_embed_processed, weights["gate_action.0.weight"], weights["gate_action.0.bias"])
         hidden_g_action = torch.tanh(hidden_g_action)
         g_action = _batched_linear(hidden_g_action, weights["gate_action.2.weight"], weights["gate_action.2.bias"])
         g_action = torch.sigmoid(g_action)
 
-        hidden_g_agent = _batched_linear(agent_embed, weights["gate_agent.0.weight"], weights["gate_agent.0.bias"])
+        hidden_g_agent = _batched_linear(agent_embed_processed, weights["gate_agent.0.weight"], weights["gate_agent.0.bias"])
         hidden_g_agent = torch.tanh(hidden_g_agent)
         g_agent = _batched_linear(hidden_g_agent, weights["gate_agent.2.weight"], weights["gate_agent.2.bias"])
         g_agent = torch.sigmoid(g_agent)
 
-        hidden_g_position = _batched_linear(position_embed, weights["gate_position.0.weight"], weights["gate_position.0.bias"])
+        hidden_g_position = _batched_linear(position_embed_processed, weights["gate_position.0.weight"], weights["gate_position.0.bias"])
         hidden_g_position = torch.tanh(hidden_g_position)
         g_position = _batched_linear(hidden_g_position, weights["gate_position.2.weight"], weights["gate_position.2.bias"])
         g_position = torch.sigmoid(g_position)
 
+        # Use processed embeddings in the fusion, too
         fused = (
             g_obs * obs_encoded
-            + g_action * act_embed
-            + g_agent * agent_embed
-            + g_position * position_embed
+            + g_action * act_embed_processed
+            + g_agent * agent_embed_processed
+            + g_position * position_embed_processed
         )
         encoded_inputs = nn.functional.layer_norm(fused, (self.hidden_dim,))
+        # === END OF FIX ===
 
         T = encoded_inputs.size(1)
         causal_mask = self.causal_bool_mask_full[:T, :T].to(encoded_inputs.device)
@@ -286,19 +278,38 @@ class PPOReactiveModelScript(PPOReactiveModelBase):
             weights["transformer.norm.bias"],
         )
 
-        # --- Output Heads (vectorized) ---
-        action_logits = _combine_heads_vectorized(
-            "action_heads", transformer_output, final_topk_indices, final_topk_scores, weights, num_experts
-        )
-        opp_logits = _combine_heads_vectorized(
-            "opp_action_heads", transformer_output, final_topk_indices, final_topk_scores, weights, num_experts
-        )
-        state_values = _combine_heads_vectorized(
-            "reward_stream_heads", transformer_output, final_topk_indices, final_topk_scores, weights, num_experts
-        )
-        win_logits = _combine_heads_vectorized(
-            "win_prob_heads", transformer_output, final_topk_indices, final_topk_scores, weights, num_experts
-        )
+
+        # --- Action Heads ---
+        action_head_outputs = torch.jit.annotate(List[torch.Tensor], [])
+        for i in range(num_experts):
+            out = _batched_linear(transformer_output, weights[f"action_heads.{i}.weight"], weights[f"action_heads.{i}.bias"])
+            action_head_outputs.append(out)
+        action_heads_stacked = torch.stack(action_head_outputs, dim=2)
+        action_logits = _reduce_heads(action_heads_stacked, final_topk_indices, final_topk_scores)
+
+        # --- Opponent Action Heads ---
+        opp_head_outputs = torch.jit.annotate(List[torch.Tensor], [])
+        for i in range(num_experts):
+            out = _batched_linear(transformer_output, weights[f"opp_action_heads.{i}.weight"], weights[f"opp_action_heads.{i}.bias"])
+            opp_head_outputs.append(out)
+        opp_heads_stacked = torch.stack(opp_head_outputs, dim=2)
+        opp_logits = _reduce_heads(opp_heads_stacked, final_topk_indices, final_topk_scores)
+
+        # --- Value Heads ---
+        value_head_outputs = torch.jit.annotate(List[torch.Tensor], [])
+        for i in range(num_experts):
+            out = _batched_linear(transformer_output, weights[f"reward_stream_heads.{i}.weight"], weights[f"reward_stream_heads.{i}.bias"])
+            value_head_outputs.append(out)
+        value_heads_stacked = torch.stack(value_head_outputs, dim=2)
+        state_values = _reduce_heads(value_heads_stacked, final_topk_indices, final_topk_scores)
+
+        # --- Win Prob Heads ---
+        win_head_outputs = torch.jit.annotate(List[torch.Tensor], [])
+        for i in range(num_experts):
+            out = _batched_linear(transformer_output, weights[f"win_prob_heads.{i}.weight"], weights[f"win_prob_heads.{i}.bias"])
+            win_head_outputs.append(out)
+        win_heads_stacked = torch.stack(win_head_outputs, dim=2)
+        win_logits = _reduce_heads(win_heads_stacked, final_topk_indices, final_topk_scores)
 
         return (
             action_logits,
