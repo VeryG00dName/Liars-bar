@@ -142,42 +142,34 @@ class PPOReactiveModelScript(PPOReactiveModelBase):
         agent_embed = _batched_embedding(weights["agent_embedding.weight"], agent_types.long())
         position_embed = _batched_embedding(weights["position_embedding.weight"], positions.long())
 
-        # === START OF FIX ===
-        # Process non-observation embeddings before gating & fusion
-        act_embed_processed = F.gelu(act_embed)
-        agent_embed_processed = F.gelu(agent_embed)
-        position_embed_processed = F.gelu(position_embed)
-
         # --- Gating (inlined) ---
         hidden_g_obs = _batched_linear(obs_encoded, weights["gate_obs.0.weight"], weights["gate_obs.0.bias"])
         hidden_g_obs = torch.tanh(hidden_g_obs)
         g_obs = _batched_linear(hidden_g_obs, weights["gate_obs.2.weight"], weights["gate_obs.2.bias"])
         g_obs = torch.sigmoid(g_obs)
 
-        hidden_g_action = _batched_linear(act_embed_processed, weights["gate_action.0.weight"], weights["gate_action.0.bias"])
+        hidden_g_action = _batched_linear(act_embed, weights["gate_action.0.weight"], weights["gate_action.0.bias"])
         hidden_g_action = torch.tanh(hidden_g_action)
         g_action = _batched_linear(hidden_g_action, weights["gate_action.2.weight"], weights["gate_action.2.bias"])
         g_action = torch.sigmoid(g_action)
 
-        hidden_g_agent = _batched_linear(agent_embed_processed, weights["gate_agent.0.weight"], weights["gate_agent.0.bias"])
+        hidden_g_agent = _batched_linear(agent_embed, weights["gate_agent.0.weight"], weights["gate_agent.0.bias"])
         hidden_g_agent = torch.tanh(hidden_g_agent)
         g_agent = _batched_linear(hidden_g_agent, weights["gate_agent.2.weight"], weights["gate_agent.2.bias"])
         g_agent = torch.sigmoid(g_agent)
 
-        hidden_g_position = _batched_linear(position_embed_processed, weights["gate_position.0.weight"], weights["gate_position.0.bias"])
+        hidden_g_position = _batched_linear(position_embed, weights["gate_position.0.weight"], weights["gate_position.0.bias"])
         hidden_g_position = torch.tanh(hidden_g_position)
         g_position = _batched_linear(hidden_g_position, weights["gate_position.2.weight"], weights["gate_position.2.bias"])
         g_position = torch.sigmoid(g_position)
 
-        # Use processed embeddings in the fusion, too
         fused = (
             g_obs * obs_encoded
-            + g_action * act_embed_processed
-            + g_agent * agent_embed_processed
-            + g_position * position_embed_processed
+            + g_action * act_embed
+            + g_agent * agent_embed
+            + g_position * position_embed
         )
         encoded_inputs = nn.functional.layer_norm(fused, (self.hidden_dim,))
-        # === END OF FIX ===
 
         T = encoded_inputs.size(1)
         causal_mask = self.causal_bool_mask_full[:T, :T].to(encoded_inputs.device)
