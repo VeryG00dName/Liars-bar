@@ -773,7 +773,7 @@ def train_generation(
         agg = {"total_loss": 0.0}
         n_batches = 0
         opt_tokens_processed = 0
-
+        test = 0
         for _ in range(k_epochs):
             if not ep_buffer:
                 continue
@@ -851,11 +851,51 @@ def train_generation(
             group_target = min(grad_accum_steps, num_minibatches)
             group_count = 0
             processed_minibatches = 0
+            from collections.abc import Mapping
+            def _first(x):
+                """Return the first sample of x, recursing for mappings."""
+                # PyTorch tensor?
+                try:
+                    import torch
+                    if isinstance(x, torch.Tensor):
+                        if x.dim() == 0:
+                            return x.item()
+                        return x[0]
+                except Exception:
+                    pass  # torch not available or some other issue
 
+                # NumPy array
+                if isinstance(x, np.ndarray):
+                    if x.ndim == 0:
+                        return x.item()
+                    return x[0]
+
+                # Mapping/dict: recurse
+                if isinstance(x, Mapping):
+                    return {k: _first(v) for k, v in x.items()}
+
+                # Sequence types
+                if isinstance(x, (list, tuple)):
+                    return x[0] if len(x) > 0 else x  # keep type for empty sequences
+
+                # Anything else (int/float/bool/None/str, etc.)
+                return x
+
+            def first_sample(batch_dict):
+                """Convenience wrapper with name that reads nicely."""
+                return {k: _first(v) for k, v in batch_dict.items()}
+            
             for bucket_len, mini_eps, bucket_minibatch_size in bucket_batches:
                 bucket_start_time = time.perf_counter()
                 assert len(mini_eps) == bucket_minibatch_size
+                if test == 0:
+                    print(mini_eps[0],"after collate")
                 mini_cpu = _collate_batch(mini_eps, L_max=bucket_len, pin_memory=True)
+                if test == 0:
+                    sample0 = first_sample(mini_cpu)
+                    import pprint
+                    pprint.pprint(sample0)
+                test = 1
                 valid_lengths_cpu = mini_cpu.get("mi", {}).get("valid_lengths")
                 if isinstance(valid_lengths_cpu, torch.Tensor):
                     opt_tokens_processed += int(valid_lengths_cpu.sum().item())

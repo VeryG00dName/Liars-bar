@@ -516,23 +516,6 @@ void RolloutManager::finalize_episode(EpisodeTracker& tracker) {
                 }
             }
            
-            // Filter sparse data into dense format for Python.
-            std::vector<int> dense_our_action;
-            std::vector<float> dense_log_prob;
-            
-            dense_our_action.reserve(st.data.our_action.size() / num_players_ + 1);
-            dense_log_prob.reserve(st.data.log_prob.size() / num_players_ + 1);
-
-            for (size_t i = 0; i < st.data.our_action.size(); ++i) {
-                if (st.data.our_action[i] != -1) {
-                    dense_our_action.push_back(st.data.our_action[i]);
-                    dense_log_prob.push_back(st.data.log_prob[i]);
-                }
-            }
-            st.data.our_action = std::move(dense_our_action);
-            st.data.log_prob = std::move(dense_log_prob);
-
-            
             // Prepare the final model input sequences for Python.
             PolicyRequest final_request;
             int seq_cap = arena_.max_sequence_length_for_policy(st.policy_id);

@@ -419,7 +419,7 @@ def _collate_batch(
         if count > 0:
             oa = ep["our_action"]
             olp = ep["log_prob"]
-
+            our_steps_for_ep = our_idx[b, :count].numpy()
             if len(oa) < count or len(olp) < count:
                 import pprint
                 pretty_printer = pprint.PrettyPrinter(indent=2, width=120)
@@ -446,8 +446,8 @@ def _collate_batch(
                 )
                 raise ValueError(error_message)
 
-            actions[b, :count] = torch.from_numpy(oa[:count])
-            old_logp[b, :count] = torch.from_numpy(olp[:count])
+            actions[b, :count] = torch.from_numpy(oa[our_steps_for_ep])
+            old_logp[b, :count] = torch.from_numpy(olp[our_steps_for_ep])
 
         # rewards (prefix up to L_pad)
         r = ep["reward"]
