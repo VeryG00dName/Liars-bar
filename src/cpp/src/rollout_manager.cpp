@@ -12,6 +12,8 @@
 #include <stdexcept>
 #include <unordered_set>
 
+#include <c10/util/Optional.h>
+
 #include <torch/torch.h>
 
 #include "bots.h"
@@ -260,9 +262,8 @@ std::unordered_map<int, std::vector<PolicyRequest>> RolloutManager::collect_requ
             continue;
         }
 
-        int best_policy = -1;
-        size_t best_count = 0;
-        const std::vector<PolicyRequest>* best_requests = nullptr;
+        std::vector<std::pair<int, const std::vector<PolicyRequest>*>> historical_groups;
+        historical_groups.reserve(policy_ids.size());
         for (int policy_id : policy_ids) {
             if (is_training_policy(policy_id)) {
                 continue;
@@ -279,52 +280,35 @@ std::unordered_map<int, std::vector<PolicyRequest>> RolloutManager::collect_requ
             }
 
             auto model_it = historical_models_.find(policy_id);
-            if (model_it == historical_models_.end() || !model_it->second) {
+            if (model_it == historical_models_.end() || !model_it->second.module) {
                 continue;
             }
 
-            const size_t request_count = requests.size();
-            if (best_policy < 0 || request_count > best_count) {
-                best_policy = policy_id;
-                best_count = request_count;
-                best_requests = &requests;
-            }
+            historical_groups.emplace_back(policy_id, &requests);
         }
 
-        if (best_policy < 0 || best_requests == nullptr) {
-            for (int policy_id : policy_ids) {
-                auto raw_it = raw.find(policy_id);
-                if (raw_it == raw.end()) {
-                    continue;
-                }
-                const auto& requests = raw_it->second;
-                if (requests.empty()) {
-                    continue;
-                }
-                auto& dst = learner_requests[policy_id];
-                dst.insert(dst.end(), requests.begin(), requests.end());
-            }
-            break;
-        }
-
-        auto model_it = historical_models_.find(best_policy);
-        if (model_it != historical_models_.end() && model_it->second) {
+        if (!historical_groups.empty()) {
             bool success = false;
             try {
-                auto actions = run_historical_inference(*model_it->second, *best_requests);
-                arena_.submit_actions(best_policy, actions);
+                auto action_map = run_batched_historical_inference(historical_groups);
+                for (auto& kv : action_map) {
+                    arena_.submit_actions(kv.first, kv.second);
+                }
                 success = true;
             } catch (const std::exception& ex) {
-                std::cerr << "[RolloutManager] Historical inference failed for policy " << best_policy
-                          << ": " << ex.what() << std::endl;
+                std::cerr << "[RolloutManager] Historical batch inference failed: " << ex.what()
+                          << std::endl;
             } catch (...) {
-                std::cerr << "[RolloutManager] Historical inference failed for policy " << best_policy
-                          << ": unknown error" << std::endl;
+                std::cerr << "[RolloutManager] Historical batch inference failed: unknown error"
+                          << std::endl;
             }
 
-            if (!success && best_requests != nullptr) {
-                auto& dst = learner_requests[best_policy];
-                dst.insert(dst.end(), best_requests->begin(), best_requests->end());
+            if (!success) {
+                for (const auto& group : historical_groups) {
+                    const auto& requests = *group.second;
+                    auto& dst = learner_requests[group.first];
+                    dst.insert(dst.end(), requests.begin(), requests.end());
+                }
                 break;
             }
 
@@ -443,7 +427,11 @@ void RolloutManager::load_historical_model(int policy_id, const std::string& pat
         auto module = std::make_shared<torch::jit::Module>(torch::jit::load(path));
         module->to(kInferenceDevice);
         module->eval();
-        historical_models_[policy_id] = std::move(module);
+        HistoricalModelEntry entry;
+        entry.module = std::move(module);
+        entry.cache_index = -1;
+        historical_models_[policy_id] = std::move(entry);
+        historical_weight_cache_dirty_ = true;
     } catch (const c10::Error& err) {
         std::cerr << "[RolloutManager] Failed to load TorchScript module from '" << path
                   << "': " << err.what_without_backtrace() << std::endl;
@@ -701,6 +689,289 @@ void RolloutManager::finalize_seat(EpisodeTracker& tracker, SeatTrajectory& seat
 
 bool RolloutManager::is_training_policy(int policy_id) const {
     return training_policy_id_set_.find(policy_id) != training_policy_id_set_.end();
+}
+
+void RolloutManager::rebuild_historical_weight_cache() {
+    if (!historical_weight_cache_dirty_) {
+        return;
+    }
+
+    historical_weight_cache_fp16_.clear();
+    historical_weight_policy_order_.clear();
+
+    if (historical_models_.empty()) {
+        historical_weight_cache_dirty_ = false;
+        return;
+    }
+
+    std::vector<std::pair<int, HistoricalModelEntry*>> entries;
+    entries.reserve(historical_models_.size());
+    for (auto& kv : historical_models_) {
+        entries.emplace_back(kv.first, &kv.second);
+    }
+    std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
+        return a.first < b.first;
+    });
+
+    torch::NoGradGuard guard;
+    std::unordered_map<std::string, std::vector<torch::Tensor>> stacked;
+    stacked.reserve(entries.size());
+
+    for (size_t idx = 0; idx < entries.size(); ++idx) {
+        auto* entry = entries[idx].second;
+        entry->cache_index = static_cast<int>(idx);
+        historical_weight_policy_order_.push_back(entries[idx].first);
+
+        auto params = entry->module->named_parameters(/*recurse=*/true);
+        for (const auto& item : params) {
+            const std::string& name = item.name;
+            auto tensor = item.value
+                              .detach()
+                              .to(kInferenceDevice, /*non_blocking=*/false, /*copy=*/true)
+                              .to(torch::kFloat16)
+                              .contiguous();
+            stacked[name].push_back(tensor);
+        }
+    }
+
+    historical_weight_cache_fp16_.reserve(stacked.size());
+    for (auto& kv : stacked) {
+        historical_weight_cache_fp16_[kv.first] = torch::stack(kv.second).contiguous();
+    }
+
+    // Provide compatibility aliases for nn.MultiheadAttention params:
+    // Split in_proj_weight/bias into q_proj/k_proj/v_proj to match Script expectations.
+    {
+        std::vector<std::string> original_keys;
+        original_keys.reserve(historical_weight_cache_fp16_.size());
+        for (const auto& kv : historical_weight_cache_fp16_) {
+            original_keys.push_back(kv.first);
+        }
+
+        auto replace_suffix = [](const std::string& s, const std::string& from, const std::string& to)
+                                  -> std::string {
+            const auto pos = s.rfind(from);
+            if (pos == std::string::npos) return s;
+            std::string out = s;
+            out.replace(pos, from.size(), to);
+            return out;
+        };
+
+        for (const auto& key : original_keys) {
+            // Handle weights: [B, 3*H, H] -> three [B, H, H]
+            if (key.find(".self_attn.in_proj_weight") != std::string::npos) {
+                auto it = historical_weight_cache_fp16_.find(key);
+                if (it == historical_weight_cache_fp16_.end()) continue;
+                const auto& w = it->second;
+                if (w.dim() != 3 || w.size(1) % 3 != 0) continue;
+                const int64_t H = w.size(1) / 3;
+                auto q = w.index({torch::indexing::Slice(), torch::indexing::Slice(0, H), torch::indexing::Slice()}).contiguous();
+                auto k = w.index({torch::indexing::Slice(), torch::indexing::Slice(H, 2 * H), torch::indexing::Slice()}).contiguous();
+                auto v = w.index({torch::indexing::Slice(), torch::indexing::Slice(2 * H, 3 * H), torch::indexing::Slice()}).contiguous();
+
+                historical_weight_cache_fp16_[replace_suffix(key, "in_proj_weight", "q_proj.weight")] = q;
+                historical_weight_cache_fp16_[replace_suffix(key, "in_proj_weight", "k_proj.weight")] = k;
+                historical_weight_cache_fp16_[replace_suffix(key, "in_proj_weight", "v_proj.weight")] = v;
+                continue;
+            }
+
+            // Handle biases: [B, 3*H] -> three [B, H]
+            if (key.find(".self_attn.in_proj_bias") != std::string::npos) {
+                auto it = historical_weight_cache_fp16_.find(key);
+                if (it == historical_weight_cache_fp16_.end()) continue;
+                const auto& b = it->second;
+                if (b.dim() != 2 || b.size(1) % 3 != 0) continue;
+                const int64_t H = b.size(1) / 3;
+                auto q = b.index({torch::indexing::Slice(), torch::indexing::Slice(0, H)}).contiguous();
+                auto k = b.index({torch::indexing::Slice(), torch::indexing::Slice(H, 2 * H)}).contiguous();
+                auto v = b.index({torch::indexing::Slice(), torch::indexing::Slice(2 * H, 3 * H)}).contiguous();
+
+                historical_weight_cache_fp16_[replace_suffix(key, "in_proj_bias", "q_proj.bias")] = q;
+                historical_weight_cache_fp16_[replace_suffix(key, "in_proj_bias", "k_proj.bias")] = k;
+                historical_weight_cache_fp16_[replace_suffix(key, "in_proj_bias", "v_proj.bias")] = v;
+                continue;
+            }
+        }
+    }
+
+    historical_weight_cache_dirty_ = false;
+}
+
+std::unordered_map<int, std::vector<uint8_t>> RolloutManager::run_batched_historical_inference(
+    const std::vector<std::pair<int, const std::vector<PolicyRequest>*>>& grouped) {
+    std::unordered_map<int, std::vector<uint8_t>> results;
+    if (grouped.empty()) {
+        return results;
+    }
+
+    rebuild_historical_weight_cache();
+    if (historical_weight_cache_fp16_.empty()) {
+        throw std::runtime_error("No cached historical weights available for batched inference");
+    }
+
+    struct RequestRef {
+        int policy_id;
+        size_t request_index;
+        const PolicyRequest* request;
+    };
+
+    std::vector<RequestRef> refs;
+    refs.reserve(grouped.size() * 4);
+
+    for (const auto& group : grouped) {
+        int policy_id = group.first;
+        const auto* requests = group.second;
+        if (requests == nullptr || requests->empty()) {
+            continue;
+        }
+        results[policy_id] = std::vector<uint8_t>(requests->size(), 0);
+        for (size_t idx = 0; idx < requests->size(); ++idx) {
+            refs.push_back(RequestRef{policy_id, idx, &(*requests)[idx]});
+        }
+    }
+
+    if (refs.empty()) {
+        return results;
+    }
+
+    torch::NoGradGuard no_grad;
+
+    constexpr std::array<int64_t, 7> kBucketBounds{{32, 64, 96, 128, 192, 256, 480}};
+    const int64_t max_limit = std::max<int64_t>(1, static_cast<int64_t>(default_max_sequence_length_));
+
+    auto select_bucket_index = [&](int64_t length) -> size_t {
+        const int64_t clamped = std::max<int64_t>(1, std::min<int64_t>(length, max_limit));
+        for (size_t i = 0; i < kBucketBounds.size(); ++i) {
+            if (clamped <= kBucketBounds[i]) {
+                return i;
+            }
+        }
+        return kBucketBounds.size() - 1;
+    };
+
+    std::array<std::vector<size_t>, kBucketBounds.size()> bucket_indices{};
+    for (size_t idx = 0; idx < refs.size(); ++idx) {
+        const auto& req = refs[idx];
+        const size_t bucket = select_bucket_index(req.request->valid_len);
+        bucket_indices[bucket].push_back(idx);
+    }
+
+    auto opts_long_device = torch::TensorOptions().dtype(torch::kInt64).device(kInferenceDevice);
+
+    for (size_t bucket_idx = 0; bucket_idx < bucket_indices.size(); ++bucket_idx) {
+        const auto& ref_indices = bucket_indices[bucket_idx];
+        if (ref_indices.empty()) {
+            continue;
+        }
+
+        const int64_t batch_size = static_cast<int64_t>(ref_indices.size());
+        const int64_t target_pad_len = std::min<int64_t>(kBucketBounds[bucket_idx], max_limit);
+
+        std::vector<PolicyRequest> batch_requests;
+        batch_requests.reserve(ref_indices.size());
+        std::vector<size_t> sequential_indices(ref_indices.size());
+        std::iota(sequential_indices.begin(), sequential_indices.end(), 0);
+        std::vector<int64_t> policy_cache_indices;
+        policy_cache_indices.reserve(ref_indices.size());
+
+        for (size_t pos = 0; pos < ref_indices.size(); ++pos) {
+            const auto& ref = refs[ref_indices[pos]];
+            batch_requests.push_back(*ref.request);
+            auto model_it = historical_models_.find(ref.policy_id);
+            if (model_it == historical_models_.end() || model_it->second.cache_index < 0) {
+                throw std::runtime_error("Missing cached weights for historical policy");
+            }
+            policy_cache_indices.push_back(static_cast<int64_t>(model_it->second.cache_index));
+        }
+
+        auto tensor_batch =
+            prepare_inference_batch(batch_requests, target_pad_len, kInferenceDevice, sequential_indices);
+        // Historical weights are cached in FP16; match input dtype to avoid JIT dtype errors.
+        if (tensor_batch.obs_sequence.dtype() != torch::kFloat16) {
+            tensor_batch.obs_sequence = tensor_batch.obs_sequence.to(torch::kFloat16);
+        }
+
+        auto policy_index_tensor = torch::tensor(policy_cache_indices, opts_long_device);
+
+        c10::Dict<std::string, torch::Tensor> weight_dict;
+        for (const auto& kv : historical_weight_cache_fp16_) {
+            auto selected = kv.second.index_select(0, policy_index_tensor).contiguous();
+            weight_dict.insert(kv.first, selected);
+        }
+
+        int module_policy = refs[ref_indices.front()].policy_id;
+        auto module_it = historical_models_.find(module_policy);
+        if (module_it == historical_models_.end() || !module_it->second.module) {
+            throw std::runtime_error("Historical module missing for policy");
+        }
+
+        auto method = module_it->second.module->find_method("forward_packed");
+        if (!method) {
+            throw std::runtime_error("Historical module does not expose forward_packed");
+        }
+
+        std::vector<torch::jit::IValue> inputs;
+        inputs.reserve(7);
+        inputs.emplace_back(tensor_batch.obs_sequence);
+        inputs.emplace_back(tensor_batch.action_sequence);
+        inputs.emplace_back(tensor_batch.agent_types);
+        inputs.emplace_back(tensor_batch.positions);
+        inputs.emplace_back(weight_dict);
+        inputs.emplace_back(tensor_batch.action_masks);
+        inputs.emplace_back(tensor_batch.padding_mask);
+
+        auto outputs_iv = method->operator()(inputs);
+        auto outputs = outputs_iv.toTuple();
+        if (!outputs || outputs->elements().size() < 3) {
+            throw std::runtime_error("Historical model returned unexpected output shape");
+        }
+
+        auto action_logits = outputs->elements()[0].toTensor().contiguous();
+        auto valid_lengths_device = tensor_batch.valid_lengths;
+
+        auto batch_indices = torch::arange(batch_size, opts_long_device);
+        auto last_indices = (valid_lengths_device - 1).clamp_min(0);
+        auto last_logits = action_logits.index({batch_indices, last_indices}).contiguous();
+        auto last_masks = tensor_batch.action_masks.index({batch_indices, last_indices}).contiguous();
+
+        auto has_legal = last_masks.any(1);
+        if (!has_legal.all().item<bool>()) {
+            auto fallback_indices = has_legal.logical_not().nonzero().flatten();
+            for (int64_t i = 0; i < fallback_indices.size(0); ++i) {
+                const int64_t row = fallback_indices[i].item<int64_t>();
+                auto mask_row_tensor = last_masks.select(0, row);
+                mask_row_tensor.fill_(false);
+                bool assigned = false;
+                const auto& ref = refs[ref_indices[static_cast<size_t>(row)]];
+                const auto& req = *ref.request;
+                for (int j = 0; j < 7; ++j) {
+                    if (req.mask[j]) {
+                        mask_row_tensor.index_put_({j}, true);
+                        assigned = true;
+                    }
+                }
+                if (!assigned) {
+                    mask_row_tensor.fill_(true);
+                }
+                last_logits.select(0, row).fill_(0.0f);
+            }
+        }
+
+        last_logits.masked_fill_(~last_masks, -std::numeric_limits<float>::infinity());
+
+        // Sample actions in FP32 for numerical stability.
+        auto probs = torch::softmax(last_logits.to(torch::kFloat32), /*dim=*/1);
+        auto actions_tensor = torch::multinomial(probs, /*num_samples=*/1);
+        actions_tensor = actions_tensor.squeeze(-1).to(torch::kCPU);
+
+        auto actions_ptr = actions_tensor.data_ptr<int64_t>();
+        for (size_t pos = 0; pos < ref_indices.size(); ++pos) {
+            const auto& ref = refs[ref_indices[pos]];
+            results[ref.policy_id][ref.request_index] = static_cast<uint8_t>(actions_ptr[pos]);
+        }
+    }
+
+    return results;
 }
 
 std::vector<uint8_t> RolloutManager::run_historical_inference(torch::jit::Module& module,

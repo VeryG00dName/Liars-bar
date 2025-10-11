@@ -10,6 +10,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <torch/script.h>
@@ -139,7 +140,15 @@ private:
 
     std::vector<EpisodeTracker> episodes_;
     std::vector<TrajectoryData> completed_buffer_;
-    std::unordered_map<int, std::shared_ptr<torch::jit::Module>> historical_models_;
+    struct HistoricalModelEntry {
+        std::shared_ptr<torch::jit::Module> module;
+        int cache_index{-1};
+    };
+
+    std::unordered_map<int, HistoricalModelEntry> historical_models_;
+    std::vector<int> historical_weight_policy_order_;
+    std::unordered_map<std::string, torch::Tensor> historical_weight_cache_fp16_;
+    bool historical_weight_cache_dirty_{false};
     std::unordered_map<int, CppBotRegistryEntry> cpp_bot_registry_;
     std::vector<uint8_t> training_env_inactive_;
     std::vector<int> active_training_counts_;
@@ -161,6 +170,9 @@ private:
     void finalize_episode(EpisodeTracker& tracker);
     void mark_training_env_inactive(int env_idx);
     void finalize_seat(EpisodeTracker& tracker, SeatTrajectory& seat_tracker, Env& env);
+    void rebuild_historical_weight_cache();
+    std::unordered_map<int, std::vector<uint8_t>>
+    run_batched_historical_inference(const std::vector<std::pair<int, const std::vector<PolicyRequest>*>>& grouped);
     std::vector<uint8_t> run_historical_inference(torch::jit::Module& module,
                                                   const std::vector<PolicyRequest>& requests);
     std::vector<uint8_t> run_cpp_bot(int policy_id, const std::vector<PolicyRequest>& requests);

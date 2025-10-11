@@ -82,6 +82,54 @@ def _chunked(seq: List[Any], size: int) -> List[List[Any]]:
         return [list(seq)]
     return [seq[i : i + size] for i in range(0, len(seq), size)]
 
+
+def _parse_positive_int(value: Any) -> Optional[int]:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _load_max_seq_metadata(
+    traced_path: Optional[str], metadata_hint: Optional[str] = None
+) -> Tuple[Optional[int], Optional[str]]:
+    """Load max-sequence metadata from a TorchScript sidecar file if present."""
+
+    candidates: List[Path] = []
+    if metadata_hint:
+        candidates.append(Path(metadata_hint))
+    if traced_path:
+        candidates.append(Path(str(traced_path) + ".max_seq_length"))
+
+    for candidate in candidates:
+        try:
+            text = candidate.read_text().strip()
+        except FileNotFoundError:
+            continue
+        except Exception:
+            logging.warning(
+                "Unable to read max_seq_length metadata from %s", candidate, exc_info=True
+            )
+            continue
+
+        if not text:
+            return None, str(candidate)
+
+        try:
+            parsed = int(text)
+        except ValueError:
+            logging.warning(
+                "Invalid max_seq_length metadata in %s: %s", candidate, text
+            )
+            continue
+
+        if parsed > 0:
+            return parsed, str(candidate)
+
+    return None, None
+
+
 class OpponentPoolManager:
     """Manages the opponent_pool.json file for persistent population state."""
     def __init__(self, filepath: str):
@@ -702,43 +750,65 @@ def train_generation(
             )
             continue
 
-        # Check for an existing, valid TorchScript path
         traced_path = agent_def.get('path_pt')
         if traced_path and os.path.exists(traced_path):
-            # Path exists, we are good to go.
             pass
         else:
-            # TorchScript path is missing or invalid, let's try to generate it.
             logging.info(
-                f"TorchScript trace for agent '{agent_def.get('name', policy_id)}' not found. Generating it now..."
+                "TorchScript trace for agent '%s' not found. Generating it now...",
+                agent_def.get('name', policy_id),
             )
-            
-            # Define the output path for the new .pt file
+
             pth_path_obj = Path(checkpoint_path)
             new_traced_path = str(pth_path_obj.with_name(f"{pth_path_obj.stem}_traced.pt"))
-            
-            # Call the tracing utility
-            traced_success = trace_model_from_checkpoint(checkpoint_path, new_traced_path, device)
-            
-            if traced_success:
-                logging.info(f"Successfully generated trace at '{new_traced_path}'")
-                traced_path = new_traced_path
-                # Update the agent definition in the pool manager
-                agent_def['path_pt'] = new_traced_path
+
+            tracing_artifacts = trace_model_from_checkpoint(checkpoint_path, new_traced_path, device)
+
+            if tracing_artifacts:
+                traced_path = tracing_artifacts.get('path', new_traced_path)
+                logging.info("Successfully generated trace at '%s'", traced_path)
+                agent_def['path_pt'] = traced_path
+                if 'max_seq_length' in tracing_artifacts:
+                    agent_def['max_seq_length'] = tracing_artifacts['max_seq_length']
+                if tracing_artifacts.get('metadata_path'):
+                    agent_def['path_max_seq'] = tracing_artifacts['metadata_path']
                 pool_was_updated = True
             else:
                 logging.error(
-                    f"Failed to generate TorchScript trace for agent '{agent_def.get('name', policy_id)}'. Skipping."
+                    "Failed to generate TorchScript trace for agent '%s'. Skipping.",
+                    agent_def.get('name', policy_id),
                 )
                 traced_path = None
 
         if not traced_path:
             continue
 
+        existing_max_seq = _parse_positive_int(agent_def.get('max_seq_length'))
+        metadata_hint = agent_def.get('path_max_seq')
+        loaded_max_seq, resolved_metadata_path = _load_max_seq_metadata(traced_path, metadata_hint)
+
+        if loaded_max_seq is not None and loaded_max_seq != existing_max_seq:
+            agent_def['max_seq_length'] = loaded_max_seq
+            existing_max_seq = loaded_max_seq
+            pool_was_updated = True
+
+        if resolved_metadata_path and agent_def.get('path_max_seq') != resolved_metadata_path:
+            agent_def['path_max_seq'] = resolved_metadata_path
+            pool_was_updated = True
+
         # Now, load the (potentially newly created) model into the C++ manager
         try:
             rollout_manager.cpp_manager.load_historical_model(policy_id, str(traced_path))
             loaded_historical_labels.append(policy_id)
+            if existing_max_seq is not None:
+                try:
+                    rollout_manager.cpp_manager.set_policy_max_sequence_length(policy_id, existing_max_seq)
+                except Exception:
+                    logging.exception(
+                        "Failed to set max sequence length %s for historical policy %s",
+                        existing_max_seq,
+                        policy_id,
+                    )
         except Exception as exc:
             logging.exception(
                 f"Failed to load traced historical policy {policy_id} from {traced_path}: {exc}"
@@ -1315,22 +1385,39 @@ def train_generation(
     logging.info(f"Saved standard PyTorch checkpoint to {final_path_pth}")
 
 
-    traced_success = trace_model_from_checkpoint(final_path_pth, final_path_pt, device)
+    tracing_artifacts = trace_model_from_checkpoint(final_path_pth, final_path_pt, device)
 
-    extra_metadata = {}
-    if traced_success and os.path.exists(final_path_pt):
-        extra_metadata["path_pt"] = final_path_pt
-    else:
-        if traced_success:
-            logging.warning(
-                "TorchScript artifact %s missing after tracing; skipping pool registration.",
-                final_path_pt,
-            )
+    extra_metadata: Dict[str, Any] = {}
+    traced_output_path = final_path_pt
+    if tracing_artifacts:
+        traced_output_path = tracing_artifacts.get("path", final_path_pt)
+        if traced_output_path and os.path.exists(traced_output_path):
+            extra_metadata["path_pt"] = traced_output_path
         else:
             logging.warning(
-                "TorchScript tracing failed for %s; historical self-play will skip C++ loading.",
-                run_name,
+                "TorchScript artifact %s missing after tracing; skipping pool registration.",
+                traced_output_path,
             )
+
+        if "max_seq_length" in tracing_artifacts:
+            extra_metadata["max_seq_length"] = tracing_artifacts["max_seq_length"]
+        if tracing_artifacts.get("metadata_path"):
+            extra_metadata["path_max_seq"] = tracing_artifacts["metadata_path"]
+    else:
+        logging.warning(
+            "TorchScript tracing failed for %s; historical self-play will skip C++ loading.",
+            run_name,
+        )
+
+    if "max_seq_length" not in extra_metadata:
+        inferred_max_seq = _parse_positive_int(getattr(model_to_save, "max_seq_length", None))
+        if inferred_max_seq is not None:
+            extra_metadata["max_seq_length"] = inferred_max_seq
+
+    if "path_pt" in extra_metadata and "path_max_seq" not in extra_metadata:
+        _, resolved_metadata_path = _load_max_seq_metadata(extra_metadata["path_pt"])
+        if resolved_metadata_path:
+            extra_metadata["path_max_seq"] = resolved_metadata_path
 
     pool_manager.add_agent(
             name=run_name,
