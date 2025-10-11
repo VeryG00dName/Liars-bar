@@ -82,10 +82,9 @@ def _single_pass_ppo(
     our_mask: torch.Tensor,
     actions: torch.Tensor,
     old_logp: torch.Tensor,
-    our_action_mask: Optional[torch.Tensor],
     step_mask: torch.Tensor,
     episode_mask: torch.Tensor,
-    sl_teacher: Optional[torch.nn.Module]
+    update_num: int = 0
 ) -> Tuple[
     torch.Tensor,
     Dict[str, torch.Tensor],
@@ -146,6 +145,38 @@ def _single_pass_ppo(
     actions_for_log_prob = actions.masked_fill(~our_mask, 0)
 
     new_logp = dist.log_prob(actions_for_log_prob).to(torch.float32)
+    
+     # ==========================================================
+    # ### START OF DIAGNOSTIC BLOCK ###
+    # ==========================================================
+    # This will run on the first K-epoch of every PPO update.
+    if update_num == 0: 
+        with torch.no_grad():
+            logp_diff = torch.abs(old_logp - new_logp)
+            valid_diff = logp_diff[step_mask] # Only compare valid steps
+
+            if valid_diff.numel() > 0:
+                avg_abs_diff = valid_diff.mean().item()
+                max_abs_diff = valid_diff.max().item()
+                
+                tolerance = 1e-3
+                mismatch_pct = (valid_diff > tolerance).float().mean().item() * 100
+
+                # Use logging to make the output clear
+                print("\n" + "="*50 +
+                             "\n--- MODEL CONSISTENCY DIAGNOSTIC (Epoch 0) ---" +
+                             f"\n    - Avg Absolute Difference in log_prob: {avg_abs_diff:.6f}" +
+                             f"\n    - Max Absolute Difference in log_prob: {max_abs_diff:.6f}" +
+                             f"\n    - Mismatch Percentage (> {tolerance} diff): {mismatch_pct:.2f}%")
+                if mismatch_pct > 5.0:
+                    print("    - VERDICT: Significant mismatch detected. Rollout and training models are inconsistent.")
+                else:
+                    print("    - VERDICT: Models appear consistent.")
+                print("="*50 + "\n")
+    # ========================================================
+    # ### END OF DIAGNOSTIC BLOCK ###
+    # ========================================================
+    
     entropy = dist.entropy().to(torch.float32)
 
     log_ratio = (new_logp - old_logp.to(torch.float32)).clamp(min=-60.0, max=60.0)
@@ -273,7 +304,6 @@ def ppo_losses_batched(
     old_logp = batch["old_logp"].float()
     
     episode_mask = torch.ones(our_idx.size(0), dtype=torch.bool, device=our_idx.device)
-    step_mask = our_mask
 
     total_loss, metrics, moe_info = _single_pass_ppo(
         model(**mi),
@@ -283,10 +313,9 @@ def ppo_losses_batched(
         our_mask=our_mask,
         actions=actions,
         old_logp=old_logp,
-        our_action_mask=batch.get("our_action_mask"),
-        step_mask=step_mask,
+        step_mask=our_mask,
         episode_mask=episode_mask,
-        sl_teacher=sl_teacher,
+        update_num=update_num
     )
 
     metrics["total_loss"] = total_loss.detach()
