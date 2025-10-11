@@ -21,8 +21,12 @@ def _batched_layer_norm(
     return normalized * weight.unsqueeze(1) + bias.unsqueeze(1)
 
 def _batched_embedding(weight: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-    expanded_indices = indices.unsqueeze(-1).expand(-1, -1, weight.size(-1))
-    return torch.gather(weight, 1, expanded_indices)
+    B, V, D = weight.shape
+    T = indices.shape[1]
+    offset = torch.arange(0, B, device=indices.device) * V
+    indices_flat = (indices + offset.unsqueeze(1)).view(-1)
+    embedded_flat = F.embedding(indices_flat, weight.view(B * V, D))
+    return embedded_flat.view(B, T, D)
 
 def _reduce_heads(
             stacked: torch.Tensor,

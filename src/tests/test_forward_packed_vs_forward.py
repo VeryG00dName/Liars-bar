@@ -12,8 +12,7 @@ from src.model.ppo_reactive_model_script import (
     PPOReactiveModelScript,
     _batched_embedding,
     _batched_layer_norm,
-    _batched_linear,
-    _combine_heads_vectorized,
+    _batched_linear
 )
 
 
@@ -331,7 +330,7 @@ def compare_forward_paths(
         top_k=top_k,
     )
     script_model.load_state_dict(model.state_dict(), strict=False)
-
+    
     model.eval()
     script_model.eval()
 
