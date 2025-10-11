@@ -343,12 +343,39 @@ bool RolloutManager::run_rollouts_step() {
 void RolloutManager::append_step(SeatTrajectory& seat_tracker, const HistoryEntry& h) {
     seat_tracker.data.agent_id.push_back(h.player);
     seat_tracker.data.reward.push_back(0.0);
-    seat_tracker.data.opp_target_action.push_back(h.action); 
+    seat_tracker.data.opp_target_action.push_back(h.action);
 
     // Placeholders to be filled by apply_inference_results if it was this agent's turn.
     seat_tracker.data.our_action.push_back(-1);
     seat_tracker.data.log_prob.push_back(0.0f);
     seat_tracker.data.value.push_back(0.0f);
+}
+
+void RolloutManager::update_penalty_rewards(
+    SeatTrajectory& seat_tracker, const std::array<uint8_t, Env::MAX_PLAYERS>& penalties) {
+    const int seat = seat_tracker.seat;
+    if (!seat_tracker.active || seat < 0 || seat_tracker.data.reward.empty()) {
+        seat_tracker.last_penalties = penalties;
+        return;
+    }
+
+    double delta_total = 0.0;
+    for (int p = 0; p < num_players_; ++p) {
+        const int diff = static_cast<int>(penalties[p]) -
+                         static_cast<int>(seat_tracker.last_penalties[p]);
+        if (diff > 0) {
+            if (p == seat) {
+                delta_total -= 0.1 * diff;
+            } else {
+                delta_total += 0.033 * diff;
+            }
+        }
+    }
+
+    if (delta_total != 0.0) {
+        seat_tracker.data.reward.back() += delta_total;
+    }
+    seat_tracker.last_penalties = penalties;
 }
 
 // Iterates through all environments and processes any new history entries.
@@ -360,13 +387,15 @@ void RolloutManager::append_new_history_entries() {
 
         const int total_history = env.get_total_history_entries();
         if (total_history > ep.last_history_len) {
+            const int prev_history_len = ep.last_history_len;
             for (auto& pair : ep.training_seats) {
                 SeatTrajectory& st = pair.second;
                 if (!st.active) continue;
 
-                for (int i = ep.last_history_len; i < total_history; ++i) {
+                for (int i = prev_history_len; i < total_history; ++i) {
                     append_step(st, env.game_history[i]);
                 }
+                update_penalty_rewards(st, env.penalties);
             }
             ep.last_history_len = total_history;
         }
@@ -451,6 +480,7 @@ void RolloutManager::finalize_episode(EpisodeTracker& tracker) {
     for (auto& pair : tracker.training_seats) {
         SeatTrajectory& st = pair.second;
         if (st.active) {
+            update_penalty_rewards(st, env.penalties);
             // Apply win/loss reward to the last step of the trajectory.
             if (!st.data.reward.empty()) {
                 if (alive_count == 1 && winner == st.seat) {
@@ -746,6 +776,7 @@ EpisodeTracker RolloutManager::new_episode_tracker(int env_idx, const std::vecto
             st.seat = seat;
             st.policy_id = roles[seat];
             st.active = true;
+            st.last_penalties = arena_.envs[env_idx].penalties;
             st.data.env_index = env_idx;
             st.data.training_agent_seat = seat;
             st.data.training_policy_id = roles[seat];

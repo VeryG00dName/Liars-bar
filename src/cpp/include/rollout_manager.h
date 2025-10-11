@@ -147,6 +147,8 @@ private:
     // Helper functions for the rollout loop.
     EpisodeTracker new_episode_tracker(int env_idx, const std::vector<int>& roles);
     void append_step(SeatTrajectory& seat_tracker, const HistoryEntry& h);
+    void update_penalty_rewards(SeatTrajectory& seat_tracker,
+                                const std::array<uint8_t, Env::MAX_PLAYERS>& penalties);
     void append_new_history_entries();
     void maybe_finalize_episodes();
     void finalize_episode(EpisodeTracker& tracker);
