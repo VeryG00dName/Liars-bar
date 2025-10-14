@@ -21,8 +21,7 @@ os.environ.pop("TORCH_LOGS", None)           # disable extra compile logs
 os.environ.setdefault("TORCHDYNAMO_VERBOSE", "0")
 os.environ.setdefault("TORCH_COMPILE_DEBUG", "0")
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-# Deterministic cuBLAS workspace requirement for CUDA
-os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+
 # Hide symbolic_shapes warnings printed via warnings module (belt-and-suspenders)
 warnings.filterwarnings(
     "ignore",
@@ -34,12 +33,8 @@ warnings.filterwarnings(
     message=".*torch.cpu.amp.autocast.* is deprecated.*",
     category=FutureWarning,
 )
-import torch
-from torch.utils.tensorboard import SummaryWriter
-from torch.nn.utils import clip_grad_norm_
-import torch.amp as amp
 
-from src.misc import lb
+
 from src import config
 from src.model.ppo_reactive_model import PPOReactiveModel
 from src.agents.learner_ar_agent import LearnerAutoregressiveAgent
@@ -48,6 +43,7 @@ from src.training.tracing_utils import trace_model_from_checkpoint
 from src.training.ppo_extras import (
     _collate_batch,
     _to_device_batch,
+    apply_determinism_settings,
     ppo_losses_batched,
     set_seed
 )
@@ -1453,8 +1449,24 @@ if __name__ == "__main__":
     parser.add_argument("--challenger-freq", type=int, default=0, help="Inject a challenger from SL every N generations. Set to 0 to disable.")
     parser.add_argument("--master-run-name", type=str, default=None, help="Overall name for the self-play experiment folder.")
     parser.add_argument("--no-sl", action="store_true", help="Start generation 1 from scratch, without SL warm-start.")
+    parser.add_argument(
+        "--determinism-level",
+        type=str,
+        choices=("none", "high", "full"),
+        default="none",
+        help="Configure PyTorch determinism knobs; defaults to the fastest ('none').",
+    )
     args = parser.parse_args()
+    if args.determinism_level in ("high", "full"):
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+        
+    import torch
+    from torch.utils.tensorboard import SummaryWriter
+    from torch.nn.utils import clip_grad_norm_
+    import torch.amp as amp
     
+    apply_determinism_settings(args.determinism_level)
+    from src.misc import lb
     master_run_name = args.master_run_name or f"selfplay_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     logging.info(f"Starting master self-play run: {master_run_name}")
 
