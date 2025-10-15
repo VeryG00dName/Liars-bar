@@ -817,6 +817,18 @@ void RolloutManager::rebuild_historical_weight_cache() {
         historical_weight_cache_fp16_[kv.first] = torch::stack(kv.second).contiguous();
     }
 
+    // Build single-policy weight dict caches for fast lookup
+    for (size_t idx = 0; idx < entries.size(); ++idx) {
+        auto* entry = entries[idx].second;
+        c10::Dict<std::string, torch::Tensor> single_dict;
+        for (const auto& kv : historical_weight_cache_fp16_) {
+            // Extract this policy's weights (at index 'idx' in the stacked tensor)
+            single_dict.insert(kv.first, kv.second[static_cast<int64_t>(idx)].contiguous());
+        }
+        entry->single_policy_weight_dict = std::move(single_dict);
+        entry->single_policy_dict_cached = true;
+    }
+
     // Provide compatibility aliases for nn.MultiheadAttention params:
     // Split in_proj_weight/bias into q_proj/k_proj/v_proj to match Script expectations.
     {
@@ -994,13 +1006,39 @@ std::unordered_map<int, std::vector<uint8_t>> RolloutManager::run_batched_histor
             prep_time_acc += std::chrono::duration_cast<std::chrono::microseconds>(prep_t1 - prep_t0);
 
             auto weights_t0 = std::chrono::high_resolution_clock::now();
-            auto policy_index_tensor = torch::tensor(policy_cache_indices, opts_long_device);
+
+            // Optimization: If all requests in this mini-batch use the same policy,
+            // we can use the pre-cached single-policy weight dict instead of index_select.
+            bool all_same_policy = true;
+            int first_policy_id = refs[ref_indices[offset]].policy_id;
+            for (size_t pos = 1; pos < static_cast<size_t>(take); ++pos) {
+                if (refs[ref_indices[offset + pos]].policy_id != first_policy_id) {
+                    all_same_policy = false;
+                    break;
+                }
+            }
 
             c10::Dict<std::string, torch::Tensor> weight_dict;
-            for (const auto& kv : historical_weight_cache_fp16_) {
-                auto selected = kv.second.index_select(0, policy_index_tensor).contiguous();
-                weight_dict.insert(kv.first, selected);
+            if (all_same_policy) {
+                // Fast path: All requests use the same policy, use cached single-policy dict
+                auto model_it = historical_models_.find(first_policy_id);
+                if (model_it != historical_models_.end() && model_it->second.single_policy_dict_cached) {
+                    const auto& cached_dict = model_it->second.single_policy_weight_dict;
+                    // Expand each weight tensor to batch dimension
+                    for (const auto& kv : cached_dict) {
+                        auto expanded = kv.value().unsqueeze(0).expand({batch_size, -1, -1}).contiguous();
+                        weight_dict.insert(kv.key(), expanded);
+                    }
+                }
+            } else {
+                // General path: Multiple policies, use index_select
+                auto policy_index_tensor = torch::tensor(policy_cache_indices, opts_long_device);
+                for (const auto& kv : historical_weight_cache_fp16_) {
+                    auto selected = kv.second.index_select(0, policy_index_tensor).contiguous();
+                    weight_dict.insert(kv.first, selected);
+                }
             }
+
             auto weights_t1 = std::chrono::high_resolution_clock::now();
             weight_time_acc += std::chrono::duration_cast<std::chrono::microseconds>(weights_t1 - weights_t0);
 

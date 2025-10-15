@@ -851,7 +851,9 @@ def train_generation(
         lambda: {"count": 0, "total_time": 0.0, "total_size": 0}
     )
 
-    for update in range(1, max_updates + 1):
+    # TEST: Limit to 10 updates for quick profiling
+    actual_max_updates = min(10, max_updates)
+    for update in range(1, actual_max_updates + 1):
         # -------- Rollout --------
         bucket_stats.clear()
         t0 = time.time()

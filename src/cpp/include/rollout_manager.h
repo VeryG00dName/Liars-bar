@@ -144,6 +144,9 @@ private:
     struct HistoricalModelEntry {
         std::shared_ptr<torch::jit::Module> module;
         int cache_index{-1};
+        // Cache for single-policy weight dict (when batch contains only this policy)
+        c10::Dict<std::string, torch::Tensor> single_policy_weight_dict;
+        bool single_policy_dict_cached{false};
     };
 
     std::unordered_map<int, HistoricalModelEntry> historical_models_;

@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn # Added nn
 from src import config
 from src.model.common_model_api import BasePolicyNetwork, BaseValueNetwork, BaseOpponentBehaviorPredictor
-from src.model.shen_models import BeliefSpacePolicy, OpponentBeliefModel
+#from src.model.shen_models import BeliefSpacePolicy, OpponentBeliefModel
 # Import new implementations for policy and value networks.
 from src.model.new_models import PolicyNetwork as NewPolicyNetwork, ValueNetwork as PPOValueNetwork
 # Import MoE models when needed (dynamic import in create_policy_network)
@@ -68,21 +68,6 @@ class ModelFactory:
         policy_key = 'policy_head.weight'
         value_key = 'value_head.0.weight' # Check first layer of value head
         return network_key in state_dict and policy_key in state_dict and value_key in state_dict
-
-    @staticmethod
-    def create_belief_space_policy(belief_dim, obs_dim, hidden_dim, output_dim):
-        model = BeliefSpacePolicy(
-            belief_dim=belief_dim, obs_dim=obs_dim, hidden_dim=hidden_dim, output_dim=output_dim
-        )
-        return model
-
-    @staticmethod
-    def create_opponent_belief_model(event_feature_dim, hidden_dim, num_opponent_types, max_seq_length=400): # Match args
-        model = OpponentBeliefModel(
-            event_feature_dim=event_feature_dim, hidden_dim=hidden_dim,
-            num_opponent_types=num_opponent_types, max_seq_length=max_seq_length
-        )
-        return model
 
     @staticmethod
     def is_autoregressive_model(state_dict: dict) -> bool:
