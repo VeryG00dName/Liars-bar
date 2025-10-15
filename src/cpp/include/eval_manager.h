@@ -83,6 +83,7 @@ private:
     std::unordered_map<int, std::shared_ptr<torch::jit::Module>> models_;
     std::unordered_map<int, int> policy_max_sequence_lengths_;
     std::unordered_map<int, CppBotRegistryEntry> cpp_bot_registry_;
+    static std::unordered_map<std::string, CppBotKind> bot_kind_cache_;
 
     std::vector<uint8_t> run_model(torch::jit::Module& module,
                                    const std::vector<PolicyRequest>& requests);

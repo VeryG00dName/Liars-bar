@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <memory>
 #include <random>
 #include <string>
@@ -150,11 +151,22 @@ private:
     std::unordered_map<std::string, torch::Tensor> historical_weight_cache_fp16_;
     bool historical_weight_cache_dirty_{false};
     std::unordered_map<int, CppBotRegistryEntry> cpp_bot_registry_;
+    static std::unordered_map<std::string, CppBotKind> bot_kind_cache_;
     std::vector<uint8_t> training_env_inactive_;
     std::vector<int> active_training_counts_;
     std::vector<int> weighted_opponent_labels_;
     std::vector<double> weighted_opponent_weights_;
     std::vector<std::vector<int>> fixed_opponent_triplets_;
+
+    // --- Profiling Timers ---
+    std::chrono::microseconds timer_total_collect_{0};
+    std::chrono::microseconds timer_log_rewards_{0};
+    std::chrono::microseconds timer_cpp_bots_{0};
+    std::chrono::microseconds timer_historical_total_{0};
+    std::chrono::microseconds timer_hist_prep_{0};
+    std::chrono::microseconds timer_hist_weights_{0};
+    std::chrono::microseconds timer_hist_model_{0};
+    std::chrono::microseconds timer_hist_post_{0};
 
     std::vector<std::vector<int>> build_roles(int batch_size,
                                               int num_players,
@@ -171,8 +183,12 @@ private:
     void mark_training_env_inactive(int env_idx);
     void finalize_seat(EpisodeTracker& tracker, SeatTrajectory& seat_tracker, Env& env);
     void rebuild_historical_weight_cache();
-    std::unordered_map<int, std::vector<uint8_t>>
-    run_batched_historical_inference(const std::vector<std::pair<int, const std::vector<PolicyRequest>*>>& grouped);
+    std::unordered_map<int, std::vector<uint8_t>> run_batched_historical_inference(
+        const std::vector<std::pair<int, const std::vector<PolicyRequest>*>>& grouped,
+        std::chrono::microseconds& prep_time_acc,
+        std::chrono::microseconds& weight_time_acc,
+        std::chrono::microseconds& model_time_acc,
+        std::chrono::microseconds& post_time_acc);
     std::vector<uint8_t> run_historical_inference(torch::jit::Module& module,
                                                   const std::vector<PolicyRequest>& requests);
     std::vector<uint8_t> run_cpp_bot(int policy_id, const std::vector<PolicyRequest>& requests);

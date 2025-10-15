@@ -17,6 +17,9 @@
 #include "bots.h"
 #include "torch_utils.h"
 
+// Cache for parsed C++ bot kinds to avoid repeated string processing
+std::unordered_map<std::string, EvalManager::CppBotKind> EvalManager::bot_kind_cache_;
+
 namespace {
 
 const torch::Device kInferenceDevice = torch::kCUDA;
@@ -545,29 +548,38 @@ std::vector<uint8_t> EvalManager::run_cpp_bot(int policy_id,
 }
 
 EvalManager::CppBotKind EvalManager::parse_cpp_bot_kind(const std::string& name) {
+    auto cache_it = bot_kind_cache_.find(name);
+    if (cache_it != bot_kind_cache_.end()) {
+        return cache_it->second;
+    }
+
     std::string lower;
     lower.reserve(name.size());
     for (char c : name) {
         lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
     }
 
+    CppBotKind kind;
     if (lower == "classic") {
-        return CppBotKind::Classic;
+        kind = CppBotKind::Classic;
     } else if (lower == "greedycardspammer") {
-        return CppBotKind::GreedyCardSpammer;
+        kind = CppBotKind::GreedyCardSpammer;
     } else if (lower == "randomagent") {
-        return CppBotKind::RandomAgent;
+        kind = CppBotKind::RandomAgent;
     } else if (lower == "selectivetableconservativechallenger") {
-        return CppBotKind::SelectiveTableConservativeChallenger;
+        kind = CppBotKind::SelectiveTableConservativeChallenger;
     } else if (lower == "strategicchallenger") {
-        return CppBotKind::StrategicChallenger;
+        kind = CppBotKind::StrategicChallenger;
     } else if (lower == "tablefirstconservativechallenger") {
-        return CppBotKind::TableFirstConservativeChallenger;
+        kind = CppBotKind::TableFirstConservativeChallenger;
     } else if (lower == "tablenontableagent") {
-        return CppBotKind::TableNonTableAgent;
+        kind = CppBotKind::TableNonTableAgent;
+    } else {
+        throw std::invalid_argument("Unknown C++ bot name: " + name);
     }
 
-    throw std::invalid_argument("Unknown C++ bot name: " + name);
+    bot_kind_cache_[name] = kind;
+    return kind;
 }
 
 std::unique_ptr<CppBotBase> EvalManager::make_cpp_bot_instance(EvalManager::CppBotKind kind,

@@ -4,6 +4,9 @@ from glob import glob
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CppExtension
 
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", "/mnt/l/Coding_Projects/Liars_bar_2/Liars-bar/persistent_cache/inductor")
+os.environ.setdefault("TRITON_CACHE_DIR",        "/mnt/l/Coding_Projects/Liars_bar_2/Liars-bar/persistent_cache/triton")
+
 PROJ_ROOT     = os.path.dirname(os.path.abspath(__file__))
 CPP_INCLUDE   = os.path.join(PROJ_ROOT, "src", "cpp", "include")
 CPP_SRC_DIR   = os.path.join(PROJ_ROOT, "src", "cpp", "src")

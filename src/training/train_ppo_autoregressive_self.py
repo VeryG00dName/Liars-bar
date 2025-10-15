@@ -34,7 +34,7 @@ warnings.filterwarnings(
     category=FutureWarning,
 )
 
-
+import torch
 from src import config
 from src.model.ppo_reactive_model import PPOReactiveModel
 from src.agents.learner_ar_agent import LearnerAutoregressiveAgent
@@ -374,28 +374,29 @@ def _allocate_integer_counts(total: int, weights: Dict[int, float], rng: np.rand
     if total <= 0:
         return {k: 0 for k in weights.keys()}
 
-    items = [(lbl, max(0.0, w)) for lbl, w in weights.items()]
-    s = sum(w for _, w in items)
-    if s <= 0.0:
-        items = [(lbl, 1.0) for lbl, _ in items]
-        s = float(len(items))
+    # Vectorized implementation with stable tie-breaking
+    labels = np.array(list(weights.keys()))
+    weight_values = np.array([max(0.0, weights[lbl]) for lbl in labels], dtype=np.float64)
 
-    raw = [(lbl, (w / s) * total) for lbl, w in items]
-    floors = {lbl: int(math.floor(x)) for lbl, x in raw}
-    used = sum(floors.values())
-    remain = total - used
+    s = weight_values.sum()
+    if s <= 1e-9:
+        # Avoid division by zero, fall back to uniform distribution
+        weight_values = np.ones_like(weight_values)
+        s = float(len(weight_values))
 
-    fracs = []
-    for lbl, x in raw:
-        frac = x - math.floor(x)
-        fracs.append((frac, rng.random(), lbl))  # rng tie-break
-    fracs.sort(reverse=True)
+    raw_values = (weight_values / s) * total
+    floors_values = np.floor(raw_values).astype(np.int64)
+    used = int(floors_values.sum())
+    remain = int(total - used)
 
-    for i in range(remain):
-        _, _, lbl = fracs[i]
-        floors[lbl] += 1
+    if remain > 0 and len(floors_values) > 0:
+        fracs = raw_values - floors_values
+        tie_breakers = rng.random(len(fracs))
+        # Sort by frac desc, then tie_breakers desc (lexsort uses last key first)
+        sort_indices = np.lexsort((tie_breakers, -fracs))
+        floors_values[sort_indices[:remain]] += 1
 
-    return floors
+    return dict(zip(labels.tolist(), floors_values.tolist()))
 
 
 def _slots_to_triplets(slot_pool: List[int]) -> List[List[int]]:
@@ -430,35 +431,44 @@ def _load_agent_from_checkpoint(
 
 def _episode_token_count(episode: Dict[str, Any]) -> int:
     """Return the number of autoregressive tokens contained in an episode."""
+    if "_token_count" in episode:
+        return int(episode.get("_token_count", 0))
+
+    count = 0
     model_input = episode.get("model_input")
     if isinstance(model_input, dict):
         valid_lengths = model_input.get("valid_lengths")
         if isinstance(valid_lengths, torch.Tensor) and valid_lengths.numel() > 0:
             try:
-                return int(valid_lengths.view(-1)[0].item())
+                count = int(valid_lengths.view(-1)[0].item())
             except Exception:
                 pass
         elif valid_lengths is not None:
             try:
-                return int(valid_lengths)
+                count = int(valid_lengths)
             except Exception:
                 pass
 
-    rewards = episode.get("reward")
-    if rewards is not None:
-        try:
-            return int(len(rewards))
-        except Exception:
-            pass
+    # Fallback to reward length
+    if count <= 0:
+        rewards = episode.get("reward")
+        if rewards is not None:
+            try:
+                count = int(len(rewards))
+            except Exception:
+                pass
 
-    actions = episode.get("our_action")
-    if actions is not None:
-        try:
-            return int(len(actions))
-        except Exception:
-            pass
+    # Fallback to action length
+    if count <= 0:
+        actions = episode.get("our_action")
+        if actions is not None:
+            try:
+                count = int(len(actions))
+            except Exception:
+                pass
 
-    return 0
+    episode["_token_count"] = int(count)
+    return int(count)
 
 
 def _prepare_episode_for_buffer(episode: Dict[str, Any]) -> Dict[str, Any]:
@@ -897,7 +907,6 @@ def train_generation(
         for ep in new_eps:
             _prepare_episode_for_buffer(ep)
             tokens = _episode_token_count(ep)
-            ep["_token_count"] = tokens
             rollout_tokens += tokens
 
         # --- AGE-BASED BUFFER MANAGEMENT ---
@@ -1460,7 +1469,7 @@ if __name__ == "__main__":
     if args.determinism_level in ("high", "full"):
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
         
-    import torch
+        
     from torch.utils.tensorboard import SummaryWriter
     from torch.nn.utils import clip_grad_norm_
     import torch.amp as amp

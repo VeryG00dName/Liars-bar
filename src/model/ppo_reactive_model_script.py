@@ -79,7 +79,6 @@ class PPOReactiveModelScript(PPOReactiveModelBase):
         dropout_rate: float = 0.1,
         max_seq_length: int = 480,
         num_agent_types: int = 4,
-        *,
         num_experts: int = 8,
         top_k: int = 2,
         expert_ffn_dim: Optional[int] = None,
@@ -104,6 +103,11 @@ class PPOReactiveModelScript(PPOReactiveModelBase):
         self._top_k = top_k
         self._num_experts = num_experts
 
+        # Pre-compute constants for performance
+        self._head_dim = hidden_dim // num_heads if num_heads > 0 else 0
+        self._scale_factor = float(self._head_dim) ** -0.5 if self._head_dim > 0 else 1.0
+        self._attn_neg_inf = float("-inf")
+
     @torch.jit.export
     def forward_packed(
         self,
@@ -124,6 +128,7 @@ class PPOReactiveModelScript(PPOReactiveModelBase):
         top_k = self._top_k
 
         device = action_sequence.device
+        # Keep TorchScript-friendly device moves; .to(device) is a no-op when already on target
         lut_act_kind_dev = self.lut_act_kind.to(device)
         lut_count_dev = self.lut_count.to(device)
         lut_table_flag_dev = self.lut_table_flag.to(device)
@@ -211,17 +216,16 @@ class PPOReactiveModelScript(PPOReactiveModelBase):
         if padding_mask is not None:
             key_padding = padding_mask.to(dtype=torch.bool).contiguous()
 
-        attn_neg_inf = float("-inf")
+        attn_neg_inf = self._attn_neg_inf
         x = encoded_inputs
         final_topk_indices = torch.jit.annotate(Optional[torch.Tensor], None)
         final_topk_scores = torch.jit.annotate(Optional[torch.Tensor], None)
 
-        head_dim = hidden_dim // num_heads
+        head_dim = self._head_dim
         causal_mask_view = causal_mask.view(1, 1, time_dim, time_dim)
+        key_padding_view = torch.jit.annotate(Optional[torch.Tensor], None)
         if key_padding is not None:
             key_padding_view = key_padding.view(key_padding.size(0), 1, 1, time_dim)
-        else:
-            key_padding_view = None
 
         for layer_idx in range(num_layers):
             q = _batched_linear(
@@ -244,7 +248,7 @@ class PPOReactiveModelScript(PPOReactiveModelBase):
             k_heads = k.view(k.size(0), time_dim, num_heads, head_dim).permute(0, 2, 1, 3)
             v_heads = v.view(v.size(0), time_dim, num_heads, head_dim).permute(0, 2, 1, 3)
 
-            attn_logits = torch.matmul(q_heads, k_heads.transpose(-2, -1)) * (float(head_dim) ** -0.5)
+            attn_logits = torch.matmul(q_heads, k_heads.transpose(-2, -1)) * self._scale_factor
             attn_logits = attn_logits.masked_fill(causal_mask_view, attn_neg_inf)
             if key_padding_view is not None:
                 attn_logits = attn_logits.masked_fill(key_padding_view, attn_neg_inf)
@@ -276,27 +280,18 @@ class PPOReactiveModelScript(PPOReactiveModelBase):
             denom = topk_scores.sum(dim=-1, keepdim=True).clamp_min(1e-6)
             topk_weights = topk_scores / denom
 
-            w1_list = [
-                weights[f"transformer.layers.{layer_idx}.moe.experts.{i}.0.weight"].unsqueeze(1)
-                for i in range(num_experts)
-            ]
-            b1_list = [
-                weights[f"transformer.layers.{layer_idx}.moe.experts.{i}.0.bias"].unsqueeze(1)
-                for i in range(num_experts)
-            ]
-            w2_list = [
-                weights[f"transformer.layers.{layer_idx}.moe.experts.{i}.3.weight"].unsqueeze(1)
-                for i in range(num_experts)
-            ]
-            b2_list = [
-                weights[f"transformer.layers.{layer_idx}.moe.experts.{i}.3.bias"].unsqueeze(1)
-                for i in range(num_experts)
-            ]
-
-            all_w1 = torch.cat(w1_list, dim=1)
-            all_b1 = torch.cat(b1_list, dim=1)
-            all_w2 = torch.cat(w2_list, dim=1)
-            all_b2 = torch.cat(b2_list, dim=1)
+            all_w1 = torch.stack([
+                weights[f"transformer.layers.{layer_idx}.moe.experts.{i}.0.weight"] for i in range(num_experts)
+            ], dim=1)
+            all_b1 = torch.stack([
+                weights[f"transformer.layers.{layer_idx}.moe.experts.{i}.0.bias"] for i in range(num_experts)
+            ], dim=1)
+            all_w2 = torch.stack([
+                weights[f"transformer.layers.{layer_idx}.moe.experts.{i}.3.weight"] for i in range(num_experts)
+            ], dim=1)
+            all_b2 = torch.stack([
+                weights[f"transformer.layers.{layer_idx}.moe.experts.{i}.3.bias"] for i in range(num_experts)
+            ], dim=1)
 
             batch = x.size(0)
             local_time = x.size(1)
@@ -334,49 +329,32 @@ class PPOReactiveModelScript(PPOReactiveModelBase):
             weights["transformer.norm.bias"],
         )
 
-        action_head_outputs = torch.jit.annotate(List[torch.Tensor], [])
-        for i in range(num_experts):
-            out = _batched_linear(
-                transformer_output,
-                weights[f"action_heads.{i}.weight"],
-                weights[f"action_heads.{i}.bias"],
-            )
-            action_head_outputs.append(out)
-        action_heads_stacked = torch.stack(action_head_outputs, dim=2)
-        action_logits = _reduce_heads(action_heads_stacked, final_topk_indices, final_topk_scores)
+        B, T, H = transformer_output.shape
+        E = num_experts
 
-        opp_head_outputs = torch.jit.annotate(List[torch.Tensor], [])
-        for i in range(num_experts):
-            out = _batched_linear(
-                transformer_output,
-                weights[f"opp_action_heads.{i}.weight"],
-                weights[f"opp_action_heads.{i}.bias"],
-            )
-            opp_head_outputs.append(out)
-        opp_heads_stacked = torch.stack(opp_head_outputs, dim=2)
-        opp_logits = _reduce_heads(opp_heads_stacked, final_topk_indices, final_topk_scores)
+        action_w = torch.stack([weights[f"action_heads.{i}.weight"] for i in range(E)], dim=1)
+        action_b = torch.stack([weights[f"action_heads.{i}.bias"] for i in range(E)], dim=1)
+        opp_w = torch.stack([weights[f"opp_action_heads.{i}.weight"] for i in range(E)], dim=1)
+        opp_b = torch.stack([weights[f"opp_action_heads.{i}.bias"] for i in range(E)], dim=1)
+        reward_w = torch.stack([weights[f"reward_stream_heads.{i}.weight"] for i in range(E)], dim=1)
+        reward_b = torch.stack([weights[f"reward_stream_heads.{i}.bias"] for i in range(E)], dim=1)
+        win_w = torch.stack([weights[f"win_prob_heads.{i}.weight"] for i in range(E)], dim=1)
+        win_b = torch.stack([weights[f"win_prob_heads.{i}.bias"] for i in range(E)], dim=1)
 
-        value_head_outputs = torch.jit.annotate(List[torch.Tensor], [])
-        for i in range(num_experts):
-            out = _batched_linear(
-                transformer_output,
-                weights[f"reward_stream_heads.{i}.weight"],
-                weights[f"reward_stream_heads.{i}.bias"],
-            )
-            value_head_outputs.append(out)
-        value_heads_stacked = torch.stack(value_head_outputs, dim=2)
-        state_values = _reduce_heads(value_heads_stacked, final_topk_indices, final_topk_scores)
+        expanded_input = transformer_output.unsqueeze(1).expand(B, E, T, H)
+        # Align dtypes for matmul stability with FP16 weights
+        if expanded_input.dtype != action_w.dtype:
+            expanded_input = expanded_input.to(dtype=action_w.dtype)
 
-        win_head_outputs = torch.jit.annotate(List[torch.Tensor], [])
-        for i in range(num_experts):
-            out = _batched_linear(
-                transformer_output,
-                weights[f"win_prob_heads.{i}.weight"],
-                weights[f"win_prob_heads.{i}.bias"],
-            )
-            win_head_outputs.append(out)
-        win_heads_stacked = torch.stack(win_head_outputs, dim=2)
-        win_logits = _reduce_heads(win_heads_stacked, final_topk_indices, final_topk_scores)
+        action_stacked = torch.matmul(expanded_input, action_w.transpose(-1, -2)) + action_b.unsqueeze(2)
+        opp_stacked = torch.matmul(expanded_input, opp_w.transpose(-1, -2)) + opp_b.unsqueeze(2)
+        reward_stacked = torch.matmul(expanded_input, reward_w.transpose(-1, -2)) + reward_b.unsqueeze(2)
+        win_stacked = torch.matmul(expanded_input, win_w.transpose(-1, -2)) + win_b.unsqueeze(2)
+
+        action_logits = _reduce_heads(action_stacked.permute(0, 2, 1, 3), final_topk_indices, final_topk_scores)
+        opp_logits = _reduce_heads(opp_stacked.permute(0, 2, 1, 3), final_topk_indices, final_topk_scores)
+        state_values = _reduce_heads(reward_stacked.permute(0, 2, 1, 3), final_topk_indices, final_topk_scores)
+        win_logits = _reduce_heads(win_stacked.permute(0, 2, 1, 3), final_topk_indices, final_topk_scores)
 
         return (
             action_logits,

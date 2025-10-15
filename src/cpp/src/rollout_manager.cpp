@@ -110,6 +110,9 @@ private:
 };
 }
 
+// Static cache for parsed bot kinds (must be at global scope)
+std::unordered_map<std::string, RolloutManager::CppBotKind> RolloutManager::bot_kind_cache_;
+
 RolloutManager::RolloutManager()
     : rng_(seed_with_optional(0)) {
     if (!torch::cuda::is_available()) {
@@ -128,6 +131,15 @@ void RolloutManager::start_rollouts(int num_episodes,
                                     const std::vector<int>& opponent_labels,
                                     const std::vector<double>& opponent_weights,
                                     const std::vector<std::vector<int>>& opponent_triplets) {
+    // Reset profiling timers at the start of a rollout cycle
+    timer_total_collect_ = std::chrono::microseconds(0);
+    timer_log_rewards_ = std::chrono::microseconds(0);
+    timer_cpp_bots_ = std::chrono::microseconds(0);
+    timer_historical_total_ = std::chrono::microseconds(0);
+    timer_hist_prep_ = std::chrono::microseconds(0);
+    timer_hist_weights_ = std::chrono::microseconds(0);
+    timer_hist_model_ = std::chrono::microseconds(0);
+    timer_hist_post_ = std::chrono::microseconds(0);
     target_episodes_ = num_episodes * std::max(1, num_players);
     num_players_ = num_players;
     training_policy_ids_ = training_policy_ids;
@@ -200,19 +212,29 @@ void RolloutManager::start_rollouts(int num_episodes,
 }
 
 std::unordered_map<int, std::vector<PolicyRequest>> RolloutManager::collect_requests_for_inference() {
+    auto total_start = std::chrono::high_resolution_clock::now();
+    // Pre-allocate vectors to reduce allocations in the loop
+    static thread_local std::vector<int> policy_ids;
+    static thread_local std::vector<std::pair<int, const std::vector<PolicyRequest>*>> historical_groups;
+
     std::unordered_map<int, std::vector<PolicyRequest>> learner_requests;
 
     while (true) {
-        log_rewards_and_dones();
+        {
+            auto t0 = std::chrono::high_resolution_clock::now();
+            log_rewards_and_dones();
+            auto t1 = std::chrono::high_resolution_clock::now();
+            timer_log_rewards_ += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0);
+        }
 
         const auto& raw = arena_.collect_requests();
         if (raw.empty()) {
             break;
         }
 
-        std::vector<int> policy_ids;
+        policy_ids.clear();
         policy_ids.reserve(raw.size());
-        for (const auto& kv : raw) {
+        for (const auto& kv : raw) { // NOLINT
             policy_ids.push_back(kv.first);
         }
 
@@ -236,16 +258,23 @@ std::unordered_map<int, std::vector<PolicyRequest>> RolloutManager::collect_requ
 
             bool success = false;
             try {
+                auto t0 = std::chrono::high_resolution_clock::now();
                 auto actions = run_cpp_bot(policy_id, requests);
                 arena_.submit_actions(policy_id, actions);
                 progressed_bot = true;
                 success = true;
+                auto t1 = std::chrono::high_resolution_clock::now();
+                timer_cpp_bots_ += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0);
             } catch (const std::exception& ex) {
                 std::cerr << "[RolloutManager] Native C++ bot execution failed for policy "
                           << policy_id << ": " << ex.what() << std::endl;
+                // Count time spent in failed attempt as bot time as well
+                auto t1 = std::chrono::high_resolution_clock::now();
+                // We don't have the start time here if exception thrown before; conservatively skip
             } catch (...) {
                 std::cerr << "[RolloutManager] Native C++ bot execution failed for policy "
                           << policy_id << ": unknown error" << std::endl;
+                // Conservatively skip timing on unknown error path
             }
 
             if (!success) {
@@ -261,8 +290,7 @@ std::unordered_map<int, std::vector<PolicyRequest>> RolloutManager::collect_requ
         if (progressed_bot) {
             continue;
         }
-
-        std::vector<std::pair<int, const std::vector<PolicyRequest>*>> historical_groups;
+        historical_groups.clear();
         historical_groups.reserve(policy_ids.size());
         for (int policy_id : policy_ids) {
             if (is_training_policy(policy_id)) {
@@ -289,8 +317,13 @@ std::unordered_map<int, std::vector<PolicyRequest>> RolloutManager::collect_requ
 
         if (!historical_groups.empty()) {
             bool success = false;
+            auto h0 = std::chrono::high_resolution_clock::now();
             try {
-                auto action_map = run_batched_historical_inference(historical_groups);
+                auto action_map = run_batched_historical_inference(historical_groups,
+                                                                   timer_hist_prep_,
+                                                                   timer_hist_weights_,
+                                                                   timer_hist_model_,
+                                                                   timer_hist_post_);
                 for (auto& kv : action_map) {
                     arena_.submit_actions(kv.first, kv.second);
                 }
@@ -302,6 +335,8 @@ std::unordered_map<int, std::vector<PolicyRequest>> RolloutManager::collect_requ
                 std::cerr << "[RolloutManager] Historical batch inference failed: unknown error"
                           << std::endl;
             }
+            auto h1 = std::chrono::high_resolution_clock::now();
+            timer_historical_total_ += std::chrono::duration_cast<std::chrono::microseconds>(h1 - h0);
 
             if (!success) {
                 for (const auto& group : historical_groups) {
@@ -330,6 +365,8 @@ std::unordered_map<int, std::vector<PolicyRequest>> RolloutManager::collect_requ
         break;
     }
 
+    auto total_end = std::chrono::high_resolution_clock::now();
+    timer_total_collect_ += std::chrono::duration_cast<std::chrono::microseconds>(total_end - total_start);
     return learner_requests;
 }
 
@@ -418,6 +455,47 @@ std::vector<TrajectoryData> RolloutManager::get_completed_episodes() {
         if (target_episodes_ > 0 && out.size() > static_cast<size_t>(target_episodes_)) {
             out.resize(static_cast<size_t>(target_episodes_));
         }
+    }
+    if (timer_total_collect_.count() > 0) {
+        const auto total_us = timer_total_collect_.count();
+        std::cout << "\n--- C++ Rollout Performance Summary ---\n"
+                  << "Total time in collect_requests: " << total_us << " us\n"
+                  << "  - Log Rewards & Dones: " << timer_log_rewards_.count() << " us ("
+                  << (total_us > 0 ? (100.0 * static_cast<double>(timer_log_rewards_.count()) / static_cast<double>(total_us)) : 0.0)
+                  << "%)\n"
+                  << "  - C++ Bot Execution: " << timer_cpp_bots_.count() << " us ("
+                  << (total_us > 0 ? (100.0 * static_cast<double>(timer_cpp_bots_.count()) / static_cast<double>(total_us)) : 0.0)
+                  << "%)\n"
+                  << "  - Historical Inference (Total): " << timer_historical_total_.count() << " us ("
+                  << (total_us > 0 ? (100.0 * static_cast<double>(timer_historical_total_.count()) / static_cast<double>(total_us)) : 0.0)
+                  << "%)\n";
+
+        if (timer_historical_total_.count() > 0) {
+            const auto hist_total_us = timer_historical_total_.count();
+            std::cout << "    - Hist. Prep Batch: " << timer_hist_prep_.count() << " us ("
+                      << (hist_total_us > 0 ? (100.0 * static_cast<double>(timer_hist_prep_.count()) / static_cast<double>(hist_total_us)) : 0.0)
+                      << "% of Hist.)\n"
+                      << "    - Hist. Prep Weights: " << timer_hist_weights_.count() << " us ("
+                      << (hist_total_us > 0 ? (100.0 * static_cast<double>(timer_hist_weights_.count()) / static_cast<double>(hist_total_us)) : 0.0)
+                      << "% of Hist.)\n"
+                      << "    - Hist. Model Execution: " << timer_hist_model_.count() << " us ("
+                      << (hist_total_us > 0 ? (100.0 * static_cast<double>(timer_hist_model_.count()) / static_cast<double>(hist_total_us)) : 0.0)
+                      << "% of Hist.)\n"
+                      << "    - Hist. Post-Processing: " << timer_hist_post_.count() << " us ("
+                      << (hist_total_us > 0 ? (100.0 * static_cast<double>(timer_hist_post_.count()) / static_cast<double>(hist_total_us)) : 0.0)
+                      << "% of Hist.)\n";
+        }
+        std::cout << "---------------------------------------\n" << std::endl;
+
+        // Reset timers for the next cycle
+        timer_total_collect_ = std::chrono::microseconds(0);
+        timer_log_rewards_ = std::chrono::microseconds(0);
+        timer_cpp_bots_ = std::chrono::microseconds(0);
+        timer_historical_total_ = std::chrono::microseconds(0);
+        timer_hist_prep_ = std::chrono::microseconds(0);
+        timer_hist_weights_ = std::chrono::microseconds(0);
+        timer_hist_model_ = std::chrono::microseconds(0);
+        timer_hist_post_ = std::chrono::microseconds(0);
     }
     return out;
 }
@@ -798,7 +876,11 @@ void RolloutManager::rebuild_historical_weight_cache() {
 }
 
 std::unordered_map<int, std::vector<uint8_t>> RolloutManager::run_batched_historical_inference(
-    const std::vector<std::pair<int, const std::vector<PolicyRequest>*>>& grouped) {
+    const std::vector<std::pair<int, const std::vector<PolicyRequest>*>>& grouped,
+    std::chrono::microseconds& prep_time_acc,
+    std::chrono::microseconds& weight_time_acc,
+    std::chrono::microseconds& model_time_acc,
+    std::chrono::microseconds& post_time_acc) {
     std::unordered_map<int, std::vector<uint8_t>> results;
     if (grouped.empty()) {
         return results;
@@ -864,110 +946,143 @@ std::unordered_map<int, std::vector<uint8_t>> RolloutManager::run_batched_histor
             continue;
         }
 
-        const int64_t batch_size = static_cast<int64_t>(ref_indices.size());
         const int64_t target_pad_len = std::min<int64_t>(kBucketBounds[bucket_idx], max_limit);
 
-        std::vector<PolicyRequest> batch_requests;
-        batch_requests.reserve(ref_indices.size());
-        std::vector<size_t> sequential_indices(ref_indices.size());
-        std::iota(sequential_indices.begin(), sequential_indices.end(), 0);
-        std::vector<int64_t> policy_cache_indices;
-        policy_cache_indices.reserve(ref_indices.size());
+        // Define batch size buckets to standardize shapes for JIT
+        constexpr std::array<int64_t, 7> kBatchSizeBuckets{{8, 16, 32, 64, 128, 256, 512}};
 
-        for (size_t pos = 0; pos < ref_indices.size(); ++pos) {
-            const auto& ref = refs[ref_indices[pos]];
-            batch_requests.push_back(*ref.request);
-            auto model_it = historical_models_.find(ref.policy_id);
-            if (model_it == historical_models_.end() || model_it->second.cache_index < 0) {
-                throw std::runtime_error("Missing cached weights for historical policy");
+        size_t offset = 0;
+        while (offset < ref_indices.size()) {
+            const size_t remaining = ref_indices.size() - offset;
+            int64_t take = static_cast<int64_t>(remaining);
+            // Select largest bucket <= remaining
+            for (size_t i = 0; i < kBatchSizeBuckets.size(); ++i) {
+                const int64_t candidate = kBatchSizeBuckets[kBatchSizeBuckets.size() - 1 - i];
+                if (candidate <= static_cast<int64_t>(remaining)) {
+                    take = candidate;
+                    break;
+                }
             }
-            policy_cache_indices.push_back(static_cast<int64_t>(model_it->second.cache_index));
-        }
 
-        auto tensor_batch =
-            prepare_inference_batch(batch_requests, target_pad_len, kInferenceDevice, sequential_indices);
-        // Historical weights are cached in FP16; match input dtype to avoid JIT dtype errors.
-        if (tensor_batch.obs_sequence.dtype() != torch::kFloat16) {
-            tensor_batch.obs_sequence = tensor_batch.obs_sequence.to(torch::kFloat16);
-        }
+            const int64_t batch_size = take;
 
-        auto policy_index_tensor = torch::tensor(policy_cache_indices, opts_long_device);
+            std::vector<PolicyRequest> batch_requests;
+            batch_requests.reserve(static_cast<size_t>(take));
+            std::vector<size_t> sequential_indices(static_cast<size_t>(take));
+            std::iota(sequential_indices.begin(), sequential_indices.end(), 0);
+            std::vector<int64_t> policy_cache_indices;
+            policy_cache_indices.reserve(static_cast<size_t>(take));
 
-        c10::Dict<std::string, torch::Tensor> weight_dict;
-        for (const auto& kv : historical_weight_cache_fp16_) {
-            auto selected = kv.second.index_select(0, policy_index_tensor).contiguous();
-            weight_dict.insert(kv.first, selected);
-        }
+            auto prep_t0 = std::chrono::high_resolution_clock::now();
+            for (size_t pos = 0; pos < static_cast<size_t>(take); ++pos) {
+                const auto& ref = refs[ref_indices[offset + pos]];
+                batch_requests.push_back(*ref.request);
+                auto model_it = historical_models_.find(ref.policy_id);
+                if (model_it == historical_models_.end() || model_it->second.cache_index < 0) {
+                    throw std::runtime_error("Missing cached weights for historical policy");
+                }
+                policy_cache_indices.push_back(static_cast<int64_t>(model_it->second.cache_index));
+            }
 
-        int module_policy = refs[ref_indices.front()].policy_id;
-        auto module_it = historical_models_.find(module_policy);
-        if (module_it == historical_models_.end() || !module_it->second.module) {
-            throw std::runtime_error("Historical module missing for policy");
-        }
+            auto tensor_batch =
+                prepare_inference_batch(batch_requests, target_pad_len, kInferenceDevice, sequential_indices);
+            // Historical weights are cached in FP16; match input dtype to avoid JIT dtype errors.
+            if (tensor_batch.obs_sequence.dtype() != torch::kFloat16) {
+                tensor_batch.obs_sequence = tensor_batch.obs_sequence.to(torch::kFloat16);
+            }
+            auto prep_t1 = std::chrono::high_resolution_clock::now();
+            prep_time_acc += std::chrono::duration_cast<std::chrono::microseconds>(prep_t1 - prep_t0);
 
-        auto method = module_it->second.module->find_method("forward_packed");
-        if (!method) {
-            throw std::runtime_error("Historical module does not expose forward_packed");
-        }
+            auto weights_t0 = std::chrono::high_resolution_clock::now();
+            auto policy_index_tensor = torch::tensor(policy_cache_indices, opts_long_device);
 
-        std::vector<torch::jit::IValue> inputs;
-        inputs.reserve(7);
-        inputs.emplace_back(tensor_batch.obs_sequence);
-        inputs.emplace_back(tensor_batch.action_sequence);
-        inputs.emplace_back(tensor_batch.agent_types);
-        inputs.emplace_back(tensor_batch.positions);
-        inputs.emplace_back(weight_dict);
-        inputs.emplace_back(tensor_batch.action_masks);
-        inputs.emplace_back(tensor_batch.padding_mask);
+            c10::Dict<std::string, torch::Tensor> weight_dict;
+            for (const auto& kv : historical_weight_cache_fp16_) {
+                auto selected = kv.second.index_select(0, policy_index_tensor).contiguous();
+                weight_dict.insert(kv.first, selected);
+            }
+            auto weights_t1 = std::chrono::high_resolution_clock::now();
+            weight_time_acc += std::chrono::duration_cast<std::chrono::microseconds>(weights_t1 - weights_t0);
 
-        auto outputs_iv = method->operator()(inputs);
-        auto outputs = outputs_iv.toTuple();
-        if (!outputs || outputs->elements().size() < 3) {
-            throw std::runtime_error("Historical model returned unexpected output shape");
-        }
+            int module_policy = refs[ref_indices[offset]].policy_id;
+            auto module_it = historical_models_.find(module_policy);
+            if (module_it == historical_models_.end() || !module_it->second.module) {
+                throw std::runtime_error("Historical module missing for policy");
+            }
 
-        auto action_logits = outputs->elements()[0].toTensor().contiguous();
-        auto valid_lengths_device = tensor_batch.valid_lengths;
+            auto method = module_it->second.module->find_method("forward_packed");
+            if (!method) {
+                throw std::runtime_error("Historical module does not expose forward_packed");
+            }
 
-        auto batch_indices = torch::arange(batch_size, opts_long_device);
-        auto last_indices = (valid_lengths_device - 1).clamp_min(0);
-        auto last_logits = action_logits.index({batch_indices, last_indices}).contiguous();
-        auto last_masks = tensor_batch.action_masks.index({batch_indices, last_indices}).contiguous();
+            std::vector<torch::jit::IValue> inputs;
+            inputs.reserve(7);
+            inputs.emplace_back(tensor_batch.obs_sequence);
+            inputs.emplace_back(tensor_batch.action_sequence);
+            inputs.emplace_back(tensor_batch.agent_types);
+            inputs.emplace_back(tensor_batch.positions);
+            inputs.emplace_back(weight_dict);
+            inputs.emplace_back(tensor_batch.action_masks);
+            inputs.emplace_back(tensor_batch.padding_mask);
 
-        auto has_legal = last_masks.any(1);
-        if (!has_legal.all().item<bool>()) {
-            auto fallback_indices = has_legal.logical_not().nonzero().flatten();
-            for (int64_t i = 0; i < fallback_indices.size(0); ++i) {
-                const int64_t row = fallback_indices[i].item<int64_t>();
-                auto mask_row_tensor = last_masks.select(0, row);
-                mask_row_tensor.fill_(false);
-                bool assigned = false;
-                const auto& ref = refs[ref_indices[static_cast<size_t>(row)]];
-                const auto& req = *ref.request;
-                for (int j = 0; j < 7; ++j) {
-                    if (req.mask[j]) {
-                        mask_row_tensor.index_put_({j}, true);
-                        assigned = true;
+            auto model_t0 = std::chrono::high_resolution_clock::now();
+            auto outputs_iv = method->operator()(inputs);
+            auto outputs = outputs_iv.toTuple();
+            if (!outputs || outputs->elements().size() < 3) {
+                throw std::runtime_error("Historical model returned unexpected output shape");
+            }
+            auto model_t1 = std::chrono::high_resolution_clock::now();
+            model_time_acc += std::chrono::duration_cast<std::chrono::microseconds>(model_t1 - model_t0);
+
+            auto post_t0 = std::chrono::high_resolution_clock::now();
+            auto action_logits = outputs->elements()[0].toTensor().contiguous();
+            auto valid_lengths_device = tensor_batch.valid_lengths;
+
+            auto batch_indices = torch::arange(batch_size, opts_long_device);
+            auto last_indices = (valid_lengths_device - 1).clamp_min(0);
+            auto last_logits = action_logits.index({batch_indices, last_indices}).contiguous();
+            auto last_masks = tensor_batch.action_masks.index({batch_indices, last_indices}).contiguous();
+
+            auto has_legal = last_masks.any(1);
+            if (!has_legal.all().item<bool>()) {
+                auto fallback_indices = has_legal.logical_not().nonzero().flatten();
+                for (int64_t i = 0; i < fallback_indices.size(0); ++i) {
+                    const int64_t row = fallback_indices[i].item<int64_t>();
+                    auto mask_row_tensor = last_masks.select(0, row);
+                    mask_row_tensor.fill_(false);
+                    bool assigned = false;
+                    const auto& ref = refs[ref_indices[offset + static_cast<size_t>(row)]];
+                    const auto& req = *ref.request;
+                    for (int j = 0; j < 7; ++j) {
+                        if (req.mask[j]) {
+                            mask_row_tensor.index_put_({j}, true);
+                            assigned = true;
+                        }
                     }
+                    if (!assigned) {
+                        mask_row_tensor.fill_(true);
+                    }
+                    last_logits.select(0, row).fill_(0.0f);
                 }
-                if (!assigned) {
-                    mask_row_tensor.fill_(true);
-                }
-                last_logits.select(0, row).fill_(0.0f);
             }
-        }
 
-        last_logits.masked_fill_(~last_masks, -std::numeric_limits<float>::infinity());
+            last_logits.masked_fill_(~last_masks, -std::numeric_limits<float>::infinity());
 
-        // Sample actions in FP32 for numerical stability.
-        auto probs = torch::softmax(last_logits.to(torch::kFloat32), /*dim=*/1);
-        auto actions_tensor = torch::multinomial(probs, /*num_samples=*/1);
-        actions_tensor = actions_tensor.squeeze(-1).to(torch::kCPU);
+            // Sample actions in FP32 for numerical stability.
+            auto probs = torch::softmax(last_logits.to(torch::kFloat32), /*dim=*/1);
+            auto actions_tensor = torch::multinomial(probs, /*num_samples=*/1);
+            actions_tensor = actions_tensor.squeeze(-1).to(torch::kCPU);
 
-        auto actions_ptr = actions_tensor.data_ptr<int64_t>();
-        for (size_t pos = 0; pos < ref_indices.size(); ++pos) {
-            const auto& ref = refs[ref_indices[pos]];
-            results[ref.policy_id][ref.request_index] = static_cast<uint8_t>(actions_ptr[pos]);
+            auto actions_ptr = actions_tensor.data_ptr<int64_t>();
+            for (size_t pos = 0; pos < static_cast<size_t>(take); ++pos) {
+                const auto& ref = refs[ref_indices[offset + pos]];
+                results[ref.policy_id][ref.request_index] = static_cast<uint8_t>(actions_ptr[pos]);
+            }
+
+            auto post_t1 = std::chrono::high_resolution_clock::now();
+            post_time_acc += std::chrono::duration_cast<std::chrono::microseconds>(post_t1 - post_t0);
+
+            offset += static_cast<size_t>(take);
         }
     }
 
@@ -1113,29 +1228,38 @@ std::vector<uint8_t> RolloutManager::run_cpp_bot(int policy_id, const std::vecto
 }
 
 RolloutManager::CppBotKind RolloutManager::parse_cpp_bot_kind(const std::string& name) {
+    auto cache_it = bot_kind_cache_.find(name);
+    if (cache_it != bot_kind_cache_.end()) {
+        return cache_it->second;
+    }
+
     std::string lower;
     lower.reserve(name.size());
     for (char c : name) {
         lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
     }
 
+    CppBotKind kind;
     if (lower == "classic") {
-        return CppBotKind::Classic;
+        kind = CppBotKind::Classic;
     } else if (lower == "greedycardspammer") {
-        return CppBotKind::GreedyCardSpammer;
+        kind = CppBotKind::GreedyCardSpammer;
     } else if (lower == "randomagent") {
-        return CppBotKind::RandomAgent;
+        kind = CppBotKind::RandomAgent;
     } else if (lower == "selectivetableconservativechallenger") {
-        return CppBotKind::SelectiveTableConservativeChallenger;
+        kind = CppBotKind::SelectiveTableConservativeChallenger;
     } else if (lower == "strategicchallenger") {
-        return CppBotKind::StrategicChallenger;
+        kind = CppBotKind::StrategicChallenger;
     } else if (lower == "tablefirstconservativechallenger") {
-        return CppBotKind::TableFirstConservativeChallenger;
+        kind = CppBotKind::TableFirstConservativeChallenger;
     } else if (lower == "tablenontableagent") {
-        return CppBotKind::TableNonTableAgent;
+        kind = CppBotKind::TableNonTableAgent;
+    } else {
+        throw std::invalid_argument("Unknown C++ bot name: " + name);
     }
 
-    throw std::invalid_argument("Unknown C++ bot name: " + name);
+    bot_kind_cache_[name] = kind;
+    return kind;
 }
 
 std::unique_ptr<CppBotBase> RolloutManager::make_cpp_bot_instance(RolloutManager::CppBotKind kind,
