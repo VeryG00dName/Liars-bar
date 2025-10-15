@@ -192,3 +192,4 @@ CODING_GUIDELINES.md
 /persistent_cache
 *.max_seq_length
 CLAUDE.md
+*.txt

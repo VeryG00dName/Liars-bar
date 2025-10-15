@@ -19,6 +19,7 @@ void bind_eval_manager(py::module_& m) {
         .def("set_max_env_batch", &EvalManager::set_max_env_batch, py::arg("max_batch"))
         .def("set_inference_batch_size", &EvalManager::set_inference_batch_size, py::arg("batch_size"))
         .def("load_model", &EvalManager::load_model, py::arg("policy_id"), py::arg("path"))
+        .def("finalize_model_loading", &EvalManager::finalize_model_loading)
         .def("register_cpp_bot", &EvalManager::register_cpp_bot,
              py::arg("policy_id"), py::arg("name"))
         .def("get_last_performance_stats", &EvalManager::get_last_performance_stats)

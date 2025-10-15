@@ -13,6 +13,7 @@
 #include <unordered_set>
 
 #include <torch/torch.h>
+#include <torch/indexing.h>
 
 #include "bots.h"
 #include "torch_utils.h"
@@ -199,10 +200,29 @@ void EvalManager::load_model(int policy_id, const std::string& path) {
         auto module = std::make_shared<torch::jit::Module>(torch::jit::load(path));
         module->to(kInferenceDevice);
         module->eval();
-        models_[policy_id] = std::move(module);
+
+        torch::NoGradGuard guard;
+        auto params = module->named_parameters(/*recurse=*/true);
+        std::unordered_map<std::string, torch::Tensor> state_dict;
+        state_dict.reserve(params.size());
+        for (const auto& item : params) {
+            auto tensor = item.value
+                              .detach()
+                              .to(kInferenceDevice, /*non_blocking=*/false, /*copy=*/true)
+                              .to(torch::kFloat16)
+                              .contiguous();
+            state_dict.emplace(item.name, std::move(tensor));
+        }
+
+        staged_state_dicts_[policy_id] = std::move(state_dict);
+        if (!representative_module_) {
+            representative_module_ = std::move(module);
+        }
+
         int max_seq_length = infer_max_seq_length_for_model(path);
         policy_max_sequence_lengths_[policy_id] = max_seq_length;
         arena_.set_policy_max_sequence_length(policy_id, max_seq_length);
+        weights_finalized_ = false;
     } catch (const c10::Error& err) {
         std::cerr << "[EvalManager] Failed to load TorchScript module from '" << path
                   << "': " << err.what_without_backtrace() << std::endl;
@@ -212,6 +232,107 @@ void EvalManager::load_model(int policy_id, const std::string& path) {
                   << "': " << err.what() << std::endl;
         throw;
     }
+}
+
+void EvalManager::finalize_model_loading() {
+    torch::NoGradGuard guard;
+
+    batched_weight_cache_.clear();
+    policy_id_to_cache_index_.clear();
+
+    if (staged_state_dicts_.empty()) {
+        weights_finalized_ = true;
+        return;
+    }
+
+    if (!representative_module_) {
+        throw std::runtime_error(
+            "No representative TorchScript module loaded before finalizing weights");
+    }
+
+    std::vector<int> policy_ids;
+    policy_ids.reserve(staged_state_dicts_.size());
+    for (const auto& kv : staged_state_dicts_) {
+        policy_ids.push_back(kv.first);
+    }
+    std::sort(policy_ids.begin(), policy_ids.end());
+
+    std::unordered_map<std::string, std::vector<torch::Tensor>> stacked;
+    for (size_t idx = 0; idx < policy_ids.size(); ++idx) {
+        int policy_id = policy_ids[idx];
+        policy_id_to_cache_index_[policy_id] = static_cast<int>(idx);
+        auto dict_it = staged_state_dicts_.find(policy_id);
+        if (dict_it == staged_state_dicts_.end()) {
+            throw std::runtime_error("Missing staged weights for policy " + std::to_string(policy_id));
+        }
+        for (const auto& kv : dict_it->second) {
+            stacked[kv.first].push_back(kv.second);
+        }
+    }
+
+    batched_weight_cache_.reserve(stacked.size());
+    for (auto& kv : stacked) {
+        batched_weight_cache_[kv.first] = torch::stack(kv.second).contiguous();
+    }
+
+    std::vector<std::string> original_keys;
+    original_keys.reserve(batched_weight_cache_.size());
+    for (const auto& kv : batched_weight_cache_) {
+        original_keys.push_back(kv.first);
+    }
+
+    using torch::indexing::Slice;
+    auto replace_suffix = [](const std::string& s, const std::string& from, const std::string& to) {
+        const auto pos = s.rfind(from);
+        if (pos == std::string::npos) {
+            return s;
+        }
+        std::string out = s;
+        out.replace(pos, from.size(), to);
+        return out;
+    };
+
+    for (const auto& key : original_keys) {
+        if (key.find(".self_attn.in_proj_weight") != std::string::npos) {
+            auto it = batched_weight_cache_.find(key);
+            if (it == batched_weight_cache_.end()) {
+                continue;
+            }
+            const auto& w = it->second;
+            if (w.dim() != 3 || w.size(1) % 3 != 0) {
+                continue;
+            }
+            const int64_t H = w.size(1) / 3;
+            auto q = w.index({Slice(), Slice(0, H), Slice()}).contiguous();
+            auto k = w.index({Slice(), Slice(H, 2 * H), Slice()}).contiguous();
+            auto v = w.index({Slice(), Slice(2 * H, 3 * H), Slice()}).contiguous();
+            batched_weight_cache_[replace_suffix(key, "in_proj_weight", "q_proj.weight")] = q;
+            batched_weight_cache_[replace_suffix(key, "in_proj_weight", "k_proj.weight")] = k;
+            batched_weight_cache_[replace_suffix(key, "in_proj_weight", "v_proj.weight")] = v;
+            continue;
+        }
+
+        if (key.find(".self_attn.in_proj_bias") != std::string::npos) {
+            auto it = batched_weight_cache_.find(key);
+            if (it == batched_weight_cache_.end()) {
+                continue;
+            }
+            const auto& b = it->second;
+            if (b.dim() != 2 || b.size(1) % 3 != 0) {
+                continue;
+            }
+            const int64_t H = b.size(1) / 3;
+            auto q = b.index({Slice(), Slice(0, H)}).contiguous();
+            auto k = b.index({Slice(), Slice(H, 2 * H)}).contiguous();
+            auto v = b.index({Slice(), Slice(2 * H, 3 * H)}).contiguous();
+            batched_weight_cache_[replace_suffix(key, "in_proj_bias", "q_proj.bias")] = q;
+            batched_weight_cache_[replace_suffix(key, "in_proj_bias", "k_proj.bias")] = k;
+            batched_weight_cache_[replace_suffix(key, "in_proj_bias", "v_proj.bias")] = v;
+            continue;
+        }
+    }
+
+    weights_finalized_ = true;
 }
 
 void EvalManager::register_cpp_bot(int policy_id, const std::string& bot_name) {
@@ -338,60 +459,75 @@ EvalOutcome EvalManager::run_roles(const std::vector<std::vector<int>>& roles,
             throw std::runtime_error("Simulation deadlock: no pending AI requests but games remain active");
         }
 
-        int priority_model_id = -1;
-        size_t max_requests = 0;
+        size_t total_pending_requests = 0;
+        for (const auto& kv : pending) {
+            total_pending_requests += kv.second.size();
+        }
+
+        std::vector<RequestRef> historical_refs;
+        historical_refs.reserve(total_pending_requests);
+        std::unordered_map<int, std::vector<uint8_t>> historical_actions;
+        std::unordered_map<int, std::vector<uint8_t>> cpp_actions;
+
         for (const auto& kv : pending) {
             int policy_id = kv.first;
-            if (kv.second.size() > max_requests) {
-                if (models_.find(policy_id) == models_.end()) {
-                    throw std::runtime_error("No registered model for policy " + std::to_string(policy_id));
+            const auto& requests = kv.second;
+            if (requests.empty()) {
+                continue;
+            }
+
+            auto cache_it = policy_id_to_cache_index_.find(policy_id);
+            if (cache_it == policy_id_to_cache_index_.end()) {
+                auto cpp_it = cpp_bot_registry_.find(policy_id);
+                if (cpp_it != cpp_bot_registry_.end()) {
+                    cpp_actions[policy_id] = run_cpp_bot(policy_id, requests);
+                    continue;
                 }
-                priority_model_id = policy_id;
-                max_requests = kv.second.size();
+                throw std::runtime_error("No registered weights for policy " + std::to_string(policy_id));
+            }
+
+            auto inserted = historical_actions.emplace(policy_id, std::vector<uint8_t>(requests.size(), 0));
+            if (!inserted.second) {
+                inserted.first->second.resize(requests.size());
+            }
+            for (size_t idx = 0; idx < requests.size(); ++idx) {
+                historical_refs.push_back(RequestRef{policy_id, idx, &requests[idx]});
             }
         }
 
-        if (priority_model_id < 0) {
-            throw std::runtime_error("No eligible model found to service pending requests");
+        if (!historical_refs.empty()) {
+            if (!weights_finalized_) {
+                throw std::runtime_error(
+                    "EvalManager::finalize_model_loading must be called before running inference");
+            }
+
+            auto model_start = Clock::now();
+            run_packed_historical_inference(historical_refs, historical_actions);
+            auto model_end = Clock::now();
+            timer_model_inference_ += std::chrono::duration_cast<Microseconds>(model_end - model_start);
         }
-
-        auto model_it = models_.find(priority_model_id);
-        if (model_it == models_.end()) {
-            throw std::runtime_error("No registered model for policy " + std::to_string(priority_model_id));
-        }
-
-        auto pending_it = pending.find(priority_model_id);
-        std::vector<PolicyRequest> priority_requests = pending_it->second;
-
-        std::vector<uint8_t> aggregated_actions;
-        aggregated_actions.reserve(priority_requests.size());
-
-        auto model_start = Clock::now();
-        size_t offset = 0;
-        const size_t batch_limit = static_cast<size_t>(std::max(1, inference_batch_size_));
-        while (offset < priority_requests.size()) {
-            size_t remaining = priority_requests.size() - offset;
-            size_t take = std::min(remaining, batch_limit);
-            std::vector<PolicyRequest> chunk(priority_requests.begin() + static_cast<std::ptrdiff_t>(offset),
-                                             priority_requests.begin() + static_cast<std::ptrdiff_t>(offset + take));
-            auto actions = run_model(*model_it->second, chunk);
-            aggregated_actions.insert(aggregated_actions.end(), actions.begin(), actions.end());
-            offset += take;
-        }
-        auto model_end = Clock::now();
-        timer_model_inference_ += std::chrono::duration_cast<Microseconds>(model_end - model_start);
 
         auto submit_start = Clock::now();
-        arena_.submit_actions(priority_model_id, aggregated_actions);
-        for (const auto& req : priority_requests) {
-            int env_idx = req.env;
-            if (env_idx >= 0 && env_idx < arena_.B) {
-                if (arena_.done[env_idx] && !env_completed[static_cast<size_t>(env_idx)]) {
-                    env_completed[static_cast<size_t>(env_idx)] = 1;
-                    ++completed_games;
+        for (const auto& kv : historical_actions) {
+            arena_.submit_actions(kv.first, kv.second);
+        }
+        for (const auto& kv : cpp_actions) {
+            arena_.submit_actions(kv.first, kv.second);
+        }
+
+        for (const auto& kv : pending) {
+            const auto& requests = kv.second;
+            for (const auto& req : requests) {
+                int env_idx = req.env;
+                if (env_idx >= 0 && env_idx < arena_.B) {
+                    if (arena_.done[env_idx] && !env_completed[static_cast<size_t>(env_idx)]) {
+                        env_completed[static_cast<size_t>(env_idx)] = 1;
+                        ++completed_games;
+                    }
                 }
             }
         }
+
         auto submit_end = Clock::now();
         timer_arena_stepping_ += std::chrono::duration_cast<Microseconds>(submit_end - submit_start);
     }
@@ -466,81 +602,138 @@ EvalOutcome EvalManager::run_roles(const std::vector<std::vector<int>>& roles,
     return outcome;
 }
 
-std::vector<uint8_t> EvalManager::run_model(torch::jit::Module& module,
-                                            const std::vector<PolicyRequest>& requests) {
-    if (requests.empty()) {
-        return {};
+void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>& refs,
+                                                  std::unordered_map<int, std::vector<uint8_t>>& out_actions) {
+    if (refs.empty()) {
+        return;
+    }
+
+    if (!representative_module_) {
+        throw std::runtime_error("No representative module available for inference");
+    }
+    auto method = representative_module_->find_method("forward_packed");
+    if (!method) {
+        throw std::runtime_error("Representative module does not expose forward_packed");
+    }
+    if (batched_weight_cache_.empty()) {
+        throw std::runtime_error("Historical weight cache is empty");
     }
 
     torch::NoGradGuard no_grad;
 
-    const int64_t batch_size = static_cast<int64_t>(requests.size());
-    auto tensor_batch = prepare_inference_batch(requests, kInferenceDevice);
-
     auto opts_long_device = torch::TensorOptions().dtype(torch::kInt64).device(kInferenceDevice);
-    auto& obs_sequence = tensor_batch.obs_sequence;
-    auto& action_sequence = tensor_batch.action_sequence;
-    auto& agent_types = tensor_batch.agent_types;
-    auto& positions = tensor_batch.positions;
-    auto& action_masks = tensor_batch.action_masks;
-    auto& padding_mask = tensor_batch.padding_mask;
-    auto valid_lengths_device = tensor_batch.valid_lengths;
+    const size_t batch_limit = static_cast<size_t>(std::max(1, inference_batch_size_));
 
-    std::vector<torch::jit::IValue> inputs;
-    inputs.reserve(6);
-    inputs.emplace_back(obs_sequence);
-    inputs.emplace_back(action_sequence);
-    inputs.emplace_back(agent_types);
-    inputs.emplace_back(positions);
-    inputs.emplace_back(action_masks);
-    inputs.emplace_back(padding_mask);
+    size_t offset = 0;
+    while (offset < refs.size()) {
+        size_t remaining = refs.size() - offset;
+        size_t take = std::min(remaining, batch_limit);
 
-    auto outputs = module.forward(inputs).toTuple();
-    if (!outputs || outputs->elements().size() < 1) {
-        throw std::runtime_error("TorchScript model returned unexpected output");
-    }
+        std::vector<PolicyRequest> batch_requests;
+        batch_requests.reserve(take);
+        std::vector<const RequestRef*> batch_refs;
+        batch_refs.reserve(take);
+        std::vector<int64_t> cache_indices;
+        cache_indices.reserve(take);
 
-    auto action_logits = outputs->elements()[0].toTensor().contiguous();
-
-    auto batch_indices = torch::arange(batch_size, opts_long_device);
-    auto last_indices = (valid_lengths_device - 1).clamp_min(0);
-    auto last_logits = action_logits.index({batch_indices, last_indices}).contiguous();
-    auto last_masks = action_masks.index({batch_indices, last_indices}).contiguous();
-
-    auto has_legal = last_masks.any(1);
-    if (!has_legal.all().item<bool>()) {
-        auto fallback_indices = has_legal.logical_not().nonzero().flatten();
-        for (int64_t i = 0; i < fallback_indices.size(0); ++i) {
-            const int64_t row = fallback_indices[i].item<int64_t>();
-            auto mask_row_tensor = last_masks.select(0, row);
-            mask_row_tensor.fill_(false);
-            bool assigned = false;
-            const auto& req = requests[static_cast<size_t>(row)];
-            for (int j = 0; j < 7; ++j) {
-                if (req.mask[j]) {
-                    mask_row_tensor.index_put_({j}, true);
-                    assigned = true;
-                }
+        for (size_t i = 0; i < take; ++i) {
+            const RequestRef& ref = refs[offset + i];
+            batch_requests.push_back(*ref.request);
+            batch_refs.push_back(&ref);
+            auto cache_it = policy_id_to_cache_index_.find(ref.policy_id);
+            if (cache_it == policy_id_to_cache_index_.end()) {
+                throw std::runtime_error("Missing cache index for policy " + std::to_string(ref.policy_id));
             }
-            if (!assigned) {
-                mask_row_tensor.fill_(true);
-            }
-            last_logits.select(0, row).fill_(0.0f);
+            cache_indices.push_back(static_cast<int64_t>(cache_it->second));
         }
+
+        auto tensor_batch = prepare_inference_batch(batch_requests, kInferenceDevice);
+        if (!tensor_batch.obs_sequence.defined()) {
+            offset += take;
+            continue;
+        }
+
+        if (tensor_batch.obs_sequence.dtype() != torch::kFloat16) {
+            tensor_batch.obs_sequence = tensor_batch.obs_sequence.to(torch::kFloat16);
+        }
+
+        auto policy_index_tensor = torch::tensor(cache_indices, opts_long_device);
+
+        c10::Dict<std::string, torch::Tensor> weight_dict;
+        weight_dict.reserve(batched_weight_cache_.size());
+        for (const auto& kv : batched_weight_cache_) {
+            auto selected = kv.second.index_select(0, policy_index_tensor).contiguous();
+            weight_dict.insert(kv.first, selected);
+        }
+
+        std::vector<torch::jit::IValue> inputs;
+        inputs.reserve(7);
+        inputs.emplace_back(tensor_batch.obs_sequence);
+        inputs.emplace_back(tensor_batch.action_sequence);
+        inputs.emplace_back(tensor_batch.agent_types);
+        inputs.emplace_back(tensor_batch.positions);
+        inputs.emplace_back(weight_dict);
+        inputs.emplace_back(tensor_batch.action_masks);
+        inputs.emplace_back(tensor_batch.padding_mask);
+
+        auto outputs_iv = method->operator()(inputs);
+        auto outputs = outputs_iv.toTuple();
+        if (!outputs || outputs->elements().empty()) {
+            throw std::runtime_error("forward_packed returned unexpected output");
+        }
+
+        auto action_logits = outputs->elements()[0].toTensor().contiguous();
+        auto valid_lengths_device = tensor_batch.valid_lengths;
+
+        const int64_t batch_size = static_cast<int64_t>(take);
+        auto batch_indices = torch::arange(batch_size, opts_long_device);
+        auto last_indices = (valid_lengths_device - 1).clamp_min(0);
+        auto last_logits = action_logits.index({batch_indices, last_indices}).contiguous();
+        auto last_masks = tensor_batch.action_masks.index({batch_indices, last_indices}).contiguous();
+
+        auto has_legal = last_masks.any(1);
+        if (!has_legal.all().item<bool>()) {
+            auto fallback_indices = has_legal.logical_not().nonzero().flatten();
+            for (int64_t i = 0; i < fallback_indices.size(0); ++i) {
+                const int64_t row = fallback_indices[i].item<int64_t>();
+                auto mask_row_tensor = last_masks.select(0, row);
+                mask_row_tensor.fill_(false);
+                bool assigned = false;
+                const auto& ref = *batch_refs[static_cast<size_t>(row)];
+                const auto& req = *ref.request;
+                for (int j = 0; j < 7; ++j) {
+                    if (req.mask[j]) {
+                        mask_row_tensor.index_put_({j}, true);
+                        assigned = true;
+                    }
+                }
+                if (!assigned) {
+                    mask_row_tensor.fill_(true);
+                }
+                last_logits.select(0, row).fill_(0.0f);
+            }
+        }
+
+        last_logits.masked_fill_(~last_masks, -std::numeric_limits<float>::infinity());
+        auto probs = torch::softmax(last_logits.to(torch::kFloat32), /*dim=*/1);
+        auto actions_tensor = torch::multinomial(probs, /*num_samples=*/1);
+        actions_tensor = actions_tensor.squeeze(-1).to(torch::kCPU);
+
+        auto actions_ptr = actions_tensor.data_ptr<int64_t>();
+        for (size_t i = 0; i < take; ++i) {
+            const auto& ref = *batch_refs[i];
+            auto out_it = out_actions.find(ref.policy_id);
+            if (out_it == out_actions.end()) {
+                throw std::runtime_error("Missing output buffer for policy " + std::to_string(ref.policy_id));
+            }
+            if (ref.request_index >= out_it->second.size()) {
+                out_it->second.resize(ref.request_index + 1);
+            }
+            out_it->second[ref.request_index] = static_cast<uint8_t>(actions_ptr[i]);
+        }
+
+        offset += take;
     }
-
-    last_logits.masked_fill_(~last_masks, -std::numeric_limits<float>::infinity());
-    auto probs = torch::softmax(last_logits, /*dim=*/1);
-    auto actions_tensor = torch::multinomial(probs, /*num_samples=*/1);
-    actions_tensor = actions_tensor.squeeze(-1).to(torch::kCPU);
-
-    auto actions_ptr = actions_tensor.data_ptr<int64_t>();
-    std::vector<uint8_t> chosen(static_cast<size_t>(batch_size));
-    for (int64_t b = 0; b < batch_size; ++b) {
-        chosen[static_cast<size_t>(b)] = static_cast<uint8_t>(actions_ptr[b]);
-    }
-
-    return chosen;
 }
 
 std::vector<uint8_t> EvalManager::run_cpp_bot(int policy_id,

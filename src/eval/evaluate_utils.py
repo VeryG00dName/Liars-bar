@@ -263,6 +263,7 @@ def load_evaluation_policies(
     eval_manager = lb.EvalManager()
     metadata: Dict[int, Dict[str, Any]] = {}
     next_neural_policy_id = int(getattr(config, "CPP_BOT_MAX_LABEL", 6)) + 1
+    neural_policies_loaded = False
 
     max_env_batch = int(getattr(config, "EVAL_VEC_BATCH_SIZE", 512))
     eval_manager.set_max_env_batch(max(1, max_env_batch))
@@ -358,11 +359,15 @@ def load_evaluation_policies(
             max_seq_length = _infer_traced_max_seq_length(traced_path)
 
             eval_manager.load_model(policy_id, str(traced_path))
+            neural_policies_loaded = True
             entry = _initial_metadata(policy_id, player_id, label, is_cpp_bot=False)
             entry["checkpoint_path"] = str(checkpoint_path)
             entry["traced_path"] = str(traced_path)
             entry["max_seq_length"] = max_seq_length
             metadata[policy_id] = entry
+
+    if neural_policies_loaded:
+        eval_manager.finalize_model_loading()
 
     return eval_manager, metadata
 

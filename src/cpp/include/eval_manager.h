@@ -54,6 +54,7 @@ public:
     void set_inference_batch_size(int batch_size);
 
     void load_model(int policy_id, const std::string& path);
+    void finalize_model_loading();
     void register_cpp_bot(int policy_id, const std::string& bot_name);
 
     EvalOutcome run_roles(const std::vector<std::vector<int>>& roles,
@@ -83,7 +84,11 @@ private:
     int max_env_batch_{512};
     int inference_batch_size_{128};
     std::mt19937 rng_;
-    std::unordered_map<int, std::shared_ptr<torch::jit::Module>> models_;
+    std::shared_ptr<torch::jit::Module> representative_module_;
+    std::unordered_map<int, std::unordered_map<std::string, torch::Tensor>> staged_state_dicts_;
+    std::unordered_map<std::string, torch::Tensor> batched_weight_cache_;
+    std::unordered_map<int, int> policy_id_to_cache_index_;
+    bool weights_finalized_{false};
     std::unordered_map<int, int> policy_max_sequence_lengths_;
     std::unordered_map<int, CppBotRegistryEntry> cpp_bot_registry_;
     static std::unordered_map<std::string, CppBotKind> bot_kind_cache_;
@@ -95,8 +100,14 @@ private:
     std::chrono::microseconds timer_model_inference_{0};
     std::chrono::microseconds timer_cpp_bots_{0};
 
-    std::vector<uint8_t> run_model(torch::jit::Module& module,
-                                   const std::vector<PolicyRequest>& requests);
+    struct RequestRef {
+        int policy_id;
+        size_t request_index;
+        const PolicyRequest* request;
+    };
+
+    void run_packed_historical_inference(const std::vector<RequestRef>& refs,
+                                         std::unordered_map<int, std::vector<uint8_t>>& out_actions);
     std::vector<uint8_t> run_cpp_bot(int policy_id, const std::vector<PolicyRequest>& requests);
     static CppBotKind parse_cpp_bot_kind(const std::string& name);
     std::unique_ptr<CppBotBase> make_cpp_bot_instance(CppBotKind kind,
