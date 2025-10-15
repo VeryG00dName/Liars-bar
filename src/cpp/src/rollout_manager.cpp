@@ -1031,6 +1031,10 @@ std::unordered_map<int, std::vector<uint8_t>> RolloutManager::run_batched_histor
             if (!outputs || outputs->elements().size() < 3) {
                 throw std::runtime_error("Historical model returned unexpected output shape");
             }
+            if (kInferenceDevice.is_cuda()) {
+                torch::cuda::synchronize();
+            }
+
             auto model_t1 = std::chrono::high_resolution_clock::now();
             model_time_acc += std::chrono::duration_cast<std::chrono::microseconds>(model_t1 - model_t0);
 
