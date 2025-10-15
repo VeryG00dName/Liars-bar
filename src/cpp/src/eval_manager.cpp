@@ -13,7 +13,6 @@
 #include <unordered_set>
 
 #include <torch/torch.h>
-#include <torch/indexing.h>
 
 #include "bots.h"
 #include "torch_utils.h"
@@ -459,15 +458,11 @@ EvalOutcome EvalManager::run_roles(const std::vector<std::vector<int>>& roles,
             throw std::runtime_error("Simulation deadlock: no pending AI requests but games remain active");
         }
 
-        size_t total_pending_requests = 0;
-        for (const auto& kv : pending) {
-            total_pending_requests += kv.second.size();
-        }
+        std::unordered_map<int, std::vector<uint8_t>> actions_by_policy;
+        actions_by_policy.reserve(pending.size());
 
         std::vector<RequestRef> historical_refs;
-        historical_refs.reserve(total_pending_requests);
-        std::unordered_map<int, std::vector<uint8_t>> historical_actions;
-        std::unordered_map<int, std::vector<uint8_t>> cpp_actions;
+        historical_refs.reserve(pending.size() * 4); // Pre-allocate with a reasonable guess
 
         for (const auto& kv : pending) {
             int policy_id = kv.first;
@@ -476,48 +471,52 @@ EvalOutcome EvalManager::run_roles(const std::vector<std::vector<int>>& roles,
                 continue;
             }
 
-            auto cache_it = policy_id_to_cache_index_.find(policy_id);
-            if (cache_it == policy_id_to_cache_index_.end()) {
-                auto cpp_it = cpp_bot_registry_.find(policy_id);
-                if (cpp_it != cpp_bot_registry_.end()) {
-                    cpp_actions[policy_id] = run_cpp_bot(policy_id, requests);
-                    continue;
-                }
-                throw std::runtime_error("No registered weights for policy " + std::to_string(policy_id));
+            // Check if it's a C++ bot
+            if (cpp_bot_registry_.count(policy_id)) {
+                actions_by_policy[policy_id] = run_cpp_bot(policy_id, requests);
+                continue;
             }
 
-            auto inserted = historical_actions.emplace(policy_id, std::vector<uint8_t>(requests.size(), 0));
-            if (!inserted.second) {
-                inserted.first->second.resize(requests.size());
+            // If not a C++ bot, it must be a historical model
+            if (policy_id_to_cache_index_.find(policy_id) == policy_id_to_cache_index_.end()) {
+                 if (!weights_finalized_) {
+                    finalize_model_loading(); // Attempt to finalize if not already done
+                    if (policy_id_to_cache_index_.find(policy_id) == policy_id_to_cache_index_.end()) {
+                        throw std::runtime_error("No registered model for policy " + std::to_string(policy_id));
+                    }
+                } else {
+                    throw std::runtime_error("No registered model for policy " + std::to_string(policy_id));
+                }
             }
-            for (size_t idx = 0; idx < requests.size(); ++idx) {
-                historical_refs.push_back(RequestRef{policy_id, idx, &requests[idx]});
+            
+            // Add to the batch for historical inference
+            actions_by_policy.emplace(policy_id, std::vector<uint8_t>(requests.size()));
+            for (size_t i = 0; i < requests.size(); ++i) {
+                historical_refs.push_back({policy_id, i, &requests[i]});
             }
         }
 
+        auto model_start = Clock::now();
         if (!historical_refs.empty()) {
             if (!weights_finalized_) {
-                throw std::runtime_error(
-                    "EvalManager::finalize_model_loading must be called before running inference");
+                finalize_model_loading();
             }
-
-            auto model_start = Clock::now();
-            run_packed_historical_inference(historical_refs, historical_actions);
-            auto model_end = Clock::now();
-            timer_model_inference_ += std::chrono::duration_cast<Microseconds>(model_end - model_start);
+            run_packed_historical_inference(historical_refs, actions_by_policy);
         }
+        auto model_end = Clock::now();
+        timer_model_inference_ += std::chrono::duration_cast<Microseconds>(model_end - model_start);
 
         auto submit_start = Clock::now();
-        for (const auto& kv : historical_actions) {
-            arena_.submit_actions(kv.first, kv.second);
-        }
-        for (const auto& kv : cpp_actions) {
-            arena_.submit_actions(kv.first, kv.second);
-        }
-
         for (const auto& kv : pending) {
+            int policy_id = kv.first;
+            auto it = actions_by_policy.find(policy_id);
+            if (it == actions_by_policy.end()) {
+                 throw std::runtime_error("Logic error: actions not found for pending policy " + std::to_string(policy_id));
+            }
+            arena_.submit_actions(policy_id, it->second);
+            
             const auto& requests = kv.second;
-            for (const auto& req : requests) {
+            for(const auto& req : requests) {
                 int env_idx = req.env;
                 if (env_idx >= 0 && env_idx < arena_.B) {
                     if (arena_.done[env_idx] && !env_completed[static_cast<size_t>(env_idx)]) {
@@ -527,7 +526,6 @@ EvalOutcome EvalManager::run_roles(const std::vector<std::vector<int>>& roles,
                 }
             }
         }
-
         auto submit_end = Clock::now();
         timer_arena_stepping_ += std::chrono::duration_cast<Microseconds>(submit_end - submit_start);
     }

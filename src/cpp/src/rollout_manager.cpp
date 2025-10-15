@@ -810,6 +810,8 @@ void RolloutManager::rebuild_historical_weight_cache() {
             original_keys.push_back(kv.first);
         }
 
+        using torch::indexing::Slice;
+
         auto replace_suffix = [](const std::string& s, const std::string& from, const std::string& to)
                                   -> std::string {
             const auto pos = s.rfind(from);
@@ -827,9 +829,9 @@ void RolloutManager::rebuild_historical_weight_cache() {
                 const auto& w = it->second;
                 if (w.dim() != 3 || w.size(1) % 3 != 0) continue;
                 const int64_t H = w.size(1) / 3;
-                auto q = w.index({torch::indexing::Slice(), torch::indexing::Slice(0, H), torch::indexing::Slice()}).contiguous();
-                auto k = w.index({torch::indexing::Slice(), torch::indexing::Slice(H, 2 * H), torch::indexing::Slice()}).contiguous();
-                auto v = w.index({torch::indexing::Slice(), torch::indexing::Slice(2 * H, 3 * H), torch::indexing::Slice()}).contiguous();
+                auto q = w.index({Slice(), Slice(0, H), Slice()}).contiguous();
+                auto k = w.index({Slice(), Slice(H, 2 * H), Slice()}).contiguous();
+                auto v = w.index({Slice(), Slice(2 * H, 3 * H), Slice()}).contiguous();
 
                 historical_weight_cache_fp16_[replace_suffix(key, "in_proj_weight", "q_proj.weight")] = q;
                 historical_weight_cache_fp16_[replace_suffix(key, "in_proj_weight", "k_proj.weight")] = k;
@@ -844,9 +846,9 @@ void RolloutManager::rebuild_historical_weight_cache() {
                 const auto& b = it->second;
                 if (b.dim() != 2 || b.size(1) % 3 != 0) continue;
                 const int64_t H = b.size(1) / 3;
-                auto q = b.index({torch::indexing::Slice(), torch::indexing::Slice(0, H)}).contiguous();
-                auto k = b.index({torch::indexing::Slice(), torch::indexing::Slice(H, 2 * H)}).contiguous();
-                auto v = b.index({torch::indexing::Slice(), torch::indexing::Slice(2 * H, 3 * H)}).contiguous();
+                auto q = b.index({Slice(), Slice(0, H)}).contiguous();
+                auto k = b.index({Slice(), Slice(H, 2 * H)}).contiguous();
+                auto v = b.index({Slice(), Slice(2 * H, 3 * H)}).contiguous();
 
                 historical_weight_cache_fp16_[replace_suffix(key, "in_proj_bias", "q_proj.bias")] = q;
                 historical_weight_cache_fp16_[replace_suffix(key, "in_proj_bias", "k_proj.bias")] = k;
