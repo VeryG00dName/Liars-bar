@@ -379,6 +379,7 @@ def run_batched_lineups(
     Dict[Tuple[int, int], int],
     Dict[Tuple[int, int], int],
     int,
+    Dict[str, int],
 ]:
     """Run one or more multiplayer lineups using the C++ evaluation manager."""
 
@@ -410,7 +411,7 @@ def run_batched_lineups(
             scheduled_roles.append([int(x) for x in shuffled.tolist()])
             scheduled_lineup_indices.append(int(lineup_idx))
 
-    results_list, h2h_counts, h2h_wins, total_games = eval_manager.run_roles(
+    results_list, h2h_counts, h2h_wins, total_games, perf_stats = eval_manager.run_roles(
         scheduled_roles,
         scheduled_lineup_indices,
         num_players_in_env,
@@ -437,7 +438,11 @@ def run_batched_lineups(
         (int(a), int(b)): int(v) for (a, b), v in h2h_wins.items()
     }
 
-    return results_typed, counts_typed, wins_typed, int(total_games)
+    perf_stats_typed: Dict[str, int] = {
+        str(k): int(v) for k, v in (perf_stats.items() if isinstance(perf_stats, dict) else [])
+    }
+
+    return results_typed, counts_typed, wins_typed, int(total_games), perf_stats_typed
 
 def run_batched_games(
     eval_manager: "lb.EvalManager",
@@ -449,7 +454,7 @@ def run_batched_games(
 ) -> Tuple[Dict[int, Dict[str, Any]], Dict[Tuple[int, int], int], Dict[Tuple[int, int], int]]:
     """Wrapper around :func:`run_batched_lineups` for a single matchup."""
 
-    results, counts, wins, _ = run_batched_lineups(
+    results, counts, wins, _, _ = run_batched_lineups(
         eval_manager,
         [matchup_policy_ids],
         num_games_per_match,

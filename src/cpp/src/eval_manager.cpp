@@ -225,6 +225,17 @@ EvalOutcome EvalManager::run_roles(const std::vector<std::vector<int>>& roles,
                                    const std::vector<int>& lineup_indices,
                                    int num_players,
                                    uint32_t seed) {
+    using Clock = std::chrono::high_resolution_clock;
+    using Microseconds = std::chrono::microseconds;
+
+    timer_total_run_roles_ = Microseconds::zero();
+    timer_arena_stepping_ = Microseconds::zero();
+    timer_collect_requests_ = Microseconds::zero();
+    timer_model_inference_ = Microseconds::zero();
+    timer_cpp_bots_ = Microseconds::zero();
+
+    auto total_start = Clock::now();
+
     EvalOutcome outcome;
 
     if (roles.empty()) {
@@ -267,6 +278,7 @@ EvalOutcome EvalManager::run_roles(const std::vector<std::vector<int>>& roles,
     int completed_games = 0;
 
     while (completed_games < static_cast<int>(total_games)) {
+        auto cpp_start = Clock::now();
         // Advance pure C++ bot turns greedily before requesting model inference.
         for (int env_idx = 0; env_idx < arena_.B; ++env_idx) {
             if (arena_.done[env_idx]) {
@@ -312,8 +324,13 @@ EvalOutcome EvalManager::run_roles(const std::vector<std::vector<int>>& roles,
                 }
             }
         }
+        auto cpp_end = Clock::now();
+        timer_cpp_bots_ += std::chrono::duration_cast<Microseconds>(cpp_end - cpp_start);
 
+        auto collect_start = Clock::now();
         const auto& pending = arena_.collect_requests();
+        auto collect_end = Clock::now();
+        timer_collect_requests_ += std::chrono::duration_cast<Microseconds>(collect_end - collect_start);
         if (pending.empty()) {
             if (completed_games == static_cast<int>(total_games)) {
                 break;
@@ -349,6 +366,7 @@ EvalOutcome EvalManager::run_roles(const std::vector<std::vector<int>>& roles,
         std::vector<uint8_t> aggregated_actions;
         aggregated_actions.reserve(priority_requests.size());
 
+        auto model_start = Clock::now();
         size_t offset = 0;
         const size_t batch_limit = static_cast<size_t>(std::max(1, inference_batch_size_));
         while (offset < priority_requests.size()) {
@@ -360,7 +378,10 @@ EvalOutcome EvalManager::run_roles(const std::vector<std::vector<int>>& roles,
             aggregated_actions.insert(aggregated_actions.end(), actions.begin(), actions.end());
             offset += take;
         }
+        auto model_end = Clock::now();
+        timer_model_inference_ += std::chrono::duration_cast<Microseconds>(model_end - model_start);
 
+        auto submit_start = Clock::now();
         arena_.submit_actions(priority_model_id, aggregated_actions);
         for (const auto& req : priority_requests) {
             int env_idx = req.env;
@@ -371,6 +392,8 @@ EvalOutcome EvalManager::run_roles(const std::vector<std::vector<int>>& roles,
                 }
             }
         }
+        auto submit_end = Clock::now();
+        timer_arena_stepping_ += std::chrono::duration_cast<Microseconds>(submit_end - submit_start);
     }
 
     for (size_t env_idx = 0; env_idx < total_games; ++env_idx) {
@@ -436,6 +459,9 @@ EvalOutcome EvalManager::run_roles(const std::vector<std::vector<int>>& roles,
             }
         }
     }
+
+    auto total_end = Clock::now();
+    timer_total_run_roles_ = std::chrono::duration_cast<Microseconds>(total_end - total_start);
 
     return outcome;
 }
@@ -545,6 +571,16 @@ std::vector<uint8_t> EvalManager::run_cpp_bot(int policy_id,
     }
 
     return actions;
+}
+
+std::unordered_map<std::string, int64_t> EvalManager::get_last_performance_stats() const {
+    std::unordered_map<std::string, int64_t> stats;
+    stats["total_run_roles_us"] = timer_total_run_roles_.count();
+    stats["arena_stepping_us"] = timer_arena_stepping_.count();
+    stats["collect_requests_us"] = timer_collect_requests_.count();
+    stats["model_inference_us"] = timer_model_inference_.count();
+    stats["cpp_bots_us"] = timer_cpp_bots_.count();
+    return stats;
 }
 
 EvalManager::CppBotKind EvalManager::parse_cpp_bot_kind(const std::string& name) {

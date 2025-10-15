@@ -456,48 +456,20 @@ std::vector<TrajectoryData> RolloutManager::get_completed_episodes() {
             out.resize(static_cast<size_t>(target_episodes_));
         }
     }
-    if (timer_total_collect_.count() > 0) {
-        const auto total_us = timer_total_collect_.count();
-        std::cout << "\n--- C++ Rollout Performance Summary ---\n"
-                  << "Total time in collect_requests: " << total_us << " us\n"
-                  << "  - Log Rewards & Dones: " << timer_log_rewards_.count() << " us ("
-                  << (total_us > 0 ? (100.0 * static_cast<double>(timer_log_rewards_.count()) / static_cast<double>(total_us)) : 0.0)
-                  << "%)\n"
-                  << "  - C++ Bot Execution: " << timer_cpp_bots_.count() << " us ("
-                  << (total_us > 0 ? (100.0 * static_cast<double>(timer_cpp_bots_.count()) / static_cast<double>(total_us)) : 0.0)
-                  << "%)\n"
-                  << "  - Historical Inference (Total): " << timer_historical_total_.count() << " us ("
-                  << (total_us > 0 ? (100.0 * static_cast<double>(timer_historical_total_.count()) / static_cast<double>(total_us)) : 0.0)
-                  << "%)\n";
-
-        if (timer_historical_total_.count() > 0) {
-            const auto hist_total_us = timer_historical_total_.count();
-            std::cout << "    - Hist. Prep Batch: " << timer_hist_prep_.count() << " us ("
-                      << (hist_total_us > 0 ? (100.0 * static_cast<double>(timer_hist_prep_.count()) / static_cast<double>(hist_total_us)) : 0.0)
-                      << "% of Hist.)\n"
-                      << "    - Hist. Prep Weights: " << timer_hist_weights_.count() << " us ("
-                      << (hist_total_us > 0 ? (100.0 * static_cast<double>(timer_hist_weights_.count()) / static_cast<double>(hist_total_us)) : 0.0)
-                      << "% of Hist.)\n"
-                      << "    - Hist. Model Execution: " << timer_hist_model_.count() << " us ("
-                      << (hist_total_us > 0 ? (100.0 * static_cast<double>(timer_hist_model_.count()) / static_cast<double>(hist_total_us)) : 0.0)
-                      << "% of Hist.)\n"
-                      << "    - Hist. Post-Processing: " << timer_hist_post_.count() << " us ("
-                      << (hist_total_us > 0 ? (100.0 * static_cast<double>(timer_hist_post_.count()) / static_cast<double>(hist_total_us)) : 0.0)
-                      << "% of Hist.)\n";
-        }
-        std::cout << "---------------------------------------\n" << std::endl;
-
-        // Reset timers for the next cycle
-        timer_total_collect_ = std::chrono::microseconds(0);
-        timer_log_rewards_ = std::chrono::microseconds(0);
-        timer_cpp_bots_ = std::chrono::microseconds(0);
-        timer_historical_total_ = std::chrono::microseconds(0);
-        timer_hist_prep_ = std::chrono::microseconds(0);
-        timer_hist_weights_ = std::chrono::microseconds(0);
-        timer_hist_model_ = std::chrono::microseconds(0);
-        timer_hist_post_ = std::chrono::microseconds(0);
-    }
     return out;
+}
+
+std::unordered_map<std::string, int64_t> RolloutManager::get_performance_stats() const {
+    std::unordered_map<std::string, int64_t> stats;
+    stats["total_collect_us"] = timer_total_collect_.count();
+    stats["log_rewards_us"] = timer_log_rewards_.count();
+    stats["cpp_bots_us"] = timer_cpp_bots_.count();
+    stats["historical_total_us"] = timer_historical_total_.count();
+    stats["hist_prep_batch_us"] = timer_hist_prep_.count();
+    stats["hist_prep_weights_us"] = timer_hist_weights_.count();
+    stats["hist_model_us"] = timer_hist_model_.count();
+    stats["hist_post_us"] = timer_hist_post_.count();
+    return stats;
 }
 
 void RolloutManager::load_historical_model(int policy_id, const std::string& path) {

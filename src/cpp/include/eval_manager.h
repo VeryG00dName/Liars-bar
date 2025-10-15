@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <memory>
 #include <random>
 #include <string>
@@ -60,6 +61,8 @@ public:
                           int num_players,
                           uint32_t seed);
 
+    std::unordered_map<std::string, int64_t> get_last_performance_stats() const;
+
 private:
     enum class CppBotKind {
         Classic,
@@ -84,6 +87,13 @@ private:
     std::unordered_map<int, int> policy_max_sequence_lengths_;
     std::unordered_map<int, CppBotRegistryEntry> cpp_bot_registry_;
     static std::unordered_map<std::string, CppBotKind> bot_kind_cache_;
+
+    // --- Performance Timers ---
+    std::chrono::microseconds timer_total_run_roles_{0};
+    std::chrono::microseconds timer_arena_stepping_{0};
+    std::chrono::microseconds timer_collect_requests_{0};
+    std::chrono::microseconds timer_model_inference_{0};
+    std::chrono::microseconds timer_cpp_bots_{0};
 
     std::vector<uint8_t> run_model(torch::jit::Module& module,
                                    const std::vector<PolicyRequest>& requests);

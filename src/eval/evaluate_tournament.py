@@ -18,7 +18,6 @@ os.environ.setdefault("TORCHDYNAMO_VERBOSE", "0")
 os.environ.setdefault("TORCH_COMPILE_DEBUG", "0")
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 # Deterministic cuBLAS workspace requirement for CUDA
-os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
 warnings.filterwarnings("ignore", message=".*symbolic_shapes.*")
 warnings.filterwarnings("ignore", message=".*CuBLAS.*not deterministic.*")
 from src.misc import lb
@@ -36,7 +35,7 @@ from src.eval.evaluate_utils import (
     run_batched_lineups,
     save_scoreboard,
 )
-from src.training.train_extras import set_seed
+from src.training.ppo_extras import set_seed, apply_determinism_settings
 
 SEED = int(getattr(config, "SEED", 42))
 set_seed(SEED)
@@ -300,7 +299,7 @@ def run_active_league(
             break
         player_usage = updated_usage
         batch_seed = int(rng.integers(0, 2**31 - 1, dtype=np.int64))
-        results_list, h2h_counts, h2h_wins, total_games = run_batched_lineups(
+        results_list, h2h_counts, h2h_wins, total_games, perf_stats = run_batched_lineups(
             eval_manager,
             [list(q) for q in quartets],
             num_games_per_match=stopping.games_per_match,
@@ -309,6 +308,11 @@ def run_active_league(
             base_seed=batch_seed,
         )
         total_games_done += int(total_games)
+
+        if perf_stats:
+            print("--- EvalManager Performance (microseconds) ---")
+            for key, value in sorted(perf_stats.items()):
+                print(f"  - {key:<24}: {value} us ({value / 1e6:.6f}s)")
 
         if len(results_list) != len(quartets):
             raise RuntimeError(
@@ -475,8 +479,15 @@ def main() -> None:
         default=4096,
         help="Limit the number of candidate quartets considered when scheduling (0 disables).",
     )
+    parser.add_argument(
+        "--determinism-level",
+        type=str,
+        choices=("none", "high", "full"),
+        default="none",
+        help="Configure PyTorch determinism knobs; defaults to the fastest ('none').",
+    )
     args = parser.parse_args()
-
+    apply_determinism_settings(args.determinism_level)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     run_specs = parse_run_specs(args.eval_runs)
     if not args.cpp_bots:

@@ -21,6 +21,7 @@ void bind_eval_manager(py::module_& m) {
         .def("load_model", &EvalManager::load_model, py::arg("policy_id"), py::arg("path"))
         .def("register_cpp_bot", &EvalManager::register_cpp_bot,
              py::arg("policy_id"), py::arg("name"))
+        .def("get_last_performance_stats", &EvalManager::get_last_performance_stats)
         .def("run_roles",
              [](EvalManager& self,
                 const std::vector<std::vector<int>>& roles,
@@ -53,7 +54,17 @@ void bind_eval_manager(py::module_& m) {
                      wins[py::make_tuple(kv.first[0], kv.first[1])] = kv.second;
                  }
 
-                 return py::make_tuple(std::move(py_lineups), std::move(counts), std::move(wins), outcome.total_games);
+                py::dict perf_stats;
+                for (const auto& kv : self.get_last_performance_stats()) {
+                    perf_stats[py::str(kv.first)] = kv.second;
+                }
+
+                return py::make_tuple(
+                    std::move(py_lineups),
+                    std::move(counts),
+                    std::move(wins),
+                    outcome.total_games,
+                    std::move(perf_stats));
              },
              py::arg("roles"),
              py::arg("lineup_indices"),
