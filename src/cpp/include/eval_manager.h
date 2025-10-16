@@ -99,6 +99,10 @@ private:
     std::chrono::microseconds timer_collect_requests_{0};
     std::chrono::microseconds timer_model_inference_{0};
     std::chrono::microseconds timer_cpp_bots_{0};
+    std::chrono::microseconds timer_hist_prep_batch_{0};
+    std::chrono::microseconds timer_hist_prep_weights_{0};
+    std::chrono::microseconds timer_hist_model_exec_{0};
+    std::chrono::microseconds timer_hist_post_{0};
 
     struct RequestRef {
         int policy_id;

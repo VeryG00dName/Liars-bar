@@ -353,6 +353,10 @@ EvalOutcome EvalManager::run_roles(const std::vector<std::vector<int>>& roles,
     timer_collect_requests_ = Microseconds::zero();
     timer_model_inference_ = Microseconds::zero();
     timer_cpp_bots_ = Microseconds::zero();
+    timer_hist_prep_batch_ = Microseconds::zero();
+    timer_hist_prep_weights_ = Microseconds::zero();
+    timer_hist_model_exec_ = Microseconds::zero();
+    timer_hist_post_ = Microseconds::zero();
 
     auto total_start = Clock::now();
 
@@ -596,6 +600,9 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
         return;
     }
 
+    using Clock = std::chrono::high_resolution_clock;
+    using Microseconds = std::chrono::microseconds;
+
     if (!representative_module_) {
         throw std::runtime_error("No representative module available for inference");
     }
@@ -617,6 +624,7 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
         size_t remaining = refs.size() - offset;
         size_t take = std::min(remaining, batch_limit);
 
+        auto prep_t0 = Clock::now();
         std::vector<PolicyRequest> batch_requests;
         batch_requests.reserve(take);
         std::vector<const RequestRef*> batch_refs;
@@ -637,6 +645,9 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
 
         auto tensor_batch = prepare_inference_batch(batch_requests, kInferenceDevice);
         if (!tensor_batch.obs_sequence.defined()) {
+            auto prep_t1 = Clock::now();
+            timer_hist_prep_batch_ +=
+                std::chrono::duration_cast<Microseconds>(prep_t1 - prep_t0);
             offset += take;
             continue;
         }
@@ -645,6 +656,10 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
             tensor_batch.obs_sequence = tensor_batch.obs_sequence.to(torch::kFloat16);
         }
 
+        auto prep_t1 = Clock::now();
+        timer_hist_prep_batch_ += std::chrono::duration_cast<Microseconds>(prep_t1 - prep_t0);
+
+        auto weights_t0 = Clock::now();
         auto policy_index_tensor = torch::tensor(cache_indices, opts_long_device);
 
         // Select the correct weights per-request into a string->Tensor dict
@@ -656,6 +671,11 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
             weight_dict.insert(kv.first, selected);
         }
 
+        auto weights_t1 = Clock::now();
+        timer_hist_prep_weights_ +=
+            std::chrono::duration_cast<Microseconds>(weights_t1 - weights_t0);
+
+        auto model_t0 = Clock::now();
         std::vector<torch::jit::IValue> inputs;
         inputs.reserve(7);
         inputs.emplace_back(tensor_batch.obs_sequence);
@@ -667,6 +687,12 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
         inputs.emplace_back(tensor_batch.padding_mask);
 
         auto outputs_iv = method->operator()(inputs);
+        torch::cuda::synchronize();
+        auto model_t1 = Clock::now();
+        timer_hist_model_exec_ +=
+            std::chrono::duration_cast<Microseconds>(model_t1 - model_t0);
+
+        auto post_t0 = Clock::now();
         auto outputs = outputs_iv.toTuple();
         if (!outputs || outputs->elements().empty()) {
             throw std::runtime_error("forward_packed returned unexpected output");
@@ -722,6 +748,9 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
             out_it->second[ref.request_index] = static_cast<uint8_t>(actions_ptr[i]);
         }
 
+        auto post_t1 = Clock::now();
+        timer_hist_post_ += std::chrono::duration_cast<Microseconds>(post_t1 - post_t0);
+
         offset += take;
     }
 }
@@ -763,6 +792,10 @@ std::unordered_map<std::string, int64_t> EvalManager::get_last_performance_stats
     stats["collect_requests_us"] = timer_collect_requests_.count();
     stats["model_inference_us"] = timer_model_inference_.count();
     stats["cpp_bots_us"] = timer_cpp_bots_.count();
+    stats["hist_prep_batch_us"] = timer_hist_prep_batch_.count();
+    stats["hist_prep_weights_us"] = timer_hist_prep_weights_.count();
+    stats["hist_model_exec_us"] = timer_hist_model_exec_.count();
+    stats["hist_post_us"] = timer_hist_post_.count();
     return stats;
 }
 
