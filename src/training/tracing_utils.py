@@ -8,9 +8,6 @@ import torch
 
 from src.agents.learner_ar_agent import LearnerAutoregressiveAgent
 
-# This is a simplified version of the logic from trace_models.py,
-# designed to be called as a library function.
-
 
 def trace_model_from_checkpoint(
     checkpoint_path: str, output_path: str, device: torch.device

@@ -121,8 +121,6 @@ class PPOReactiveModelScript(PPOReactiveModelBase):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         del action_masks  # Unused, kept for API compatibility.
 
-        hidden_dim = self._hidden_dim
-        num_heads = self._num_heads
         num_layers = self._num_layers
         num_experts = self._num_experts
         top_k = self._top_k
@@ -216,52 +214,52 @@ class PPOReactiveModelScript(PPOReactiveModelBase):
         if padding_mask is not None:
             key_padding = padding_mask.to(dtype=torch.bool).contiguous()
 
-        attn_neg_inf = self._attn_neg_inf
         x = encoded_inputs
         final_topk_indices = torch.jit.annotate(Optional[torch.Tensor], None)
         final_topk_scores = torch.jit.annotate(Optional[torch.Tensor], None)
 
-        head_dim = self._head_dim
-        causal_mask_view = causal_mask.view(1, 1, time_dim, time_dim)
-        key_padding_view = torch.jit.annotate(Optional[torch.Tensor], None)
-        if key_padding is not None:
-            key_padding_view = key_padding.view(key_padding.size(0), 1, 1, time_dim)
-
         for layer_idx in range(num_layers):
+            # --- START: FlashAttention Implementation ---
+            B, T, H = x.shape
+            
+            # 1. Project to Q, K, V
             q = _batched_linear(
                 x,
-                weights[f"transformer.layers.{layer_idx}.self_attn.q_proj.weight"],
-                weights[f"transformer.layers.{layer_idx}.self_attn.q_proj.bias"],
+                weights[f"transformer.layers.{layer_idx}.q_proj.weight"],
+                weights[f"transformer.layers.{layer_idx}.q_proj.bias"],
             )
             k = _batched_linear(
                 x,
-                weights[f"transformer.layers.{layer_idx}.self_attn.k_proj.weight"],
-                weights[f"transformer.layers.{layer_idx}.self_attn.k_proj.bias"],
+                weights[f"transformer.layers.{layer_idx}.k_proj.weight"],
+                weights[f"transformer.layers.{layer_idx}.k_proj.bias"],
             )
             v = _batched_linear(
                 x,
-                weights[f"transformer.layers.{layer_idx}.self_attn.v_proj.weight"],
-                weights[f"transformer.layers.{layer_idx}.self_attn.v_proj.bias"],
+                weights[f"transformer.layers.{layer_idx}.v_proj.weight"],
+                weights[f"transformer.layers.{layer_idx}.v_proj.bias"],
             )
 
-            q_heads = q.view(q.size(0), time_dim, num_heads, head_dim).permute(0, 2, 1, 3)
-            k_heads = k.view(k.size(0), time_dim, num_heads, head_dim).permute(0, 2, 1, 3)
-            v_heads = v.view(v.size(0), time_dim, num_heads, head_dim).permute(0, 2, 1, 3)
+            # 2. Reshape for attention heads
+            q = q.view(B, T, self._num_heads, self._head_dim).transpose(1, 2)
+            k = k.view(B, T, self._num_heads, self._head_dim).transpose(1, 2)
+            v = v.view(B, T, self._num_heads, self._head_dim).transpose(1, 2)
 
-            attn_logits = torch.matmul(q_heads, k_heads.transpose(-2, -1)) * self._scale_factor
-            attn_logits = attn_logits.masked_fill(causal_mask_view, attn_neg_inf)
-            if key_padding_view is not None:
-                attn_logits = attn_logits.masked_fill(key_padding_view, attn_neg_inf)
-
-            attn_probs = torch.softmax(attn_logits, dim=-1)
-            context = torch.matmul(attn_probs, v_heads)
-            context = context.permute(0, 2, 1, 3).contiguous().view(x.size(0), time_dim, hidden_dim)
-
+            # 3. Call scaled_dot_product_attention (FlashAttention)
+            is_causal = causal_mask is not None and key_padding is None
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=causal_mask if not is_causal else None,
+                is_causal=is_causal
+            )
+            
+            # 4. Reshape and project output
+            attn_output = attn_output.transpose(1, 2).contiguous().view(B, T, H)
             attn_output = _batched_linear(
-                context,
-                weights[f"transformer.layers.{layer_idx}.self_attn.out_proj.weight"],
-                weights[f"transformer.layers.{layer_idx}.self_attn.out_proj.bias"],
+                attn_output,
+                weights[f"transformer.layers.{layer_idx}.out_proj.weight"],
+                weights[f"transformer.layers.{layer_idx}.out_proj.bias"],
             )
+            # --- END: FlashAttention Implementation ---
 
             residual = x + attn_output
             x = _batched_layer_norm(
@@ -270,6 +268,7 @@ class PPOReactiveModelScript(PPOReactiveModelBase):
                 weights[f"transformer.layers.{layer_idx}.norm1.bias"],
             )
 
+            # --- START: Fully Unrolled Sparse MoE Logic ---
             gate_logits = _batched_linear(
                 x,
                 weights[f"transformer.layers.{layer_idx}.moe.gate.weight"],
@@ -277,41 +276,180 @@ class PPOReactiveModelScript(PPOReactiveModelBase):
             )
             gate_probs = torch.softmax(gate_logits, dim=-1)
             topk_scores, topk_indices = torch.topk(gate_probs, top_k, dim=-1)
-            denom = topk_scores.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-            topk_weights = topk_scores / denom
+            topk_weights = topk_scores / topk_scores.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
-            all_w1 = torch.stack([
-                weights[f"transformer.layers.{layer_idx}.moe.experts.{i}.0.weight"] for i in range(num_experts)
-            ], dim=1)
-            all_b1 = torch.stack([
-                weights[f"transformer.layers.{layer_idx}.moe.experts.{i}.0.bias"] for i in range(num_experts)
-            ], dim=1)
-            all_w2 = torch.stack([
-                weights[f"transformer.layers.{layer_idx}.moe.experts.{i}.3.weight"] for i in range(num_experts)
-            ], dim=1)
-            all_b2 = torch.stack([
-                weights[f"transformer.layers.{layer_idx}.moe.experts.{i}.3.bias"] for i in range(num_experts)
-            ], dim=1)
+            y = torch.zeros_like(x)
+            
+            # --- Expert 0 ---
+            route_mask_0 = (topk_indices == 0).any(dim=-1)
+            if route_mask_0.any():
+                batch_indices, time_indices = torch.where(route_mask_0)
+                expert_inputs = x[batch_indices, time_indices]
+                expert_mask = (topk_indices[batch_indices, time_indices] == 0)
+                rank_in_topk = torch.where(expert_mask)[1]
+                expert_routing_weights = topk_weights[batch_indices, time_indices, rank_in_topk].unsqueeze(-1)
+                
+                w1 = weights[f"transformer.layers.{layer_idx}.moe.experts.0.0.weight"][batch_indices]
+                b1 = weights[f"transformer.layers.{layer_idx}.moe.experts.0.0.bias"][batch_indices]
+                w2 = weights[f"transformer.layers.{layer_idx}.moe.experts.0.3.weight"][batch_indices]
+                b2 = weights[f"transformer.layers.{layer_idx}.moe.experts.0.3.bias"][batch_indices]
 
-            batch = x.size(0)
-            local_time = x.size(1)
-            expert_dim = all_w1.size(2)
+                hidden = F.gelu(torch.bmm(expert_inputs.unsqueeze(1), w1.transpose(1, 2)) + b1.unsqueeze(1))
+                out = torch.bmm(hidden, w2.transpose(1, 2)) + b2.unsqueeze(1)
+                weighted_out = out.squeeze(1) * expert_routing_weights
+                
+                temp_y = torch.zeros_like(y[0]).index_add_(0, time_indices, weighted_out)
+                y = y.index_add(0, batch_indices, temp_y)
 
-            x_be = x.unsqueeze(2).expand(batch, local_time, num_experts, hidden_dim).reshape(
-                batch * num_experts, local_time, hidden_dim
-            )
-            w1_be = all_w1.reshape(batch * num_experts, expert_dim, hidden_dim)
-            b1_be = all_b1.reshape(batch * num_experts, expert_dim)
-            hidden_be = torch.bmm(x_be, w1_be.transpose(1, 2)) + b1_be.unsqueeze(1)
-            hidden_be = F.gelu(hidden_be)
+            # --- Expert 1 ---
+            route_mask_1 = (topk_indices == 1).any(dim=-1)
+            if route_mask_1.any():
+                batch_indices, time_indices = torch.where(route_mask_1)
+                expert_inputs = x[batch_indices, time_indices]
+                expert_mask = (topk_indices[batch_indices, time_indices] == 1)
+                rank_in_topk = torch.where(expert_mask)[1]
+                expert_routing_weights = topk_weights[batch_indices, time_indices, rank_in_topk].unsqueeze(-1)
 
-            w2_be = all_w2.reshape(batch * num_experts, hidden_dim, expert_dim)
-            b2_be = all_b2.reshape(batch * num_experts, hidden_dim)
-            out_be = torch.bmm(hidden_be, w2_be.transpose(1, 2)) + b2_be.unsqueeze(1)
-            experts_stacked = out_be.view(batch, local_time, num_experts, hidden_dim)
-            gather_index = topk_indices.unsqueeze(-1).expand(-1, -1, -1, hidden_dim)
-            topk_selected = torch.gather(experts_stacked, 2, gather_index)
-            moe_output = (topk_selected * topk_weights.unsqueeze(-1)).sum(dim=2)
+                w1 = weights[f"transformer.layers.{layer_idx}.moe.experts.1.0.weight"][batch_indices]
+                b1 = weights[f"transformer.layers.{layer_idx}.moe.experts.1.0.bias"][batch_indices]
+                w2 = weights[f"transformer.layers.{layer_idx}.moe.experts.1.3.weight"][batch_indices]
+                b2 = weights[f"transformer.layers.{layer_idx}.moe.experts.1.3.bias"][batch_indices]
+
+                hidden = F.gelu(torch.bmm(expert_inputs.unsqueeze(1), w1.transpose(1, 2)) + b1.unsqueeze(1))
+                out = torch.bmm(hidden, w2.transpose(1, 2)) + b2.unsqueeze(1)
+                weighted_out = out.squeeze(1) * expert_routing_weights
+                
+                temp_y = torch.zeros_like(y[0]).index_add_(0, time_indices, weighted_out)
+                y = y.index_add(0, batch_indices, temp_y)
+
+            # --- Expert 2 ---
+            route_mask_2 = (topk_indices == 2).any(dim=-1)
+            if route_mask_2.any():
+                batch_indices, time_indices = torch.where(route_mask_2)
+                expert_inputs = x[batch_indices, time_indices]
+                expert_mask = (topk_indices[batch_indices, time_indices] == 2)
+                rank_in_topk = torch.where(expert_mask)[1]
+                expert_routing_weights = topk_weights[batch_indices, time_indices, rank_in_topk].unsqueeze(-1)
+
+                w1 = weights[f"transformer.layers.{layer_idx}.moe.experts.2.0.weight"][batch_indices]
+                b1 = weights[f"transformer.layers.{layer_idx}.moe.experts.2.0.bias"][batch_indices]
+                w2 = weights[f"transformer.layers.{layer_idx}.moe.experts.2.3.weight"][batch_indices]
+                b2 = weights[f"transformer.layers.{layer_idx}.moe.experts.2.3.bias"][batch_indices]
+                
+                hidden = F.gelu(torch.bmm(expert_inputs.unsqueeze(1), w1.transpose(1, 2)) + b1.unsqueeze(1))
+                out = torch.bmm(hidden, w2.transpose(1, 2)) + b2.unsqueeze(1)
+                weighted_out = out.squeeze(1) * expert_routing_weights
+
+                temp_y = torch.zeros_like(y[0]).index_add_(0, time_indices, weighted_out)
+                y = y.index_add(0, batch_indices, temp_y)
+
+            # --- Expert 3 ---
+            route_mask_3 = (topk_indices == 3).any(dim=-1)
+            if route_mask_3.any():
+                batch_indices, time_indices = torch.where(route_mask_3)
+                expert_inputs = x[batch_indices, time_indices]
+                expert_mask = (topk_indices[batch_indices, time_indices] == 3)
+                rank_in_topk = torch.where(expert_mask)[1]
+                expert_routing_weights = topk_weights[batch_indices, time_indices, rank_in_topk].unsqueeze(-1)
+
+                w1 = weights[f"transformer.layers.{layer_idx}.moe.experts.3.0.weight"][batch_indices]
+                b1 = weights[f"transformer.layers.{layer_idx}.moe.experts.3.0.bias"][batch_indices]
+                w2 = weights[f"transformer.layers.{layer_idx}.moe.experts.3.3.weight"][batch_indices]
+                b2 = weights[f"transformer.layers.{layer_idx}.moe.experts.3.3.bias"][batch_indices]
+                
+                hidden = F.gelu(torch.bmm(expert_inputs.unsqueeze(1), w1.transpose(1, 2)) + b1.unsqueeze(1))
+                out = torch.bmm(hidden, w2.transpose(1, 2)) + b2.unsqueeze(1)
+                weighted_out = out.squeeze(1) * expert_routing_weights
+
+                temp_y = torch.zeros_like(y[0]).index_add_(0, time_indices, weighted_out)
+                y = y.index_add(0, batch_indices, temp_y)
+
+            # --- Expert 4 ---
+            route_mask_4 = (topk_indices == 4).any(dim=-1)
+            if route_mask_4.any():
+                batch_indices, time_indices = torch.where(route_mask_4)
+                expert_inputs = x[batch_indices, time_indices]
+                expert_mask = (topk_indices[batch_indices, time_indices] == 4)
+                rank_in_topk = torch.where(expert_mask)[1]
+                expert_routing_weights = topk_weights[batch_indices, time_indices, rank_in_topk].unsqueeze(-1)
+
+                w1 = weights[f"transformer.layers.{layer_idx}.moe.experts.4.0.weight"][batch_indices]
+                b1 = weights[f"transformer.layers.{layer_idx}.moe.experts.4.0.bias"][batch_indices]
+                w2 = weights[f"transformer.layers.{layer_idx}.moe.experts.4.3.weight"][batch_indices]
+                b2 = weights[f"transformer.layers.{layer_idx}.moe.experts.4.3.bias"][batch_indices]
+                
+                hidden = F.gelu(torch.bmm(expert_inputs.unsqueeze(1), w1.transpose(1, 2)) + b1.unsqueeze(1))
+                out = torch.bmm(hidden, w2.transpose(1, 2)) + b2.unsqueeze(1)
+                weighted_out = out.squeeze(1) * expert_routing_weights
+
+                temp_y = torch.zeros_like(y[0]).index_add_(0, time_indices, weighted_out)
+                y = y.index_add(0, batch_indices, temp_y)
+                
+            # --- Expert 5 ---
+            route_mask_5 = (topk_indices == 5).any(dim=-1)
+            if route_mask_5.any():
+                batch_indices, time_indices = torch.where(route_mask_5)
+                expert_inputs = x[batch_indices, time_indices]
+                expert_mask = (topk_indices[batch_indices, time_indices] == 5)
+                rank_in_topk = torch.where(expert_mask)[1]
+                expert_routing_weights = topk_weights[batch_indices, time_indices, rank_in_topk].unsqueeze(-1)
+
+                w1 = weights[f"transformer.layers.{layer_idx}.moe.experts.5.0.weight"][batch_indices]
+                b1 = weights[f"transformer.layers.{layer_idx}.moe.experts.5.0.bias"][batch_indices]
+                w2 = weights[f"transformer.layers.{layer_idx}.moe.experts.5.3.weight"][batch_indices]
+                b2 = weights[f"transformer.layers.{layer_idx}.moe.experts.5.3.bias"][batch_indices]
+                
+                hidden = F.gelu(torch.bmm(expert_inputs.unsqueeze(1), w1.transpose(1, 2)) + b1.unsqueeze(1))
+                out = torch.bmm(hidden, w2.transpose(1, 2)) + b2.unsqueeze(1)
+                weighted_out = out.squeeze(1) * expert_routing_weights
+
+                temp_y = torch.zeros_like(y[0]).index_add_(0, time_indices, weighted_out)
+                y = y.index_add(0, batch_indices, temp_y)
+                
+            # --- Expert 6 ---
+            route_mask_6 = (topk_indices == 6).any(dim=-1)
+            if route_mask_6.any():
+                batch_indices, time_indices = torch.where(route_mask_6)
+                expert_inputs = x[batch_indices, time_indices]
+                expert_mask = (topk_indices[batch_indices, time_indices] == 6)
+                rank_in_topk = torch.where(expert_mask)[1]
+                expert_routing_weights = topk_weights[batch_indices, time_indices, rank_in_topk].unsqueeze(-1)
+
+                w1 = weights[f"transformer.layers.{layer_idx}.moe.experts.6.0.weight"][batch_indices]
+                b1 = weights[f"transformer.layers.{layer_idx}.moe.experts.6.0.bias"][batch_indices]
+                w2 = weights[f"transformer.layers.{layer_idx}.moe.experts.6.3.weight"][batch_indices]
+                b2 = weights[f"transformer.layers.{layer_idx}.moe.experts.6.3.bias"][batch_indices]
+                
+                hidden = F.gelu(torch.bmm(expert_inputs.unsqueeze(1), w1.transpose(1, 2)) + b1.unsqueeze(1))
+                out = torch.bmm(hidden, w2.transpose(1, 2)) + b2.unsqueeze(1)
+                weighted_out = out.squeeze(1) * expert_routing_weights
+
+                temp_y = torch.zeros_like(y[0]).index_add_(0, time_indices, weighted_out)
+                y = y.index_add(0, batch_indices, temp_y)
+                
+            # --- Expert 7 ---
+            route_mask_7 = (topk_indices == 7).any(dim=-1)
+            if route_mask_7.any():
+                batch_indices, time_indices = torch.where(route_mask_7)
+                expert_inputs = x[batch_indices, time_indices]
+                expert_mask = (topk_indices[batch_indices, time_indices] == 7)
+                rank_in_topk = torch.where(expert_mask)[1]
+                expert_routing_weights = topk_weights[batch_indices, time_indices, rank_in_topk].unsqueeze(-1)
+
+                w1 = weights[f"transformer.layers.{layer_idx}.moe.experts.7.0.weight"][batch_indices]
+                b1 = weights[f"transformer.layers.{layer_idx}.moe.experts.7.0.bias"][batch_indices]
+                w2 = weights[f"transformer.layers.{layer_idx}.moe.experts.7.3.weight"][batch_indices]
+                b2 = weights[f"transformer.layers.{layer_idx}.moe.experts.7.3.bias"][batch_indices]
+                
+                hidden = F.gelu(torch.bmm(expert_inputs.unsqueeze(1), w1.transpose(1, 2)) + b1.unsqueeze(1))
+                out = torch.bmm(hidden, w2.transpose(1, 2)) + b2.unsqueeze(1)
+                weighted_out = out.squeeze(1) * expert_routing_weights
+
+                temp_y = torch.zeros_like(y[0]).index_add_(0, time_indices, weighted_out)
+                y = y.index_add(0, batch_indices, temp_y)
+
+            moe_output = y
+            # --- END: Fully Unrolled Sparse MoE Logic ---
 
             residual2 = x + moe_output
             x = _batched_layer_norm(

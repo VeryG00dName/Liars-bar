@@ -45,29 +45,104 @@ class TopKMoELayer(nn.Module):
             [_make_moe_ffn(hidden_dim, expert_ffn_dim, dropout) for _ in range(num_experts)]
         )
 
+    @torch.jit.script_method
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        gate_logits = self.gate(x)
-        gate_probs = torch.softmax(gate_logits, dim=-1)
-        topk_scores, topk_indices = torch.topk(gate_probs, self.top_k, dim=-1)
-        topk_weights = topk_scores / topk_scores.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        """
+        Robust and JIT-compatible MoE forward pass with unrolled expert loop.
+        """
+        B, T, H = x.shape
+        x_flat = x.view(-1, H)
 
-        expert_outs: List[torch.Tensor] = []
-        for expert in self.experts:
-            expert_outs.append(expert(x))
-        expert_outputs = torch.stack(expert_outs, dim=2)
+        gate_logits = self.gate(x_flat)
+        topk_weights, topk_indices = torch.topk(
+            torch.softmax(gate_logits, dim=-1), self.top_k, dim=-1
+        )
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
-        bsz, tsz, ksz = topk_indices.shape
-        gather_index = topk_indices.unsqueeze(-1).expand(bsz, tsz, ksz, self.hidden_dim)
+        y_flat = torch.zeros_like(x_flat)
         
-        topk_outputs = torch.gather(expert_outputs, 2, gather_index)
-        combined = (topk_outputs * topk_weights.unsqueeze(-1)).sum(dim=2)
+        # We manually unroll the loop to use integer literals for indexing self.experts
+        
+        # Expert 0
+        expert_mask_0 = (topk_indices == 0).any(dim=-1)
+        if expert_mask_0.any():
+            token_indices_0 = torch.where(expert_mask_0)[0]
+            expert_inputs_0 = x_flat[token_indices_0]
+            rank_in_topk_0 = torch.where((topk_indices[token_indices_0] == 0))[1]
+            weights_0 = topk_weights[token_indices_0, rank_in_topk_0].unsqueeze(-1)
+            y_flat.index_add_(0, token_indices_0, self.experts[0](expert_inputs_0) * weights_0)
 
+        # Expert 1
+        expert_mask_1 = (topk_indices == 1).any(dim=-1)
+        if expert_mask_1.any():
+            token_indices_1 = torch.where(expert_mask_1)[0]
+            expert_inputs_1 = x_flat[token_indices_1]
+            rank_in_topk_1 = torch.where((topk_indices[token_indices_1] == 1))[1]
+            weights_1 = topk_weights[token_indices_1, rank_in_topk_1].unsqueeze(-1)
+            y_flat.index_add_(0, token_indices_1, self.experts[1](expert_inputs_1) * weights_1)
+
+        # Expert 2
+        expert_mask_2 = (topk_indices == 2).any(dim=-1)
+        if expert_mask_2.any():
+            token_indices_2 = torch.where(expert_mask_2)[0]
+            expert_inputs_2 = x_flat[token_indices_2]
+            rank_in_topk_2 = torch.where((topk_indices[token_indices_2] == 2))[1]
+            weights_2 = topk_weights[token_indices_2, rank_in_topk_2].unsqueeze(-1)
+            y_flat.index_add_(0, token_indices_2, self.experts[2](expert_inputs_2) * weights_2)
+
+        # Expert 3
+        expert_mask_3 = (topk_indices == 3).any(dim=-1)
+        if expert_mask_3.any():
+            token_indices_3 = torch.where(expert_mask_3)[0]
+            expert_inputs_3 = x_flat[token_indices_3]
+            rank_in_topk_3 = torch.where((topk_indices[token_indices_3] == 3))[1]
+            weights_3 = topk_weights[token_indices_3, rank_in_topk_3].unsqueeze(-1)
+            y_flat.index_add_(0, token_indices_3, self.experts[3](expert_inputs_3) * weights_3)
+
+        # Expert 4
+        expert_mask_4 = (topk_indices == 4).any(dim=-1)
+        if expert_mask_4.any():
+            token_indices_4 = torch.where(expert_mask_4)[0]
+            expert_inputs_4 = x_flat[token_indices_4]
+            rank_in_topk_4 = torch.where((topk_indices[token_indices_4] == 4))[1]
+            weights_4 = topk_weights[token_indices_4, rank_in_topk_4].unsqueeze(-1)
+            y_flat.index_add_(0, token_indices_4, self.experts[4](expert_inputs_4) * weights_4)
+
+        # Expert 5
+        expert_mask_5 = (topk_indices == 5).any(dim=-1)
+        if expert_mask_5.any():
+            token_indices_5 = torch.where(expert_mask_5)[0]
+            expert_inputs_5 = x_flat[token_indices_5]
+            rank_in_topk_5 = torch.where((topk_indices[token_indices_5] == 5))[1]
+            weights_5 = topk_weights[token_indices_5, rank_in_topk_5].unsqueeze(-1)
+            y_flat.index_add_(0, token_indices_5, self.experts[5](expert_inputs_5) * weights_5)
+
+        # Expert 6
+        expert_mask_6 = (topk_indices == 6).any(dim=-1)
+        if expert_mask_6.any():
+            token_indices_6 = torch.where(expert_mask_6)[0]
+            expert_inputs_6 = x_flat[token_indices_6]
+            rank_in_topk_6 = torch.where((topk_indices[token_indices_6] == 6))[1]
+            weights_6 = topk_weights[token_indices_6, rank_in_topk_6].unsqueeze(-1)
+            y_flat.index_add_(0, token_indices_6, self.experts[6](expert_inputs_6) * weights_6)
+
+        # Expert 7
+        expert_mask_7 = (topk_indices == 7).any(dim=-1)
+        if expert_mask_7.any():
+            token_indices_7 = torch.where(expert_mask_7)[0]
+            expert_inputs_7 = x_flat[token_indices_7]
+            rank_in_topk_7 = torch.where((topk_indices[token_indices_7] == 7))[1]
+            weights_7 = topk_weights[token_indices_7, rank_in_topk_7].unsqueeze(-1)
+            y_flat.index_add_(0, token_indices_7, self.experts[7](expert_inputs_7) * weights_7)
+
+        y = y_flat.view(B, T, H)
+        
         routing_info = {
-            "gate_logits": gate_logits,
-            "topk_indices": topk_indices,
-            "topk_scores": topk_weights,
+            "gate_logits": gate_logits.view(B, T, -1),
+            "topk_indices": topk_indices.view(B, T, -1),
+            "topk_scores": topk_weights.view(B, T, -1),
         }
-        return combined, routing_info
+        return y, routing_info
 
 
 class MoETransformerEncoderLayer(nn.Module):
