@@ -448,7 +448,7 @@ EvalOutcome EvalManager::run_roles(const std::vector<std::vector<int>>& roles,
         timer_cpp_bots_ += std::chrono::duration_cast<Microseconds>(cpp_end - cpp_start);
 
         auto collect_start = Clock::now();
-        const auto& pending = arena_.collect_requests();
+        auto pending = arena_.collect_requests();
         auto collect_end = Clock::now();
         timer_collect_requests_ += std::chrono::duration_cast<Microseconds>(collect_end - collect_start);
         if (pending.empty()) {
@@ -467,9 +467,6 @@ EvalOutcome EvalManager::run_roles(const std::vector<std::vector<int>>& roles,
         for (const auto& kv : pending) {
             int policy_id = kv.first;
             const auto& requests = kv.second;
-            if (requests.empty()) {
-                continue;
-            }
 
             // Check if it's a C++ bot
             if (cpp_bot_registry_.count(policy_id)) {
@@ -479,14 +476,7 @@ EvalOutcome EvalManager::run_roles(const std::vector<std::vector<int>>& roles,
 
             // If not a C++ bot, it must be a historical model
             if (policy_id_to_cache_index_.find(policy_id) == policy_id_to_cache_index_.end()) {
-                 if (!weights_finalized_) {
-                    finalize_model_loading(); // Attempt to finalize if not already done
-                    if (policy_id_to_cache_index_.find(policy_id) == policy_id_to_cache_index_.end()) {
-                        throw std::runtime_error("No registered model for policy " + std::to_string(policy_id));
-                    }
-                } else {
-                    throw std::runtime_error("No registered model for policy " + std::to_string(policy_id));
-                }
+                throw std::runtime_error("No registered model for policy " + std::to_string(policy_id));
             }
             
             // Add to the batch for historical inference
@@ -657,9 +647,11 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
 
         auto policy_index_tensor = torch::tensor(cache_indices, opts_long_device);
 
+        // Select the correct weights per-request into a string->Tensor dict
         c10::Dict<std::string, torch::Tensor> weight_dict;
         weight_dict.reserve(batched_weight_cache_.size());
         for (const auto& kv : batched_weight_cache_) {
+            // kv.second shape: [num_policies, ...]; select rows for this batch
             auto selected = kv.second.index_select(0, policy_index_tensor).contiguous();
             weight_dict.insert(kv.first, selected);
         }
@@ -835,4 +827,3 @@ std::unique_ptr<CppBotBase> EvalManager::make_cpp_bot_instance(EvalManager::CppB
 
     throw std::runtime_error("Unhandled C++ bot kind");
 }
-
