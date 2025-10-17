@@ -789,13 +789,97 @@ void RolloutManager::rebuild_historical_weight_cache() {
         historical_weight_cache_fp16_[kv.first] = torch::stack(kv.second).contiguous();
     }
 
+    // --- START: NEW Pre-stacking Logic ---
+    // Determine number of layers/experts by scanning keys
+    int num_layers = 0;
+    int num_experts = 0;
+    for (const auto& kv : historical_weight_cache_fp16_) {
+        const std::string& key = kv.first;
+        const size_t pos_layer = key.find("transformer.layers.");
+        const size_t pos_moe = key.find(".moe.experts.");
+        if (pos_layer == std::string::npos || pos_moe == std::string::npos) continue;
+
+        size_t layer_start = pos_layer + std::strlen("transformer.layers.");
+        size_t layer_end = key.find('.', layer_start);
+        if (layer_end == std::string::npos) continue;
+        int layer_idx = 0;
+        try { layer_idx = std::stoi(key.substr(layer_start, layer_end - layer_start)); }
+        catch (...) { continue; }
+        num_layers = std::max(num_layers, layer_idx + 1);
+
+        size_t expert_start = pos_moe + std::strlen(".moe.experts.");
+        size_t expert_end = key.find('.', expert_start);
+        if (expert_end == std::string::npos) continue;
+        int expert_idx = 0;
+        try { expert_idx = std::stoi(key.substr(expert_start, expert_end - expert_start)); }
+        catch (...) { continue; }
+        num_experts = std::max(num_experts, expert_idx + 1);
+    }
+
+    if (num_layers > 0 && num_experts > 0) {
+        for (int layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
+            std::vector<torch::Tensor> w1_list, b1_list, w2_list, b2_list;
+            w1_list.reserve(num_experts);
+            b1_list.reserve(num_experts);
+            w2_list.reserve(num_experts);
+            b2_list.reserve(num_experts);
+
+            bool have_all = true;
+            for (int expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
+                const std::string base =
+                    "transformer.layers." + std::to_string(layer_idx) + ".moe.experts." + std::to_string(expert_idx);
+                const std::string w1_key = base + ".0.weight";
+                const std::string b1_key = base + ".0.bias";
+                const std::string w2_key = base + ".3.weight";
+                const std::string b2_key = base + ".3.bias";
+
+                auto it_w1 = historical_weight_cache_fp16_.find(w1_key);
+                auto it_b1 = historical_weight_cache_fp16_.find(b1_key);
+                auto it_w2 = historical_weight_cache_fp16_.find(w2_key);
+                auto it_b2 = historical_weight_cache_fp16_.find(b2_key);
+                if (it_w1 == historical_weight_cache_fp16_.end() || it_b1 == historical_weight_cache_fp16_.end() ||
+                    it_w2 == historical_weight_cache_fp16_.end() || it_b2 == historical_weight_cache_fp16_.end()) {
+                    have_all = false;
+                    break;
+                }
+                w1_list.push_back(it_w1->second);
+                b1_list.push_back(it_b1->second);
+                w2_list.push_back(it_w2->second);
+                b2_list.push_back(it_b2->second);
+            }
+
+            if (have_all && !w1_list.empty()) {
+                const std::string prefix =
+                    "transformer.layers." + std::to_string(layer_idx) + ".moe.experts.";
+                historical_weight_cache_fp16_[prefix + "w1"] = torch::stack(w1_list, 0).contiguous();
+                historical_weight_cache_fp16_[prefix + "b1"] = torch::stack(b1_list, 0).contiguous();
+                historical_weight_cache_fp16_[prefix + "w2"] = torch::stack(w2_list, 0).contiguous();
+                historical_weight_cache_fp16_[prefix + "b2"] = torch::stack(b2_list, 0).contiguous();
+            }
+        }
+    }
+    // --- END: NEW Pre-stacking Logic ---
+
     // Build single-policy weight dict caches for fast lookup
     for (size_t idx = 0; idx < entries.size(); ++idx) {
         auto* entry = entries[idx].second;
         c10::Dict<std::string, torch::Tensor> single_dict;
         for (const auto& kv : historical_weight_cache_fp16_) {
-            // Extract this policy's weights (at index 'idx' in the stacked tensor)
-            single_dict.insert(kv.first, kv.second[static_cast<int64_t>(idx)].contiguous());
+            const std::string& k = kv.first;
+            bool is_moe_expert =
+                (k.find(".moe.experts.w1") != std::string::npos) ||
+                (k.find(".moe.experts.b1") != std::string::npos) ||
+                (k.find(".moe.experts.w2") != std::string::npos) ||
+                (k.find(".moe.experts.b2") != std::string::npos);
+            if (is_moe_expert) {
+                // For pre-stacked MoE tensors [E, B, ...], extract this policy as [E, 1, ...]
+                auto sel = kv.second.index({torch::indexing::Slice(), static_cast<int64_t>(idx)}).contiguous();
+                // Insert with an explicit singleton batch dim at position 1 to ease later expansion
+                single_dict.insert(kv.first, sel.unsqueeze(1));
+            } else {
+                // Extract this policy's weights (at index 'idx' in the stacked tensor)
+                single_dict.insert(kv.first, kv.second[static_cast<int64_t>(idx)].contiguous());
+            }
         }
         entry->single_policy_weight_dict = std::move(single_dict);
         entry->single_policy_dict_cached = true;
@@ -821,6 +905,17 @@ void RolloutManager::rebuild_historical_weight_cache() {
             return out;
         };
 
+        auto drop_self_attn = [](const std::string& s) {
+            constexpr const char* needle = ".self_attn.";
+            const auto pos = s.find(needle);
+            if (pos == std::string::npos) {
+                return s;
+            }
+            std::string out = s;
+            out.replace(pos, std::strlen(needle), ".");
+            return out;
+        };
+
         for (const auto& key : original_keys) {
             // Handle weights: [B, 3*H, H] -> three [B, H, H]
             if (key.find(".self_attn.in_proj_weight") != std::string::npos) {
@@ -833,9 +928,17 @@ void RolloutManager::rebuild_historical_weight_cache() {
                 auto k = w.index({Slice(), Slice(H, 2 * H), Slice()}).contiguous();
                 auto v = w.index({Slice(), Slice(2 * H, 3 * H), Slice()}).contiguous();
 
-                historical_weight_cache_fp16_[replace_suffix(key, "in_proj_weight", "q_proj.weight")] = q;
-                historical_weight_cache_fp16_[replace_suffix(key, "in_proj_weight", "k_proj.weight")] = k;
-                historical_weight_cache_fp16_[replace_suffix(key, "in_proj_weight", "v_proj.weight")] = v;
+                const auto q_key = replace_suffix(key, "in_proj_weight", "q_proj.weight");
+                const auto k_key = replace_suffix(key, "in_proj_weight", "k_proj.weight");
+                const auto v_key = replace_suffix(key, "in_proj_weight", "v_proj.weight");
+
+                historical_weight_cache_fp16_[q_key] = q;
+                historical_weight_cache_fp16_[k_key] = k;
+                historical_weight_cache_fp16_[v_key] = v;
+
+                historical_weight_cache_fp16_[drop_self_attn(q_key)] = q;
+                historical_weight_cache_fp16_[drop_self_attn(k_key)] = k;
+                historical_weight_cache_fp16_[drop_self_attn(v_key)] = v;
                 continue;
             }
 
@@ -850,10 +953,25 @@ void RolloutManager::rebuild_historical_weight_cache() {
                 auto k = b.index({Slice(), Slice(H, 2 * H)}).contiguous();
                 auto v = b.index({Slice(), Slice(2 * H, 3 * H)}).contiguous();
 
-                historical_weight_cache_fp16_[replace_suffix(key, "in_proj_bias", "q_proj.bias")] = q;
-                historical_weight_cache_fp16_[replace_suffix(key, "in_proj_bias", "k_proj.bias")] = k;
-                historical_weight_cache_fp16_[replace_suffix(key, "in_proj_bias", "v_proj.bias")] = v;
+                const auto q_key = replace_suffix(key, "in_proj_bias", "q_proj.bias");
+                const auto k_key = replace_suffix(key, "in_proj_bias", "k_proj.bias");
+                const auto v_key = replace_suffix(key, "in_proj_bias", "v_proj.bias");
+
+                historical_weight_cache_fp16_[q_key] = q;
+                historical_weight_cache_fp16_[k_key] = k;
+                historical_weight_cache_fp16_[v_key] = v;
+
+                historical_weight_cache_fp16_[drop_self_attn(q_key)] = q;
+                historical_weight_cache_fp16_[drop_self_attn(k_key)] = k;
+                historical_weight_cache_fp16_[drop_self_attn(v_key)] = v;
                 continue;
+            }
+
+            if (key.find(".self_attn.") != std::string::npos) {
+                const auto alias = drop_self_attn(key);
+                if (alias != key && !historical_weight_cache_fp16_.count(alias)) {
+                    historical_weight_cache_fp16_[alias] = historical_weight_cache_fp16_.at(key);
+                }
             }
         }
     }
@@ -998,9 +1116,33 @@ std::unordered_map<int, std::vector<uint8_t>> RolloutManager::run_batched_histor
                 auto model_it = historical_models_.find(first_policy_id);
                 if (model_it != historical_models_.end() && model_it->second.single_policy_dict_cached) {
                     const auto& cached_dict = model_it->second.single_policy_weight_dict;
-                    // Expand each weight tensor to batch dimension
+                    // Expand each weight tensor to batch dimension with shape-aware logic
                     for (const auto& kv : cached_dict) {
-                        auto expanded = kv.value().unsqueeze(0).expand({batch_size, -1, -1}).contiguous();
+                        const auto& t = kv.value();
+                        torch::Tensor expanded;
+                        const int64_t dims = t.dim();
+                        if (dims == 1) {
+                            // [H] -> [B, H]
+                            expanded = t.unsqueeze(0).expand({batch_size, -1}).contiguous();
+                        } else if (dims == 2) {
+                            // [H, H] or [V, H] -> [B, H, H]
+                            expanded = t.unsqueeze(0).expand({batch_size, -1, -1}).contiguous();
+                        } else if (dims == 3) {
+                            // [B?, ?, ?] already has batch? Keep shape-consistent: [B, ?, ?]
+                            // In practice we don't expect dims==3 here; fall back to broadcasting on leading dim
+                            expanded = t.expand({batch_size, t.size(1), t.size(2)}).contiguous();
+                        } else if (dims == 4) {
+                            // Pre-stacked MoE weights are cached as [E, 1, F, H] or [E, 1, H, F]
+                            // Expand along dim=1 to match current batch size -> [E, B, F, H]/[E, B, H, F]
+                            expanded = t.expand({t.size(0), static_cast<int64_t>(batch_size), t.size(2), t.size(3)}).contiguous();
+                        } else {
+                            // Fallback: try to broadcast a new leading batch dimension
+                            expanded = t;
+                            for (int i = 0; i < dims; ++i) {
+                                (void)i;
+                            }
+                            expanded = t;
+                        }
                         weight_dict.insert(kv.key(), expanded);
                     }
                 }
@@ -1008,7 +1150,19 @@ std::unordered_map<int, std::vector<uint8_t>> RolloutManager::run_batched_histor
                 // General path: Multiple policies, use index_select
                 auto policy_index_tensor = torch::tensor(policy_cache_indices, opts_long_device);
                 for (const auto& kv : historical_weight_cache_fp16_) {
-                    auto selected = kv.second.index_select(0, policy_index_tensor).contiguous();
+                    const std::string& k = kv.first;
+                    bool is_moe_expert =
+                        (k.find(".moe.experts.w1") != std::string::npos) ||
+                        (k.find(".moe.experts.b1") != std::string::npos) ||
+                        (k.find(".moe.experts.w2") != std::string::npos) ||
+                        (k.find(".moe.experts.b2") != std::string::npos);
+                    torch::Tensor selected;
+                    if (is_moe_expert) {
+                        // Select along policy dimension (dim=1)
+                        selected = kv.second.index_select(1, policy_index_tensor).contiguous();
+                    } else {
+                        selected = kv.second.index_select(0, policy_index_tensor).contiguous();
+                    }
                     weight_dict.insert(kv.first, selected);
                 }
             }

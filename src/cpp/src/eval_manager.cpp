@@ -274,6 +274,86 @@ void EvalManager::finalize_model_loading() {
         batched_weight_cache_[kv.first] = torch::stack(kv.second).contiguous();
     }
 
+    // --- START: NEW Pre-stacking Logic ---
+    // Discover number of layers and experts by scanning keys
+    int num_layers = 0;
+    int num_experts = 0;
+    for (const auto& kv : batched_weight_cache_) {
+        const std::string& key = kv.first;
+        const size_t pos_layer = key.find("transformer.layers.");
+        const size_t pos_moe = key.find(".moe.experts.");
+        if (pos_layer == std::string::npos || pos_moe == std::string::npos) continue;
+
+        // parse layer index
+        size_t layer_start = pos_layer + std::strlen("transformer.layers.");
+        size_t layer_end = key.find('.', layer_start);
+        if (layer_end == std::string::npos) continue;
+        int layer_idx = 0;
+        try {
+            layer_idx = std::stoi(key.substr(layer_start, layer_end - layer_start));
+        } catch (...) {
+            continue;
+        }
+        num_layers = std::max(num_layers, layer_idx + 1);
+
+        // parse expert index
+        size_t expert_start = pos_moe + std::strlen(".moe.experts.");
+        size_t expert_end = key.find('.', expert_start);
+        if (expert_end == std::string::npos) continue;
+        int expert_idx = 0;
+        try {
+            expert_idx = std::stoi(key.substr(expert_start, expert_end - expert_start));
+        } catch (...) {
+            continue;
+        }
+        num_experts = std::max(num_experts, expert_idx + 1);
+    }
+
+    // Stack expert weights into single tensors per layer: [E, B, F, H] / [E, B, H, F]
+    if (num_layers > 0 && num_experts > 0) {
+        for (int layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
+            std::vector<torch::Tensor> w1_list, b1_list, w2_list, b2_list;
+            w1_list.reserve(num_experts);
+            b1_list.reserve(num_experts);
+            w2_list.reserve(num_experts);
+            b2_list.reserve(num_experts);
+
+            bool have_all = true;
+            for (int expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
+                const std::string base =
+                    "transformer.layers." + std::to_string(layer_idx) + ".moe.experts." + std::to_string(expert_idx);
+                const std::string w1_key = base + ".0.weight";
+                const std::string b1_key = base + ".0.bias";
+                const std::string w2_key = base + ".3.weight";
+                const std::string b2_key = base + ".3.bias";
+
+                auto it_w1 = batched_weight_cache_.find(w1_key);
+                auto it_b1 = batched_weight_cache_.find(b1_key);
+                auto it_w2 = batched_weight_cache_.find(w2_key);
+                auto it_b2 = batched_weight_cache_.find(b2_key);
+                if (it_w1 == batched_weight_cache_.end() || it_b1 == batched_weight_cache_.end() ||
+                    it_w2 == batched_weight_cache_.end() || it_b2 == batched_weight_cache_.end()) {
+                    have_all = false;
+                    break;
+                }
+                w1_list.push_back(it_w1->second);
+                b1_list.push_back(it_b1->second);
+                w2_list.push_back(it_w2->second);
+                b2_list.push_back(it_b2->second);
+            }
+
+            if (have_all && !w1_list.empty()) {
+                const std::string prefix =
+                    "transformer.layers." + std::to_string(layer_idx) + ".moe.experts.";
+                batched_weight_cache_[prefix + "w1"] = torch::stack(w1_list, 0).contiguous();
+                batched_weight_cache_[prefix + "b1"] = torch::stack(b1_list, 0).contiguous();
+                batched_weight_cache_[prefix + "w2"] = torch::stack(w2_list, 0).contiguous();
+                batched_weight_cache_[prefix + "b2"] = torch::stack(b2_list, 0).contiguous();
+            }
+        }
+    }
+    // --- END: NEW Pre-stacking Logic ---
+
     std::vector<std::string> original_keys;
     original_keys.reserve(batched_weight_cache_.size());
     for (const auto& kv : batched_weight_cache_) {
@@ -291,6 +371,17 @@ void EvalManager::finalize_model_loading() {
         return out;
     };
 
+    auto drop_self_attn = [](const std::string& s) {
+        constexpr const char* needle = ".self_attn.";
+        const auto pos = s.find(needle);
+        if (pos == std::string::npos) {
+            return s;
+        }
+        std::string out = s;
+        out.replace(pos, std::strlen(needle), ".");
+        return out;
+    };
+
     for (const auto& key : original_keys) {
         if (key.find(".self_attn.in_proj_weight") != std::string::npos) {
             auto it = batched_weight_cache_.find(key);
@@ -305,9 +396,17 @@ void EvalManager::finalize_model_loading() {
             auto q = w.index({Slice(), Slice(0, H), Slice()}).contiguous();
             auto k = w.index({Slice(), Slice(H, 2 * H), Slice()}).contiguous();
             auto v = w.index({Slice(), Slice(2 * H, 3 * H), Slice()}).contiguous();
-            batched_weight_cache_[replace_suffix(key, "in_proj_weight", "q_proj.weight")] = q;
-            batched_weight_cache_[replace_suffix(key, "in_proj_weight", "k_proj.weight")] = k;
-            batched_weight_cache_[replace_suffix(key, "in_proj_weight", "v_proj.weight")] = v;
+            const auto q_key = replace_suffix(key, "in_proj_weight", "q_proj.weight");
+            const auto k_key = replace_suffix(key, "in_proj_weight", "k_proj.weight");
+            const auto v_key = replace_suffix(key, "in_proj_weight", "v_proj.weight");
+
+            batched_weight_cache_[q_key] = q;
+            batched_weight_cache_[k_key] = k;
+            batched_weight_cache_[v_key] = v;
+
+            batched_weight_cache_[drop_self_attn(q_key)] = q;
+            batched_weight_cache_[drop_self_attn(k_key)] = k;
+            batched_weight_cache_[drop_self_attn(v_key)] = v;
             continue;
         }
 
@@ -324,10 +423,25 @@ void EvalManager::finalize_model_loading() {
             auto q = b.index({Slice(), Slice(0, H)}).contiguous();
             auto k = b.index({Slice(), Slice(H, 2 * H)}).contiguous();
             auto v = b.index({Slice(), Slice(2 * H, 3 * H)}).contiguous();
-            batched_weight_cache_[replace_suffix(key, "in_proj_bias", "q_proj.bias")] = q;
-            batched_weight_cache_[replace_suffix(key, "in_proj_bias", "k_proj.bias")] = k;
-            batched_weight_cache_[replace_suffix(key, "in_proj_bias", "v_proj.bias")] = v;
+            const auto q_key = replace_suffix(key, "in_proj_bias", "q_proj.bias");
+            const auto k_key = replace_suffix(key, "in_proj_bias", "k_proj.bias");
+            const auto v_key = replace_suffix(key, "in_proj_bias", "v_proj.bias");
+
+            batched_weight_cache_[q_key] = q;
+            batched_weight_cache_[k_key] = k;
+            batched_weight_cache_[v_key] = v;
+
+            batched_weight_cache_[drop_self_attn(q_key)] = q;
+            batched_weight_cache_[drop_self_attn(k_key)] = k;
+            batched_weight_cache_[drop_self_attn(v_key)] = v;
             continue;
+        }
+
+        if (key.find(".self_attn.") != std::string::npos) {
+            const auto alias = drop_self_attn(key);
+            if (alias != key && !batched_weight_cache_.count(alias)) {
+                batched_weight_cache_[alias] = batched_weight_cache_.at(key);
+            }
         }
     }
 
@@ -666,8 +780,21 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
         c10::Dict<std::string, torch::Tensor> weight_dict;
         weight_dict.reserve(batched_weight_cache_.size());
         for (const auto& kv : batched_weight_cache_) {
-            // kv.second shape: [num_policies, ...]; select rows for this batch
-            auto selected = kv.second.index_select(0, policy_index_tensor).contiguous();
+            const std::string& k = kv.first;
+            // For pre-stacked MoE expert tensors with shape [E, B, ...],
+            // select along policy dimension (dim=1). For all others, select along dim=0.
+            bool is_moe_expert =
+                (k.find(".moe.experts.w1") != std::string::npos) ||
+                (k.find(".moe.experts.b1") != std::string::npos) ||
+                (k.find(".moe.experts.w2") != std::string::npos) ||
+                (k.find(".moe.experts.b2") != std::string::npos);
+            torch::Tensor selected;
+            if (is_moe_expert) {
+                selected = kv.second.index_select(1, policy_index_tensor).contiguous();
+            } else {
+                // kv.second shape: [num_policies, ...]; select rows for this batch
+                selected = kv.second.index_select(0, policy_index_tensor).contiguous();
+            }
             weight_dict.insert(kv.first, selected);
         }
 

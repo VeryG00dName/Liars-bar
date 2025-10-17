@@ -7,8 +7,37 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.misc import lb
 from src.model.ppo_reactive_model_base import PPOReactiveModelBase
 
+
+class TopKMoEKernel(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        gate_logits: torch.Tensor,
+        topk_indices: torch.Tensor,
+        w1: torch.Tensor,
+        b1: torch.Tensor,
+        w2: torch.Tensor,
+        b2: torch.Tensor,
+    ) -> torch.Tensor:
+        # --- START: Ensure FP16 for CUDA kernel ---
+        # The kernel is now specialized for FP16, so we must ensure inputs match.
+        if x.dtype != torch.float16:
+            x = x.to(torch.float16)
+        if gate_logits.dtype != torch.float16:
+            gate_logits = gate_logits.to(torch.float16)
+        if w1.dtype != torch.float16:
+            w1, b1, w2, b2 = w1.to(torch.float16), b1.to(torch.float16), w2.to(torch.float16), b2.to(torch.float16)
+        # --- END: Ensure FP16 for CUDA kernel ---
+        
+        return lb.moe_forward(x, gate_logits, topk_indices, w1, b1, w2, b2)
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        raise NotImplementedError("TopKMoEKernel backward is not implemented")
 
 # --- JIT-compatible helper functions moved to module level ---
 def _batched_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
@@ -57,6 +86,33 @@ def _reduce_heads(
     gather_idx = final_indices.unsqueeze(-1).expand(bsz, tsz, ksz, out_dim)
     top_outputs = torch.gather(stacked, 2, gather_idx)
     return (top_outputs * final_scores.unsqueeze(-1)).sum(dim=2)
+
+
+# TorchScript cannot compile calls into pybind functions. Provide an ignored wrapper
+# and gate its use behind torch.jit.is_scripting() checks.
+@torch.jit.ignore
+def _moe_forward_fused(
+    x: torch.Tensor,
+    gate_logits: torch.Tensor,
+    topk_indices: torch.Tensor,
+    w1: torch.Tensor,
+    b1: torch.Tensor,
+    w2: torch.Tensor,
+    b2: torch.Tensor,
+) -> torch.Tensor:
+    if x.dtype != torch.float16:
+        x = x.to(torch.float16)
+    if gate_logits.dtype != torch.float16:
+        gate_logits = gate_logits.to(torch.float16)
+    if w1.dtype != torch.float16:
+        w1 = w1.to(torch.float16)
+    if b1.dtype != torch.float16:
+        b1 = b1.to(torch.float16)
+    if w2.dtype != torch.float16:
+        w2 = w2.to(torch.float16)
+    if b2.dtype != torch.float16:
+        b2 = b2.to(torch.float16)
+    return lb.moe_forward(x, gate_logits, topk_indices, w1, b1, w2, b2)
 
 
 class PPOReactiveModelScript(PPOReactiveModelBase):
@@ -268,188 +324,75 @@ class PPOReactiveModelScript(PPOReactiveModelBase):
                 weights[f"transformer.layers.{layer_idx}.norm1.bias"],
             )
 
-            # --- START: Fully Unrolled Sparse MoE Logic ---
+            # --- START: Fused Sparse MoE Logic ---
             gate_logits = _batched_linear(
                 x,
                 weights[f"transformer.layers.{layer_idx}.moe.gate.weight"],
                 weights[f"transformer.layers.{layer_idx}.moe.gate.bias"],
             )
+            if gate_logits.dtype != x.dtype:
+                gate_logits = gate_logits.to(dtype=x.dtype)
+            topk_indices = torch.topk(gate_logits, top_k, dim=-1).indices
             gate_probs = torch.softmax(gate_logits, dim=-1)
-            topk_scores, topk_indices = torch.topk(gate_probs, top_k, dim=-1)
+            topk_scores = torch.gather(gate_probs, -1, topk_indices)
             topk_weights = topk_scores / topk_scores.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
-            y = torch.zeros_like(x)
-            
-            # --- Expert 0 ---
-            route_mask_0 = (topk_indices == 0).any(dim=-1)
-            if route_mask_0.any():
-                batch_indices, time_indices = torch.where(route_mask_0)
-                expert_inputs = x[batch_indices, time_indices]
-                expert_mask = (topk_indices[batch_indices, time_indices] == 0)
-                rank_in_topk = torch.where(expert_mask)[1]
-                expert_routing_weights = topk_weights[batch_indices, time_indices, rank_in_topk].unsqueeze(-1)
-                
-                w1 = weights[f"transformer.layers.{layer_idx}.moe.experts.0.0.weight"][batch_indices]
-                b1 = weights[f"transformer.layers.{layer_idx}.moe.experts.0.0.bias"][batch_indices]
-                w2 = weights[f"transformer.layers.{layer_idx}.moe.experts.0.3.weight"][batch_indices]
-                b2 = weights[f"transformer.layers.{layer_idx}.moe.experts.0.3.bias"][batch_indices]
+            if (not torch.jit.is_scripting()) and x.is_cuda:
+                # Use pre-stacked expert tensors provided by C++ managers.
+                expert_w1 = weights[f"transformer.layers.{layer_idx}.moe.experts.w1"]
+                expert_b1 = weights[f"transformer.layers.{layer_idx}.moe.experts.b1"]
+                expert_w2 = weights[f"transformer.layers.{layer_idx}.moe.experts.w2"]
+                expert_b2 = weights[f"transformer.layers.{layer_idx}.moe.experts.b2"]
 
-                hidden = F.gelu(torch.bmm(expert_inputs.unsqueeze(1), w1.transpose(1, 2)) + b1.unsqueeze(1))
-                out = torch.bmm(hidden, w2.transpose(1, 2)) + b2.unsqueeze(1)
-                weighted_out = out.squeeze(1) * expert_routing_weights
-                
-                temp_y = torch.zeros_like(y[0]).index_add_(0, time_indices, weighted_out)
-                y = y.index_add(0, batch_indices, temp_y)
+                moe_output = _moe_forward_fused(
+                    x.contiguous(),
+                    gate_logits.contiguous(),
+                    topk_indices.to(dtype=torch.long).contiguous(),
+                    expert_w1.contiguous(),
+                    expert_b1.contiguous(),
+                    expert_w2.contiguous(),
+                    expert_b2.contiguous(),
+                )
+            else:
+                y = torch.zeros_like(x)
+                for expert_idx in range(num_experts):
+                    route_mask = (topk_indices == expert_idx).any(dim=-1)
+                    if route_mask.any():
+                        batch_indices, time_indices = torch.where(route_mask)
+                        expert_inputs = x[batch_indices, time_indices]
+                        expert_mask = (
+                            topk_indices[batch_indices, time_indices] == expert_idx
+                        )
+                        rank_in_topk = torch.where(expert_mask)[1]
+                        expert_routing_weights = topk_weights[
+                            batch_indices, time_indices, rank_in_topk
+                        ].unsqueeze(-1)
 
-            # --- Expert 1 ---
-            route_mask_1 = (topk_indices == 1).any(dim=-1)
-            if route_mask_1.any():
-                batch_indices, time_indices = torch.where(route_mask_1)
-                expert_inputs = x[batch_indices, time_indices]
-                expert_mask = (topk_indices[batch_indices, time_indices] == 1)
-                rank_in_topk = torch.where(expert_mask)[1]
-                expert_routing_weights = topk_weights[batch_indices, time_indices, rank_in_topk].unsqueeze(-1)
+                        w1 = weights[
+                            f"transformer.layers.{layer_idx}.moe.experts.{expert_idx}.0.weight"
+                        ][batch_indices]
+                        b1 = weights[
+                            f"transformer.layers.{layer_idx}.moe.experts.{expert_idx}.0.bias"
+                        ][batch_indices]
+                        w2 = weights[
+                            f"transformer.layers.{layer_idx}.moe.experts.{expert_idx}.3.weight"
+                        ][batch_indices]
+                        b2 = weights[
+                            f"transformer.layers.{layer_idx}.moe.experts.{expert_idx}.3.bias"
+                        ][batch_indices]
 
-                w1 = weights[f"transformer.layers.{layer_idx}.moe.experts.1.0.weight"][batch_indices]
-                b1 = weights[f"transformer.layers.{layer_idx}.moe.experts.1.0.bias"][batch_indices]
-                w2 = weights[f"transformer.layers.{layer_idx}.moe.experts.1.3.weight"][batch_indices]
-                b2 = weights[f"transformer.layers.{layer_idx}.moe.experts.1.3.bias"][batch_indices]
+                        hidden = F.gelu(
+                            torch.bmm(expert_inputs.unsqueeze(1), w1.transpose(1, 2))
+                            + b1.unsqueeze(1)
+                        )
+                        out = torch.bmm(hidden, w2.transpose(1, 2)) + b2.unsqueeze(1)
+                        weighted_out = out.squeeze(1) * expert_routing_weights
 
-                hidden = F.gelu(torch.bmm(expert_inputs.unsqueeze(1), w1.transpose(1, 2)) + b1.unsqueeze(1))
-                out = torch.bmm(hidden, w2.transpose(1, 2)) + b2.unsqueeze(1)
-                weighted_out = out.squeeze(1) * expert_routing_weights
-                
-                temp_y = torch.zeros_like(y[0]).index_add_(0, time_indices, weighted_out)
-                y = y.index_add(0, batch_indices, temp_y)
+                        temp_y = torch.zeros_like(y[0]).index_add_(0, time_indices, weighted_out)
+                        y = y.index_add(0, batch_indices, temp_y)
 
-            # --- Expert 2 ---
-            route_mask_2 = (topk_indices == 2).any(dim=-1)
-            if route_mask_2.any():
-                batch_indices, time_indices = torch.where(route_mask_2)
-                expert_inputs = x[batch_indices, time_indices]
-                expert_mask = (topk_indices[batch_indices, time_indices] == 2)
-                rank_in_topk = torch.where(expert_mask)[1]
-                expert_routing_weights = topk_weights[batch_indices, time_indices, rank_in_topk].unsqueeze(-1)
-
-                w1 = weights[f"transformer.layers.{layer_idx}.moe.experts.2.0.weight"][batch_indices]
-                b1 = weights[f"transformer.layers.{layer_idx}.moe.experts.2.0.bias"][batch_indices]
-                w2 = weights[f"transformer.layers.{layer_idx}.moe.experts.2.3.weight"][batch_indices]
-                b2 = weights[f"transformer.layers.{layer_idx}.moe.experts.2.3.bias"][batch_indices]
-                
-                hidden = F.gelu(torch.bmm(expert_inputs.unsqueeze(1), w1.transpose(1, 2)) + b1.unsqueeze(1))
-                out = torch.bmm(hidden, w2.transpose(1, 2)) + b2.unsqueeze(1)
-                weighted_out = out.squeeze(1) * expert_routing_weights
-
-                temp_y = torch.zeros_like(y[0]).index_add_(0, time_indices, weighted_out)
-                y = y.index_add(0, batch_indices, temp_y)
-
-            # --- Expert 3 ---
-            route_mask_3 = (topk_indices == 3).any(dim=-1)
-            if route_mask_3.any():
-                batch_indices, time_indices = torch.where(route_mask_3)
-                expert_inputs = x[batch_indices, time_indices]
-                expert_mask = (topk_indices[batch_indices, time_indices] == 3)
-                rank_in_topk = torch.where(expert_mask)[1]
-                expert_routing_weights = topk_weights[batch_indices, time_indices, rank_in_topk].unsqueeze(-1)
-
-                w1 = weights[f"transformer.layers.{layer_idx}.moe.experts.3.0.weight"][batch_indices]
-                b1 = weights[f"transformer.layers.{layer_idx}.moe.experts.3.0.bias"][batch_indices]
-                w2 = weights[f"transformer.layers.{layer_idx}.moe.experts.3.3.weight"][batch_indices]
-                b2 = weights[f"transformer.layers.{layer_idx}.moe.experts.3.3.bias"][batch_indices]
-                
-                hidden = F.gelu(torch.bmm(expert_inputs.unsqueeze(1), w1.transpose(1, 2)) + b1.unsqueeze(1))
-                out = torch.bmm(hidden, w2.transpose(1, 2)) + b2.unsqueeze(1)
-                weighted_out = out.squeeze(1) * expert_routing_weights
-
-                temp_y = torch.zeros_like(y[0]).index_add_(0, time_indices, weighted_out)
-                y = y.index_add(0, batch_indices, temp_y)
-
-            # --- Expert 4 ---
-            route_mask_4 = (topk_indices == 4).any(dim=-1)
-            if route_mask_4.any():
-                batch_indices, time_indices = torch.where(route_mask_4)
-                expert_inputs = x[batch_indices, time_indices]
-                expert_mask = (topk_indices[batch_indices, time_indices] == 4)
-                rank_in_topk = torch.where(expert_mask)[1]
-                expert_routing_weights = topk_weights[batch_indices, time_indices, rank_in_topk].unsqueeze(-1)
-
-                w1 = weights[f"transformer.layers.{layer_idx}.moe.experts.4.0.weight"][batch_indices]
-                b1 = weights[f"transformer.layers.{layer_idx}.moe.experts.4.0.bias"][batch_indices]
-                w2 = weights[f"transformer.layers.{layer_idx}.moe.experts.4.3.weight"][batch_indices]
-                b2 = weights[f"transformer.layers.{layer_idx}.moe.experts.4.3.bias"][batch_indices]
-                
-                hidden = F.gelu(torch.bmm(expert_inputs.unsqueeze(1), w1.transpose(1, 2)) + b1.unsqueeze(1))
-                out = torch.bmm(hidden, w2.transpose(1, 2)) + b2.unsqueeze(1)
-                weighted_out = out.squeeze(1) * expert_routing_weights
-
-                temp_y = torch.zeros_like(y[0]).index_add_(0, time_indices, weighted_out)
-                y = y.index_add(0, batch_indices, temp_y)
-                
-            # --- Expert 5 ---
-            route_mask_5 = (topk_indices == 5).any(dim=-1)
-            if route_mask_5.any():
-                batch_indices, time_indices = torch.where(route_mask_5)
-                expert_inputs = x[batch_indices, time_indices]
-                expert_mask = (topk_indices[batch_indices, time_indices] == 5)
-                rank_in_topk = torch.where(expert_mask)[1]
-                expert_routing_weights = topk_weights[batch_indices, time_indices, rank_in_topk].unsqueeze(-1)
-
-                w1 = weights[f"transformer.layers.{layer_idx}.moe.experts.5.0.weight"][batch_indices]
-                b1 = weights[f"transformer.layers.{layer_idx}.moe.experts.5.0.bias"][batch_indices]
-                w2 = weights[f"transformer.layers.{layer_idx}.moe.experts.5.3.weight"][batch_indices]
-                b2 = weights[f"transformer.layers.{layer_idx}.moe.experts.5.3.bias"][batch_indices]
-                
-                hidden = F.gelu(torch.bmm(expert_inputs.unsqueeze(1), w1.transpose(1, 2)) + b1.unsqueeze(1))
-                out = torch.bmm(hidden, w2.transpose(1, 2)) + b2.unsqueeze(1)
-                weighted_out = out.squeeze(1) * expert_routing_weights
-
-                temp_y = torch.zeros_like(y[0]).index_add_(0, time_indices, weighted_out)
-                y = y.index_add(0, batch_indices, temp_y)
-                
-            # --- Expert 6 ---
-            route_mask_6 = (topk_indices == 6).any(dim=-1)
-            if route_mask_6.any():
-                batch_indices, time_indices = torch.where(route_mask_6)
-                expert_inputs = x[batch_indices, time_indices]
-                expert_mask = (topk_indices[batch_indices, time_indices] == 6)
-                rank_in_topk = torch.where(expert_mask)[1]
-                expert_routing_weights = topk_weights[batch_indices, time_indices, rank_in_topk].unsqueeze(-1)
-
-                w1 = weights[f"transformer.layers.{layer_idx}.moe.experts.6.0.weight"][batch_indices]
-                b1 = weights[f"transformer.layers.{layer_idx}.moe.experts.6.0.bias"][batch_indices]
-                w2 = weights[f"transformer.layers.{layer_idx}.moe.experts.6.3.weight"][batch_indices]
-                b2 = weights[f"transformer.layers.{layer_idx}.moe.experts.6.3.bias"][batch_indices]
-                
-                hidden = F.gelu(torch.bmm(expert_inputs.unsqueeze(1), w1.transpose(1, 2)) + b1.unsqueeze(1))
-                out = torch.bmm(hidden, w2.transpose(1, 2)) + b2.unsqueeze(1)
-                weighted_out = out.squeeze(1) * expert_routing_weights
-
-                temp_y = torch.zeros_like(y[0]).index_add_(0, time_indices, weighted_out)
-                y = y.index_add(0, batch_indices, temp_y)
-                
-            # --- Expert 7 ---
-            route_mask_7 = (topk_indices == 7).any(dim=-1)
-            if route_mask_7.any():
-                batch_indices, time_indices = torch.where(route_mask_7)
-                expert_inputs = x[batch_indices, time_indices]
-                expert_mask = (topk_indices[batch_indices, time_indices] == 7)
-                rank_in_topk = torch.where(expert_mask)[1]
-                expert_routing_weights = topk_weights[batch_indices, time_indices, rank_in_topk].unsqueeze(-1)
-
-                w1 = weights[f"transformer.layers.{layer_idx}.moe.experts.7.0.weight"][batch_indices]
-                b1 = weights[f"transformer.layers.{layer_idx}.moe.experts.7.0.bias"][batch_indices]
-                w2 = weights[f"transformer.layers.{layer_idx}.moe.experts.7.3.weight"][batch_indices]
-                b2 = weights[f"transformer.layers.{layer_idx}.moe.experts.7.3.bias"][batch_indices]
-                
-                hidden = F.gelu(torch.bmm(expert_inputs.unsqueeze(1), w1.transpose(1, 2)) + b1.unsqueeze(1))
-                out = torch.bmm(hidden, w2.transpose(1, 2)) + b2.unsqueeze(1)
-                weighted_out = out.squeeze(1) * expert_routing_weights
-
-                temp_y = torch.zeros_like(y[0]).index_add_(0, time_indices, weighted_out)
-                y = y.index_add(0, batch_indices, temp_y)
-
-            moe_output = y
-            # --- END: Fully Unrolled Sparse MoE Logic ---
+                moe_output = y
+            # --- END: Fused Sparse MoE Logic ---
 
             residual2 = x + moe_output
             x = _batched_layer_norm(
