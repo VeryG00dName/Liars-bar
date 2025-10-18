@@ -181,10 +181,12 @@ def load_checkpoint_weights(checkpoint_path, device="cuda"):
     "table_flag_embedding.weight", "agent_embedding.weight",
     "position_embedding.weight",
     "gate_obs.0.weight", "gate_obs.0.bias", "gate_obs.2.weight", "gate_obs.2.bias",
+    "action_heads.0.weight", "action_heads.0.bias",
+    "opp_action_heads.0.weight", "opp_action_heads.0.bias",
 ]:
         t = weight_dict[k]
         print(k, tuple(t.shape), t.dtype)
-    
+
     # Add fixed buffers (LUTs) AFTER adding batch dim
     # LUTs should NOT have batch dimension - they're shared lookup tables
     print("Adding fixed buffers (LUTs)...")
@@ -292,9 +294,10 @@ def profile_forward_pass(checkpoint_path, batch_size=128, seq_len=256):
     print("\nWarming up (1 iteration)...")
     torch.cuda.reset_peak_memory_stats()
     with torch.no_grad():
+        policy_indices = torch.zeros(obs_seq.size(0), dtype=torch.long, device=device)
         _ = lb.forward_packed_cpp(
             obs_seq, act_seq, agent_types, positions,
-            weight_dict, padding_mask,
+            weight_dict, policy_indices, padding_mask,
             arch["num_layers"],
             arch["num_heads"],
             arch["hidden_dim"],
@@ -324,9 +327,10 @@ def profile_forward_pass(checkpoint_path, batch_size=128, seq_len=256):
         with_stack=True,
     ) as prof:
         with torch.no_grad():
+            policy_indices = torch.zeros(obs_seq.size(0), dtype=torch.long, device=device)
             action_logits, opp_logits, state_values, win_logits = lb.forward_packed_cpp(
                 obs_seq, act_seq, agent_types, positions,
-                weight_dict, padding_mask,
+                weight_dict, policy_indices, padding_mask,
                 arch["num_layers"],
                 arch["num_heads"],
                 arch["hidden_dim"],

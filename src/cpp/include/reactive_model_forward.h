@@ -15,8 +15,9 @@
  * @param action_sequence Action sequences [B, T] (long tensor)
  * @param agent_types Agent type IDs [B, T] (long tensor)
  * @param positions Position IDs [B, T] (long tensor)
- * @param weights Batched weight dictionary. All weights have batch dimension B.
- *                Keys follow the pattern: "module.submodule.weight" or "module.submodule.bias"
+ * @param batched_weights Small batched weight cache [W, ...]. Keys follow the pattern:
+ *                "module.submodule.weight" or "module.submodule.bias".
+ * @param policy_indices Indices selecting a weight entry per sample [B].
  * @param padding_mask Optional padding mask [B, T] (bool tensor, True = padding)
  * @param num_layers Number of transformer layers
  * @param num_heads Number of attention heads
@@ -38,7 +39,8 @@ forward_packed_cpp(
     const torch::Tensor& action_sequence,
     const torch::Tensor& agent_types,
     const torch::Tensor& positions,
-    const c10::Dict<std::string, torch::Tensor>& weights,
+    const c10::Dict<std::string, torch::Tensor>& batched_weights, // Shape [W, ...]
+    const torch::Tensor& policy_indices, // Shape [B]
     const torch::optional<torch::Tensor>& padding_mask = torch::nullopt,
     int64_t num_layers = 2,
     int64_t num_heads = 4,

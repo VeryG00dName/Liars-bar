@@ -685,32 +685,20 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
         auto weights_t0 = Clock::now();
         auto policy_index_tensor = torch::tensor(cache_indices, opts_long_device);
 
-        // Select the correct weights per-request
-        // IMPORTANT: Don't call .contiguous() to avoid creating copies - use views
-        c10::Dict<std::string, torch::Tensor> weight_dict;
-        weight_dict.reserve(batched_weight_cache_.size());
-        for (const auto& kv : batched_weight_cache_) {
-            // All weights are batched along dim=0 (policy dimension)
-            // Shape: [num_policies, ...] for regular weights
-            // Shape: [num_policies, E, ...] for pre-stacked MoE expert weights
-            // Use index_select without .contiguous() to create views instead of copies
-            torch::Tensor selected = kv.value().index_select(0, policy_index_tensor);
-            weight_dict.insert(kv.key(), selected);
-        }
-
         auto weights_t1 = Clock::now();
         timer_hist_prep_weights_ +=
             std::chrono::duration_cast<Microseconds>(weights_t1 - weights_t0);
 
         auto model_t0 = Clock::now();
 
-        // Call our C++ forward function
+        // Call our C++ forward function, letting it handle per-request weight selection
         auto [action_logits, opp_logits, state_values, win_logits] = forward_packed_cpp(
             tensor_batch.obs_sequence,
             tensor_batch.action_sequence,
             tensor_batch.agent_types,
             tensor_batch.positions,
-            weight_dict,
+            batched_weight_cache_,
+            policy_index_tensor,
             tensor_batch.padding_mask,
             num_layers_,
             num_heads_,
@@ -783,7 +771,6 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
         offset += take;
 
         // Force release of intermediate tensors to avoid memory buildup
-        weight_dict.clear();
         if (offset % (batch_limit * 4) == 0) {
             at::accelerator::emptyCache();
         }

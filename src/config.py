@@ -1,5 +1,4 @@
 import os
-from gymnasium import spaces
 
 # ============================
 # Path Configuration
@@ -163,12 +162,11 @@ DEVICE = "cuda"
 FORCE_CUDA_SYNC_FOR_TIMING = True
 CPP_BOT_MAX_LABEL = 6
 # ============================
-# Depreated, kept for compatiblty
+# Everything past this is depreated, kept for compatiblty!
 # ============================
 NUM_EPISODES = 40000
 UPDATE_STEPS = 3
 AUX_LOSS_WEIGHT = 1
-
 
 RENDER_MODE = None  # Set to 'human' to enable rendering
 USE_WRAPPER = False
@@ -182,8 +180,8 @@ MAX_SEQUENCE_LENGTH = 480
 
 # Neural Network Configuration
 HIDDEN_DIM = 256
-INPUT_DIM = 26  # Will be dynamically set
-OUTPUT_DIM = 7  # Will be dynamically set
+INPUT_DIM = 26  # depreated, kept for compatiblty!
+OUTPUT_DIM = 7  # depreated, kept for compatiblty!
 NUM_OBS_STACK = 50
 
 # ============================
@@ -196,14 +194,3 @@ STRATEGY_NUM_LAYERS = 2
 STRATEGY_DIM = 5
 STRATEGY_NUM_CLASSES = 10  # Unused
 STRATEGY_DROPOUT = 0.1
-
-# ============================
-# Derived Configurations
-# ============================
-def set_derived_config(env_observation_space, env_action_space, num_opponents):
-    global INPUT_DIM, OUTPUT_DIM
-    if not isinstance(env_observation_space, spaces.Box):
-        raise NotImplementedError("Only Box observation spaces are supported.")
-
-    INPUT_DIM = env_observation_space.shape[0] + 2 + (STRATEGY_DIM * num_opponents)
-    OUTPUT_DIM = env_action_space.n

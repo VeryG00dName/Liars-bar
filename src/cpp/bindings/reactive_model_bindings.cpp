@@ -16,6 +16,7 @@ void bind_reactive_model(py::module_& m) {
            const torch::Tensor& agent_types,
            const torch::Tensor& positions,
            py::dict weights_py,
+           const torch::Tensor& policy_indices,
            const torch::optional<torch::Tensor>& padding_mask,
            int64_t num_layers,
            int64_t num_heads,
@@ -39,6 +40,7 @@ void bind_reactive_model(py::module_& m) {
                 agent_types,
                 positions,
                 weights,
+                policy_indices,
                 padding_mask,
                 num_layers,
                 num_heads,
@@ -54,6 +56,7 @@ void bind_reactive_model(py::module_& m) {
         py::arg("agent_types"),
         py::arg("positions"),
         py::arg("weights"),
+        py::arg("policy_indices"),
         py::arg("padding_mask") = torch::nullopt,
         py::arg("num_layers") = 2,
         py::arg("num_heads") = 4,
@@ -65,15 +68,16 @@ void bind_reactive_model(py::module_& m) {
         R"doc(
         Stateless forward pass for PPOReactiveModel with batched weights.
 
-        This function computes the forward pass using pre-loaded batched weights,
-        replacing TorchScript inference with direct C++ computation.
+        This function computes the forward pass using a small batched weight cache [W, ...]
+        and a per-sample `policy_indices` tensor [B] to select the appropriate weights.
 
         Args:
             obs_sequence: Observation sequences [B, T, obs_dim]
             action_sequence: Action sequences [B, T] (long tensor)
             agent_types: Agent type IDs [B, T] (long tensor)
             positions: Position IDs [B, T] (long tensor)
-            weights: Batched weight dictionary (all weights have batch dim B)
+            weights: Small batched weight dictionary [W, ...]
+            policy_indices: Indices selecting weights per sample [B]
             padding_mask: Optional padding mask [B, T] (bool, True=padding)
             num_layers: Number of transformer layers (default: 2)
             num_heads: Number of attention heads (default: 4)
