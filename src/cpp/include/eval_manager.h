@@ -55,7 +55,10 @@ public:
     void set_max_env_batch(int max_batch);
     void set_inference_batch_size(int batch_size);
 
-    void load_model(int policy_id, const std::string& path);
+    void load_model(
+        int policy_id,
+        const std::unordered_map<std::string, torch::Tensor>& state_dict,
+        const std::string& original_path);
     void finalize_model_loading();
     void register_cpp_bot(int policy_id, const std::string& bot_name);
 

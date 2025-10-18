@@ -1,5 +1,6 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <torch/extension.h>
 
 #include "eval_manager.h"
 
@@ -18,7 +19,18 @@ void bind_eval_manager(py::module_& m) {
         .def(py::init<>())
         .def("set_max_env_batch", &EvalManager::set_max_env_batch, py::arg("max_batch"))
         .def("set_inference_batch_size", &EvalManager::set_inference_batch_size, py::arg("batch_size"))
-        .def("load_model", &EvalManager::load_model, py::arg("policy_id"), py::arg("path"))
+        .def(
+            "load_model",
+            [](EvalManager& self, int policy_id, py::dict state_dict_py, const std::string& original_path) {
+                std::unordered_map<std::string, torch::Tensor> state_dict;
+                for (auto item : state_dict_py) {
+                    state_dict[item.first.cast<std::string>()] = item.second.cast<torch::Tensor>();
+                }
+                self.load_model(policy_id, state_dict, original_path);
+            },
+            py::arg("policy_id"),
+            py::arg("state_dict"),
+            py::arg("original_path"))
         .def("finalize_model_loading", &EvalManager::finalize_model_loading)
         .def("register_cpp_bot", &EvalManager::register_cpp_bot,
              py::arg("policy_id"), py::arg("name"))

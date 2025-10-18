@@ -194,12 +194,12 @@ void EvalManager::set_inference_batch_size(int batch_size) {
     inference_batch_size_ = batch_size;
 }
 
-void EvalManager::load_model(int policy_id, const std::string& path) {
+void EvalManager::load_model(
+    int policy_id,
+    const std::unordered_map<std::string, torch::Tensor>& state_dict,
+    const std::string& original_path) {
     try {
         torch::NoGradGuard guard;
-
-        // Load state_dict from .pth file
-        auto state_dict = load_state_dict_from_pth(path, "" /* policy_key */);
 
         // Move weights to inference device and convert to FP16
         std::unordered_map<std::string, torch::Tensor> processed_dict;
@@ -215,17 +215,18 @@ void EvalManager::load_model(int policy_id, const std::string& path) {
 
         staged_state_dicts_[policy_id] = std::move(processed_dict);
 
-        int max_seq_length = infer_max_seq_length_for_model(path);
+        // Infer max sequence length using the original path metadata if available
+        int max_seq_length = infer_max_seq_length_for_model(original_path);
         policy_max_sequence_lengths_[policy_id] = max_seq_length;
         arena_.set_policy_max_sequence_length(policy_id, max_seq_length);
         weights_finalized_ = false;
     } catch (const c10::Error& err) {
-        std::cerr << "[EvalManager] Failed to load .pth checkpoint from '" << path
-                  << "': " << err.what_without_backtrace() << std::endl;
+        std::cerr << "[EvalManager] Failed to process state_dict for policy " << policy_id
+                  << ": " << err.what_without_backtrace() << std::endl;
         throw;
     } catch (const std::exception& err) {
-        std::cerr << "[EvalManager] Failed to load .pth checkpoint from '" << path
-                  << "': " << err.what() << std::endl;
+        std::cerr << "[EvalManager] Failed to process state_dict for policy " << policy_id
+                  << ": " << err.what() << std::endl;
         throw;
     }
 }
@@ -271,13 +272,10 @@ void EvalManager::finalize_model_loading() {
         batched_weight_cache_.insert(kv.first, torch::stack(kv.second).contiguous());
     }
 
-    // Add fixed buffers (LUTs for action decomposition)
-    add_fixed_buffers(batched_weight_cache_, kInferenceDevice);
-
     std::vector<std::string> original_keys;
     original_keys.reserve(batched_weight_cache_.size());
     for (const auto& kv : batched_weight_cache_) {
-        original_keys.push_back(kv.first);
+        original_keys.push_back(kv.key());
     }
 
     using torch::indexing::Slice;
@@ -304,11 +302,10 @@ void EvalManager::finalize_model_loading() {
 
     for (const auto& key : original_keys) {
         if (key.find(".self_attn.in_proj_weight") != std::string::npos) {
-            auto it = batched_weight_cache_.find(key);
-            if (it == batched_weight_cache_.end()) {
+            if (!batched_weight_cache_.contains(key)) {
                 continue;
             }
-            const auto& w = it->second;
+            const auto& w = batched_weight_cache_.at(key);
             if (w.dim() != 3 || w.size(1) % 3 != 0) {
                 continue;
             }
@@ -320,22 +317,21 @@ void EvalManager::finalize_model_loading() {
             const auto k_key = replace_suffix(key, "in_proj_weight", "k_proj.weight");
             const auto v_key = replace_suffix(key, "in_proj_weight", "v_proj.weight");
 
-            batched_weight_cache_[q_key] = q;
-            batched_weight_cache_[k_key] = k;
-            batched_weight_cache_[v_key] = v;
+            batched_weight_cache_.insert(q_key, q);
+            batched_weight_cache_.insert(k_key, k);
+            batched_weight_cache_.insert(v_key, v);
 
-            batched_weight_cache_[drop_self_attn(q_key)] = q;
-            batched_weight_cache_[drop_self_attn(k_key)] = k;
-            batched_weight_cache_[drop_self_attn(v_key)] = v;
+            batched_weight_cache_.insert(drop_self_attn(q_key), q);
+            batched_weight_cache_.insert(drop_self_attn(k_key), k);
+            batched_weight_cache_.insert(drop_self_attn(v_key), v);
             continue;
         }
 
         if (key.find(".self_attn.in_proj_bias") != std::string::npos) {
-            auto it = batched_weight_cache_.find(key);
-            if (it == batched_weight_cache_.end()) {
+            if (!batched_weight_cache_.contains(key)) {
                 continue;
             }
-            const auto& b = it->second;
+            const auto& b = batched_weight_cache_.at(key);
             if (b.dim() != 2 || b.size(1) % 3 != 0) {
                 continue;
             }
@@ -347,20 +343,20 @@ void EvalManager::finalize_model_loading() {
             const auto k_key = replace_suffix(key, "in_proj_bias", "k_proj.bias");
             const auto v_key = replace_suffix(key, "in_proj_bias", "v_proj.bias");
 
-            batched_weight_cache_[q_key] = q;
-            batched_weight_cache_[k_key] = k;
-            batched_weight_cache_[v_key] = v;
+            batched_weight_cache_.insert(q_key, q);
+            batched_weight_cache_.insert(k_key, k);
+            batched_weight_cache_.insert(v_key, v);
 
-            batched_weight_cache_[drop_self_attn(q_key)] = q;
-            batched_weight_cache_[drop_self_attn(k_key)] = k;
-            batched_weight_cache_[drop_self_attn(v_key)] = v;
+            batched_weight_cache_.insert(drop_self_attn(q_key), q);
+            batched_weight_cache_.insert(drop_self_attn(k_key), k);
+            batched_weight_cache_.insert(drop_self_attn(v_key), v);
             continue;
         }
 
         if (key.find(".self_attn.") != std::string::npos) {
             const auto alias = drop_self_attn(key);
-            if (alias != key && !batched_weight_cache_.count(alias)) {
-                batched_weight_cache_[alias] = batched_weight_cache_.at(key);
+            if (alias != key && !batched_weight_cache_.contains(alias)) {
+                batched_weight_cache_.insert(alias, batched_weight_cache_.at(key));
             }
         }
     }
@@ -696,8 +692,8 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
             // All weights are batched along dim=0 (policy dimension)
             // Shape: [num_policies, ...] for regular weights
             // Shape: [num_policies, E, ...] for pre-stacked MoE expert weights
-            torch::Tensor selected = kv.second.index_select(0, policy_index_tensor).contiguous();
-            weight_dict.insert(kv.first, selected);
+            torch::Tensor selected = kv.value().index_select(0, policy_index_tensor).contiguous();
+            weight_dict.insert(kv.key(), selected);
         }
 
         auto weights_t1 = Clock::now();

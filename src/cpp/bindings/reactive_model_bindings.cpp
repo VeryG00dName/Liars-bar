@@ -96,24 +96,7 @@ void bind_reactive_model(py::module_& m) {
         )doc"
     );
 
-    m.def(
-        "load_state_dict_from_pth",
-        &load_state_dict_from_pth,
-        py::arg("path"),
-        py::arg("policy_key") = "",
-        R"doc(
-        Load a .pth checkpoint file and extract the state_dict.
-
-        Handles both direct state_dict files and wrapped checkpoint formats.
-
-        Args:
-            path: Path to the .pth checkpoint file
-            policy_key: Optional key for wrapped checkpoints (e.g., "agent_0")
-
-        Returns:
-            dict: State dictionary mapping parameter names to tensors
-        )doc"
-    );
+    // Note: C++ .pth loading helper removed; handled in Python.
 
     m.def(
         "batch_state_dicts",

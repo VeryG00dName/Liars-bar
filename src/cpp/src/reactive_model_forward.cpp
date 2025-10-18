@@ -208,9 +208,12 @@ forward_packed_cpp(
     // Action Decomposition
     // ========================================================================
     auto action_long = action_sequence.to(torch::kLong);
-    auto act_kind_ids = lut_act_kind.index({action_long});
-    auto count_ids = lut_count.index({action_long});
-    auto table_flag_ids = lut_table_flag.index({action_long});
+    // Use torch::gather to index the batched LUTs correctly.
+    // Ensure the output is Long for embedding lookups.
+    auto act_kind_ids = torch::gather(lut_act_kind, 1, action_long).to(torch::kLong);
+    auto count_ids = torch::gather(lut_count, 1, action_long).to(torch::kLong);
+    auto table_flag_ids = torch::gather(lut_table_flag, 1, action_long).to(torch::kLong);
+
 
     // Apply padding mask if provided
     if (padding_mask.has_value()) {

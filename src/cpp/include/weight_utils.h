@@ -35,22 +35,7 @@ void prestack_moe_expert_weights(
     int64_t num_experts
 );
 
-/**
- * Load a .pth checkpoint file and extract the state_dict.
- *
- * This function loads a PyTorch checkpoint (.pth file) and extracts the model
- * weights, handling both formats:
- * 1. Direct state_dict: {"module.weight": tensor, ...}
- * 2. Wrapped checkpoint: {"policy_nets": {"agent_key": state_dict}, ...}
- *
- * @param path Path to the .pth checkpoint file
- * @param policy_key Optional key for wrapped checkpoints (e.g., "agent_0")
- * @return State dictionary mapping parameter names to tensors
- */
-std::unordered_map<std::string, torch::Tensor> load_state_dict_from_pth(
-    const std::string& path,
-    const std::string& policy_key = ""
-);
+// Note: Previous C++ .pth loading helper removed.
 
 /**
  * Batch multiple state_dicts into a single batched weight dictionary.

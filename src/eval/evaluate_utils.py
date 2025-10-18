@@ -327,12 +327,9 @@ def load_evaluation_policies(
         for gen_spec in gens_to_load:
             base_dir = Path(config.CHECKPOINT_DIR) / run_name / f"gen_{gen_spec}"
 
-            # Look for .pth checkpoint files (prioritize compiled version)
-            pth_candidates = [
-                base_dir / "compiled_final.pth",
-                base_dir / "final.pth",
-            ]
-            checkpoint_path = next((p for p in pth_candidates if p.exists()), None)
+            # Look for .pth checkpoint files, prioritizing already fixed/converted ones.
+            final_path = base_dir / "final.pth"
+            checkpoint_path = final_path if final_path.exists() else None
 
             if checkpoint_path is None:
                 print(
@@ -340,23 +337,45 @@ def load_evaluation_policies(
                 )
                 continue
 
-            checkpoint, agent_key, meta = _load_checkpoint(checkpoint_path, device)
+            # We don't need to load the checkpoint in Python yet, just get metadata.
             player_id = f"{run_name}_gen_{gen_spec}"
-            label = int(meta.get("label", 0))
+            
+            # Try to infer label from a full checkpoint if it exists, otherwise default
+            label = 0
+            full_ckpt_path = base_dir / "checkpoint.pth"
+            if full_ckpt_path.exists():
+                 _, _, meta = _load_checkpoint(full_ckpt_path, device)
+                 label = int(meta.get("label", 0))
 
             policy_id = next_neural_policy_id
             next_neural_policy_id += 1
 
-            # Infer max sequence length from .pth.max_seq_length file or path
-            max_seq_length = _infer_traced_max_seq_length(checkpoint_path)
-
-            # Load .pth weights directly (no TorchScript needed)
-            eval_manager.load_model(policy_id, str(checkpoint_path))
+            # NEW: Load checkpoint in Python and pass state_dict to C++
+            try:
+                data = torch.load(checkpoint_path, map_location="cpu")
+                if isinstance(data, dict) and "model_state_dict" in data:
+                    state_dict = data["model_state_dict"]
+                else:
+                    state_dict = data
+                if not isinstance(state_dict, dict):
+                    raise TypeError(
+                        f"Checkpoint did not contain a valid state_dict: {checkpoint_path}"
+                    )
+            except Exception as e:
+                print(f"[ERROR] Failed to load or parse checkpoint in Python: {e}")
+                continue
+            eval_manager.load_model(
+                policy_id=policy_id,
+                state_dict=state_dict,
+                original_path=str(checkpoint_path),
+            )
+            
             neural_policies_loaded = True
             entry = _initial_metadata(policy_id, player_id, label, is_cpp_bot=False)
             entry["checkpoint_path"] = str(checkpoint_path)
-            entry["max_seq_length"] = max_seq_length
+            entry["max_seq_length"] = _infer_traced_max_seq_length(checkpoint_path)
             metadata[policy_id] = entry
+
 
     if neural_policies_loaded:
         eval_manager.finalize_model_loading()
