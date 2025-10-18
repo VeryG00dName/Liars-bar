@@ -11,7 +11,44 @@ void bind_reactive_model(py::module_& m) {
     // Expose the main forward function
     m.def(
         "forward_packed_cpp",
-        &forward_packed_cpp,
+        [](const torch::Tensor& obs_sequence,
+           const torch::Tensor& action_sequence,
+           const torch::Tensor& agent_types,
+           const torch::Tensor& positions,
+           py::dict weights_py,
+           const torch::optional<torch::Tensor>& padding_mask,
+           int64_t num_layers,
+           int64_t num_heads,
+           int64_t hidden_dim,
+           int64_t num_experts,
+           int64_t top_k,
+           int64_t count_pad,
+           int64_t tflag_pad) {
+            // Convert Python dict to c10::Dict
+            c10::Dict<std::string, torch::Tensor> weights;
+            for (auto item : weights_py) {
+                std::string key = py::cast<std::string>(item.first);
+                torch::Tensor value = py::cast<torch::Tensor>(item.second);
+                weights.insert(key, value);
+            }
+
+            // Call C++ function
+            return forward_packed_cpp(
+                obs_sequence,
+                action_sequence,
+                agent_types,
+                positions,
+                weights,
+                padding_mask,
+                num_layers,
+                num_heads,
+                hidden_dim,
+                num_experts,
+                top_k,
+                count_pad,
+                tflag_pad
+            );
+        },
         py::arg("obs_sequence"),
         py::arg("action_sequence"),
         py::arg("agent_types"),

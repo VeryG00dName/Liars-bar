@@ -11,7 +11,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <unordered_set>
-
+#include <ATen/DeviceAccelerator.h>
 #include <torch/torch.h>
 
 #include "bots.h"
@@ -686,13 +686,15 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
         auto policy_index_tensor = torch::tensor(cache_indices, opts_long_device);
 
         // Select the correct weights per-request
+        // IMPORTANT: Don't call .contiguous() to avoid creating copies - use views
         c10::Dict<std::string, torch::Tensor> weight_dict;
         weight_dict.reserve(batched_weight_cache_.size());
         for (const auto& kv : batched_weight_cache_) {
             // All weights are batched along dim=0 (policy dimension)
             // Shape: [num_policies, ...] for regular weights
             // Shape: [num_policies, E, ...] for pre-stacked MoE expert weights
-            torch::Tensor selected = kv.value().index_select(0, policy_index_tensor).contiguous();
+            // Use index_select without .contiguous() to create views instead of copies
+            torch::Tensor selected = kv.value().index_select(0, policy_index_tensor);
             weight_dict.insert(kv.key(), selected);
         }
 
@@ -779,6 +781,12 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
         timer_hist_post_ += std::chrono::duration_cast<Microseconds>(post_t1 - post_t0);
 
         offset += take;
+
+        // Force release of intermediate tensors to avoid memory buildup
+        weight_dict.clear();
+        if (offset % (batch_limit * 4) == 0) {
+            at::accelerator::emptyCache();
+        }
     }
 }
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <torch/torch.h>
+#include <ATen/core/Dict.h>
 #include <string>
 #include <unordered_map>
 

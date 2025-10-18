@@ -36,8 +36,8 @@ torch::Tensor batched_linear(
     const torch::Tensor& bias
 ) {
     // input: [B, T, in_dim]
-    // weight: [B, out_dim, in_dim]
-    // bias: [B, out_dim]
+    // weight: [W, out_dim, in_dim] where W is 1 or B
+    // bias: [W, out_dim]
     // output: [B, T, out_dim]
 
     // Ensure dtype compatibility
@@ -51,10 +51,26 @@ torch::Tensor batched_linear(
         b = b.to(weight.scalar_type());
     }
 
+    int64_t B = x.size(0);
+    int64_t W = weight.size(0);
+
     // Compute: x @ weight^T + bias
-    // x: [B, T, in_dim], weight^T: [B, in_dim, out_dim]
-    auto output = torch::matmul(x, weight.transpose(1, 2));  // [B, T, out_dim]
-    output = output + b.unsqueeze(1);  // Broadcast bias over time dimension
+    // Handle broadcasting when W=1 but B>1
+    torch::Tensor output;
+    if (W == 1 && B > 1) {
+        // Broadcast case: weight [1, out_dim, in_dim] -> use for all B samples
+        // Squeeze weight to [out_dim, in_dim], compute, then result auto-broadcasts
+        auto w_2d = weight.squeeze(0);  // [out_dim, in_dim]
+        auto b_1d = b.squeeze(0);        // [out_dim]
+
+        // x: [B, T, in_dim] @ w_2d.T: [in_dim, out_dim] -> [B, T, out_dim]
+        output = torch::matmul(x, w_2d.transpose(0, 1)) + b_1d.unsqueeze(0).unsqueeze(0);
+    } else {
+        // Normal batched case: W == B
+        // x: [B, T, in_dim], weight^T: [B, in_dim, out_dim]
+        output = torch::matmul(x, weight.transpose(1, 2));  // [B, T, out_dim]
+        output = output + b.unsqueeze(1);  // Broadcast bias over time dimension
+    }
 
     return output;
 }
@@ -66,8 +82,8 @@ torch::Tensor batched_layer_norm(
     double eps
 ) {
     // input: [B, T, dim]
-    // weight: [B, dim]
-    // bias: [B, dim]
+    // weight: [W, dim] where W is 1 or B
+    // bias: [W, dim]
 
     // Ensure dtype compatibility
     auto x = input;
@@ -81,6 +97,9 @@ torch::Tensor batched_layer_norm(
         b = b.to(w.scalar_type());
     }
 
+    int64_t B = x.size(0);
+    int64_t W = w.size(0);
+
     // Compute mean and variance along last dimension
     auto mean = x.mean(/*dim=*/-1, /*keepdim=*/true);
     auto var = (x - mean).pow(2).mean(/*dim=*/-1, /*keepdim=*/true);
@@ -90,8 +109,16 @@ torch::Tensor batched_layer_norm(
     auto normalized = (x - mean) * inv_std;
 
     // Apply affine transformation
-    // w and b: [B, dim] -> [B, 1, dim] for broadcasting
-    auto output = normalized * w.unsqueeze(1) + b.unsqueeze(1);
+    torch::Tensor output;
+    if (W == 1 && B > 1) {
+        // Broadcast case: w and b are [1, dim]
+        auto w_1d = w.squeeze(0);  // [dim]
+        auto b_1d = b.squeeze(0);  // [dim]
+        output = normalized * w_1d + b_1d;
+    } else {
+        // Normal batched case: w and b: [B, dim] -> [B, 1, dim] for broadcasting
+        output = normalized * w.unsqueeze(1) + b.unsqueeze(1);
+    }
 
     return output;
 }
@@ -100,35 +127,45 @@ torch::Tensor batched_embedding(
     const torch::Tensor& weight,
     const torch::Tensor& indices
 ) {
-    // weight: [B, vocab_size, embed_dim]
+    // weight: [W, vocab_size, embed_dim] where W is 1 or B
     // indices: [B, T]
     // output: [B, T, embed_dim]
 
-    int64_t batch_size = weight.size(0);
+    int64_t W = weight.size(0);
     int64_t vocab_size = weight.size(1);
     int64_t embed_dim = weight.size(2);
+    int64_t batch_size = indices.size(0);
     int64_t time_dim = indices.size(1);
 
-    // Flatten weights: [B * vocab_size, embed_dim]
-    auto weight_flat = weight.reshape({batch_size * vocab_size, embed_dim});
+    if (W == 1 && batch_size > 1) {
+        // Broadcast case: single embedding table for all samples
+        auto weight_2d = weight.squeeze(0);  // [vocab_size, embed_dim]
+        auto indices_flat = indices.reshape({-1});  // [B * T]
+        auto embedded_flat = torch::embedding(weight_2d, indices_flat);
+        return embedded_flat.reshape({batch_size, time_dim, embed_dim});
+    } else {
+        // Normal batched case: W == B
+        // Flatten weights: [B * vocab_size, embed_dim]
+        auto weight_flat = weight.reshape({W * vocab_size, embed_dim});
 
-    // Create batch offsets for each example
-    // offset[i] = i * vocab_size
-    auto offset = torch::arange(0, batch_size, indices.options()) * vocab_size;
+        // Create batch offsets for each example
+        // offset[i] = i * vocab_size
+        auto offset = torch::arange(0, W, indices.options()) * vocab_size;
 
-    // Offset indices: [B, T] + [B, 1] -> [B, T]
-    auto indices_offset = indices + offset.unsqueeze(1);
+        // Offset indices: [B, T] + [B, 1] -> [B, T]
+        auto indices_offset = indices + offset.unsqueeze(1);
 
-    // Flatten indices: [B * T]
-    auto indices_flat = indices_offset.reshape({-1});
+        // Flatten indices: [B * T]
+        auto indices_flat = indices_offset.reshape({-1});
 
-    // Perform flat embedding lookup
-    auto embedded_flat = torch::embedding(weight_flat, indices_flat);
+        // Perform flat embedding lookup
+        auto embedded_flat = torch::embedding(weight_flat, indices_flat);
 
-    // Reshape back: [B, T, embed_dim]
-    auto embedded = embedded_flat.reshape({batch_size, time_dim, embed_dim});
+        // Reshape back: [B, T, embed_dim]
+        auto embedded = embedded_flat.reshape({batch_size, time_dim, embed_dim});
 
-    return embedded;
+        return embedded;
+    }
 }
 
 torch::Tensor reduce_expert_heads(
@@ -208,11 +245,18 @@ forward_packed_cpp(
     // Action Decomposition
     // ========================================================================
     auto action_long = action_sequence.to(torch::kLong);
-    // Use torch::gather to index the batched LUTs correctly.
-    // Ensure the output is Long for embedding lookups.
-    auto act_kind_ids = torch::gather(lut_act_kind, 1, action_long).to(torch::kLong);
-    auto count_ids = torch::gather(lut_count, 1, action_long).to(torch::kLong);
-    auto table_flag_ids = torch::gather(lut_table_flag, 1, action_long).to(torch::kLong);
+
+    // Use LUTs to decompose actions: lut[action_id] -> component
+    // LUTs are 1D [11], action_long is [B, T]
+    // Flatten, lookup, reshape
+    auto action_flat = action_long.flatten();
+    auto act_kind_flat = lut_act_kind.index({action_flat});
+    auto count_flat = lut_count.index({action_flat});
+    auto tflag_flat = lut_table_flag.index({action_flat});
+
+    auto act_kind_ids = act_kind_flat.view(action_long.sizes());
+    auto count_ids = count_flat.view(action_long.sizes());
+    auto table_flag_ids = tflag_flat.view(action_long.sizes());
 
 
     // Apply padding mask if provided
@@ -360,22 +404,31 @@ forward_packed_cpp(
         // Attention Block
         // ====================================================================
 
+        // Get combined in_proj weight and bias, then split into Q, K, V
+        auto in_proj_weight = get_weight(weights, layer_prefix + ".self_attn.in_proj_weight");
+        auto in_proj_bias = get_weight(weights, layer_prefix + ".self_attn.in_proj_bias");
+
+        // Determine chunking dimension based on whether weights are batched
+        // Batched: [B, 3*H, H] and [B, 3*H], chunk on dim=1
+        // Unbatched: [3*H, H] and [3*H], chunk on dim=0
+        int64_t weight_chunk_dim = (in_proj_weight.dim() == 3) ? 1 : 0;
+        int64_t bias_chunk_dim = (in_proj_bias.dim() == 2) ? 1 : 0;
+
+        // Split into Q, K, V weights
+        auto qkv_weights = in_proj_weight.chunk(3, weight_chunk_dim);
+        auto qkv_biases = in_proj_bias.chunk(3, bias_chunk_dim);
+
+        auto q_weight = qkv_weights[0];
+        auto k_weight = qkv_weights[1];
+        auto v_weight = qkv_weights[2];
+        auto q_bias = qkv_biases[0];
+        auto k_bias = qkv_biases[1];
+        auto v_bias = qkv_biases[2];
+
         // Project to Q, K, V
-        auto q = batched_linear(
-            x,
-            get_weight(weights, layer_prefix + ".q_proj.weight"),
-            get_weight(weights, layer_prefix + ".q_proj.bias")
-        );
-        auto k = batched_linear(
-            x,
-            get_weight(weights, layer_prefix + ".k_proj.weight"),
-            get_weight(weights, layer_prefix + ".k_proj.bias")
-        );
-        auto v = batched_linear(
-            x,
-            get_weight(weights, layer_prefix + ".v_proj.weight"),
-            get_weight(weights, layer_prefix + ".v_proj.bias")
-        );
+        auto q = batched_linear(x, q_weight, q_bias);
+        auto k = batched_linear(x, k_weight, k_bias);
+        auto v = batched_linear(x, v_weight, v_bias);
 
         // Reshape for multi-head attention: [B, T, H] -> [B, num_heads, T, head_dim]
         q = q.view({batch_size, seq_len, num_heads, head_dim}).transpose(1, 2);
@@ -397,8 +450,8 @@ forward_packed_cpp(
         // Output projection
         attn_output = batched_linear(
             attn_output,
-            get_weight(weights, layer_prefix + ".out_proj.weight"),
-            get_weight(weights, layer_prefix + ".out_proj.bias")
+            get_weight(weights, layer_prefix + ".self_attn.out_proj.weight"),
+            get_weight(weights, layer_prefix + ".self_attn.out_proj.bias")
         );
 
         // Residual connection + LayerNorm
@@ -443,6 +496,15 @@ forward_packed_cpp(
             auto expert_b1 = get_weight(weights, layer_prefix + ".moe.experts.b1");
             auto expert_w2 = get_weight(weights, layer_prefix + ".moe.experts.w2");
             auto expert_b2 = get_weight(weights, layer_prefix + ".moe.experts.b2");
+
+            // If weights are batched [1, num_experts, ...], squeeze out batch dim for CUDA kernel
+            // CUDA kernel expects [num_experts, ...] format
+            if (expert_w1.size(0) == 1 && expert_w1.dim() == 4) {
+                expert_w1 = expert_w1.squeeze(0);  // [1, E, ...] -> [E, ...]
+                expert_b1 = expert_b1.squeeze(0);
+                expert_w2 = expert_w2.squeeze(0);
+                expert_b2 = expert_b2.squeeze(0);
+            }
 
             // Ensure FP16 for CUDA kernel
             auto x_fp16 = x.to(torch::kHalf).contiguous();
@@ -557,36 +619,61 @@ forward_packed_cpp(
         win_b_list.push_back(get_weight(weights, "win_prob_heads." + std::to_string(i) + ".bias"));
     }
 
-    // Stack along expert dimension: [B, num_experts, ...]
-    auto action_w = torch::stack(action_w_list, /*dim=*/1);
-    auto action_b = torch::stack(action_b_list, /*dim=*/1);
-    auto opp_w = torch::stack(opp_w_list, /*dim=*/1);
-    auto opp_b = torch::stack(opp_b_list, /*dim=*/1);
-    auto reward_w = torch::stack(reward_w_list, /*dim=*/1);
-    auto reward_b = torch::stack(reward_b_list, /*dim=*/1);
-    auto win_w = torch::stack(win_w_list, /*dim=*/1);
-    auto win_b = torch::stack(win_b_list, /*dim=*/1);
+    // Detect if weights are batched and determine stacking dimension
+    // Unbatched weights: [out, in], stack along dim=0 -> [num_experts, out, in]
+    // Batched weights: [B, out, in], stack along dim=1 -> [B, num_experts, out, in]
+    int64_t stack_dim = (action_w_list[0].dim() == 3) ? 1 : 0;
+
+    // Stack along expert dimension
+    auto action_w = torch::stack(action_w_list, stack_dim);
+    auto action_b = torch::stack(action_b_list, stack_dim);
+    auto opp_w = torch::stack(opp_w_list, stack_dim);
+    auto opp_b = torch::stack(opp_b_list, stack_dim);
+    auto reward_w = torch::stack(reward_w_list, stack_dim);
+    auto reward_b = torch::stack(reward_b_list, stack_dim);
+    auto win_w = torch::stack(win_w_list, stack_dim);
+    auto win_b = torch::stack(win_b_list, stack_dim);
 
     // Expand transformer output for per-expert computation
-    // [B, T, H] -> [B, num_experts, T, H]
-    auto expanded_input = transformer_output.unsqueeze(1).expand({batch_size, num_experts, seq_len, hidden_dim});
+    // Handle both batched and unbatched cases
+    torch::Tensor expanded_input;
+    int64_t bias_unsqueeze_dim;
+
+    if (stack_dim == 1) {
+        // Batched case: [B, T, H] -> [B, num_experts, T, H]
+        expanded_input = transformer_output.unsqueeze(1).expand({batch_size, num_experts, seq_len, hidden_dim});
+        bias_unsqueeze_dim = 2;  // unsqueeze to [B, num_experts, 1, out_dim]
+    } else {
+        // Unbatched case: [B, T, H] -> [num_experts, B, T, H]
+        expanded_input = transformer_output.unsqueeze(0).expand({num_experts, batch_size, seq_len, hidden_dim});
+        bias_unsqueeze_dim = 1;  // unsqueeze to [num_experts, 1, out_dim]
+    }
 
     // Ensure dtype compatibility
     if (expanded_input.scalar_type() != action_w.scalar_type()) {
         expanded_input = expanded_input.to(action_w.scalar_type());
     }
 
-    // Compute per-expert outputs: [B, num_experts, T, out_dim]
-    auto action_stacked = torch::matmul(expanded_input, action_w.transpose(-1, -2)) + action_b.unsqueeze(2);
-    auto opp_stacked = torch::matmul(expanded_input, opp_w.transpose(-1, -2)) + opp_b.unsqueeze(2);
-    auto reward_stacked = torch::matmul(expanded_input, reward_w.transpose(-1, -2)) + reward_b.unsqueeze(2);
-    auto win_stacked = torch::matmul(expanded_input, win_w.transpose(-1, -2)) + win_b.unsqueeze(2);
+    // Compute per-expert outputs
+    auto action_stacked = torch::matmul(expanded_input, action_w.transpose(-1, -2)) + action_b.unsqueeze(bias_unsqueeze_dim);
+    auto opp_stacked = torch::matmul(expanded_input, opp_w.transpose(-1, -2)) + opp_b.unsqueeze(bias_unsqueeze_dim);
+    auto reward_stacked = torch::matmul(expanded_input, reward_w.transpose(-1, -2)) + reward_b.unsqueeze(bias_unsqueeze_dim);
+    auto win_stacked = torch::matmul(expanded_input, win_w.transpose(-1, -2)) + win_b.unsqueeze(bias_unsqueeze_dim);
 
     // Permute to [B, T, num_experts, out_dim] for reduce_expert_heads
-    action_stacked = action_stacked.permute({0, 2, 1, 3});
-    opp_stacked = opp_stacked.permute({0, 2, 1, 3});
-    reward_stacked = reward_stacked.permute({0, 2, 1, 3});
-    win_stacked = win_stacked.permute({0, 2, 1, 3});
+    if (stack_dim == 1) {
+        // Batched: [B, num_experts, T, out_dim] -> [B, T, num_experts, out_dim]
+        action_stacked = action_stacked.permute({0, 2, 1, 3});
+        opp_stacked = opp_stacked.permute({0, 2, 1, 3});
+        reward_stacked = reward_stacked.permute({0, 2, 1, 3});
+        win_stacked = win_stacked.permute({0, 2, 1, 3});
+    } else {
+        // Unbatched: [num_experts, B, T, out_dim] -> [B, T, num_experts, out_dim]
+        action_stacked = action_stacked.permute({1, 2, 0, 3});
+        opp_stacked = opp_stacked.permute({1, 2, 0, 3});
+        reward_stacked = reward_stacked.permute({1, 2, 0, 3});
+        win_stacked = win_stacked.permute({1, 2, 0, 3});
+    }
 
     // Reduce using MoE routing weights
     auto action_logits = reduce_expert_heads(action_stacked, final_topk_indices, final_topk_scores);
