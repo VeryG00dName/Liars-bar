@@ -326,13 +326,17 @@ def load_evaluation_policies(
 
         for gen_spec in gens_to_load:
             base_dir = Path(config.CHECKPOINT_DIR) / run_name / f"gen_{gen_spec}"
-            checkpoint_path = base_dir / "compiled_final.pth"
-            if not checkpoint_path.exists():
-                checkpoint_path = base_dir / "final.pth"
 
-            if not checkpoint_path.exists():
+            # Look for .pth checkpoint files (prioritize compiled version)
+            pth_candidates = [
+                base_dir / "compiled_final.pth",
+                base_dir / "final.pth",
+            ]
+            checkpoint_path = next((p for p in pth_candidates if p.exists()), None)
+
+            if checkpoint_path is None:
                 print(
-                    f"[WARN] No checkpoint found for {run_name} gen {gen_spec} in {base_dir}, skipping..."
+                    f"[WARN] No .pth checkpoint found for {run_name} gen {gen_spec} in {base_dir}, skipping..."
                 )
                 continue
 
@@ -340,29 +344,17 @@ def load_evaluation_policies(
             player_id = f"{run_name}_gen_{gen_spec}"
             label = int(meta.get("label", 0))
 
-            traced_candidates = [
-                base_dir / "final_traced.pt",
-                base_dir / "compiled_final_traced.pt",
-                base_dir / "final_traced.ts",
-                base_dir / "compiled_final_traced.ts",
-            ]
-            traced_path = next((p for p in traced_candidates if p.exists()), None)
-            if traced_path is None:
-                print(
-                    f"[WARN] No TorchScript trace found for {run_name} gen {gen_spec} in {base_dir}, skipping..."
-                )
-                continue
-
             policy_id = next_neural_policy_id
             next_neural_policy_id += 1
 
-            max_seq_length = _infer_traced_max_seq_length(traced_path)
+            # Infer max sequence length from .pth.max_seq_length file or path
+            max_seq_length = _infer_traced_max_seq_length(checkpoint_path)
 
-            eval_manager.load_model(policy_id, str(traced_path))
+            # Load .pth weights directly (no TorchScript needed)
+            eval_manager.load_model(policy_id, str(checkpoint_path))
             neural_policies_loaded = True
             entry = _initial_metadata(policy_id, player_id, label, is_cpp_bot=False)
             entry["checkpoint_path"] = str(checkpoint_path)
-            entry["traced_path"] = str(traced_path)
             entry["max_seq_length"] = max_seq_length
             metadata[policy_id] = entry
 

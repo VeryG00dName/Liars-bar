@@ -196,38 +196,35 @@ void EvalManager::set_inference_batch_size(int batch_size) {
 
 void EvalManager::load_model(int policy_id, const std::string& path) {
     try {
-        auto module = std::make_shared<torch::jit::Module>(torch::jit::load(path));
-        module->to(kInferenceDevice);
-        module->eval();
-
         torch::NoGradGuard guard;
-        auto params = module->named_parameters(/*recurse=*/true);
-        std::unordered_map<std::string, torch::Tensor> state_dict;
-        state_dict.reserve(params.size());
-        for (const auto& item : params) {
-            auto tensor = item.value
+
+        // Load state_dict from .pth file
+        auto state_dict = load_state_dict_from_pth(path, "" /* policy_key */);
+
+        // Move weights to inference device and convert to FP16
+        std::unordered_map<std::string, torch::Tensor> processed_dict;
+        processed_dict.reserve(state_dict.size());
+        for (auto& kv : state_dict) {
+            auto tensor = kv.second
                               .detach()
                               .to(kInferenceDevice, /*non_blocking=*/false, /*copy=*/true)
                               .to(torch::kFloat16)
                               .contiguous();
-            state_dict.emplace(item.name, std::move(tensor));
+            processed_dict.emplace(kv.first, std::move(tensor));
         }
 
-        staged_state_dicts_[policy_id] = std::move(state_dict);
-        if (!representative_module_) {
-            representative_module_ = std::move(module);
-        }
+        staged_state_dicts_[policy_id] = std::move(processed_dict);
 
         int max_seq_length = infer_max_seq_length_for_model(path);
         policy_max_sequence_lengths_[policy_id] = max_seq_length;
         arena_.set_policy_max_sequence_length(policy_id, max_seq_length);
         weights_finalized_ = false;
     } catch (const c10::Error& err) {
-        std::cerr << "[EvalManager] Failed to load TorchScript module from '" << path
+        std::cerr << "[EvalManager] Failed to load .pth checkpoint from '" << path
                   << "': " << err.what_without_backtrace() << std::endl;
         throw;
     } catch (const std::exception& err) {
-        std::cerr << "[EvalManager] Failed to load TorchScript module from '" << path
+        std::cerr << "[EvalManager] Failed to load .pth checkpoint from '" << path
                   << "': " << err.what() << std::endl;
         throw;
     }
@@ -244,17 +241,17 @@ void EvalManager::finalize_model_loading() {
         return;
     }
 
-    if (!representative_module_) {
-        throw std::runtime_error(
-            "No representative TorchScript module loaded before finalizing weights");
-    }
-
     std::vector<int> policy_ids;
     policy_ids.reserve(staged_state_dicts_.size());
     for (const auto& kv : staged_state_dicts_) {
         policy_ids.push_back(kv.first);
     }
     std::sort(policy_ids.begin(), policy_ids.end());
+
+    // Pre-stack MoE expert weights in each individual state_dict before batching
+    for (auto& kv : staged_state_dicts_) {
+        prestack_moe_expert_weights(kv.second, num_layers_, num_experts_);
+    }
 
     std::unordered_map<std::string, std::vector<torch::Tensor>> stacked;
     for (size_t idx = 0; idx < policy_ids.size(); ++idx) {
@@ -269,90 +266,13 @@ void EvalManager::finalize_model_loading() {
         }
     }
 
-    batched_weight_cache_.reserve(stacked.size());
+    // Stack weights across policies
     for (auto& kv : stacked) {
-        batched_weight_cache_[kv.first] = torch::stack(kv.second).contiguous();
+        batched_weight_cache_.insert(kv.first, torch::stack(kv.second).contiguous());
     }
 
-    // --- START: NEW Pre-stacking Logic ---
-    // Discover number of layers and experts by scanning keys
-    int num_layers = 0;
-    int num_experts = 0;
-    for (const auto& kv : batched_weight_cache_) {
-        const std::string& key = kv.first;
-        const size_t pos_layer = key.find("transformer.layers.");
-        const size_t pos_moe = key.find(".moe.experts.");
-        if (pos_layer == std::string::npos || pos_moe == std::string::npos) continue;
-
-        // parse layer index
-        size_t layer_start = pos_layer + std::strlen("transformer.layers.");
-        size_t layer_end = key.find('.', layer_start);
-        if (layer_end == std::string::npos) continue;
-        int layer_idx = 0;
-        try {
-            layer_idx = std::stoi(key.substr(layer_start, layer_end - layer_start));
-        } catch (...) {
-            continue;
-        }
-        num_layers = std::max(num_layers, layer_idx + 1);
-
-        // parse expert index
-        size_t expert_start = pos_moe + std::strlen(".moe.experts.");
-        size_t expert_end = key.find('.', expert_start);
-        if (expert_end == std::string::npos) continue;
-        int expert_idx = 0;
-        try {
-            expert_idx = std::stoi(key.substr(expert_start, expert_end - expert_start));
-        } catch (...) {
-            continue;
-        }
-        num_experts = std::max(num_experts, expert_idx + 1);
-    }
-
-    // Stack expert weights into single tensors per layer: [E, B, F, H] / [E, B, H, F]
-    if (num_layers > 0 && num_experts > 0) {
-        for (int layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
-            std::vector<torch::Tensor> w1_list, b1_list, w2_list, b2_list;
-            w1_list.reserve(num_experts);
-            b1_list.reserve(num_experts);
-            w2_list.reserve(num_experts);
-            b2_list.reserve(num_experts);
-
-            bool have_all = true;
-            for (int expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
-                const std::string base =
-                    "transformer.layers." + std::to_string(layer_idx) + ".moe.experts." + std::to_string(expert_idx);
-                const std::string w1_key = base + ".0.weight";
-                const std::string b1_key = base + ".0.bias";
-                const std::string w2_key = base + ".3.weight";
-                const std::string b2_key = base + ".3.bias";
-
-                auto it_w1 = batched_weight_cache_.find(w1_key);
-                auto it_b1 = batched_weight_cache_.find(b1_key);
-                auto it_w2 = batched_weight_cache_.find(w2_key);
-                auto it_b2 = batched_weight_cache_.find(b2_key);
-                if (it_w1 == batched_weight_cache_.end() || it_b1 == batched_weight_cache_.end() ||
-                    it_w2 == batched_weight_cache_.end() || it_b2 == batched_weight_cache_.end()) {
-                    have_all = false;
-                    break;
-                }
-                w1_list.push_back(it_w1->second);
-                b1_list.push_back(it_b1->second);
-                w2_list.push_back(it_w2->second);
-                b2_list.push_back(it_b2->second);
-            }
-
-            if (have_all && !w1_list.empty()) {
-                const std::string prefix =
-                    "transformer.layers." + std::to_string(layer_idx) + ".moe.experts.";
-                batched_weight_cache_[prefix + "w1"] = torch::stack(w1_list, 0).contiguous();
-                batched_weight_cache_[prefix + "b1"] = torch::stack(b1_list, 0).contiguous();
-                batched_weight_cache_[prefix + "w2"] = torch::stack(w2_list, 0).contiguous();
-                batched_weight_cache_[prefix + "b2"] = torch::stack(b2_list, 0).contiguous();
-            }
-        }
-    }
-    // --- END: NEW Pre-stacking Logic ---
+    // Add fixed buffers (LUTs for action decomposition)
+    add_fixed_buffers(batched_weight_cache_, kInferenceDevice);
 
     std::vector<std::string> original_keys;
     original_keys.reserve(batched_weight_cache_.size());
@@ -717,13 +637,6 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
     using Clock = std::chrono::high_resolution_clock;
     using Microseconds = std::chrono::microseconds;
 
-    if (!representative_module_) {
-        throw std::runtime_error("No representative module available for inference");
-    }
-    auto method = representative_module_->find_method("forward_packed");
-    if (!method) {
-        throw std::runtime_error("Representative module does not expose forward_packed");
-    }
     if (batched_weight_cache_.empty()) {
         throw std::runtime_error("Historical weight cache is empty");
     }
@@ -776,25 +689,14 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
         auto weights_t0 = Clock::now();
         auto policy_index_tensor = torch::tensor(cache_indices, opts_long_device);
 
-        // Select the correct weights per-request into a string->Tensor dict
+        // Select the correct weights per-request
         c10::Dict<std::string, torch::Tensor> weight_dict;
         weight_dict.reserve(batched_weight_cache_.size());
         for (const auto& kv : batched_weight_cache_) {
-            const std::string& k = kv.first;
-            // For pre-stacked MoE expert tensors with shape [E, B, ...],
-            // select along policy dimension (dim=1). For all others, select along dim=0.
-            bool is_moe_expert =
-                (k.find(".moe.experts.w1") != std::string::npos) ||
-                (k.find(".moe.experts.b1") != std::string::npos) ||
-                (k.find(".moe.experts.w2") != std::string::npos) ||
-                (k.find(".moe.experts.b2") != std::string::npos);
-            torch::Tensor selected;
-            if (is_moe_expert) {
-                selected = kv.second.index_select(1, policy_index_tensor).contiguous();
-            } else {
-                // kv.second shape: [num_policies, ...]; select rows for this batch
-                selected = kv.second.index_select(0, policy_index_tensor).contiguous();
-            }
+            // All weights are batched along dim=0 (policy dimension)
+            // Shape: [num_policies, ...] for regular weights
+            // Shape: [num_policies, E, ...] for pre-stacked MoE expert weights
+            torch::Tensor selected = kv.second.index_select(0, policy_index_tensor).contiguous();
             weight_dict.insert(kv.first, selected);
         }
 
@@ -803,29 +705,31 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
             std::chrono::duration_cast<Microseconds>(weights_t1 - weights_t0);
 
         auto model_t0 = Clock::now();
-        std::vector<torch::jit::IValue> inputs;
-        inputs.reserve(7);
-        inputs.emplace_back(tensor_batch.obs_sequence);
-        inputs.emplace_back(tensor_batch.action_sequence);
-        inputs.emplace_back(tensor_batch.agent_types);
-        inputs.emplace_back(tensor_batch.positions);
-        inputs.emplace_back(weight_dict);
-        inputs.emplace_back(tensor_batch.action_masks);
-        inputs.emplace_back(tensor_batch.padding_mask);
 
-        auto outputs_iv = method->operator()(inputs);
+        // Call our C++ forward function
+        auto [action_logits, opp_logits, state_values, win_logits] = forward_packed_cpp(
+            tensor_batch.obs_sequence,
+            tensor_batch.action_sequence,
+            tensor_batch.agent_types,
+            tensor_batch.positions,
+            weight_dict,
+            tensor_batch.padding_mask,
+            num_layers_,
+            num_heads_,
+            hidden_dim_,
+            num_experts_,
+            top_k_,
+            count_pad_,
+            tflag_pad_
+        );
+
         torch::cuda::synchronize();
         auto model_t1 = Clock::now();
         timer_hist_model_exec_ +=
             std::chrono::duration_cast<Microseconds>(model_t1 - model_t0);
 
         auto post_t0 = Clock::now();
-        auto outputs = outputs_iv.toTuple();
-        if (!outputs || outputs->elements().empty()) {
-            throw std::runtime_error("forward_packed returned unexpected output");
-        }
-
-        auto action_logits = outputs->elements()[0].toTensor().contiguous();
+        action_logits = action_logits.contiguous();
         auto valid_lengths_device = tensor_batch.valid_lengths;
 
         const int64_t batch_size = static_cast<int64_t>(take);

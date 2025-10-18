@@ -1,6 +1,8 @@
 #pragma once
 
 #include "vec_arena.h"
+#include "reactive_model_forward.h"
+#include "weight_utils.h"
 
 #include <array>
 #include <cstddef>
@@ -13,7 +15,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include <torch/script.h>
+#include <torch/torch.h>
 
 class CppBotBase {
 public:
@@ -84,9 +86,18 @@ private:
     int max_env_batch_{512};
     int inference_batch_size_{128};
     std::mt19937 rng_;
-    std::shared_ptr<torch::jit::Module> representative_module_;
+
+    // Model architecture parameters (inferred from first loaded model)
+    int64_t num_layers_{2};
+    int64_t num_heads_{4};
+    int64_t hidden_dim_{256};
+    int64_t num_experts_{8};
+    int64_t top_k_{2};
+    int64_t count_pad_{4};
+    int64_t tflag_pad_{3};
+
     std::unordered_map<int, std::unordered_map<std::string, torch::Tensor>> staged_state_dicts_;
-    std::unordered_map<std::string, torch::Tensor> batched_weight_cache_;
+    c10::Dict<std::string, torch::Tensor> batched_weight_cache_;
     std::unordered_map<int, int> policy_id_to_cache_index_;
     bool weights_finalized_{false};
     std::unordered_map<int, int> policy_max_sequence_lengths_;
