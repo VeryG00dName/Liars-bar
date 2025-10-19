@@ -18,6 +18,7 @@
 
 #include "bots.h"
 #include "torch_utils.h"
+#include "weight_utils.h"
 
 namespace {
 const torch::Device kInferenceDevice = torch::kCUDA;
@@ -885,96 +886,8 @@ void RolloutManager::rebuild_historical_weight_cache() {
         entry->single_policy_dict_cached = true;
     }
 
-    // Provide compatibility aliases for nn.MultiheadAttention params:
-    // Split in_proj_weight/bias into q_proj/k_proj/v_proj to match Script expectations.
-    {
-        std::vector<std::string> original_keys;
-        original_keys.reserve(historical_weight_cache_fp16_.size());
-        for (const auto& kv : historical_weight_cache_fp16_) {
-            original_keys.push_back(kv.first);
-        }
-
-        using torch::indexing::Slice;
-
-        auto replace_suffix = [](const std::string& s, const std::string& from, const std::string& to)
-                                  -> std::string {
-            const auto pos = s.rfind(from);
-            if (pos == std::string::npos) return s;
-            std::string out = s;
-            out.replace(pos, from.size(), to);
-            return out;
-        };
-
-        auto drop_self_attn = [](const std::string& s) {
-            constexpr const char* needle = ".self_attn.";
-            const auto pos = s.find(needle);
-            if (pos == std::string::npos) {
-                return s;
-            }
-            std::string out = s;
-            out.replace(pos, std::strlen(needle), ".");
-            return out;
-        };
-
-        for (const auto& key : original_keys) {
-            // Handle weights: [B, 3*H, H] -> three [B, H, H]
-            if (key.find(".self_attn.in_proj_weight") != std::string::npos) {
-                auto it = historical_weight_cache_fp16_.find(key);
-                if (it == historical_weight_cache_fp16_.end()) continue;
-                const auto& w = it->second;
-                if (w.dim() != 3 || w.size(1) % 3 != 0) continue;
-                const int64_t H = w.size(1) / 3;
-                auto q = w.index({Slice(), Slice(0, H), Slice()}).contiguous();
-                auto k = w.index({Slice(), Slice(H, 2 * H), Slice()}).contiguous();
-                auto v = w.index({Slice(), Slice(2 * H, 3 * H), Slice()}).contiguous();
-
-                const auto q_key = replace_suffix(key, "in_proj_weight", "q_proj.weight");
-                const auto k_key = replace_suffix(key, "in_proj_weight", "k_proj.weight");
-                const auto v_key = replace_suffix(key, "in_proj_weight", "v_proj.weight");
-
-                historical_weight_cache_fp16_[q_key] = q;
-                historical_weight_cache_fp16_[k_key] = k;
-                historical_weight_cache_fp16_[v_key] = v;
-
-                historical_weight_cache_fp16_[drop_self_attn(q_key)] = q;
-                historical_weight_cache_fp16_[drop_self_attn(k_key)] = k;
-                historical_weight_cache_fp16_[drop_self_attn(v_key)] = v;
-                continue;
-            }
-
-            // Handle biases: [B, 3*H] -> three [B, H]
-            if (key.find(".self_attn.in_proj_bias") != std::string::npos) {
-                auto it = historical_weight_cache_fp16_.find(key);
-                if (it == historical_weight_cache_fp16_.end()) continue;
-                const auto& b = it->second;
-                if (b.dim() != 2 || b.size(1) % 3 != 0) continue;
-                const int64_t H = b.size(1) / 3;
-                auto q = b.index({Slice(), Slice(0, H)}).contiguous();
-                auto k = b.index({Slice(), Slice(H, 2 * H)}).contiguous();
-                auto v = b.index({Slice(), Slice(2 * H, 3 * H)}).contiguous();
-
-                const auto q_key = replace_suffix(key, "in_proj_bias", "q_proj.bias");
-                const auto k_key = replace_suffix(key, "in_proj_bias", "k_proj.bias");
-                const auto v_key = replace_suffix(key, "in_proj_bias", "v_proj.bias");
-
-                historical_weight_cache_fp16_[q_key] = q;
-                historical_weight_cache_fp16_[k_key] = k;
-                historical_weight_cache_fp16_[v_key] = v;
-
-                historical_weight_cache_fp16_[drop_self_attn(q_key)] = q;
-                historical_weight_cache_fp16_[drop_self_attn(k_key)] = k;
-                historical_weight_cache_fp16_[drop_self_attn(v_key)] = v;
-                continue;
-            }
-
-            if (key.find(".self_attn.") != std::string::npos) {
-                const auto alias = drop_self_attn(key);
-                if (alias != key && !historical_weight_cache_fp16_.count(alias)) {
-                    historical_weight_cache_fp16_[alias] = historical_weight_cache_fp16_.at(key);
-                }
-            }
-        }
-    }
+    // Unify attention weight processing and aliasing
+    process_and_split_attention_weights(historical_weight_cache_fp16_);
 
     historical_weight_cache_dirty_ = false;
 }

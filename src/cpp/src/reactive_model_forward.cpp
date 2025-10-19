@@ -134,9 +134,20 @@ forward_packed_cpp(
     for (const auto& pair : batched_weights) {
         const auto& key = pair.key();
         const auto& tensor = pair.value();
-        if (tensor.dim() == 1) {
+
+        if (tensor.dim() == 1) { // LUTs are not batched
             weights.insert(key, tensor);
+            continue;
+        }
+
+        // Check if this is a pre-stacked MoE expert weight tensor
+        bool is_moe_expert_stack = (key.find(".moe.experts.") != std::string::npos);
+
+        if (is_moe_expert_stack) {
+            // For MoE weights [E, B, ...], select along batch dimension 1
+            weights.insert(key, tensor.index_select(1, policy_indices));
         } else {
+            // For standard weights [B, ...], select along batch dimension 0
             weights.insert(key, tensor.index_select(0, policy_indices));
         }
     }

@@ -141,6 +141,74 @@ def ensure_batched_(wd):
             continue
     return wd
 
+def _split_attention_weights(wd: dict) -> dict:
+    """Split fused in-proj tensors into q/k/v and add alias keys.
+
+    - For keys ending with '.self_attn.in_proj_weight': split [B, 3*H, H]
+      into q_proj.weight/k_proj.weight/v_proj.weight (each [B, H, H]).
+    - For keys ending with '.self_attn.in_proj_bias': split [B, 3*H]
+      into q_proj.bias/k_proj.bias/v_proj.bias (each [B, H]).
+    - Add aliases by removing the first occurrence of '.self_attn.' in keys.
+    """
+    def replace_suffix(s: str, from_s: str, to_s: str) -> str:
+        idx = s.rfind(from_s)
+        if idx == -1:
+            return s
+        return s[:idx] + to_s + s[idx + len(from_s):]
+
+    def drop_self_attn(s: str) -> str:
+        return s.replace('.self_attn.', '.', 1)
+
+    keys = list(wd.keys())
+    for key in keys:
+        if key.endswith('.self_attn.in_proj_weight') and key in wd:
+            w = wd[key]
+            if not torch.is_tensor(w):
+                continue
+            if w.dim() not in (2, 3):
+                continue
+            dim = 1 if w.dim() == 3 else 0
+            if (w.size(dim) % 3) != 0:
+                continue
+            q, k, v = torch.chunk(w, 3, dim=dim)
+            q_key = replace_suffix(key, 'in_proj_weight', 'q_proj.weight')
+            k_key = replace_suffix(key, 'in_proj_weight', 'k_proj.weight')
+            v_key = replace_suffix(key, 'in_proj_weight', 'v_proj.weight')
+            wd[q_key] = q.contiguous()
+            wd[k_key] = k.contiguous()
+            wd[v_key] = v.contiguous()
+            wd[drop_self_attn(q_key)] = wd[q_key]
+            wd[drop_self_attn(k_key)] = wd[k_key]
+            wd[drop_self_attn(v_key)] = wd[v_key]
+            continue
+
+        if key.endswith('.self_attn.in_proj_bias') and key in wd:
+            b = wd[key]
+            if not torch.is_tensor(b):
+                continue
+            if b.dim() not in (1, 2):
+                continue
+            dim = 1 if b.dim() == 2 else 0
+            if (b.size(dim) % 3) != 0:
+                continue
+            q, k, v = torch.chunk(b, 3, dim=dim)
+            q_key = replace_suffix(key, 'in_proj_bias', 'q_proj.bias')
+            k_key = replace_suffix(key, 'in_proj_bias', 'k_proj.bias')
+            v_key = replace_suffix(key, 'in_proj_bias', 'v_proj.bias')
+            wd[q_key] = q.contiguous()
+            wd[k_key] = k.contiguous()
+            wd[v_key] = v.contiguous()
+            wd[drop_self_attn(q_key)] = wd[q_key]
+            wd[drop_self_attn(k_key)] = wd[k_key]
+            wd[drop_self_attn(v_key)] = wd[v_key]
+            continue
+
+        if '.self_attn.' in key and key in wd:
+            alias = drop_self_attn(key)
+            if alias != key and alias not in wd:
+                wd[alias] = wd[key]
+    return wd
+
 # -----------------------------
 # Checkpoint loading
 # -----------------------------

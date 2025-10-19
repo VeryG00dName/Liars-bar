@@ -74,3 +74,26 @@ void add_fixed_buffers(
     c10::Dict<std::string, torch::Tensor>& weights,
     const torch::Device& device
 );
+
+/**
+ * Split fused nn.MultiheadAttention in_proj_weight/bias into separate Q/K/V tensors
+ * and add compatibility aliases by dropping the ".self_attn." segment.
+ *
+ * This modifies the provided weight dictionary in-place by:
+ *  - For any key matching "*.self_attn.in_proj_weight": splitting [B, 3*H, H]
+ *    into q_proj.weight/k_proj.weight/v_proj.weight each shaped [B, H, H].
+ *  - For any key matching "*.self_attn.in_proj_bias": splitting [B, 3*H]
+ *    into q_proj.bias/k_proj.bias/v_proj.bias each shaped [B, H].
+ *  - Adding alias entries where the substring ".self_attn." is removed for all
+ *    self-attention related keys to satisfy alternative naming conventions.
+ */
+void process_and_split_attention_weights(
+    c10::Dict<std::string, torch::Tensor>& weights
+);
+
+/**
+ * Overload for std::unordered_map-backed weight dictionaries.
+ */
+void process_and_split_attention_weights(
+    std::unordered_map<std::string, torch::Tensor>& weights
+);

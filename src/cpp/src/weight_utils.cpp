@@ -6,6 +6,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <vector>
+#include <cstring>
 
 void prestack_moe_expert_weights(
     std::unordered_map<std::string, torch::Tensor>& state_dict,
@@ -152,4 +153,210 @@ void add_fixed_buffers(
     weights.insert("lut_act_kind", lut_act_kind);
     weights.insert("lut_count", lut_count);
     weights.insert("lut_table_flag", lut_table_flag);
+}
+
+// -----------------------------------------------------------------------------
+// Attention weight processing utilities
+// -----------------------------------------------------------------------------
+
+namespace {
+using torch::indexing::Slice;
+
+inline std::string replace_suffix(const std::string& s,
+                                  const std::string& from,
+                                  const std::string& to) {
+    const auto pos = s.rfind(from);
+    if (pos == std::string::npos) {
+        return s;
+    }
+    std::string out = s;
+    out.replace(pos, from.size(), to);
+    return out;
+}
+
+inline std::string drop_self_attn_alias(const std::string& s) {
+    constexpr const char* needle = ".self_attn.";
+    const auto pos = s.find(needle);
+    if (pos == std::string::npos) {
+        return s;
+    }
+    std::string out = s;
+    out.replace(pos, std::strlen(needle), ".");
+    return out;
+}
+}  // namespace
+
+void process_and_split_attention_weights(
+    c10::Dict<std::string, torch::Tensor>& weights
+) {
+    std::vector<std::string> original_keys;
+    original_keys.reserve(weights.size());
+    for (const auto& kv : weights) {
+        original_keys.push_back(kv.key());
+    }
+
+    for (const auto& key : original_keys) {
+        if (key.find(".self_attn.in_proj_weight") != std::string::npos) {
+            if (!weights.contains(key)) continue;
+            const auto& w = weights.at(key);
+            if (!w.defined() || (w.dim() != 3 && w.dim() != 2)) continue;
+
+            const int64_t chunk_dim = (w.dim() == 3) ? 1 : 0;
+            if (w.size(chunk_dim) % 3 != 0) continue;
+            const int64_t H = w.size(chunk_dim) / 3;
+
+            torch::Tensor q, k, v;
+            if (w.dim() == 3) {
+                q = w.index({Slice(), Slice(0, H), Slice()}).contiguous();
+                k = w.index({Slice(), Slice(H, 2 * H), Slice()}).contiguous();
+                v = w.index({Slice(), Slice(2 * H, 3 * H), Slice()}).contiguous();
+            } else {
+                // Unbatched path: [3*H, H] -> three [H, H]
+                q = w.index({Slice(0, H), Slice()}).contiguous();
+                k = w.index({Slice(H, 2 * H), Slice()}).contiguous();
+                v = w.index({Slice(2 * H, 3 * H), Slice()}).contiguous();
+            }
+
+            const auto q_key = replace_suffix(key, "in_proj_weight", "q_proj.weight");
+            const auto k_key = replace_suffix(key, "in_proj_weight", "k_proj.weight");
+            const auto v_key = replace_suffix(key, "in_proj_weight", "v_proj.weight");
+
+            weights.insert(q_key, q);
+            weights.insert(k_key, k);
+            weights.insert(v_key, v);
+
+            weights.insert(drop_self_attn_alias(q_key), q);
+            weights.insert(drop_self_attn_alias(k_key), k);
+            weights.insert(drop_self_attn_alias(v_key), v);
+            continue;
+        }
+
+        if (key.find(".self_attn.in_proj_bias") != std::string::npos) {
+            if (!weights.contains(key)) continue;
+            const auto& b = weights.at(key);
+            if (!b.defined() || (b.dim() != 2 && b.dim() != 1)) continue;
+
+            const int64_t chunk_dim = (b.dim() == 2) ? 1 : 0;
+            if (b.size(chunk_dim) % 3 != 0) continue;
+            const int64_t H = b.size(chunk_dim) / 3;
+
+            torch::Tensor q, k, v;
+            if (b.dim() == 2) {
+                q = b.index({Slice(), Slice(0, H)}).contiguous();
+                k = b.index({Slice(), Slice(H, 2 * H)}).contiguous();
+                v = b.index({Slice(), Slice(2 * H, 3 * H)}).contiguous();
+            } else {
+                // Unbatched path: [3*H] -> three [H]
+                q = b.index({Slice(0, H)}).contiguous();
+                k = b.index({Slice(H, 2 * H)}).contiguous();
+                v = b.index({Slice(2 * H, 3 * H)}).contiguous();
+            }
+
+            const auto q_key = replace_suffix(key, "in_proj_bias", "q_proj.bias");
+            const auto k_key = replace_suffix(key, "in_proj_bias", "k_proj.bias");
+            const auto v_key = replace_suffix(key, "in_proj_bias", "v_proj.bias");
+
+            weights.insert(q_key, q);
+            weights.insert(k_key, k);
+            weights.insert(v_key, v);
+
+            weights.insert(drop_self_attn_alias(q_key), q);
+            weights.insert(drop_self_attn_alias(k_key), k);
+            weights.insert(drop_self_attn_alias(v_key), v);
+            continue;
+        }
+
+        if (key.find(".self_attn.") != std::string::npos) {
+            const auto alias = drop_self_attn_alias(key);
+            if (alias != key && !weights.contains(alias)) {
+                weights.insert(alias, weights.at(key));
+            }
+        }
+    }
+}
+
+void process_and_split_attention_weights(
+    std::unordered_map<std::string, torch::Tensor>& weights
+) {
+    std::vector<std::string> original_keys;
+    original_keys.reserve(weights.size());
+    for (const auto& kv : weights) {
+        original_keys.push_back(kv.first);
+    }
+
+    for (const auto& key : original_keys) {
+        auto it = weights.find(key);
+        if (it == weights.end()) continue;
+
+        if (key.find(".self_attn.in_proj_weight") != std::string::npos) {
+            const auto& w = it->second;
+            if (!w.defined() || (w.dim() != 3 && w.dim() != 2)) continue;
+            const int64_t chunk_dim = (w.dim() == 3) ? 1 : 0;
+            if (w.size(chunk_dim) % 3 != 0) continue;
+            const int64_t H = w.size(chunk_dim) / 3;
+
+            torch::Tensor q, k, v;
+            if (w.dim() == 3) {
+                q = w.index({Slice(), Slice(0, H), Slice()}).contiguous();
+                k = w.index({Slice(), Slice(H, 2 * H), Slice()}).contiguous();
+                v = w.index({Slice(), Slice(2 * H, 3 * H), Slice()}).contiguous();
+            } else {
+                q = w.index({Slice(0, H), Slice()}).contiguous();
+                k = w.index({Slice(H, 2 * H), Slice()}).contiguous();
+                v = w.index({Slice(2 * H, 3 * H), Slice()}).contiguous();
+            }
+
+            const auto q_key = replace_suffix(key, "in_proj_weight", "q_proj.weight");
+            const auto k_key = replace_suffix(key, "in_proj_weight", "k_proj.weight");
+            const auto v_key = replace_suffix(key, "in_proj_weight", "v_proj.weight");
+
+            weights[q_key] = q;
+            weights[k_key] = k;
+            weights[v_key] = v;
+
+            weights[drop_self_attn_alias(q_key)] = q;
+            weights[drop_self_attn_alias(k_key)] = k;
+            weights[drop_self_attn_alias(v_key)] = v;
+            continue;
+        }
+
+        if (key.find(".self_attn.in_proj_bias") != std::string::npos) {
+            const auto& b = it->second;
+            if (!b.defined() || (b.dim() != 2 && b.dim() != 1)) continue;
+            const int64_t chunk_dim = (b.dim() == 2) ? 1 : 0;
+            if (b.size(chunk_dim) % 3 != 0) continue;
+            const int64_t H = b.size(chunk_dim) / 3;
+
+            torch::Tensor q, k, v;
+            if (b.dim() == 2) {
+                q = b.index({Slice(), Slice(0, H)}).contiguous();
+                k = b.index({Slice(), Slice(H, 2 * H)}).contiguous();
+                v = b.index({Slice(), Slice(2 * H, 3 * H)}).contiguous();
+            } else {
+                q = b.index({Slice(0, H)}).contiguous();
+                k = b.index({Slice(H, 2 * H)}).contiguous();
+                v = b.index({Slice(2 * H, 3 * H)}).contiguous();
+            }
+
+            const auto q_key = replace_suffix(key, "in_proj_bias", "q_proj.bias");
+            const auto k_key = replace_suffix(key, "in_proj_bias", "k_proj.bias");
+            const auto v_key = replace_suffix(key, "in_proj_bias", "v_proj.bias");
+
+            weights[q_key] = q;
+            weights[k_key] = k;
+            weights[v_key] = v;
+
+            weights[drop_self_attn_alias(q_key)] = q;
+            weights[drop_self_attn_alias(k_key)] = k;
+            weights[drop_self_attn_alias(v_key)] = v;
+            continue;
+        }
+
+        if (key.find(".self_attn.") != std::string::npos) {
+            const auto alias = drop_self_attn_alias(key);
+            if (alias != key && !weights.count(alias)) {
+                weights[alias] = it->second;
+            }
+        }
+    }
 }
