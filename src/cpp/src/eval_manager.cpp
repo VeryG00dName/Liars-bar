@@ -16,6 +16,7 @@
 
 #include "bots.h"
 #include "torch_utils.h"
+#include "weight_utils.h"
 
 // Cache for parsed C++ bot kinds to avoid repeated string processing
 std::unordered_map<std::string, EvalManager::CppBotKind> EvalManager::bot_kind_cache_;
@@ -201,10 +202,21 @@ void EvalManager::load_model(
     try {
         torch::NoGradGuard guard;
 
+        // LUT keys that should be skipped (will be added by add_fixed_buffers)
+        const std::unordered_set<std::string> lut_keys = {
+            "lut_act_kind", "lut_count", "lut_table_flag"
+        };
+
         // Move weights to inference device and convert to FP16
+        // Skip LUTs - they will be added fresh in finalize_model_loading()
         std::unordered_map<std::string, torch::Tensor> processed_dict;
         processed_dict.reserve(state_dict.size());
         for (auto& kv : state_dict) {
+            // Skip LUTs - they are constant buffers that will be added later
+            if (lut_keys.find(kv.first) != lut_keys.end()) {
+                continue;
+            }
+
             auto tensor = kv.second
                               .detach()
                               .to(kInferenceDevice, /*non_blocking=*/false, /*copy=*/true)
@@ -267,9 +279,57 @@ void EvalManager::finalize_model_loading() {
         }
     }
 
-    // Stack weights across policies
+    // Stack weights across policies (LUTs already excluded in load_model)
     for (auto& kv : stacked) {
         batched_weight_cache_.insert(kv.first, torch::stack(kv.second).contiguous());
+    }
+
+    // DEBUG: Verify weights are actually different between policies
+    if (batched_weight_cache_.contains("obs_encoder.0.weight")) {
+        auto stacked_weight = batched_weight_cache_.at("obs_encoder.0.weight");
+        fprintf(stderr, "[EvalManager] Stacked weight verification: obs_encoder.0.weight shape=[");
+        for (int i = 0; i < stacked_weight.dim(); ++i) {
+            fprintf(stderr, "%ld%s", stacked_weight.size(i), i < stacked_weight.dim()-1 ? "," : "");
+        }
+        fprintf(stderr, "]\n");
+
+        // Check if all policies have same weights (would indicate a bug)
+        if (stacked_weight.size(0) >= 2) {
+            auto policy0 = stacked_weight[0].flatten();
+            auto policy1 = stacked_weight[1].flatten();
+            auto diff = (policy0 - policy1).abs().max().item<float>();
+            fprintf(stderr, "[EvalManager] Max abs diff between policy 0 and 1 weights: %.6f %s\n",
+                    diff, diff < 1e-6 ? "(IDENTICAL - BUG!)" : "(different - OK)");
+        }
+    }
+
+    // Clear temporary storage to free memory
+    stacked.clear();
+    staged_state_dicts_.clear();  // CRITICAL: Free the per-policy tensors after stacking
+
+    // Add fixed buffers (LUTs) - these are constant and shared across all policies
+    add_fixed_buffers(batched_weight_cache_, kInferenceDevice);
+
+    // Verify ALL 3 LUTs were added correctly
+    const std::vector<std::string> lut_names = {"lut_act_kind", "lut_count", "lut_table_flag"};
+    for (const auto& lut_name : lut_names) {
+        if (batched_weight_cache_.contains(lut_name)) {
+            auto lut = batched_weight_cache_.at(lut_name);
+            fprintf(stderr, "[EvalManager] LUT verification: %s shape=[%ld], dtype=%s, device=%s\n",
+                    lut_name.c_str(), lut.numel(),
+                    torch::toString(lut.dtype()).c_str(), lut.device().str().c_str());
+            if (lut.numel() == 11 && lut.device().is_cuda() && lut.dtype() == torch::kLong) {
+                auto cpu_lut = lut.to(torch::kCPU);
+                auto ptr = cpu_lut.data_ptr<int64_t>();
+                fprintf(stderr, "[EvalManager]   Values: [%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld]\n",
+                        ptr[0],ptr[1],ptr[2],ptr[3],ptr[4],ptr[5],ptr[6],ptr[7],ptr[8],ptr[9],ptr[10]);
+            } else {
+                fprintf(stderr, "[EvalManager] ERROR: %s has wrong size (%ld), device (%s), or dtype!\n",
+                        lut_name.c_str(), lut.numel(), lut.device().str().c_str());
+            }
+        } else {
+            fprintf(stderr, "[EvalManager] ERROR: %s not found in batched_weight_cache!\n", lut_name.c_str());
+        }
     }
 
     // Unify attention weight processing and aliasing
@@ -556,8 +616,17 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
     auto opts_long_device = torch::TensorOptions().dtype(torch::kInt64).device(kInferenceDevice);
     const size_t batch_limit = static_cast<size_t>(std::max(1, inference_batch_size_));
 
+    // DEBUG: Log batching info
+    static int total_calls = 0;
+    if (total_calls++ < 5) {
+        fprintf(stderr, "[EvalManager] run_packed_historical_inference: %zu requests, batch_limit=%zu\n",
+                refs.size(), batch_limit);
+    }
+
     size_t offset = 0;
+    size_t num_batches = 0;
     while (offset < refs.size()) {
+        ++num_batches;
         size_t remaining = refs.size() - offset;
         size_t take = std::min(remaining, batch_limit);
 
@@ -688,6 +757,12 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
         if (offset % (batch_limit * 4) == 0) {
             at::accelerator::emptyCache();
         }
+    }
+
+    // DEBUG: Log number of batches processed
+    if (total_calls <= 5) {
+        fprintf(stderr, "[EvalManager] Processed %zu requests in %zu batches (avg %.1f per batch)\n",
+                refs.size(), num_batches, refs.size() / (double)num_batches);
     }
 }
 

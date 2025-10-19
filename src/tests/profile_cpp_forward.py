@@ -126,6 +126,7 @@ def ensure_batched_(wd):
     - Split attention q/k/v: ensure batch dim at 0 for weights/biases
     - MoE stacked tensors: ensure shape [E, 1, ...] so policy batch (W) is at dim=1
     - LUTs remain 1-D
+    - Idempotent: calling multiple times won't add extra dimensions
     """
     for k, t in list(wd.items()):
         if not torch.is_tensor(t):
@@ -145,6 +146,9 @@ def ensure_batched_(wd):
                 # Reorder [1,E,out,in] -> [E,1,out,in]
                 wd[k] = t.permute(1, 0, 2, 3).contiguous()
                 continue
+            if t.ndim == 4:
+                # Already batched correctly [E, 1, out, in]
+                continue
 
         if ".moe.experts.b1" in k or ".moe.experts.b2" in k:
             if t.ndim == 2:  # [E, dim] -> [E,1,dim]
@@ -154,35 +158,87 @@ def ensure_batched_(wd):
                 # Reorder [1,E,dim] -> [E,1,dim]
                 wd[k] = t.permute(1, 0, 2).contiguous()
                 continue
+            if t.ndim == 3:
+                # Already batched correctly [E, 1, dim]
+                continue
 
         # Fused attention params: add batch dim at 0
         if k.endswith("in_proj_weight") and t.ndim == 2:
             wd[k] = t.unsqueeze(0).contiguous()
             continue
+        if k.endswith("in_proj_weight") and t.ndim == 3:
+            # Already batched [1, 3*H, H]
+            continue
         if k.endswith("in_proj_bias") and t.ndim == 1:
             wd[k] = t.unsqueeze(0).contiguous()
+            continue
+        if k.endswith("in_proj_bias") and t.ndim == 2:
+            # Already batched [1, 3*H]
             continue
 
         # Split attention q/k/v weights and biases
         if (k.endswith("q_proj.weight") or k.endswith("k_proj.weight") or k.endswith("v_proj.weight")) and t.ndim == 2:
             wd[k] = t.unsqueeze(0).contiguous()
             continue
+        if (k.endswith("q_proj.weight") or k.endswith("k_proj.weight") or k.endswith("v_proj.weight")) and t.ndim == 3:
+            # Already batched [1, H, H]
+            continue
         if (k.endswith("q_proj.bias") or k.endswith("k_proj.bias") or k.endswith("v_proj.bias")) and t.ndim == 1:
             wd[k] = t.unsqueeze(0).contiguous()
+            continue
+        if (k.endswith("q_proj.bias") or k.endswith("k_proj.bias") or k.endswith("v_proj.bias")) and t.ndim == 2:
+            # Already batched [1, H]
             continue
 
         # Embeddings: [vocab, dim] -> [1, vocab, dim]
         if k.endswith("embedding.weight") and t.ndim == 2:
             wd[k] = t.unsqueeze(0).contiguous()
             continue
+        if k.endswith("embedding.weight") and t.ndim == 3:
+            # Already batched [1, vocab, dim]
+            continue
 
         # Standard linear/LayerNorm params
+        # LayerNorm: 1D [H] -> 2D [1, H]
+        # Linear: 2D [out, in] -> 3D [1, out, in]
+        # Biases: 1D [dim] -> 2D [1, dim]
+
+        if k.endswith(".weight") and t.ndim == 1:
+            # LayerNorm weight: [H] -> [1, H]
+            wd[k] = t.unsqueeze(0).contiguous()
+            continue
         if k.endswith(".weight") and t.ndim == 2:
+            # Could be: batched LayerNorm [1, H] or unbatched Linear [out, in]
+            # Explicitly check if it's a known LayerNorm layer
+            is_layernorm_layer = (
+                "norm" in k.lower() or
+                "obs_encoder.1" in k or  # obs_encoder.1 is LayerNorm
+                ".1.weight" in k and "encoder" in k  # Common pattern: encoder.1 = LayerNorm
+            )
+
+            if is_layernorm_layer and t.size(0) == 1:
+                # Batched LayerNorm [1, H] - already batched, skip
+                continue
+            elif t.size(0) == t.size(1):
+                # Square matrix (attention): [H, H] -> [1, H, H]
+                wd[k] = t.unsqueeze(0).contiguous()
+                continue
+            else:
+                # Linear layer (including [1, in]): [out, in] -> [1, out, in]
+                wd[k] = t.unsqueeze(0).contiguous()
+                continue
+        if k.endswith(".weight") and t.ndim == 3:
+            # Already batched [1, out, in]
+            continue
+
+        if k.endswith(".bias") and t.ndim == 1:
+            # Any bias: [dim] -> [1, dim]
             wd[k] = t.unsqueeze(0).contiguous()
             continue
-        if (k.endswith(".bias") or k.endswith(".weight")) and t.ndim == 1:
-            wd[k] = t.unsqueeze(0).contiguous()
+        if k.endswith(".bias") and t.ndim == 2:
+            # Already batched [1, dim]
             continue
+
     return wd
 
 def _split_attention_weights(wd: dict) -> dict:
@@ -335,6 +391,21 @@ def load_checkpoint_weights(checkpoint_path, device="cuda"):
         shape = tuple(t.shape)
         if len(shape) == 0 or shape[0] != 1:  # print only if first dim is not 1
             print(k, shape, t.dtype)
+
+    print("\nLayerNorm weights (checking dimensions):")
+    for k, t in weight_dict.items():
+        if "norm" in k.lower() and ("weight" in k or "bias" in k):
+            print(f"  {k}: {tuple(t.shape)}, {t.dtype}")
+
+    print("\nLinear weights (should be 3D [W, out, in]):")
+    for k, t in weight_dict.items():
+        is_layernorm = "norm" in k.lower() or "obs_encoder.1" in k or (".1.weight" in k and "encoder" in k)
+        if k.endswith(".weight") and not ("embedding" in k or is_layernorm or k in LUT_KEYS):
+            if t.ndim != 3:
+                print(f"  ❌ {k}: {tuple(t.shape)}, {t.dtype} (expected 3D)")
+            # Don't print all the ✓ to reduce clutter
+            # else:
+            #     print(f"  ✓ {k}: {tuple(t.shape)}, {t.dtype}")
 
     # Add fixed buffers (LUTs) after other processing; keep them 1-D
     print("Adding fixed buffers (LUTs)...")

@@ -388,9 +388,9 @@ torch::Tensor indexed_batched_linear(
     long long stride_a = static_cast<long long>(M) * static_cast<long long>(K);
     long long stride_b = static_cast<long long>(N) * static_cast<long long>(K);
     long long stride_c = static_cast<long long>(M) * static_cast<long long>(N);
-    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_a, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH, &stride_a, sizeof(stride_a)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt error");
-    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_b, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH, &stride_b, sizeof(stride_b)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt error");
-    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_c, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH, &stride_c, sizeof(stride_c)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt error");
+    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_a, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_a, sizeof(stride_a)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt error");
+    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_b, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_b, sizeof(stride_b)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt error");
+    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_c, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_c, sizeof(stride_c)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt error");
 
     size_t workspace_size = 1 << 22; // 4MB
     auto workspace = torch::empty({static_cast<long>(workspace_size)}, input_cast.options().dtype(torch::kByte));
@@ -430,16 +430,21 @@ torch::Tensor indexed_batched_linear(
             1,
             &heuristic,
             &returned_results);
-        const char* dtype_str = (dtype == at::kHalf) ? "f16" : (dtype == at::kFloat) ? "f32" : "other";
-        TORCH_CHECK(st == CUBLAS_STATUS_SUCCESS,
-            "cublasLtMatmulAlgoGetHeuristic failed: ", cublas_status_to_string(st),
-            " (", static_cast<int>(st), ")",
-            "; M=", time_steps, ", N=", out_dim, ", K=", in_dim,
-            ", batch=", batch_size, ", dtype=", dtype_str,
-            ", epilogue=", (epilogue == IndexedLinearEpilogue::BiasGELU ? "GELU_BIAS" : "BIAS"),
-            ", workspace=", workspace_size);
+
+        // Fallback to torch::matmul if cuBLASLt can't find a heuristic
+        // This typically happens with small, misaligned dimensions (e.g., K=9 with FP16)
+        if (st != CUBLAS_STATUS_SUCCESS || returned_results == 0) {
+            cublasLtMatmulPreferenceDestroy(preference);
+
+            // Use PyTorch's matmul which handles any matrix size
+            auto result = torch::matmul(input_cast, weight_batched.transpose(-1, -2));
+            result.add_(bias_batched.unsqueeze(1));
+            if (epilogue == IndexedLinearEpilogue::BiasGELU) {
+                result = torch::gelu(result);
+            }
+            return result;
+        }
     }
-    TORCH_CHECK(returned_results > 0, "No cuBLASLt heuristic found");
 
     float alpha_float = 1.0f;
     float beta_float = 0.0f;

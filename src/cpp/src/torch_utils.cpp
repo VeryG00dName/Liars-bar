@@ -82,6 +82,25 @@ void fill_batch_from_requests(CpuBatchTensors& batch,
         const int64_t pos_rows =
             req_pos_ptr ? static_cast<int64_t>(req.position_sequence.size()) : 0;
 
+        // Validate that all sequence lengths are consistent
+        // This prevents silent bugs where obs_sequence is shorter than action_sequence
+        if (obs_rows > 0 && action_rows > 0 && obs_rows != action_rows) {
+            throw std::runtime_error(
+                "PolicyRequest[" + std::to_string(b) + "] has inconsistent sequence lengths: "
+                "obs_rows=" + std::to_string(obs_rows) + ", action_rows=" + std::to_string(action_rows) +
+                ", valid_len=" + std::to_string(req.valid_len));
+        }
+        if (obs_rows > 0 && agent_rows > 0 && obs_rows != agent_rows) {
+            throw std::runtime_error(
+                "PolicyRequest[" + std::to_string(b) + "] has inconsistent sequence lengths: "
+                "obs_rows=" + std::to_string(obs_rows) + ", agent_rows=" + std::to_string(agent_rows));
+        }
+        if (obs_rows > 0 && pos_rows > 0 && obs_rows != pos_rows) {
+            throw std::runtime_error(
+                "PolicyRequest[" + std::to_string(b) + "] has inconsistent sequence lengths: "
+                "obs_rows=" + std::to_string(obs_rows) + ", pos_rows=" + std::to_string(pos_rows));
+        }
+
         for (int64_t t = 0; t < std::min<int64_t>(requested_len, pad_len); ++t) {
             float* dst_obs = obs_ptr + t * OBS_DIM;
             if (req_obs_ptr && t < obs_rows) {
@@ -155,6 +174,7 @@ ModelInputBatch transfer_to_device(CpuBatchTensors&& cpu_batch,
         result.padding_mask = std::move(cpu_batch.padding_mask);
         result.valid_lengths = std::move(cpu_batch.valid_lengths);
     }
+
     return result;
 }
 

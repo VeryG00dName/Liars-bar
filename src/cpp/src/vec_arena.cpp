@@ -103,6 +103,24 @@ void VecArena::prepare_ai_sequence(const Env& e, int ai_seat, int seq_cap, Polic
     out.position_sequence.resize(out.valid_len);
     out.action_mask_sequence.resize(static_cast<size_t>(out.valid_len) * 7);
     out.obs_sequence.resize(static_cast<size_t>(out.valid_len) * OBS_DIM);
+
+    // Validate all sequences have consistent lengths
+    const size_t expected_obs_size = static_cast<size_t>(out.valid_len) * OBS_DIM;
+    const size_t expected_mask_size = static_cast<size_t>(out.valid_len) * 7;
+    if (out.obs_sequence.size() != expected_obs_size ||
+        out.action_sequence.size() != static_cast<size_t>(out.valid_len) ||
+        out.agent_type_sequence.size() != static_cast<size_t>(out.valid_len) ||
+        out.position_sequence.size() != static_cast<size_t>(out.valid_len) ||
+        out.action_mask_sequence.size() != expected_mask_size) {
+        throw std::runtime_error(
+            "prepare_ai_sequence BUG: inconsistent sizes after resize! "
+            "valid_len=" + std::to_string(out.valid_len) +
+            ", obs=" + std::to_string(out.obs_sequence.size()) + " (expected=" + std::to_string(expected_obs_size) + ")" +
+            ", action=" + std::to_string(out.action_sequence.size()) + " (expected=" + std::to_string(out.valid_len) + ")" +
+            ", agent=" + std::to_string(out.agent_type_sequence.size()) +
+            ", pos=" + std::to_string(out.position_sequence.size()) +
+            ", mask=" + std::to_string(out.action_mask_sequence.size()) + " (expected=" + std::to_string(expected_mask_size) + ")");
+    }
 }
 
 // ---------- API ----------

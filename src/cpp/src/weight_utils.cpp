@@ -166,9 +166,11 @@ void add_fixed_buffers(
         torch::dtype(torch::kLong).device(device)
     );
 
-    weights.insert("lut_act_kind", lut_act_kind);
-    weights.insert("lut_count", lut_count);
-    weights.insert("lut_table_flag", lut_table_flag);
+    // Use insert_or_assign to ensure LUTs are always set correctly
+    // (insert() fails silently if key exists)
+    weights.insert_or_assign("lut_act_kind", lut_act_kind);
+    weights.insert_or_assign("lut_count", lut_count);
+    weights.insert_or_assign("lut_table_flag", lut_table_flag);
 }
 
 // -----------------------------------------------------------------------------

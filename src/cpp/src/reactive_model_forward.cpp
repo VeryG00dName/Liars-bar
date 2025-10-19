@@ -101,6 +101,40 @@ forward_packed_cpp(
     int64_t batch_size = obs_sequence.size(0);
     int64_t seq_len = obs_sequence.size(1);
     int64_t obs_dim = obs_sequence.size(2);
+    int64_t action_seq_len = action_sequence.size(1);
+
+    // DEBUG: Check policy indices distribution
+    static int call_count = 0;
+    if (call_count++ < 3) {  // Only print first 3 calls
+        auto unique_policies = std::get<0>(torch::_unique(policy_indices_cpu));
+        fprintf(stderr, "[DEBUG forward_packed_cpp call %d] batch_size=%ld, num_unique_policies=%ld\n",
+                call_count, batch_size, unique_policies.size(0));
+        if (unique_policies.size(0) <= 20 && unique_policies.size(0) > 0) {
+            fprintf(stderr, "[DEBUG] Unique policy indices: ");
+            auto ptr = unique_policies.data_ptr<int64_t>();
+            for (int64_t i = 0; i < std::min<int64_t>(unique_policies.size(0), 20); ++i) {
+                fprintf(stderr, "%ld ", ptr[i]);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+
+    // Validate all sequences have matching batch and sequence dimensions
+    // CRITICAL: This must happen BEFORE any tensor operations that assume matching shapes
+    TORCH_CHECK(action_sequence.size(0) == batch_size,
+        "action_sequence batch size mismatch: expected ", batch_size, ", got ", action_sequence.size(0));
+    TORCH_CHECK(action_seq_len == seq_len,
+        "SEQUENCE LENGTH MISMATCH: obs_sequence has seq_len=", seq_len,
+        ", but action_sequence has seq_len=", action_seq_len,
+        ". PolicyRequest data is inconsistent - check where PolicyRequests are created!");
+    TORCH_CHECK(agent_types.size(0) == batch_size,
+        "agent_types batch size mismatch: expected ", batch_size, ", got ", agent_types.size(0));
+    TORCH_CHECK(agent_types.size(1) == seq_len,
+        "agent_types seq_len mismatch: expected ", seq_len, ", got ", agent_types.size(1));
+    TORCH_CHECK(positions.size(0) == batch_size,
+        "positions batch size mismatch: expected ", batch_size, ", got ", positions.size(0));
+    TORCH_CHECK(positions.size(1) == seq_len,
+        "positions seq_len mismatch: expected ", seq_len, ", got ", positions.size(1));
 
     auto device = action_sequence.device();
     auto dtype = obs_sequence.scalar_type();
