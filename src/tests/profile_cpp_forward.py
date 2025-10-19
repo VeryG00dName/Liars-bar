@@ -119,25 +119,69 @@ def _infer_arch_cfg(ckpt: Mapping) -> dict:
 LUT_KEYS = {"lut_act_kind", "lut_count", "lut_table_flag"}
 
 def ensure_batched_(wd):
+    """Ensure a consistent leading batch dim for all weights.
+
+    - Standard params: [out,in] -> [1,out,in]; [dim] -> [1,dim]
+    - Fused attention in-proj_*: treat like standard (get batch dim at 0)
+    - Split attention q/k/v: ensure batch dim at 0 for weights/biases
+    - MoE stacked tensors: ensure shape [E, 1, ...] so policy batch (W) is at dim=1
+    - LUTs remain 1-D
+    """
     for k, t in list(wd.items()):
+        if not torch.is_tensor(t):
+            continue
+
+        # LUTs stay 1-D
         if k in LUT_KEYS:
-            # keep LUTs 1-D Long[11]
             wd[k] = t.to(torch.long).contiguous().view(-1)
+            continue
+
+        # MoE stacked weights/biases: enforce [E, 1, ...]
+        if ".moe.experts.w1" in k or ".moe.experts.w2" in k:
+            if t.ndim == 3:  # [E, out, in] -> [E,1,out,in]
+                wd[k] = t.unsqueeze(1).contiguous()
+                continue
+            if t.ndim == 4 and t.size(0) == 1 and t.size(1) > 1:
+                # Reorder [1,E,out,in] -> [E,1,out,in]
+                wd[k] = t.permute(1, 0, 2, 3).contiguous()
+                continue
+
+        if ".moe.experts.b1" in k or ".moe.experts.b2" in k:
+            if t.ndim == 2:  # [E, dim] -> [E,1,dim]
+                wd[k] = t.unsqueeze(1).contiguous()
+                continue
+            if t.ndim == 3 and t.size(0) == 1 and t.size(1) > 1:
+                # Reorder [1,E,dim] -> [E,1,dim]
+                wd[k] = t.permute(1, 0, 2).contiguous()
+                continue
+
+        # Fused attention params: add batch dim at 0
+        if k.endswith("in_proj_weight") and t.ndim == 2:
+            wd[k] = t.unsqueeze(0).contiguous()
+            continue
+        if k.endswith("in_proj_bias") and t.ndim == 1:
+            wd[k] = t.unsqueeze(0).contiguous()
+            continue
+
+        # Split attention q/k/v weights and biases
+        if (k.endswith("q_proj.weight") or k.endswith("k_proj.weight") or k.endswith("v_proj.weight")) and t.ndim == 2:
+            wd[k] = t.unsqueeze(0).contiguous()
+            continue
+        if (k.endswith("q_proj.bias") or k.endswith("k_proj.bias") or k.endswith("v_proj.bias")) and t.ndim == 1:
+            wd[k] = t.unsqueeze(0).contiguous()
             continue
 
         # Embeddings: [vocab, dim] -> [1, vocab, dim]
         if k.endswith("embedding.weight") and t.ndim == 2:
-            wd[k] = t.unsqueeze(0)
+            wd[k] = t.unsqueeze(0).contiguous()
             continue
 
-        # Linear weights: [out, in] -> [1, out, in]
+        # Standard linear/LayerNorm params
         if k.endswith(".weight") and t.ndim == 2:
-            wd[k] = t.unsqueeze(0)
+            wd[k] = t.unsqueeze(0).contiguous()
             continue
-
-        # Biases / LayerNorm params: [dim] -> [1, dim]
         if (k.endswith(".bias") or k.endswith(".weight")) and t.ndim == 1:
-            wd[k] = t.unsqueeze(0)
+            wd[k] = t.unsqueeze(0).contiguous()
             continue
     return wd
 
@@ -230,112 +274,79 @@ def load_checkpoint_weights(checkpoint_path, device="cuda"):
     # Ensure we pass ONLY tensors and a plain dict to the C++ helpers
     tensor_only = {k: v for k, v in processed_dict.items() if torch.is_tensor(v)}
 
-    # Pre-stack MoE weights (returns modified dict)
+    # --- DIAG: after _to_device_fp16 ---
+    def _find_first_key(keys, predicate):
+        for k in keys:
+            if predicate(k):
+                return k
+        return None
+    attn_fused_key_0 = _find_first_key(tensor_only.keys(),
+                                        lambda k: k.endswith('.self_attn.in_proj_weight') and '.layers.0.' in k)
+    moe_sample_w1_0 = _find_first_key(tensor_only.keys(),
+                                      lambda k: '.layers.0.moe.experts.' in k and k.endswith('.0.weight'))
+    if attn_fused_key_0:
+        t = tensor_only[attn_fused_key_0]
+        print(f"[DIAG] after _to_device_fp16: {attn_fused_key_0} -> {tuple(t.shape)}, {t.dtype}")
+    if moe_sample_w1_0:
+        t = tensor_only[moe_sample_w1_0]
+        print(f"[DIAG] after _to_device_fp16: {moe_sample_w1_0} -> {tuple(t.shape)}, {t.dtype}")
+
+    # 1) Pre-stack MoE on unbatched inputs
     print("Pre-stacking MoE expert weights...")
-    tensor_only = lb.prestack_moe_expert_weights(tensor_only, arch_cfg["num_layers"], arch_cfg["num_experts"])
+    weight_dict = lb.prestack_moe_expert_weights(dict(tensor_only), arch_cfg["num_layers"], arch_cfg["num_experts"])
 
-    # This is what the C++ forward expects
-    weight_dict = dict(tensor_only)
+    # --- DIAG: after prestack (unbatched), check stacked MoE tensors ---
+    stacked_w1_key_0 = f"transformer.layers.0.moe.experts.w1"
+    if stacked_w1_key_0 in weight_dict:
+        t = weight_dict[stacked_w1_key_0]
+        print(f"[DIAG] after prestack: {stacked_w1_key_0} -> {tuple(t.shape)}, {t.dtype}")
 
+    # 2) Ensure batch dims:
+    weight_dict = ensure_batched_(weight_dict)
+
+    # --- DIAG: after ensure_batched_ ---
+    if attn_fused_key_0 and attn_fused_key_0 in weight_dict:
+        t = weight_dict[attn_fused_key_0]
+        print(f"[DIAG] after ensure_batched_: {attn_fused_key_0} -> {tuple(t.shape)}, {t.dtype}")
+    if stacked_w1_key_0 in weight_dict:
+        t = weight_dict[stacked_w1_key_0]
+        print(f"[DIAG] after ensure_batched_: {stacked_w1_key_0} -> {tuple(t.shape)}, {t.dtype}")
+
+    # 3) Split fused attention weights into q/k/v and add aliases
+    _split_attention_weights(weight_dict)
+
+    # 4) Ensure batch dims again to cover newly added q/k/v params
+    weight_dict = ensure_batched_(weight_dict)
+
+    # --- DIAG: after split, check Q/K/V for layer 0 ---
+    for base in ("transformer.layers.0.self_attn.", "transformer.layers.0."):
+        for proj in ("q_proj", "k_proj", "v_proj"):
+            wk = base + f"{proj}.weight"
+            bk = base + f"{proj}.bias"
+            if wk in weight_dict:
+                tw = weight_dict[wk]
+                print(f"[DIAG] after split: {wk} -> {tuple(tw.shape)}, {tw.dtype}")
+            if bk in weight_dict:
+                tb = weight_dict[bk]
+                print(f"[DIAG] after split: {bk} -> {tuple(tb.shape)}, {tb.dtype}")
+                
+    print("\nlayers that don't have a batch dimension after processing:")
+    for k, t in weight_dict.items():
+        shape = tuple(t.shape)
+        if len(shape) == 0 or shape[0] != 1:  # print only if first dim is not 1
+            print(k, shape, t.dtype)
+
+    # Add fixed buffers (LUTs) after other processing; keep them 1-D
+    print("Adding fixed buffers (LUTs)...")
+    weight_dict = lb.add_fixed_buffers(weight_dict, device)
+
+    # Sanity-check LUTs
     for k in ("lut_act_kind", "lut_count", "lut_table_flag"):
         t = weight_dict[k]
-    assert t.dtype == torch.long and t.dim() == 1 and t.numel() == 11, \
-        f"{k} must be 1-D long[11], got {tuple(t.shape)}, {t.dtype}"
-    weight_dict = ensure_batched_(weight_dict)
-    for k in [
-    "obs_encoder.0.weight", "obs_encoder.0.bias",
-    "obs_encoder.1.weight", "obs_encoder.1.bias",
-    "act_kind_embedding.weight", "count_embedding.weight",
-    "table_flag_embedding.weight", "agent_embedding.weight",
-    "position_embedding.weight",
-    "gate_obs.0.weight", "gate_obs.0.bias", "gate_obs.2.weight", "gate_obs.2.bias",
-    "action_heads.0.weight", "action_heads.0.bias",
-    "opp_action_heads.0.weight", "opp_action_heads.0.bias",
-]:
-        t = weight_dict[k]
-        print(k, tuple(t.shape), t.dtype)
-
-    # Add fixed buffers (LUTs) AFTER adding batch dim
-    # LUTs should NOT have batch dimension - they're shared lookup tables
-    print("Adding fixed buffers (LUTs)...")
-    lb.add_fixed_buffers(weight_dict, device)
+        assert t.dtype == torch.long and t.dim() == 1 and t.numel() == 11, \
+            f"{k} must be 1-D long[11], got {tuple(t.shape)}, {t.dtype}"
 
     return weight_dict, arch_cfg
-
-
-def replicate_weights_for_batch(weight_dict, batch_size, device="cuda"):
-    """
-    Replicate weights to simulate multiple samples using the same model.
-
-    This mimics what EvalManager does: if you have 128 requests all for the same
-    policy, it uses index_select to replicate the weights 128 times.
-    """
-    if batch_size == 1:
-        return weight_dict
-
-    print(f"Replicating weights for batch_size={batch_size} (simulates {batch_size} inference requests)...")
-
-    # Create indices: [0, 0, 0, ..., 0] (batch_size times)
-    # This simulates all requests using policy_id=0
-    indices = torch.zeros(batch_size, dtype=torch.long, device=device)
-
-    replicated = {}
-    for key, tensor in weight_dict.items():
-        # For LUTs (unbatched, 1D), don't replicate
-        if tensor.ndim == 1:
-            replicated[key] = tensor
-        else:
-            # Use index_select to replicate along batch dimension (dim=0)
-            replicated[key] = tensor.index_select(0, indices)
-
-    return replicated
-
-
-def load_checkpoint_weights_old(checkpoint_path, device="cuda"):
-    """Load weights from a checkpoint file and prepare a GPU FP16 weight dict."""
-    print(f"\nLoading checkpoint from {checkpoint_path}...")
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-
-    # Infer architecture config
-    arch_cfg = _infer_arch_cfg(checkpoint)
-    print(f"Model architecture: {PPOReactiveModel} (using arch_cfg: {arch_cfg})")
-
-    # Extract and convert weights
-    print("Converting weights to FP16 and moving to GPU...")
-    state_dict = _extract_state_dict(checkpoint)
-
-    processed_dict = _to_device_fp16(state_dict, device=device)
-
-    # Ensure we pass ONLY tensors and a plain dict to the C++ helpers
-    tensor_only = {k: v for k, v in processed_dict.items() if torch.is_tensor(v)}
-
-    # Pre-stack MoE weights (returns modified dict)
-    print("Pre-stacking MoE expert weights...")
-    tensor_only = lb.prestack_moe_expert_weights(tensor_only, arch_cfg["num_layers"], arch_cfg["num_experts"])
-
-    # This is what the C++ forward expects
-    weight_dict = dict(tensor_only)
-
-    # IMPORTANT: Add batch dimension (forward_packed_cpp expects batched weights)
-    # Single model: [out_dim, in_dim] -> [1, out_dim, in_dim]
-    # This represents having 1 model in the policy pool
-    print("Adding batch dimension to all weights (simulates 1 model in pool)...")
-
-    # Add fixed buffers (LUTs) AFTER adding batch dim
-    # LUTs should NOT have batch dimension - they're shared lookup tables
-    print("Adding fixed buffers (LUTs)...")
-    lb.add_fixed_buffers(weight_dict, device)
-
-    print(f"Total weight tensors: {len(weight_dict)}")
-
-    # Calculate total memory
-    total_params = sum(t.numel() for t in weight_dict.values())
-    total_bytes  = sum(t.numel() * t.element_size() for t in weight_dict.values())
-    print(f"Total parameters: {total_params:,}")
-    print(f"Total memory: {total_bytes / 1024**3:.2f} GB")
-
-    return weight_dict, arch_cfg
-
 
 # -----------------------------
 # Profiling
@@ -362,7 +373,14 @@ def profile_forward_pass(checkpoint_path, batch_size=128, seq_len=256):
     print("\nWarming up (1 iteration)...")
     torch.cuda.reset_peak_memory_stats()
     with torch.no_grad():
+        # DIAG: Input tensor shapes prior to warm-up call
+        print(f"[DIAG] obs_seq: {tuple(obs_seq.shape)}, {obs_seq.dtype}")
+        print(f"[DIAG] act_seq: {tuple(act_seq.shape)}, {act_seq.dtype}")
+        print(f"[DIAG] agent_types: {tuple(agent_types.shape)}, {agent_types.dtype}")
+        print(f"[DIAG] positions: {tuple(positions.shape)}, {positions.dtype}")
+        print(f"[DIAG] padding_mask: {tuple(padding_mask.shape)}, {padding_mask.dtype}")
         policy_indices = torch.zeros(obs_seq.size(0), dtype=torch.long, device=device)
+        print(f"[DIAG] policy_indices: {tuple(policy_indices.shape)}, {policy_indices.dtype}")
         _ = lb.forward_packed_cpp(
             obs_seq, act_seq, agent_types, positions,
             weight_dict, policy_indices, padding_mask,
@@ -385,6 +403,38 @@ def profile_forward_pass(checkpoint_path, batch_size=128, seq_len=256):
 
     torch.cuda.reset_peak_memory_stats()
 
+    # ------------------------------------------------------------------
+    # DIAG: Comprehensive weight dict logging before profiling
+    # ------------------------------------------------------------------
+    print("\n[DIAG] FINAL WEIGHT DICT SUMMARY (key -> shape, dtype)")
+    suspicious = []
+    for k in sorted(weight_dict.keys()):
+        t = weight_dict[k]
+        shp = tuple(t.shape)
+        print(f"  {k}: {shp}, {t.dtype}")
+        if any(dim == 171 for dim in shp):
+            suspicious.append((k, shp))
+
+    if suspicious:
+        print("[DIAG][WARN] Tensors containing dimension 171 detected:")
+        for k, shp in suspicious:
+            print(f"  -> {k}: {shp}")
+
+    # Check attention Q/K/V shapes against hidden_dim
+    H = int(arch["hidden_dim"]) if "hidden_dim" in arch else None
+    if H is not None:
+        def _expect_weight(shp):
+            return len(shp) == 3 and shp[0] == 1 and shp[1] == H and shp[2] == H
+        def _expect_bias(shp):
+            return len(shp) == 2 and shp[0] == 1 and shp[1] == H
+        for k in sorted(weight_dict.keys()):
+            if "q_proj.weight" in k or "k_proj.weight" in k or "v_proj.weight" in k:
+                if not _expect_weight(tuple(weight_dict[k].shape)):
+                    print(f"[DIAG][MISMATCH] {k} expected [1,{H},{H}], got {tuple(weight_dict[k].shape)}")
+            if "q_proj.bias" in k or "k_proj.bias" in k or "v_proj.bias" in k:
+                if not _expect_bias(tuple(weight_dict[k].shape)):
+                    print(f"[DIAG][MISMATCH] {k} expected [1,{H}], got {tuple(weight_dict[k].shape)}")
+
     with torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,
@@ -395,7 +445,13 @@ def profile_forward_pass(checkpoint_path, batch_size=128, seq_len=256):
         with_stack=True,
     ) as prof:
         with torch.no_grad():
+            # DIAG: Input tensor shapes just before profiled call
+            print(f"[DIAG] obs_seq: {tuple(obs_seq.shape)}, {obs_seq.dtype}")
+            print(f"[DIAG] act_seq: {tuple(act_seq.shape)}, {act_seq.dtype}")
+            print(f"[DIAG] agent_types: {tuple(agent_types.shape)}, {agent_types.dtype}")
+            print(f"[DIAG] positions: {tuple(positions.shape)}, {positions.dtype}")
             policy_indices = torch.zeros(obs_seq.size(0), dtype=torch.long, device=device)
+            print(f"[DIAG] policy_indices: {tuple(policy_indices.shape)}, {policy_indices.dtype}")
             action_logits, opp_logits, state_values, win_logits = lb.forward_packed_cpp(
                 obs_seq, act_seq, agent_types, positions,
                 weight_dict, policy_indices, padding_mask,
@@ -452,12 +508,12 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python profile_cpp_forward.py <checkpoint_path> [batch_size] [seq_len]")
         print("\nExample:")
-        print("  python profile_cpp_forward.py checkpoints/test80/gen_0/final.pth 128 256")
+        print("  python profile_cpp_forward.py checkpoints/test75/gen_0/final.pth 128 256")
         sys.exit(1)
 
     checkpoint_path = sys.argv[1]
     # IMPORTANT: batch_size must match weight batch dimension (1 for single model)
-    # C++ forward_packed_cpp is designed for batched MODELS, not batched SAMPLES
+    # C++ forward_packed_cpp is designed for batched MODELS and batched INPUTS.
     batch_size = int(sys.argv[2]) if len(sys.argv) > 2 else 1
     seq_len    = int(sys.argv[3]) if len(sys.argv) > 3 else 256
 

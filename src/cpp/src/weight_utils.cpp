@@ -77,6 +77,22 @@ void prestack_moe_expert_weights(
         state_dict[layer_prefix + ".moe.experts.b1"] = torch::stack(b1_experts, stack_dim);
         state_dict[layer_prefix + ".moe.experts.w2"] = torch::stack(w2_experts, stack_dim);
         state_dict[layer_prefix + ".moe.experts.b2"] = torch::stack(b2_experts, stack_dim);
+
+        // Cleanup: remove per-expert individual weight keys to avoid ambiguity
+        for (int64_t expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
+            std::string expert_prefix =
+                layer_prefix + ".moe.experts." + std::to_string(expert_idx);
+
+            std::string w1_key = expert_prefix + ".0.weight";
+            std::string b1_key = expert_prefix + ".0.bias";
+            std::string w2_key = expert_prefix + ".3.weight";
+            std::string b2_key = expert_prefix + ".3.bias";
+
+            state_dict.erase(w1_key);
+            state_dict.erase(b1_key);
+            state_dict.erase(w2_key);
+            state_dict.erase(b2_key);
+        }
     }
 }
 
