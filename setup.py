@@ -2,7 +2,12 @@
 import os, sys
 from glob import glob
 from setuptools import setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+from torch.utils.cpp_extension import (
+    BuildExtension,
+    CppExtension,
+    CUDAExtension,
+    CUDA_HOME,
+)
 
 os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", "/mnt/l/Coding_Projects/Liars_bar_2/Liars-bar/persistent_cache/inductor")
 os.environ.setdefault("TRITON_CACHE_DIR",        "/mnt/l/Coding_Projects/Liars_bar_2/Liars-bar/persistent_cache/triton")
@@ -48,11 +53,41 @@ if sys.platform == "win32":
 else:
     extra_compile_args, extra_link_args = linux_macos_flags(PROFILE)
 
+# Resolve CUDA paths explicitly (WSL-friendly)
+cuda_home = CUDA_HOME or os.environ.get("CUDA_HOME") or "/usr/local/cuda"
+cuda_ver_suffix = os.environ.get("CUDA_VER_SUFFIX", "")  # e.g., "-12.9" if you prefer versioned path
+cuda_root_candidates = [
+    cuda_home,
+    f"{cuda_home}{cuda_ver_suffix}",
+    "/usr/local/cuda-12.9",
+    "/usr/local/cuda-12.8",
+]
+cuda_include_dirs = []
+cuda_lib_dirs = []
+for root in cuda_root_candidates:
+    inc1 = os.path.join(root, "include")
+    inc2 = os.path.join(root, "targets", "x86_64-linux", "include")
+    lib1 = os.path.join(root, "lib64")
+    lib2 = os.path.join(root, "targets", "x86_64-linux", "lib")
+    for p in (inc1, inc2):
+        if os.path.isdir(p) and p not in cuda_include_dirs:
+            cuda_include_dirs.append(p)
+    for p in (lib1, lib2):
+        if os.path.isdir(p) and p not in cuda_lib_dirs:
+            cuda_lib_dirs.append(p)
+
+# Prepend CUDA include dirs for NVCC specifically as well
+if "nvcc" in extra_compile_args:
+    for p in cuda_include_dirs:
+        extra_compile_args["nvcc"].insert(0, f"-I{p}")
+
 ext = CUDAExtension(
     name="src.misc.lb",
     sources=SOURCES,
-    include_dirs=[CPP_INCLUDE],
-    extra_compile_args=extra_compile_args,   # dict form is supported (cxx/nvcc)
+    include_dirs=[CPP_INCLUDE] + cuda_include_dirs,
+    library_dirs=cuda_lib_dirs,
+    libraries=['cublasLt'],
+    extra_compile_args=extra_compile_args,
     extra_link_args=extra_link_args,
 )
 
