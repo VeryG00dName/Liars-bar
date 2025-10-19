@@ -1,5 +1,6 @@
 #include "indexed_kernels.h"
 
+#include <ATen/AccumulateType.h> // For at::acc_type
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -240,17 +241,7 @@ torch::Tensor indexed_batched_embedding(
     auto batch_size = indices.size(0);
     auto time_steps = indices.size(1);
 
-    if (!weight_cache.is_cuda()) {
-        auto policy_cpu = policy_indices.cpu();
-        auto gathered = weight_cache.index_select(0, policy_cpu);
-        auto result = torch::embedding(
-            gathered.reshape({batch_size, vocab_size, hidden_dim}),
-            indices,
-            -1,
-            false,
-            false);
-        return result;
-    }
+    TORCH_CHECK(weight_cache.is_cuda(), "indexed_batched_embedding expects CUDA tensors for weight_cache");
 
     auto weight_contig = weight_cache.contiguous();
     auto indices_contig = indices.contiguous();
@@ -299,16 +290,7 @@ torch::Tensor indexed_batched_layer_norm(
     auto time_steps = input.size(1);
     auto hidden_dim = input.size(2);
 
-    if (!input.is_cuda()) {
-        auto policy_cpu = policy_indices.cpu();
-        auto gamma = gamma_cache.index_select(0, policy_cpu);
-        auto beta = beta_cache.index_select(0, policy_cpu);
-        auto x = input.to(gamma.scalar_type());
-        auto mean = x.mean(-1, true);
-        auto var = x.var(-1, false, true);
-        auto x_hat = (x - mean) / torch::sqrt(var + eps);
-        return x_hat * gamma.unsqueeze(1) + beta.unsqueeze(1);
-    }
+    TORCH_CHECK(input.is_cuda(), "indexed_batched_layer_norm expects CUDA tensors for input");
 
     auto input_contig = input.contiguous();
     auto gamma_contig = gamma_cache.contiguous();

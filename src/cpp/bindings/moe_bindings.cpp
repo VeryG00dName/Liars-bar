@@ -11,6 +11,7 @@ void bind_moe(py::module_& m) {
           py::arg("x"),
           py::arg("gate_logits"),
           py::arg("topk_indices"),
+          py::arg("policy_indices"),
           py::arg("w1"),
           py::arg("b1"),
           py::arg("w2"),
