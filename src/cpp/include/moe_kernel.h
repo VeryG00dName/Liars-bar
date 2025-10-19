@@ -7,6 +7,7 @@
 torch::Tensor moe_forward_cuda(torch::Tensor x,
                                torch::Tensor gate_logits,
                                torch::Tensor topk_indices,
+                               torch::Tensor policy_indices,
                                torch::Tensor w1,
                                torch::Tensor b1,
                                torch::Tensor w2,

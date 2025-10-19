@@ -18,6 +18,7 @@ __global__ void simple_moe_forward_kernel_half(
     const at::Half* __restrict__ x,
     const at::Half* __restrict__ gate_logits,
     const int64_t* __restrict__ topk_indices,
+    const int64_t* __restrict__ policy_indices,
     at::Half* __restrict__ output,
     int64_t batch_size,
     int64_t tokens_per_batch,
@@ -42,7 +43,7 @@ __global__ void simple_moe_forward_kernel_half(
     }
 
     const int64_t batch_index = token_index / tokens_per_batch;
-    const int64_t weight_batch_index = weight_batch == 1 ? 0 : batch_index;
+    const int64_t weight_batch_index = weight_batch == 1 ? 0 : policy_indices[batch_index];
 
     const at::Half* x_ptr = x + token_index * hidden_dim;
     at::Half* out_ptr = output + token_index * hidden_dim;
@@ -103,6 +104,7 @@ torch::Tensor moe_forward_cuda(
     torch::Tensor x,
     torch::Tensor gate_logits,
     torch::Tensor topk_indices,
+    torch::Tensor policy_indices,
     torch::Tensor w1,
     torch::Tensor b1,
     torch::Tensor w2,
@@ -131,9 +133,15 @@ torch::Tensor moe_forward_cuda(
     // No more AT_DISPATCH. We call the specific kernel we need.
     auto stream = at::cuda::getCurrentCUDAStream();
 
+    auto policy_indices_contig = policy_indices.to(torch::kLong).contiguous();
+    if (policy_indices_contig.device() != x.device()) {
+        policy_indices_contig = policy_indices_contig.to(x.device());
+    }
+
     if (ffn_dim <= 512) {
         simple_moe_forward_kernel_half<512><<<blocks, threads, 0, stream>>>(
             x.data_ptr<at::Half>(), gate_logits.data_ptr<at::Half>(), topk_indices.data_ptr<int64_t>(),
+            policy_indices_contig.data_ptr<int64_t>(),
             output.data_ptr<at::Half>(), x.size(0), x.size(1), hidden_dim, gate_logits.size(2),
             topk_indices.size(2), ffn_dim, w1.size(1), w1.stride(1), b1.stride(1), w2.stride(1),
             b2.stride(1), w1.data_ptr<at::Half>(), b1.data_ptr<at::Half>(),
@@ -141,6 +149,7 @@ torch::Tensor moe_forward_cuda(
     } else if (ffn_dim <= 1024) {
         simple_moe_forward_kernel_half<1024><<<blocks, threads, 0, stream>>>(
             x.data_ptr<at::Half>(), gate_logits.data_ptr<at::Half>(), topk_indices.data_ptr<int64_t>(),
+            policy_indices_contig.data_ptr<int64_t>(),
             output.data_ptr<at::Half>(), x.size(0), x.size(1), hidden_dim, gate_logits.size(2),
             topk_indices.size(2), ffn_dim, w1.size(1), w1.stride(1), b1.stride(1), w2.stride(1),
             b2.stride(1), w1.data_ptr<at::Half>(), b1.data_ptr<at::Half>(),
@@ -148,6 +157,7 @@ torch::Tensor moe_forward_cuda(
     } else { // ffn_dim <= 2048
         simple_moe_forward_kernel_half<2048><<<blocks, threads, 0, stream>>>(
             x.data_ptr<at::Half>(), gate_logits.data_ptr<at::Half>(), topk_indices.data_ptr<int64_t>(),
+            policy_indices_contig.data_ptr<int64_t>(),
             output.data_ptr<at::Half>(), x.size(0), x.size(1), hidden_dim, gate_logits.size(2),
             topk_indices.size(2), ffn_dim, w1.size(1), w1.stride(1), b1.stride(1), w2.stride(1),
             b2.stride(1), w1.data_ptr<at::Half>(), b1.data_ptr<at::Half>(),

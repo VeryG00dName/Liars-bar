@@ -52,56 +52,6 @@ forward_packed_cpp(
 );
 
 /**
- * Helper function: Batched linear transformation.
- *
- * Computes: output = input @ weight^T + bias
- * where weight and bias have a batch dimension.
- *
- * @param input Input tensor [B, T, in_dim]
- * @param weight Weight tensor [B, out_dim, in_dim]
- * @param bias Bias tensor [B, out_dim]
- * @return Output tensor [B, T, out_dim]
- */
-torch::Tensor batched_linear(
-    const torch::Tensor& input,
-    const torch::Tensor& weight,
-    const torch::Tensor& bias
-);
-
-/**
- * Helper function: Batched layer normalization.
- *
- * Computes: output = (input - mean) / sqrt(var + eps) * weight + bias
- * where weight and bias have a batch dimension.
- *
- * @param input Input tensor [B, T, dim]
- * @param weight Weight tensor [B, dim]
- * @param bias Bias tensor [B, dim]
- * @param eps Epsilon for numerical stability
- * @return Output tensor [B, T, dim]
- */
-torch::Tensor batched_layer_norm(
-    const torch::Tensor& input,
-    const torch::Tensor& weight,
-    const torch::Tensor& bias,
-    double eps = 1e-5
-);
-
-/**
- * Helper function: Batched embedding lookup.
- *
- * Performs embedding lookup where embedding weights have a batch dimension.
- *
- * @param weight Embedding weights [B, vocab_size, embed_dim]
- * @param indices Indices to lookup [B, T] (long tensor)
- * @return Embedded tensor [B, T, embed_dim]
- */
-torch::Tensor batched_embedding(
-    const torch::Tensor& weight,
-    const torch::Tensor& indices
-);
-
-/**
  * Helper function: Reduce per-expert head outputs using MoE routing weights.
  *
  * Applies weighted combination of expert outputs based on Top-K routing decisions.
