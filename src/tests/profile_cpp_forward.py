@@ -572,21 +572,158 @@ def profile_forward_pass(checkpoint_path, batch_size=128, seq_len=256):
     return prof
 
 
+def profile_multi_policy(checkpoint_path: str, batch_size: int, seq_len: int, num_policies: int):
+    """Profile forward pass with multiple policies (simulating eval scenario)."""
+    import gc
+    device = "cuda"
+
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    print(f"\nLoading checkpoint and duplicating {num_policies} times...")
+
+    # Load base checkpoint
+    base_ckpt = torch.load(checkpoint_path, map_location="cpu")
+
+    arch_cfg = _infer_arch_cfg(base_ckpt)
+
+    # Process weights like EvalManager does: preprocess on CPU, then stack, then FP16+GPU
+    print(f"Processing weights for stacking...")
+
+    # Extract raw state dict (CPU, FP32)
+    state_dict = _extract_state_dict(base_ckpt)
+
+    # Filter to only tensors
+    tensor_only = {k: v for k, v in state_dict.items() if torch.is_tensor(v)}
+
+    # Prestack MoE expert weights (on CPU)
+    print("Pre-stacking MoE expert weights...")
+    single_wd = lb.prestack_moe_expert_weights(dict(tensor_only), arch_cfg["num_layers"], arch_cfg["num_experts"])
+
+    # Split fused attention weights (if any) into q/k/v
+    print("Splitting attention weights...")
+    _split_attention_weights(single_wd)
+
+    # Now stack num_policies copies (still on CPU, FP32)
+    print(f"Stacking {num_policies} copies...")
+    stacked_weights = {}
+    for key in single_wd.keys():
+        if key in LUT_KEYS:
+            continue  # Skip LUTs, will add later
+
+        # Stack num_policies copies along dim 0 (policy dimension)
+        tensors = [single_wd[key] for _ in range(num_policies)]
+        stacked_weights[key] = torch.stack(tensors, dim=0).contiguous()
+
+    # Now move to device and convert to FP16
+    print(f"Moving to {device} and converting to FP16...")
+    for key in stacked_weights.keys():
+        stacked_weights[key] = stacked_weights[key].to(device).to(torch.float16).contiguous()
+
+    # Add LUTs (shared across all policies)
+    stacked_weights = lb.add_fixed_buffers(stacked_weights, device)
+
+    mem_after_weights = torch.cuda.memory_allocated() / 1024**3
+    print(f"Memory after loading {num_policies} policies: {mem_after_weights:.2f} GB")
+    print(f"  (~{mem_after_weights/num_policies:.2f} GB per policy)")
+
+    # Create dummy inputs
+    obs_seq, act_seq, agent_types, positions, padding_mask = create_dummy_inputs(
+        batch_size=batch_size,
+        seq_len=seq_len,
+        device=device,
+    )
+
+    # Random policy indices (simulating multiple policies in same batch)
+    policy_indices = torch.randint(0, num_policies, (batch_size,), dtype=torch.long, device=device)
+    num_unique = len(torch.unique(policy_indices))
+    print(f"Policy indices: {num_unique} unique policies in batch (out of {num_policies} total)")
+
+    # Warmup
+    print("\nWarmup pass...")
+    torch.cuda.reset_peak_memory_stats()
+    with torch.no_grad():
+        _ = lb.forward_packed_cpp(
+            obs_seq, act_seq, agent_types, positions,
+            stacked_weights, policy_indices, padding_mask,
+            arch_cfg["num_layers"], arch_cfg["num_heads"], arch_cfg["hidden_dim"],
+            arch_cfg["num_experts"], arch_cfg["top_k"],
+            arch_cfg["count_pad"], arch_cfg["tflag_pad"],
+        )
+    torch.cuda.synchronize()
+    warmup_mem = torch.cuda.max_memory_allocated() / 1024**3
+    print(f"Warmup peak memory: {warmup_mem:.2f} GB")
+
+    # Profile
+    print("\n" + "=" * 80)
+    print(f"PROFILING {num_policies} POLICIES")
+    print("=" * 80)
+
+    torch.cuda.reset_peak_memory_stats()
+
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=False,  # Disable to reduce warnings
+    ) as prof:
+        with torch.no_grad():
+            action_logits, opp_logits, state_values, win_logits = lb.forward_packed_cpp(
+                obs_seq, act_seq, agent_types, positions,
+                stacked_weights, policy_indices, padding_mask,
+                arch_cfg["num_layers"], arch_cfg["num_heads"], arch_cfg["hidden_dim"],
+                arch_cfg["num_experts"], arch_cfg["top_k"],
+                arch_cfg["count_pad"], arch_cfg["tflag_pad"],
+            )
+
+    torch.cuda.synchronize()
+
+    peak_mem = torch.cuda.max_memory_allocated() / 1024**3
+    print(f"\nPeak memory: {peak_mem:.2f} GB")
+    print(f"Memory breakdown:")
+    print(f"  Weights: ~{mem_after_weights:.2f} GB ({mem_after_weights/num_policies:.2f} GB/policy)")
+    print(f"  Activations: ~{peak_mem - mem_after_weights:.2f} GB")
+
+    # Print CUDA time table
+    print("\n" + "=" * 80)
+    print("TOP TIME-CONSUMING CUDA OPERATIONS")
+    print("=" * 80)
+    print(
+        prof.key_averages().table(
+            sort_by="cuda_time_total",
+            row_limit=20,
+            top_level_events_only=False,
+        )
+    )
+
+    trace_path = f"multi_policy_trace_{num_policies}p.json"
+    prof.export_chrome_trace(trace_path)
+    print(f"\nChrome trace exported to: {trace_path}")
+    print("View it at: chrome://tracing")
+
+    return prof
+
+
 # -----------------------------
 # Main
 # -----------------------------
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python profile_cpp_forward.py <checkpoint_path> [batch_size] [seq_len]")
+        print("Usage: python profile_cpp_forward.py <checkpoint_path> [batch_size] [seq_len] [num_policies]")
         print("\nExample:")
-        print("  python profile_cpp_forward.py checkpoints/test75/gen_0/final.pth 128 256")
+        print("  python profile_cpp_forward.py checkpoints/test75/gen_0/final.pth 128 256 1")
+        print("  python profile_cpp_forward.py checkpoints/test75/gen_0/final.pth 512 64 30")
+        print("\nNote: num_policies > 1 will duplicate the checkpoint to test batched weights")
         sys.exit(1)
 
     checkpoint_path = sys.argv[1]
-    # IMPORTANT: batch_size must match weight batch dimension (1 for single model)
-    # C++ forward_packed_cpp is designed for batched MODELS and batched INPUTS.
-    batch_size = int(sys.argv[2]) if len(sys.argv) > 2 else 1
-    seq_len    = int(sys.argv[3]) if len(sys.argv) > 3 else 256
+    batch_size = int(sys.argv[2]) if len(sys.argv) > 2 else 512
+    seq_len    = int(sys.argv[3]) if len(sys.argv) > 3 else 64
+    num_policies = int(sys.argv[4]) if len(sys.argv) > 4 else 1
 
     if not Path(checkpoint_path).exists():
         print(f"Error: Checkpoint not found: {checkpoint_path}")
@@ -598,9 +735,15 @@ if __name__ == "__main__":
     print(f"Checkpoint: {checkpoint_path}")
     print(f"Batch size: {batch_size}")
     print(f"Sequence length: {seq_len}")
+    print(f"Num policies: {num_policies}")
 
     try:
-        profile_forward_pass(checkpoint_path, batch_size, seq_len)
+        if num_policies == 1:
+            profile_forward_pass(checkpoint_path, batch_size, seq_len)
+        else:
+            # Test with multiple policies by duplicating the checkpoint
+            print(f"\nTesting with {num_policies} duplicate policies for memory profiling...")
+            profile_multi_policy(checkpoint_path, batch_size, seq_len, num_policies)
         print("\n✅ Profiling completed successfully!")
     except Exception as e:
         print(f"\n❌ Profiling failed: {e}")
