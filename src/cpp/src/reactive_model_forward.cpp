@@ -499,10 +499,14 @@ forward_packed_cpp(
                 printed_expert_w1_addr = true;
             }
 
-            auto expert_w1_ptrs = get_weight(batched_weights, layer_prefix + ".moe.experts.w1_ptrs");
-            auto expert_b1_ptrs = get_weight(batched_weights, layer_prefix + ".moe.experts.b1_ptrs");
-            auto expert_w2_ptrs = get_weight(batched_weights, layer_prefix + ".moe.experts.w2_ptrs");
-            auto expert_b2_ptrs = get_weight(batched_weights, layer_prefix + ".moe.experts.b2_ptrs");
+            // Determine tensor shape: [num_policies, num_experts, ...] or [num_experts, num_policies, ...]
+            const int64_t num_policies_in_cache = expert_w1.size(0);
+            const int64_t dim1 = expert_w1.size(1);
+
+            // Auto-detect layout based on which dimension matches num_experts
+            const bool policy_first = (dim1 == num_experts);
+            TORCH_CHECK(policy_first || num_policies_in_cache == num_experts,
+                "Cannot determine expert weight tensor layout");
 
             auto orig_dtype = x.scalar_type();
             auto x_fp16 = x.to(torch::kHalf).contiguous();
@@ -545,35 +549,6 @@ forward_packed_cpp(
 
             const auto* sorted_expert_ptr = sorted_expert_cpu.data_ptr<int64_t>();
             const auto* sorted_policy_ptr = sorted_policy_cpu.data_ptr<int64_t>();
-
-            auto w1_ptr_cpu = expert_w1_ptrs.to(torch::kCPU).contiguous();
-            auto b1_ptr_cpu = expert_b1_ptrs.to(torch::kCPU).contiguous();
-            auto w2_ptr_cpu = expert_w2_ptrs.to(torch::kCPU).contiguous();
-            auto b2_ptr_cpu = expert_b2_ptrs.to(torch::kCPU).contiguous();
-
-            // Verify pointer tensor dimensions
-            TORCH_CHECK(w1_ptr_cpu.dim() == 2, "w1_ptrs must be 2D");
-            const int64_t num_policies_in_cache = w1_ptr_cpu.size(0);
-            const int64_t num_experts_in_ptrs = w1_ptr_cpu.size(1);
-
-            // Debug: print pointer tensor shape on first call
-            static bool printed_once = false;
-            if (!printed_once) {
-                fprintf(stderr, "[DEBUG MoE] Pointer tensor shape: [%ld, %ld]\n",
-                        num_policies_in_cache, num_experts_in_ptrs);
-                fprintf(stderr, "[DEBUG MoE] Expected: num_experts=%ld\n", num_experts);
-                fprintf(stderr, "[DEBUG MoE] Stacked expert w1 shape: [%ld, %ld, %ld, %ld]\n",
-                        expert_w1.size(0), expert_w1.size(1), expert_w1.size(2), expert_w1.size(3));
-                printed_once = true;
-            }
-
-            TORCH_CHECK(num_experts_in_ptrs == num_experts,
-                "Pointer tensor expert dimension mismatch: expected ", num_experts, ", got ", num_experts_in_ptrs);
-
-            const auto* w1_ptr_data = w1_ptr_cpu.data_ptr<uint64_t>();
-            const auto* b1_ptr_data = b1_ptr_cpu.data_ptr<uint64_t>();
-            const auto* w2_ptr_data = w2_ptr_cpu.data_ptr<uint64_t>();
-            const auto* b2_ptr_data = b2_ptr_cpu.data_ptr<uint64_t>();
 
             std::vector<uintptr_t> input_ptrs;
             std::vector<uintptr_t> output_ptrs;
@@ -620,13 +595,18 @@ forward_packed_cpp(
                     "Expert index out of range: expert_id=", expert_id,
                     ", num_experts=", num_experts);
 
-                const int64_t ptr_idx = policy_id * num_experts + expert_id;
+                // Compute expert weight pointers on-the-fly from the actual tensors
+                auto w1_expert = policy_first ? expert_w1[policy_id][expert_id] : expert_w1[expert_id][policy_id];
+                auto b1_expert = policy_first ? expert_b1[policy_id][expert_id] : expert_b1[expert_id][policy_id];
+                auto w2_expert = policy_first ? expert_w2[policy_id][expert_id] : expert_w2[expert_id][policy_id];
+                auto b2_expert = policy_first ? expert_b2[policy_id][expert_id] : expert_b2[expert_id][policy_id];
+
                 input_ptrs.push_back(input_ptr);
                 output_ptrs.push_back(output_ptr);
-                w1_ptrs.push_back(static_cast<uintptr_t>(w1_ptr_data[ptr_idx]));
-                b1_ptrs.push_back(static_cast<uintptr_t>(b1_ptr_data[ptr_idx]));
-                w2_ptrs.push_back(static_cast<uintptr_t>(w2_ptr_data[ptr_idx]));
-                b2_ptrs.push_back(static_cast<uintptr_t>(b2_ptr_data[ptr_idx]));
+                w1_ptrs.push_back(reinterpret_cast<uintptr_t>(w1_expert.data_ptr<at::Half>()));
+                b1_ptrs.push_back(reinterpret_cast<uintptr_t>(b1_expert.data_ptr<at::Half>()));
+                w2_ptrs.push_back(reinterpret_cast<uintptr_t>(w2_expert.data_ptr<at::Half>()));
+                b2_ptrs.push_back(reinterpret_cast<uintptr_t>(b2_expert.data_ptr<at::Half>()));
                 group_m_sizes.push_back(count);
                 groups.push_back({cursor, count, expert_id, policy_id});
 
