@@ -53,6 +53,18 @@ if sys.platform == "win32":
 else:
     extra_compile_args, extra_link_args = linux_macos_flags(PROFILE)
 
+tensor_core_macro = "-DCUTLASS_ENABLE_TENSOR_OP_MMA=1"
+cuda_arch = os.environ.get("LB_CUDA_ARCH", "80")
+
+if "cxx" in extra_compile_args and tensor_core_macro not in extra_compile_args["cxx"]:
+    extra_compile_args["cxx"].append(tensor_core_macro)
+
+if "nvcc" in extra_compile_args:
+    if tensor_core_macro not in extra_compile_args["nvcc"]:
+        extra_compile_args["nvcc"].append(tensor_core_macro)
+    if not any(arg.startswith("-arch=") for arg in extra_compile_args["nvcc"]):
+        extra_compile_args["nvcc"].append(f"-arch=sm_{cuda_arch}")
+
 # Resolve CUDA paths explicitly (WSL-friendly)
 cuda_home = CUDA_HOME or os.environ.get("CUDA_HOME") or "/usr/local/cuda"
 cuda_ver_suffix = os.environ.get("CUDA_VER_SUFFIX", "")  # e.g., "-12.9" if you prefer versioned path
@@ -76,17 +88,34 @@ for root in cuda_root_candidates:
         if os.path.isdir(p) and p not in cuda_lib_dirs:
             cuda_lib_dirs.append(p)
 
+cutlass_include_dirs = []
+
+cutlass_root_candidates = [
+    os.environ.get("CUTLASS_PATH"),
+    os.path.join(PROJ_ROOT, "third_party", "cutlass"),
+]
+
+for root in cutlass_root_candidates:
+    if not root:
+        continue
+    for candidate in (root, os.path.join(root, "include")):
+        if os.path.isdir(candidate) and candidate not in cutlass_include_dirs:
+            cutlass_include_dirs.append(candidate)
+
 # Prepend CUDA include dirs for NVCC specifically as well
 if "nvcc" in extra_compile_args:
-    for p in cuda_include_dirs:
-        extra_compile_args["nvcc"].insert(0, f"-I{p}")
+    for p in cuda_include_dirs + cutlass_include_dirs:
+        include_flag = f"-I{p}"
+        if include_flag not in extra_compile_args["nvcc"]:
+            extra_compile_args["nvcc"].insert(0, include_flag)
 
 ext = CUDAExtension(
     name="src.misc.lb",
     sources=SOURCES,
-    include_dirs=[CPP_INCLUDE] + cuda_include_dirs,
+    include_dirs=[CPP_INCLUDE] + cuda_include_dirs + cutlass_include_dirs,
     library_dirs=cuda_lib_dirs,
     libraries=['cublasLt'],
+    define_macros=[("CUTLASS_ENABLE_TENSOR_OP_MMA", "1")],
     extra_compile_args=extra_compile_args,
     extra_link_args=extra_link_args,
 )
