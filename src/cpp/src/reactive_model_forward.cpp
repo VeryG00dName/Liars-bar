@@ -484,37 +484,155 @@ forward_packed_cpp(
         torch::Tensor moe_output;
 
         if (x.is_cuda()) {
-            // Get pre-stacked expert weights
-            auto expert_w1 = get_weight(batched_weights, layer_prefix + ".moe.experts.w1");
-            auto expert_b1 = get_weight(batched_weights, layer_prefix + ".moe.experts.b1");
-            auto expert_w2 = get_weight(batched_weights, layer_prefix + ".moe.experts.w2");
-            auto expert_b2 = get_weight(batched_weights, layer_prefix + ".moe.experts.b2");
+            // Get pre-stacked expert weights and pointer metadata
+            auto expert_w1 = get_weight(batched_weights, layer_prefix + ".moe.experts.w1").to(torch::kHalf).contiguous();
+            auto expert_b1 = get_weight(batched_weights, layer_prefix + ".moe.experts.b1").to(torch::kHalf).contiguous();
+            auto expert_w2 = get_weight(batched_weights, layer_prefix + ".moe.experts.w2").to(torch::kHalf).contiguous();
+            auto expert_b2 = get_weight(batched_weights, layer_prefix + ".moe.experts.b2").to(torch::kHalf).contiguous();
 
-            // Ensure FP16 for CUDA kernel
+            auto expert_w1_ptrs = get_weight(batched_weights, layer_prefix + ".moe.experts.w1_ptrs");
+            auto expert_b1_ptrs = get_weight(batched_weights, layer_prefix + ".moe.experts.b1_ptrs");
+            auto expert_w2_ptrs = get_weight(batched_weights, layer_prefix + ".moe.experts.w2_ptrs");
+            auto expert_b2_ptrs = get_weight(batched_weights, layer_prefix + ".moe.experts.b2_ptrs");
+
+            auto orig_dtype = x.scalar_type();
             auto x_fp16 = x.to(torch::kHalf).contiguous();
-            auto gate_logits_fp16 = gate_logits.to(torch::kHalf).contiguous();
+
+            const int64_t num_tokens = batch_size * seq_len;
+            auto x_flat = x_fp16.view({num_tokens, hidden_dim});
+
             auto topk_indices_long = topk_indices.to(torch::kLong).contiguous();
-            auto expert_w1_fp16 = expert_w1.to(torch::kHalf).contiguous();
-            auto expert_b1_fp16 = expert_b1.to(torch::kHalf).contiguous();
-            auto expert_w2_fp16 = expert_w2.to(torch::kHalf).contiguous();
-            auto expert_b2_fp16 = expert_b2.to(torch::kHalf).contiguous();
+            auto flat_expert_indices = topk_indices_long.reshape({-1});
+            auto flat_routing_weights = topk_weights.reshape({-1});
 
-            // Call custom CUDA kernel
-            moe_output = moe_forward_cuda(
-                x_fp16,
-                gate_logits_fp16,
-                topk_indices_long,
-                policy_indices_for_ops,
-                expert_w1_fp16,
-                expert_b1_fp16,
-                expert_w2_fp16,
-                expert_b2_fp16
+            auto token_indices = torch::arange(
+                num_tokens,
+                torch::dtype(torch::kLong).device(x.device())
             );
+            auto expanded_token_indices = token_indices.unsqueeze(-1)
+                                                  .expand({num_tokens, top_k})
+                                                  .reshape({-1});
 
-            // Convert back to original dtype if needed
-            if (moe_output.scalar_type() != x.scalar_type()) {
-                moe_output = moe_output.to(x.scalar_type());
+            auto sort_tuple = torch::sort(flat_expert_indices);
+            auto sorted_expert_indices = std::get<0>(sort_tuple);
+            auto sort_order = std::get<1>(sort_tuple);
+
+            auto sorted_token_indices = expanded_token_indices.index_select(0, sort_order);
+            auto sorted_routing_weights = flat_routing_weights.index_select(0, sort_order);
+
+            auto policy_indices_long = policy_indices_for_ops.to(torch::kLong);
+            auto policy_tokens = policy_indices_long.unsqueeze(1)
+                                                     .expand({batch_size, seq_len})
+                                                     .reshape({-1});
+            auto flat_policy_indices = policy_tokens.index_select(0, expanded_token_indices);
+            auto sorted_policy_indices = flat_policy_indices.index_select(0, sort_order);
+
+            auto expert_inputs = x_flat.index_select(0, sorted_token_indices).contiguous();
+            auto expert_outputs = torch::zeros_like(expert_inputs);
+
+            // Build grouped dispatch metadata on CPU to drive the grouped GEMM helper
+            auto sorted_expert_cpu = sorted_expert_indices.to(torch::kCPU);
+            auto sorted_policy_cpu = sorted_policy_indices.to(torch::kCPU);
+
+            const auto* sorted_expert_ptr = sorted_expert_cpu.data_ptr<int64_t>();
+            const auto* sorted_policy_ptr = sorted_policy_cpu.data_ptr<int64_t>();
+
+            auto w1_ptr_cpu = expert_w1_ptrs.to(torch::kCPU).contiguous();
+            auto b1_ptr_cpu = expert_b1_ptrs.to(torch::kCPU).contiguous();
+            auto w2_ptr_cpu = expert_w2_ptrs.to(torch::kCPU).contiguous();
+            auto b2_ptr_cpu = expert_b2_ptrs.to(torch::kCPU).contiguous();
+
+            const auto* w1_ptr_data = w1_ptr_cpu.data_ptr<uint64_t>();
+            const auto* b1_ptr_data = b1_ptr_cpu.data_ptr<uint64_t>();
+            const auto* w2_ptr_data = w2_ptr_cpu.data_ptr<uint64_t>();
+            const auto* b2_ptr_data = b2_ptr_cpu.data_ptr<uint64_t>();
+
+            std::vector<uintptr_t> input_ptrs;
+            std::vector<uintptr_t> output_ptrs;
+            std::vector<uintptr_t> w1_ptrs;
+            std::vector<uintptr_t> b1_ptrs;
+            std::vector<uintptr_t> w2_ptrs;
+            std::vector<uintptr_t> b2_ptrs;
+            std::vector<int64_t> group_m_sizes;
+
+            struct GroupRange {
+                int64_t start;
+                int64_t count;
+                int64_t expert;
+                int64_t policy;
+            };
+            std::vector<GroupRange> groups;
+
+            const int64_t total_routes = sorted_expert_indices.size(0);
+            const uintptr_t input_base = reinterpret_cast<uintptr_t>(expert_inputs.data_ptr<at::Half>());
+            const uintptr_t output_base = reinterpret_cast<uintptr_t>(expert_outputs.data_ptr<at::Half>());
+            const int64_t element_size = static_cast<int64_t>(expert_inputs.element_size());
+
+            int64_t cursor = 0;
+            while (cursor < total_routes) {
+                const int64_t expert_id = sorted_expert_ptr[cursor];
+                const int64_t policy_id = sorted_policy_ptr[cursor];
+
+                int64_t end = cursor + 1;
+                while (end < total_routes &&
+                       sorted_expert_ptr[end] == expert_id &&
+                       sorted_policy_ptr[end] == policy_id) {
+                    ++end;
+                }
+
+                const int64_t count = end - cursor;
+                const uintptr_t input_ptr = input_base + static_cast<uintptr_t>(cursor * hidden_dim * element_size);
+                const uintptr_t output_ptr = output_base + static_cast<uintptr_t>(cursor * hidden_dim * element_size);
+
+                input_ptrs.push_back(input_ptr);
+                output_ptrs.push_back(output_ptr);
+                w1_ptrs.push_back(static_cast<uintptr_t>(w1_ptr_data[policy_id * num_experts + expert_id]));
+                b1_ptrs.push_back(static_cast<uintptr_t>(b1_ptr_data[policy_id * num_experts + expert_id]));
+                w2_ptrs.push_back(static_cast<uintptr_t>(w2_ptr_data[policy_id * num_experts + expert_id]));
+                b2_ptrs.push_back(static_cast<uintptr_t>(b2_ptr_data[policy_id * num_experts + expert_id]));
+                group_m_sizes.push_back(count);
+                groups.push_back({cursor, count, expert_id, policy_id});
+
+                cursor = end;
             }
+
+            const int64_t ffn_dim = expert_w1.size(-2);
+
+            if (!groups.empty()) {
+                grouped_ffn_gemm_forward(
+                    input_ptrs,
+                    w1_ptrs,
+                    b1_ptrs,
+                    w2_ptrs,
+                    b2_ptrs,
+                    output_ptrs,
+                    group_m_sizes,
+                    hidden_dim,
+                    ffn_dim
+                );
+            }
+
+            // Temporary fallback implementation using standard ATen operators
+            for (const auto& group : groups) {
+                auto input_chunk = expert_inputs.narrow(0, group.start, group.count);
+                auto w1_tensor = expert_w1.index({group.policy, group.expert});
+                auto b1_tensor = expert_b1.index({group.policy, group.expert});
+                auto w2_tensor = expert_w2.index({group.policy, group.expert});
+                auto b2_tensor = expert_b2.index({group.policy, group.expert});
+
+                auto hidden = torch::gelu(at::linear(input_chunk, w1_tensor, b1_tensor));
+                auto out_chunk = at::linear(hidden, w2_tensor, b2_tensor);
+                expert_outputs.narrow(0, group.start, group.count).copy_(out_chunk);
+            }
+
+            auto sorted_weights_half = sorted_routing_weights.to(expert_outputs.dtype()).unsqueeze(-1);
+            auto weighted_outputs = expert_outputs * sorted_weights_half;
+
+            auto moe_output_flat = torch::zeros({num_tokens, hidden_dim}, expert_outputs.options());
+            moe_output_flat.index_add_(0, sorted_token_indices, weighted_outputs);
+            auto moe_output_half = moe_output_flat.view({batch_size, seq_len, hidden_dim});
+
+            moe_output = moe_output_half.to(orig_dtype);
         } else {
             // CPU fallback: Unrolled MoE computation
             auto y = torch::zeros_like(x);

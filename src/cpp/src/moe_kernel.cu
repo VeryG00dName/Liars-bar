@@ -5,6 +5,7 @@
 #include <cuda_fp16.h>
 
 #include <cmath>
+#include <vector>
 
 // No anonymous namespace needed, these are local to the file
 
@@ -45,4 +46,17 @@ torch::Tensor moe_forward_cuda(
     torch::Tensor,
     torch::Tensor) {
     TORCH_CHECK(false, "moe_forward_cuda is not implemented");
+}
+
+void grouped_ffn_gemm_forward(
+    const std::vector<uintptr_t>&,
+    const std::vector<uintptr_t>&,
+    const std::vector<uintptr_t>&,
+    const std::vector<uintptr_t>&,
+    const std::vector<uintptr_t>&,
+    const std::vector<uintptr_t>&,
+    const std::vector<int64_t>&,
+    int64_t,
+    int64_t) {
+    // No-op stub: the fused grouped FFN kernel will populate this in a future change.
 }

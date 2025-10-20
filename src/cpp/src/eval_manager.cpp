@@ -4,6 +4,7 @@
 #include <array>
 #include <cctype>
 #include <cstring>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -11,6 +12,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <unordered_set>
+#include <ATen/ATen.h>
 #include <ATen/DeviceAccelerator.h>
 #include <torch/torch.h>
 
@@ -305,6 +307,52 @@ void EvalManager::finalize_model_loading() {
                                .to(torch::kFloat16)
                                .contiguous();
         batched_weight_cache_.insert(key, stacked_gpu);
+
+        if (stacked_gpu.device().is_cuda()) {
+            auto append_ptrs = [&](const std::string& suffix) {
+                if (key.size() < suffix.size() || key.rfind(suffix) != key.size() - suffix.size()) {
+                    return;
+                }
+
+                TORCH_CHECK(
+                    stacked_gpu.dim() >= 2,
+                    "Expected stacked MoE tensor to have at least 2 dimensions"
+                );
+                TORCH_CHECK(
+                    stacked_gpu.dtype() == torch::kFloat16,
+                    "MoE tensors must be FP16 before pointer caching: " + key
+                );
+
+                const int64_t num_policies = stacked_gpu.size(0);
+                const int64_t num_experts = stacked_gpu.size(1);
+                auto ptr_tensor = torch::empty(
+                    {num_policies, num_experts},
+                    torch::dtype(torch::kUInt64).device(torch::kCPU)
+                );
+
+                const uintptr_t base_address = reinterpret_cast<uintptr_t>(stacked_gpu.data_ptr<at::Half>());
+                const int64_t stride_policy = stacked_gpu.stride(0);
+                const int64_t stride_expert = stacked_gpu.stride(1);
+                const int64_t element_size = static_cast<int64_t>(stacked_gpu.element_size());
+
+                auto ptr_data = ptr_tensor.data_ptr<uint64_t>();
+                for (int64_t p = 0; p < num_policies; ++p) {
+                    for (int64_t e = 0; e < num_experts; ++e) {
+                        const int64_t offset = p * stride_policy + e * stride_expert;
+                        ptr_data[p * num_experts + e] = static_cast<uint64_t>(
+                            base_address + static_cast<uintptr_t>(offset * element_size)
+                        );
+                    }
+                }
+
+                batched_weight_cache_.insert_or_assign(key + "_ptrs", ptr_tensor);
+            };
+
+            append_ptrs(".moe.experts.w1");
+            append_ptrs(".moe.experts.b1");
+            append_ptrs(".moe.experts.w2");
+            append_ptrs(".moe.experts.b2");
+        }
 
         // Proactively free CPU per-policy tensors for this key to reduce RAM
         for (int policy_id : policy_ids) {
