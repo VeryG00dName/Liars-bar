@@ -306,6 +306,7 @@ void EvalManager::finalize_model_loading() {
                                .to(kInferenceDevice, /*non_blocking=*/false, /*copy=*/true)
                                .to(torch::kFloat16)
                                .contiguous();
+
         batched_weight_cache_.insert(key, stacked_gpu);
 
         if (stacked_gpu.device().is_cuda()) {
@@ -367,13 +368,34 @@ void EvalManager::finalize_model_loading() {
                 }
 
                 auto ptr_data = ptr_tensor_cpu.data_ptr<uint64_t>();
+
+                // Use PyTorch indexing (same as weight_utils.cpp) to get data pointers
+                // The stacked tensor is contiguous, so slices [p][e] should point into it correctly
                 for (int64_t p = 0; p < num_policies; ++p) {
                     for (int64_t e = 0; e < num_experts; ++e) {
-                        const int64_t offset = p * stride_policy + e * stride_expert;
-                        ptr_data[p * num_experts + e] = static_cast<uint64_t>(
-                            base_address + static_cast<uintptr_t>(offset * element_size)
+                        // Get the expert tensor slice
+                        auto expert_tensor = stacked_gpu[p][e];
+
+                        ptr_data[p * num_experts + e] = reinterpret_cast<uint64_t>(
+                            expert_tensor.data_ptr<at::Half>()
                         );
                     }
+                }
+
+                // Validation: sample first weight value from pointer vs direct indexing
+                static bool validated_once = false;
+                if (!validated_once && key.find(".w1") != std::string::npos && num_policies > 0 && num_experts > 0) {
+                    // Get pointer for policy 0, expert 0
+                    uint64_t ptr_p0e0 = ptr_data[0 * num_experts + 0];
+                    auto direct_tensor = stacked_gpu[0][0];
+
+                    // Sample first value via direct access
+                    at::Half val_direct = direct_tensor.flatten()[0].item<at::Half>();
+
+                    fprintf(stderr, "[DEBUG] Pointer validation for %s [0][0]: ptr=0x%lx, val_direct=%f\n",
+                            key.c_str(), ptr_p0e0, static_cast<float>(val_direct));
+
+                    validated_once = true;
                 }
 
                 // Move pointer tensor to same device as weights (CUDA)

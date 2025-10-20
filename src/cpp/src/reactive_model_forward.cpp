@@ -485,10 +485,19 @@ forward_packed_cpp(
 
         if (x.is_cuda()) {
             // Get pre-stacked expert weights and pointer metadata
-            auto expert_w1 = get_weight(batched_weights, layer_prefix + ".moe.experts.w1").to(torch::kHalf).contiguous();
-            auto expert_b1 = get_weight(batched_weights, layer_prefix + ".moe.experts.b1").to(torch::kHalf).contiguous();
-            auto expert_w2 = get_weight(batched_weights, layer_prefix + ".moe.experts.w2").to(torch::kHalf).contiguous();
-            auto expert_b2 = get_weight(batched_weights, layer_prefix + ".moe.experts.b2").to(torch::kHalf).contiguous();
+            // NOTE: Weights are already FP16 and contiguous from eval_manager, don't call .to().contiguous()
+            // because that creates a new tensor and invalidates the pointer tensors!
+            auto expert_w1 = get_weight(batched_weights, layer_prefix + ".moe.experts.w1");
+            auto expert_b1 = get_weight(batched_weights, layer_prefix + ".moe.experts.b1");
+            auto expert_w2 = get_weight(batched_weights, layer_prefix + ".moe.experts.w2");
+            auto expert_b2 = get_weight(batched_weights, layer_prefix + ".moe.experts.b2");
+
+            static bool printed_expert_w1_addr = false;
+            if (!printed_expert_w1_addr && layer_idx == 0) {
+                uintptr_t expert_w1_addr = reinterpret_cast<uintptr_t>(expert_w1.data_ptr<at::Half>());
+                fprintf(stderr, "[DEBUG forward_packed_cpp] Layer 0 expert_w1[0][0] address: 0x%lx\n", expert_w1_addr);
+                printed_expert_w1_addr = true;
+            }
 
             auto expert_w1_ptrs = get_weight(batched_weights, layer_prefix + ".moe.experts.w1_ptrs");
             auto expert_b1_ptrs = get_weight(batched_weights, layer_prefix + ".moe.experts.b1_ptrs");

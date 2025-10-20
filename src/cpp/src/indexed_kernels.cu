@@ -328,6 +328,20 @@ void grouped_ffn_gemm_forward(
         auto* b2_ptr = reinterpret_cast<const at::Half*>(b2_ptrs[group_idx]);
         auto* output_ptr = reinterpret_cast<at::Half*>(output_ptrs[group_idx]);
 
+        // Validation: sample first weight value to verify pointer is valid
+        static bool validated_weights = false;
+        if (!validated_weights && group_idx == 0) {
+            auto w1_sample = torch::from_blob(
+                const_cast<at::Half*>(w1_ptr),
+                {ffn_dim, hidden_dim},
+                torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA)
+            );
+            at::Half val = w1_sample[0][0].item<at::Half>();
+            fprintf(stderr, "[DEBUG GEMM] Group 0 w1[0][0] = %f (ptr=0x%lx)\n",
+                    static_cast<float>(val), reinterpret_cast<uintptr_t>(w1_ptr));
+            validated_weights = true;
+        }
+
         // ====================================================================
         // First GEMM: hidden = input @ w1.T
         // input: [M, hidden_dim]
