@@ -407,7 +407,7 @@ def _create_new_agent(agent_type: str, device: torch.device) -> LearnerAutoregre
     agent = LearnerAutoregressiveAgent(device, f"learner_{agent_type}")
     if agent_type == 'main':
         model = PPOReactiveModel(
-            obs_dim=9,
+            obs_dim=16,
             use_gradient_checkpointing=bool(getattr(config, "USE_GRADIENT_CHECKPOINTING", False)),
         )
     else:  # Future branches (e.g., exploiter) can be added here.

@@ -9,7 +9,10 @@
 #include <vector>
 
 static constexpr int DEFAULT_MAX_LEN = 480;
-static constexpr int OBS_DIM = 2 + (Env::MAX_PLAYERS - 1) + Env::MAX_PLAYERS; // newerest dim
+// Base newerest dim = 2 (hand counts) + (MAX_PLAYERS-1) opponent hand sizes + MAX_PLAYERS penalties
+static constexpr int BASE_OBS_DIM = 2 + (Env::MAX_PLAYERS - 1) + Env::MAX_PLAYERS;
+// Pad to a multiple of 8 to ensure Tensor Core friendly FP16 GEMMs
+static constexpr int OBS_DIM = ((BASE_OBS_DIM + 7) / 8) * 8;
 
 struct PolicyRequest {
         int env = -1;    // env index [0..B)
@@ -61,8 +64,8 @@ struct VecArena {
         void submit_actions(int policy_id, const std::vector<uint8_t>& actions);
         void submit_actions(int policy_id, const uint8_t* actions, size_t count);
 
-	// Observation dimensionality for newerest
-	int obs_dim() const { return 2 + (n_players - 1) + n_players; }
+	// Observation dimensionality for newerest (padded)
+	int obs_dim() const { return OBS_DIM; }
 
 private:
 	// Helpers

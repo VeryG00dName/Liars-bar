@@ -21,7 +21,7 @@ from src.model.ppo_reactive_model import PPOReactiveModel
 # -----------------------------
 # Utilities
 # -----------------------------
-def create_dummy_inputs(batch_size=128, seq_len=256, obs_dim=9, device="cuda"):
+def create_dummy_inputs(batch_size=128, seq_len=256, obs_dim=16, device="cuda"):
     """Create dummy inputs matching real inference patterns."""
     print(f"\nCreating dummy inputs: batch={batch_size}, seq_len={seq_len}, obs_dim={obs_dim}")
 

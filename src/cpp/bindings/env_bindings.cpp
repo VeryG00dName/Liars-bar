@@ -39,7 +39,10 @@ std::vector<float> env_observe_newerest_py(const Env& e, int agent_index) {
     if (agent_index < 0 || agent_index >= e.num_players()) {
         throw std::runtime_error("observe_newerest: agent_index out of range");
     }
-    float buf[2 * Env::MAX_PLAYERS + 1];
+    // Compute padded observation dimension based on MAX_PLAYERS
+    constexpr int BASE = 2 + (Env::MAX_PLAYERS - 1) + Env::MAX_PLAYERS;
+    constexpr int PADDED = ((BASE + 7) / 8) * 8;
+    float buf[PADDED];
     int n = e.observe_vector_newerest(agent_index, buf);
     if (n < 0) {
         n = 0;

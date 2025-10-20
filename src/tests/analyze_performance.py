@@ -47,7 +47,7 @@ warnings.filterwarnings(
 # Quiet excessively noisy symbolic shape warnings emitted during compilation.
 logging.getLogger("torch.fx.experimental.symbolic_shapes").setLevel(logging.ERROR)
 # Default architecture hyper-parameters for the PPO reactive model family.
-DEFAULT_OBS_DIM = 9
+DEFAULT_OBS_DIM = 16
 DEFAULT_ACTION_DIM = 7
 DEFAULT_NUM_AGENT_TYPES = 4
 DEFAULT_NUM_EXPERTS = 8

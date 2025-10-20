@@ -7,6 +7,7 @@
 #include <c10/core/ScalarType.h>
 
 #include <iostream>
+#include <cstdint>
 #include <stdexcept>
 #include <sstream>
 #include <chrono>
@@ -346,7 +347,7 @@ forward_packed_cpp(
 
     // Final layer norm (uses torch::layer_norm, not batched version)
     auto encoded_inputs = torch::layer_norm(fused, {hidden_dim});
-    if (obs_sequence.is_cuda()) { torch::cuda::synchronize(); }
+    
     auto enc_t1 = Clock::now();
     timers["fwd_input_encoding_us"] += std::chrono::duration_cast<Microseconds>(enc_t1 - enc_t0);
 
@@ -405,7 +406,7 @@ forward_packed_cpp(
         auto q = indexed_batched_linear(x, q_weight, q_bias, policy_indices_for_ops, timers);
         auto k = indexed_batched_linear(x, k_weight, k_bias, policy_indices_for_ops, timers);
         auto v = indexed_batched_linear(x, v_weight, v_bias, policy_indices_for_ops, timers);
-        if (x.is_cuda()) { torch::cuda::synchronize(); }
+        
         auto t_attn_proj_1 = Clock::now();
         timers["fwd_attn_proj_us"] += std::chrono::duration_cast<Microseconds>(t_attn_proj_1 - t_attn_proj_0);
 
@@ -423,7 +424,7 @@ forward_packed_cpp(
             /*dropout_p=*/0.0,
             /*is_causal=*/true  // Enables causal masking
         );
-        if (x.is_cuda()) { torch::cuda::synchronize(); }
+        
         auto t_sdpa_1 = Clock::now();
         timers["fwd_attn_sdpa_us"] += std::chrono::duration_cast<Microseconds>(t_sdpa_1 - t_sdpa_0);
 
@@ -448,7 +449,7 @@ forward_packed_cpp(
             get_weight(batched_weights, layer_prefix + ".norm1.bias"),
             policy_indices_for_ops
         );
-        if (x.is_cuda()) { torch::cuda::synchronize(); }
+        
         auto t_attn_out_1 = Clock::now();
         timers["fwd_attn_output_us"] += std::chrono::duration_cast<Microseconds>(t_attn_out_1 - t_attn_out_0);
 
@@ -484,29 +485,25 @@ forward_packed_cpp(
         torch::Tensor moe_output;
 
         if (x.is_cuda()) {
-            // Get pre-stacked expert weights and pointer metadata
-            // NOTE: Weights are already FP16 and contiguous from eval_manager, don't call .to().contiguous()
-            // because that creates a new tensor and invalidates the pointer tensors!
-            auto expert_w1 = get_weight(batched_weights, layer_prefix + ".moe.experts.w1");
-            auto expert_b1 = get_weight(batched_weights, layer_prefix + ".moe.experts.b1");
-            auto expert_w2 = get_weight(batched_weights, layer_prefix + ".moe.experts.w2");
-            auto expert_b2 = get_weight(batched_weights, layer_prefix + ".moe.experts.b2");
+            // Use pre-cached pointer tensors for MoE expert weights
+            auto w1_ptrs_gpu = get_weight(batched_weights, layer_prefix + ".moe.experts.w1_ptrs");
+            auto b1_ptrs_gpu = get_weight(batched_weights, layer_prefix + ".moe.experts.b1_ptrs");
+            auto w2_ptrs_gpu = get_weight(batched_weights, layer_prefix + ".moe.experts.w2_ptrs");
+            auto b2_ptrs_gpu = get_weight(batched_weights, layer_prefix + ".moe.experts.b2_ptrs");
 
-            static bool printed_expert_w1_addr = false;
-            if (!printed_expert_w1_addr && layer_idx == 0) {
-                uintptr_t expert_w1_addr = reinterpret_cast<uintptr_t>(expert_w1.data_ptr<at::Half>());
-                fprintf(stderr, "[DEBUG forward_packed_cpp] Layer 0 expert_w1[0][0] address: 0x%lx\n", expert_w1_addr);
-                printed_expert_w1_addr = true;
-            }
+            // Pointer tensors are tiny; move to CPU for quick indexed lookup
+            auto w1_ptrs_cpu = w1_ptrs_gpu.cpu().contiguous();
+            auto b1_ptrs_cpu = b1_ptrs_gpu.cpu().contiguous();
+            auto w2_ptrs_cpu = w2_ptrs_gpu.cpu().contiguous();
+            auto b2_ptrs_cpu = b2_ptrs_gpu.cpu().contiguous();
 
-            // Determine tensor shape: [num_policies, num_experts, ...] or [num_experts, num_policies, ...]
-            const int64_t num_policies_in_cache = expert_w1.size(0);
-            const int64_t dim1 = expert_w1.size(1);
+            const uint64_t* w1_ptr_data = w1_ptrs_cpu.data_ptr<uint64_t>();
+            const uint64_t* b1_ptr_data = b1_ptrs_cpu.data_ptr<uint64_t>();
+            const uint64_t* w2_ptr_data = w2_ptrs_cpu.data_ptr<uint64_t>();
+            const uint64_t* b2_ptr_data = b2_ptrs_cpu.data_ptr<uint64_t>();
+            const int64_t num_policies_in_cache = w1_ptrs_cpu.size(0);
+            const int64_t num_experts_in_cache = w1_ptrs_cpu.size(1);
 
-            // Auto-detect layout based on which dimension matches num_experts
-            const bool policy_first = (dim1 == num_experts);
-            TORCH_CHECK(policy_first || num_policies_in_cache == num_experts,
-                "Cannot determine expert weight tensor layout");
 
             auto orig_dtype = x.scalar_type();
             auto x_fp16 = x.to(torch::kHalf).contiguous();
@@ -595,25 +592,22 @@ forward_packed_cpp(
                     "Expert index out of range: expert_id=", expert_id,
                     ", num_experts=", num_experts);
 
-                // Compute expert weight pointers on-the-fly from the actual tensors
-                auto w1_expert = policy_first ? expert_w1[policy_id][expert_id] : expert_w1[expert_id][policy_id];
-                auto b1_expert = policy_first ? expert_b1[policy_id][expert_id] : expert_b1[expert_id][policy_id];
-                auto w2_expert = policy_first ? expert_w2[policy_id][expert_id] : expert_w2[expert_id][policy_id];
-                auto b2_expert = policy_first ? expert_b2[policy_id][expert_id] : expert_b2[expert_id][policy_id];
-
                 input_ptrs.push_back(input_ptr);
                 output_ptrs.push_back(output_ptr);
-                w1_ptrs.push_back(reinterpret_cast<uintptr_t>(w1_expert.data_ptr<at::Half>()));
-                b1_ptrs.push_back(reinterpret_cast<uintptr_t>(b1_expert.data_ptr<at::Half>()));
-                w2_ptrs.push_back(reinterpret_cast<uintptr_t>(w2_expert.data_ptr<at::Half>()));
-                b2_ptrs.push_back(reinterpret_cast<uintptr_t>(b2_expert.data_ptr<at::Half>()));
+
+                // Look up pre-cached, stable GPU pointers
+                w1_ptrs.push_back(w1_ptr_data[policy_id * num_experts_in_cache + expert_id]);
+                b1_ptrs.push_back(b1_ptr_data[policy_id * num_experts_in_cache + expert_id]);
+                w2_ptrs.push_back(w2_ptr_data[policy_id * num_experts_in_cache + expert_id]);
+                b2_ptrs.push_back(b2_ptr_data[policy_id * num_experts_in_cache + expert_id]);
+
                 group_m_sizes.push_back(count);
-                groups.push_back({cursor, count, expert_id, policy_id});
 
                 cursor = end;
             }
 
-            const int64_t ffn_dim = expert_w1.size(-2);
+            // Expert FFN dimension from one of the original tensors (shape only)
+            const int64_t ffn_dim = get_weight(batched_weights, layer_prefix + ".moe.experts.w1").size(-2);
 
             if (!groups.empty()) {
                 grouped_ffn_gemm_forward(
@@ -682,7 +676,7 @@ forward_packed_cpp(
 
             moe_output = y;
         }
-        if (x.is_cuda()) { torch::cuda::synchronize(); }
+        
         auto t_moe_1 = Clock::now();
         timers["fwd_moe_block_us"] += std::chrono::duration_cast<Microseconds>(t_moe_1 - t_moe_0);
 
@@ -695,7 +689,7 @@ forward_packed_cpp(
             get_weight(batched_weights, layer_prefix + ".norm2.bias"),
             policy_indices_for_ops
         );
-        if (x.is_cuda()) { torch::cuda::synchronize(); }
+        
         auto t_moe_res_1 = Clock::now();
         timers["fwd_moe_residual_us"] += std::chrono::duration_cast<Microseconds>(t_moe_res_1 - t_moe_res_0);
 
@@ -770,7 +764,7 @@ forward_packed_cpp(
     auto opp_logits = reduce_expert_heads(opp_stacked, final_topk_indices, final_topk_scores);
     auto state_values = reduce_expert_heads(reward_stacked, final_topk_indices, final_topk_scores);
     auto win_logits = reduce_expert_heads(win_stacked, final_topk_indices, final_topk_scores);
-    if (x.is_cuda()) { torch::cuda::synchronize(); }
+    
     auto t_heads_1 = Clock::now();
     timers["fwd_heads_us"] += std::chrono::duration_cast<Microseconds>(t_heads_1 - t_heads_0);
 

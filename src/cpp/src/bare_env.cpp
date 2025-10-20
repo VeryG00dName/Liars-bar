@@ -134,7 +134,9 @@ int Env::observe_vector(float out[3 + MAX_PLAYERS]) const {
 }
 
 int Env::observe_vector_newerest(int agent_index, float* out) const {
-    const int D = 2 + (n_players - 1) + n_players;
+    // Base dimension and padded dimension (to multiple of 8)
+    const int baseD = 2 + (n_players - 1) + n_players;
+    const int D = ((baseD + 7) / 8) * 8;
     if (out) {
         int idx = 0;
 
@@ -158,6 +160,11 @@ int Env::observe_vector_newerest(int agent_index, float* out) const {
             const int p = (agent_index + i) % n_players;
             out[idx++] = static_cast<float>(penalties[p]) / 6.0f;
         }
+
+        // Zero-pad remaining slots up to padded D
+        for (; idx < D; ++idx) {
+            out[idx] = 0.0f;
+        }
     }
     return D;
 }
@@ -179,7 +186,8 @@ bool Env::step(uint8_t a) {
     H.action = a;
     H.step = global_step;
     valid_actions(H.mask.data());
-    const int D = 2 + (n_players - 1) + n_players;
+    const int baseD = 2 + (n_players - 1) + n_players;
+    const int D = ((baseD + 7) / 8) * 8;
     H.observations.resize(n_players, std::vector<float>(D));
     for (int p = 0; p < n_players; ++p) {
         observe_vector_newerest(p, H.observations[p].data());

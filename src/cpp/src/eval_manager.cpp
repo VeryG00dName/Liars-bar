@@ -356,13 +356,17 @@ void EvalManager::finalize_model_loading() {
                             ptr_via_index, ptr_via_stride,
                             (ptr_via_index == ptr_via_stride) ? "YES" : "NO");
 
-                    // Test for policy 1, expert 0
-                    auto test_tensor_p1e0 = stacked_gpu[1][0];
-                    uintptr_t ptr_p1e0_index = reinterpret_cast<uintptr_t>(test_tensor_p1e0.data_ptr<at::Half>());
-                    uintptr_t ptr_p1e0_stride = base_address + (1 * stride_policy + 0 * stride_expert) * element_size;
-                    fprintf(stderr, "[DEBUG eval_manager] [1][0] ptr via index: 0x%lx, via stride: 0x%lx, match: %s\n",
-                            ptr_p1e0_index, ptr_p1e0_stride,
-                            (ptr_p1e0_index == ptr_p1e0_stride) ? "YES" : "NO");
+                    // Test for policy 1, expert 0 (only if at least 2 policies are present)
+                    if (num_policies >= 2) {
+                        auto test_tensor_p1e0 = stacked_gpu[1][0];
+                        uintptr_t ptr_p1e0_index = reinterpret_cast<uintptr_t>(test_tensor_p1e0.data_ptr<at::Half>());
+                        uintptr_t ptr_p1e0_stride = base_address + (1 * stride_policy + 0 * stride_expert) * element_size;
+                        fprintf(stderr, "[DEBUG eval_manager] [1][0] ptr via index: 0x%lx, via stride: 0x%lx, match: %s\n",
+                                ptr_p1e0_index, ptr_p1e0_stride,
+                                (ptr_p1e0_index == ptr_p1e0_stride) ? "YES" : "NO");
+                    } else {
+                        fprintf(stderr, "[DEBUG eval_manager] single-policy load detected; skipping [1][0] pointer check.\n");
+                    }
 
                     printed_strides = true;
                 }

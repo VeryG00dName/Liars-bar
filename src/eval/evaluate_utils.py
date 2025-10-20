@@ -361,6 +361,24 @@ def load_evaluation_policies(
                     raise TypeError(
                         f"Checkpoint did not contain a valid state_dict: {checkpoint_path}"
                     )
+                # Backward-compat: pad obs_encoder input weights from 9 -> 16 if needed
+                w_key = "obs_encoder.0.weight"
+                try:
+                    if w_key in state_dict:
+                        w = state_dict[w_key]
+                        if isinstance(w, torch.Tensor) and w.ndim == 2:
+                            in_dim = int(w.size(1))
+                            if in_dim == 9:
+                                out_dim = int(w.size(0))
+                                pad = 16 - in_dim
+                                if pad > 0:
+                                    # ensure CPU tensor
+                                    w_cpu = w.to("cpu")
+                                    zeros = torch.zeros((out_dim, pad), dtype=w_cpu.dtype, device=w_cpu.device)
+                                    state_dict[w_key] = torch.cat([w_cpu, zeros], dim=1)
+                                    print(f"[INFO] Padded {w_key} from [{out_dim},9] to [{out_dim},16] for {checkpoint_path}")
+                except Exception as pad_err:
+                    print(f"[WARN] Failed to pad obs_encoder weights for {checkpoint_path}: {pad_err}")
             except Exception as e:
                 print(f"[ERROR] Failed to load or parse checkpoint in Python: {e}")
                 continue
