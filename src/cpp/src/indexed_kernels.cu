@@ -10,6 +10,7 @@
 #include <memory>
 #include <vector>
 #include <chrono>
+#include <mutex>
 
 namespace {
 
@@ -248,6 +249,37 @@ torch::Tensor indexed_batched_embedding(
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
+}
+
+void grouped_ffn_gemm_forward(
+    const uintptr_t* input_ptrs,
+    const uintptr_t* w1_ptrs,
+    const uintptr_t* b1_ptrs,
+    const uintptr_t* w2_ptrs,
+    const uintptr_t* b2_ptrs,
+    const uintptr_t* output_ptrs,
+    const int64_t* m_sizes,
+    int64_t group_count,
+    int64_t hidden_dim,
+    int64_t ffn_dim) {
+    // The optimized CUTLASS implementation is still under construction. For now we simply
+    // issue a warning (once) and fall back to the slow, eager PyTorch path that follows this
+    // call in reactive_model_forward.cpp.
+    static std::once_flag warn_once;
+    std::call_once(warn_once, [] {
+        TORCH_WARN("grouped_ffn_gemm_forward is currently a no-op; falling back to the slow path");
+    });
+
+    (void)input_ptrs;
+    (void)w1_ptrs;
+    (void)b1_ptrs;
+    (void)w2_ptrs;
+    (void)b2_ptrs;
+    (void)output_ptrs;
+    (void)m_sizes;
+    (void)group_count;
+    (void)hidden_dim;
+    (void)ffn_dim;
 }
 
 torch::Tensor indexed_batched_layer_norm(

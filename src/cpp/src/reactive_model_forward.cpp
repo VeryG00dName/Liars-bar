@@ -600,13 +600,14 @@ forward_packed_cpp(
 
             if (!groups.empty()) {
                 grouped_ffn_gemm_forward(
-                    input_ptrs,
-                    w1_ptrs,
-                    b1_ptrs,
-                    w2_ptrs,
-                    b2_ptrs,
-                    output_ptrs,
-                    group_m_sizes,
+                    input_ptrs.data(),
+                    w1_ptrs.data(),
+                    b1_ptrs.data(),
+                    w2_ptrs.data(),
+                    b2_ptrs.data(),
+                    output_ptrs.data(),
+                    group_m_sizes.data(),
+                    static_cast<int64_t>(groups.size()),
                     hidden_dim,
                     ffn_dim
                 );

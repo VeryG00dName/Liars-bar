@@ -46,3 +46,17 @@ torch::Tensor indexed_batched_linear(
     std::unordered_map<std::string, std::chrono::microseconds>& timers,
     IndexedLinearEpilogue epilogue = IndexedLinearEpilogue::Bias);
 
+// Runs the grouped FFN GEMM forward pass using CUTLASS grouped kernels.
+// Each array argument is expected to contain device pointers for the operands.
+void grouped_ffn_gemm_forward(
+    const uintptr_t* input_ptrs,
+    const uintptr_t* w1_ptrs,
+    const uintptr_t* b1_ptrs,
+    const uintptr_t* w2_ptrs,
+    const uintptr_t* b2_ptrs,
+    const uintptr_t* output_ptrs,
+    const int64_t* m_sizes,
+    int64_t group_count,
+    int64_t hidden_dim,
+    int64_t ffn_dim);
+
