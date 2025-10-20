@@ -4,8 +4,10 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cublas_v2.h>
 #include <cublasLt.h>
 #include <c10/cuda/CUDAException.h>
+#include <cuda_fp16.h>
 #include <cmath>
 #include <memory>
 #include <vector>
@@ -13,6 +15,14 @@
 #include <mutex>
 
 namespace {
+
+// -----------------------------------------------------------------------------
+// GELU Activation
+// -----------------------------------------------------------------------------
+
+__device__ inline float gelu(float x) {
+    return 0.5f * x * (1.0f + tanhf(0.79788456f * (x + 0.044715f * x * x * x)));
+}
 
 // -----------------------------------------------------------------------------
 // Embedding Kernel
@@ -251,6 +261,20 @@ torch::Tensor indexed_batched_embedding(
     return output;
 }
 
+// GELU activation kernel for intermediate tensors
+template<typename scalar_t>
+__global__ void gelu_inplace_kernel(
+    scalar_t* data,
+    int64_t total_elements
+) {
+    const int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) return;
+
+    const float x = static_cast<float>(data[idx]);
+    const float gelu_val = gelu(x);
+    data[idx] = static_cast<scalar_t>(gelu_val);
+}
+
 void grouped_ffn_gemm_forward(
     const uintptr_t* input_ptrs,
     const uintptr_t* w1_ptrs,
@@ -262,24 +286,176 @@ void grouped_ffn_gemm_forward(
     int64_t group_count,
     int64_t hidden_dim,
     int64_t ffn_dim) {
-    // The optimized CUTLASS implementation is still under construction. For now we simply
-    // issue a warning (once) and fall back to the slow, eager PyTorch path that follows this
-    // call in reactive_model_forward.cpp.
-    static std::once_flag warn_once;
-    std::call_once(warn_once, [] {
-        TORCH_WARN("grouped_ffn_gemm_forward is currently a no-op; falling back to the slow path");
-    });
 
-    (void)input_ptrs;
-    (void)w1_ptrs;
-    (void)b1_ptrs;
-    (void)w2_ptrs;
-    (void)b2_ptrs;
-    (void)output_ptrs;
-    (void)m_sizes;
-    (void)group_count;
-    (void)hidden_dim;
-    (void)ffn_dim;
+    if (group_count == 0) return;
+
+    // Get cuBLAS handle and CUDA stream
+    auto handle = at::cuda::getCurrentCUDABlasHandle();
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    // We'll use FP16 for all operations (input is already FP16 from caller)
+    const cudaDataType_t data_type = CUDA_R_16F;
+    const cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F_FAST_16F;
+
+    // Scalars for GEMM (alpha=1.0, beta=0.0 for first GEMM, beta=1.0 for bias add)
+    const __half alpha_half = __float2half(1.0f);
+    const __half beta_zero = __float2half(0.0f);
+    const __half beta_one = __float2half(1.0f);
+
+    // Allocate workspace for intermediate hidden states
+    // We'll allocate a single large buffer and partition it across groups
+    int64_t max_m = 0;
+    for (int64_t i = 0; i < group_count; ++i) {
+        max_m = std::max(max_m, m_sizes[i]);
+    }
+
+    // Allocate intermediate buffer: [max_m * ffn_dim] elements
+    auto intermediate_buffer = torch::empty(
+        {max_m * ffn_dim},
+        torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA)
+    );
+    auto* intermediate_ptr = reinterpret_cast<at::Half*>(intermediate_buffer.data_ptr());
+
+    // Process each group
+    for (int64_t group_idx = 0; group_idx < group_count; ++group_idx) {
+        const int64_t M = m_sizes[group_idx];
+        if (M == 0) continue;
+
+        auto* input_ptr = reinterpret_cast<const at::Half*>(input_ptrs[group_idx]);
+        auto* w1_ptr = reinterpret_cast<const at::Half*>(w1_ptrs[group_idx]);
+        auto* b1_ptr = reinterpret_cast<const at::Half*>(b1_ptrs[group_idx]);
+        auto* w2_ptr = reinterpret_cast<const at::Half*>(w2_ptrs[group_idx]);
+        auto* b2_ptr = reinterpret_cast<const at::Half*>(b2_ptrs[group_idx]);
+        auto* output_ptr = reinterpret_cast<at::Half*>(output_ptrs[group_idx]);
+
+        // ====================================================================
+        // First GEMM: hidden = input @ w1.T
+        // input: [M, hidden_dim]
+        // w1: [ffn_dim, hidden_dim] (stored as row-major, treat as transposed)
+        // hidden: [M, ffn_dim]
+        // ====================================================================
+
+        // Using cublasSgemmEx-like operation via cublasGemmEx
+        // C = alpha * A @ B + beta * C
+        // We want: hidden = input @ w1.T
+        // A = input [M, K=hidden_dim], op(A) = N
+        // B = w1 [N=ffn_dim, K=hidden_dim], op(B) = T (transpose)
+        // C = hidden [M, N=ffn_dim]
+
+        auto status1 = cublasGemmEx(
+            handle,
+            CUBLAS_OP_T,           // op(B) = transpose w1
+            CUBLAS_OP_N,           // op(A) = no-transpose input
+            ffn_dim,               // M (rows of op(B)) = ffn_dim
+            M,                     // N (cols of op(A)) = M (batch tokens)
+            hidden_dim,            // K (common dimension) = hidden_dim
+            &alpha_half,           // alpha
+            w1_ptr,                // B: [ffn_dim, hidden_dim]
+            data_type,
+            hidden_dim,            // ldb (leading dim of B before transpose)
+            input_ptr,             // A: [M, hidden_dim]
+            data_type,
+            hidden_dim,            // lda
+            &beta_zero,            // beta = 0 (overwrite)
+            intermediate_ptr,      // C: [M, ffn_dim]
+            data_type,
+            ffn_dim,               // ldc
+            compute_type,
+            CUBLAS_GEMM_DEFAULT
+        );
+
+        TORCH_CHECK(status1 == CUBLAS_STATUS_SUCCESS,
+            "grouped_ffn_gemm_forward: First GEMM failed with cuBLAS status ",
+            cublas_status_to_string(status1));
+
+        // ====================================================================
+        // Add bias b1 to each row
+        // ====================================================================
+        // b1: [ffn_dim]
+        // We broadcast-add b1 to each of the M rows
+
+        // Simple approach: use a kernel to add bias
+        // Alternative: use cublas<t>axpy in a loop, but a custom kernel is cleaner
+
+        auto b1_tensor = torch::from_blob(
+            const_cast<at::Half*>(b1_ptr),
+            {ffn_dim},
+            torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA)
+        );
+        auto intermediate_tensor = torch::from_blob(
+            intermediate_ptr,
+            {M, ffn_dim},
+            torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA)
+        );
+
+        // Broadcast add: intermediate_tensor += b1_tensor
+        intermediate_tensor.add_(b1_tensor);
+
+        // ====================================================================
+        // Apply GELU activation in-place
+        // ====================================================================
+
+        const int64_t total_elements = M * ffn_dim;
+        const int threads = 256;
+        const int blocks = (total_elements + threads - 1) / threads;
+
+        gelu_inplace_kernel<at::Half><<<blocks, threads, 0, stream>>>(
+            intermediate_ptr,
+            total_elements
+        );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+        // ====================================================================
+        // Second GEMM: output = hidden @ w2.T
+        // hidden: [M, ffn_dim]
+        // w2: [hidden_dim, ffn_dim] (stored as row-major, treat as transposed)
+        // output: [M, hidden_dim]
+        // ====================================================================
+
+        auto status2 = cublasGemmEx(
+            handle,
+            CUBLAS_OP_T,           // op(B) = transpose w2
+            CUBLAS_OP_N,           // op(A) = no-transpose hidden
+            hidden_dim,            // M (rows of op(B)) = hidden_dim
+            M,                     // N (cols of op(A)) = M (batch tokens)
+            ffn_dim,               // K (common dimension) = ffn_dim
+            &alpha_half,           // alpha
+            w2_ptr,                // B: [hidden_dim, ffn_dim]
+            data_type,
+            ffn_dim,               // ldb (leading dim of B before transpose)
+            intermediate_ptr,      // A: [M, ffn_dim]
+            data_type,
+            ffn_dim,               // lda
+            &beta_zero,            // beta = 0 (overwrite)
+            output_ptr,            // C: [M, hidden_dim]
+            data_type,
+            hidden_dim,            // ldc
+            compute_type,
+            CUBLAS_GEMM_DEFAULT
+        );
+
+        TORCH_CHECK(status2 == CUBLAS_STATUS_SUCCESS,
+            "grouped_ffn_gemm_forward: Second GEMM failed with cuBLAS status ",
+            cublas_status_to_string(status2));
+
+        // ====================================================================
+        // Add bias b2 to each row
+        // ====================================================================
+
+        auto b2_tensor = torch::from_blob(
+            const_cast<at::Half*>(b2_ptr),
+            {hidden_dim},
+            torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA)
+        );
+        auto output_tensor = torch::from_blob(
+            output_ptr,
+            {M, hidden_dim},
+            torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA)
+        );
+
+        // Broadcast add: output_tensor += b2_tensor
+        output_tensor.add_(b2_tensor);
+    }
 }
 
 torch::Tensor indexed_batched_layer_norm(

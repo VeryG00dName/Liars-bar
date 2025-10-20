@@ -96,6 +96,110 @@ void prestack_moe_expert_weights(
     }
 }
 
+void create_moe_weight_pointers(
+    std::unordered_map<std::string, torch::Tensor>& state_dict,
+    int64_t num_layers,
+    int64_t num_experts
+) {
+    /**
+     * Create pointer tensors for MoE expert weights.
+     *
+     * These pointer tensors store the actual CUDA device pointer addresses
+     * of each expert's weights, enabling efficient grouped GEMM operations.
+     *
+     * For each layer, creates:
+     * - transformer.layers.X.moe.experts.w1_ptrs: [batch_size, num_experts]
+     * - transformer.layers.X.moe.experts.b1_ptrs: [batch_size, num_experts]
+     * - transformer.layers.X.moe.experts.w2_ptrs: [batch_size, num_experts]
+     * - transformer.layers.X.moe.experts.b2_ptrs: [batch_size, num_experts]
+     */
+
+    // Determine if weights are batched
+    bool is_batched = false;
+    int64_t batch_size = 1;
+
+    for (const auto& pair : state_dict) {
+        if (pair.first.find("obs_encoder.0.weight") != std::string::npos) {
+            if (pair.second.dim() == 3) {
+                is_batched = true;
+                batch_size = pair.second.size(0);
+                break;
+            }
+        }
+    }
+
+    for (int64_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
+        std::string layer_prefix = "transformer.layers." + std::to_string(layer_idx);
+
+        // Get the stacked expert weights
+        auto& w1_stacked = state_dict.at(layer_prefix + ".moe.experts.w1");
+        auto& b1_stacked = state_dict.at(layer_prefix + ".moe.experts.b1");
+        auto& w2_stacked = state_dict.at(layer_prefix + ".moe.experts.w2");
+        auto& b2_stacked = state_dict.at(layer_prefix + ".moe.experts.b2");
+
+        // Ensure weights are CUDA tensors
+        TORCH_CHECK(w1_stacked.is_cuda(), "Expert weights must be on CUDA device");
+
+        // Detect dimension ordering based on actual shape
+        // Two possible formats:
+        // 1. eval_manager format: [batch_size, num_experts, ...] (batch first)
+        // 2. profile format: [num_experts, batch_size, ...] (expert first)
+        bool expert_first = (w1_stacked.size(0) == num_experts);
+
+        // Create pointer tensors on CPU first, then copy to GPU
+        auto w1_ptrs = torch::zeros({batch_size, num_experts}, torch::dtype(torch::kUInt64).device(torch::kCPU));
+        auto b1_ptrs = torch::zeros({batch_size, num_experts}, torch::dtype(torch::kUInt64).device(torch::kCPU));
+        auto w2_ptrs = torch::zeros({batch_size, num_experts}, torch::dtype(torch::kUInt64).device(torch::kCPU));
+        auto b2_ptrs = torch::zeros({batch_size, num_experts}, torch::dtype(torch::kUInt64).device(torch::kCPU));
+
+        auto w1_ptrs_acc = w1_ptrs.accessor<uint64_t, 2>();
+        auto b1_ptrs_acc = b1_ptrs.accessor<uint64_t, 2>();
+        auto w2_ptrs_acc = w2_ptrs.accessor<uint64_t, 2>();
+        auto b2_ptrs_acc = b2_ptrs.accessor<uint64_t, 2>();
+
+        // Fill in the pointers based on detected format
+        if (expert_first) {
+            // Weights are shaped [num_experts, batch_size, ...]
+            for (int64_t e = 0; e < num_experts; ++e) {
+                for (int64_t b = 0; b < batch_size; ++b) {
+                    // Index as [expert][batch] but store as [batch][expert]
+                    auto w1_expert = w1_stacked[e][b];
+                    auto b1_expert = b1_stacked[e][b];
+                    auto w2_expert = w2_stacked[e][b];
+                    auto b2_expert = b2_stacked[e][b];
+
+                    w1_ptrs_acc[b][e] = reinterpret_cast<uint64_t>(w1_expert.data_ptr());
+                    b1_ptrs_acc[b][e] = reinterpret_cast<uint64_t>(b1_expert.data_ptr());
+                    w2_ptrs_acc[b][e] = reinterpret_cast<uint64_t>(w2_expert.data_ptr());
+                    b2_ptrs_acc[b][e] = reinterpret_cast<uint64_t>(b2_expert.data_ptr());
+                }
+            }
+        } else {
+            // Weights are shaped [batch_size, num_experts, ...]
+            for (int64_t b = 0; b < batch_size; ++b) {
+                for (int64_t e = 0; e < num_experts; ++e) {
+                    auto w1_expert = w1_stacked[b][e];
+                    auto b1_expert = b1_stacked[b][e];
+                    auto w2_expert = w2_stacked[b][e];
+                    auto b2_expert = b2_stacked[b][e];
+
+                    w1_ptrs_acc[b][e] = reinterpret_cast<uint64_t>(w1_expert.data_ptr());
+                    b1_ptrs_acc[b][e] = reinterpret_cast<uint64_t>(b1_expert.data_ptr());
+                    w2_ptrs_acc[b][e] = reinterpret_cast<uint64_t>(w2_expert.data_ptr());
+                    b2_ptrs_acc[b][e] = reinterpret_cast<uint64_t>(b2_expert.data_ptr());
+                }
+            }
+        }
+
+        // Move pointer tensors to GPU (keep as UInt64)
+        auto device = w1_stacked.device();
+        state_dict[layer_prefix + ".moe.experts.w1_ptrs"] = w1_ptrs.to(device);
+        state_dict[layer_prefix + ".moe.experts.b1_ptrs"] = b1_ptrs.to(device);
+        state_dict[layer_prefix + ".moe.experts.w2_ptrs"] = w2_ptrs.to(device);
+        state_dict[layer_prefix + ".moe.experts.b2_ptrs"] = b2_ptrs.to(device);
+    }
+}
+
 // Note: Previous C++ .pth loading helper removed; loading now handled in Python.
 
 c10::Dict<std::string, torch::Tensor> batch_state_dicts(

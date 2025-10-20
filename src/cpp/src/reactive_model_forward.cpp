@@ -542,6 +542,25 @@ forward_packed_cpp(
             auto w2_ptr_cpu = expert_w2_ptrs.to(torch::kCPU).contiguous();
             auto b2_ptr_cpu = expert_b2_ptrs.to(torch::kCPU).contiguous();
 
+            // Verify pointer tensor dimensions
+            TORCH_CHECK(w1_ptr_cpu.dim() == 2, "w1_ptrs must be 2D");
+            const int64_t num_policies_in_cache = w1_ptr_cpu.size(0);
+            const int64_t num_experts_in_ptrs = w1_ptr_cpu.size(1);
+
+            // Debug: print pointer tensor shape on first call
+            static bool printed_once = false;
+            if (!printed_once) {
+                fprintf(stderr, "[DEBUG MoE] Pointer tensor shape: [%ld, %ld]\n",
+                        num_policies_in_cache, num_experts_in_ptrs);
+                fprintf(stderr, "[DEBUG MoE] Expected: num_experts=%ld\n", num_experts);
+                fprintf(stderr, "[DEBUG MoE] Stacked expert w1 shape: [%ld, %ld, %ld, %ld]\n",
+                        expert_w1.size(0), expert_w1.size(1), expert_w1.size(2), expert_w1.size(3));
+                printed_once = true;
+            }
+
+            TORCH_CHECK(num_experts_in_ptrs == num_experts,
+                "Pointer tensor expert dimension mismatch: expected ", num_experts, ", got ", num_experts_in_ptrs);
+
             const auto* w1_ptr_data = w1_ptr_cpu.data_ptr<uint64_t>();
             const auto* b1_ptr_data = b1_ptr_cpu.data_ptr<uint64_t>();
             const auto* w2_ptr_data = w2_ptr_cpu.data_ptr<uint64_t>();
@@ -584,12 +603,21 @@ forward_packed_cpp(
                 const uintptr_t input_ptr = input_base + static_cast<uintptr_t>(cursor * hidden_dim * element_size);
                 const uintptr_t output_ptr = output_base + static_cast<uintptr_t>(cursor * hidden_dim * element_size);
 
+                // Bounds check: policy_id must be in [0, num_policies_in_cache)
+                TORCH_CHECK(policy_id >= 0 && policy_id < num_policies_in_cache,
+                    "Policy index out of range: policy_id=", policy_id,
+                    ", num_policies_in_cache=", num_policies_in_cache);
+                TORCH_CHECK(expert_id >= 0 && expert_id < num_experts,
+                    "Expert index out of range: expert_id=", expert_id,
+                    ", num_experts=", num_experts);
+
+                const int64_t ptr_idx = policy_id * num_experts + expert_id;
                 input_ptrs.push_back(input_ptr);
                 output_ptrs.push_back(output_ptr);
-                w1_ptrs.push_back(static_cast<uintptr_t>(w1_ptr_data[policy_id * num_experts + expert_id]));
-                b1_ptrs.push_back(static_cast<uintptr_t>(b1_ptr_data[policy_id * num_experts + expert_id]));
-                w2_ptrs.push_back(static_cast<uintptr_t>(w2_ptr_data[policy_id * num_experts + expert_id]));
-                b2_ptrs.push_back(static_cast<uintptr_t>(b2_ptr_data[policy_id * num_experts + expert_id]));
+                w1_ptrs.push_back(static_cast<uintptr_t>(w1_ptr_data[ptr_idx]));
+                b1_ptrs.push_back(static_cast<uintptr_t>(b1_ptr_data[ptr_idx]));
+                w2_ptrs.push_back(static_cast<uintptr_t>(w2_ptr_data[ptr_idx]));
+                b2_ptrs.push_back(static_cast<uintptr_t>(b2_ptr_data[ptr_idx]));
                 group_m_sizes.push_back(count);
                 groups.push_back({cursor, count, expert_id, policy_id});
 
@@ -611,19 +639,6 @@ forward_packed_cpp(
                     hidden_dim,
                     ffn_dim
                 );
-            }
-
-            // Temporary fallback implementation using standard ATen operators
-            for (const auto& group : groups) {
-                auto input_chunk = expert_inputs.narrow(0, group.start, group.count);
-                auto w1_tensor = expert_w1.index({group.policy, group.expert});
-                auto b1_tensor = expert_b1.index({group.policy, group.expert});
-                auto w2_tensor = expert_w2.index({group.policy, group.expert});
-                auto b2_tensor = expert_b2.index({group.policy, group.expert});
-
-                auto hidden = torch::gelu(at::linear(input_chunk, w1_tensor, b1_tensor));
-                auto out_chunk = at::linear(hidden, w2_tensor, b2_tensor);
-                expert_outputs.narrow(0, group.start, group.count).copy_(out_chunk);
             }
 
             auto sorted_weights_half = sorted_routing_weights.to(expert_outputs.dtype()).unsqueeze(-1);

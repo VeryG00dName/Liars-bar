@@ -325,7 +325,9 @@ void EvalManager::finalize_model_loading() {
 
                 const int64_t num_policies = stacked_gpu.size(0);
                 const int64_t num_experts = stacked_gpu.size(1);
-                auto ptr_tensor = torch::empty(
+
+                // Create pointer tensor on CPU first
+                auto ptr_tensor_cpu = torch::empty(
                     {num_policies, num_experts},
                     torch::dtype(torch::kUInt64).device(torch::kCPU)
                 );
@@ -335,7 +337,36 @@ void EvalManager::finalize_model_loading() {
                 const int64_t stride_expert = stacked_gpu.stride(1);
                 const int64_t element_size = static_cast<int64_t>(stacked_gpu.element_size());
 
-                auto ptr_data = ptr_tensor.data_ptr<uint64_t>();
+                // Debug: print stride information for first weight tensor
+                static bool printed_strides = false;
+                if (!printed_strides && key.find(".w1") != std::string::npos) {
+                    fprintf(stderr, "[DEBUG eval_manager] %s shape: [%ld, %ld, %ld, %ld]\n",
+                            key.c_str(),
+                            stacked_gpu.size(0), stacked_gpu.size(1),
+                            stacked_gpu.size(2), stacked_gpu.size(3));
+                    fprintf(stderr, "[DEBUG eval_manager] stride(0)=%ld, stride(1)=%ld, element_size=%ld\n",
+                            stride_policy, stride_expert, element_size);
+
+                    // Verify pointer calculation for policy 0, expert 0
+                    auto test_tensor_indexed = stacked_gpu[0][0];
+                    uintptr_t ptr_via_index = reinterpret_cast<uintptr_t>(test_tensor_indexed.data_ptr<at::Half>());
+                    uintptr_t ptr_via_stride = base_address + (0 * stride_policy + 0 * stride_expert) * element_size;
+                    fprintf(stderr, "[DEBUG eval_manager] [0][0] ptr via index: 0x%lx, via stride: 0x%lx, match: %s\n",
+                            ptr_via_index, ptr_via_stride,
+                            (ptr_via_index == ptr_via_stride) ? "YES" : "NO");
+
+                    // Test for policy 1, expert 0
+                    auto test_tensor_p1e0 = stacked_gpu[1][0];
+                    uintptr_t ptr_p1e0_index = reinterpret_cast<uintptr_t>(test_tensor_p1e0.data_ptr<at::Half>());
+                    uintptr_t ptr_p1e0_stride = base_address + (1 * stride_policy + 0 * stride_expert) * element_size;
+                    fprintf(stderr, "[DEBUG eval_manager] [1][0] ptr via index: 0x%lx, via stride: 0x%lx, match: %s\n",
+                            ptr_p1e0_index, ptr_p1e0_stride,
+                            (ptr_p1e0_index == ptr_p1e0_stride) ? "YES" : "NO");
+
+                    printed_strides = true;
+                }
+
+                auto ptr_data = ptr_tensor_cpu.data_ptr<uint64_t>();
                 for (int64_t p = 0; p < num_policies; ++p) {
                     for (int64_t e = 0; e < num_experts; ++e) {
                         const int64_t offset = p * stride_policy + e * stride_expert;
@@ -345,7 +376,9 @@ void EvalManager::finalize_model_loading() {
                     }
                 }
 
-                batched_weight_cache_.insert_or_assign(key + "_ptrs", ptr_tensor);
+                // Move pointer tensor to same device as weights (CUDA)
+                auto ptr_tensor_gpu = ptr_tensor_cpu.to(stacked_gpu.device());
+                batched_weight_cache_.insert_or_assign(key + "_ptrs", ptr_tensor_gpu);
             };
 
             append_ptrs(".moe.experts.w1");

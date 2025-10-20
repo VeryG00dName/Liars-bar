@@ -115,7 +115,10 @@ ext = CUDAExtension(
     include_dirs=[CPP_INCLUDE] + cuda_include_dirs + cutlass_include_dirs,
     library_dirs=cuda_lib_dirs,
     libraries=['cublasLt'],
-    define_macros=[("CUTLASS_ENABLE_TENSOR_OP_MMA", "1")],
+    define_macros=[
+        ("CUTLASS_ENABLE_TENSOR_OP_MMA", "1"),
+        ("TORCH_USE_CUDA_DSA", "1"),  # Enable device-side assertions for debugging
+    ],
     extra_compile_args=extra_compile_args,
     extra_link_args=extra_link_args,
 )

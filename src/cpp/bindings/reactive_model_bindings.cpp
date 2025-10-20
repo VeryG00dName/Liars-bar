@@ -137,6 +137,46 @@ void bind_reactive_model(py::module_& m) {
         )doc"
     );
 
+    m.def(
+        "create_moe_weight_pointers",
+        [](py::dict state_dict_py, int64_t num_layers, int64_t num_experts) {
+            // Convert Python dict to std::unordered_map
+            std::unordered_map<std::string, torch::Tensor> state_dict;
+            for (auto item : state_dict_py) {
+                std::string key = py::cast<std::string>(item.first);
+                torch::Tensor value = py::cast<torch::Tensor>(item.second);
+                state_dict[key] = value;
+            }
+
+            // Call C++ function
+            create_moe_weight_pointers(state_dict, num_layers, num_experts);
+
+            // Convert back to Python dict
+            py::dict result;
+            for (const auto& pair : state_dict) {
+                result[py::cast(pair.first)] = py::cast(pair.second);
+            }
+            return result;
+        },
+        py::arg("state_dict"),
+        py::arg("num_layers"),
+        py::arg("num_experts"),
+        R"doc(
+        Create pointer tensors for MoE expert weights.
+
+        This must be called AFTER prestack_moe_expert_weights() and AFTER
+        weights are moved to CUDA device.
+
+        Args:
+            state_dict: Weight dictionary (will be modified in-place and returned)
+            num_layers: Number of transformer layers
+            num_experts: Number of MoE experts per layer
+
+        Returns:
+            dict: Modified state_dict with added pointer tensors
+        )doc"
+    );
+
     // Note: C++ .pth loading helper removed; handled in Python.
 
     m.def(

@@ -36,6 +36,31 @@ void prestack_moe_expert_weights(
     int64_t num_experts
 );
 
+/**
+ * Create pointer tensors for MoE expert weights.
+ *
+ * This function creates tensors containing the CUDA device pointer addresses
+ * of each expert's weights, enabling efficient grouped GEMM operations.
+ *
+ * Must be called AFTER prestack_moe_expert_weights() and AFTER weights are
+ * moved to CUDA device.
+ *
+ * Creates pointer tensors with shape [batch_size, num_experts]:
+ *   - "transformer.layers.{L}.moe.experts.w1_ptrs"
+ *   - "transformer.layers.{L}.moe.experts.b1_ptrs"
+ *   - "transformer.layers.{L}.moe.experts.w2_ptrs"
+ *   - "transformer.layers.{L}.moe.experts.b2_ptrs"
+ *
+ * @param state_dict The weight dictionary to modify in-place
+ * @param num_layers Number of transformer layers
+ * @param num_experts Number of MoE experts per layer
+ */
+void create_moe_weight_pointers(
+    std::unordered_map<std::string, torch::Tensor>& state_dict,
+    int64_t num_layers,
+    int64_t num_experts
+);
+
 // Note: Previous C++ .pth loading helper removed.
 
 /**

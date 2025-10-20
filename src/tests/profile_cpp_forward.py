@@ -407,6 +407,10 @@ def load_checkpoint_weights(checkpoint_path, device="cuda"):
             # else:
             #     print(f"  ✓ {k}: {tuple(t.shape)}, {t.dtype}")
 
+    # Create MoE weight pointer tensors (must be after weights are on CUDA)
+    print("Creating MoE weight pointers...")
+    weight_dict = lb.create_moe_weight_pointers(weight_dict, arch_cfg["num_layers"], arch_cfg["num_experts"])
+
     # Add fixed buffers (LUTs) after other processing; keep them 1-D
     print("Adding fixed buffers (LUTs)...")
     weight_dict = lb.add_fixed_buffers(weight_dict, device)
@@ -620,6 +624,10 @@ def profile_multi_policy(checkpoint_path: str, batch_size: int, seq_len: int, nu
     print(f"Moving to {device} and converting to FP16...")
     for key in stacked_weights.keys():
         stacked_weights[key] = stacked_weights[key].to(device).to(torch.float16).contiguous()
+
+    # Create MoE weight pointer tensors
+    print("Creating MoE weight pointers...")
+    stacked_weights = lb.create_moe_weight_pointers(stacked_weights, arch_cfg["num_layers"], arch_cfg["num_experts"])
 
     # Add LUTs (shared across all policies)
     stacked_weights = lb.add_fixed_buffers(stacked_weights, device)
