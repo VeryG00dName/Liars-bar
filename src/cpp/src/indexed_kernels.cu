@@ -9,6 +9,7 @@
 #include <cmath>
 #include <memory>
 #include <vector>
+#include <chrono>
 
 namespace {
 
@@ -300,11 +301,15 @@ torch::Tensor indexed_batched_layer_norm(
     return output;
 }
 
+using Clock = std::chrono::high_resolution_clock;
+using Microseconds = std::chrono::microseconds;
+
 torch::Tensor indexed_batched_linear(
     const torch::Tensor& input,
     const torch::Tensor& weight_cache,
     const torch::Tensor& bias_cache,
     const torch::Tensor& policy_indices,
+    std::unordered_map<std::string, Microseconds>& timers,
     IndexedLinearEpilogue epilogue) {
     TORCH_CHECK(weight_cache.dim() == 3, "weight cache must be [W, out, in]");
     TORCH_CHECK(bias_cache.dim() == 2, "bias cache must be [W, out]");
@@ -319,10 +324,16 @@ torch::Tensor indexed_batched_linear(
 
     if (!input.is_cuda()) {
         auto policy_cpu = policy_indices.cpu();
+        auto t0 = Clock::now();
         auto weight = weight_cache.index_select(0, policy_cpu);
         auto bias = bias_cache.index_select(0, policy_cpu);
+        auto t1 = Clock::now();
+        timers["linear_index_select_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
         auto x = input.to(weight.scalar_type());
+        auto t2 = Clock::now();
         auto result = torch::matmul(x, weight.transpose(-1, -2)) + bias.unsqueeze(1);
+        auto t3 = Clock::now();
+        timers["linear_cublas_matmul_us"] += std::chrono::duration_cast<Microseconds>(t3 - t2);
         if (epilogue == IndexedLinearEpilogue::BiasGELU) {
             result = torch::gelu(result);
         }
@@ -341,8 +352,12 @@ torch::Tensor indexed_batched_linear(
     if (policy_contig.device() != input.device()) {
         policy_contig = policy_contig.to(input.device());
     }
+    auto t0 = Clock::now();
     auto weight_batched = weight_contig.index_select(0, policy_contig).contiguous(); // [B, out, in]
     auto bias_batched = bias_contig.index_select(0, policy_contig).contiguous();     // [B, out]
+    torch::cuda::synchronize();
+    auto t1 = Clock::now();
+    timers["linear_index_select_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
 
     auto output = torch::empty({batch_size, time_steps, out_dim}, input_cast.options());
 
@@ -437,11 +452,15 @@ torch::Tensor indexed_batched_linear(
             cublasLtMatmulPreferenceDestroy(preference);
 
             // Use PyTorch's matmul which handles any matrix size
+            auto fb0 = Clock::now();
             auto result = torch::matmul(input_cast, weight_batched.transpose(-1, -2));
             result.add_(bias_batched.unsqueeze(1));
             if (epilogue == IndexedLinearEpilogue::BiasGELU) {
                 result = torch::gelu(result);
             }
+            if (input_cast.is_cuda()) { torch::cuda::synchronize(); }
+            auto fb1 = Clock::now();
+            timers["linear_matmul_fallback_us"] += std::chrono::duration_cast<Microseconds>(fb1 - fb0);
             return result;
         }
     }
@@ -452,6 +471,7 @@ torch::Tensor indexed_batched_linear(
     const void* beta_ptr = &beta_float;
 
     // Strided-batched matmul with base pointers
+    auto gemm_t0 = Clock::now();
     auto matmul_status = cublasLtMatmul(
         handle,
         desc.op_desc,
@@ -469,6 +489,9 @@ torch::Tensor indexed_batched_linear(
         workspace_size ? workspace.data_ptr() : nullptr,
         workspace_size,
         stream);
+    if (input_cast.is_cuda()) { torch::cuda::synchronize(); }
+    auto gemm_t1 = Clock::now();
+    timers["linear_cublas_matmul_us"] += std::chrono::duration_cast<Microseconds>(gemm_t1 - gemm_t0);
     const char* dtype_str = (dtype == at::kHalf) ? "f16" : (dtype == at::kFloat) ? "f32" : "other";
     TORCH_CHECK(
         matmul_status == CUBLAS_STATUS_SUCCESS,
@@ -486,10 +509,14 @@ torch::Tensor indexed_batched_linear(
     TORCH_CHECK(cublasLtMatmulPreferenceDestroy(preference) == CUBLAS_STATUS_SUCCESS, "cuBLASLt error");
 
     // Apply bias and optional GELU epilogue per batch
+    auto epi_t0 = Clock::now();
     output.add_(bias_batched.unsqueeze(1));
     if (epilogue == IndexedLinearEpilogue::BiasGELU) {
         output = torch::gelu(output);
     }
+    if (output.is_cuda()) { torch::cuda::synchronize(); }
+    auto epi_t1 = Clock::now();
+    timers["linear_epilogue_us"] += std::chrono::duration_cast<Microseconds>(epi_t1 - epi_t0);
 
     return output;
 }

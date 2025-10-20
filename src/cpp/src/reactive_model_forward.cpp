@@ -9,6 +9,8 @@
 #include <iostream>
 #include <stdexcept>
 #include <sstream>
+#include <chrono>
+#include <unordered_map>
 
 namespace {
 
@@ -62,6 +64,10 @@ torch::Tensor reduce_expert_heads(
 // Main Forward Function
 // ============================================================================
 
+using Clock = std::chrono::high_resolution_clock;
+using Microseconds = std::chrono::microseconds;
+
+// Wrapper to preserve original signature (e.g., Python bindings)
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 forward_packed_cpp(
     const torch::Tensor& obs_sequence,
@@ -77,7 +83,44 @@ forward_packed_cpp(
     int64_t num_experts,
     int64_t top_k,
     int64_t count_pad,
-    int64_t tflag_pad
+    int64_t tflag_pad) {
+    std::unordered_map<std::string, Microseconds> dummy;
+    return forward_packed_cpp(
+        obs_sequence,
+        action_sequence,
+        agent_types,
+        positions,
+        batched_weights,
+        policy_indices,
+        padding_mask,
+        num_layers,
+        num_heads,
+        hidden_dim,
+        num_experts,
+        top_k,
+        count_pad,
+        tflag_pad,
+        dummy
+    );
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+forward_packed_cpp(
+    const torch::Tensor& obs_sequence,
+    const torch::Tensor& action_sequence,
+    const torch::Tensor& agent_types,
+    const torch::Tensor& positions,
+    const c10::Dict<std::string, torch::Tensor>& batched_weights, // [W, ...]
+    const torch::Tensor& policy_indices, // [B]
+    const torch::optional<torch::Tensor>& padding_mask,
+    int64_t num_layers,
+    int64_t num_heads,
+    int64_t hidden_dim,
+    int64_t num_experts,
+    int64_t top_k,
+    int64_t count_pad,
+    int64_t tflag_pad,
+    std::unordered_map<std::string, Microseconds>& timers
 ) {
     auto policy_indices_long = policy_indices.to(torch::kLong).contiguous();
     auto policy_indices_cpu = policy_indices_long.device().is_cpu()
@@ -183,11 +226,13 @@ forward_packed_cpp(
     // ========================================================================
 
     // Observation encoding: Linear -> LayerNorm -> GELU
+    auto enc_t0 = Clock::now();
     auto obs_encoded = indexed_batched_linear(
         obs_sequence,
         get_weight(batched_weights, "obs_encoder.0.weight"),
         get_weight(batched_weights, "obs_encoder.0.bias"),
-        policy_indices_for_ops
+        policy_indices_for_ops,
+        timers
     );
     obs_encoded = indexed_batched_layer_norm(
         obs_encoded,
@@ -226,14 +271,16 @@ forward_packed_cpp(
         obs_encoded,
         get_weight(batched_weights, "gate_obs.0.weight"),
         get_weight(batched_weights, "gate_obs.0.bias"),
-        policy_indices_for_ops
+        policy_indices_for_ops,
+        timers
     );
     hidden_g_obs = torch::tanh(hidden_g_obs);
     auto g_obs = indexed_batched_linear(
         hidden_g_obs,
         get_weight(batched_weights, "gate_obs.2.weight"),
         get_weight(batched_weights, "gate_obs.2.bias"),
-        policy_indices_for_ops
+        policy_indices_for_ops,
+        timers
     );
     g_obs = torch::sigmoid(g_obs);
 
@@ -242,14 +289,16 @@ forward_packed_cpp(
         act_embed,
         get_weight(batched_weights, "gate_action.0.weight"),
         get_weight(batched_weights, "gate_action.0.bias"),
-        policy_indices_for_ops
+        policy_indices_for_ops,
+        timers
     );
     hidden_g_action = torch::tanh(hidden_g_action);
     auto g_action = indexed_batched_linear(
         hidden_g_action,
         get_weight(batched_weights, "gate_action.2.weight"),
         get_weight(batched_weights, "gate_action.2.bias"),
-        policy_indices_for_ops
+        policy_indices_for_ops,
+        timers
     );
     g_action = torch::sigmoid(g_action);
 
@@ -258,14 +307,16 @@ forward_packed_cpp(
         agent_embed,
         get_weight(batched_weights, "gate_agent.0.weight"),
         get_weight(batched_weights, "gate_agent.0.bias"),
-        policy_indices_for_ops
+        policy_indices_for_ops,
+        timers
     );
     hidden_g_agent = torch::tanh(hidden_g_agent);
     auto g_agent = indexed_batched_linear(
         hidden_g_agent,
         get_weight(batched_weights, "gate_agent.2.weight"),
         get_weight(batched_weights, "gate_agent.2.bias"),
-        policy_indices_for_ops
+        policy_indices_for_ops,
+        timers
     );
     g_agent = torch::sigmoid(g_agent);
 
@@ -274,14 +325,16 @@ forward_packed_cpp(
         position_embed,
         get_weight(batched_weights, "gate_position.0.weight"),
         get_weight(batched_weights, "gate_position.0.bias"),
-        policy_indices_for_ops
+        policy_indices_for_ops,
+        timers
     );
     hidden_g_position = torch::tanh(hidden_g_position);
     auto g_position = indexed_batched_linear(
         hidden_g_position,
         get_weight(batched_weights, "gate_position.2.weight"),
         get_weight(batched_weights, "gate_position.2.bias"),
-        policy_indices_for_ops
+        policy_indices_for_ops,
+        timers
     );
     g_position = torch::sigmoid(g_position);
 
@@ -293,6 +346,9 @@ forward_packed_cpp(
 
     // Final layer norm (uses torch::layer_norm, not batched version)
     auto encoded_inputs = torch::layer_norm(fused, {hidden_dim});
+    if (obs_sequence.is_cuda()) { torch::cuda::synchronize(); }
+    auto enc_t1 = Clock::now();
+    timers["fwd_input_encoding_us"] += std::chrono::duration_cast<Microseconds>(enc_t1 - enc_t0);
 
     // ========================================================================
     // Prepare Masks for Attention
@@ -345,9 +401,13 @@ forward_packed_cpp(
         auto v_bias = qkv_biases[2];
 
         // Project to Q, K, V
-        auto q = indexed_batched_linear(x, q_weight, q_bias, policy_indices_for_ops);
-        auto k = indexed_batched_linear(x, k_weight, k_bias, policy_indices_for_ops);
-        auto v = indexed_batched_linear(x, v_weight, v_bias, policy_indices_for_ops);
+        auto t_attn_proj_0 = Clock::now();
+        auto q = indexed_batched_linear(x, q_weight, q_bias, policy_indices_for_ops, timers);
+        auto k = indexed_batched_linear(x, k_weight, k_bias, policy_indices_for_ops, timers);
+        auto v = indexed_batched_linear(x, v_weight, v_bias, policy_indices_for_ops, timers);
+        if (x.is_cuda()) { torch::cuda::synchronize(); }
+        auto t_attn_proj_1 = Clock::now();
+        timers["fwd_attn_proj_us"] += std::chrono::duration_cast<Microseconds>(t_attn_proj_1 - t_attn_proj_0);
 
         // Reshape for multi-head attention: [B, T, H] -> [B, num_heads, T, head_dim]
         q = q.view({batch_size, seq_len, num_heads, head_dim}).transpose(1, 2);
@@ -356,22 +416,28 @@ forward_packed_cpp(
 
         // Apply FlashAttention (scaled dot-product attention)
         // Use is_causal=true for causal masking
+        auto t_sdpa_0 = Clock::now();
         auto attn_output = torch::scaled_dot_product_attention(
             q, k, v,
             /*attn_mask=*/torch::nullopt,
             /*dropout_p=*/0.0,
             /*is_causal=*/true  // Enables causal masking
         );
+        if (x.is_cuda()) { torch::cuda::synchronize(); }
+        auto t_sdpa_1 = Clock::now();
+        timers["fwd_attn_sdpa_us"] += std::chrono::duration_cast<Microseconds>(t_sdpa_1 - t_sdpa_0);
 
         // Reshape back: [B, num_heads, T, head_dim] -> [B, T, H]
         attn_output = attn_output.transpose(1, 2).contiguous().view({batch_size, seq_len, hidden_dim});
 
         // Output projection
+        auto t_attn_out_0 = Clock::now();
         attn_output = indexed_batched_linear(
             attn_output,
             get_weight(batched_weights, layer_prefix + ".self_attn.out_proj.weight"),
             get_weight(batched_weights, layer_prefix + ".self_attn.out_proj.bias"),
-            policy_indices_for_ops
+            policy_indices_for_ops,
+            timers
         );
 
         // Residual connection + LayerNorm
@@ -382,17 +448,22 @@ forward_packed_cpp(
             get_weight(batched_weights, layer_prefix + ".norm1.bias"),
             policy_indices_for_ops
         );
+        if (x.is_cuda()) { torch::cuda::synchronize(); }
+        auto t_attn_out_1 = Clock::now();
+        timers["fwd_attn_output_us"] += std::chrono::duration_cast<Microseconds>(t_attn_out_1 - t_attn_out_0);
 
         // ====================================================================
         // MoE Block
         // ====================================================================
 
         // Compute gate logits
+        auto t_moe_0 = Clock::now();
         auto gate_logits = indexed_batched_linear(
             x,
             get_weight(batched_weights, layer_prefix + ".moe.gate.weight"),
             get_weight(batched_weights, layer_prefix + ".moe.gate.bias"),
-            policy_indices_for_ops
+            policy_indices_for_ops,
+            timers
         );
 
         // Ensure dtype consistency
@@ -488,8 +559,12 @@ forward_packed_cpp(
 
             moe_output = y;
         }
+        if (x.is_cuda()) { torch::cuda::synchronize(); }
+        auto t_moe_1 = Clock::now();
+        timers["fwd_moe_block_us"] += std::chrono::duration_cast<Microseconds>(t_moe_1 - t_moe_0);
 
         // Residual connection + LayerNorm
+        auto t_moe_res_0 = Clock::now();
         auto residual2 = x + moe_output;
         x = indexed_batched_layer_norm(
             residual2,
@@ -497,6 +572,9 @@ forward_packed_cpp(
             get_weight(batched_weights, layer_prefix + ".norm2.bias"),
             policy_indices_for_ops
         );
+        if (x.is_cuda()) { torch::cuda::synchronize(); }
+        auto t_moe_res_1 = Clock::now();
+        timers["fwd_moe_residual_us"] += std::chrono::duration_cast<Microseconds>(t_moe_res_1 - t_moe_res_0);
 
         // Save final routing info for head reduction
         final_topk_indices = topk_indices;
@@ -506,6 +584,7 @@ forward_packed_cpp(
     // ========================================================================
     // Final Layer Norm
     // ========================================================================
+    auto t_heads_0 = Clock::now();
     auto transformer_output = indexed_batched_layer_norm(
         x,
         get_weight(batched_weights, "transformer.norm.weight"),
@@ -527,28 +606,32 @@ forward_packed_cpp(
                 transformer_output,
                 get_weight(batched_weights, "action_heads." + std::to_string(i) + ".weight"),
                 get_weight(batched_weights, "action_heads." + std::to_string(i) + ".bias"),
-                policy_indices_for_ops)
+                policy_indices_for_ops,
+                timers)
         );
         opp_logits_list.push_back(
             indexed_batched_linear(
                 transformer_output,
                 get_weight(batched_weights, "opp_action_heads." + std::to_string(i) + ".weight"),
                 get_weight(batched_weights, "opp_action_heads." + std::to_string(i) + ".bias"),
-                policy_indices_for_ops)
+                policy_indices_for_ops,
+                timers)
         );
         state_values_list.push_back(
             indexed_batched_linear(
                 transformer_output,
                 get_weight(batched_weights, "reward_stream_heads." + std::to_string(i) + ".weight"),
                 get_weight(batched_weights, "reward_stream_heads." + std::to_string(i) + ".bias"),
-                policy_indices_for_ops)
+                policy_indices_for_ops,
+                timers)
         );
         win_logits_list.push_back(
             indexed_batched_linear(
                 transformer_output,
                 get_weight(batched_weights, "win_prob_heads." + std::to_string(i) + ".weight"),
                 get_weight(batched_weights, "win_prob_heads." + std::to_string(i) + ".bias"),
-                policy_indices_for_ops)
+                policy_indices_for_ops,
+                timers)
         );
     }
 
@@ -564,6 +647,9 @@ forward_packed_cpp(
     auto opp_logits = reduce_expert_heads(opp_stacked, final_topk_indices, final_topk_scores);
     auto state_values = reduce_expert_heads(reward_stacked, final_topk_indices, final_topk_scores);
     auto win_logits = reduce_expert_heads(win_stacked, final_topk_indices, final_topk_scores);
+    if (x.is_cuda()) { torch::cuda::synchronize(); }
+    auto t_heads_1 = Clock::now();
+    timers["fwd_heads_us"] += std::chrono::duration_cast<Microseconds>(t_heads_1 - t_heads_0);
 
     return std::make_tuple(action_logits, opp_logits, state_values, win_logits);
 }

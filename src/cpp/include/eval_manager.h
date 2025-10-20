@@ -118,6 +118,9 @@ private:
     std::chrono::microseconds timer_hist_model_exec_{0};
     std::chrono::microseconds timer_hist_post_{0};
 
+    // Fine-grained timers captured inside forward pass and kernels
+    std::unordered_map<std::string, std::chrono::microseconds> detailed_timers_;
+
     struct RequestRef {
         int policy_id;
         size_t request_index;

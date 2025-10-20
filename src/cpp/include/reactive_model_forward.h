@@ -3,6 +3,8 @@
 #include <torch/torch.h>
 #include <tuple>
 #include <string>
+#include <unordered_map>
+#include <chrono>
 
 /**
  * Stateless forward pass for PPOReactiveModel with batched weights.
@@ -49,6 +51,26 @@ forward_packed_cpp(
     int64_t top_k = 2,
     int64_t count_pad = 4,
     int64_t tflag_pad = 3
+);
+
+// Overload with detailed timers map for granular profiling
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+forward_packed_cpp(
+    const torch::Tensor& obs_sequence,
+    const torch::Tensor& action_sequence,
+    const torch::Tensor& agent_types,
+    const torch::Tensor& positions,
+    const c10::Dict<std::string, torch::Tensor>& batched_weights, // Shape [W, ...]
+    const torch::Tensor& policy_indices, // Shape [B]
+    const torch::optional<torch::Tensor>& padding_mask,
+    int64_t num_layers,
+    int64_t num_heads,
+    int64_t hidden_dim,
+    int64_t num_experts,
+    int64_t top_k,
+    int64_t count_pad,
+    int64_t tflag_pad,
+    std::unordered_map<std::string, std::chrono::microseconds>& timers
 );
 
 /**

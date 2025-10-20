@@ -1,6 +1,8 @@
 #pragma once
 
 #include <torch/extension.h>
+#include <unordered_map>
+#include <chrono>
 
 // Fused linear epilogues supported by the indexed batched linear helper.
 enum class IndexedLinearEpilogue {
@@ -41,5 +43,6 @@ torch::Tensor indexed_batched_linear(
     const torch::Tensor& weight_cache,
     const torch::Tensor& bias_cache,
     const torch::Tensor& policy_indices,
+    std::unordered_map<std::string, std::chrono::microseconds>& timers,
     IndexedLinearEpilogue epilogue = IndexedLinearEpilogue::Bias);
 

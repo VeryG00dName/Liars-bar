@@ -311,8 +311,18 @@ def run_active_league(
 
         if perf_stats:
             print("--- EvalManager Performance (microseconds) ---")
-            for key, value in sorted(perf_stats.items()):
+            main_timers = {k: v for k, v in perf_stats.items() if not k.startswith("fwd_") and not k.startswith("linear_")}
+            detailed_timers = {k: v for k, v in perf_stats.items() if k.startswith("fwd_") or k.startswith("linear_")}
+
+            for key, value in sorted(main_timers.items()):
                 print(f"  - {key:<24}: {value} us ({value / 1e6:.6f}s)")
+
+            if detailed_timers:
+                print("\n--- Forward Pass Breakdown (microseconds) ---")
+                total_fwd_time = sum(detailed_timers.values())
+                for key, value in sorted(detailed_timers.items(), key=lambda item: -item[1]):
+                    perc = (value / total_fwd_time * 100.0) if total_fwd_time > 0 else 0.0
+                    print(f"  - {key:<24}: {value} us ({value / 1e6:.6f}s) [{perc:.1f}%]")
 
         if len(results_list) != len(quartets):
             raise RuntimeError(

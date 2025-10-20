@@ -207,21 +207,23 @@ void EvalManager::load_model(
             "lut_act_kind", "lut_count", "lut_table_flag"
         };
 
-        // Move weights to inference device and convert to FP16
-        // Skip LUTs - they will be added fresh in finalize_model_loading()
+        // Store CPU FP32 weights as-is (skip LUTs). We'll stack on CPU and
+        // transfer once in finalize_model_loading() to avoid VRAM thrashing.
         std::unordered_map<std::string, torch::Tensor> processed_dict;
         processed_dict.reserve(state_dict.size());
         for (auto& kv : state_dict) {
-            // Skip LUTs - they are constant buffers that will be added later
             if (lut_keys.find(kv.first) != lut_keys.end()) {
                 continue;
             }
 
-            auto tensor = kv.second
-                              .detach()
-                              .to(kInferenceDevice, /*non_blocking=*/false, /*copy=*/true)
-                              .to(torch::kFloat16)
-                              .contiguous();
+            auto tensor = kv.second.detach();
+            if (!tensor.device().is_cpu()) {
+                tensor = tensor.to(torch::kCPU, /*non_blocking=*/false, /*copy=*/true);
+            }
+            if (tensor.dtype() != torch::kFloat32) {
+                tensor = tensor.to(torch::kFloat32);
+            }
+            tensor = tensor.contiguous();
             processed_dict.emplace(kv.first, std::move(tensor));
         }
 
@@ -261,27 +263,56 @@ void EvalManager::finalize_model_loading() {
     }
     std::sort(policy_ids.begin(), policy_ids.end());
 
-    // Pre-stack MoE expert weights in each individual state_dict before batching
+    // Pre-stack MoE expert weights in each individual state_dict before batching (CPU)
     for (auto& kv : staged_state_dicts_) {
         prestack_moe_expert_weights(kv.second, num_layers_, num_experts_);
     }
 
-    std::unordered_map<std::string, std::vector<torch::Tensor>> stacked;
+    // Build mapping policy_id -> index used during inference
     for (size_t idx = 0; idx < policy_ids.size(); ++idx) {
-        int policy_id = policy_ids[idx];
-        policy_id_to_cache_index_[policy_id] = static_cast<int>(idx);
-        auto dict_it = staged_state_dicts_.find(policy_id);
-        if (dict_it == staged_state_dicts_.end()) {
-            throw std::runtime_error("Missing staged weights for policy " + std::to_string(policy_id));
-        }
-        for (const auto& kv : dict_it->second) {
-            stacked[kv.first].push_back(kv.second);
-        }
+        policy_id_to_cache_index_[policy_ids[idx]] = static_cast<int>(idx);
     }
 
-    // Stack weights across policies (LUTs already excluded in load_model)
-    for (auto& kv : stacked) {
-        batched_weight_cache_.insert(kv.first, torch::stack(kv.second).contiguous());
+    // Determine keys to process from the first policy's dict
+    const auto& first_dict = staged_state_dicts_.at(policy_ids[0]);
+    std::vector<std::string> keys;
+    keys.reserve(first_dict.size());
+    for (const auto& kv : first_dict) {
+        keys.push_back(kv.first);
+    }
+
+    // For each key, gather CPU tensors across policies, stack on CPU, then
+    // transfer the final stacked tensor to GPU as FP16 and cache it.
+    for (const auto& key : keys) {
+        std::vector<torch::Tensor> cpu_tensors;
+        cpu_tensors.reserve(policy_ids.size());
+        for (int policy_id : policy_ids) {
+            auto dict_it = staged_state_dicts_.find(policy_id);
+            if (dict_it == staged_state_dicts_.end()) {
+                throw std::runtime_error("Missing staged weights for policy " + std::to_string(policy_id));
+            }
+            auto& per_policy = dict_it->second;
+            auto itw = per_policy.find(key);
+            if (itw == per_policy.end()) {
+                throw std::runtime_error("Missing key '" + key + "' in staged weights for policy " + std::to_string(policy_id));
+            }
+            cpu_tensors.push_back(itw->second);
+        }
+
+        auto stacked_cpu = torch::stack(cpu_tensors, /*dim=*/0).contiguous();
+        auto stacked_gpu = stacked_cpu
+                               .to(kInferenceDevice, /*non_blocking=*/false, /*copy=*/true)
+                               .to(torch::kFloat16)
+                               .contiguous();
+        batched_weight_cache_.insert(key, stacked_gpu);
+
+        // Proactively free CPU per-policy tensors for this key to reduce RAM
+        for (int policy_id : policy_ids) {
+            auto dit = staged_state_dicts_.find(policy_id);
+            if (dit != staged_state_dicts_.end()) {
+                dit->second.erase(key);
+            }
+        }
     }
 
     // DEBUG: Verify weights are actually different between policies
@@ -304,7 +335,6 @@ void EvalManager::finalize_model_loading() {
     }
 
     // Clear temporary storage to free memory
-    stacked.clear();
     staged_state_dicts_.clear();  // CRITICAL: Free the per-policy tensors after stacking
 
     // Add fixed buffers (LUTs) - these are constant and shared across all policies
@@ -361,6 +391,9 @@ EvalOutcome EvalManager::run_roles(const std::vector<std::vector<int>>& roles,
     timer_hist_prep_weights_ = Microseconds::zero();
     timer_hist_model_exec_ = Microseconds::zero();
     timer_hist_post_ = Microseconds::zero();
+
+    // Reset detailed timers for this run
+    detailed_timers_.clear();
 
     auto total_start = Clock::now();
 
@@ -689,7 +722,8 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
             num_experts_,
             top_k_,
             count_pad_,
-            tflag_pad_
+            tflag_pad_,
+            detailed_timers_
         );
 
         torch::cuda::synchronize();
@@ -755,7 +789,10 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
 
         // Force release of intermediate tensors to avoid memory buildup
         if (offset % (batch_limit * 4) == 0) {
+
+            // WSL/Linux build path: release CUDA caching allocator pages
             at::accelerator::emptyCache();
+
         }
     }
 
@@ -807,6 +844,11 @@ std::unordered_map<std::string, int64_t> EvalManager::get_last_performance_stats
     stats["hist_prep_weights_us"] = timer_hist_prep_weights_.count();
     stats["hist_model_exec_us"] = timer_hist_model_exec_.count();
     stats["hist_post_us"] = timer_hist_post_.count();
+
+    // Merge detailed timers captured during model forward
+    for (const auto& kv : detailed_timers_) {
+        stats[kv.first] = kv.second.count();
+    }
     return stats;
 }
 
