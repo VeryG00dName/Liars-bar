@@ -12,6 +12,7 @@
 #include <sstream>
 #include <chrono>
 #include <unordered_map>
+#include <algorithm>
 
 namespace {
 
@@ -45,15 +46,85 @@ torch::Tensor reduce_expert_heads(
     int64_t T = stacked.size(1);
     int64_t K = topk_indices.size(2);
     int64_t out_dim = stacked.size(3);
+    int64_t expert_dim = stacked.size(2);
+
+    TORCH_CHECK(expert_dim > 0, "reduce_expert_heads: stacked tensor must have a non-zero expert dimension");
+
+    // Ensure indices and scores are on the same device/dtype as stacked and contiguous
+    auto indices = topk_indices.to(torch::kLong);
+    if (!indices.is_contiguous()) {
+        indices = indices.contiguous();
+    }
+    if (indices.device() != stacked.device()) {
+        indices = indices.to(stacked.device());
+    }
+
+    auto scores = topk_scores;
+    if (scores.device() != stacked.device()) {
+        scores = scores.to(stacked.device());
+    }
+    if (scores.scalar_type() != stacked.scalar_type()) {
+        scores = scores.to(stacked.scalar_type());
+    }
+    if (!scores.is_contiguous()) {
+        scores = scores.contiguous();
+    }
+
+    auto min_max = torch::_aminmax(indices);
+    auto min_idx = std::get<0>(min_max).item<int64_t>();
+    auto max_idx = std::get<1>(min_max).item<int64_t>();
+
+    if (min_idx < 0 || max_idx >= expert_dim) {
+        auto clamped_indices = torch::clamp(indices, 0, expert_dim - 1);
+        auto invalid_mask = (indices != clamped_indices);
+        auto invalid_count = invalid_mask.sum().item<int64_t>();
+
+        std::ostringstream oss;
+        oss << "MoE routing produced out-of-range expert indices (valid range [0, "
+            << (expert_dim - 1) << "]). Observed min=" << min_idx
+            << ", max=" << max_idx << ".";
+
+        if (invalid_count > 0) {
+            oss << " Clamping " << invalid_count << " offending indices and renormalizing weights.";
+            auto invalid_coords = torch::nonzero(invalid_mask).to(torch::kCPU);
+            auto preview = std::min<int64_t>(5, invalid_coords.size(0));
+            if (preview > 0) {
+                oss << " Example coordinates (batch, time, topk):";
+                for (int64_t i = 0; i < preview; ++i) {
+                    auto row = invalid_coords[i];
+                    oss << " (" << row[0].item<int64_t>()
+                        << "," << row[1].item<int64_t>()
+                        << "," << row[2].item<int64_t>() << ")";
+                }
+            }
+
+            std::cerr << "[WARN] " << oss.str() << std::endl;
+
+            indices = clamped_indices;
+
+            auto invalid_mask_scores = invalid_mask;
+            if (invalid_mask_scores.device() != scores.device()) {
+                invalid_mask_scores = invalid_mask_scores.to(scores.device());
+            }
+
+            scores = scores.clone();
+            scores.masked_fill_(invalid_mask_scores, 0);
+            auto denom = scores.sum(-1, /*keepdim=*/true).clamp_min(1e-6);
+            scores = scores / denom;
+        } else {
+            std::cerr << "[WARN] " << oss.str() << " No indices were clamped due to empty mask." << std::endl;
+            indices = clamped_indices;
+        }
+    }
 
     // Expand indices for gather: [B, T, K] -> [B, T, K, out_dim]
-    auto gather_idx = topk_indices.unsqueeze(-1).expand({B, T, K, out_dim});
+    auto gather_idx = indices.unsqueeze(-1).expand({B, T, K, out_dim});
 
     // Gather top-K expert outputs: [B, T, K, out_dim]
     auto top_outputs = torch::gather(stacked, /*dim=*/2, gather_idx);
 
     // Weight by routing scores: [B, T, K, 1] * [B, T, K, out_dim]
-    auto weighted = top_outputs * topk_scores.unsqueeze(-1);
+    auto weighted = top_outputs * scores.unsqueeze(-1);
 
     // Sum over K dimension: [B, T, out_dim]
     auto output = weighted.sum(/*dim=*/2);
