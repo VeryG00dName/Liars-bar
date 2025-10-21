@@ -764,7 +764,7 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
     }
 
     // 2. Pad this max length to the nearest "good" bucket size
-    constexpr std::array<int64_t, 8> kSeqLenBuckets = {{32, 64, 128, 192, 256, 512}};
+    constexpr std::array<int64_t, 8> kSeqLenBuckets = {{8 , 16, 32, 64, 128, 192, 256, 512}};
     int64_t target_pad_len = kSeqLenBuckets.back();
     for (int64_t b : kSeqLenBuckets) {
         if (max_len <= b) {

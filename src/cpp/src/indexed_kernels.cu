@@ -13,6 +13,180 @@
 #include <vector>
 #include <chrono>
 #include <mutex>
+// cuBLASLt debug dump (CUDA 12.9-compatible)
+// Put this in a .cu/.cpp compiled with the same includes as your Lt code.
+
+#include <cstdio>
+#include <cinttypes>
+#include <iostream>
+
+static const char* dtypeStr(cudaDataType_t t) {
+    switch (t) {
+    case CUDA_R_32F: return "CUDA_R_32F";
+    case CUDA_R_16F: return "CUDA_R_16F";
+    case CUDA_R_16BF: return "CUDA_R_16BF";
+    case CUDA_R_64F: return "CUDA_R_64F";
+    case CUDA_R_8I:  return "CUDA_R_8I";
+    case CUDA_R_8U:  return "CUDA_R_8U";
+    default:         return "UNKNOWN";
+    }
+}
+
+static const char* computeStr(cublasComputeType_t c) {
+    switch (c) {
+    case CUBLAS_COMPUTE_32F:           return "CUBLAS_COMPUTE_32F";
+    case CUBLAS_COMPUTE_32F_FAST_16F:  return "CUBLAS_COMPUTE_32F_FAST_16F";
+    case CUBLAS_COMPUTE_32F_FAST_TF32: return "CUBLAS_COMPUTE_32F_FAST_TF32";
+    case CUBLAS_COMPUTE_16F:           return "CUBLAS_COMPUTE_16F";
+    case CUBLAS_COMPUTE_64F:           return "CUBLAS_COMPUTE_64F";
+    default:                           return "UNKNOWN";
+    }
+}
+
+static const char* orderStr(cublasLtOrder_t o) {
+    switch (o) {
+    case CUBLASLT_ORDER_ROW:          return "ROW";
+    case CUBLASLT_ORDER_COL:          return "COL";
+    case CUBLASLT_ORDER_COL32:        return "COL32";
+    case CUBLASLT_ORDER_COL4_4R2_8C:  return "COL4_4R2_8C";
+    case CUBLASLT_ORDER_COL32_2R_4R4: return "COL32_2R_4R4";
+    default:                          return "UNKNOWN";
+    }
+}
+
+static const char* transStr(cublasOperation_t t) {
+    switch (t) {
+    case CUBLAS_OP_N: return "N";
+    case CUBLAS_OP_T: return "T";
+    case CUBLAS_OP_C: return "C";
+    default:          return "?";
+    }
+}
+
+static const char* epilogueStr(cublasLtEpilogue_t e) {
+    switch (e) {
+    case CUBLASLT_EPILOGUE_DEFAULT:         return "DEFAULT";
+    case CUBLASLT_EPILOGUE_RELU:            return "RELU";
+    case CUBLASLT_EPILOGUE_RELU_AUX:        return "RELU_AUX";
+    case CUBLASLT_EPILOGUE_GELU:            return "GELU";
+    case CUBLASLT_EPILOGUE_GELU_AUX:        return "GELU_AUX";
+    case CUBLASLT_EPILOGUE_BIAS:            return "BIAS";
+    case CUBLASLT_EPILOGUE_RELU_BIAS:       return "RELU_BIAS";
+    case CUBLASLT_EPILOGUE_RELU_AUX_BIAS:   return "RELU_AUX_BIAS";
+    case CUBLASLT_EPILOGUE_GELU_BIAS:       return "GELU_BIAS";
+    case CUBLASLT_EPILOGUE_GELU_AUX_BIAS:   return "GELU_AUX_BIAS";
+    default:                                 return "UNKNOWN";
+    }
+}
+
+// minimal attr getters (12.9 symbols only)
+template <typename T>
+static void getDescAttr(cublasLtMatmulDesc_t d, cublasLtMatmulDescAttributes_t a, T& out) {
+    size_t sz = sizeof(T);
+    cublasLtMatmulDescGetAttribute(d, a, &out, sz, &sz);
+}
+template <typename T>
+static size_t getLayoutAttrSZ(cublasLtMatrixLayout_t lay, cublasLtMatrixLayoutAttribute_t attr, T& out) {
+    size_t written = 0;
+    auto st = cublasLtMatrixLayoutGetAttribute(lay, attr, &out, sizeof(T), &written);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        std::cout << "[LT] GetAttribute failed attr=" << (int)attr << " st=" << (int)st << "\n";
+    }
+    return written;
+}
+template <typename T>
+static void getPrefAttr(cublasLtMatmulPreference_t p, cublasLtMatmulPreferenceAttributes_t a, T& out) {
+    size_t sz = sizeof(T);
+    cublasLtMatmulPreferenceGetAttribute(p, a, &out, sz, &sz);
+}
+
+static void dumpLayout(const char* tag, cublasLtMatrixLayout_t lay) {
+    int64_t rows=0, cols=0, ld=0;
+    int      batch=1;           // 32-bit
+    long long stride_bytes=0;   // 64-bit
+    cudaDataType_t dtype = CUDA_R_32F;
+    cublasLtOrder_t order = CUBLASLT_ORDER_COL;
+
+    getLayoutAttrSZ(lay, CUBLASLT_MATRIX_LAYOUT_TYPE, dtype);
+    getLayoutAttrSZ(lay, CUBLASLT_MATRIX_LAYOUT_ROWS, rows);
+    getLayoutAttrSZ(lay, CUBLASLT_MATRIX_LAYOUT_COLS, cols);
+    getLayoutAttrSZ(lay, CUBLASLT_MATRIX_LAYOUT_LD,   ld);
+    getLayoutAttrSZ(lay, CUBLASLT_MATRIX_LAYOUT_ORDER, order);
+    size_t bc_written  = getLayoutAttrSZ(lay, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, batch);
+    size_t sb_written  = getLayoutAttrSZ(lay, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, stride_bytes);
+
+    std::cout << "  [" << tag << "] dtype=" << dtypeStr(dtype)
+              << " rows=" << rows << " cols=" << cols
+              << " ld="   << ld   << " order=" << orderStr(order)
+              << " batch=" << batch << " (bytes=" << bc_written << ")"
+              << " stride_bytes=" << stride_bytes << " (bytes=" << sb_written << ")"
+              << "\n";
+}
+
+static void dumpOpDesc(cublasLtMatmulDesc_t op) {
+    cublasOperation_t ta=CUBLAS_OP_N, tb=CUBLAS_OP_N;
+    cudaDataType_t scaleType = CUDA_R_32F;
+    cublasComputeType_t compute = CUBLAS_COMPUTE_32F;
+    cublasLtEpilogue_t epi = CUBLASLT_EPILOGUE_DEFAULT;
+
+    getDescAttr(op, CUBLASLT_MATMUL_DESC_TRANSA, ta);
+    getDescAttr(op, CUBLASLT_MATMUL_DESC_TRANSB, tb);
+    getDescAttr(op, CUBLASLT_MATMUL_DESC_COMPUTE_TYPE, compute);
+    getDescAttr(op, CUBLASLT_MATMUL_DESC_SCALE_TYPE,   scaleType);
+    getDescAttr(op, CUBLASLT_MATMUL_DESC_EPILOGUE,     epi);
+
+    std::cout << "  [op_desc] transA=" << transStr(ta)
+              << " transB=" << transStr(tb)
+              << " compute=" << computeStr(compute)
+              << " scaleType=" << dtypeStr(scaleType)
+              << " epilogue=" << epilogueStr(epi) << "\n";
+
+    // Bias pointer/type (12.9 has these)
+    void* biasPtr = nullptr;
+    size_t got = 0;
+    if (cublasLtMatmulDescGetAttribute(op, CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+                                       &biasPtr, sizeof(biasPtr), &got) == CUBLAS_STATUS_SUCCESS && got == sizeof(biasPtr)) {
+        cudaDataType_t biasType = CUDA_R_32F;
+        cublasLtMatmulDescGetAttribute(op, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE,
+                                       &biasType, sizeof(biasType), &got);
+        std::cout << "  [op_desc] bias_ptr=" << biasPtr
+                  << " bias_type=" << dtypeStr(biasType) << "\n";
+    }
+}
+
+static void dumpPreference(cublasLtMatmulPreference_t pref) {
+    size_t maxWs=0;
+    getPrefAttr(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, maxWs);
+    std::cout << "  [preference] max_workspace=" << maxWs << "\n";
+}
+
+static void dumpHeuristic(const cublasLtMatmulHeuristicResult_t& h) {
+    std::cout << "  [heuristic] state=" << (int)h.state
+              << " wavesCount=" << h.wavesCount
+              << " workspaceSize=" << h.workspaceSize << "\n";
+}
+
+static void dumpLtConfigLt(
+    cublasLtHandle_t lt_handle,                    // lt handle (unused here; kept for signature parity)
+    cublasLtMatmulDesc_t op_desc,
+    cublasLtMatrixLayout_t a,
+    cublasLtMatrixLayout_t b,
+    cublasLtMatrixLayout_t c,
+    cublasLtMatmulPreference_t pref)
+{
+    (void)lt_handle;
+    int drv=0, rt=0; cudaDriverGetVersion(&drv); cudaRuntimeGetVersion(&rt);
+    auto vers=[&](int v){ return std::to_string(v/1000)+"."+std::to_string((v%1000)/10); };
+    std::cout << "===== cuBLASLt Matmul Config (driver " << vers(drv)
+            << ", runtime " << vers(rt) << ") =====\n";
+    dumpOpDesc(op_desc);
+    dumpLayout("A", a);
+    dumpLayout("B", b);
+    dumpLayout("C", c);
+    dumpPreference(pref);
+    std::cout << "==============================================\n";
+}
+
 
 namespace {
 
@@ -585,15 +759,15 @@ torch::Tensor indexed_batched_linear(
 
     auto handle = at::cuda::getCurrentCUDABlasLtHandle();
     auto stream = at::cuda::getCurrentCUDAStream();
-
+    cudaStream_t raw_stream = stream.stream();
     const auto dtype = input_cast.scalar_type();
-
+    std::cout << "[DBG] raw_stream=" << raw_stream << "\n";
     // Create descriptors with current dynamic dimensions
     MatmulDescriptors desc{};
     const auto compute_type = compute_type_for(dtype);
     const auto data_type = cuda_dtype_for(dtype);
     TORCH_CHECK(
-        cublasLtMatmulDescCreate(&desc.op_desc, compute_type, data_type) == CUBLAS_STATUS_SUCCESS,
+        cublasLtMatmulDescCreate(&desc.op_desc, compute_type, CUDA_R_32F) == CUBLAS_STATUS_SUCCESS,
         "cuBLASLt error");
     cublasOperation_t trans_a = CUBLAS_OP_N;
     cublasOperation_t trans_b = CUBLAS_OP_T; // B is [N, K] but treated as transposed
@@ -618,17 +792,30 @@ torch::Tensor indexed_batched_linear(
     TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_b, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt error");
     TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_c, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt error");
     // Configure strided batched A/B/C (base pointers + batch stride)
-    const int32_t batch_count = static_cast<int32_t>(batch_size);
-    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_a, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt error");
-    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_b, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt error");
-    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_c, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt error");
-    long long stride_a = static_cast<long long>(M) * static_cast<long long>(K);
-    long long stride_b = static_cast<long long>(N) * static_cast<long long>(K);
-    long long stride_c = static_cast<long long>(M) * static_cast<long long>(N);
-    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_a, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_a, sizeof(stride_a)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt error");
-    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_b, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_b, sizeof(stride_b)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt error");
-    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_c, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_c, sizeof(stride_c)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt error");
+    // 1) Batch count: cuBLASLt expects a 32-bit int for this attribute on CUDA 12.x
+    const int batch_count = static_cast<int>(batch_size);
+    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(
+        desc.layout_a, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)) == CUBLAS_STATUS_SUCCESS, "A batch size cuBLASLt error");
+    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(
+        desc.layout_b, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)) == CUBLAS_STATUS_SUCCESS, "B batch size cuBLASLt error");
+    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(
+        desc.layout_c, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)) == CUBLAS_STATUS_SUCCESS, "C batch size cuBLASLt error");
 
+    // 2) Strides must be **bytes**. Use the real tensor element size (handles FP16/BF16/FP32)
+    const long long elem_bytes = static_cast<long long>(input_cast.element_size()); // 2 for FP16/BF16, 4 for FP32
+    const long long stride_a_bytes = static_cast<long long>(M) * static_cast<long long>(K) * elem_bytes; // A: [M,K]
+    const long long stride_b_bytes = static_cast<long long>(N) * static_cast<long long>(K) * elem_bytes; // B: [N,K] (transB=T)
+    const long long stride_c_bytes = static_cast<long long>(M) * static_cast<long long>(N) * elem_bytes; // C: [M,N]
+
+    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(
+        desc.layout_a, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+        &stride_a_bytes, sizeof(stride_a_bytes)) == CUBLAS_STATUS_SUCCESS, "A stride cuBLASLt error");
+    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(
+        desc.layout_b, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+        &stride_b_bytes, sizeof(stride_b_bytes)) == CUBLAS_STATUS_SUCCESS, "B stride cuBLASLt error");
+    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(
+        desc.layout_c, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+    &stride_c_bytes, sizeof(stride_c_bytes)) == CUBLAS_STATUS_SUCCESS, "C stride cuBLASLt error");
     size_t workspace_size = 1 << 22; // 4MB
     auto workspace = torch::empty({static_cast<long>(workspace_size)}, input_cast.options().dtype(torch::kByte));
 
@@ -653,8 +840,11 @@ torch::Tensor indexed_batched_linear(
             " (", static_cast<int>(st), ")");
     }
 
-    cublasLtMatmulHeuristicResult_t heuristic;
+    dumpLtConfigLt(handle, desc.op_desc, desc.layout_a, desc.layout_b, desc.layout_c, preference);
+
+    cublasLtMatmulHeuristicResult_t heuristic{};
     int returned_results = 0;
+
     auto st = cublasLtMatmulAlgoGetHeuristic(
         handle,
         desc.op_desc,
@@ -667,12 +857,20 @@ torch::Tensor indexed_batched_linear(
         &heuristic,
         &returned_results);
 
+    std::cout << "cublasLtMatmulAlgoGetHeuristic status=" << (int)st
+            << " returned=" << returned_results << "\n";
+
+    if (st == CUBLAS_STATUS_SUCCESS && returned_results > 0) {
+        dumpHeuristic(heuristic);
+    } else {
+        std::cerr << "No heuristic. Check: ORDER vs LD, batch stride BYTES, compute/scale types, epilogue/bias.\n";
+    }
+
     // NEW: No fallback. If a heuristic is not found, it's a fatal error.
     TORCH_CHECK(
         st == CUBLAS_STATUS_SUCCESS && returned_results > 0,
         "indexed_batched_linear: cublasLtMatmulAlgoGetHeuristic failed to find a valid algorithm. ",
-        "This is a fatal error, indicating that a matrix multiplication dimension is not aligned for hardware acceleration (e.g., not a multiple of 8 for FP16). ",
-        "Check your model's linear layer dimensions. ",
+        "This is a fatal error.",
         "M=", time_steps, ", N=", out_dim, ", K=", in_dim, ", batch=", batch_size,
         ", cuBLAS status: ", cublas_status_to_string(st)
     );
@@ -701,7 +899,7 @@ torch::Tensor indexed_batched_linear(
         &heuristic.algo,
         workspace_size ? workspace.data_ptr() : nullptr,
         workspace_size,
-        stream);
+        raw_stream);
     if (input_cast.is_cuda()) { torch::cuda::synchronize(); }
     auto gemm_t1 = Clock::now();
     timers["linear_cublas_matmul_us"] += std::chrono::duration_cast<Microseconds>(gemm_t1 - gemm_t0);

@@ -71,8 +71,7 @@ cuda_ver_suffix = os.environ.get("CUDA_VER_SUFFIX", "")  # e.g., "-12.9" if you 
 cuda_root_candidates = [
     cuda_home,
     f"{cuda_home}{cuda_ver_suffix}",
-    "/usr/local/cuda-12.9",
-    "/usr/local/cuda-12.8",
+    "/usr/local/cuda-13.0"
 ]
 cuda_include_dirs = []
 cuda_lib_dirs = []
