@@ -595,11 +595,19 @@ forward_packed_cpp(
                 input_ptrs.push_back(input_ptr);
                 output_ptrs.push_back(output_ptr);
 
-                // Look up pre-cached, stable GPU pointers
-                w1_ptrs.push_back(w1_ptr_data[policy_id * num_experts_in_cache + expert_id]);
-                b1_ptrs.push_back(b1_ptr_data[policy_id * num_experts_in_cache + expert_id]);
-                w2_ptrs.push_back(w2_ptr_data[policy_id * num_experts_in_cache + expert_id]);
-                b2_ptrs.push_back(b2_ptr_data[policy_id * num_experts_in_cache + expert_id]);
+                // Look up pre-cached, stable GPU pointers with bounds checking
+                const int64_t ptr_index = policy_id * num_experts_in_cache + expert_id;
+                const int64_t max_ptr_index = num_policies_in_cache * num_experts_in_cache;
+                TORCH_CHECK(ptr_index >= 0 && ptr_index < max_ptr_index,
+                    "Pointer table index out of bounds: ptr_index=", ptr_index,
+                    " (policy_id=", policy_id, ", expert_id=", expert_id, ")",
+                    ", max_index=", max_ptr_index,
+                    " (num_policies=", num_policies_in_cache, ", num_experts=", num_experts_in_cache, ")");
+
+                w1_ptrs.push_back(w1_ptr_data[ptr_index]);
+                b1_ptrs.push_back(b1_ptr_data[ptr_index]);
+                w2_ptrs.push_back(w2_ptr_data[ptr_index]);
+                b2_ptrs.push_back(b2_ptr_data[ptr_index]);
 
                 group_m_sizes.push_back(count);
 
@@ -609,7 +617,17 @@ forward_packed_cpp(
             // Expert FFN dimension from one of the original tensors (shape only)
             const int64_t ffn_dim = get_weight(batched_weights, layer_prefix + ".moe.experts.w1").size(-2);
 
-            if (!groups.empty()) {
+            if (!group_m_sizes.empty()) {
+                std::cout << "[DEBUG MoE FFN] Executing grouped_ffn_gemm_forward with "
+                          << group_m_sizes.size() << " groups, ffn_dim=" << ffn_dim
+                          << ", hidden_dim=" << hidden_dim << std::endl;
+                std::cout << "[DEBUG MoE FFN] First 3 group sizes: ";
+                for (size_t i = 0; i < std::min(size_t(3), group_m_sizes.size()); ++i) {
+                    std::cout << group_m_sizes[i] << " ";
+                }
+                std::cout << std::endl;
+                std::cout << "[DEBUG MoE FFN] First w1 pointer: 0x" << std::hex << w1_ptrs[0] << std::dec << std::endl;
+
                 grouped_ffn_gemm_forward(
                     input_ptrs.data(),
                     w1_ptrs.data(),
@@ -618,10 +636,14 @@ forward_packed_cpp(
                     b2_ptrs.data(),
                     output_ptrs.data(),
                     group_m_sizes.data(),
-                    static_cast<int64_t>(groups.size()),
+                    static_cast<int64_t>(group_m_sizes.size()),
                     hidden_dim,
                     ffn_dim
                 );
+
+                std::cout << "[DEBUG MoE FFN] grouped_ffn_gemm_forward completed successfully" << std::endl;
+            } else {
+                std::cout << "[DEBUG MoE FFN] Skipping grouped_ffn_gemm_forward: group_m_sizes is empty" << std::endl;
             }
 
             auto sorted_weights_half = sorted_routing_weights.to(expert_outputs.dtype()).unsqueeze(-1);

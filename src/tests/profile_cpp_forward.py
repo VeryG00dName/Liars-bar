@@ -76,6 +76,32 @@ def _extract_state_dict(ckpt) -> Mapping:
     raise TypeError("Could not find a tensor mapping in checkpoint (try 'model_state_dict').")
 
 
+# -----------------------------
+# Legacy weight compatibility
+# -----------------------------
+def _pad_obs_encoder_input_inplace(state_dict: dict, target_in_dim: int = 16) -> bool:
+    """Pad obs_encoder.0.weight from [out,9] -> [out,16] if needed (mutates in place).
+
+    Returns True if any padding was applied.
+    """
+    key = "obs_encoder.0.weight"
+    if key not in state_dict:
+        return False
+    w = state_dict[key]
+    if not torch.is_tensor(w) or w.ndim != 2:
+        return False
+    in_dim = int(w.size(1))
+    if in_dim >= target_in_dim:
+        return False
+    out_dim = int(w.size(0))
+    pad = target_in_dim - in_dim
+    w_cpu = w.detach().to("cpu")
+    zeros = torch.zeros((out_dim, pad), dtype=w_cpu.dtype, device=w_cpu.device)
+    state_dict[key] = torch.cat([w_cpu, zeros], dim=1)
+    print(f"[INFO] Padded {key} from [{out_dim},{in_dim}] to [{out_dim},{target_in_dim}] (profiling)")
+    return True
+
+
 def _to_device_fp16(sd: Mapping, device="cuda") -> dict:
     """
     Convert only floating-point tensors to fp16 and move all tensors to `device`.
@@ -324,6 +350,11 @@ def load_checkpoint_weights(checkpoint_path, device="cuda"):
     # Extract and convert weights
     print("Converting weights to FP16 and moving to GPU...")
     state_dict = _extract_state_dict(checkpoint)
+    # Backward-compat pad: ensure obs_encoder input dim is 16 if legacy 9
+    try:
+        _pad_obs_encoder_input_inplace(state_dict, target_in_dim=16)
+    except Exception as _e:
+        print(f"[WARN] Padding obs_encoder.0.weight failed during load: {_e}")
     
     processed_dict = _to_device_fp16(state_dict, device=device)
 
@@ -597,6 +628,11 @@ def profile_multi_policy(checkpoint_path: str, batch_size: int, seq_len: int, nu
 
     # Extract raw state dict (CPU, FP32)
     state_dict = _extract_state_dict(base_ckpt)
+    # Backward-compat pad for legacy 9-dim obs
+    try:
+        _pad_obs_encoder_input_inplace(state_dict, target_in_dim=16)
+    except Exception as _e:
+        print(f"[WARN] Padding obs_encoder.0.weight failed for multi-policy: {_e}")
 
     # Filter to only tensors
     tensor_only = {k: v for k, v in state_dict.items() if torch.is_tensor(v)}

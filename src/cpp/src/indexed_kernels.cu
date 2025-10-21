@@ -13,6 +13,7 @@
 #include <vector>
 #include <chrono>
 #include <mutex>
+#include <iostream>
 // cuBLASLt debug dump (CUDA 12.9-compatible)
 // Put this in a .cu/.cpp compiled with the same includes as your Lt code.
 
@@ -461,7 +462,20 @@ void grouped_ffn_gemm_forward(
     int64_t hidden_dim,
     int64_t ffn_dim) {
 
-    if (group_count == 0) return;
+    if (group_count == 0) {
+        std::cout << "[DEBUG FFN GEMM] group_count=0, returning early" << std::endl;
+        return;
+    }
+    std::cout << "test!!!!!!!!!!!!!!!!!!";
+    std::cout << "[DEBUG FFN GEMM] Starting grouped FFN: group_count=" << group_count
+              << ", hidden_dim=" << hidden_dim << ", ffn_dim=" << ffn_dim << std::endl;
+
+    // Debug: print first few group sizes
+    for (int64_t i = 0; i < std::min(group_count, 3L); ++i) {
+        std::cout << "[DEBUG FFN GEMM] Group " << i << ": m_size=" << m_sizes[i]
+                  << ", input_ptr=0x" << std::hex << input_ptrs[i]
+                  << ", w1_ptr=0x" << w1_ptrs[i] << std::dec << std::endl;
+    }
 
     // Get cuBLAS handle and CUDA stream
     auto handle = at::cuda::getCurrentCUDABlasHandle();
@@ -748,14 +762,82 @@ torch::Tensor indexed_batched_linear(
     if (policy_contig.device() != input.device()) {
         policy_contig = policy_contig.to(input.device());
     }
+    // Validate policy indices are within bounds before index_select
+    auto policy_max = policy_contig.max();
+    auto policy_min = policy_contig.min();
+    
+    // CLAMPING: Ensure indices are within the valid range of the weight_cache.
+    // This is a safeguard against invalid policy IDs being passed from the Python side.
+    auto clamped_policy_indices = torch::clamp(policy_contig, 0, weight_contig.size(0) - 1);
+
+    if (!torch::equal(policy_contig, clamped_policy_indices)) {
+        std::cerr << "[WARN] Clamping policy indices. Original min=" << policy_min.item<int64_t>()
+                  << ", max=" << policy_max.item<int64_t>()
+                  << ". Clamped to [0, " << weight_contig.size(0) - 1 << "]" << std::endl;
+    }
+
+    TORCH_CHECK(policy_min.item<int64_t>() >= 0,
+        "indexed_batched_linear: policy indices contain negative values: min=", policy_min.item<int64_t>());
+    TORCH_CHECK(policy_max.item<int64_t>() < weight_contig.size(0),
+        "indexed_batched_linear: policy index out of bounds: max_index=", policy_max.item<int64_t>(),
+        ", weight_cache_size=", weight_contig.size(0),
+        " (batch_size=", batch_size, ", time_steps=", time_steps, ")");
+
+    // DEBUG: Print policy indices and weight cache size
+    std::cout << "[DBG idx_select] weight_cache_size=" << weight_contig.size(0)
+              << ", policy_indices_size=" << policy_contig.size(0)
+              << ", min=" << policy_min.item<int64_t>()
+              << ", max=" << policy_max.item<int64_t>()
+              << ", weight_cache_dims=" << weight_contig.dim()
+              << ", weight_cache_shape=[";
+    for (int64_t i = 0; i < weight_contig.dim(); ++i) {
+        if (i > 0) std::cout << ",";
+        std::cout << weight_contig.size(i);
+    }
+    std::cout << "]" << std::endl;
+    if (policy_contig.size(0) <= 20) {
+        std::cout << "[DBG idx_select] policy_indices=[";
+        auto policy_cpu = policy_contig.cpu();
+        auto policy_accessor = policy_cpu.accessor<int64_t, 1>();
+        for (int64_t i = 0; i < policy_contig.size(0); ++i) {
+            if (i > 0) std::cout << ",";
+            std::cout << policy_accessor[i];
+        }
+        std::cout << "]" << std::endl;
+    }
+
     auto t0 = Clock::now();
-    auto weight_batched = weight_contig.index_select(0, policy_contig).contiguous(); // [B, out, in]
-    auto bias_batched = bias_contig.index_select(0, policy_contig).contiguous();     // [B, out]
+    auto weight_batched = weight_contig.index_select(0, clamped_policy_indices).contiguous(); // [B, out, in]
+    auto bias_batched = bias_contig.index_select(0, clamped_policy_indices).contiguous();     // [B, out]
     torch::cuda::synchronize();
     auto t1 = Clock::now();
     timers["linear_index_select_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
 
     auto output = torch::empty({batch_size, time_steps, out_dim}, input_cast.options());
+
+    // CRITICAL VALIDATION: Check that index_select didn't produce invalid tensors
+    TORCH_CHECK(weight_batched.is_contiguous(),
+        "weight_batched must be contiguous after index_select");
+    TORCH_CHECK(weight_batched.size(0) == batch_size,
+        "weight_batched size mismatch: expected ", batch_size, " got ", weight_batched.size(0));
+    TORCH_CHECK(weight_batched.size(1) == out_dim && weight_batched.size(2) == in_dim,
+        "weight_batched shape mismatch: expected [", batch_size, ",", out_dim, ",", in_dim, "]",
+        " got [", weight_batched.size(0), ",", weight_batched.size(1), ",", weight_batched.size(2), "]");
+    TORCH_CHECK(input_cast.is_contiguous(),
+        "input_cast must be contiguous, got strides: ", input_cast.strides());
+    TORCH_CHECK(input_cast.size(0) == batch_size && input_cast.size(1) == time_steps && input_cast.size(2) == in_dim,
+        "input_cast shape mismatch: expected [", batch_size, ",", time_steps, ",", in_dim, "]",
+        " got [", input_cast.size(0), ",", input_cast.size(1), ",", input_cast.size(2), "]");
+
+    // Debug: print tensor info before cuBLASLt
+    std::cout << "[DBG Linear] batch=" << batch_size << ", time_steps=" << time_steps
+              << ", in_dim=" << in_dim << ", out_dim=" << out_dim << std::endl;
+    std::cout << "[DBG Linear] input_ptr=0x" << std::hex
+              << reinterpret_cast<uintptr_t>(input_cast.data_ptr()) << std::dec
+              << ", input_size=" << (input_cast.numel() * input_cast.element_size()) << " bytes" << std::endl;
+    std::cout << "[DBG Linear] weight_batched_ptr=0x" << std::hex
+              << reinterpret_cast<uintptr_t>(weight_batched.data_ptr()) << std::dec
+              << ", size=" << (weight_batched.numel() * weight_batched.element_size()) << " bytes" << std::endl;
 
     auto handle = at::cuda::getCurrentCUDABlasLtHandle();
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -931,4 +1013,3 @@ torch::Tensor indexed_batched_linear(
 
     return output;
 }
-
