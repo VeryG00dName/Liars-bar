@@ -655,38 +655,29 @@ torch::Tensor indexed_batched_linear(
 
     cublasLtMatmulHeuristicResult_t heuristic;
     int returned_results = 0;
-    {
-        auto st = cublasLtMatmulAlgoGetHeuristic(
-            handle,
-            desc.op_desc,
-            desc.layout_a,
-            desc.layout_b,
-            desc.layout_c,
-            desc.layout_c,
-            preference,
-            1,
-            &heuristic,
-            &returned_results);
+    auto st = cublasLtMatmulAlgoGetHeuristic(
+        handle,
+        desc.op_desc,
+        desc.layout_a,
+        desc.layout_b,
+        desc.layout_c,
+        desc.layout_c,
+        preference,
+        1,
+        &heuristic,
+        &returned_results);
 
-        // Fallback to torch::matmul if cuBLASLt can't find a heuristic
-        // This typically happens with small, misaligned dimensions (e.g., K=9 with FP16)
-        if (st != CUBLAS_STATUS_SUCCESS || returned_results == 0) {
-            cublasLtMatmulPreferenceDestroy(preference);
+    // NEW: No fallback. If a heuristic is not found, it's a fatal error.
+    TORCH_CHECK(
+        st == CUBLAS_STATUS_SUCCESS && returned_results > 0,
+        "indexed_batched_linear: cublasLtMatmulAlgoGetHeuristic failed to find a valid algorithm. ",
+        "This is a fatal error, indicating that a matrix multiplication dimension is not aligned for hardware acceleration (e.g., not a multiple of 8 for FP16). ",
+        "Check your model's linear layer dimensions. ",
+        "M=", time_steps, ", N=", out_dim, ", K=", in_dim, ", batch=", batch_size,
+        ", cuBLAS status: ", cublas_status_to_string(st)
+    );
 
-            // Use PyTorch's matmul which handles any matrix size
-            auto fb0 = Clock::now();
-            auto result = torch::matmul(input_cast, weight_batched.transpose(-1, -2));
-            result.add_(bias_batched.unsqueeze(1));
-            if (epilogue == IndexedLinearEpilogue::BiasGELU) {
-                result = torch::gelu(result);
-            }
-            if (input_cast.is_cuda()) { torch::cuda::synchronize(); }
-            auto fb1 = Clock::now();
-            timers["linear_matmul_fallback_us"] += std::chrono::duration_cast<Microseconds>(fb1 - fb0);
-            return result;
-        }
-    }
-
+    // Fast path is now the ONLY path.
     float alpha_float = 1.0f;
     float beta_float = 0.0f;
     const void* alpha_ptr = &alpha_float;

@@ -754,34 +754,58 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
     torch::NoGradGuard no_grad;
 
     auto opts_long_device = torch::TensorOptions().dtype(torch::kInt64).device(kInferenceDevice);
-    const size_t batch_limit = static_cast<size_t>(std::max(1, inference_batch_size_));
 
-    // DEBUG: Log batching info
-    static int total_calls = 0;
-    if (total_calls++ < 5) {
-        fprintf(stderr, "[EvalManager] run_packed_historical_inference: %zu requests, batch_limit=%zu\n",
-                refs.size(), batch_limit);
+    // --- Single Padded Sequence Length Strategy ---
+
+    // 1. Find max sequence length in this entire group of requests
+    int64_t max_len = 1;
+    for (const auto& ref : refs) {
+        max_len = std::max(max_len, static_cast<int64_t>(ref.request->valid_len));
     }
 
+    // 2. Pad this max length to the nearest "good" bucket size
+    constexpr std::array<int64_t, 8> kSeqLenBuckets = {{32, 64, 128, 192, 256, 512}};
+    int64_t target_pad_len = kSeqLenBuckets.back();
+    for (int64_t b : kSeqLenBuckets) {
+        if (max_len <= b) {
+            target_pad_len = b;
+            break;
+        }
+    }
+
+    // Define BATCH SIZE buckets
+    constexpr std::array<size_t, 7> kBatchSizeBuckets{{8, 16, 32, 64, 128, 256, 512}};
+    const size_t max_batch_bucket_size = kBatchSizeBuckets.back();
+
+    // 3. Process requests in chunks, all using the same target_pad_len
     size_t offset = 0;
-    size_t num_batches = 0;
     while (offset < refs.size()) {
-        ++num_batches;
-        size_t remaining = refs.size() - offset;
-        size_t take = std::min(remaining, batch_limit);
+        const size_t num_real_requests = std::min(refs.size() - offset, max_batch_bucket_size);
+
+        size_t target_batch_size = num_real_requests;
+        for (size_t bucket_size : kBatchSizeBuckets) {
+            if (num_real_requests <= bucket_size) {
+                target_batch_size = bucket_size;
+                break;
+            }
+        }
+        const size_t num_padding_requests = target_batch_size - num_real_requests;
 
         auto prep_t0 = Clock::now();
         std::vector<PolicyRequest> batch_requests;
-        batch_requests.reserve(take);
-        std::vector<const RequestRef*> batch_refs;
-        batch_refs.reserve(take);
+        batch_requests.reserve(target_batch_size);
+        std::vector<const RequestRef*> current_batch_refs;
+        current_batch_refs.reserve(num_real_requests);
         std::vector<int64_t> cache_indices;
-        cache_indices.reserve(take);
+        cache_indices.reserve(target_batch_size);
+        std::vector<size_t> sequential_indices;
+        sequential_indices.reserve(target_batch_size);
 
-        for (size_t i = 0; i < take; ++i) {
+        for (size_t i = 0; i < num_real_requests; ++i) {
             const RequestRef& ref = refs[offset + i];
             batch_requests.push_back(*ref.request);
-            batch_refs.push_back(&ref);
+            current_batch_refs.push_back(&ref);
+            sequential_indices.push_back(i);
             auto cache_it = policy_id_to_cache_index_.find(ref.policy_id);
             if (cache_it == policy_id_to_cache_index_.end()) {
                 throw std::runtime_error("Missing cache index for policy " + std::to_string(ref.policy_id));
@@ -789,32 +813,34 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
             cache_indices.push_back(static_cast<int64_t>(cache_it->second));
         }
 
-        auto tensor_batch = prepare_inference_batch(batch_requests, kInferenceDevice);
+        if (num_padding_requests > 0 && num_real_requests > 0) {
+            const PolicyRequest& padding_template = *refs[offset].request;
+            int64_t last_valid_cache_index = cache_indices.back();
+            for (size_t i = 0; i < num_padding_requests; ++i) {
+                batch_requests.push_back(padding_template);
+                cache_indices.push_back(last_valid_cache_index);
+                sequential_indices.push_back(num_real_requests + i);
+            }
+        }
+        
+        // 4. Prepare batch with the UNIFIED target_pad_len and correct indices
+        auto tensor_batch = prepare_inference_batch(batch_requests, target_pad_len, kInferenceDevice, sequential_indices);
+        
         if (!tensor_batch.obs_sequence.defined()) {
-            auto prep_t1 = Clock::now();
-            timer_hist_prep_batch_ +=
-                std::chrono::duration_cast<Microseconds>(prep_t1 - prep_t0);
-            offset += take;
+            offset += num_real_requests;
             continue;
         }
 
         if (tensor_batch.obs_sequence.dtype() != torch::kFloat16) {
             tensor_batch.obs_sequence = tensor_batch.obs_sequence.to(torch::kFloat16);
         }
-
+        
+        auto policy_index_tensor = torch::tensor(cache_indices, opts_long_device);
+        
         auto prep_t1 = Clock::now();
         timer_hist_prep_batch_ += std::chrono::duration_cast<Microseconds>(prep_t1 - prep_t0);
 
-        auto weights_t0 = Clock::now();
-        auto policy_index_tensor = torch::tensor(cache_indices, opts_long_device);
-
-        auto weights_t1 = Clock::now();
-        timer_hist_prep_weights_ +=
-            std::chrono::duration_cast<Microseconds>(weights_t1 - weights_t0);
-
         auto model_t0 = Clock::now();
-
-        // Call our C++ forward function, letting it handle per-request weight selection
         auto [action_logits, opp_logits, state_values, win_logits] = forward_packed_cpp(
             tensor_batch.obs_sequence,
             tensor_batch.action_sequence,
@@ -832,42 +858,40 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
             tflag_pad_,
             detailed_timers_
         );
-
         torch::cuda::synchronize();
         auto model_t1 = Clock::now();
-        timer_hist_model_exec_ +=
-            std::chrono::duration_cast<Microseconds>(model_t1 - model_t0);
+        timer_hist_model_exec_ += std::chrono::duration_cast<Microseconds>(model_t1 - model_t0);
 
         auto post_t0 = Clock::now();
         action_logits = action_logits.contiguous();
         auto valid_lengths_device = tensor_batch.valid_lengths;
 
-        const int64_t batch_size = static_cast<int64_t>(take);
-        auto batch_indices = torch::arange(batch_size, opts_long_device);
+        const int64_t current_batch_size = static_cast<int64_t>(target_batch_size);
+        auto batch_indices = torch::arange(current_batch_size, opts_long_device);
         auto last_indices = (valid_lengths_device - 1).clamp_min(0);
         auto last_logits = action_logits.index({batch_indices, last_indices}).contiguous();
         auto last_masks = tensor_batch.action_masks.index({batch_indices, last_indices}).contiguous();
 
-        auto has_legal = last_masks.any(1);
-        if (!has_legal.all().item<bool>()) {
-            auto fallback_indices = has_legal.logical_not().nonzero().flatten();
-            for (int64_t i = 0; i < fallback_indices.size(0); ++i) {
-                const int64_t row = fallback_indices[i].item<int64_t>();
-                auto mask_row_tensor = last_masks.select(0, row);
-                mask_row_tensor.fill_(false);
-                bool assigned = false;
-                const auto& ref = *batch_refs[static_cast<size_t>(row)];
-                const auto& req = *ref.request;
-                for (int j = 0; j < 7; ++j) {
-                    if (req.mask[j]) {
-                        mask_row_tensor.index_put_({j}, true);
-                        assigned = true;
+        if (num_real_requests > 0) {
+            auto real_has_legal = last_masks.slice(0, 0, num_real_requests).any(1);
+            if (!real_has_legal.all().item<bool>()) {
+                auto fallback_indices = real_has_legal.logical_not().nonzero().flatten();
+                for (int64_t i = 0; i < fallback_indices.size(0); ++i) {
+                    const int64_t row = fallback_indices[i].item<int64_t>();
+                    auto mask_row_tensor = last_masks.select(0, row);
+                    mask_row_tensor.fill_(false);
+                    bool assigned = false;
+                    const auto& ref = *current_batch_refs[static_cast<size_t>(row)];
+                    const auto& req = *ref.request;
+                    for (int j = 0; j < 7; ++j) {
+                        if (req.mask[j]) {
+                            mask_row_tensor.index_put_({j}, true);
+                            assigned = true;
+                        }
                     }
+                    if (!assigned) mask_row_tensor.fill_(true);
+                    last_logits.select(0, row).fill_(0.0f);
                 }
-                if (!assigned) {
-                    mask_row_tensor.fill_(true);
-                }
-                last_logits.select(0, row).fill_(0.0f);
             }
         }
 
@@ -877,8 +901,8 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
         actions_tensor = actions_tensor.squeeze(-1).to(torch::kCPU);
 
         auto actions_ptr = actions_tensor.data_ptr<int64_t>();
-        for (size_t i = 0; i < take; ++i) {
-            const auto& ref = *batch_refs[i];
+        for (size_t i = 0; i < num_real_requests; ++i) {
+            const auto& ref = *current_batch_refs[i];
             auto out_it = out_actions.find(ref.policy_id);
             if (out_it == out_actions.end()) {
                 throw std::runtime_error("Missing output buffer for policy " + std::to_string(ref.policy_id));
@@ -891,22 +915,8 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
 
         auto post_t1 = Clock::now();
         timer_hist_post_ += std::chrono::duration_cast<Microseconds>(post_t1 - post_t0);
-
-        offset += take;
-
-        // Force release of intermediate tensors to avoid memory buildup
-        if (offset % (batch_limit * 4) == 0) {
-
-            // WSL/Linux build path: release CUDA caching allocator pages
-            at::accelerator::emptyCache();
-
-        }
-    }
-
-    // DEBUG: Log number of batches processed
-    if (total_calls <= 5) {
-        fprintf(stderr, "[EvalManager] Processed %zu requests in %zu batches (avg %.1f per batch)\n",
-                refs.size(), num_batches, refs.size() / (double)num_batches);
+        
+        offset += num_real_requests;
     }
 }
 
