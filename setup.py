@@ -23,12 +23,12 @@ SOURCES = sorted(
 )
 
 # Toggle with: PROFILE=1 python setup.py build_ext -i
-PROFILE = 0
+PROFILE = 1
 
 def linux_macos_flags(profile: bool):
     if profile:
         cxx = ["-O2", "-g", "-fno-omit-frame-pointer", "-fno-lto", "-std=c++17", "-UNDEBUG"]
-        nvcc = ["-O2", "-lineinfo"]
+        nvcc = ["-O0", "-G", "-lineinfo", "-Xptxas", "-O0"]
         link = ["-fno-lto"]
     else:
         cxx = ["-O3", "-DNDEBUG", "-std=c++17"]

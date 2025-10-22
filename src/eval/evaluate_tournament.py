@@ -497,7 +497,7 @@ def main() -> None:
         help="Configure PyTorch determinism knobs; defaults to the fastest ('none').",
     )
     args = parser.parse_args()
-    apply_determinism_settings(args.determinism_level)
+    #apply_determinism_settings(args.determinism_level)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     run_specs = parse_run_specs(args.eval_runs)
     if not args.cpp_bots:

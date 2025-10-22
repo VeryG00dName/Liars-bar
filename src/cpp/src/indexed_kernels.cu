@@ -258,6 +258,22 @@ __global__ void indexed_batched_layer_norm_kernel(
     int64_t time_steps,
     int64_t hidden_dim,
     double eps) {
+    
+    // Debug printing in kernel
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        printf("LayerNorm Kernel Debug:\n");
+        printf("Input ptr: %p\n", (void*)input);
+        printf("Batch size: %ld, Time steps: %ld, Hidden dim: %ld\n", 
+               batch_size, time_steps, hidden_dim);
+        printf("Epsilon: %e\n", eps);
+        
+        // Print first few input values
+        printf("First few input values:\n");
+        for (int i = 0; i < min(10, (int)hidden_dim); i++) {
+            printf("%f ", (float)input[i]);
+        }
+        printf("\n");
+    }
     const int64_t token_index = blockIdx.x;
     if (token_index >= batch_size * time_steps) {
         return;
@@ -296,7 +312,32 @@ __global__ void indexed_batched_layer_norm_kernel(
         shared_sum = block_sum / static_cast<acc_t>(hidden_dim);
     }
     __syncthreads();
-    const acc_t mean = shared_sum;
+    const acc_t mean = shared_sum / static_cast<acc_t>(hidden_dim);
+
+    // Enhanced debug: Check input values and print statistics
+    if (blockIdx.x < 5 && threadIdx.x == 0) {
+        acc_t max_abs_val = 0.0f;
+        acc_t min_val = 1e9;
+        acc_t max_val = -1e9;
+        bool has_nan = false;
+        bool has_inf = false;
+        
+        for (int64_t h = 0; h < hidden_dim; h++) {
+            acc_t val = static_cast<acc_t>(input[blockIdx.x * hidden_dim + h]);
+            if (isnan(val)) has_nan = true;
+            if (isinf(val)) has_inf = true;
+            max_abs_val = max(max_abs_val, fabs(val));
+            min_val = min(min_val, val);
+            max_val = max(max_val, val);
+        }
+        
+        printf("Token %ld stats:\n", blockIdx.x);
+        printf("  Range: [%f, %f]\n", (float)min_val, (float)max_val);
+        printf("  Max abs value: %f\n", (float)max_abs_val);
+        printf("  Mean: %f\n", (float)mean);
+        printf("  Has NaN: %s\n", has_nan ? "YES" : "NO");
+        printf("  Has Inf: %s\n", has_inf ? "YES" : "NO");
+    }
 
     acc_t thread_var = static_cast<acc_t>(0);
     for (int64_t h = threadIdx.x; h < hidden_dim; h += blockDim.x) {
@@ -317,6 +358,12 @@ __global__ void indexed_batched_layer_norm_kernel(
     __syncthreads();
 
     const acc_t inv_std = rsqrt(shared_var + static_cast<acc_t>(eps));
+
+    // Debug: Print variance and inv_std for first few tokens
+    if (blockIdx.x < 5 && threadIdx.x == 0) {
+        printf("Token %ld - Variance: %f, Inv_std: %f\n", 
+               blockIdx.x, (float)shared_var, (float)inv_std);
+    }
 
     for (int64_t h = threadIdx.x; h < hidden_dim; h += blockDim.x) {
         const acc_t norm = (static_cast<acc_t>(input_ptr[h]) - mean) * inv_std;
@@ -395,6 +442,10 @@ torch::Tensor indexed_batched_embedding(
     TORCH_CHECK(weight_cache.dim() == 3, "Embedding cache must be [W, vocab, hidden]");
     TORCH_CHECK(indices.dim() == 2, "Indices must be [B, T]");
     TORCH_CHECK(policy_indices.dim() == 1, "policy_indices must be [B]");
+    // Debug: Check for NaN/Inf/negative values in indices (should be integer indices)
+    TORCH_CHECK(!indices.isnan().any().item<bool>(), "Embedding indices contain NaN");
+    TORCH_CHECK(!indices.isinf().any().item<bool>(), "Embedding indices contain Inf");
+    TORCH_CHECK((indices >= 0).all().item<bool>(), "Embedding indices contain negative values");
 
     auto vocab_size = weight_cache.size(1);
     auto hidden_dim = weight_cache.size(2);
@@ -463,24 +514,12 @@ void grouped_ffn_gemm_forward(
     int64_t ffn_dim) {
 
     if (group_count == 0) {
-        std::cout << "[DEBUG FFN GEMM] group_count=0, returning early" << std::endl;
         return;
-    }
-    std::cout << "test!!!!!!!!!!!!!!!!!!";
-    std::cout << "[DEBUG FFN GEMM] Starting grouped FFN: group_count=" << group_count
-              << ", hidden_dim=" << hidden_dim << ", ffn_dim=" << ffn_dim << std::endl;
-
-    // Debug: print first few group sizes
-    for (int64_t i = 0; i < std::min(group_count, 3L); ++i) {
-        std::cout << "[DEBUG FFN GEMM] Group " << i << ": m_size=" << m_sizes[i]
-                  << ", input_ptr=0x" << std::hex << input_ptrs[i]
-                  << ", w1_ptr=0x" << w1_ptrs[i] << std::dec << std::endl;
     }
 
     // Get cuBLAS handle and CUDA stream
     auto handle = at::cuda::getCurrentCUDABlasHandle();
     auto stream = at::cuda::getCurrentCUDAStream();
-
     // We'll use FP16 for all operations (input is already FP16 from caller)
     const cudaDataType_t data_type = CUDA_R_16F;
     const cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F_FAST_16F;
@@ -515,20 +554,6 @@ void grouped_ffn_gemm_forward(
         auto* w2_ptr = reinterpret_cast<const at::Half*>(w2_ptrs[group_idx]);
         auto* b2_ptr = reinterpret_cast<const at::Half*>(b2_ptrs[group_idx]);
         auto* output_ptr = reinterpret_cast<at::Half*>(output_ptrs[group_idx]);
-
-        // Validation: sample first weight value to verify pointer is valid
-        static bool validated_weights = false;
-        if (!validated_weights && group_idx == 0) {
-            auto w1_sample = torch::from_blob(
-                const_cast<at::Half*>(w1_ptr),
-                {ffn_dim, hidden_dim},
-                torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA)
-            );
-            at::Half val = w1_sample[0][0].item<at::Half>();
-            fprintf(stderr, "[DEBUG GEMM] Group 0 w1[0][0] = %f (ptr=0x%lx)\n",
-                    static_cast<float>(val), reinterpret_cast<uintptr_t>(w1_ptr));
-            validated_weights = true;
-        }
 
         // ====================================================================
         // First GEMM: hidden = input @ w1.T
@@ -669,6 +694,62 @@ torch::Tensor indexed_batched_layer_norm(
     TORCH_CHECK(input.dim() == 3, "input must be [B, T, H]");
     TORCH_CHECK(gamma_cache.dim() == 2, "gamma cache must be [W, H]");
     TORCH_CHECK(beta_cache.dim() == 2, "beta cache must be [W, H]");
+    
+    // Detailed input validation
+    auto fp32_input = input.to(torch::kFloat32);
+    auto abs_input = fp32_input.abs();
+    auto max_val = abs_input.max().item<float>();
+    auto mean_val = fp32_input.mean().item<float>();
+    auto std_val = fp32_input.std().item<float>();
+    
+    std::cerr << "\nLayerNorm Input Validation:\n"
+              << "Max abs value: " << max_val << "\n"
+              << "Mean: " << mean_val << "\n"
+              << "Std dev: " << std_val << "\n";
+              
+    // Check for potential numerical issues
+    if (max_val > 1e4) {
+        std::cerr << "Warning: Large input values detected in LayerNorm\n";
+    }
+    if (std_val < 1e-7) {
+        std::cerr << "Warning: Very small standard deviation in LayerNorm input\n";
+    }
+    
+    // Enhanced debug: Check for NaN/Inf and print detailed stats
+    auto check_tensor = [](const torch::Tensor& t, const char* name) {
+        if (t.isnan().any().item<bool>()) {
+            auto nan_mask = t.isnan();
+            auto nan_count = nan_mask.sum().item<int64_t>();
+            std::cerr << name << " contains " << nan_count << " NaN values" << std::endl;
+            // Print first NaN position
+            auto nan_indices = nan_mask.nonzero();
+            if (nan_indices.size(0) > 0) {
+                auto first_nan = nan_indices[0];
+                std::cerr << "First NaN at index: ";
+                for (int64_t i = 0; i < first_nan.size(0); ++i) {
+                    std::cerr << first_nan[i].item<int64_t>() << " ";
+                }
+                std::cerr << std::endl;
+            }
+            TORCH_CHECK(false, name, " contains NaN values");
+        }
+        if (t.isinf().any().item<bool>()) {
+            auto inf_mask = t.isinf();
+            auto inf_count = inf_mask.sum().item<int64_t>();
+            std::cerr << name << " contains " << inf_count << " Inf values" << std::endl;
+            TORCH_CHECK(false, name, " contains Inf values");
+        }
+        // Print tensor stats for the last few elements
+        auto stats = t.to(torch::kFloat32);  // Convert for accurate stats
+        std::cerr << name << " stats - min: " << stats.min().item<float>()
+                 << " max: " << stats.max().item<float>()
+                 << " mean: " << stats.mean().item<float>()
+                 << " std: " << stats.std().item<float>() << std::endl;
+    };
+    
+    check_tensor(input, "LayerNorm input");
+    check_tensor(gamma_cache, "LayerNorm gamma_cache");
+    check_tensor(beta_cache, "LayerNorm beta_cache");
 
     auto batch_size = input.size(0);
     auto time_steps = input.size(1);
@@ -724,6 +805,59 @@ torch::Tensor indexed_batched_linear(
     TORCH_CHECK(weight_cache.dim() == 3, "weight cache must be [W, out, in]");
     TORCH_CHECK(bias_cache.dim() == 2, "bias cache must be [W, out]");
     TORCH_CHECK(input.dim() == 3, "input must be [B, T, in]");
+
+    // Convert to FP32 for accumulation to prevent FP16 overflow
+    auto input_fp32 = input.to(torch::kFloat32);
+    auto weight_cache_fp32 = weight_cache.to(torch::kFloat32);
+    auto bias_cache_fp32 = bias_cache.to(torch::kFloat32);
+
+    auto debug_print = [](const torch::Tensor& t, const char* name) {
+        auto stats = t.to(torch::kFloat32);
+        std::cerr << "\n=== " << name << " ===\n"
+                  << "Shape: " << t.sizes() << "\n"
+                  << "Min: " << stats.min().item<float>() << "\n"
+                  << "Max: " << stats.max().item<float>() << "\n"
+                  << "Mean: " << stats.mean().item<float>() << "\n"
+                  << "Std: " << stats.std().item<float>() << "\n"
+                  << "Has NaN: " << (t.isnan().any().item<bool>() ? "YES" : "NO") << "\n"
+                  << "Has Inf: " << (t.isinf().any().item<bool>() ? "YES" : "NO") << "\n";
+    };
+    
+    // Enhanced debug: Check for NaN/Inf in all input tensors and print stats
+    auto check_tensor = [](const torch::Tensor& t, const char* name) {
+        if (t.isnan().any().item<bool>()) {
+            auto nan_mask = t.isnan();
+            auto nan_count = nan_mask.sum().item<int64_t>();
+            std::cerr << name << " contains " << nan_count << " NaN values" << std::endl;
+            // Print first NaN position
+            auto nan_indices = nan_mask.nonzero();
+            if (nan_indices.size(0) > 0) {
+                auto first_nan = nan_indices[0];
+                std::cerr << "First NaN at index: ";
+                for (int64_t i = 0; i < first_nan.size(0); ++i) {
+                    std::cerr << first_nan[i].item<int64_t>() << " ";
+                }
+                std::cerr << std::endl;
+            }
+            TORCH_CHECK(false, name, " contains NaN values");
+        }
+        if (t.isinf().any().item<bool>()) {
+            auto inf_mask = t.isinf();
+            auto inf_count = inf_mask.sum().item<int64_t>();
+            std::cerr << name << " contains " << inf_count << " Inf values" << std::endl;
+            TORCH_CHECK(false, name, " contains Inf values");
+        }
+        // Print tensor stats
+        auto stats = t.to(torch::kFloat32);  // Convert for accurate stats
+        std::cerr << name << " stats - min: " << stats.min().item<float>()
+                 << " max: " << stats.max().item<float>()
+                 << " mean: " << stats.mean().item<float>()
+                 << " std: " << stats.std().item<float>() << std::endl;
+    };
+    
+    check_tensor(input, "Linear input");
+    check_tensor(weight_cache, "Linear weight_cache");
+    check_tensor(bias_cache, "Linear bias_cache");
 
     const int64_t batch_size = input.size(0);
     const int64_t time_steps = input.size(1);
@@ -783,29 +917,6 @@ torch::Tensor indexed_batched_linear(
         ", weight_cache_size=", weight_contig.size(0),
         " (batch_size=", batch_size, ", time_steps=", time_steps, ")");
 
-    // DEBUG: Print policy indices and weight cache size
-    std::cout << "[DBG idx_select] weight_cache_size=" << weight_contig.size(0)
-              << ", policy_indices_size=" << policy_contig.size(0)
-              << ", min=" << policy_min.item<int64_t>()
-              << ", max=" << policy_max.item<int64_t>()
-              << ", weight_cache_dims=" << weight_contig.dim()
-              << ", weight_cache_shape=[";
-    for (int64_t i = 0; i < weight_contig.dim(); ++i) {
-        if (i > 0) std::cout << ",";
-        std::cout << weight_contig.size(i);
-    }
-    std::cout << "]" << std::endl;
-    if (policy_contig.size(0) <= 20) {
-        std::cout << "[DBG idx_select] policy_indices=[";
-        auto policy_cpu = policy_contig.cpu();
-        auto policy_accessor = policy_cpu.accessor<int64_t, 1>();
-        for (int64_t i = 0; i < policy_contig.size(0); ++i) {
-            if (i > 0) std::cout << ",";
-            std::cout << policy_accessor[i];
-        }
-        std::cout << "]" << std::endl;
-    }
-
     auto t0 = Clock::now();
     auto weight_batched = weight_contig.index_select(0, clamped_policy_indices).contiguous(); // [B, out, in]
     auto bias_batched = bias_contig.index_select(0, clamped_policy_indices).contiguous();     // [B, out]
@@ -829,21 +940,10 @@ torch::Tensor indexed_batched_linear(
         "input_cast shape mismatch: expected [", batch_size, ",", time_steps, ",", in_dim, "]",
         " got [", input_cast.size(0), ",", input_cast.size(1), ",", input_cast.size(2), "]");
 
-    // Debug: print tensor info before cuBLASLt
-    std::cout << "[DBG Linear] batch=" << batch_size << ", time_steps=" << time_steps
-              << ", in_dim=" << in_dim << ", out_dim=" << out_dim << std::endl;
-    std::cout << "[DBG Linear] input_ptr=0x" << std::hex
-              << reinterpret_cast<uintptr_t>(input_cast.data_ptr()) << std::dec
-              << ", input_size=" << (input_cast.numel() * input_cast.element_size()) << " bytes" << std::endl;
-    std::cout << "[DBG Linear] weight_batched_ptr=0x" << std::hex
-              << reinterpret_cast<uintptr_t>(weight_batched.data_ptr()) << std::dec
-              << ", size=" << (weight_batched.numel() * weight_batched.element_size()) << " bytes" << std::endl;
-
     auto handle = at::cuda::getCurrentCUDABlasLtHandle();
     auto stream = at::cuda::getCurrentCUDAStream();
     cudaStream_t raw_stream = stream.stream();
     const auto dtype = input_cast.scalar_type();
-    std::cout << "[DBG] raw_stream=" << raw_stream << "\n";
     // Create descriptors with current dynamic dimensions
     MatmulDescriptors desc{};
     const auto compute_type = compute_type_for(dtype);

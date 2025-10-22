@@ -70,7 +70,7 @@ torch::Tensor reduce_expert_heads(
         scores = scores.contiguous();
     }
 
-    auto min_max = torch::_aminmax(indices);
+    auto min_max = torch::aminmax(indices);
     auto min_idx = std::get<0>(min_max).item<int64_t>();
     auto max_idx = std::get<1>(min_max).item<int64_t>();
 
@@ -582,9 +582,15 @@ forward_packed_cpp(
             const int64_t num_tokens = batch_size * seq_len;
             auto x_flat = x_fp16.view({num_tokens, hidden_dim});
 
+            std::cout << "[EARLY DEBUG] Starting MoE routing. num_tokens=" << num_tokens
+                      << ", top_k=" << top_k << ", topk_indices.sizes()=" << topk_indices.sizes() << std::endl;
+
             auto topk_indices_long = topk_indices.to(torch::kLong).contiguous();
             auto flat_expert_indices = topk_indices_long.reshape({-1});
             auto flat_routing_weights = topk_weights.reshape({-1});
+
+            std::cout << "[EARLY DEBUG] After reshape: flat_expert_indices.size=" << flat_expert_indices.size(0)
+                      << ", flat_routing_weights.size=" << flat_routing_weights.size(0) << std::endl;
 
             auto token_indices = torch::arange(
                 num_tokens,
@@ -592,7 +598,10 @@ forward_packed_cpp(
             );
             auto expanded_token_indices = token_indices.unsqueeze(-1)
                                                   .expand({num_tokens, top_k})
+                                                  .contiguous()
                                                   .reshape({-1});
+
+            std::cout << "[EARLY DEBUG] After expand: expanded_token_indices.size=" << expanded_token_indices.size(0) << std::endl;
 
             auto sort_tuple = torch::sort(flat_expert_indices);
             auto sorted_expert_indices = std::get<0>(sort_tuple);
@@ -610,6 +619,17 @@ forward_packed_cpp(
 
             auto expert_inputs = x_flat.index_select(0, sorted_token_indices).contiguous();
             auto expert_outputs = torch::zeros_like(expert_inputs);
+
+            // DEBUG: Check buffer sizes
+            const int64_t expected_routes = num_tokens * top_k;
+            std::cout << "[CRITICAL MoE] num_tokens=" << num_tokens << ", top_k=" << top_k
+                      << ", expected_routes=" << expected_routes << std::endl;
+            std::cout << "[CRITICAL MoE] sorted_token_indices.size=" << sorted_token_indices.size(0)
+                      << ", expert_inputs.size=" << expert_inputs.sizes()
+                      << ", expert_outputs.size=" << expert_outputs.sizes() << std::endl;
+            std::cout << "[CRITICAL MoE] expert_outputs buffer: "
+                      << (expert_outputs.numel() * expert_outputs.element_size()) << " bytes allocated, "
+                      << (expected_routes * hidden_dim * 2) << " bytes needed" << std::endl;
 
             // Build grouped dispatch metadata on CPU to drive the grouped GEMM helper
             auto sorted_expert_cpu = sorted_expert_indices.to(torch::kCPU);
@@ -689,16 +709,6 @@ forward_packed_cpp(
             const int64_t ffn_dim = get_weight(batched_weights, layer_prefix + ".moe.experts.w1").size(-2);
 
             if (!group_m_sizes.empty()) {
-                std::cout << "[DEBUG MoE FFN] Executing grouped_ffn_gemm_forward with "
-                          << group_m_sizes.size() << " groups, ffn_dim=" << ffn_dim
-                          << ", hidden_dim=" << hidden_dim << std::endl;
-                std::cout << "[DEBUG MoE FFN] First 3 group sizes: ";
-                for (size_t i = 0; i < std::min(size_t(3), group_m_sizes.size()); ++i) {
-                    std::cout << group_m_sizes[i] << " ";
-                }
-                std::cout << std::endl;
-                std::cout << "[DEBUG MoE FFN] First w1 pointer: 0x" << std::hex << w1_ptrs[0] << std::dec << std::endl;
-
                 grouped_ffn_gemm_forward(
                     input_ptrs.data(),
                     w1_ptrs.data(),
@@ -711,10 +721,6 @@ forward_packed_cpp(
                     hidden_dim,
                     ffn_dim
                 );
-
-                std::cout << "[DEBUG MoE FFN] grouped_ffn_gemm_forward completed successfully" << std::endl;
-            } else {
-                std::cout << "[DEBUG MoE FFN] Skipping grouped_ffn_gemm_forward: group_m_sizes is empty" << std::endl;
             }
 
             auto sorted_weights_half = sorted_routing_weights.to(expert_outputs.dtype()).unsqueeze(-1);
