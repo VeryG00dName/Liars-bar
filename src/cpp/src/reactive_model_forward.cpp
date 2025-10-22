@@ -410,6 +410,11 @@ forward_packed_cpp(
     );
     g_position = torch::sigmoid(g_position);
 
+    // Ensure embeddings match compute dtype (FP32) for fused combine
+    if (act_embed.scalar_type() != obs_encoded.scalar_type()) act_embed = act_embed.to(obs_encoded.scalar_type());
+    if (agent_embed.scalar_type() != obs_encoded.scalar_type()) agent_embed = agent_embed.to(obs_encoded.scalar_type());
+    if (position_embed.scalar_type() != obs_encoded.scalar_type()) position_embed = position_embed.to(obs_encoded.scalar_type());
+
     // Fused embedding
     auto fused = g_obs * obs_encoded
                + g_action * act_embed

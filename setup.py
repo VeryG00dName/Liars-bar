@@ -117,6 +117,7 @@ ext = CUDAExtension(
     define_macros=[
         ("CUTLASS_ENABLE_TENSOR_OP_MMA", "1"),
         ("TORCH_USE_CUDA_DSA", "1"),  # Enable device-side assertions for debugging
+        ("LB_ENABLE_KERNEL_DEBUG","0")
     ],
     extra_compile_args=extra_compile_args,
     extra_link_args=extra_link_args,

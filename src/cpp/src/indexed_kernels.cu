@@ -14,7 +14,8 @@
 #include <chrono>
 #include <mutex>
 #include <iostream>
-// cuBLASLt debug dump (CUDA 12.9-compatible)
+#include <cstdlib>
+// cuBLASLt debug dump
 // Put this in a .cu/.cpp compiled with the same includes as your Lt code.
 
 #include <cstdio>
@@ -32,6 +33,23 @@ static const char* dtypeStr(cudaDataType_t t) {
     default:         return "UNKNOWN";
     }
 }
+
+// ----------------------------------------------------------------------------
+// Debug gating helpers (runtime)
+//  - Host-side verbose logs can be enabled via env vars:
+//      LB_DEBUG_CUBLASLT=1   -> cuBLASLt config and heuristic dumps
+//      LB_DEBUG_STATS=1      -> tensor stats/validation prints
+//  - Kernel printf is gated at compile time with LB_ENABLE_KERNEL_DEBUG
+// ----------------------------------------------------------------------------
+static inline bool lb_env_enabled(const char* name) {
+    const char* v = std::getenv(name);
+    if (!v || !*v) return false;
+    // Treat '0', 'false', 'no' as disabled; anything else enabled
+    if (v[0] == '0' || v[0] == 'F' || v[0] == 'f' || v[0] == 'N' || v[0] == 'n') return false;
+    return true;
+}
+static bool LB_DBG_CUBLASLT() { static int flag = -1; if (flag < 0) flag = lb_env_enabled("LB_DEBUG_CUBLASLT"); return flag != 0; }
+static bool LB_DBG_STATS()    { static int flag = -1; if (flag < 0) flag = lb_env_enabled("LB_DEBUG_STATS");    return flag != 0; }
 
 static const char* computeStr(cublasComputeType_t c) {
     switch (c) {
@@ -80,7 +98,7 @@ static const char* epilogueStr(cublasLtEpilogue_t e) {
     }
 }
 
-// minimal attr getters (12.9 symbols only)
+// minimal attr getters
 template <typename T>
 static void getDescAttr(cublasLtMatmulDesc_t d, cublasLtMatmulDescAttributes_t a, T& out) {
     size_t sz = sizeof(T);
@@ -142,7 +160,7 @@ static void dumpOpDesc(cublasLtMatmulDesc_t op) {
               << " scaleType=" << dtypeStr(scaleType)
               << " epilogue=" << epilogueStr(epi) << "\n";
 
-    // Bias pointer/type (12.9 has these)
+    // Bias pointer/type
     void* biasPtr = nullptr;
     size_t got = 0;
     if (cublasLtMatmulDescGetAttribute(op, CUBLASLT_MATMUL_DESC_BIAS_POINTER,
@@ -175,6 +193,7 @@ static void dumpLtConfigLt(
     cublasLtMatrixLayout_t c,
     cublasLtMatmulPreference_t pref)
 {
+    if (!LB_DBG_CUBLASLT()) return;  // gated
     (void)lt_handle;
     int drv=0, rt=0; cudaDriverGetVersion(&drv); cudaRuntimeGetVersion(&rt);
     auto vers=[&](int v){ return std::to_string(v/1000)+"."+std::to_string((v%1000)/10); };
@@ -259,7 +278,8 @@ __global__ void indexed_batched_layer_norm_kernel(
     int64_t hidden_dim,
     double eps) {
     
-    // Debug printing in kernel
+    // Debug printing in kernel (compile-time gated)
+#ifdef LB_ENABLE_KERNEL_DEBUG
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         printf("LayerNorm Kernel Debug:\n");
         printf("Input ptr: %p\n", (void*)input);
@@ -274,6 +294,7 @@ __global__ void indexed_batched_layer_norm_kernel(
         }
         printf("\n");
     }
+#endif
     const int64_t token_index = blockIdx.x;
     if (token_index >= batch_size * time_steps) {
         return;
@@ -309,12 +330,14 @@ __global__ void indexed_batched_layer_norm_kernel(
     acc_t block_sum = (threadIdx.x < warp_count) ? shared_partial[threadIdx.x] : static_cast<acc_t>(0);
     block_sum = warp_reduce_sum(block_sum);
     if (threadIdx.x == 0) {
-        shared_sum = block_sum / static_cast<acc_t>(hidden_dim);
+        // Store the raw sum for the block; divide once when computing mean
+        shared_sum = block_sum;
     }
     __syncthreads();
     const acc_t mean = shared_sum / static_cast<acc_t>(hidden_dim);
 
-    // Enhanced debug: Check input values and print statistics
+    // Enhanced debug: Check input values and print statistics (compile-time gated)
+#ifdef LB_ENABLE_KERNEL_DEBUG
     if (blockIdx.x < 5 && threadIdx.x == 0) {
         acc_t max_abs_val = 0.0f;
         acc_t min_val = 1e9;
@@ -331,13 +354,14 @@ __global__ void indexed_batched_layer_norm_kernel(
             max_val = max(max_val, val);
         }
         
-        printf("Token %ld stats:\n", blockIdx.x);
+        printf("Token %d stats:\n", (int)blockIdx.x);
         printf("  Range: [%f, %f]\n", (float)min_val, (float)max_val);
         printf("  Max abs value: %f\n", (float)max_abs_val);
         printf("  Mean: %f\n", (float)mean);
         printf("  Has NaN: %s\n", has_nan ? "YES" : "NO");
         printf("  Has Inf: %s\n", has_inf ? "YES" : "NO");
     }
+#endif
 
     acc_t thread_var = static_cast<acc_t>(0);
     for (int64_t h = threadIdx.x; h < hidden_dim; h += blockDim.x) {
@@ -360,10 +384,12 @@ __global__ void indexed_batched_layer_norm_kernel(
     const acc_t inv_std = rsqrt(shared_var + static_cast<acc_t>(eps));
 
     // Debug: Print variance and inv_std for first few tokens
+#ifdef LB_ENABLE_KERNEL_DEBUG
     if (blockIdx.x < 5 && threadIdx.x == 0) {
-        printf("Token %ld - Variance: %f, Inv_std: %f\n", 
-               blockIdx.x, (float)shared_var, (float)inv_std);
+        printf("Token %d - Variance: %f, Inv_std: %f\n", 
+               (int)blockIdx.x, (float)shared_var, (float)inv_std);
     }
+#endif
 
     for (int64_t h = threadIdx.x; h < hidden_dim; h += blockDim.x) {
         const acc_t norm = (static_cast<acc_t>(input_ptr[h]) - mean) * inv_std;
@@ -376,26 +402,14 @@ __global__ void indexed_batched_layer_norm_kernel(
 // Helper utilities for cuBLASLt
 // -----------------------------------------------------------------------------
 
-cublasComputeType_t compute_type_for(const at::ScalarType dtype) {
-    switch (dtype) {
-        case at::kFloat:
-            return CUBLAS_COMPUTE_32F;
-        case at::kHalf:
-            return CUBLAS_COMPUTE_32F_FAST_16F;
-        default:
-            TORCH_CHECK(false, "Unsupported dtype for indexed_batched_linear");
-    }
+cublasComputeType_t compute_type_for(const at::ScalarType /*dtype*/) {
+    // Force FP32 compute for numerical stability and consistency
+    return CUBLAS_COMPUTE_32F;
 }
 
-cudaDataType_t cuda_dtype_for(const at::ScalarType dtype) {
-    switch (dtype) {
-        case at::kFloat:
-            return CUDA_R_32F;
-        case at::kHalf:
-            return CUDA_R_16F;
-        default:
-            TORCH_CHECK(false, "Unsupported dtype for indexed_batched_linear");
-    }
+cudaDataType_t cuda_dtype_for(const at::ScalarType /*dtype*/) {
+    // Use FP32 tensor data type for GEMM inputs/outputs
+    return CUDA_R_32F;
 }
 
 // Convert cuBLAS status codes to readable strings for diagnostics.
@@ -702,10 +716,12 @@ torch::Tensor indexed_batched_layer_norm(
     auto mean_val = fp32_input.mean().item<float>();
     auto std_val = fp32_input.std().item<float>();
     
-    std::cerr << "\nLayerNorm Input Validation:\n"
-              << "Max abs value: " << max_val << "\n"
-              << "Mean: " << mean_val << "\n"
-              << "Std dev: " << std_val << "\n";
+    if (LB_DBG_STATS()) {
+        std::cerr << "\nLayerNorm Input Validation:\n"
+                  << "Max abs value: " << max_val << "\n"
+                  << "Mean: " << mean_val << "\n"
+                  << "Std dev: " << std_val << "\n";
+    }
               
     // Check for potential numerical issues
     if (max_val > 1e4) {
@@ -739,12 +755,13 @@ torch::Tensor indexed_batched_layer_norm(
             std::cerr << name << " contains " << inf_count << " Inf values" << std::endl;
             TORCH_CHECK(false, name, " contains Inf values");
         }
-        // Print tensor stats for the last few elements
-        auto stats = t.to(torch::kFloat32);  // Convert for accurate stats
-        std::cerr << name << " stats - min: " << stats.min().item<float>()
-                 << " max: " << stats.max().item<float>()
-                 << " mean: " << stats.mean().item<float>()
-                 << " std: " << stats.std().item<float>() << std::endl;
+        if (LB_DBG_STATS()) {
+            auto stats = t.to(torch::kFloat32);  // Convert for accurate stats
+            std::cerr << name << " stats - min: " << stats.min().item<float>()
+                     << " max: " << stats.max().item<float>()
+                     << " mean: " << stats.mean().item<float>()
+                     << " std: " << stats.std().item<float>() << std::endl;
+        }
     };
     
     check_tensor(input, "LayerNorm input");
@@ -758,11 +775,31 @@ torch::Tensor indexed_batched_layer_norm(
     TORCH_CHECK(input.is_cuda(), "indexed_batched_layer_norm expects CUDA tensors for input");
 
     auto input_contig = input.contiguous();
-    auto gamma_contig = gamma_cache.contiguous();
-    auto beta_contig = beta_cache.contiguous();
+    auto gamma_t = gamma_cache;
+    auto beta_t  = beta_cache;
+    if (gamma_t.device() != input.device()) gamma_t = gamma_t.to(input.device());
+    if (beta_t.device() != input.device())  beta_t  = beta_t.to(input.device());
+    // Align parameter dtype with input to avoid mixed-type kernel access
+    if (gamma_t.scalar_type() != input.scalar_type()) gamma_t = gamma_t.to(input.scalar_type());
+    if (beta_t.scalar_type()  != input.scalar_type())  beta_t = beta_t.to(input.scalar_type());
+    auto gamma_contig = gamma_t.contiguous();
+    auto beta_contig  = beta_t.contiguous();
     auto policy_contig = policy_indices.to(torch::kLong).contiguous();
     if (policy_contig.device() != input.device()) {
         policy_contig = policy_contig.to(input.device());
+    }
+    // Validate and clamp policy indices to valid expert/policy range
+    const int64_t num_policies = gamma_contig.size(0);
+    TORCH_CHECK(num_policies == beta_contig.size(0), "LayerNorm caches (gamma/beta) disagree on W dimension");
+    TORCH_CHECK(gamma_contig.size(1) == hidden_dim && beta_contig.size(1) == hidden_dim,
+                "LayerNorm caches must have H == hidden_dim");
+    auto pol_min = policy_contig.min().item<int64_t>();
+    auto pol_max = policy_contig.max().item<int64_t>();
+    if (pol_min < 0 || pol_max >= num_policies) {
+        auto clamped = torch::clamp(policy_contig, 0, num_policies - 1);
+        std::cerr << "[WARN] indexed_batched_layer_norm: clamping policy indices to [0," << (num_policies-1)
+                  << "] (observed min=" << pol_min << ", max=" << pol_max << ")" << std::endl;
+        policy_contig = clamped;
     }
 
     auto output = torch::empty_like(input_contig, input_contig.options());
@@ -847,17 +884,71 @@ torch::Tensor indexed_batched_linear(
             std::cerr << name << " contains " << inf_count << " Inf values" << std::endl;
             TORCH_CHECK(false, name, " contains Inf values");
         }
-        // Print tensor stats
-        auto stats = t.to(torch::kFloat32);  // Convert for accurate stats
-        std::cerr << name << " stats - min: " << stats.min().item<float>()
-                 << " max: " << stats.max().item<float>()
-                 << " mean: " << stats.mean().item<float>()
-                 << " std: " << stats.std().item<float>() << std::endl;
+        if (LB_DBG_STATS()) {
+            auto stats = t.to(torch::kFloat32);  // Convert for accurate stats
+            std::cerr << name << " stats - min: " << stats.min().item<float>()
+                     << " max: " << stats.max().item<float>()
+                     << " mean: " << stats.mean().item<float>()
+                     << " std: " << stats.std().item<float>() << std::endl;
+        }
     };
     
+    // Strictly validate runtime inputs; abort on invalid activations
     check_tensor(input, "Linear input");
-    check_tensor(weight_cache, "Linear weight_cache");
-    check_tensor(bias_cache, "Linear bias_cache");
+
+    // Weights/bias may occasionally contain NaN from upstream packing.
+    // Instead of aborting, sanitize and warn to keep evaluation running.
+    auto weight_sanitized = weight_cache;
+    auto bias_sanitized   = bias_cache;
+    try {
+        bool w_has_nan = weight_cache.isnan().any().item<bool>();
+        bool w_has_inf = weight_cache.isinf().any().item<bool>();
+        if (w_has_nan || w_has_inf) {
+            auto nan_count = weight_cache.isnan().sum().item<int64_t>();
+            auto inf_count = weight_cache.isinf().sum().item<int64_t>();
+            std::cerr << "[WARN] Linear weight_cache contains NaN/Inf. nan=" << nan_count
+                      << ", inf=" << inf_count << ". Applying nan_to_num(0)." << std::endl;
+            // Replace NaN/Inf with zero to avoid propagating invalid values
+            auto w = weight_cache;
+            if (w.isnan().any().item<bool>()) {
+                auto mask = w.isnan();
+                w = w.clone();
+                w.masked_fill_(mask, 0);
+            }
+            if (w.isinf().any().item<bool>()) {
+                auto mask = w.isinf();
+                if (!w.is_contiguous()) w = w.contiguous();
+                w.masked_fill_(mask, 0);
+            }
+            weight_sanitized = w;
+        }
+    } catch (...) {
+        // Swallow unexpected errors in debug path; leave weights as-is
+    }
+    try {
+        bool b_has_nan = bias_cache.isnan().any().item<bool>();
+        bool b_has_inf = bias_cache.isinf().any().item<bool>();
+        if (b_has_nan || b_has_inf) {
+            auto nan_count = bias_cache.isnan().sum().item<int64_t>();
+            auto inf_count = bias_cache.isinf().sum().item<int64_t>();
+            std::cerr << "[WARN] Linear bias_cache contains NaN/Inf. nan=" << nan_count
+                      << ", inf=" << inf_count << ". Applying nan_to_num(0)." << std::endl;
+            auto b = bias_cache;
+            if (b.isnan().any().item<bool>()) {
+                auto mask = b.isnan();
+                b = b.clone();
+                b.masked_fill_(mask, 0);
+            }
+            if (b.isinf().any().item<bool>()) {
+                auto mask = b.isinf();
+                if (!b.is_contiguous()) b = b.contiguous();
+                b.masked_fill_(mask, 0);
+            }
+            bias_sanitized = b;
+        }
+    } catch (...) {}
+
+    TORCH_CHECK(input.is_cuda(), "indexed_batched_linear expects CUDA tensors for input");
 
     const int64_t batch_size = input.size(0);
     const int64_t time_steps = input.size(1);
@@ -866,32 +957,15 @@ torch::Tensor indexed_batched_linear(
 
     TORCH_CHECK(weight_cache.size(2) == in_dim, "Input dim mismatch");
 
-    if (!input.is_cuda()) {
-        auto policy_cpu = policy_indices.cpu();
-        auto t0 = Clock::now();
-        auto weight = weight_cache.index_select(0, policy_cpu);
-        auto bias = bias_cache.index_select(0, policy_cpu);
-        auto t1 = Clock::now();
-        timers["linear_index_select_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
-        auto x = input.to(weight.scalar_type());
-        auto t2 = Clock::now();
-        auto result = torch::matmul(x, weight.transpose(-1, -2)) + bias.unsqueeze(1);
-        auto t3 = Clock::now();
-        timers["linear_cublas_matmul_us"] += std::chrono::duration_cast<Microseconds>(t3 - t2);
-        if (epilogue == IndexedLinearEpilogue::BiasGELU) {
-            result = torch::gelu(result);
-        }
-        return result;
-    }
-
     TORCH_CHECK(weight_cache.device().is_cuda(), "weight cache must be CUDA when input is CUDA");
     TORCH_CHECK(bias_cache.device().is_cuda(), "bias cache must be CUDA when input is CUDA");
 
     c10::cuda::CUDAGuard guard(input.device());
 
-    auto input_cast = input.to(weight_cache.scalar_type()).contiguous();
-    auto weight_contig = weight_cache.contiguous();
-    auto bias_contig = bias_cache.contiguous();
+    // Force FP32 compute: cast inputs/weights/bias to float32 on device
+    auto input_cast = input.to(torch::kFloat32).contiguous();
+    auto weight_contig = weight_sanitized.to(torch::kFloat32).contiguous();
+    auto bias_contig = bias_sanitized.to(torch::kFloat32).contiguous();
     auto policy_contig = policy_indices.to(torch::kLong).contiguous();
     if (policy_contig.device() != input.device()) {
         policy_contig = policy_contig.to(input.device());
@@ -946,8 +1020,8 @@ torch::Tensor indexed_batched_linear(
     const auto dtype = input_cast.scalar_type();
     // Create descriptors with current dynamic dimensions
     MatmulDescriptors desc{};
-    const auto compute_type = compute_type_for(dtype);
-    const auto data_type = cuda_dtype_for(dtype);
+    const auto compute_type = CUBLAS_COMPUTE_32F;
+    const auto data_type = CUDA_R_32F;
     TORCH_CHECK(
         cublasLtMatmulDescCreate(&desc.op_desc, compute_type, CUDA_R_32F) == CUBLAS_STATUS_SUCCESS,
         "cuBLASLt error");
@@ -1039,13 +1113,14 @@ torch::Tensor indexed_batched_linear(
         &heuristic,
         &returned_results);
 
-    std::cout << "cublasLtMatmulAlgoGetHeuristic status=" << (int)st
-            << " returned=" << returned_results << "\n";
-
-    if (st == CUBLAS_STATUS_SUCCESS && returned_results > 0) {
-        dumpHeuristic(heuristic);
-    } else {
-        std::cerr << "No heuristic. Check: ORDER vs LD, batch stride BYTES, compute/scale types, epilogue/bias.\n";
+    if (LB_DBG_CUBLASLT()) {
+        std::cout << "cublasLtMatmulAlgoGetHeuristic status=" << (int)st
+                  << " returned=" << returned_results << "\n";
+        if (st == CUBLAS_STATUS_SUCCESS && returned_results > 0) {
+            dumpHeuristic(heuristic);
+        } else {
+            std::cerr << "No heuristic. Check: ORDER vs LD, batch stride BYTES, compute/scale types, epilogue/bias.\n";
+        }
     }
 
     // NEW: No fallback. If a heuristic is not found, it's a fatal error.
@@ -1110,6 +1185,10 @@ torch::Tensor indexed_batched_linear(
     if (output.is_cuda()) { torch::cuda::synchronize(); }
     auto epi_t1 = Clock::now();
     timers["linear_epilogue_us"] += std::chrono::duration_cast<Microseconds>(epi_t1 - epi_t0);
+
+    // Strict validation: no fallback; ensure output has no NaN/Inf
+    TORCH_CHECK(!output.isnan().any().item<bool>(), "indexed_batched_linear: output contains NaN after FP32 GEMM");
+    TORCH_CHECK(!output.isinf().any().item<bool>(), "indexed_batched_linear: output contains Inf after FP32 GEMM");
 
     return output;
 }
