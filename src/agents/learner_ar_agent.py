@@ -10,12 +10,10 @@ import torch.amp as amp
 
 from src import config
 from src.model.model_factory import ModelFactory as MFactoryUtil
-from src.model.ppo_autoregressive_model import PPOAutoregressiveModel
-from src.model.ppo_fused_model import PPOFusedModel
 # --- NEW IMPORT ---
 from src.model.ppo_reactive_model import PPOReactiveModel
 from src.model.ppo_reactive_model_script import PPOReactiveModelScript
-
+from src.model.ppo_reactive_model_debug import PPOReactiveModelDebug
 __all__ = ["LearnerAutoregressiveAgent", "build_model_from_state"]
 EXPECTED_MODEL_ARGS = {
             "obs_sequence",
@@ -212,14 +210,9 @@ class LearnerAutoregressiveAgent:
         # --- NEW, ROBUST ARCHITECTURE DETECTION ---
         if self.compile:
             ModelClass = PPOReactiveModelScript
-        elif MFactoryUtil.is_reactive_model(model_state_dict):
-            ModelClass = PPOReactiveModel
-        elif MFactoryUtil.is_fused_model(model_state_dict):
-            ModelClass = PPOFusedModel
-        elif MFactoryUtil.is_ppo_autoregressive_model(model_state_dict):
-            ModelClass = PPOAutoregressiveModel
         else:
-            ModelClass = PPOFusedModel
+            ModelClass = PPOReactiveModel
+
         
         # Infer dimensions that are common to all architectures
         inferred_obs_dim = MFactoryUtil.get_input_dim_from_state_dict(model_state_dict, 'obs_encoder.0')
@@ -235,30 +228,13 @@ class LearnerAutoregressiveAgent:
 
         self.max_seq_length = inferred_max_seq
 
-        # --- NEW, CONDITIONAL KWARGS FOR FUSED MODEL ---
-        extra_kwargs: Dict[str, Any] = {}
-        if ModelClass is PPOFusedModel:
-            bricks_tensor = None
-            for key, tensor in model_state_dict.items():
-                if key.endswith("strategy_dictionary.bricks"):
-                    bricks_tensor = tensor
-                    break
-            if bricks_tensor is not None:
-                num_bricks, brick_dim = bricks_tensor.shape
-                extra_kwargs["num_bricks"] = num_bricks
-                extra_kwargs["brick_dim"] = brick_dim
-            else:
-                extra_kwargs["num_bricks"] = getattr(config, "NUM_BRICKS", 32)
-                extra_kwargs["brick_dim"] = getattr(config, "BRICK_DIM", 32)
-
         # Instantiate the CORRECT ModelClass with all inferred parameters
         self.model = ModelClass(
             obs_dim=inferred_obs_dim,
             action_dim=inferred_action_dim,
             hidden_dim=inferred_hidden_dim,
             num_heads=num_heads,
-            max_seq_length=inferred_max_seq,
-            **extra_kwargs,
+            max_seq_length=inferred_max_seq
         ).to(self.device)
 
             # Use strict=False to handle cases where an agent is loaded into a
@@ -273,14 +249,15 @@ class LearnerAutoregressiveAgent:
 def build_model_from_state(
     model_state_dict: Dict[str, torch.Tensor],
     device: torch.device,
+    debug: bool = False,
 ) -> torch.nn.Module:
     """
     Reconstruct a learner model from a serialized state dict.
-    This function is polymorphic and can identify and build either a
-    PPOFusedModel or a PPOReactiveModel.
     """
-    ModelClass = PPOReactiveModel
-    # --- END OF MODIFICATIONS ---
+    if debug:
+        ModelClass = PPOReactiveModelDebug
+    else:
+        ModelClass = PPOReactiveModel
 
     try:
         inferred_obs_dim = MFactoryUtil.get_input_dim_from_state_dict(model_state_dict, "obs_encoder.0")
@@ -294,29 +271,12 @@ def build_model_from_state(
         logging.error("Failed to infer model dimensions: %s", exc, exc_info=True)
         raise
 
-    # --- START OF MODIFICATIONS ---
-    extra_kwargs: Dict[str, Any] = {}
-    # Only populate strategy dictionary kwargs if we are building a Fused model
-    if ModelClass is PPOFusedModel:
-        bricks_tensor = None
-        for key, tensor in model_state_dict.items():
-            if key.endswith("strategy_dictionary.bricks"):
-                bricks_tensor = tensor
-                break
-        if bricks_tensor is not None:
-            extra_kwargs["num_bricks"], extra_kwargs["brick_dim"] = bricks_tensor.shape
-        else:
-            # Fallback for older fused models that might not have the dictionary
-            extra_kwargs["num_bricks"] = getattr(config, "NUM_BRICKS", 32)
-            extra_kwargs["brick_dim"] = getattr(config, "BRICK_DIM", 32)
-
     model = ModelClass(
         obs_dim=inferred_obs_dim,
         action_dim=inferred_action_dim,
         hidden_dim=inferred_hidden_dim,
         num_heads=num_heads,
-        max_seq_length=inferred_max_seq,
-        **extra_kwargs,
+        max_seq_length=inferred_max_seq
     ).to(device)
 
     model.load_state_dict(model_state_dict, strict=False)

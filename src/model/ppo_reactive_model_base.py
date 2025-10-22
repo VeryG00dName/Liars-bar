@@ -10,40 +10,6 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from src.misc import lb
-
-
-class TopKMoEKernel(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        x: torch.Tensor,
-        gate_logits: torch.Tensor,
-        topk_indices: torch.Tensor,
-        w1: torch.Tensor,
-        b1: torch.Tensor,
-        w2: torch.Tensor,
-        b2: torch.Tensor,
-    ) -> torch.Tensor:
-        return lb.moe_forward(x, gate_logits, topk_indices, w1, b1, w2, b2)
-
-    @staticmethod
-    def backward(ctx, *grad_outputs):
-        raise NotImplementedError("TopKMoEKernel backward is not implemented")
-
-
-@torch.jit.ignore
-def _moe_forward_fused_base(
-    x: torch.Tensor,
-    gate_logits: torch.Tensor,
-    topk_indices: torch.Tensor,
-    w1: torch.Tensor,
-    b1: torch.Tensor,
-    w2: torch.Tensor,
-    b2: torch.Tensor,
-) -> torch.Tensor:
-    return lb.moe_forward(x, gate_logits, topk_indices, w1, b1, w2, b2)
-
 
 __all__ = [
     "PPOReactiveModelBase",
@@ -79,10 +45,9 @@ class TopKMoELayer(nn.Module):
             [_make_moe_ffn(hidden_dim, expert_ffn_dim, dropout) for _ in range(num_experts)]
         )
 
-    @torch.jit.script_method
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Robust and JIT-compatible MoE forward pass with an optional fused CUDA kernel.
+        Pure PyTorch MoE forward pass using top-k routing.
         """
         B, T, H = x.shape
         x_flat = x.view(-1, H)
@@ -97,47 +62,21 @@ class TopKMoELayer(nn.Module):
         topk_scores = torch.gather(gate_probs, -1, topk_indices)
         topk_weights = topk_scores / topk_scores.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
-        use_fused = (not self.training) and x.is_cuda and (not torch.jit.is_scripting())
-
-        if use_fused:
-            expert_w1 = torch.stack(
-                [expert[0].weight.to(dtype=x.dtype) for expert in self.experts], dim=0
-            ).unsqueeze(1)
-            expert_b1 = torch.stack(
-                [expert[0].bias.to(dtype=x.dtype) for expert in self.experts], dim=0
-            ).unsqueeze(1)
-            expert_w2 = torch.stack(
-                [expert[3].weight.to(dtype=x.dtype) for expert in self.experts], dim=0
-            ).unsqueeze(1)
-            expert_b2 = torch.stack(
-                [expert[3].bias.to(dtype=x.dtype) for expert in self.experts], dim=0
-            ).unsqueeze(1)
-
-            # Use an ignored wrapper so TorchScript doesn't try to compile the pybind call
-            moe_output = _moe_forward_fused_base(
-                x.contiguous(),
-                gate_logits.contiguous(),
-                topk_indices.to(dtype=torch.long).contiguous(),
-                expert_w1.contiguous(),
-                expert_b1.contiguous(),
-                expert_w2.contiguous(),
-                expert_b2.contiguous(),
-            )
-        else:
-            topk_indices_flat = topk_indices.view(-1, self.top_k)
-            topk_weights_flat = topk_weights.view(-1, self.top_k)
-            y_flat = torch.zeros_like(x_flat)
-            for expert_idx, expert in enumerate(self.experts):
-                mask = (topk_indices_flat == expert_idx).any(dim=-1)
-                if mask.any():
-                    token_indices = torch.where(mask)[0]
-                    expert_inputs = x_flat[token_indices]
-                    ranks = torch.where(
-                        topk_indices_flat[token_indices] == expert_idx
-                    )[1]
-                    routing = topk_weights_flat[token_indices, ranks].unsqueeze(-1)
-                    y_flat.index_add_(0, token_indices, expert(expert_inputs) * routing)
-            moe_output = y_flat.view(B, T, H)
+        # Pure PyTorch implementation
+        topk_indices_flat = topk_indices.view(-1, self.top_k)
+        topk_weights_flat = topk_weights.view(-1, self.top_k)
+        y_flat = torch.zeros_like(x_flat)
+        for expert_idx, expert in enumerate(self.experts):
+            mask = (topk_indices_flat == expert_idx).any(dim=-1)
+            if mask.any():
+                token_indices = torch.where(mask)[0]
+                expert_inputs = x_flat[token_indices]
+                ranks = torch.where(
+                    topk_indices_flat[token_indices] == expert_idx
+                )[1]
+                routing = topk_weights_flat[token_indices, ranks].unsqueeze(-1)
+                y_flat.index_add_(0, token_indices, expert(expert_inputs) * routing)
+        moe_output = y_flat.view(B, T, H)
 
         routing_info = {
             "gate_logits": gate_logits,

@@ -1,6 +1,5 @@
 #include "reactive_model_forward.h"
 #include "indexed_kernels.h"
-#include "moe_kernel.h"
 
 #include <torch/torch.h>
 #include <ATen/ATen.h>
