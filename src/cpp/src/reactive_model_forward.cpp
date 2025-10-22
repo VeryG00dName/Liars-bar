@@ -31,6 +31,498 @@ torch::Tensor get_weight(
 
 } // anonymous namespace
 
+// ============================================================================
+// Layer-by-Layer Testing Functions
+// ============================================================================
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+test_action_decomposition(
+    const torch::Tensor& action_sequence,
+    const c10::Dict<std::string, torch::Tensor>& batched_weights,
+    const torch::Tensor& policy_indices,
+    const torch::optional<torch::Tensor>& padding_mask,
+    int64_t count_pad,
+    int64_t tflag_pad
+) {
+    int64_t batch_size = action_sequence.size(0);
+    int64_t seq_len = action_sequence.size(1);
+    auto device = action_sequence.device();
+
+    // Load LUT buffers
+    auto lut_act_kind = get_weight(batched_weights, "lut_act_kind").to(device);
+    auto lut_count = get_weight(batched_weights, "lut_count").to(device);
+    auto lut_table_flag = get_weight(batched_weights, "lut_table_flag").to(device);
+
+    // Decompose actions using LUTs
+    auto action_long = action_sequence.to(torch::kLong);
+    auto action_flat = action_long.flatten();
+
+    auto act_kind_flat = lut_act_kind.index({action_flat});
+    auto count_flat = lut_count.index({action_flat});
+    auto table_flag_flat = lut_table_flag.index({action_flat});
+
+    auto act_kind_ids = act_kind_flat.view({batch_size, seq_len}).to(torch::kLong);
+    auto count_ids = count_flat.view({batch_size, seq_len}).to(torch::kLong);
+    auto table_flag_ids = table_flag_flat.view({batch_size, seq_len}).to(torch::kLong);
+
+    // Apply padding mask if provided
+    if (padding_mask.has_value()) {
+        auto pad_mask = padding_mask.value().to(torch::kBool);
+        auto zero_like = torch::zeros_like(act_kind_ids);
+        auto count_pad_tensor = torch::full_like(count_ids, count_pad, torch::kLong);
+        auto tflag_pad_tensor = torch::full_like(table_flag_ids, tflag_pad, torch::kLong);
+
+        act_kind_ids = torch::where(pad_mask, zero_like, act_kind_ids);
+        count_ids = torch::where(pad_mask, count_pad_tensor, count_ids);
+        table_flag_ids = torch::where(pad_mask, tflag_pad_tensor, table_flag_ids);
+    }
+
+    return std::make_tuple(act_kind_ids, count_ids, table_flag_ids);
+}
+
+c10::Dict<std::string, torch::Tensor>
+test_embeddings(
+    const torch::Tensor& obs_sequence,
+    const torch::Tensor& act_kind_ids,
+    const torch::Tensor& count_ids,
+    const torch::Tensor& table_flag_ids,
+    const torch::Tensor& agent_types,
+    const torch::Tensor& positions,
+    const c10::Dict<std::string, torch::Tensor>& batched_weights,
+    const torch::Tensor& policy_indices
+) {
+    auto device = obs_sequence.device();
+    auto policy_indices_for_ops = policy_indices.to(device).to(torch::kLong).contiguous();
+
+    c10::Dict<std::string, torch::Tensor> result;
+
+    // Observation encoding: Linear -> LayerNorm -> GELU
+    std::unordered_map<std::string, std::chrono::microseconds> dummy_timers;
+    auto obs_encoded = indexed_batched_linear(
+        obs_sequence,
+        get_weight(batched_weights, "obs_encoder.0.weight"),
+        get_weight(batched_weights, "obs_encoder.0.bias"),
+        policy_indices_for_ops,
+        dummy_timers
+    );
+    obs_encoded = indexed_batched_layer_norm(
+        obs_encoded,
+        get_weight(batched_weights, "obs_encoder.1.weight"),
+        get_weight(batched_weights, "obs_encoder.1.bias"),
+        policy_indices_for_ops,
+        /* eps = */ 1e-5
+    );
+    obs_encoded = torch::gelu(obs_encoded);
+    result.insert("obs_embed", obs_encoded);
+
+    // Action embeddings (factorized)
+    auto act_kind_embed = indexed_batched_embedding(
+        get_weight(batched_weights, "act_kind_embedding.weight"),
+        act_kind_ids,
+        policy_indices_for_ops
+    );
+    auto count_embed = indexed_batched_embedding(
+        get_weight(batched_weights, "count_embedding.weight"),
+        count_ids,
+        policy_indices_for_ops
+    );
+    auto table_flag_embed = indexed_batched_embedding(
+        get_weight(batched_weights, "table_flag_embedding.weight"),
+        table_flag_ids,
+        policy_indices_for_ops
+    );
+    auto action_embed = act_kind_embed + count_embed + table_flag_embed;
+
+    result.insert("act_kind_embed", act_kind_embed);
+    result.insert("count_embed", count_embed);
+    result.insert("table_flag_embed", table_flag_embed);
+    result.insert("action_embed", action_embed);
+
+    // Agent type embedding
+    auto agent_embed = indexed_batched_embedding(
+        get_weight(batched_weights, "agent_embedding.weight"),
+        agent_types.to(torch::kLong),
+        policy_indices_for_ops
+    );
+    result.insert("agent_embed", agent_embed);
+
+    // Position embedding
+    auto position_embed = indexed_batched_embedding(
+        get_weight(batched_weights, "position_embedding.weight"),
+        positions.to(torch::kLong),
+        policy_indices_for_ops
+    );
+    result.insert("position_embed", position_embed);
+
+    return result;
+}
+
+c10::Dict<std::string, torch::Tensor>
+test_gating(
+    const torch::Tensor& obs_embed,
+    const torch::Tensor& action_embed,
+    const torch::Tensor& agent_embed,
+    const torch::Tensor& position_embed,
+    const c10::Dict<std::string, torch::Tensor>& batched_weights,
+    const torch::Tensor& policy_indices
+) {
+    auto device = obs_embed.device();
+    auto policy_indices_for_ops = policy_indices.to(device).to(torch::kLong).contiguous();
+
+    c10::Dict<std::string, torch::Tensor> result;
+    std::unordered_map<std::string, std::chrono::microseconds> dummy_timers;
+
+    // Gate for observations
+    auto hidden_g_obs = indexed_batched_linear(
+        obs_embed,
+        get_weight(batched_weights, "gate_obs.0.weight"),
+        get_weight(batched_weights, "gate_obs.0.bias"),
+        policy_indices_for_ops,
+        dummy_timers
+    );
+    hidden_g_obs = torch::tanh(hidden_g_obs);
+    auto g_obs = indexed_batched_linear(
+        hidden_g_obs,
+        get_weight(batched_weights, "gate_obs.2.weight"),
+        get_weight(batched_weights, "gate_obs.2.bias"),
+        policy_indices_for_ops,
+        dummy_timers
+    );
+    g_obs = torch::sigmoid(g_obs);
+    result.insert("g_obs", g_obs);
+
+    // Gate for actions
+    auto hidden_g_action = indexed_batched_linear(
+        action_embed,
+        get_weight(batched_weights, "gate_action.0.weight"),
+        get_weight(batched_weights, "gate_action.0.bias"),
+        policy_indices_for_ops,
+        dummy_timers
+    );
+    hidden_g_action = torch::tanh(hidden_g_action);
+    auto g_action = indexed_batched_linear(
+        hidden_g_action,
+        get_weight(batched_weights, "gate_action.2.weight"),
+        get_weight(batched_weights, "gate_action.2.bias"),
+        policy_indices_for_ops,
+        dummy_timers
+    );
+    g_action = torch::sigmoid(g_action);
+    result.insert("g_action", g_action);
+
+    // Gate for agent types
+    auto hidden_g_agent = indexed_batched_linear(
+        agent_embed,
+        get_weight(batched_weights, "gate_agent.0.weight"),
+        get_weight(batched_weights, "gate_agent.0.bias"),
+        policy_indices_for_ops,
+        dummy_timers
+    );
+    hidden_g_agent = torch::tanh(hidden_g_agent);
+    auto g_agent = indexed_batched_linear(
+        hidden_g_agent,
+        get_weight(batched_weights, "gate_agent.2.weight"),
+        get_weight(batched_weights, "gate_agent.2.bias"),
+        policy_indices_for_ops,
+        dummy_timers
+    );
+    g_agent = torch::sigmoid(g_agent);
+    result.insert("g_agent", g_agent);
+
+    // Gate for positions
+    auto hidden_g_position = indexed_batched_linear(
+        position_embed,
+        get_weight(batched_weights, "gate_position.0.weight"),
+        get_weight(batched_weights, "gate_position.0.bias"),
+        policy_indices_for_ops,
+        dummy_timers
+    );
+    hidden_g_position = torch::tanh(hidden_g_position);
+    auto g_position = indexed_batched_linear(
+        hidden_g_position,
+        get_weight(batched_weights, "gate_position.2.weight"),
+        get_weight(batched_weights, "gate_position.2.bias"),
+        policy_indices_for_ops,
+        dummy_timers
+    );
+    g_position = torch::sigmoid(g_position);
+    result.insert("g_position", g_position);
+
+    return result;
+}
+
+c10::Dict<std::string, torch::Tensor>
+test_fusion(
+    const torch::Tensor& g_obs,
+    const torch::Tensor& g_action,
+    const torch::Tensor& g_agent,
+    const torch::Tensor& g_position,
+    const torch::Tensor& obs_embed,
+    const torch::Tensor& action_embed,
+    const torch::Tensor& agent_embed,
+    const torch::Tensor& position_embed,
+    int64_t hidden_dim
+) {
+    c10::Dict<std::string, torch::Tensor> result;
+
+    // Ensure dtype consistency for embeddings
+    auto act_embed_casted = action_embed.scalar_type() != obs_embed.scalar_type()
+        ? action_embed.to(obs_embed.scalar_type())
+        : action_embed;
+    auto agent_embed_casted = agent_embed.scalar_type() != obs_embed.scalar_type()
+        ? agent_embed.to(obs_embed.scalar_type())
+        : agent_embed;
+    auto position_embed_casted = position_embed.scalar_type() != obs_embed.scalar_type()
+        ? position_embed.to(obs_embed.scalar_type())
+        : position_embed;
+
+    // Fused embedding
+    auto fused = g_obs * obs_embed
+               + g_action * act_embed_casted
+               + g_agent * agent_embed_casted
+               + g_position * position_embed_casted;
+    result.insert("fused_raw", fused);
+
+    // Final layer norm
+    auto combined = torch::layer_norm(fused, {hidden_dim});
+    result.insert("combined", combined);
+
+    return result;
+}
+
+c10::Dict<std::string, torch::Tensor>
+test_attention_layer(
+    const torch::Tensor& x,
+    const c10::Dict<std::string, torch::Tensor>& batched_weights,
+    const torch::Tensor& policy_indices,
+    const torch::optional<torch::Tensor>& padding_mask,
+    int64_t layer_idx,
+    int64_t num_heads,
+    int64_t hidden_dim
+) {
+    auto device = x.device();
+    auto policy_indices_for_ops = policy_indices.to(device).to(torch::kLong).contiguous();
+    int64_t head_dim = hidden_dim / num_heads;
+
+    c10::Dict<std::string, torch::Tensor> result;
+    std::unordered_map<std::string, std::chrono::microseconds> dummy_timers;
+
+    std::string layer_prefix = "transformer.layers." + std::to_string(layer_idx);
+
+    // Get combined in_proj weight and bias, then split into Q, K, V
+    auto in_proj_weight = get_weight(batched_weights, layer_prefix + ".self_attn.in_proj_weight");
+    auto in_proj_bias = get_weight(batched_weights, layer_prefix + ".self_attn.in_proj_bias");
+
+    // Determine chunking dimension
+    int64_t weight_chunk_dim = (in_proj_weight.dim() == 3) ? 1 : 0;
+    int64_t bias_chunk_dim = (in_proj_bias.dim() == 2) ? 1 : 0;
+
+    // Split into Q, K, V weights
+    auto qkv_weights = in_proj_weight.chunk(3, weight_chunk_dim);
+    auto qkv_biases = in_proj_bias.chunk(3, bias_chunk_dim);
+
+    // Project to Q, K, V
+    auto q = indexed_batched_linear(x, qkv_weights[0], qkv_biases[0], policy_indices_for_ops, dummy_timers);
+    auto k = indexed_batched_linear(x, qkv_weights[1], qkv_biases[1], policy_indices_for_ops, dummy_timers);
+    auto v = indexed_batched_linear(x, qkv_weights[2], qkv_biases[2], policy_indices_for_ops, dummy_timers);
+
+    // Reshape for multi-head attention
+    q = q.view({batch_size, seq_len, num_heads, head_dim}).transpose(1, 2);
+    k = k.view({batch_size, seq_len, num_heads, head_dim}).transpose(1, 2);
+    v = v.view({batch_size, seq_len, num_heads, head_dim}).transpose(1, 2);
+
+    // Apply scaled dot-product attention with causal masking
+    auto attn_output = torch::scaled_dot_product_attention(
+        q, k, v,
+        torch::nullopt,
+        0.0,
+        true  // is_causal
+    );
+
+    // Reshape back
+    attn_output = attn_output.transpose(1, 2).contiguous().view({batch_size, seq_len, hidden_dim});
+
+    // Output projection
+    attn_output = indexed_batched_linear(
+        attn_output,
+        get_weight(batched_weights, layer_prefix + ".self_attn.out_proj.weight"),
+        get_weight(batched_weights, layer_prefix + ".self_attn.out_proj.bias"),
+        policy_indices_for_ops,
+        dummy_timers
+    );
+    result.insert("attn_output", attn_output);
+
+    // Residual connection + LayerNorm
+    auto residual = x + attn_output;
+    auto post_attn = indexed_batched_layer_norm(
+        residual,
+        get_weight(batched_weights, layer_prefix + ".norm1.weight"),
+        get_weight(batched_weights, layer_prefix + ".norm1.bias"),
+        policy_indices_for_ops
+    );
+    result.insert("post_attn", post_attn);
+
+    return result;
+}
+
+c10::Dict<std::string, torch::Tensor>
+test_moe_layer(
+    const torch::Tensor& x,
+    const c10::Dict<std::string, torch::Tensor>& batched_weights,
+    const torch::Tensor& policy_indices,
+    int64_t layer_idx,
+    int64_t num_experts,
+    int64_t top_k,
+    int64_t hidden_dim
+) {
+    auto device = x.device();
+    auto policy_indices_for_ops = policy_indices.to(device).to(torch::kLong).contiguous();
+
+    c10::Dict<std::string, torch::Tensor> result;
+    std::unordered_map<std::string, std::chrono::microseconds> dummy_timers;
+
+    std::string layer_prefix = "transformer.layers." + std::to_string(layer_idx);
+
+    // Compute gate logits
+    auto gate_logits = indexed_batched_linear(
+        x,
+        get_weight(batched_weights, layer_prefix + ".moe.gate.weight"),
+        get_weight(batched_weights, layer_prefix + ".moe.gate.bias"),
+        policy_indices_for_ops,
+        dummy_timers
+    );
+
+    // Ensure dtype consistency
+    if (gate_logits.scalar_type() != x.scalar_type()) {
+        gate_logits = gate_logits.to(x.scalar_type());
+    }
+    result.insert("gate_logits", gate_logits);
+
+    // Top-K selection
+    auto topk_result = torch::topk(gate_logits, top_k, -1);
+    auto topk_indices = std::get<1>(topk_result);
+    result.insert("topk_indices", topk_indices);
+
+    // Compute routing weights
+    auto gate_probs = torch::softmax(gate_logits, -1);
+    auto topk_scores = torch::gather(gate_probs, -1, topk_indices);
+    auto topk_weights = topk_scores / topk_scores.sum(-1, true).clamp_min(1e-6);
+    result.insert("topk_scores", topk_weights);
+
+    // For now, use CPU fallback for MoE computation (can be optimized later)
+    // This matches the PyTorch implementation
+    int64_t batch_size = x.size(0);
+    int64_t seq_len = x.size(1);
+    auto y = torch::zeros_like(x);
+
+    auto expert_w1 = get_weight(batched_weights, layer_prefix + ".moe.experts.w1");
+    auto expert_b1 = get_weight(batched_weights, layer_prefix + ".moe.experts.b1");
+    auto expert_w2 = get_weight(batched_weights, layer_prefix + ".moe.experts.w2");
+    auto expert_b2 = get_weight(batched_weights, layer_prefix + ".moe.experts.b2");
+
+    auto policy_indices_cpu = policy_indices.to(torch::kCPU).to(torch::kLong).contiguous();
+
+    for (int64_t expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
+        auto route_mask = (topk_indices == expert_idx).any(-1);
+
+        if (!route_mask.any().item<bool>()) {
+            continue;
+        }
+
+        auto mask_indices = torch::where(route_mask);
+        auto batch_indices = mask_indices[0];
+        auto time_indices = mask_indices[1];
+
+        auto expert_inputs = x.index({batch_indices, time_indices});
+        auto expert_mask = (topk_indices.index({batch_indices, time_indices}) == expert_idx);
+        auto rank_in_topk = torch::where(expert_mask)[1];
+        auto expert_routing_weights = topk_weights.index({batch_indices, time_indices, rank_in_topk}).unsqueeze(-1);
+
+        auto policy_for_tokens = policy_indices_cpu.index({batch_indices});
+
+        auto w1 = expert_w1.index({expert_idx, policy_for_tokens});
+        auto b1 = expert_b1.index({expert_idx, policy_for_tokens});
+        auto w2 = expert_w2.index({expert_idx, policy_for_tokens});
+        auto b2 = expert_b2.index({expert_idx, policy_for_tokens});
+
+        auto hidden = torch::gelu(
+            torch::bmm(expert_inputs.unsqueeze(1), w1.transpose(1, 2)) + b1.unsqueeze(1)
+        );
+        auto out = torch::bmm(hidden, w2.transpose(1, 2)) + b2.unsqueeze(1);
+        auto weighted_out = out.squeeze(1) * expert_routing_weights;
+
+        y.index_put_({batch_indices, time_indices},
+                      y.index({batch_indices, time_indices}) + weighted_out);
+    }
+
+    result.insert("moe_output", y);
+
+    return result;
+}
+
+c10::Dict<std::string, torch::Tensor>
+test_heads(
+    const torch::Tensor& transformer_output,
+    const c10::Dict<std::string, torch::Tensor>& batched_weights,
+    const torch::Tensor& policy_indices,
+    int64_t num_experts
+) {
+    auto device = transformer_output.device();
+    auto policy_indices_for_ops = policy_indices.to(device).to(torch::kLong).contiguous();
+
+    c10::Dict<std::string, torch::Tensor> result;
+    std::unordered_map<std::string, std::chrono::microseconds> dummy_timers;
+
+    std::vector<torch::Tensor> action_logits_list, opp_logits_list, state_values_list, win_logits_list;
+
+    for (int64_t i = 0; i < num_experts; ++i) {
+        action_logits_list.push_back(
+            indexed_batched_linear(
+                transformer_output,
+                get_weight(batched_weights, "action_heads." + std::to_string(i) + ".weight"),
+                get_weight(batched_weights, "action_heads." + std::to_string(i) + ".bias"),
+                policy_indices_for_ops,
+                dummy_timers)
+        );
+        opp_logits_list.push_back(
+            indexed_batched_linear(
+                transformer_output,
+                get_weight(batched_weights, "opp_action_heads." + std::to_string(i) + ".weight"),
+                get_weight(batched_weights, "opp_action_heads." + std::to_string(i) + ".bias"),
+                policy_indices_for_ops,
+                dummy_timers)
+        );
+        state_values_list.push_back(
+            indexed_batched_linear(
+                transformer_output,
+                get_weight(batched_weights, "reward_stream_heads." + std::to_string(i) + ".weight"),
+                get_weight(batched_weights, "reward_stream_heads." + std::to_string(i) + ".bias"),
+                policy_indices_for_ops,
+                dummy_timers)
+        );
+        win_logits_list.push_back(
+            indexed_batched_linear(
+                transformer_output,
+                get_weight(batched_weights, "win_prob_heads." + std::to_string(i) + ".weight"),
+                get_weight(batched_weights, "win_prob_heads." + std::to_string(i) + ".bias"),
+                policy_indices_for_ops,
+                dummy_timers)
+        );
+    }
+
+    // Stack along expert dimension
+    result.insert("action_heads_stacked", torch::stack(action_logits_list, 2));
+    result.insert("opp_heads_stacked", torch::stack(opp_logits_list, 2));
+    result.insert("reward_heads_stacked", torch::stack(state_values_list, 2));
+    result.insert("win_heads_stacked", torch::stack(win_logits_list, 2));
+
+    return result;
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
 torch::Tensor reduce_expert_heads(
     const torch::Tensor& stacked,
     const torch::Tensor& topk_indices,
@@ -214,7 +706,6 @@ forward_packed_cpp(
 
     int64_t batch_size = obs_sequence.size(0);
     int64_t seq_len = obs_sequence.size(1);
-    int64_t obs_dim = obs_sequence.size(2);
     int64_t action_seq_len = action_sequence.size(1);
 
     // DEBUG: Check policy indices distribution
@@ -251,7 +742,6 @@ forward_packed_cpp(
         "positions seq_len mismatch: expected ", seq_len, ", got ", positions.size(1));
 
     auto device = action_sequence.device();
-    auto dtype = obs_sequence.scalar_type();
 
     // ========================================================================
     // Load LUT buffers (action decomposition tables)

@@ -250,4 +250,220 @@ void bind_reactive_model(py::module_& m) {
             dict: Modified weight dictionary with added buffers
         )doc"
     );
+
+    // ========================================================================
+    // Layer-by-Layer Testing Functions
+    // ========================================================================
+
+    m.def(
+        "test_action_decomposition",
+        [](const torch::Tensor& action_sequence,
+           py::dict weights_py,
+           const torch::Tensor& policy_indices,
+           const torch::optional<torch::Tensor>& padding_mask,
+           int64_t count_pad,
+           int64_t tflag_pad) {
+            c10::Dict<std::string, torch::Tensor> weights;
+            for (auto item : weights_py) {
+                weights.insert(py::cast<std::string>(item.first), py::cast<torch::Tensor>(item.second));
+            }
+            return test_action_decomposition(action_sequence, weights, policy_indices, padding_mask, count_pad, tflag_pad);
+        },
+        py::arg("action_sequence"),
+        py::arg("weights"),
+        py::arg("policy_indices"),
+        py::arg("padding_mask") = torch::nullopt,
+        py::arg("count_pad") = 4,
+        py::arg("tflag_pad") = 3,
+        "Test action decomposition into (kind, count, table_flag)"
+    );
+
+    m.def(
+        "test_embeddings",
+        [](const torch::Tensor& obs_sequence,
+           const torch::Tensor& act_kind_ids,
+           const torch::Tensor& count_ids,
+           const torch::Tensor& table_flag_ids,
+           const torch::Tensor& agent_types,
+           const torch::Tensor& positions,
+           py::dict weights_py,
+           const torch::Tensor& policy_indices) {
+            c10::Dict<std::string, torch::Tensor> weights;
+            for (auto item : weights_py) {
+                weights.insert(py::cast<std::string>(item.first), py::cast<torch::Tensor>(item.second));
+            }
+            auto result = test_embeddings(obs_sequence, act_kind_ids, count_ids, table_flag_ids, agent_types, positions, weights, policy_indices);
+
+            py::dict py_result;
+            for (const auto& pair : result) {
+                py_result[py::cast(pair.key())] = py::cast(pair.value());
+            }
+            return py_result;
+        },
+        py::arg("obs_sequence"),
+        py::arg("act_kind_ids"),
+        py::arg("count_ids"),
+        py::arg("table_flag_ids"),
+        py::arg("agent_types"),
+        py::arg("positions"),
+        py::arg("weights"),
+        py::arg("policy_indices"),
+        "Test all embeddings (obs, action, agent, position)"
+    );
+
+    m.def(
+        "test_gating",
+        [](const torch::Tensor& obs_embed,
+           const torch::Tensor& action_embed,
+           const torch::Tensor& agent_embed,
+           const torch::Tensor& position_embed,
+           py::dict weights_py,
+           const torch::Tensor& policy_indices) {
+            c10::Dict<std::string, torch::Tensor> weights;
+            for (auto item : weights_py) {
+                weights.insert(py::cast<std::string>(item.first), py::cast<torch::Tensor>(item.second));
+            }
+            auto result = test_gating(obs_embed, action_embed, agent_embed, position_embed, weights, policy_indices);
+
+            py::dict py_result;
+            for (const auto& pair : result) {
+                py_result[py::cast(pair.key())] = py::cast(pair.value());
+            }
+            return py_result;
+        },
+        py::arg("obs_embed"),
+        py::arg("action_embed"),
+        py::arg("agent_embed"),
+        py::arg("position_embed"),
+        py::arg("weights"),
+        py::arg("policy_indices"),
+        "Test gating networks"
+    );
+
+    m.def(
+        "test_fusion",
+        [](const torch::Tensor& g_obs,
+           const torch::Tensor& g_action,
+           const torch::Tensor& g_agent,
+           const torch::Tensor& g_position,
+           const torch::Tensor& obs_embed,
+           const torch::Tensor& action_embed,
+           const torch::Tensor& agent_embed,
+           const torch::Tensor& position_embed,
+           int64_t hidden_dim) {
+            auto result = test_fusion(g_obs, g_action, g_agent, g_position, obs_embed, action_embed, agent_embed, position_embed, hidden_dim);
+
+            py::dict py_result;
+            for (const auto& pair : result) {
+                py_result[py::cast(pair.key())] = py::cast(pair.value());
+            }
+            return py_result;
+        },
+        py::arg("g_obs"),
+        py::arg("g_action"),
+        py::arg("g_agent"),
+        py::arg("g_position"),
+        py::arg("obs_embed"),
+        py::arg("action_embed"),
+        py::arg("agent_embed"),
+        py::arg("position_embed"),
+        py::arg("hidden_dim"),
+        "Test fusion layer (gated combination + layer norm)"
+    );
+
+    m.def(
+        "test_attention_layer",
+        [](const torch::Tensor& x,
+           py::dict weights_py,
+           const torch::Tensor& policy_indices,
+           const torch::optional<torch::Tensor>& padding_mask,
+           int64_t layer_idx,
+           int64_t num_heads,
+           int64_t hidden_dim) {
+            c10::Dict<std::string, torch::Tensor> weights;
+            for (auto item : weights_py) {
+                weights.insert(py::cast<std::string>(item.first), py::cast<torch::Tensor>(item.second));
+            }
+            auto result = test_attention_layer(x, weights, policy_indices, padding_mask, layer_idx, num_heads, hidden_dim);
+
+            py::dict py_result;
+            for (const auto& pair : result) {
+                py_result[py::cast(pair.key())] = py::cast(pair.value());
+            }
+            return py_result;
+        },
+        py::arg("x"),
+        py::arg("weights"),
+        py::arg("policy_indices"),
+        py::arg("padding_mask") = torch::nullopt,
+        py::arg("layer_idx") = 0,
+        py::arg("num_heads") = 4,
+        py::arg("hidden_dim") = 256,
+        "Test attention layer"
+    );
+
+    m.def(
+        "test_moe_layer",
+        [](const torch::Tensor& x,
+           py::dict weights_py,
+           const torch::Tensor& policy_indices,
+           int64_t layer_idx,
+           int64_t num_experts,
+           int64_t top_k,
+           int64_t hidden_dim) {
+            c10::Dict<std::string, torch::Tensor> weights;
+            for (auto item : weights_py) {
+                weights.insert(py::cast<std::string>(item.first), py::cast<torch::Tensor>(item.second));
+            }
+            auto result = test_moe_layer(x, weights, policy_indices, layer_idx, num_experts, top_k, hidden_dim);
+
+            py::dict py_result;
+            for (const auto& pair : result) {
+                py_result[py::cast(pair.key())] = py::cast(pair.value());
+            }
+            return py_result;
+        },
+        py::arg("x"),
+        py::arg("weights"),
+        py::arg("policy_indices"),
+        py::arg("layer_idx") = 0,
+        py::arg("num_experts") = 8,
+        py::arg("top_k") = 2,
+        py::arg("hidden_dim") = 256,
+        "Test MoE layer"
+    );
+
+    m.def(
+        "test_heads",
+        [](const torch::Tensor& transformer_output,
+           py::dict weights_py,
+           const torch::Tensor& policy_indices,
+           int64_t num_experts) {
+            c10::Dict<std::string, torch::Tensor> weights;
+            for (auto item : weights_py) {
+                weights.insert(py::cast<std::string>(item.first), py::cast<torch::Tensor>(item.second));
+            }
+            auto result = test_heads(transformer_output, weights, policy_indices, num_experts);
+
+            py::dict py_result;
+            for (const auto& pair : result) {
+                py_result[py::cast(pair.key())] = py::cast(pair.value());
+            }
+            return py_result;
+        },
+        py::arg("transformer_output"),
+        py::arg("weights"),
+        py::arg("policy_indices"),
+        py::arg("num_experts") = 8,
+        "Test per-expert head computation"
+    );
+
+    m.def(
+        "reduce_expert_heads",
+        &reduce_expert_heads,
+        py::arg("stacked"),
+        py::arg("topk_indices"),
+        py::arg("topk_scores"),
+        "Reduce expert heads using MoE routing weights"
+    );
 }

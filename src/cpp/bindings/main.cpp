@@ -8,7 +8,6 @@ void bind_ps(py::module_& m);
 void bind_vec_arena(py::module_& m);
 void bind_rollout_manager(py::module_& m);
 void bind_eval_manager(py::module_& m);
-void bind_moe(py::module_& m);
 void bind_reactive_model(py::module_& m);
 
 PYBIND11_MODULE(lb, m) {
@@ -20,6 +19,5 @@ PYBIND11_MODULE(lb, m) {
     bind_vec_arena(m);
     bind_rollout_manager(m);
     bind_eval_manager(m);
-    bind_moe(m);
     bind_reactive_model(m);
 }

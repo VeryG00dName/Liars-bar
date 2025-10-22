@@ -25,9 +25,14 @@ def generate_random_inputs(
     seq_length: int,
     obs_dim: int,
     action_dim: int = 7,
+    pad_obs_to: int = 16,
 ) -> Dict[str, torch.Tensor]:
     """
     Generate random inputs that match the model's expected format.
+
+    Args:
+        pad_obs_to: Pad observation dimension to this value for CUDA alignment.
+                    If obs_dim < pad_obs_to, observations will be zero-padded.
 
     Returns:
         Dictionary with keys: obs_sequence, action_sequence, agent_types,
@@ -35,6 +40,12 @@ def generate_random_inputs(
     """
     # Generate observations (random values in reasonable range)
     obs_sequence = torch.randn(batch_size, seq_length, obs_dim)
+
+    # Pad observations to aligned dimension for CUDA efficiency
+    if obs_dim < pad_obs_to:
+        padding = torch.zeros(batch_size, seq_length, pad_obs_to - obs_dim)
+        obs_sequence = torch.cat([obs_sequence, padding], dim=-1)
+        print(f"Padded observations from {obs_dim} to {pad_obs_to} dimensions")
 
     # Generate action sequence (random valid action indices 0-10)
     action_sequence = torch.randint(0, 11, (batch_size, seq_length))
@@ -60,6 +71,33 @@ def generate_random_inputs(
         'action_masks': action_masks,
         'padding_mask': padding_mask,
     }
+
+
+def pad_model_weights(model_state_dict: Dict[str, torch.Tensor], pad_obs_to: int = 16) -> Dict[str, torch.Tensor]:
+    """
+    Pad observation encoder weights for CUDA alignment.
+
+    Args:
+        model_state_dict: Model state dictionary
+        pad_obs_to: Target dimension for padding (default 16)
+
+    Returns:
+        Modified state dict with padded weights
+    """
+    # Pad obs_encoder.0.weight from [hidden_dim, obs_dim] to [hidden_dim, pad_obs_to]
+    obs_linear_weight_key = "obs_encoder.0.weight"
+    if obs_linear_weight_key in model_state_dict:
+        weight = model_state_dict[obs_linear_weight_key]
+        hidden_dim, obs_dim = weight.shape
+
+        if obs_dim < pad_obs_to:
+            # Pad with zeros
+            padding = torch.zeros(hidden_dim, pad_obs_to - obs_dim, dtype=weight.dtype, device=weight.device)
+            padded_weight = torch.cat([weight, padding], dim=1)
+            model_state_dict[obs_linear_weight_key] = padded_weight
+            print(f"Padded {obs_linear_weight_key} from [{hidden_dim}, {obs_dim}] to [{hidden_dim}, {pad_obs_to}]")
+
+    return model_state_dict
 
 
 def save_debug_outputs(outputs_dict: Dict[str, torch.Tensor], path: Path):
@@ -97,20 +135,34 @@ def main():
     else:
         raise ValueError(f"Could not find model state dict in checkpoint (keys: {list(checkpoint.keys())})")
 
+    # Infer original obs_dim before padding
+    obs_linear_weight = model_state_dict.get("obs_encoder.0.weight")
+    if obs_linear_weight is not None:
+        original_obs_dim = obs_linear_weight.shape[1]
+        print(f"Detected original obs_dim: {original_obs_dim}")
+    else:
+        raise ValueError("Could not find obs_encoder.0.weight in model state dict")
+
+    # Pad model weights for CUDA alignment
+    PAD_OBS_TO = 16
+    print(f"Padding model weights for CUDA alignment...")
+    model_state_dict = pad_model_weights(model_state_dict, pad_obs_to=PAD_OBS_TO)
+
     print(f"Building model from state dict...")
     device = torch.device('cpu')
     model = build_model_from_state(model_state_dict, device, debug=True)
     model.eval()
 
-    # Infer obs_dim from model
-    obs_dim = model.obs_encoder[0].in_features
-    print(f"Detected obs_dim: {obs_dim}")
+    # obs_dim is now the original dimension (before padding)
+    obs_dim = original_obs_dim
+    print(f"Will generate inputs with obs_dim={obs_dim}, then pad to {PAD_OBS_TO}")
 
     print(f"Generating random inputs: batch_size={args.batch_size}, seq_length={args.seq_length}")
     inputs = generate_random_inputs(
         batch_size=args.batch_size,
         seq_length=args.seq_length,
         obs_dim=obs_dim,
+        pad_obs_to=PAD_OBS_TO,
     )
 
     print("Running debug forward pass...")

@@ -213,7 +213,8 @@ namespace {
 // -----------------------------------------------------------------------------
 // GELU Activation
 // -----------------------------------------------------------------------------
-
+using Clock = std::chrono::high_resolution_clock;
+using Microseconds = std::chrono::microseconds;
 __device__ inline float gelu(float x) {
     return 0.5f * x * (1.0f + tanhf(0.79788456f * (x + 0.044715f * x * x * x)));
 }
@@ -827,368 +828,123 @@ torch::Tensor indexed_batched_layer_norm(
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
-}
-
-using Clock = std::chrono::high_resolution_clock;
-using Microseconds = std::chrono::microseconds;
 
 torch::Tensor indexed_batched_linear(
     const torch::Tensor& input,
-    const torch::Tensor& weight_cache,
-    const torch::Tensor& bias_cache,
-    const torch::Tensor& policy_indices,
+    const torch::Tensor& weight_cache,  // [W, out, in]
+    const torch::Tensor& bias_cache,    // [W, out]
+    const torch::Tensor& policy_indices,// [B]
     std::unordered_map<std::string, Microseconds>& timers,
-    IndexedLinearEpilogue epilogue) {
-    TORCH_CHECK(weight_cache.dim() == 3, "weight cache must be [W, out, in]");
-    TORCH_CHECK(bias_cache.dim() == 2, "bias cache must be [W, out]");
-    TORCH_CHECK(input.dim() == 3, "input must be [B, T, in]");
-
-    // Convert to FP32 for accumulation to prevent FP16 overflow
-    auto input_fp32 = input.to(torch::kFloat32);
-    auto weight_cache_fp32 = weight_cache.to(torch::kFloat32);
-    auto bias_cache_fp32 = bias_cache.to(torch::kFloat32);
-
-    auto debug_print = [](const torch::Tensor& t, const char* name) {
-        auto stats = t.to(torch::kFloat32);
-        std::cerr << "\n=== " << name << " ===\n"
-                  << "Shape: " << t.sizes() << "\n"
-                  << "Min: " << stats.min().item<float>() << "\n"
-                  << "Max: " << stats.max().item<float>() << "\n"
-                  << "Mean: " << stats.mean().item<float>() << "\n"
-                  << "Std: " << stats.std().item<float>() << "\n"
-                  << "Has NaN: " << (t.isnan().any().item<bool>() ? "YES" : "NO") << "\n"
-                  << "Has Inf: " << (t.isinf().any().item<bool>() ? "YES" : "NO") << "\n";
-    };
-    
-    // Enhanced debug: Check for NaN/Inf in all input tensors and print stats
-    auto check_tensor = [](const torch::Tensor& t, const char* name) {
-        if (t.isnan().any().item<bool>()) {
-            auto nan_mask = t.isnan();
-            auto nan_count = nan_mask.sum().item<int64_t>();
-            std::cerr << name << " contains " << nan_count << " NaN values" << std::endl;
-            // Print first NaN position
-            auto nan_indices = nan_mask.nonzero();
-            if (nan_indices.size(0) > 0) {
-                auto first_nan = nan_indices[0];
-                std::cerr << "First NaN at index: ";
-                for (int64_t i = 0; i < first_nan.size(0); ++i) {
-                    std::cerr << first_nan[i].item<int64_t>() << " ";
-                }
-                std::cerr << std::endl;
-            }
-            TORCH_CHECK(false, name, " contains NaN values");
-        }
-        if (t.isinf().any().item<bool>()) {
-            auto inf_mask = t.isinf();
-            auto inf_count = inf_mask.sum().item<int64_t>();
-            std::cerr << name << " contains " << inf_count << " Inf values" << std::endl;
-            TORCH_CHECK(false, name, " contains Inf values");
-        }
-        if (LB_DBG_STATS()) {
-            auto stats = t.to(torch::kFloat32);  // Convert for accurate stats
-            std::cerr << name << " stats - min: " << stats.min().item<float>()
-                     << " max: " << stats.max().item<float>()
-                     << " mean: " << stats.mean().item<float>()
-                     << " std: " << stats.std().item<float>() << std::endl;
-        }
-    };
-    
-    // Strictly validate runtime inputs; abort on invalid activations
-    check_tensor(input, "Linear input");
-
-    // Weights/bias may occasionally contain NaN from upstream packing.
-    // Instead of aborting, sanitize and warn to keep evaluation running.
-    auto weight_sanitized = weight_cache;
-    auto bias_sanitized   = bias_cache;
-    try {
-        bool w_has_nan = weight_cache.isnan().any().item<bool>();
-        bool w_has_inf = weight_cache.isinf().any().item<bool>();
-        if (w_has_nan || w_has_inf) {
-            auto nan_count = weight_cache.isnan().sum().item<int64_t>();
-            auto inf_count = weight_cache.isinf().sum().item<int64_t>();
-            std::cerr << "[WARN] Linear weight_cache contains NaN/Inf. nan=" << nan_count
-                      << ", inf=" << inf_count << ". Applying nan_to_num(0)." << std::endl;
-            // Replace NaN/Inf with zero to avoid propagating invalid values
-            auto w = weight_cache;
-            if (w.isnan().any().item<bool>()) {
-                auto mask = w.isnan();
-                w = w.clone();
-                w.masked_fill_(mask, 0);
-            }
-            if (w.isinf().any().item<bool>()) {
-                auto mask = w.isinf();
-                if (!w.is_contiguous()) w = w.contiguous();
-                w.masked_fill_(mask, 0);
-            }
-            weight_sanitized = w;
-        }
-    } catch (...) {
-        // Swallow unexpected errors in debug path; leave weights as-is
-    }
-    try {
-        bool b_has_nan = bias_cache.isnan().any().item<bool>();
-        bool b_has_inf = bias_cache.isinf().any().item<bool>();
-        if (b_has_nan || b_has_inf) {
-            auto nan_count = bias_cache.isnan().sum().item<int64_t>();
-            auto inf_count = bias_cache.isinf().sum().item<int64_t>();
-            std::cerr << "[WARN] Linear bias_cache contains NaN/Inf. nan=" << nan_count
-                      << ", inf=" << inf_count << ". Applying nan_to_num(0)." << std::endl;
-            auto b = bias_cache;
-            if (b.isnan().any().item<bool>()) {
-                auto mask = b.isnan();
-                b = b.clone();
-                b.masked_fill_(mask, 0);
-            }
-            if (b.isinf().any().item<bool>()) {
-                auto mask = b.isinf();
-                if (!b.is_contiguous()) b = b.contiguous();
-                b.masked_fill_(mask, 0);
-            }
-            bias_sanitized = b;
-        }
-    } catch (...) {}
-
+    IndexedLinearEpilogue epilogue)
+{
+    // === 1. Robust Input Validation ===
     TORCH_CHECK(input.is_cuda(), "indexed_batched_linear expects CUDA tensors for input");
+    TORCH_CHECK(weight_cache.is_cuda(), "weight_cache must be on CUDA device");
+    TORCH_CHECK(bias_cache.is_cuda(), "bias_cache must be on CUDA device");
 
-    const int64_t batch_size = input.size(0);
-    const int64_t time_steps = input.size(1);
-    const int64_t in_dim = input.size(2);
-    const int64_t out_dim = weight_cache.size(1);
-
-    TORCH_CHECK(weight_cache.size(2) == in_dim, "Input dim mismatch");
-
-    TORCH_CHECK(weight_cache.device().is_cuda(), "weight cache must be CUDA when input is CUDA");
-    TORCH_CHECK(bias_cache.device().is_cuda(), "bias cache must be CUDA when input is CUDA");
-
-    c10::cuda::CUDAGuard guard(input.device());
-
-    // Force FP32 compute: cast inputs/weights/bias to float32 on device
-    auto input_cast = input.to(torch::kFloat32).contiguous();
-    auto weight_contig = weight_sanitized.to(torch::kFloat32).contiguous();
-    auto bias_contig = bias_sanitized.to(torch::kFloat32).contiguous();
-    auto policy_contig = policy_indices.to(torch::kLong).contiguous();
-    if (policy_contig.device() != input.device()) {
-        policy_contig = policy_contig.to(input.device());
-    }
-    // Validate policy indices are within bounds before index_select
-    auto policy_max = policy_contig.max();
-    auto policy_min = policy_contig.min();
+    TORCH_CHECK(input.dim()        == 3, "Input tensor must be 3D [B, T, in], got ", input.sizes());
+    TORCH_CHECK(weight_cache.dim() == 3, "weight_cache must be 3D [W, out, in], got ", weight_cache.sizes());
+    TORCH_CHECK(bias_cache.dim()   == 2, "bias_cache must be 2D [W, out], got ", bias_cache.sizes());
     
-    // CLAMPING: Ensure indices are within the valid range of the weight_cache.
-    // This is a safeguard against invalid policy IDs being passed from the Python side.
-    auto clamped_policy_indices = torch::clamp(policy_contig, 0, weight_contig.size(0) - 1);
+    TORCH_CHECK(policy_indices.dim() == 1, "policy_indices must be 1D [B], got ", policy_indices.sizes());
 
-    if (!torch::equal(policy_contig, clamped_policy_indices)) {
-        std::cerr << "[WARN] Clamping policy indices. Original min=" << policy_min.item<int64_t>()
-                  << ", max=" << policy_max.item<int64_t>()
-                  << ". Clamped to [0, " << weight_contig.size(0) - 1 << "]" << std::endl;
+    const int64_t B = input.size(0);
+    const int64_t T = input.size(1);
+    const int64_t In_Dim = input.size(2);
+    const int64_t W = weight_cache.size(0);
+    const int64_t Out_Dim = weight_cache.size(1);
+
+    TORCH_CHECK(policy_indices.size(0) == B, "policy_indices batch size must match input, expected ", B, ", got ", policy_indices.size(0));
+    TORCH_CHECK(weight_cache.size(2) == In_Dim, "weight_cache input dim must match input tensor, expected ", In_Dim, ", got ", weight_cache.size(2));
+    TORCH_CHECK(bias_cache.size(0) == W && bias_cache.size(1) == Out_Dim, "bias_cache shape mismatch");
+
+    // === 2. Data Preparation and Sanitization ===
+    auto input_f32 = input.to(torch::kFloat32).contiguous();
+    auto weight_f32 = weight_cache.to(torch::kFloat32).contiguous();
+    auto bias_f32 = bias_cache.to(torch::kFloat32).contiguous();
+    
+    auto policy_indices_long = policy_indices.to(torch::kLong).contiguous();
+    if (policy_indices_long.device() != input.device()) {
+        policy_indices_long = policy_indices_long.to(input.device());
     }
 
-    TORCH_CHECK(policy_min.item<int64_t>() >= 0,
-        "indexed_batched_linear: policy indices contain negative values: min=", policy_min.item<int64_t>());
-    TORCH_CHECK(policy_max.item<int64_t>() < weight_contig.size(0),
-        "indexed_batched_linear: policy index out of bounds: max_index=", policy_max.item<int64_t>(),
-        ", weight_cache_size=", weight_contig.size(0),
-        " (batch_size=", batch_size, ", time_steps=", time_steps, ")");
+    auto policy_min = policy_indices_long.min().item<int64_t>();
+    auto policy_max = policy_indices_long.max().item<int64_t>();
+    TORCH_CHECK(policy_min >= 0 && policy_max < W,
+                "policy_indices are out of valid range. Got min=", policy_min, ", max=", policy_max,
+                ", but valid range is [0, ", W - 1, "]");
 
     auto t0 = Clock::now();
-    auto weight_batched = weight_contig.index_select(0, clamped_policy_indices).contiguous(); // [B, out, in]
-    auto bias_batched = bias_contig.index_select(0, clamped_policy_indices).contiguous();     // [B, out]
-    torch::cuda::synchronize();
+    auto weight_batched = weight_f32.index_select(0, policy_indices_long);
+    auto bias_batched = bias_f32.index_select(0, policy_indices_long);
     auto t1 = Clock::now();
     timers["linear_index_select_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
 
-    auto output = torch::empty({batch_size, time_steps, out_dim}, input_cast.options());
+    auto output = torch::empty({B, T, Out_Dim}, input_f32.options());
 
-    // CRITICAL VALIDATION: Check that index_select didn't produce invalid tensors
-    TORCH_CHECK(weight_batched.is_contiguous(),
-        "weight_batched must be contiguous after index_select");
-    TORCH_CHECK(weight_batched.size(0) == batch_size,
-        "weight_batched size mismatch: expected ", batch_size, " got ", weight_batched.size(0));
-    TORCH_CHECK(weight_batched.size(1) == out_dim && weight_batched.size(2) == in_dim,
-        "weight_batched shape mismatch: expected [", batch_size, ",", out_dim, ",", in_dim, "]",
-        " got [", weight_batched.size(0), ",", weight_batched.size(1), ",", weight_batched.size(2), "]");
-    TORCH_CHECK(input_cast.is_contiguous(),
-        "input_cast must be contiguous, got strides: ", input_cast.strides());
-    TORCH_CHECK(input_cast.size(0) == batch_size && input_cast.size(1) == time_steps && input_cast.size(2) == in_dim,
-        "input_cast shape mismatch: expected [", batch_size, ",", time_steps, ",", in_dim, "]",
-        " got [", input_cast.size(0), ",", input_cast.size(1), ",", input_cast.size(2), "]");
-
+    // === 3. cuBLASLt Setup and Execution ===
     auto handle = at::cuda::getCurrentCUDABlasLtHandle();
     auto stream = at::cuda::getCurrentCUDAStream();
-    cudaStream_t raw_stream = stream.stream();
-    const auto dtype = input_cast.scalar_type();
-    // Create descriptors with current dynamic dimensions
     MatmulDescriptors desc{};
+
     const auto compute_type = CUBLAS_COMPUTE_32F;
     const auto data_type = CUDA_R_32F;
-    TORCH_CHECK(
-        cublasLtMatmulDescCreate(&desc.op_desc, compute_type, CUDA_R_32F) == CUBLAS_STATUS_SUCCESS,
-        "cuBLASLt error");
+
+    TORCH_CHECK(cublasLtMatmulDescCreate(&desc.op_desc, compute_type, CUDA_R_32F) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: MatmulDescCreate failed");
     cublasOperation_t trans_a = CUBLAS_OP_N;
-    cublasOperation_t trans_b = CUBLAS_OP_T; // B is [N, K] but treated as transposed
-    TORCH_CHECK(cublasLtMatmulDescSetAttribute(
-        desc.op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt error");
-    TORCH_CHECK(cublasLtMatmulDescSetAttribute(
-        desc.op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &trans_b, sizeof(trans_b)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt error");
-    // Scalars alpha/beta are host pointers
-    cublasLtPointerMode_t ab_pointer_mode = CUBLASLT_POINTER_MODE_HOST;
-    TORCH_CHECK(cublasLtMatmulDescSetAttribute(
-        desc.op_desc, CUBLASLT_MATMUL_DESC_POINTER_MODE, &ab_pointer_mode, sizeof(ab_pointer_mode)) == CUBLAS_STATUS_SUCCESS,
-        "cuBLASLt error");
+    cublasOperation_t trans_b = CUBLAS_OP_T;
+    TORCH_CHECK(cublasLtMatmulDescSetAttribute(desc.op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: SetAttribute TRANSA failed");
+    TORCH_CHECK(cublasLtMatmulDescSetAttribute(desc.op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &trans_b, sizeof(trans_b)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: SetAttribute TRANSB failed");
 
-    const int64_t M = time_steps;
-    const int64_t K = in_dim;
-    const int64_t N = out_dim;
-    TORCH_CHECK(cublasLtMatrixLayoutCreate(&desc.layout_a, data_type, M, K, K) == CUBLAS_STATUS_SUCCESS, "cuBLASLt error");
-    TORCH_CHECK(cublasLtMatrixLayoutCreate(&desc.layout_b, data_type, N, K, K) == CUBLAS_STATUS_SUCCESS, "cuBLASLt error");
-    TORCH_CHECK(cublasLtMatrixLayoutCreate(&desc.layout_c, data_type, M, N, N) == CUBLAS_STATUS_SUCCESS, "cuBLASLt error");
-    cublasLtOrder_t order = CUBLASLT_ORDER_ROW;
-    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_a, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt error");
-    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_b, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt error");
-    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_c, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt error");
-    // Configure strided batched A/B/C (base pointers + batch stride)
-    // 1) Batch count: cuBLASLt expects a 32-bit int for this attribute on CUDA 12.x
-    const int batch_count = static_cast<int>(batch_size);
-    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(
-        desc.layout_a, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)) == CUBLAS_STATUS_SUCCESS, "A batch size cuBLASLt error");
-    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(
-        desc.layout_b, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)) == CUBLAS_STATUS_SUCCESS, "B batch size cuBLASLt error");
-    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(
-        desc.layout_c, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)) == CUBLAS_STATUS_SUCCESS, "C batch size cuBLASLt error");
+    const int64_t M = T;
+    const int64_t K = In_Dim;
+    const int64_t N = Out_Dim;
 
-    // 2) Strides must be **bytes**. Use the real tensor element size (handles FP16/BF16/FP32)
-    const long long elem_bytes = static_cast<long long>(input_cast.element_size()); // 2 for FP16/BF16, 4 for FP32
-    const long long stride_a_bytes = static_cast<long long>(M) * static_cast<long long>(K) * elem_bytes; // A: [M,K]
-    const long long stride_b_bytes = static_cast<long long>(N) * static_cast<long long>(K) * elem_bytes; // B: [N,K] (transB=T)
-    const long long stride_c_bytes = static_cast<long long>(M) * static_cast<long long>(N) * elem_bytes; // C: [M,N]
+    TORCH_CHECK(cublasLtMatrixLayoutCreate(&desc.layout_a, data_type, M, K, K) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: LayoutCreate A failed");
+    TORCH_CHECK(cublasLtMatrixLayoutCreate(&desc.layout_b, data_type, N, K, K) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: LayoutCreate B failed");
+    TORCH_CHECK(cublasLtMatrixLayoutCreate(&desc.layout_c, data_type, M, N, N) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: LayoutCreate C failed");
 
-    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(
-        desc.layout_a, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
-        &stride_a_bytes, sizeof(stride_a_bytes)) == CUBLAS_STATUS_SUCCESS, "A stride cuBLASLt error");
-    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(
-        desc.layout_b, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
-        &stride_b_bytes, sizeof(stride_b_bytes)) == CUBLAS_STATUS_SUCCESS, "B stride cuBLASLt error");
-    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(
-        desc.layout_c, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
-    &stride_c_bytes, sizeof(stride_c_bytes)) == CUBLAS_STATUS_SUCCESS, "C stride cuBLASLt error");
-    size_t workspace_size = 1 << 22; // 4MB
-    auto workspace = torch::empty({static_cast<long>(workspace_size)}, input_cast.options().dtype(torch::kByte));
+    const int batch_count_32 = static_cast<int>(B);
+    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_a, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count_32, sizeof(batch_count_32)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: SetBatch A failed");
+    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_b, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count_32, sizeof(batch_count_32)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: SetBatch B failed");
+    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_c, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count_32, sizeof(batch_count_32)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: SetBatch C failed");
 
+    const long long elem_bytes = static_cast<long long>(input_f32.element_size());
+    const long long stride_a_bytes = M * K * elem_bytes;
+    const long long stride_b_bytes = N * K * elem_bytes;
+    const long long stride_c_bytes = M * N * elem_bytes;
+    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_a, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_a_bytes, sizeof(stride_a_bytes)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: SetStride A failed");
+    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_b, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_b_bytes, sizeof(stride_b_bytes)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: SetStride B failed");
+    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_c, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_c_bytes, sizeof(stride_c_bytes)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: SetStride C failed");
+    
+    size_t workspace_size = 1 << 22;
+    auto workspace = torch::empty({(long)workspace_size}, torch::kByte, input_f32.options());
     cublasLtMatmulPreference_t preference;
-    TORCH_CHECK(cublasLtMatmulPreferenceCreate(&preference) == CUBLAS_STATUS_SUCCESS, "cuBLASLt error");
-    TORCH_CHECK(cublasLtMatmulPreferenceSetAttribute(
-        preference,
-        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-        &workspace_size,
-        sizeof(workspace_size)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt error");
-
-    // Use default epilogue; apply bias/GELU after GEMM for clarity/compat
-    cublasLtEpilogue_t epilogue_attr = CUBLASLT_EPILOGUE_DEFAULT;
-    {
-        auto st = cublasLtMatmulDescSetAttribute(
-            desc.op_desc,
-            CUBLASLT_MATMUL_DESC_EPILOGUE,
-            &epilogue_attr,
-            sizeof(epilogue_attr));
-        TORCH_CHECK(st == CUBLAS_STATUS_SUCCESS,
-            "cublasLtMatmulDescSetAttribute(EPILOGUE) failed: ", cublas_status_to_string(st),
-            " (", static_cast<int>(st), ")");
-    }
-
-    dumpLtConfigLt(handle, desc.op_desc, desc.layout_a, desc.layout_b, desc.layout_c, preference);
+    TORCH_CHECK(cublasLtMatmulPreferenceCreate(&preference) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: PreferenceCreate failed");
+    TORCH_CHECK(cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size, sizeof(workspace_size)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: PreferenceSetAttribute failed");
 
     cublasLtMatmulHeuristicResult_t heuristic{};
     int returned_results = 0;
-
-    auto st = cublasLtMatmulAlgoGetHeuristic(
-        handle,
-        desc.op_desc,
-        desc.layout_a,
-        desc.layout_b,
-        desc.layout_c,
-        desc.layout_c,
-        preference,
-        1,
-        &heuristic,
-        &returned_results);
-
-    if (LB_DBG_CUBLASLT()) {
-        std::cout << "cublasLtMatmulAlgoGetHeuristic status=" << (int)st
-                  << " returned=" << returned_results << "\n";
-        if (st == CUBLAS_STATUS_SUCCESS && returned_results > 0) {
-            dumpHeuristic(heuristic);
-        } else {
-            std::cerr << "No heuristic. Check: ORDER vs LD, batch stride BYTES, compute/scale types, epilogue/bias.\n";
-        }
-    }
-
-    // NEW: No fallback. If a heuristic is not found, it's a fatal error.
-    TORCH_CHECK(
-        st == CUBLAS_STATUS_SUCCESS && returned_results > 0,
-        "indexed_batched_linear: cublasLtMatmulAlgoGetHeuristic failed to find a valid algorithm. ",
-        "This is a fatal error.",
-        "M=", time_steps, ", N=", out_dim, ", K=", in_dim, ", batch=", batch_size,
-        ", cuBLAS status: ", cublas_status_to_string(st)
-    );
-
-    // Fast path is now the ONLY path.
-    float alpha_float = 1.0f;
-    float beta_float = 0.0f;
-    const void* alpha_ptr = &alpha_float;
-    const void* beta_ptr = &beta_float;
-
-    // Strided-batched matmul with base pointers
+    auto heuristic_status = cublasLtMatmulAlgoGetHeuristic(handle, desc.op_desc, desc.layout_a, desc.layout_b, desc.layout_c, desc.layout_c, preference, 1, &heuristic, &returned_results);
+    TORCH_CHECK(heuristic_status == CUBLAS_STATUS_SUCCESS && returned_results > 0, "cuBLASLt: Failed to find a valid GEMM algorithm. Status: ", cublas_status_to_string(heuristic_status));
+    
+    float alpha_float = 1.0f, beta_float = 0.0f;
     auto gemm_t0 = Clock::now();
-    auto matmul_status = cublasLtMatmul(
-        handle,
-        desc.op_desc,
-        alpha_ptr,
-        input_cast.data_ptr(),        // A base: [B, M, K]
-        desc.layout_a,
-        weight_batched.data_ptr(),    // B base: [B, N, K]
-        desc.layout_b,
-        beta_ptr,
-        output.data_ptr(),            // C base: [B, M, N]
-        desc.layout_c,
-        output.data_ptr(),
-        desc.layout_c,
-        &heuristic.algo,
-        workspace_size ? workspace.data_ptr() : nullptr,
-        workspace_size,
-        raw_stream);
-    if (input_cast.is_cuda()) { torch::cuda::synchronize(); }
+    auto matmul_status = cublasLtMatmul(handle, desc.op_desc, &alpha_float, input_f32.data_ptr(), desc.layout_a, weight_batched.data_ptr(), desc.layout_b, &beta_float, output.data_ptr(), desc.layout_c, output.data_ptr(), desc.layout_c, &heuristic.algo, workspace.data_ptr(), workspace_size, stream.stream());
     auto gemm_t1 = Clock::now();
     timers["linear_cublas_matmul_us"] += std::chrono::duration_cast<Microseconds>(gemm_t1 - gemm_t0);
-    const char* dtype_str = (dtype == at::kHalf) ? "f16" : (dtype == at::kFloat) ? "f32" : "other";
-    TORCH_CHECK(
-        matmul_status == CUBLAS_STATUS_SUCCESS,
-        "cublasLtMatmul failed: ", cublas_status_to_string(matmul_status),
-        " (", static_cast<int>(matmul_status), ")",
-        "; M=", time_steps,
-        ", N=", out_dim,
-        ", K=", in_dim,
-        ", batch=", batch_size,
-        ", dtype=", dtype_str,
-        ", epilogue=DEFAULT",
-        ", workspace=", workspace_size
-    );
+    TORCH_CHECK(matmul_status == CUBLAS_STATUS_SUCCESS, "cuBLASLt: Matmul execution failed with status ", cublas_status_to_string(matmul_status));
+    
+    TORCH_CHECK(cublasLtMatmulPreferenceDestroy(preference) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: PreferenceDestroy failed");
 
-    TORCH_CHECK(cublasLtMatmulPreferenceDestroy(preference) == CUBLAS_STATUS_SUCCESS, "cuBLASLt error");
-
-    // Apply bias and optional GELU epilogue per batch
+    // === 4. Epilogue: Bias and Activation ===
     auto epi_t0 = Clock::now();
     output.add_(bias_batched.unsqueeze(1));
     if (epilogue == IndexedLinearEpilogue::BiasGELU) {
         output = torch::gelu(output);
     }
-    if (output.is_cuda()) { torch::cuda::synchronize(); }
     auto epi_t1 = Clock::now();
     timers["linear_epilogue_us"] += std::chrono::duration_cast<Microseconds>(epi_t1 - epi_t0);
 
-    // Strict validation: no fallback; ensure output has no NaN/Inf
-    TORCH_CHECK(!output.isnan().any().item<bool>(), "indexed_batched_linear: output contains NaN after FP32 GEMM");
-    TORCH_CHECK(!output.isinf().any().item<bool>(), "indexed_batched_linear: output contains Inf after FP32 GEMM");
-
-    return output;
+    return output.to(input.scalar_type());
 }
