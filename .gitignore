@@ -193,3 +193,4 @@ CODING_GUIDELINES.md
 *.max_seq_length
 CLAUDE.md
 *.txt
+.github/copilot-instructions.md
