@@ -110,7 +110,7 @@ test_embeddings(
         get_weight(batched_weights, "obs_encoder.1.weight"),
         get_weight(batched_weights, "obs_encoder.1.bias"),
         policy_indices_for_ops,
-        /* eps = */ 1e-5
+        /* eps = */ 1e-4
     );
     obs_encoded = torch::gelu(obs_encoded);
     result.insert("obs_embed", obs_encoded);
@@ -302,6 +302,8 @@ test_attention_layer(
 ) {
     auto device = x.device();
     auto policy_indices_for_ops = policy_indices.to(device).to(torch::kLong).contiguous();
+    int64_t batch_size = x.size(0);
+    int64_t seq_len = x.size(1);
     int64_t head_dim = hidden_dim / num_heads;
 
     c10::Dict<std::string, torch::Tensor> result;
@@ -706,6 +708,7 @@ forward_packed_cpp(
 
     int64_t batch_size = obs_sequence.size(0);
     int64_t seq_len = obs_sequence.size(1);
+    int64_t obs_dim = obs_sequence.size(2);
     int64_t action_seq_len = action_sequence.size(1);
 
     // DEBUG: Check policy indices distribution
@@ -742,6 +745,7 @@ forward_packed_cpp(
         "positions seq_len mismatch: expected ", seq_len, ", got ", positions.size(1));
 
     auto device = action_sequence.device();
+    auto dtype = obs_sequence.scalar_type();
 
     // ========================================================================
     // Load LUT buffers (action decomposition tables)

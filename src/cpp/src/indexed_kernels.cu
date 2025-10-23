@@ -828,6 +828,7 @@ torch::Tensor indexed_batched_layer_norm(
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
+}
 
 torch::Tensor indexed_batched_linear(
     const torch::Tensor& input,
@@ -904,6 +905,11 @@ torch::Tensor indexed_batched_linear(
     TORCH_CHECK(cublasLtMatrixLayoutCreate(&desc.layout_b, data_type, N, K, K) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: LayoutCreate B failed");
     TORCH_CHECK(cublasLtMatrixLayoutCreate(&desc.layout_c, data_type, M, N, N) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: LayoutCreate C failed");
 
+    cublasLtOrder_t order = CUBLASLT_ORDER_ROW;
+    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_a, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: SetOrder A failed");
+    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_b, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: SetOrder B failed");
+    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_c, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: SetOrder C failed");
+
     const int batch_count_32 = static_cast<int>(B);
     TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_a, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count_32, sizeof(batch_count_32)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: SetBatch A failed");
     TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_b, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count_32, sizeof(batch_count_32)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: SetBatch B failed");
@@ -918,7 +924,7 @@ torch::Tensor indexed_batched_linear(
     TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_c, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_c_bytes, sizeof(stride_c_bytes)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: SetStride C failed");
     
     size_t workspace_size = 1 << 22;
-    auto workspace = torch::empty({(long)workspace_size}, torch::kByte, input_f32.options());
+    auto workspace = torch::empty({(long)workspace_size}, input_f32.options().dtype(torch::kByte));
     cublasLtMatmulPreference_t preference;
     TORCH_CHECK(cublasLtMatmulPreferenceCreate(&preference) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: PreferenceCreate failed");
     TORCH_CHECK(cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size, sizeof(workspace_size)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: PreferenceSetAttribute failed");

@@ -32,6 +32,7 @@ void prestack_moe_expert_weights(
         }
     }
 
+    int64_t batch_size = 1;
     if (is_batched) {
         // Infer batch size from any weight
         for (const auto& pair : state_dict) {
@@ -114,6 +115,7 @@ void create_moe_weight_pointers(
      */
 
     // Determine if weights are batched
+    bool is_batched = false;
     int64_t batch_size = 1;
 
     for (const auto& pair : state_dict) {
