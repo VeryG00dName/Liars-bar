@@ -199,8 +199,13 @@ void bind_reactive_model(py::module_& m) {
                 state_dicts.push_back(state_dict);
             }
 
-            // Call C++ function
-            return batch_state_dicts(state_dicts);
+            // Call C++ function and convert c10::Dict to Python dict
+            auto batched = batch_state_dicts(state_dicts);
+            py::dict result;
+            for (const auto& pair : batched) {
+                result[py::cast(pair.key())] = py::cast(pair.value());
+            }
+            return result;
         },
         py::arg("state_dicts"),
         R"doc(

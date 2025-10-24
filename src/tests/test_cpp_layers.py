@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import pickle
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import numpy as np
@@ -64,10 +64,11 @@ def pad_model_weights(model_state_dict: Dict[str, torch.Tensor], pad_obs_to: int
 
 
 def prepare_batched_weights(
-    state_dict: Dict[str, torch.Tensor],
+    state_dict: Optional[Dict[str, torch.Tensor]],
     num_layers: int = 2,
     num_experts: int = 8,
-    device: str = 'cpu'
+    device: str = 'cpu',
+    state_dict2: Optional[Dict[str, torch.Tensor]] = None,
 ) -> Dict[str, torch.Tensor]:
     """
     Prepare batched weights for C++ testing.
@@ -77,14 +78,20 @@ def prepare_batched_weights(
     """
     # First, prestack MoE expert weights (must be done before adding batch dim)
     print(f"Pre-stacking MoE expert weights ({num_layers} layers, {num_experts} experts)...")
-    state_dict_stacked = lb.prestack_moe_expert_weights(state_dict, num_layers, num_experts)
-
-    batched: Dict[str, torch.Tensor] = {}
-
-    for key, value in state_dict_stacked.items():
-        # Add batch dimension [1, ...] and move to device
-        t = value.unsqueeze(0).to(device)
-        batched[key] = t
+    if state_dict2 is None:
+        state_dict_stacked = lb.prestack_moe_expert_weights(state_dict, num_layers, num_experts)
+        batched: Dict[str, torch.Tensor] = {}
+        for key, value in state_dict_stacked.items():
+            # Add batch dimension [1, ...] and move to device
+            t = value.unsqueeze(0).to(device)
+            batched[key] = t
+    else:
+        # Two-policy: prestack individually then stack across policies
+        sd1 = lb.prestack_moe_expert_weights(dict(state_dict), num_layers, num_experts)
+        sd2 = lb.prestack_moe_expert_weights(dict(state_dict2), num_layers, num_experts)
+        batched = lb.batch_state_dicts([sd1, sd2])
+        for k in list(batched.keys()):
+            batched[k] = batched[k].to(device)
 
     # If using CUDA, convert floating-point weights to FP16 before creating
     # MoE pointer tensors so that GPU kernels (which expect Half) match dtype.
@@ -181,7 +188,7 @@ def test_action_decomposition(
 
     # Policy indices (single policy, index 0)
     batch_size = action_sequence.size(0)
-    policy_indices = torch.zeros(batch_size, dtype=torch.long, device=device)
+    policy_indices = reference.get('input/policy_indices', torch.zeros(batch_size, dtype=torch.long)).to(device)
 
     # Call C++ function
     act_kind_ids_cpp, count_ids_cpp, table_flag_ids_cpp = lb.test_action_decomposition(
@@ -221,7 +228,7 @@ def test_embeddings(
     positions = reference['input/positions'].to(device)
 
     batch_size = obs_sequence.size(0)
-    policy_indices = torch.zeros(batch_size, dtype=torch.long, device=device)
+    policy_indices = reference.get('input/policy_indices', torch.zeros(batch_size, dtype=torch.long)).to(device)
 
     # Call C++ function
     embeddings_cpp = lb.test_embeddings(
@@ -342,7 +349,7 @@ def test_transformer_layers(
     x_cpp = reference['fusion/combined'].to(device)
 
     batch_size = x_cpp.size(0)
-    policy_indices = torch.zeros(batch_size, dtype=torch.long, device=device)
+    policy_indices = reference.get('input/policy_indices', torch.zeros(batch_size, dtype=torch.long)).to(device)
     padding_mask = reference.get('input/padding_mask')
     if padding_mask is not None:
         padding_mask = padding_mask.to(device)
@@ -409,12 +416,23 @@ def test_transformer_layers(
             reference[f'transformer/layer_{layer_idx}/moe_output']
         )
 
-        # Residual + norm for next layer
-        # Note: C++ test function doesn't include this, so we need to do it here
-        x_cpp = x_cpp + moe_cpp['moe_output']
-        # Apply layer norm manually - but we'd need the weights
-        # For now, use reference output to continue
-        x_cpp = reference[f'transformer/layer_{layer_idx}/output'].to(device)
+        # Residual + LayerNorm for next layer (use per-policy LN params)
+        residual2 = x_cpp + moe_cpp['moe_output']
+
+        # Gather per-sample gamma/beta for norm2
+        ln_gamma = batched_weights[f'transformer.layers.{layer_idx}.norm2.weight'].to(device)
+        ln_beta = batched_weights[f'transformer.layers.{layer_idx}.norm2.bias'].to(device)
+        # ln_gamma/beta shape: [W, H] -> select per policy -> [B, H]
+        gamma_sel = ln_gamma.index_select(0, policy_indices)
+        beta_sel = ln_beta.index_select(0, policy_indices)
+        # Compute LN manually for [B, T, H]
+        eps = 1e-5
+        mean = residual2.mean(dim=-1, keepdim=True)
+        var = residual2.var(dim=-1, unbiased=False, keepdim=True)
+        inv_std = torch.rsqrt(var + eps)
+        normed = (residual2 - mean) * inv_std
+        # Broadcast gamma/beta to [B, T, H]
+        x_cpp = normed * gamma_sel.unsqueeze(1) + beta_sel.unsqueeze(1)
 
     # Test final norm (uses reference since we're chaining layers)
     transformer_output_ref = reference['transformer/final_output'].to(device)
@@ -440,7 +458,7 @@ def test_heads(
     transformer_output = reference['transformer/final_output'].to(device)
 
     batch_size = transformer_output.size(0)
-    policy_indices = torch.zeros(batch_size, dtype=torch.long, device=device)
+    policy_indices = reference.get('input/policy_indices', torch.zeros(batch_size, dtype=torch.long)).to(device)
 
     # Call C++ function
     heads_cpp = lb.test_heads(
@@ -464,7 +482,9 @@ def main():
     parser = argparse.ArgumentParser(description='Test C++ layers against PyTorch reference')
     parser.add_argument('reference', type=str, help='Path to reference outputs pickle file')
     parser.add_argument('checkpoint', type=str, help='Path to checkpoint')
+    parser.add_argument('--checkpoint2', type=str, default=None, help='Optional second checkpoint for multi-policy test')
     parser.add_argument('--agent-key', type=str, default='self', help='Agent key in checkpoint')
+    parser.add_argument('--agent-key2', type=str, default='self', help='Agent key in second checkpoint')
     parser.add_argument('--device', type=str, default='cpu', help='Device to use (cpu or cuda)')
 
     args = parser.parse_args()
@@ -485,12 +505,19 @@ def main():
     # Load checkpoint weights
     print("Loading checkpoint weights...")
     state_dict = load_checkpoint_weights(Path(args.checkpoint), args.agent_key)
-    print(f"Loaded {len(state_dict)} weight tensors")
+    state_dict2 = None
+    if args.checkpoint2:
+        state_dict2 = load_checkpoint_weights(Path(args.checkpoint2), args.agent_key2)
+        print(f"Loaded A: {len(state_dict)} tensors; B: {len(state_dict2)} tensors")
+    else:
+        print(f"Loaded {len(state_dict)} weight tensors")
 
     # Pad model weights for CUDA alignment
     PAD_OBS_TO = 16
     print(f"Padding model weights for CUDA alignment (obs_dim -> {PAD_OBS_TO})...")
     state_dict = pad_model_weights(state_dict, pad_obs_to=PAD_OBS_TO)
+    if state_dict2 is not None:
+        state_dict2 = pad_model_weights(state_dict2, pad_obs_to=PAD_OBS_TO)
 
     # Prepare batched weights for C++ (includes MoE expert weight stacking)
     print("Preparing batched weights...")
@@ -498,7 +525,8 @@ def main():
         state_dict,
         num_layers=2,
         num_experts=8,
-        device=args.device
+        device=args.device,
+        state_dict2=state_dict2,
     )
     print(f"Prepared {len(batched_weights)} batched weights")
 

@@ -110,13 +110,15 @@ def save_debug_outputs(outputs_dict: Dict[str, torch.Tensor], path: Path):
 
 def main():
     parser = argparse.ArgumentParser(description='Generate PyTorch reference outputs')
-    parser.add_argument('checkpoint', type=str, help='Path to checkpoint')
+    parser.add_argument('checkpoint', type=str, help='Path to checkpoint (policy A)')
+    parser.add_argument('--checkpoint2', type=str, default=None, help='Optional second checkpoint (policy B)')
     parser.add_argument('--batch-size', type=int, default=512, help='Batch size')
     parser.add_argument('--seq-length', type=int, default=64, help='Sequence length')
     parser.add_argument('--output', type=str, default='reference_outputs.pkl',
                        help='Output path for reference file')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--agent-key', type=str, default='self', help='Agent key in checkpoint')
+    parser.add_argument('--agent-key', type=str, default='self', help='Agent key for checkpoint A')
+    parser.add_argument('--agent-key2', type=str, default='self', help='Agent key for checkpoint B')
 
     args = parser.parse_args()
 
@@ -124,8 +126,12 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    print(f"Loading checkpoint from {args.checkpoint}")
+    print(f"Loading checkpoint A from {args.checkpoint}")
     checkpoint = torch.load(args.checkpoint, map_location='cpu')
+    checkpoint2 = None
+    if args.checkpoint2:
+        print(f"Loading checkpoint B from {args.checkpoint2}")
+        checkpoint2 = torch.load(args.checkpoint2, map_location='cpu')
 
     # Load model using existing infrastructure
     if 'policy_nets' in checkpoint and args.agent_key in checkpoint['policy_nets']:
@@ -133,7 +139,16 @@ def main():
     elif 'model_state_dict' in checkpoint:
         model_state_dict = checkpoint['model_state_dict']
     else:
-        raise ValueError(f"Could not find model state dict in checkpoint (keys: {list(checkpoint.keys())})")
+        raise ValueError(f"Could not find model state dict in checkpoint A (keys: {list(checkpoint.keys())})")
+
+    model_state_dict2 = None
+    if checkpoint2 is not None:
+        if 'policy_nets' in checkpoint2 and args.agent_key2 in checkpoint2['policy_nets']:
+            model_state_dict2 = checkpoint2['policy_nets'][args.agent_key2]
+        elif 'model_state_dict' in checkpoint2:
+            model_state_dict2 = checkpoint2['model_state_dict']
+        else:
+            raise ValueError(f"Could not find model state dict in checkpoint B (keys: {list(checkpoint2.keys())})")
 
     # Infer original obs_dim before padding
     obs_linear_weight = model_state_dict.get("obs_encoder.0.weight")
@@ -148,10 +163,16 @@ def main():
     print(f"Padding model weights for CUDA alignment...")
     model_state_dict = pad_model_weights(model_state_dict, pad_obs_to=PAD_OBS_TO)
 
-    print(f"Building model from state dict...")
+    print(f"Building model(s) from state dict...")
     device = torch.device('cpu')
     model = build_model_from_state(model_state_dict, device, debug=True)
     model.eval()
+    model2 = None
+    if model_state_dict2 is not None:
+        # Enforce same obs padding for B as for A
+        model_state_dict2 = pad_model_weights(model_state_dict2, pad_obs_to=PAD_OBS_TO)
+        model2 = build_model_from_state(model_state_dict2, device, debug=True)
+        model2.eval()
 
     # obs_dim is now the original dimension (before padding)
     obs_dim = original_obs_dim
@@ -165,17 +186,75 @@ def main():
         pad_obs_to=PAD_OBS_TO,
     )
 
-    print("Running debug forward pass...")
-    with torch.no_grad():
-        debug_outputs = model(
-            obs_sequence=inputs['obs_sequence'],
-            action_sequence=inputs['action_sequence'],
-            agent_types=inputs['agent_types'],
-            positions=inputs['positions'],
-            action_masks=inputs['action_masks'],
-            padding_mask=inputs['padding_mask'],
-            return_debug_outputs=True,
-        )
+    # Build policy indices for a 2-policy batch if checkpoint2 provided
+    if model2 is not None:
+        B = args.batch_size
+        policy_indices = torch.zeros(B, dtype=torch.long)
+        # Alternate policies for diversity
+        policy_indices[::2] = 0
+        policy_indices[1::2] = 1
+        # Split inputs per-policy
+        idx_a = (policy_indices == 0).nonzero(as_tuple=False).squeeze(1)
+        idx_b = (policy_indices == 1).nonzero(as_tuple=False).squeeze(1)
+
+        def index_inputs(ix: torch.Tensor) -> Dict[str, torch.Tensor]:
+            return {
+                'obs_sequence': inputs['obs_sequence'].index_select(0, ix),
+                'action_sequence': inputs['action_sequence'].index_select(0, ix),
+                'agent_types': inputs['agent_types'].index_select(0, ix),
+                'positions': inputs['positions'].index_select(0, ix),
+                'action_masks': inputs['action_masks'].index_select(0, ix),
+                'padding_mask': inputs['padding_mask'].index_select(0, ix),
+            }
+
+        print("Running debug forward pass (two policies, merged)...")
+        with torch.no_grad():
+            outs_a = model(
+                obs_sequence=index_inputs(idx_a)['obs_sequence'],
+                action_sequence=index_inputs(idx_a)['action_sequence'],
+                agent_types=index_inputs(idx_a)['agent_types'],
+                positions=index_inputs(idx_a)['positions'],
+                action_masks=index_inputs(idx_a)['action_masks'],
+                padding_mask=index_inputs(idx_a)['padding_mask'],
+                return_debug_outputs=True,
+            )
+            outs_b = model2(
+                obs_sequence=index_inputs(idx_b)['obs_sequence'],
+                action_sequence=index_inputs(idx_b)['action_sequence'],
+                agent_types=index_inputs(idx_b)['agent_types'],
+                positions=index_inputs(idx_b)['positions'],
+                action_masks=index_inputs(idx_b)['action_masks'],
+                padding_mask=index_inputs(idx_b)['padding_mask'],
+                return_debug_outputs=True,
+            )
+
+        # Merge outputs back into batch order: initialize with zeros and scatter
+        debug_outputs = {}
+        for key in outs_a.keys():
+            ta = outs_a[key]
+            tb = outs_b[key]
+            # Expect [Ba, T, ...] and [Bb, T, ...]
+            Tshape = ta.shape[1:]
+            merged = ta.new_zeros((args.batch_size, *Tshape))
+            merged.index_copy_(0, idx_a, ta)
+            merged.index_copy_(0, idx_b, tb)
+            debug_outputs[key] = merged
+
+        # Record policy indices for tests
+        debug_outputs['input/policy_indices'] = policy_indices
+    else:
+        print("Running debug forward pass...")
+        with torch.no_grad():
+            debug_outputs = model(
+                obs_sequence=inputs['obs_sequence'],
+                action_sequence=inputs['action_sequence'],
+                agent_types=inputs['agent_types'],
+                positions=inputs['positions'],
+                action_masks=inputs['action_masks'],
+                padding_mask=inputs['padding_mask'],
+                return_debug_outputs=True,
+            )
+        debug_outputs['input/policy_indices'] = torch.zeros(args.batch_size, dtype=torch.long)
 
     # Save outputs
     output_path = Path(args.output)
