@@ -97,22 +97,31 @@ test_embeddings(
     c10::Dict<std::string, torch::Tensor> result;
 
     // Observation encoding: Linear -> LayerNorm -> GELU
+    // Break down into individual steps for debugging
     std::unordered_map<std::string, std::chrono::microseconds> dummy_timers;
-    auto obs_encoded = indexed_batched_linear(
+
+    // Step 1: Linear
+    auto obs_linear = indexed_batched_linear(
         obs_sequence,
         get_weight(batched_weights, "obs_encoder.0.weight"),
         get_weight(batched_weights, "obs_encoder.0.bias"),
         policy_indices_for_ops,
         dummy_timers
     );
-    obs_encoded = indexed_batched_layer_norm(
-        obs_encoded,
+    result.insert("obs_linear", obs_linear);
+
+    // Step 2: LayerNorm
+    auto obs_layernorm = indexed_batched_layer_norm(
+        obs_linear,
         get_weight(batched_weights, "obs_encoder.1.weight"),
         get_weight(batched_weights, "obs_encoder.1.bias"),
         policy_indices_for_ops,
-        /* eps = */ 1e-4
+        /* eps = */ 1e-5  // Match PyTorch default
     );
-    obs_encoded = torch::gelu(obs_encoded);
+    result.insert("obs_layernorm", obs_layernorm);
+
+    // Step 3: GELU
+    auto obs_encoded = torch::gelu(obs_layernorm);
     result.insert("obs_embed", obs_encoded);
 
     // Action embeddings (factorized)

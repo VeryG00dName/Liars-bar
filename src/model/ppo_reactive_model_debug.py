@@ -66,7 +66,16 @@ class PPOReactiveModelDebug(PPOReactiveModelBase):
             debug_outputs['decompose/table_flag_ids'] = table_flag_ids.detach().cpu()
 
         # === Step 2: Embeddings ===
-        obs_embed = self.obs_encoder(obs_sequence)
+        # Break down obs_encoder into individual steps: Linear -> LayerNorm -> GELU
+        obs_linear = self.obs_encoder[0](obs_sequence)  # Linear layer
+        if return_debug_outputs:
+            debug_outputs['embeddings/obs_linear'] = obs_linear.detach().cpu()
+
+        obs_layernorm = self.obs_encoder[1](obs_linear)  # LayerNorm
+        if return_debug_outputs:
+            debug_outputs['embeddings/obs_layernorm'] = obs_layernorm.detach().cpu()
+
+        obs_embed = self.obs_encoder[2](obs_layernorm)  # GELU
         if return_debug_outputs:
             debug_outputs['embeddings/obs_embed'] = obs_embed.detach().cpu()
 

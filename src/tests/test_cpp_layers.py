@@ -63,22 +63,36 @@ def pad_model_weights(model_state_dict: Dict[str, torch.Tensor], pad_obs_to: int
     return model_state_dict
 
 
-def prepare_batched_weights(state_dict: Dict[str, torch.Tensor], device: str = 'cpu') -> Dict[str, torch.Tensor]:
+def prepare_batched_weights(
+    state_dict: Dict[str, torch.Tensor],
+    num_layers: int = 2,
+    num_experts: int = 8,
+    device: str = 'cpu'
+) -> Dict[str, torch.Tensor]:
     """
     Prepare batched weights for C++ testing.
 
     For single-policy testing, we add a batch dimension to all weights.
+    Also pre-stacks MoE expert weights and creates pointer tensors.
     """
+    # First, prestack MoE expert weights (must be done before adding batch dim)
+    print(f"Pre-stacking MoE expert weights ({num_layers} layers, {num_experts} experts)...")
+    state_dict_stacked = lb.prestack_moe_expert_weights(state_dict, num_layers, num_experts)
+
     batched = {}
 
-    for key, value in state_dict.items():
+    for key, value in state_dict_stacked.items():
         # Add batch dimension [1, ...]
         batched[key] = value.unsqueeze(0).to(device)
 
-    # Add fixed buffers (action decomposition LUTs)
-    batched = lb.add_fixed_buffers(batched, device)
+    # Create MoE weight pointers (must be done after moving to device)
+    print("Creating MoE weight pointers...")
+    batched_with_ptrs = lb.create_moe_weight_pointers(batched, num_layers, num_experts)
 
-    return batched
+    # Add fixed buffers (action decomposition LUTs)
+    batched_final = lb.add_fixed_buffers(batched_with_ptrs, device)
+
+    return batched_final
 
 
 def compare_tensors(
@@ -215,7 +229,12 @@ def test_embeddings(
 
     # Compare outputs
     all_match = True
-    for key in ['obs_embed', 'act_kind_embed', 'count_embed', 'table_flag_embed',
+    # Test obs_encoder intermediate outputs first
+    for key in ['obs_linear', 'obs_layernorm', 'obs_embed']:
+        all_match &= compare_tensors(key, embeddings_cpp[key], reference[f'embeddings/{key}'])
+
+    # Then test other embeddings
+    for key in ['act_kind_embed', 'count_embed', 'table_flag_embed',
                 'action_embed', 'agent_embed', 'position_embed']:
         all_match &= compare_tensors(key, embeddings_cpp[key], reference[f'embeddings/{key}'])
 
@@ -465,9 +484,14 @@ def main():
     print(f"Padding model weights for CUDA alignment (obs_dim -> {PAD_OBS_TO})...")
     state_dict = pad_model_weights(state_dict, pad_obs_to=PAD_OBS_TO)
 
-    # Prepare batched weights for C++
+    # Prepare batched weights for C++ (includes MoE expert weight stacking)
     print("Preparing batched weights...")
-    batched_weights = prepare_batched_weights(state_dict, args.device)
+    batched_weights = prepare_batched_weights(
+        state_dict,
+        num_layers=2,
+        num_experts=8,
+        device=args.device
+    )
     print(f"Prepared {len(batched_weights)} batched weights")
 
     # Run tests

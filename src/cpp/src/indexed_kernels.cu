@@ -876,72 +876,19 @@ torch::Tensor indexed_batched_linear(
                 ", but valid range is [0, ", W - 1, "]");
 
     auto t0 = Clock::now();
-    auto weight_batched = weight_f32.index_select(0, policy_indices_long);
-    auto bias_batched = bias_f32.index_select(0, policy_indices_long);
+    auto weight_batched = weight_f32.index_select(0, policy_indices_long).contiguous();
+    auto bias_batched = bias_f32.index_select(0, policy_indices_long).contiguous();
     auto t1 = Clock::now();
     timers["linear_index_select_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
 
-    auto output = torch::empty({B, T, Out_Dim}, input_f32.options());
-
-    // === 3. cuBLASLt Setup and Execution ===
-    auto handle = at::cuda::getCurrentCUDABlasLtHandle();
-    auto stream = at::cuda::getCurrentCUDAStream();
-    MatmulDescriptors desc{};
-
-    const auto compute_type = CUBLAS_COMPUTE_32F;
-    const auto data_type = CUDA_R_32F;
-
-    TORCH_CHECK(cublasLtMatmulDescCreate(&desc.op_desc, compute_type, CUDA_R_32F) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: MatmulDescCreate failed");
-    cublasOperation_t trans_a = CUBLAS_OP_N;
-    cublasOperation_t trans_b = CUBLAS_OP_T;
-    TORCH_CHECK(cublasLtMatmulDescSetAttribute(desc.op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: SetAttribute TRANSA failed");
-    TORCH_CHECK(cublasLtMatmulDescSetAttribute(desc.op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &trans_b, sizeof(trans_b)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: SetAttribute TRANSB failed");
-
-    const int64_t M = T;
-    const int64_t K = In_Dim;
-    const int64_t N = Out_Dim;
-
-    TORCH_CHECK(cublasLtMatrixLayoutCreate(&desc.layout_a, data_type, M, K, K) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: LayoutCreate A failed");
-    TORCH_CHECK(cublasLtMatrixLayoutCreate(&desc.layout_b, data_type, N, K, K) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: LayoutCreate B failed");
-    TORCH_CHECK(cublasLtMatrixLayoutCreate(&desc.layout_c, data_type, M, N, N) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: LayoutCreate C failed");
-
-    cublasLtOrder_t order = CUBLASLT_ORDER_ROW;
-    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_a, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: SetOrder A failed");
-    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_b, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: SetOrder B failed");
-    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_c, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: SetOrder C failed");
-
-    const int batch_count_32 = static_cast<int>(B);
-    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_a, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count_32, sizeof(batch_count_32)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: SetBatch A failed");
-    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_b, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count_32, sizeof(batch_count_32)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: SetBatch B failed");
-    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_c, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count_32, sizeof(batch_count_32)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: SetBatch C failed");
-
-    const long long elem_bytes = static_cast<long long>(input_f32.element_size());
-    const long long stride_a_bytes = M * K * elem_bytes;
-    const long long stride_b_bytes = N * K * elem_bytes;
-    const long long stride_c_bytes = M * N * elem_bytes;
-    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_a, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_a_bytes, sizeof(stride_a_bytes)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: SetStride A failed");
-    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_b, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_b_bytes, sizeof(stride_b_bytes)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: SetStride B failed");
-    TORCH_CHECK(cublasLtMatrixLayoutSetAttribute(desc.layout_c, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_c_bytes, sizeof(stride_c_bytes)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: SetStride C failed");
-    
-    size_t workspace_size = 1 << 22;
-    auto workspace = torch::empty({(long)workspace_size}, input_f32.options().dtype(torch::kByte));
-    cublasLtMatmulPreference_t preference;
-    TORCH_CHECK(cublasLtMatmulPreferenceCreate(&preference) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: PreferenceCreate failed");
-    TORCH_CHECK(cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size, sizeof(workspace_size)) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: PreferenceSetAttribute failed");
-
-    cublasLtMatmulHeuristicResult_t heuristic{};
-    int returned_results = 0;
-    auto heuristic_status = cublasLtMatmulAlgoGetHeuristic(handle, desc.op_desc, desc.layout_a, desc.layout_b, desc.layout_c, desc.layout_c, preference, 1, &heuristic, &returned_results);
-    TORCH_CHECK(heuristic_status == CUBLAS_STATUS_SUCCESS && returned_results > 0, "cuBLASLt: Failed to find a valid GEMM algorithm. Status: ", cublas_status_to_string(heuristic_status));
-    
-    float alpha_float = 1.0f, beta_float = 0.0f;
+    // === 3. Use PyTorch's optimized batched matmul ===
+    // Reshape for batched matmul: [B, T, In_Dim] @ [B, In_Dim, Out_Dim] -> [B, T, Out_Dim]
+    // weight_batched is [B, Out_Dim, In_Dim], so we need to transpose the last two dims
     auto gemm_t0 = Clock::now();
-    auto matmul_status = cublasLtMatmul(handle, desc.op_desc, &alpha_float, input_f32.data_ptr(), desc.layout_a, weight_batched.data_ptr(), desc.layout_b, &beta_float, output.data_ptr(), desc.layout_c, output.data_ptr(), desc.layout_c, &heuristic.algo, workspace.data_ptr(), workspace_size, stream.stream());
+    auto weight_transposed = weight_batched.transpose(1, 2);  // [B, In_Dim, Out_Dim]
+    auto output = torch::matmul(input_f32, weight_transposed);  // [B, T, Out_Dim]
     auto gemm_t1 = Clock::now();
     timers["linear_cublas_matmul_us"] += std::chrono::duration_cast<Microseconds>(gemm_t1 - gemm_t0);
-    TORCH_CHECK(matmul_status == CUBLAS_STATUS_SUCCESS, "cuBLASLt: Matmul execution failed with status ", cublas_status_to_string(matmul_status));
-    
-    TORCH_CHECK(cublasLtMatmulPreferenceDestroy(preference) == CUBLAS_STATUS_SUCCESS, "cuBLASLt: PreferenceDestroy failed");
 
     // === 4. Epilogue: Bias and Activation ===
     auto epi_t0 = Clock::now();

@@ -1,5 +1,6 @@
 #include "reactive_model_forward.h"
 #include "weight_utils.h"
+#include "indexed_kernels.h"
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -465,5 +466,22 @@ void bind_reactive_model(py::module_& m) {
         py::arg("topk_indices"),
         py::arg("topk_scores"),
         "Reduce expert heads using MoE routing weights"
+    );
+
+    // Simple test wrapper for indexed_batched_linear
+    m.def(
+        "test_indexed_batched_linear",
+        [](const torch::Tensor& input,
+           const torch::Tensor& weight_cache,
+           const torch::Tensor& bias_cache,
+           const torch::Tensor& policy_indices) {
+            std::unordered_map<std::string, std::chrono::microseconds> timers;
+            return indexed_batched_linear(input, weight_cache, bias_cache, policy_indices, timers);
+        },
+        py::arg("input"),
+        py::arg("weight_cache"),
+        py::arg("bias_cache"),
+        py::arg("policy_indices"),
+        "Test indexed_batched_linear directly"
     );
 }
