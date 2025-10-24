@@ -8,6 +8,7 @@
 #include <cublasLt.h>
 #include <c10/cuda/CUDAException.h>
 #include <cuda_fp16.h>
+#include <c10/cuda/CUDAStream.h>
 #include <cmath>
 #include <memory>
 #include <vector>
@@ -21,6 +22,23 @@
 #include <cstdio>
 #include <cinttypes>
 #include <iostream>
+
+// Simple RAII helper for cleanup actions
+template<typename F>
+struct ScopeGuard {
+    F func;
+    bool active;
+    ScopeGuard(F f) : func(std::move(f)), active(true) {}
+    ~ScopeGuard() { if (active) func(); }
+    void dismiss() { active = false; }
+    ScopeGuard(const ScopeGuard&) = delete;
+    ScopeGuard& operator=(const ScopeGuard&) = delete;
+};
+
+template<typename F>
+ScopeGuard<F> make_scope_guard(F f) {
+    return ScopeGuard<F>(std::move(f));
+}
 
 static const char* dtypeStr(cudaDataType_t t) {
     switch (t) {
@@ -523,6 +541,128 @@ __global__ void gelu_inplace_kernel(
     data[idx] = static_cast<scalar_t>(gelu_val);
 }
 
+namespace {
+
+__device__ inline float fast_gelu(float x) {
+    const float kAlpha = 0.7978845608f;       // sqrt(2/pi)
+    const float kGamma = 0.044715f;
+    float x_cube = x * x * x;
+    return 0.5f * x * (1.0f + tanhf(kAlpha * (x + kGamma * x_cube)));
+}
+
+__global__ void add_bias_gelu_and_cast_kernel(
+    float* hidden,
+    const __half* bias,
+    __half* hidden_half,
+    int64_t rows,
+    int64_t cols
+) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = rows * cols;
+    if (idx >= total) return;
+
+    int64_t col = idx % cols;
+    float val = hidden[idx] + __half2float(bias[col]);
+    float gelu = fast_gelu(val);
+    hidden[idx] = gelu;
+    hidden_half[idx] = __float2half(gelu);
+}
+
+__global__ void add_bias_and_cast_kernel(
+    float* data,
+    const __half* bias,
+    __half* dst_half,
+    int64_t rows,
+    int64_t cols
+) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = rows * cols;
+    if (idx >= total) return;
+
+    int64_t col = idx % cols;
+    float val = data[idx] + __half2float(bias[col]);
+    data[idx] = val;
+    dst_half[idx] = __float2half(val);
+}
+
+__global__ void cast_float_to_half_kernel(
+    const float* src,
+    __half* dst,
+    int64_t total
+) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    dst[idx] = __float2half(src[idx]);
+}
+
+inline void launch_add_bias_gelu_and_cast(
+    float* hidden,
+    const at::Half* bias,
+    at::Half* hidden_half,
+    int64_t rows,
+    int64_t cols,
+    cudaStream_t stream
+) {
+    if (rows == 0 || cols == 0) {
+        return;
+    }
+    const int threads = 256;
+    const int64_t total = rows * cols;
+    const int blocks = static_cast<int>((total + threads - 1) / threads);
+    add_bias_gelu_and_cast_kernel<<<blocks, threads, 0, stream>>>(
+        hidden,
+        reinterpret_cast<const __half*>(bias),
+        reinterpret_cast<__half*>(hidden_half),
+        rows,
+        cols
+    );
+}
+
+inline void launch_add_bias_and_cast(
+    float* data,
+    const at::Half* bias,
+    at::Half* dst_half,
+    int64_t rows,
+    int64_t cols,
+    cudaStream_t stream
+) {
+    if (rows == 0 || cols == 0) {
+        return;
+    }
+    const int threads = 256;
+    const int64_t total = rows * cols;
+    const int blocks = static_cast<int>((total + threads - 1) / threads);
+    add_bias_and_cast_kernel<<<blocks, threads, 0, stream>>>(
+        data,
+        reinterpret_cast<const __half*>(bias),
+        reinterpret_cast<__half*>(dst_half),
+        rows,
+        cols
+    );
+}
+
+inline void launch_cast_float_to_half(
+    float* src,
+    at::Half* dst,
+    int64_t rows,
+    int64_t cols,
+    cudaStream_t stream
+) {
+    if (rows == 0 || cols == 0) {
+        return;
+    }
+    const int threads = 256;
+    const int64_t total = rows * cols;
+    const int blocks = static_cast<int>((total + threads - 1) / threads);
+    cast_float_to_half_kernel<<<blocks, threads, 0, stream>>>(
+        src,
+        reinterpret_cast<__half*>(dst),
+        total
+    );
+}
+
+} // anonymous namespace
+
 void grouped_ffn_gemm_forward(
     const uintptr_t* input_ptrs,
     const uintptr_t* w1_ptrs,
@@ -572,58 +712,61 @@ void grouped_ffn_gemm_forward(
     const int validate_setting = LB_MOE_VALIDATE_GROUPS();
     const bool validate_all_groups = validate_setting < 0;
     int validated_groups = 0;
+    int planned_validations = 0;
     const int log_gemm_setting = LB_MOE_LOG_GEMM_GROUPS();
     const bool log_gemm_enabled = log_gemm_setting != 0;
     const bool log_gemm_all = log_gemm_setting < 0;
     int logged_gemm_groups = 0;
 
-    // Get cuBLAS handle and CUDA stream
-    auto handle = at::cuda::getCurrentCUDABlasHandle();
-    auto stream = at::cuda::getCurrentCUDAStream();
-    // We'll use FP16 for all operations (input is already FP16 from caller)
-    const cudaDataType_t data_type = CUDA_R_16F;
     const cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F;
-
-    // Scalars for GEMM (alpha=1.0, beta=0.0 for first GEMM, beta=1.0 for bias add)
     const float alpha_one = 1.0f;
     const float beta_zero = 0.0f;
 
-    // Allocate workspace for intermediate hidden states
-    // We'll allocate a single large buffer and partition it across groups
     int64_t max_m = 0;
     for (int64_t i = 0; i < group_count; ++i) {
         max_m = std::max(max_m, m_sizes[i]);
     }
 
-    // Allocate intermediate buffer: [max_m * ffn_dim] elements
-    auto intermediate_buffer = torch::empty(
-        {max_m * ffn_dim},
-        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA)
-    );
-    auto output_buffer = torch::empty(
-        {max_m * hidden_dim},
-        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA)
-    );
-    auto* intermediate_ptr = intermediate_buffer.data_ptr<float>();
-    auto* output_float_ptr = output_buffer.data_ptr<float>();
+    struct GroupTask {
+        int64_t group_idx;
+        int64_t m;
+        int64_t policy_id;
+        int64_t expert_id;
+        int64_t token_offset;
+        const at::Half* input_ptr;
+        const at::Half* w1_ptr;
+        const at::Half* b1_ptr;
+        const at::Half* w2_ptr;
+        const at::Half* b2_ptr;
+        at::Half* output_ptr;
+        bool validate;
+    };
 
-    // Process each group
+    std::vector<GroupTask> tasks;
+    tasks.reserve(group_count);
+
     for (int64_t group_idx = 0; group_idx < group_count; ++group_idx) {
         const int64_t M = m_sizes[group_idx];
-        if (M == 0) continue;
+        if (M == 0) {
+            continue;
+        }
 
         const int64_t policy_id = policy_ids[group_idx];
         const int64_t expert_id = expert_ids[group_idx];
         const int64_t token_offset = token_offsets ? token_offsets[group_idx] : -1;
 
-        auto* input_ptr = reinterpret_cast<const at::Half*>(input_ptrs[group_idx]);
-        auto* w1_ptr = reinterpret_cast<const at::Half*>(w1_ptrs[group_idx]);
-        auto* b1_ptr = reinterpret_cast<const at::Half*>(b1_ptrs[group_idx]);
-        auto* w2_ptr = reinterpret_cast<const at::Half*>(w2_ptrs[group_idx]);
-        auto* b2_ptr = reinterpret_cast<const at::Half*>(b2_ptrs[group_idx]);
-        auto* output_ptr = reinterpret_cast<at::Half*>(output_ptrs[group_idx]);
-        const bool validate_this_group = (validate_setting != 0) && (validate_all_groups || validated_groups < validate_setting);
-        const bool log_this_group = log_gemm_enabled && (log_gemm_all || logged_gemm_groups < std::abs(log_gemm_setting));
+        const at::Half* input_ptr = reinterpret_cast<const at::Half*>(input_ptrs[group_idx]);
+        const at::Half* w1_ptr = reinterpret_cast<const at::Half*>(w1_ptrs[group_idx]);
+        const at::Half* b1_ptr = reinterpret_cast<const at::Half*>(b1_ptrs[group_idx]);
+        const at::Half* w2_ptr = reinterpret_cast<const at::Half*>(w2_ptrs[group_idx]);
+        const at::Half* b2_ptr = reinterpret_cast<const at::Half*>(b2_ptrs[group_idx]);
+        at::Half* output_ptr = reinterpret_cast<at::Half*>(output_ptrs[group_idx]);
+
+        bool validate_this_group = (validate_setting != 0) && (validate_all_groups || planned_validations < validate_setting);
+        if (validate_this_group) {
+            ++planned_validations;
+        }
+        bool log_this_group = log_gemm_enabled && (log_gemm_all || logged_gemm_groups < std::abs(log_gemm_setting));
         if (log_this_group) {
             ++logged_gemm_groups;
             std::cerr << "[LB][MOE_GEMM] group=" << group_idx
@@ -636,22 +779,22 @@ void grouped_ffn_gemm_forward(
                       << " hidden_dim=" << hidden_dim
                       << " ffn_dim=" << ffn_dim
                       << std::endl;
-        std::cerr << "    first_gemm: transa=T transb=N"
-                  << " m=" << ffn_dim
-                  << " n=" << M
-                  << " k=" << hidden_dim
-                  << " lda=" << hidden_dim
-                  << " ldb=" << hidden_dim
-                  << " ldc=" << ffn_dim
-                  << std::endl;
-        std::cerr << "    second_gemm: transa=T transb=N"
-                  << " m=" << hidden_dim
-                  << " n=" << M
-                  << " k=" << ffn_dim
-                  << " lda=" << ffn_dim
-                  << " ldb=" << ffn_dim
-                  << " ldc=" << hidden_dim
-                  << std::endl;
+            std::cerr << "    first_gemm: transa=T transb=N"
+                      << " m=" << ffn_dim
+                      << " n=" << M
+                      << " k=" << hidden_dim
+                      << " lda=" << hidden_dim
+                      << " ldb=" << hidden_dim
+                      << " ldc=" << ffn_dim
+                      << std::endl;
+            std::cerr << "    second_gemm: transa=T transb=N"
+                      << " m=" << hidden_dim
+                      << " n=" << M
+                      << " k=" << ffn_dim
+                      << " lda=" << ffn_dim
+                      << " ldb=" << ffn_dim
+                      << " ldc=" << hidden_dim
+                      << std::endl;
             std::cerr << "    ptrs: input=" << static_cast<const void*>(input_ptr)
                       << " w1=" << static_cast<const void*>(w1_ptr)
                       << " b1=" << static_cast<const void*>(b1_ptr)
@@ -661,273 +804,341 @@ void grouped_ffn_gemm_forward(
                       << std::endl;
         }
 
-        // ====================================================================
-        // First GEMM: hidden = input @ w1.T
-        // input: [M, hidden_dim]
-        // w1: [ffn_dim, hidden_dim] (stored as row-major, treat as transposed)
-        // hidden: [M, ffn_dim]
-        // ====================================================================
+        tasks.push_back({group_idx, M, policy_id, expert_id, token_offset,
+                         input_ptr, w1_ptr, b1_ptr, w2_ptr, b2_ptr, output_ptr,
+                         validate_this_group});
+    }
 
-        // Using cublasSgemmEx-like operation via cublasGemmEx
-        // C = alpha * A @ B + beta * C
-        // We want: hidden = input @ w1.T
-        // A = input [M, K=hidden_dim], op(A) = N
-        // B = w1 [N=ffn_dim, K=hidden_dim], op(B) = T (transpose)
-        // C = hidden [M, N=ffn_dim]
+    if (tasks.empty()) {
+        if (log_guard && guard_enabled) {
+            std::cerr << "[LB][MOE_GUARD] grouped_ffn_gemm_forward received only empty groups" << std::endl;
+        }
+        return;
+    }
 
-        auto status1 = cublasGemmEx(
-            handle,
-            CUBLAS_OP_T,           // row-major trick: A <- w1, use T
-            CUBLAS_OP_N,           // row-major trick: B <- input^T via no-op
-            ffn_dim,               // M (rows of op(B)) = ffn_dim
-            M,                     // N (cols of op(A)) = M (batch tokens)
-            hidden_dim,            // K (common dimension) = hidden_dim
-            &alpha_one,            // alpha
-            w1_ptr,                // A: w1 row-major [ffn_dim, hidden_dim]
-            CUDA_R_16F,
-            hidden_dim,            // lda = K (row-major columns of w1)
-            input_ptr,             // B: input row-major [M, hidden_dim]
-            CUDA_R_16F,
-            hidden_dim,            // ldb = hidden_dim (input transposed view rows)
-            &beta_zero,            // beta = 0 (overwrite)
-            intermediate_ptr,      // C: [M, ffn_dim] (float buffer)
-            CUDA_R_32F,
-            ffn_dim,               // ldc
-            compute_type,
-            CUBLAS_GEMM_DEFAULT
-        );
+    const int num_streams = static_cast<int>(std::min<int64_t>(4, std::max<int64_t>(1, static_cast<int64_t>(tasks.size()))));
 
-        TORCH_CHECK(status1 == CUBLAS_STATUS_SUCCESS,
-            "grouped_ffn_gemm_forward: First GEMM failed with cuBLAS status ",
-            cublas_status_to_string(status1));
+    auto base_stream = at::cuda::getCurrentCUDAStream();
+    std::vector<at::cuda::CUDAStream> streams;
+    streams.reserve(num_streams);
+    streams.push_back(base_stream);
+    const int device_index = base_stream.device_index();
+    for (int i = 1; i < num_streams; ++i) {
+        streams.push_back(at::cuda::getStreamFromPool(false, device_index));
+    }
 
-        // ====================================================================
-        // Add bias b1 to each row
-        // ====================================================================
-        // b1: [ffn_dim]
-        // We broadcast-add b1 to each of the M rows
-
-        // Simple approach: use a kernel to add bias
-        // Alternative: use cublas<t>axpy in a loop, but a custom kernel is cleaner
-
-        auto b1_tensor = torch::from_blob(
-            const_cast<at::Half*>(b1_ptr),
-            {ffn_dim},
-            torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA)
-        ).to(torch::kFloat32);
-        auto intermediate_tensor = torch::from_blob(
-            intermediate_ptr,
-            {M, ffn_dim},
-            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA)
-        );
-
-        intermediate_tensor.add_(b1_tensor);
-        intermediate_tensor.copy_(torch::gelu(intermediate_tensor));
-
-        // Optional guard: verify intermediate is finite; if not, recompute via reference matmul path
-        if (guard_enabled) {
-            auto finite_mask = intermediate_tensor.isfinite();
-            bool all_finite = finite_mask.all().item<bool>();
-            if (!all_finite) {
-                ++fallback_hidden_groups;
-                if (log_guard) {
-                    guard_logs.push_back({group_idx, policy_id, expert_id, token_offset, M, kStageHidden});
-                }
-                auto input_tensor = torch::from_blob(
-                    const_cast<at::Half*>(input_ptr),
-                    {M, hidden_dim},
-                    torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA)
-                );
-                auto w1_tensor = torch::from_blob(
-                    const_cast<at::Half*>(w1_ptr),
-                    {ffn_dim, hidden_dim},
-                    torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA)
-                );
-                auto hidden_ref = torch::matmul(input_tensor.to(torch::kFloat32), w1_tensor.to(torch::kFloat32).transpose(0,1)) + b1_tensor;
-                hidden_ref = torch::gelu(hidden_ref);
-                intermediate_tensor.copy_(hidden_ref);
+    std::vector<cublasHandle_t> handles(num_streams);
+    for (int i = 0; i < num_streams; ++i) {
+        TORCH_CHECK(cublasCreate(&handles[i]) == CUBLAS_STATUS_SUCCESS,
+                    "grouped_ffn_gemm_forward: failed to create cuBLAS handle");
+        TORCH_CHECK(cublasSetStream(handles[i], streams[i].stream()) == CUBLAS_STATUS_SUCCESS,
+                    "grouped_ffn_gemm_forward: failed to set cuBLAS stream");
+    #if defined(CUBLAS_VERSION) && CUBLAS_VERSION >= 11000
+        cublasSetMathMode(handles[i], CUBLAS_TENSOR_OP_MATH);
+    #endif
+    }
+    auto handle_guard = make_scope_guard([&]() {
+        for (auto& h : handles) {
+            if (h) {
+                cublasDestroy(h);
             }
         }
+    });
 
-        // ====================================================================
-        // Second GEMM: output = hidden @ w2.T
-        // hidden: [M, ffn_dim]
-        // w2: [hidden_dim, ffn_dim] (stored as row-major, treat as transposed)
-        // output: [M, hidden_dim]
-        // ====================================================================
+    auto float_options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    auto half_options = torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA);
 
-        // Convert hidden activations back to half before GEMM; cuBLAS does not
-        // support (A=FP16, B=FP32, C=FP32) with the default algorithm.
-        auto intermediate_half_tensor = intermediate_tensor.to(torch::kHalf);
-        const auto* intermediate_half_ptr = reinterpret_cast<const at::Half*>(intermediate_half_tensor.data_ptr<at::Half>());
+    auto intermediate_buffer = torch::empty({num_streams, max_m * ffn_dim}, float_options);
+    auto intermediate_half_buffer = torch::empty({num_streams, max_m * ffn_dim}, half_options);
+    auto output_buffer = torch::empty({num_streams, max_m * hidden_dim}, float_options);
 
-        auto status2 = cublasGemmEx(
-            handle,
-            CUBLAS_OP_T,           // row-major trick: A <- w2, use T
-            CUBLAS_OP_N,           // row-major trick: B <- hidden^T via no-op
-            hidden_dim,            // M (rows of op(B)) = hidden_dim
-            M,                     // N (cols of op(A)) = M (batch tokens)
-            ffn_dim,               // K (common dimension) = ffn_dim
-            &alpha_one,            // alpha
-            w2_ptr,                // A: w2 row-major [hidden_dim, ffn_dim]
-            CUDA_R_16F,
-            ffn_dim,               // lda = K (row-major columns of w2)
-            intermediate_half_ptr, // B: hidden row-major [M, ffn_dim] (cast to fp16)
-            CUDA_R_16F,
-            ffn_dim,               // ldb = ffn_dim (hidden transposed view rows)
-            &beta_zero,            // beta = 0 (overwrite)
-            output_float_ptr,      // C: [M, hidden_dim] float buffer
-            CUDA_R_32F,
-            hidden_dim,            // ldc
-            compute_type,
-            CUBLAS_GEMM_DEFAULT
-        );
+    float* intermediate_base = intermediate_buffer.data_ptr<float>();
+    at::Half* intermediate_half_base = intermediate_half_buffer.data_ptr<at::Half>();
+    float* output_base = output_buffer.data_ptr<float>();
 
-        TORCH_CHECK(status2 == CUBLAS_STATUS_SUCCESS,
-            "grouped_ffn_gemm_forward: Second GEMM failed with cuBLAS status ",
-            cublas_status_to_string(status2));
+    std::vector<std::vector<const GroupTask*>> stream_tasks(num_streams);
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        stream_tasks[i % num_streams].push_back(&tasks[i]);
+    }
 
-        // ====================================================================
-        // Add bias b2 to each row
-        // ====================================================================
+    std::mutex guard_mutex;
 
-        auto b2_tensor = torch::from_blob(
-            const_cast<at::Half*>(b2_ptr),
-            {hidden_dim},
-            torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA)
-        ).to(torch::kFloat32);
-        auto output_tensor_float = torch::from_blob(
-            output_float_ptr,
-            {M, hidden_dim},
-            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA)
-        );
+    for (int stream_idx = 0; stream_idx < num_streams; ++stream_idx) {
+        if (stream_tasks[stream_idx].empty()) {
+            continue;
+        }
 
-        output_tensor_float.add_(b2_tensor);
+        at::cuda::CUDAStreamGuard guard(streams[stream_idx]);
+        auto handle = handles[stream_idx];
+        float* intermediate_ptr = intermediate_base + static_cast<int64_t>(stream_idx) * max_m * ffn_dim;
+        at::Half* intermediate_half_ptr = intermediate_half_base + static_cast<int64_t>(stream_idx) * max_m * ffn_dim;
+        float* output_float_ptr = output_base + static_cast<int64_t>(stream_idx) * max_m * hidden_dim;
 
-        if (guard_enabled) {
-            auto finite_mask2 = output_tensor_float.isfinite();
-            bool all_finite2 = finite_mask2.all().item<bool>();
-            if (!all_finite2) {
-                ++fallback_output_groups;
-                if (log_guard) {
-                    guard_logs.push_back({group_idx, policy_id, expert_id, token_offset, M, kStageOutput});
-                }
-                auto w2_tensor = torch::from_blob(
-                    const_cast<at::Half*>(w2_ptr),
-                    {hidden_dim, ffn_dim},
-                    torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA)
-                );
-                auto inter_f32 = torch::from_blob(
+        for (const GroupTask* task_ptr : stream_tasks[stream_idx]) {
+            const GroupTask& task = *task_ptr;
+            const int64_t M = task.m;
+            if (M == 0) {
+                continue;
+            }
+
+            auto status1 = cublasGemmEx(
+                handle,
+                CUBLAS_OP_T,
+                CUBLAS_OP_N,
+                ffn_dim,
+                M,
+                hidden_dim,
+                &alpha_one,
+                task.w1_ptr,
+                CUDA_R_16F,
+                hidden_dim,
+                task.input_ptr,
+                CUDA_R_16F,
+                hidden_dim,
+                &beta_zero,
+                intermediate_ptr,
+                CUDA_R_32F,
+                ffn_dim,
+                compute_type,
+                CUBLAS_GEMM_DEFAULT
+            );
+
+            TORCH_CHECK(status1 == CUBLAS_STATUS_SUCCESS,
+                        "grouped_ffn_gemm_forward: First GEMM failed with cuBLAS status ",
+                        cublas_status_to_string(status1));
+
+            launch_add_bias_gelu_and_cast(
+                intermediate_ptr,
+                task.b1_ptr,
+                intermediate_half_ptr,
+                M,
+                ffn_dim,
+                streams[stream_idx].stream());
+
+            torch::Tensor intermediate_tensor;
+            if (guard_enabled || task.validate) {
+                intermediate_tensor = torch::from_blob(
                     intermediate_ptr,
                     {M, ffn_dim},
-                    torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA)
+                    [](void*) {},
+                    float_options
                 );
-                auto out_ref = torch::matmul(inter_f32, w2_tensor.to(torch::kFloat32).transpose(0,1)) + b2_tensor;
-                output_tensor_float.copy_(out_ref);
             }
-        }
 
-        auto output_tensor_half = torch::from_blob(
-            output_ptr,
-            {M, hidden_dim},
-            torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA)
-        );
-        output_tensor_half.copy_(output_tensor_float.to(torch::kHalf));
-
-        if (validate_this_group) {
-            ++validated_groups;
-            auto half_opts = torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA);
-
-            auto input_tensor = torch::from_blob(
-                const_cast<at::Half*>(input_ptr),
-                {M, hidden_dim},
-                half_opts
-            );
-            auto w1_tensor = torch::from_blob(
-                const_cast<at::Half*>(w1_ptr),
-                {ffn_dim, hidden_dim},
-                half_opts
-            );
-            auto b1_tensor_val = torch::from_blob(
-                const_cast<at::Half*>(b1_ptr),
-                {ffn_dim},
-                half_opts
-            );
-            auto w2_tensor = torch::from_blob(
-                const_cast<at::Half*>(w2_ptr),
-                {hidden_dim, ffn_dim},
-                half_opts
-            );
-            auto b2_tensor_val = torch::from_blob(
-                const_cast<at::Half*>(b2_ptr),
-                {hidden_dim},
-                half_opts
-            );
-
-            auto input_f32 = input_tensor.to(torch::kFloat32);
-            auto w1_f32 = w1_tensor.to(torch::kFloat32);
-            auto b1_f32 = b1_tensor_val.to(torch::kFloat32);
-            auto w2_f32 = w2_tensor.to(torch::kFloat32);
-            auto b2_f32 = b2_tensor_val.to(torch::kFloat32);
-
-            auto hidden_ref = torch::matmul(input_f32, w1_f32.transpose(0, 1)) + b1_f32;
-            hidden_ref = torch::gelu(hidden_ref);
-            auto output_ref = torch::matmul(hidden_ref, w2_f32.transpose(0, 1)) + b2_f32;
-
-            auto output_actual_f32 = output_tensor_float;
-            auto diff = (output_actual_f32 - output_ref).abs();
-            auto diff_flat = diff.view({-1});
-            auto max_abs_idx_tensor = diff_flat.argmax();
-            float max_abs = diff_flat.index({max_abs_idx_tensor}).item<float>();
-            float mean_abs = diff.mean().item<float>();
-
-            auto denom = output_ref.abs().clamp_min(1e-6);
-            auto rel = diff / denom;
-            auto rel_flat = rel.view({-1});
-            float max_rel = rel_flat.index({rel_flat.argmax()}).item<float>();
-            float mean_rel = rel.mean().item<float>();
-
-            int64_t worst_index = max_abs_idx_tensor.item<int64_t>();
-            if (hidden_dim > 0 && M > 0) {
-                int64_t worst_m = worst_index / hidden_dim;
-                int64_t worst_h = worst_index % hidden_dim;
-                float actual_val = output_actual_f32.index({worst_m, worst_h}).item<float>();
-                float ref_val = output_ref.index({worst_m, worst_h}).item<float>();
-                float diff_val = actual_val - ref_val;
-
-                std::cerr << "[LB][MOE_VALIDATE] group=" << group_idx
-                          << " policy=" << policy_id
-                          << " expert=" << expert_id;
-                if (token_offset >= 0) {
-                    std::cerr << " offset=" << token_offset;
+            if (guard_enabled) {
+                auto finite_mask = intermediate_tensor.isfinite();
+                bool all_finite = finite_mask.all().item<bool>();
+                if (!all_finite) {
+                    ++fallback_hidden_groups;
+                    if (log_guard) {
+                        std::lock_guard<std::mutex> lock(guard_mutex);
+                        guard_logs.push_back({task.group_idx, task.policy_id, task.expert_id, task.token_offset, M, kStageHidden});
+                    }
+                    auto input_tensor = torch::from_blob(
+                        const_cast<at::Half*>(task.input_ptr),
+                        {M, hidden_dim},
+                        [](void*) {},
+                        half_options
+                    );
+                    auto w1_tensor = torch::from_blob(
+                        const_cast<at::Half*>(task.w1_ptr),
+                        {ffn_dim, hidden_dim},
+                        [](void*) {},
+                        half_options
+                    );
+                    auto b1_tensor = torch::from_blob(
+                        const_cast<at::Half*>(task.b1_ptr),
+                        {ffn_dim},
+                        [](void*) {},
+                        half_options
+                    ).to(torch::kFloat32);
+                    auto hidden_ref = torch::matmul(input_tensor.to(torch::kFloat32), w1_tensor.to(torch::kFloat32).transpose(0, 1)) + b1_tensor;
+                    hidden_ref = torch::gelu(hidden_ref);
+                    intermediate_tensor.copy_(hidden_ref);
+                    launch_cast_float_to_half(intermediate_ptr, intermediate_half_ptr, M, ffn_dim, streams[stream_idx].stream());
                 }
-                std::cerr << " M=" << M
-                          << " max_abs=" << max_abs
-                          << " mean_abs=" << mean_abs
-                          << " max_rel=" << max_rel
-                          << " mean_rel=" << mean_rel
-                          << std::endl;
+            }
 
-                if (max_abs > 5e-4f || max_rel > 1.0f || std::isnan(max_abs) || std::isnan(max_rel)) {
-                    std::cerr << "    worst_coord=(" << worst_m << "," << worst_h << ")"
-                              << " actual=" << actual_val
-                              << " ref=" << ref_val
-                              << " diff=" << diff_val
+            auto status2 = cublasGemmEx(
+                handle,
+                CUBLAS_OP_T,
+                CUBLAS_OP_N,
+                hidden_dim,
+                M,
+                ffn_dim,
+                &alpha_one,
+                task.w2_ptr,
+                CUDA_R_16F,
+                ffn_dim,
+                reinterpret_cast<const at::Half*>(intermediate_half_ptr),
+                CUDA_R_16F,
+                ffn_dim,
+                &beta_zero,
+                output_float_ptr,
+                CUDA_R_32F,
+                hidden_dim,
+                compute_type,
+                CUBLAS_GEMM_DEFAULT
+            );
+
+            TORCH_CHECK(status2 == CUBLAS_STATUS_SUCCESS,
+                        "grouped_ffn_gemm_forward: Second GEMM failed with cuBLAS status ",
+                        cublas_status_to_string(status2));
+
+            launch_add_bias_and_cast(
+                output_float_ptr,
+                task.b2_ptr,
+                task.output_ptr,
+                M,
+                hidden_dim,
+                streams[stream_idx].stream());
+
+            torch::Tensor output_tensor_float;
+            if (guard_enabled || task.validate) {
+                output_tensor_float = torch::from_blob(
+                    output_float_ptr,
+                    {M, hidden_dim},
+                    [](void*) {},
+                    float_options
+                );
+            }
+
+            if (guard_enabled) {
+                auto finite_mask2 = output_tensor_float.isfinite();
+                bool all_finite2 = finite_mask2.all().item<bool>();
+                if (!all_finite2) {
+                    ++fallback_output_groups;
+                    if (log_guard) {
+                        std::lock_guard<std::mutex> lock(guard_mutex);
+                        guard_logs.push_back({task.group_idx, task.policy_id, task.expert_id, task.token_offset, M, kStageOutput});
+                    }
+                    auto w2_tensor = torch::from_blob(
+                        const_cast<at::Half*>(task.w2_ptr),
+                        {hidden_dim, ffn_dim},
+                        [](void*) {},
+                        half_options
+                    );
+                    auto inter_f32 = torch::from_blob(
+                        intermediate_ptr,
+                        {M, ffn_dim},
+                        [](void*) {},
+                        float_options
+                    );
+                    auto b2_tensor = torch::from_blob(
+                        const_cast<at::Half*>(task.b2_ptr),
+                        {hidden_dim},
+                        [](void*) {},
+                        half_options
+                    ).to(torch::kFloat32);
+                    auto out_ref = torch::matmul(inter_f32, w2_tensor.to(torch::kFloat32).transpose(0, 1)) + b2_tensor;
+                    output_tensor_float.copy_(out_ref);
+                    launch_cast_float_to_half(output_float_ptr, task.output_ptr, M, hidden_dim, streams[stream_idx].stream());
+                }
+            }
+
+            if (task.validate) {
+                ++validated_groups;
+                auto half_opts = torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA);
+
+                auto input_tensor = torch::from_blob(
+                    const_cast<at::Half*>(task.input_ptr),
+                    {M, hidden_dim},
+                    [](void*) {},
+                    half_opts
+                );
+                auto w1_tensor = torch::from_blob(
+                    const_cast<at::Half*>(task.w1_ptr),
+                    {ffn_dim, hidden_dim},
+                    [](void*) {},
+                    half_opts
+                );
+                auto b1_tensor = torch::from_blob(
+                    const_cast<at::Half*>(task.b1_ptr),
+                    {ffn_dim},
+                    [](void*) {},
+                    half_opts
+                );
+                auto w2_tensor = torch::from_blob(
+                    const_cast<at::Half*>(task.w2_ptr),
+                    {hidden_dim, ffn_dim},
+                    [](void*) {},
+                    half_opts
+                );
+                auto b2_tensor = torch::from_blob(
+                    const_cast<at::Half*>(task.b2_ptr),
+                    {hidden_dim},
+                    [](void*) {},
+                    half_opts
+                );
+
+                auto input_f32 = input_tensor.to(torch::kFloat32);
+                auto w1_f32 = w1_tensor.to(torch::kFloat32);
+                auto b1_f32 = b1_tensor.to(torch::kFloat32);
+                auto w2_f32 = w2_tensor.to(torch::kFloat32);
+                auto b2_f32 = b2_tensor.to(torch::kFloat32);
+
+                auto hidden_ref = torch::matmul(input_f32, w1_f32.transpose(0, 1)) + b1_f32;
+                hidden_ref = torch::gelu(hidden_ref);
+                auto output_ref = torch::matmul(hidden_ref, w2_f32.transpose(0, 1)) + b2_f32;
+
+                auto diff = (output_tensor_float - output_ref).abs();
+                auto diff_flat = diff.view({-1});
+                auto max_abs_idx_tensor = diff_flat.argmax();
+                float max_abs = diff_flat.index({max_abs_idx_tensor}).item<float>();
+                float mean_abs = diff.mean().item<float>();
+
+                auto denom = output_ref.abs().clamp_min(1e-6);
+                auto rel = diff / denom;
+                auto rel_flat = rel.view({-1});
+                float max_rel = rel_flat.index({rel_flat.argmax()}).item<float>();
+                float mean_rel = rel.mean().item<float>();
+
+                int64_t worst_index = max_abs_idx_tensor.item<int64_t>();
+                if (hidden_dim > 0 && M > 0) {
+                    int64_t worst_m = worst_index / hidden_dim;
+                    int64_t worst_h = worst_index % hidden_dim;
+                    float actual_val = output_tensor_float.index({worst_m, worst_h}).item<float>();
+                    float ref_val = output_ref.index({worst_m, worst_h}).item<float>();
+                    float diff_val = actual_val - ref_val;
+
+                    std::cerr << "[LB][MOE_VALIDATE] group=" << task.group_idx
+                              << " policy=" << task.policy_id
+                              << " expert=" << task.expert_id;
+                    if (task.token_offset >= 0) {
+                        std::cerr << " offset=" << task.token_offset;
+                    }
+                    std::cerr << " M=" << M
+                              << " max_abs=" << max_abs
+                              << " mean_abs=" << mean_abs
+                              << " max_rel=" << max_rel
+                              << " mean_rel=" << mean_rel
+                              << std::endl;
+
+                    if (max_abs > 5e-4f || max_rel > 1.0f || std::isnan(max_abs) || std::isnan(max_rel)) {
+                        std::cerr << "    worst_coord=(" << worst_m << "," << worst_h << ")"
+                                  << " actual=" << actual_val
+                                  << " ref=" << ref_val
+                                  << " diff=" << diff_val
+                                  << std::endl;
+                    }
+                } else {
+                    std::cerr << "[LB][MOE_VALIDATE] group=" << task.group_idx
+                              << " policy=" << task.policy_id
+                              << " expert=" << task.expert_id
+                              << " M=" << M
+                              << " -- skipped coord breakdown due to degenerate dims"
+                              << " max_abs=" << max_abs
+                              << " mean_abs=" << mean_abs
+                              << " max_rel=" << max_rel
+                              << " mean_rel=" << mean_rel
                               << std::endl;
                 }
-            } else {
-                std::cerr << "[LB][MOE_VALIDATE] group=" << group_idx
-                          << " policy=" << policy_id
-                          << " expert=" << expert_id
-                          << " M=" << M
-                          << " -- skipped coord breakdown due to degenerate dims"
-                          << " max_abs=" << max_abs
-                          << " mean_abs=" << mean_abs
-                          << " max_rel=" << max_rel
-                          << " mean_rel=" << mean_rel
-                          << std::endl;
             }
         }
+    }
+
+    for (int i = 1; i < num_streams; ++i) {
+        streams[i].synchronize();
     }
 
     if (log_guard) {
