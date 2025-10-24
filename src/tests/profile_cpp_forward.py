@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Profile C++ forward_packed_cpp to identify memory bottlenecks.
+Profile C++ forward_packed to identify memory bottlenecks.
 """
 import sys
 from pathlib import Path
@@ -487,7 +487,7 @@ def profile_forward_pass(checkpoint_path, batch_size=128, seq_len=256):
         print(f"[DIAG] padding_mask: {tuple(padding_mask.shape)}, {padding_mask.dtype}")
         policy_indices = torch.zeros(obs_seq.size(0), dtype=torch.long, device=device)
         print(f"[DIAG] policy_indices: {tuple(policy_indices.shape)}, {policy_indices.dtype}")
-        _ = lb.forward_packed_cpp(
+        _ = lb.forward_packed(
             obs_seq, act_seq, agent_types, positions,
             weight_dict, policy_indices, padding_mask,
             arch["num_layers"],
@@ -558,7 +558,7 @@ def profile_forward_pass(checkpoint_path, batch_size=128, seq_len=256):
             print(f"[DIAG] positions: {tuple(positions.shape)}, {positions.dtype}")
             policy_indices = torch.zeros(obs_seq.size(0), dtype=torch.long, device=device)
             print(f"[DIAG] policy_indices: {tuple(policy_indices.shape)}, {policy_indices.dtype}")
-            action_logits, opp_logits, state_values, win_logits = lb.forward_packed_cpp(
+            action_logits, opp_logits, state_values, win_logits = lb.forward_packed(
                 obs_seq, act_seq, agent_types, positions,
                 weight_dict, policy_indices, padding_mask,
                 arch["num_layers"],
@@ -688,7 +688,7 @@ def profile_multi_policy(checkpoint_path: str, batch_size: int, seq_len: int, nu
     print("\nWarmup pass...")
     torch.cuda.reset_peak_memory_stats()
     with torch.no_grad():
-        _ = lb.forward_packed_cpp(
+        _ = lb.forward_packed(
             obs_seq, act_seq, agent_types, positions,
             stacked_weights, policy_indices, padding_mask,
             arch_cfg["num_layers"], arch_cfg["num_heads"], arch_cfg["hidden_dim"],
@@ -716,7 +716,7 @@ def profile_multi_policy(checkpoint_path: str, batch_size: int, seq_len: int, nu
         with_stack=False,  # Disable to reduce warnings
     ) as prof:
         with torch.no_grad():
-            action_logits, opp_logits, state_values, win_logits = lb.forward_packed_cpp(
+            action_logits, opp_logits, state_values, win_logits = lb.forward_packed(
                 obs_seq, act_seq, agent_types, positions,
                 stacked_weights, policy_indices, padding_mask,
                 arch_cfg["num_layers"], arch_cfg["num_heads"], arch_cfg["hidden_dim"],

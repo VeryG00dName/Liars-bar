@@ -39,7 +39,7 @@ static const char* dtypeStr(cudaDataType_t t) {
 //  - Host-side verbose logs can be enabled via env vars:
 //      LB_DEBUG_CUBLASLT=1   -> cuBLASLt config and heuristic dumps
 //      LB_DEBUG_STATS=1      -> tensor stats/validation prints
-//  - Kernel printf is gated at compile time with LB_ENABLE_KERNEL_DEBUG
+//      LB_ENABLE_KERNEL_DEBUG=1 -> enable in-kernel debug prints
 // ----------------------------------------------------------------------------
 static inline bool lb_env_enabled(const char* name) {
     const char* v = std::getenv(name);
@@ -51,6 +51,18 @@ static inline bool lb_env_enabled(const char* name) {
 static bool LB_DBG_CUBLASLT() { static int flag = -1; if (flag < 0) flag = lb_env_enabled("LB_DEBUG_CUBLASLT"); return flag != 0; }
 static bool LB_DBG_STATS()    { static int flag = -1; if (flag < 0) flag = lb_env_enabled("LB_DEBUG_STATS");    return flag != 0; }
 static bool LB_MOE_GUARD()    { static int flag = -1; if (flag < 0) flag = lb_env_enabled("LB_MOE_GUARD");    return flag != 0; }
+static bool LB_MOE_LOG_GUARD(){ static int flag = -1; if (flag < 0) flag = lb_env_enabled("LB_MOE_LOG_GUARD"); return flag != 0; }
+static bool LB_KERNEL_DEBUG_ENABLED() { static int flag = -1; if (flag < 0) flag = lb_env_enabled("LB_ENABLE_KERNEL_DEBUG") ? 1 : 0; return flag != 0; }
+static int lb_env_int(const char* name, int default_value) {
+    const char* v = std::getenv(name);
+    if (!v || !*v) return default_value;
+    char* end = nullptr;
+    long parsed = std::strtol(v, &end, 10);
+    if (end == v) return default_value;
+    return static_cast<int>(parsed);
+}
+static int LB_MOE_VALIDATE_GROUPS() { static int value = lb_env_int("LB_MOE_VALIDATE_GROUPS", 0); return value; }
+static int LB_MOE_LOG_GEMM_GROUPS() { static int value = lb_env_int("LB_MOE_LOG_GEMM", 0); return value; }
 
 static const char* computeStr(cublasComputeType_t c) {
     switch (c) {
@@ -278,17 +290,16 @@ __global__ void indexed_batched_layer_norm_kernel(
     int64_t batch_size,
     int64_t time_steps,
     int64_t hidden_dim,
-    double eps) {
-    
-    // Debug printing in kernel (compile-time gated)
-#ifdef LB_ENABLE_KERNEL_DEBUG
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
+    double eps,
+    bool debug_enabled) {
+    // Debug printing in kernel (runtime gated via host flag)
+    if (debug_enabled && threadIdx.x == 0 && blockIdx.x == 0) {
         printf("LayerNorm Kernel Debug:\n");
         printf("Input ptr: %p\n", (void*)input);
-        printf("Batch size: %ld, Time steps: %ld, Hidden dim: %ld\n", 
+        printf("Batch size: %ld, Time steps: %ld, Hidden dim: %ld\n",
                batch_size, time_steps, hidden_dim);
         printf("Epsilon: %e\n", eps);
-        
+
         // Print first few input values
         printf("First few input values:\n");
         for (int i = 0; i < min(10, (int)hidden_dim); i++) {
@@ -296,7 +307,6 @@ __global__ void indexed_batched_layer_norm_kernel(
         }
         printf("\n");
     }
-#endif
     const int64_t token_index = blockIdx.x;
     if (token_index >= batch_size * time_steps) {
         return;
@@ -338,24 +348,23 @@ __global__ void indexed_batched_layer_norm_kernel(
     __syncthreads();
     const acc_t mean = shared_sum / static_cast<acc_t>(hidden_dim);
 
-    // Enhanced debug: Check input values and print statistics (compile-time gated)
-#ifdef LB_ENABLE_KERNEL_DEBUG
-    if (blockIdx.x < 5 && threadIdx.x == 0) {
+    // Enhanced debug: Check input values and print statistics when enabled
+    if (debug_enabled && blockIdx.x < 5 && threadIdx.x == 0) {
         acc_t max_abs_val = 0.0f;
         acc_t min_val = 1e9;
         acc_t max_val = -1e9;
         bool has_nan = false;
         bool has_inf = false;
-        
+
         for (int64_t h = 0; h < hidden_dim; h++) {
-            acc_t val = static_cast<acc_t>(input[blockIdx.x * hidden_dim + h]);
+            acc_t val = static_cast<acc_t>(input_ptr[h]);
             if (isnan(val)) has_nan = true;
             if (isinf(val)) has_inf = true;
             max_abs_val = max(max_abs_val, fabs(val));
             min_val = min(min_val, val);
             max_val = max(max_val, val);
         }
-        
+
         printf("Token %d stats:\n", (int)blockIdx.x);
         printf("  Range: [%f, %f]\n", (float)min_val, (float)max_val);
         printf("  Max abs value: %f\n", (float)max_abs_val);
@@ -363,7 +372,6 @@ __global__ void indexed_batched_layer_norm_kernel(
         printf("  Has NaN: %s\n", has_nan ? "YES" : "NO");
         printf("  Has Inf: %s\n", has_inf ? "YES" : "NO");
     }
-#endif
 
     acc_t thread_var = static_cast<acc_t>(0);
     for (int64_t h = threadIdx.x; h < hidden_dim; h += blockDim.x) {
@@ -386,12 +394,10 @@ __global__ void indexed_batched_layer_norm_kernel(
     const acc_t inv_std = rsqrt(shared_var + static_cast<acc_t>(eps));
 
     // Debug: Print variance and inv_std for first few tokens
-#ifdef LB_ENABLE_KERNEL_DEBUG
-    if (blockIdx.x < 5 && threadIdx.x == 0) {
-        printf("Token %d - Variance: %f, Inv_std: %f\n", 
+    if (debug_enabled && blockIdx.x < 5 && threadIdx.x == 0) {
+        printf("Token %d - Variance: %f, Inv_std: %f\n",
                (int)blockIdx.x, (float)shared_var, (float)inv_std);
     }
-#endif
 
     for (int64_t h = threadIdx.x; h < hidden_dim; h += blockDim.x) {
         const acc_t norm = (static_cast<acc_t>(input_ptr[h]) - mean) * inv_std;
@@ -525,25 +531,62 @@ void grouped_ffn_gemm_forward(
     const uintptr_t* b2_ptrs,
     const uintptr_t* output_ptrs,
     const int64_t* m_sizes,
+    const int64_t* policy_ids,
+    const int64_t* expert_ids,
+    const int64_t* token_offsets,
     int64_t group_count,
     int64_t hidden_dim,
     int64_t ffn_dim) {
 
+    TORCH_CHECK(m_sizes != nullptr, "grouped_ffn_gemm_forward: m_sizes must not be null");
+    TORCH_CHECK(policy_ids != nullptr, "grouped_ffn_gemm_forward: policy_ids must not be null");
+    TORCH_CHECK(expert_ids != nullptr, "grouped_ffn_gemm_forward: expert_ids must not be null");
+
+    const bool guard_enabled = LB_MOE_GUARD();
+    const bool log_guard = LB_MOE_LOG_GUARD();
+
     if (group_count == 0) {
+        if (log_guard) {
+            std::cerr << "[LB][MOE_GUARD] grouped_ffn_gemm_forward invoked with group_count=0" << std::endl;
+        }
         return;
     }
+
+    struct GuardLogEntry {
+        int64_t group_idx;
+        int64_t policy_id;
+        int64_t expert_id;
+        int64_t token_offset;
+        int64_t m;
+        const char* stage;
+    };
+
+    std::vector<GuardLogEntry> guard_logs;
+    if (log_guard) {
+        guard_logs.reserve(group_count * 2);
+    }
+    int64_t fallback_hidden_groups = 0;
+    int64_t fallback_output_groups = 0;
+    constexpr const char* kStageHidden = "hidden_gemm";
+    constexpr const char* kStageOutput = "output_gemm";
+    const int validate_setting = LB_MOE_VALIDATE_GROUPS();
+    const bool validate_all_groups = validate_setting < 0;
+    int validated_groups = 0;
+    const int log_gemm_setting = LB_MOE_LOG_GEMM_GROUPS();
+    const bool log_gemm_enabled = log_gemm_setting != 0;
+    const bool log_gemm_all = log_gemm_setting < 0;
+    int logged_gemm_groups = 0;
 
     // Get cuBLAS handle and CUDA stream
     auto handle = at::cuda::getCurrentCUDABlasHandle();
     auto stream = at::cuda::getCurrentCUDAStream();
     // We'll use FP16 for all operations (input is already FP16 from caller)
     const cudaDataType_t data_type = CUDA_R_16F;
-    const cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F_FAST_16F;
+    const cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F;
 
     // Scalars for GEMM (alpha=1.0, beta=0.0 for first GEMM, beta=1.0 for bias add)
-    const __half alpha_half = __float2half(1.0f);
-    const __half beta_zero = __float2half(0.0f);
-    const __half beta_one = __float2half(1.0f);
+    const float alpha_one = 1.0f;
+    const float beta_zero = 0.0f;
 
     // Allocate workspace for intermediate hidden states
     // We'll allocate a single large buffer and partition it across groups
@@ -555,14 +598,23 @@ void grouped_ffn_gemm_forward(
     // Allocate intermediate buffer: [max_m * ffn_dim] elements
     auto intermediate_buffer = torch::empty(
         {max_m * ffn_dim},
-        torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA)
+        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA)
     );
-    auto* intermediate_ptr = reinterpret_cast<at::Half*>(intermediate_buffer.data_ptr());
+    auto output_buffer = torch::empty(
+        {max_m * hidden_dim},
+        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA)
+    );
+    auto* intermediate_ptr = intermediate_buffer.data_ptr<float>();
+    auto* output_float_ptr = output_buffer.data_ptr<float>();
 
     // Process each group
     for (int64_t group_idx = 0; group_idx < group_count; ++group_idx) {
         const int64_t M = m_sizes[group_idx];
         if (M == 0) continue;
+
+        const int64_t policy_id = policy_ids[group_idx];
+        const int64_t expert_id = expert_ids[group_idx];
+        const int64_t token_offset = token_offsets ? token_offsets[group_idx] : -1;
 
         auto* input_ptr = reinterpret_cast<const at::Half*>(input_ptrs[group_idx]);
         auto* w1_ptr = reinterpret_cast<const at::Half*>(w1_ptrs[group_idx]);
@@ -570,6 +622,44 @@ void grouped_ffn_gemm_forward(
         auto* w2_ptr = reinterpret_cast<const at::Half*>(w2_ptrs[group_idx]);
         auto* b2_ptr = reinterpret_cast<const at::Half*>(b2_ptrs[group_idx]);
         auto* output_ptr = reinterpret_cast<at::Half*>(output_ptrs[group_idx]);
+        const bool validate_this_group = (validate_setting != 0) && (validate_all_groups || validated_groups < validate_setting);
+        const bool log_this_group = log_gemm_enabled && (log_gemm_all || logged_gemm_groups < std::abs(log_gemm_setting));
+        if (log_this_group) {
+            ++logged_gemm_groups;
+            std::cerr << "[LB][MOE_GEMM] group=" << group_idx
+                      << " policy=" << policy_id
+                      << " expert=" << expert_id;
+            if (token_offset >= 0) {
+                std::cerr << " offset=" << token_offset;
+            }
+            std::cerr << " M=" << M
+                      << " hidden_dim=" << hidden_dim
+                      << " ffn_dim=" << ffn_dim
+                      << std::endl;
+        std::cerr << "    first_gemm: transa=T transb=N"
+                  << " m=" << ffn_dim
+                  << " n=" << M
+                  << " k=" << hidden_dim
+                  << " lda=" << hidden_dim
+                  << " ldb=" << hidden_dim
+                  << " ldc=" << ffn_dim
+                  << std::endl;
+        std::cerr << "    second_gemm: transa=T transb=N"
+                  << " m=" << hidden_dim
+                  << " n=" << M
+                  << " k=" << ffn_dim
+                  << " lda=" << ffn_dim
+                  << " ldb=" << ffn_dim
+                  << " ldc=" << hidden_dim
+                  << std::endl;
+            std::cerr << "    ptrs: input=" << static_cast<const void*>(input_ptr)
+                      << " w1=" << static_cast<const void*>(w1_ptr)
+                      << " b1=" << static_cast<const void*>(b1_ptr)
+                      << " w2=" << static_cast<const void*>(w2_ptr)
+                      << " b2=" << static_cast<const void*>(b2_ptr)
+                      << " out=" << static_cast<void*>(output_ptr)
+                      << std::endl;
+        }
 
         // ====================================================================
         // First GEMM: hidden = input @ w1.T
@@ -588,20 +678,20 @@ void grouped_ffn_gemm_forward(
         auto status1 = cublasGemmEx(
             handle,
             CUBLAS_OP_T,           // row-major trick: A <- w1, use T
-            CUBLAS_OP_T,           // row-major trick: B <- input, use T
+            CUBLAS_OP_N,           // row-major trick: B <- input^T via no-op
             ffn_dim,               // M (rows of op(B)) = ffn_dim
             M,                     // N (cols of op(A)) = M (batch tokens)
             hidden_dim,            // K (common dimension) = hidden_dim
-            &alpha_half,           // alpha
+            &alpha_one,            // alpha
             w1_ptr,                // A: w1 row-major [ffn_dim, hidden_dim]
-            data_type,
+            CUDA_R_16F,
             hidden_dim,            // lda = K (row-major columns of w1)
             input_ptr,             // B: input row-major [M, hidden_dim]
-            data_type,
-            M,                     // ldb = M (row-major rows of input)
+            CUDA_R_16F,
+            hidden_dim,            // ldb = hidden_dim (input transposed view rows)
             &beta_zero,            // beta = 0 (overwrite)
-            intermediate_ptr,      // C: [M, ffn_dim]
-            data_type,
+            intermediate_ptr,      // C: [M, ffn_dim] (float buffer)
+            CUDA_R_32F,
             ffn_dim,               // ldc
             compute_type,
             CUBLAS_GEMM_DEFAULT
@@ -624,35 +714,25 @@ void grouped_ffn_gemm_forward(
             const_cast<at::Half*>(b1_ptr),
             {ffn_dim},
             torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA)
-        );
+        ).to(torch::kFloat32);
         auto intermediate_tensor = torch::from_blob(
             intermediate_ptr,
             {M, ffn_dim},
-            torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA)
+            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA)
         );
 
-        // Broadcast add: intermediate_tensor += b1_tensor
         intermediate_tensor.add_(b1_tensor);
-
-        // ====================================================================
-        // Apply GELU activation in-place
-        // ====================================================================
-
-        const int64_t total_elements = M * ffn_dim;
-        const int threads = 256;
-        const int blocks = (total_elements + threads - 1) / threads;
-
-        gelu_inplace_kernel<at::Half><<<blocks, threads, 0, stream>>>(
-            intermediate_ptr,
-            total_elements
-        );
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        intermediate_tensor.copy_(torch::gelu(intermediate_tensor));
 
         // Optional guard: verify intermediate is finite; if not, recompute via reference matmul path
-        if (LB_MOE_GUARD()) {
+        if (guard_enabled) {
             auto finite_mask = intermediate_tensor.isfinite();
             bool all_finite = finite_mask.all().item<bool>();
             if (!all_finite) {
+                ++fallback_hidden_groups;
+                if (log_guard) {
+                    guard_logs.push_back({group_idx, policy_id, expert_id, token_offset, M, kStageHidden});
+                }
                 auto input_tensor = torch::from_blob(
                     const_cast<at::Half*>(input_ptr),
                     {M, hidden_dim},
@@ -663,10 +743,9 @@ void grouped_ffn_gemm_forward(
                     {ffn_dim, hidden_dim},
                     torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA)
                 );
-                auto b1_float = b1_tensor.to(torch::kFloat32);
-                auto hidden_ref = torch::matmul(input_tensor.to(torch::kFloat32), w1_tensor.to(torch::kFloat32).transpose(0,1)) + b1_float;
+                auto hidden_ref = torch::matmul(input_tensor.to(torch::kFloat32), w1_tensor.to(torch::kFloat32).transpose(0,1)) + b1_tensor;
                 hidden_ref = torch::gelu(hidden_ref);
-                intermediate_tensor.copy_(hidden_ref.to(torch::kHalf));
+                intermediate_tensor.copy_(hidden_ref);
             }
         }
 
@@ -677,23 +756,28 @@ void grouped_ffn_gemm_forward(
         // output: [M, hidden_dim]
         // ====================================================================
 
+        // Convert hidden activations back to half before GEMM; cuBLAS does not
+        // support (A=FP16, B=FP32, C=FP32) with the default algorithm.
+        auto intermediate_half_tensor = intermediate_tensor.to(torch::kHalf);
+        const auto* intermediate_half_ptr = reinterpret_cast<const at::Half*>(intermediate_half_tensor.data_ptr<at::Half>());
+
         auto status2 = cublasGemmEx(
             handle,
             CUBLAS_OP_T,           // row-major trick: A <- w2, use T
-            CUBLAS_OP_T,           // row-major trick: B <- hidden, use T
+            CUBLAS_OP_N,           // row-major trick: B <- hidden^T via no-op
             hidden_dim,            // M (rows of op(B)) = hidden_dim
             M,                     // N (cols of op(A)) = M (batch tokens)
             ffn_dim,               // K (common dimension) = ffn_dim
-            &alpha_half,           // alpha
+            &alpha_one,            // alpha
             w2_ptr,                // A: w2 row-major [hidden_dim, ffn_dim]
-            data_type,
+            CUDA_R_16F,
             ffn_dim,               // lda = K (row-major columns of w2)
-            intermediate_ptr,      // B: hidden row-major [M, ffn_dim]
-            data_type,
-            M,                     // ldb = M (row-major rows of hidden)
+            intermediate_half_ptr, // B: hidden row-major [M, ffn_dim] (cast to fp16)
+            CUDA_R_16F,
+            ffn_dim,               // ldb = ffn_dim (hidden transposed view rows)
             &beta_zero,            // beta = 0 (overwrite)
-            output_ptr,            // C: [M, hidden_dim]
-            data_type,
+            output_float_ptr,      // C: [M, hidden_dim] float buffer
+            CUDA_R_32F,
             hidden_dim,            // ldc
             compute_type,
             CUBLAS_GEMM_DEFAULT
@@ -711,20 +795,23 @@ void grouped_ffn_gemm_forward(
             const_cast<at::Half*>(b2_ptr),
             {hidden_dim},
             torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA)
-        );
-        auto output_tensor = torch::from_blob(
-            output_ptr,
+        ).to(torch::kFloat32);
+        auto output_tensor_float = torch::from_blob(
+            output_float_ptr,
             {M, hidden_dim},
-            torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA)
+            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA)
         );
 
-        // Broadcast add: output_tensor += b2_tensor
-        output_tensor.add_(b2_tensor);
+        output_tensor_float.add_(b2_tensor);
 
-        if (LB_MOE_GUARD()) {
-            auto finite_mask2 = output_tensor.isfinite();
+        if (guard_enabled) {
+            auto finite_mask2 = output_tensor_float.isfinite();
             bool all_finite2 = finite_mask2.all().item<bool>();
             if (!all_finite2) {
+                ++fallback_output_groups;
+                if (log_guard) {
+                    guard_logs.push_back({group_idx, policy_id, expert_id, token_offset, M, kStageOutput});
+                }
                 auto w2_tensor = torch::from_blob(
                     const_cast<at::Half*>(w2_ptr),
                     {hidden_dim, ffn_dim},
@@ -733,10 +820,139 @@ void grouped_ffn_gemm_forward(
                 auto inter_f32 = torch::from_blob(
                     intermediate_ptr,
                     {M, ffn_dim},
-                    torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA)
-                ).to(torch::kFloat32);
-                auto out_ref = torch::matmul(inter_f32, w2_tensor.to(torch::kFloat32).transpose(0,1)) + b2_tensor.to(torch::kFloat32);
-                output_tensor.copy_(out_ref.to(torch::kHalf));
+                    torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA)
+                );
+                auto out_ref = torch::matmul(inter_f32, w2_tensor.to(torch::kFloat32).transpose(0,1)) + b2_tensor;
+                output_tensor_float.copy_(out_ref);
+            }
+        }
+
+        auto output_tensor_half = torch::from_blob(
+            output_ptr,
+            {M, hidden_dim},
+            torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA)
+        );
+        output_tensor_half.copy_(output_tensor_float.to(torch::kHalf));
+
+        if (validate_this_group) {
+            ++validated_groups;
+            auto half_opts = torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA);
+
+            auto input_tensor = torch::from_blob(
+                const_cast<at::Half*>(input_ptr),
+                {M, hidden_dim},
+                half_opts
+            );
+            auto w1_tensor = torch::from_blob(
+                const_cast<at::Half*>(w1_ptr),
+                {ffn_dim, hidden_dim},
+                half_opts
+            );
+            auto b1_tensor_val = torch::from_blob(
+                const_cast<at::Half*>(b1_ptr),
+                {ffn_dim},
+                half_opts
+            );
+            auto w2_tensor = torch::from_blob(
+                const_cast<at::Half*>(w2_ptr),
+                {hidden_dim, ffn_dim},
+                half_opts
+            );
+            auto b2_tensor_val = torch::from_blob(
+                const_cast<at::Half*>(b2_ptr),
+                {hidden_dim},
+                half_opts
+            );
+
+            auto input_f32 = input_tensor.to(torch::kFloat32);
+            auto w1_f32 = w1_tensor.to(torch::kFloat32);
+            auto b1_f32 = b1_tensor_val.to(torch::kFloat32);
+            auto w2_f32 = w2_tensor.to(torch::kFloat32);
+            auto b2_f32 = b2_tensor_val.to(torch::kFloat32);
+
+            auto hidden_ref = torch::matmul(input_f32, w1_f32.transpose(0, 1)) + b1_f32;
+            hidden_ref = torch::gelu(hidden_ref);
+            auto output_ref = torch::matmul(hidden_ref, w2_f32.transpose(0, 1)) + b2_f32;
+
+            auto output_actual_f32 = output_tensor_float;
+            auto diff = (output_actual_f32 - output_ref).abs();
+            auto diff_flat = diff.view({-1});
+            auto max_abs_idx_tensor = diff_flat.argmax();
+            float max_abs = diff_flat.index({max_abs_idx_tensor}).item<float>();
+            float mean_abs = diff.mean().item<float>();
+
+            auto denom = output_ref.abs().clamp_min(1e-6);
+            auto rel = diff / denom;
+            auto rel_flat = rel.view({-1});
+            float max_rel = rel_flat.index({rel_flat.argmax()}).item<float>();
+            float mean_rel = rel.mean().item<float>();
+
+            int64_t worst_index = max_abs_idx_tensor.item<int64_t>();
+            if (hidden_dim > 0 && M > 0) {
+                int64_t worst_m = worst_index / hidden_dim;
+                int64_t worst_h = worst_index % hidden_dim;
+                float actual_val = output_actual_f32.index({worst_m, worst_h}).item<float>();
+                float ref_val = output_ref.index({worst_m, worst_h}).item<float>();
+                float diff_val = actual_val - ref_val;
+
+                std::cerr << "[LB][MOE_VALIDATE] group=" << group_idx
+                          << " policy=" << policy_id
+                          << " expert=" << expert_id;
+                if (token_offset >= 0) {
+                    std::cerr << " offset=" << token_offset;
+                }
+                std::cerr << " M=" << M
+                          << " max_abs=" << max_abs
+                          << " mean_abs=" << mean_abs
+                          << " max_rel=" << max_rel
+                          << " mean_rel=" << mean_rel
+                          << std::endl;
+
+                if (max_abs > 5e-4f || max_rel > 1.0f || std::isnan(max_abs) || std::isnan(max_rel)) {
+                    std::cerr << "    worst_coord=(" << worst_m << "," << worst_h << ")"
+                              << " actual=" << actual_val
+                              << " ref=" << ref_val
+                              << " diff=" << diff_val
+                              << std::endl;
+                }
+            } else {
+                std::cerr << "[LB][MOE_VALIDATE] group=" << group_idx
+                          << " policy=" << policy_id
+                          << " expert=" << expert_id
+                          << " M=" << M
+                          << " -- skipped coord breakdown due to degenerate dims"
+                          << " max_abs=" << max_abs
+                          << " mean_abs=" << mean_abs
+                          << " max_rel=" << max_rel
+                          << " mean_rel=" << mean_rel
+                          << std::endl;
+            }
+        }
+    }
+
+    if (log_guard) {
+        if (!guard_enabled) {
+            std::cerr << "[LB][MOE_GUARD] guard disabled; no fallback checks executed (group_count="
+                      << group_count << ")." << std::endl;
+        } else if (guard_logs.empty()) {
+            std::cerr << "[LB][MOE_GUARD] guard enabled; no fallbacks triggered (group_count="
+                      << group_count << ")." << std::endl;
+        } else {
+            std::cerr << "[LB][MOE_GUARD] guard fallback summary: entries="
+                      << guard_logs.size()
+                      << " (hidden=" << fallback_hidden_groups
+                      << ", output=" << fallback_output_groups
+                      << ", group_count=" << group_count << ")" << std::endl;
+            for (const auto& entry : guard_logs) {
+                std::cerr << "  group=" << entry.group_idx
+                          << " policy=" << entry.policy_id
+                          << " expert=" << entry.expert_id;
+                if (entry.token_offset >= 0) {
+                    std::cerr << " offset=" << entry.token_offset;
+                }
+                std::cerr << " M=" << entry.m
+                          << " stage=" << entry.stage
+                          << std::endl;
             }
         }
     }
@@ -852,6 +1068,7 @@ torch::Tensor indexed_batched_layer_norm(
 
     c10::cuda::CUDAGuard guard(input.device());
     auto stream = at::cuda::getCurrentCUDAStream();
+    const bool kernel_debug_enabled = LB_KERNEL_DEBUG_ENABLED();
 
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(
         input.scalar_type(), "indexed_batched_layer_norm_cuda", [&] {
@@ -865,7 +1082,8 @@ torch::Tensor indexed_batched_layer_norm(
                 batch_size,
                 time_steps,
                 hidden_dim,
-                eps);
+                eps,
+                kernel_debug_enabled);
         });
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();

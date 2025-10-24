@@ -841,7 +841,7 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
         timer_hist_prep_batch_ += std::chrono::duration_cast<Microseconds>(prep_t1 - prep_t0);
 
         auto model_t0 = Clock::now();
-        auto [action_logits, opp_logits, state_values, win_logits] = forward_packed_cpp(
+        auto [action_logits, opp_logits, state_values, win_logits] = forward_packed(
             tensor_batch.obs_sequence,
             tensor_batch.action_sequence,
             tensor_batch.agent_types,

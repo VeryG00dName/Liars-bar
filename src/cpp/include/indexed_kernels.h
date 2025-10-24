@@ -48,6 +48,7 @@ torch::Tensor indexed_batched_linear(
 
 // Runs the grouped FFN GEMM forward pass using CUTLASS grouped kernels.
 // Each array argument is expected to contain device pointers for the operands.
+// policy_ids / expert_ids / token_offsets provide per-group metadata for diagnostics.
 void grouped_ffn_gemm_forward(
     const uintptr_t* input_ptrs,
     const uintptr_t* w1_ptrs,
@@ -56,6 +57,9 @@ void grouped_ffn_gemm_forward(
     const uintptr_t* b2_ptrs,
     const uintptr_t* output_ptrs,
     const int64_t* m_sizes,
+    const int64_t* policy_ids,
+    const int64_t* expert_ids,
+    const int64_t* token_offsets,
     int64_t group_count,
     int64_t hidden_dim,
     int64_t ffn_dim);

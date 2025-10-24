@@ -560,6 +560,7 @@ def main():
     print("=" * 80)
     print(f"Reference: {args.reference}")
     print(f"Checkpoint: {args.checkpoint}")
+    print(f"second Checkpoint: {args.checkpoint2}")
     print(f"Device: {args.device}")
     print()
 

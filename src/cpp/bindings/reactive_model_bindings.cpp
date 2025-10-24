@@ -11,7 +11,7 @@ namespace py = pybind11;
 void bind_reactive_model(py::module_& m) {
     // Expose the main forward function
     m.def(
-        "forward_packed_cpp",
+        "forward_packed",
         [](const torch::Tensor& obs_sequence,
            const torch::Tensor& action_sequence,
            const torch::Tensor& agent_types,
@@ -35,7 +35,7 @@ void bind_reactive_model(py::module_& m) {
             }
 
             // Call C++ function
-            return forward_packed_cpp(
+            return forward_packed(
                 obs_sequence,
                 action_sequence,
                 agent_types,

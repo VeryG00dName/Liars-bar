@@ -36,7 +36,7 @@
  *         - win_logits: [B, T, 1]
  */
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-forward_packed_cpp(
+forward_packed(
     const torch::Tensor& obs_sequence,
     const torch::Tensor& action_sequence,
     const torch::Tensor& agent_types,
@@ -55,7 +55,7 @@ forward_packed_cpp(
 
 // Overload with detailed timers map for granular profiling
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-forward_packed_cpp(
+forward_packed(
     const torch::Tensor& obs_sequence,
     const torch::Tensor& action_sequence,
     const torch::Tensor& agent_types,

@@ -493,6 +493,9 @@ test_moe_layer(
     std::vector<uintptr_t> w2_ptrs;
     std::vector<uintptr_t> b2_ptrs;
     std::vector<int64_t> group_m_sizes;
+    std::vector<int64_t> group_policy_ids;
+    std::vector<int64_t> group_expert_ids;
+    std::vector<int64_t> group_token_offsets;
 
     const int64_t total_routes = sorted_expert_indices.size(0);
     const uintptr_t input_base = reinterpret_cast<uintptr_t>(expert_inputs.data_ptr<at::Half>());
@@ -531,6 +534,9 @@ test_moe_layer(
         b2_ptrs.push_back(b2_ptr_data[ptr_index]);
 
         group_m_sizes.push_back(count);
+        group_policy_ids.push_back(policy_id);
+        group_expert_ids.push_back(expert_id);
+        group_token_offsets.push_back(cursor);
         cursor = end;
     }
 
@@ -546,6 +552,9 @@ test_moe_layer(
             b2_ptrs.data(),
             output_ptrs.data(),
             group_m_sizes.data(),
+            group_policy_ids.data(),
+            group_expert_ids.data(),
+            group_token_offsets.data(),
             static_cast<int64_t>(group_m_sizes.size()),
             hidden_dim,
             ffn_dim
@@ -831,7 +840,7 @@ using Microseconds = std::chrono::microseconds;
 
 // Wrapper to preserve original signature (e.g., Python bindings)
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-forward_packed_cpp(
+forward_packed(
     const torch::Tensor& obs_sequence,
     const torch::Tensor& action_sequence,
     const torch::Tensor& agent_types,
@@ -847,7 +856,7 @@ forward_packed_cpp(
     int64_t count_pad,
     int64_t tflag_pad) {
     std::unordered_map<std::string, Microseconds> dummy;
-    return forward_packed_cpp(
+    return forward_packed(
         obs_sequence,
         action_sequence,
         agent_types,
@@ -867,7 +876,7 @@ forward_packed_cpp(
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-forward_packed_cpp(
+forward_packed(
     const torch::Tensor& obs_sequence,
     const torch::Tensor& action_sequence,
     const torch::Tensor& agent_types,
@@ -1307,6 +1316,9 @@ forward_packed_cpp(
             std::vector<uintptr_t> w2_ptrs;
             std::vector<uintptr_t> b2_ptrs;
             std::vector<int64_t> group_m_sizes;
+            std::vector<int64_t> group_policy_ids;
+            std::vector<int64_t> group_expert_ids;
+            std::vector<int64_t> group_token_offsets;
 
             struct GroupRange {
                 int64_t start;
@@ -1363,6 +1375,9 @@ forward_packed_cpp(
                 b2_ptrs.push_back(b2_ptr_data[ptr_index]);
 
                 group_m_sizes.push_back(count);
+                group_policy_ids.push_back(policy_id);
+                group_expert_ids.push_back(expert_id);
+                group_token_offsets.push_back(cursor);
 
                 cursor = end;
             }
@@ -1379,6 +1394,9 @@ forward_packed_cpp(
                     b2_ptrs.data(),
                     output_ptrs.data(),
                     group_m_sizes.data(),
+                    group_policy_ids.data(),
+                    group_expert_ids.data(),
+                    group_token_offsets.data(),
                     static_cast<int64_t>(group_m_sizes.size()),
                     hidden_dim,
                     ffn_dim
