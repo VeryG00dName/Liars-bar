@@ -13,6 +13,9 @@
 #include <unordered_map>
 #include <algorithm>
 
+using Clock = std::chrono::high_resolution_clock;
+using Microseconds = std::chrono::microseconds;
+
 namespace {
 
 // Helper to get weight from dict with error checking
@@ -89,16 +92,15 @@ test_embeddings(
     const torch::Tensor& agent_types,
     const torch::Tensor& positions,
     const c10::Dict<std::string, torch::Tensor>& batched_weights,
-    const torch::Tensor& policy_indices
+    const torch::Tensor& policy_indices,
+    std::unordered_map<std::string, Microseconds>* timers
 ) {
     auto device = obs_sequence.device();
     auto policy_indices_for_ops = policy_indices.to(device).to(torch::kLong).contiguous();
 
     c10::Dict<std::string, torch::Tensor> result;
-
-    // Observation encoding: Linear -> LayerNorm -> GELU
-    // Break down into individual steps for debugging
-    std::unordered_map<std::string, std::chrono::microseconds> dummy_timers;
+    std::unordered_map<std::string, Microseconds> dummy_timers;
+    auto& timer_ref = timers ? *timers : dummy_timers;
 
     // Step 1: Linear
     auto obs_linear = indexed_batched_linear(
@@ -106,7 +108,7 @@ test_embeddings(
         get_weight(batched_weights, "obs_encoder.0.weight"),
         get_weight(batched_weights, "obs_encoder.0.bias"),
         policy_indices_for_ops,
-        dummy_timers
+        timer_ref
     );
     result.insert("obs_linear", obs_linear);
 
@@ -173,13 +175,15 @@ test_gating(
     const torch::Tensor& agent_embed,
     const torch::Tensor& position_embed,
     const c10::Dict<std::string, torch::Tensor>& batched_weights,
-    const torch::Tensor& policy_indices
+    const torch::Tensor& policy_indices,
+    std::unordered_map<std::string, Microseconds>* timers
 ) {
     auto device = obs_embed.device();
     auto policy_indices_for_ops = policy_indices.to(device).to(torch::kLong).contiguous();
 
     c10::Dict<std::string, torch::Tensor> result;
-    std::unordered_map<std::string, std::chrono::microseconds> dummy_timers;
+    std::unordered_map<std::string, Microseconds> dummy_timers;
+    auto& timer_ref = timers ? *timers : dummy_timers;
 
     // Gate for observations
     auto hidden_g_obs = indexed_batched_linear(
@@ -187,7 +191,7 @@ test_gating(
         get_weight(batched_weights, "gate_obs.0.weight"),
         get_weight(batched_weights, "gate_obs.0.bias"),
         policy_indices_for_ops,
-        dummy_timers
+        timer_ref
     );
     hidden_g_obs = torch::tanh(hidden_g_obs);
     auto g_obs = indexed_batched_linear(
@@ -195,7 +199,7 @@ test_gating(
         get_weight(batched_weights, "gate_obs.2.weight"),
         get_weight(batched_weights, "gate_obs.2.bias"),
         policy_indices_for_ops,
-        dummy_timers
+        timer_ref
     );
     g_obs = torch::sigmoid(g_obs);
     result.insert("g_obs", g_obs);
@@ -206,7 +210,7 @@ test_gating(
         get_weight(batched_weights, "gate_action.0.weight"),
         get_weight(batched_weights, "gate_action.0.bias"),
         policy_indices_for_ops,
-        dummy_timers
+        timer_ref
     );
     hidden_g_action = torch::tanh(hidden_g_action);
     auto g_action = indexed_batched_linear(
@@ -214,7 +218,7 @@ test_gating(
         get_weight(batched_weights, "gate_action.2.weight"),
         get_weight(batched_weights, "gate_action.2.bias"),
         policy_indices_for_ops,
-        dummy_timers
+        timer_ref
     );
     g_action = torch::sigmoid(g_action);
     result.insert("g_action", g_action);
@@ -225,7 +229,7 @@ test_gating(
         get_weight(batched_weights, "gate_agent.0.weight"),
         get_weight(batched_weights, "gate_agent.0.bias"),
         policy_indices_for_ops,
-        dummy_timers
+        timer_ref
     );
     hidden_g_agent = torch::tanh(hidden_g_agent);
     auto g_agent = indexed_batched_linear(
@@ -233,7 +237,7 @@ test_gating(
         get_weight(batched_weights, "gate_agent.2.weight"),
         get_weight(batched_weights, "gate_agent.2.bias"),
         policy_indices_for_ops,
-        dummy_timers
+        timer_ref
     );
     g_agent = torch::sigmoid(g_agent);
     result.insert("g_agent", g_agent);
@@ -244,7 +248,7 @@ test_gating(
         get_weight(batched_weights, "gate_position.0.weight"),
         get_weight(batched_weights, "gate_position.0.bias"),
         policy_indices_for_ops,
-        dummy_timers
+        timer_ref
     );
     hidden_g_position = torch::tanh(hidden_g_position);
     auto g_position = indexed_batched_linear(
@@ -252,7 +256,7 @@ test_gating(
         get_weight(batched_weights, "gate_position.2.weight"),
         get_weight(batched_weights, "gate_position.2.bias"),
         policy_indices_for_ops,
-        dummy_timers
+        timer_ref
     );
     g_position = torch::sigmoid(g_position);
     result.insert("g_position", g_position);
@@ -835,9 +839,6 @@ torch::Tensor reduce_expert_heads(
 // Main Forward Function
 // ============================================================================
 
-using Clock = std::chrono::high_resolution_clock;
-using Microseconds = std::chrono::microseconds;
-
 // Wrapper to preserve original signature (e.g., Python bindings)
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 forward_packed(
@@ -936,178 +937,63 @@ forward_packed(
     TORCH_CHECK(positions.size(1) == seq_len,
         "positions seq_len mismatch: expected ", seq_len, ", got ", positions.size(1));
 
-    auto device = action_sequence.device();
-    auto dtype = obs_sequence.scalar_type();
+    // ========================================================================
+    // Action Decomposition (shared with diagnostics)
+    // ========================================================================
+    auto decomp = test_action_decomposition(
+        action_sequence,
+        batched_weights,
+        policy_indices_for_ops,
+        padding_mask,
+        count_pad,
+        tflag_pad
+    );
+    auto act_kind_ids = std::get<0>(decomp);
+    auto count_ids = std::get<1>(decomp);
+    auto table_flag_ids = std::get<2>(decomp);
 
     // ========================================================================
-    // Load LUT buffers (action decomposition tables)
+    // Encoding Phase (shared helpers)
     // ========================================================================
-    // These are fixed buffers that decompose action IDs into (kind, count, flag)
-    auto lut_act_kind = get_weight(batched_weights, "lut_act_kind").to(device);
-    auto lut_count = get_weight(batched_weights, "lut_count").to(device);
-    auto lut_table_flag = get_weight(batched_weights, "lut_table_flag").to(device);
-
-    // ========================================================================
-    // Action Decomposition
-    // ========================================================================
-    auto action_long = action_sequence.to(torch::kLong);
-
-    // LUTs are 1D [11], action_long is 2D [B, T]
-    // Flatten, index, reshape pattern for 1D LUT indexing
-    auto action_flat = action_long.flatten();  // [B*T]
-
-    auto act_kind_flat = lut_act_kind.index({action_flat});  // [B*T]
-    auto count_flat = lut_count.index({action_flat});        // [B*T]
-    auto table_flag_flat = lut_table_flag.index({action_flat}); // [B*T]
-
-    // Reshape back to [B, T] and ensure Long dtype for embedding lookups
-    auto act_kind_ids = act_kind_flat.view({batch_size, seq_len}).to(torch::kLong);
-    auto count_ids = count_flat.view({batch_size, seq_len}).to(torch::kLong);
-    auto table_flag_ids = table_flag_flat.view({batch_size, seq_len}).to(torch::kLong);
-
-
-    // Apply padding mask if provided
-    if (padding_mask.has_value()) {
-        auto pad_mask = padding_mask.value().to(torch::kBool);
-        auto zero_like = torch::zeros_like(act_kind_ids);
-        auto count_pad_tensor = torch::full_like(count_ids, count_pad, torch::kLong);
-        auto tflag_pad_tensor = torch::full_like(table_flag_ids, tflag_pad, torch::kLong);
-
-        act_kind_ids = torch::where(pad_mask, zero_like, act_kind_ids);
-        count_ids = torch::where(pad_mask, count_pad_tensor, count_ids);
-        table_flag_ids = torch::where(pad_mask, tflag_pad_tensor, table_flag_ids);
-    }
-
-    // ========================================================================
-    // Encoding Phase
-    // ========================================================================
-
-    // Observation encoding: Linear -> LayerNorm -> GELU
     auto enc_t0 = Clock::now();
-    auto obs_encoded = indexed_batched_linear(
+    auto embeddings = test_embeddings(
         obs_sequence,
-        get_weight(batched_weights, "obs_encoder.0.weight"),
-        get_weight(batched_weights, "obs_encoder.0.bias"),
+        act_kind_ids,
+        count_ids,
+        table_flag_ids,
+        agent_types,
+        positions,
+        batched_weights,
         policy_indices_for_ops,
-        timers
+        &timers
     );
-    obs_encoded = indexed_batched_layer_norm(
+    auto obs_encoded = embeddings.at("obs_embed");
+    auto action_embed = embeddings.at("action_embed");
+    auto agent_embed = embeddings.at("agent_embed");
+    auto position_embed = embeddings.at("position_embed");
+
+    auto gating = test_gating(
         obs_encoded,
-        get_weight(batched_weights, "obs_encoder.1.weight"),
-        get_weight(batched_weights, "obs_encoder.1.bias"),
-        policy_indices_for_ops
-    );
-    obs_encoded = torch::gelu(obs_encoded);
-
-    // Action embeddings (factorized)
-    auto act_embed =
-        indexed_batched_embedding(get_weight(batched_weights, "act_kind_embedding.weight"), act_kind_ids, policy_indices_for_ops)
-        + indexed_batched_embedding(get_weight(batched_weights, "count_embedding.weight"), count_ids, policy_indices_for_ops)
-        + indexed_batched_embedding(get_weight(batched_weights, "table_flag_embedding.weight"), table_flag_ids, policy_indices_for_ops);
-
-    // Agent type embedding
-    auto agent_embed = indexed_batched_embedding(
-        get_weight(batched_weights, "agent_embedding.weight"),
-        agent_types.to(torch::kLong),
-        policy_indices_for_ops
-    );
-
-    // Position embedding
-    auto position_embed = indexed_batched_embedding(
-        get_weight(batched_weights, "position_embedding.weight"),
-        positions.to(torch::kLong),
-        policy_indices_for_ops
-    );
-
-    // ========================================================================
-    // Gated Fusion (4 independent gates)
-    // ========================================================================
-
-    // Gate for observations
-    auto hidden_g_obs = indexed_batched_linear(
-        obs_encoded,
-        get_weight(batched_weights, "gate_obs.0.weight"),
-        get_weight(batched_weights, "gate_obs.0.bias"),
-        policy_indices_for_ops,
-        timers
-    );
-    hidden_g_obs = torch::tanh(hidden_g_obs);
-    auto g_obs = indexed_batched_linear(
-        hidden_g_obs,
-        get_weight(batched_weights, "gate_obs.2.weight"),
-        get_weight(batched_weights, "gate_obs.2.bias"),
-        policy_indices_for_ops,
-        timers
-    );
-    g_obs = torch::sigmoid(g_obs);
-
-    // Gate for actions
-    auto hidden_g_action = indexed_batched_linear(
-        act_embed,
-        get_weight(batched_weights, "gate_action.0.weight"),
-        get_weight(batched_weights, "gate_action.0.bias"),
-        policy_indices_for_ops,
-        timers
-    );
-    hidden_g_action = torch::tanh(hidden_g_action);
-    auto g_action = indexed_batched_linear(
-        hidden_g_action,
-        get_weight(batched_weights, "gate_action.2.weight"),
-        get_weight(batched_weights, "gate_action.2.bias"),
-        policy_indices_for_ops,
-        timers
-    );
-    g_action = torch::sigmoid(g_action);
-
-    // Gate for agent types
-    auto hidden_g_agent = indexed_batched_linear(
+        action_embed,
         agent_embed,
-        get_weight(batched_weights, "gate_agent.0.weight"),
-        get_weight(batched_weights, "gate_agent.0.bias"),
-        policy_indices_for_ops,
-        timers
-    );
-    hidden_g_agent = torch::tanh(hidden_g_agent);
-    auto g_agent = indexed_batched_linear(
-        hidden_g_agent,
-        get_weight(batched_weights, "gate_agent.2.weight"),
-        get_weight(batched_weights, "gate_agent.2.bias"),
-        policy_indices_for_ops,
-        timers
-    );
-    g_agent = torch::sigmoid(g_agent);
-
-    // Gate for positions
-    auto hidden_g_position = indexed_batched_linear(
         position_embed,
-        get_weight(batched_weights, "gate_position.0.weight"),
-        get_weight(batched_weights, "gate_position.0.bias"),
+        batched_weights,
         policy_indices_for_ops,
-        timers
+        &timers
     );
-    hidden_g_position = torch::tanh(hidden_g_position);
-    auto g_position = indexed_batched_linear(
-        hidden_g_position,
-        get_weight(batched_weights, "gate_position.2.weight"),
-        get_weight(batched_weights, "gate_position.2.bias"),
-        policy_indices_for_ops,
-        timers
+
+    auto fusion = test_fusion(
+        gating.at("g_obs"),
+        gating.at("g_action"),
+        gating.at("g_agent"),
+        gating.at("g_position"),
+        obs_encoded,
+        action_embed,
+        agent_embed,
+        position_embed,
+        hidden_dim
     );
-    g_position = torch::sigmoid(g_position);
-
-    // Ensure embeddings match compute dtype (FP32) for fused combine
-    if (act_embed.scalar_type() != obs_encoded.scalar_type()) act_embed = act_embed.to(obs_encoded.scalar_type());
-    if (agent_embed.scalar_type() != obs_encoded.scalar_type()) agent_embed = agent_embed.to(obs_encoded.scalar_type());
-    if (position_embed.scalar_type() != obs_encoded.scalar_type()) position_embed = position_embed.to(obs_encoded.scalar_type());
-
-    // Fused embedding
-    auto fused = g_obs * obs_encoded
-               + g_action * act_embed
-               + g_agent * agent_embed
-               + g_position * position_embed;
-
-    // Final layer norm (uses torch::layer_norm, not batched version)
-    auto encoded_inputs = torch::layer_norm(fused, {hidden_dim});
+    auto encoded_inputs = fusion.at("combined");
     
     auto enc_t1 = Clock::now();
     timers["fwd_input_encoding_us"] += std::chrono::duration_cast<Microseconds>(enc_t1 - enc_t0);

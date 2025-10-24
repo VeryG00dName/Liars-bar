@@ -129,7 +129,8 @@ test_embeddings(
     const torch::Tensor& agent_types,
     const torch::Tensor& positions,
     const c10::Dict<std::string, torch::Tensor>& batched_weights,
-    const torch::Tensor& policy_indices
+    const torch::Tensor& policy_indices,
+    std::unordered_map<std::string, std::chrono::microseconds>* timers = nullptr
 );
 
 /**
@@ -148,7 +149,8 @@ test_gating(
     const torch::Tensor& agent_embed,
     const torch::Tensor& position_embed,
     const c10::Dict<std::string, torch::Tensor>& batched_weights,
-    const torch::Tensor& policy_indices
+    const torch::Tensor& policy_indices,
+    std::unordered_map<std::string, std::chrono::microseconds>* timers = nullptr
 );
 
 /**
