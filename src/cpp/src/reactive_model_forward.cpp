@@ -431,7 +431,8 @@ test_moe_layer(
     auto expert_w2 = get_weight(batched_weights, layer_prefix + ".moe.experts.w2");
     auto expert_b2 = get_weight(batched_weights, layer_prefix + ".moe.experts.b2");
 
-    auto policy_indices_cpu = policy_indices.to(torch::kCPU).to(torch::kLong).contiguous();
+    // Keep policy_indices on the same device as expert weights for indexing
+    auto policy_indices_for_indexing = policy_indices_for_ops.to(torch::kLong).contiguous();
 
     for (int64_t expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
         auto route_mask = (topk_indices == expert_idx).any(-1);
@@ -449,12 +450,13 @@ test_moe_layer(
         auto rank_in_topk = torch::where(expert_mask)[1];
         auto expert_routing_weights = topk_weights.index({batch_indices, time_indices, rank_in_topk}).unsqueeze(-1);
 
-        auto policy_for_tokens = policy_indices_cpu.index({batch_indices});
+        auto policy_for_tokens = policy_indices_for_indexing.index({batch_indices});
 
-        auto w1 = expert_w1.index({expert_idx, policy_for_tokens});
-        auto b1 = expert_b1.index({expert_idx, policy_for_tokens});
-        auto w2 = expert_w2.index({expert_idx, policy_for_tokens});
-        auto b2 = expert_b2.index({expert_idx, policy_for_tokens});
+        // Index with batch-first layout: [batch_size, num_experts, ...]
+        auto w1 = expert_w1.index({policy_for_tokens, expert_idx});
+        auto b1 = expert_b1.index({policy_for_tokens, expert_idx});
+        auto w2 = expert_w2.index({policy_for_tokens, expert_idx});
+        auto b2 = expert_b2.index({policy_for_tokens, expert_idx});
 
         auto hidden = torch::gelu(
             torch::bmm(expert_inputs.unsqueeze(1), w1.transpose(1, 2)) + b1.unsqueeze(1)

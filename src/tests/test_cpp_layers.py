@@ -494,6 +494,25 @@ def main():
     )
     print(f"Prepared {len(batched_weights)} batched weights")
 
+    # Diagnostic: Check devices of all tensors
+    print("\nDiagnostic: Checking tensor devices...")
+    cpu_tensors = []
+    cuda_tensors = []
+    for key, value in batched_weights.items():
+        if value.device.type == 'cpu':
+            cpu_tensors.append(key)
+        else:
+            cuda_tensors.append(key)
+
+    if cpu_tensors:
+        print(f"WARNING: Found {len(cpu_tensors)} tensors on CPU:")
+        for key in cpu_tensors[:10]:  # Show first 10
+            print(f"  - {key}")
+        if len(cpu_tensors) > 10:
+            print(f"  ... and {len(cpu_tensors) - 10} more")
+    else:
+        print(f"All {len(batched_weights)} tensors are on {args.device}")
+
     # Run tests
     results = {}
 
