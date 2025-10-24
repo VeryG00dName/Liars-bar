@@ -439,6 +439,43 @@ void bind_reactive_model(py::module_& m) {
         "Test MoE layer"
     );
 
+    // Diagnostic helpers for MoE
+    m.def(
+        "test_moe_routing_sort",
+        [](const torch::Tensor& x,
+           py::dict weights_py,
+           const torch::Tensor& policy_indices,
+           int64_t layer_idx,
+           int64_t num_experts,
+           int64_t top_k) {
+            c10::Dict<std::string, torch::Tensor> weights;
+            for (auto item : weights_py) {
+                weights.insert(py::cast<std::string>(item.first), py::cast<torch::Tensor>(item.second));
+            }
+            auto result = test_moe_routing_sort(x, weights, policy_indices, layer_idx, num_experts, top_k);
+            py::dict py_result;
+            for (const auto& pair : result) {
+                py_result[py::cast(pair.key())] = py::cast(pair.value());
+            }
+            return py_result;
+        },
+        py::arg("x"),
+        py::arg("weights"),
+        py::arg("policy_indices"),
+        py::arg("layer_idx"),
+        py::arg("num_experts"),
+        py::arg("top_k"),
+        "Test MoE routing and sorting stages"
+    );
+
+    m.def(
+        "test_moe_group_ranges",
+        &test_moe_group_ranges,
+        py::arg("sorted_expert_indices"),
+        py::arg("sorted_policy_indices"),
+        "Build (start,count,expert,policy) group ranges from sorted indices"
+    );
+
     m.def(
         "test_heads",
         [](const torch::Tensor& transformer_output,

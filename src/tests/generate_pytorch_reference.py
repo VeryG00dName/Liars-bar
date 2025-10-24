@@ -244,20 +244,73 @@ def main():
         debug_outputs['input/policy_indices'] = policy_indices
     else:
         print("Running debug forward pass...")
-        with torch.no_grad():
-            debug_outputs = model(
-                obs_sequence=inputs['obs_sequence'],
-                action_sequence=inputs['action_sequence'],
-                agent_types=inputs['agent_types'],
-                positions=inputs['positions'],
-                action_masks=inputs['action_masks'],
-                padding_mask=inputs['padding_mask'],
-                return_debug_outputs=True,
-            )
+    with torch.no_grad():
+        debug_outputs = model(
+            obs_sequence=inputs['obs_sequence'],
+            action_sequence=inputs['action_sequence'],
+            agent_types=inputs['agent_types'],
+            positions=inputs['positions'],
+            action_masks=inputs['action_masks'],
+            padding_mask=inputs['padding_mask'],
+            return_debug_outputs=True,
+        )
         debug_outputs['input/policy_indices'] = torch.zeros(args.batch_size, dtype=torch.long)
 
     # Save outputs
     output_path = Path(args.output)
+    # ------------------------------------------------------------------
+    # Add staged MoE routing/sorting intermediates to reference
+    # ------------------------------------------------------------------
+    try:
+        # Determine number of transformer layers from recorded keys
+        # We look for any key like 'transformer/layer_X/moe_gate_logits'
+        layer_ids = []
+        for k in list(debug_outputs.keys()):
+            if isinstance(k, str) and k.startswith('transformer/layer_') and k.endswith('/moe_gate_logits'):
+                try:
+                    lid = int(k.split('transformer/layer_')[1].split('/')[0])
+                    layer_ids.append(lid)
+                except Exception:
+                    pass
+        layer_ids = sorted(set(layer_ids))
+
+        policy_indices = debug_outputs.get('input/policy_indices', torch.zeros(args.batch_size, dtype=torch.long))
+        # Ensure CPU tensors for staging
+        policy_indices_cpu = policy_indices.to(torch.long).cpu()
+
+        for lid in layer_ids:
+            gk = f'transformer/layer_{lid}/moe_gate_logits'
+            tk = f'transformer/layer_{lid}/moe_topk_indices'
+            wk = f'transformer/layer_{lid}/moe_topk_scores'
+            if gk not in debug_outputs or tk not in debug_outputs or wk not in debug_outputs:
+                continue
+            gate_logits = debug_outputs[gk]
+            topk_indices = debug_outputs[tk]
+            topk_scores = debug_outputs[wk]
+
+            B, T, K = topk_indices.shape
+            num_tokens = B * T
+            flat_expert_indices = topk_indices.to(torch.long).reshape(-1)
+            flat_routing_weights = topk_scores.reshape(-1)
+            token_indices = torch.arange(num_tokens, dtype=torch.long)
+            expanded_token_indices = token_indices.unsqueeze(-1).expand(num_tokens, K).reshape(-1)
+
+            sorted_vals, sort_order = torch.sort(flat_expert_indices)
+            sorted_expert_indices = sorted_vals
+            sorted_token_indices = expanded_token_indices.index_select(0, sort_order)
+            sorted_routing_weights = flat_routing_weights.index_select(0, sort_order)
+
+            policy_tokens = policy_indices_cpu.unsqueeze(1).expand(B, T).reshape(-1)
+            flat_policy_indices = policy_tokens.index_select(0, expanded_token_indices)
+            sorted_policy_indices = flat_policy_indices.index_select(0, sort_order)
+
+            debug_outputs[f'transformer/layer_{lid}/moe_sorted_expert_indices'] = sorted_expert_indices
+            debug_outputs[f'transformer/layer_{lid}/moe_sorted_token_indices'] = sorted_token_indices
+            debug_outputs[f'transformer/layer_{lid}/moe_sorted_policy_indices'] = sorted_policy_indices
+            debug_outputs[f'transformer/layer_{lid}/moe_sorted_routing_weights'] = sorted_routing_weights
+    except Exception as e:
+        print(f"[WARN] Failed to add staged MoE routing/sorting outputs: {e}")
+
     save_debug_outputs(debug_outputs, output_path)
 
     print("\nSummary of recorded tensors:")

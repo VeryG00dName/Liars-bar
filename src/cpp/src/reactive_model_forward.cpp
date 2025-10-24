@@ -565,6 +565,101 @@ test_moe_layer(
 }
 
 c10::Dict<std::string, torch::Tensor>
+test_moe_routing_sort(
+    const torch::Tensor& x,
+    const c10::Dict<std::string, torch::Tensor>& batched_weights,
+    const torch::Tensor& policy_indices,
+    int64_t layer_idx,
+    int64_t num_experts,
+    int64_t top_k
+) {
+    auto device = x.device();
+    auto policy_indices_for_ops = policy_indices.to(device).to(torch::kLong).contiguous();
+    int64_t batch_size = x.size(0);
+    int64_t seq_len = x.size(1);
+    std::unordered_map<std::string, std::chrono::microseconds> dummy_timers;
+
+    std::string layer_prefix = "transformer.layers." + std::to_string(layer_idx);
+
+    // Gate logits
+    auto gate_logits = indexed_batched_linear(
+        x,
+        get_weight(batched_weights, layer_prefix + ".moe.gate.weight"),
+        get_weight(batched_weights, layer_prefix + ".moe.gate.bias"),
+        policy_indices_for_ops,
+        dummy_timers
+    );
+    if (gate_logits.scalar_type() != x.scalar_type()) gate_logits = gate_logits.to(x.scalar_type());
+
+    // Top-K
+    auto topk_result = torch::topk(gate_logits, top_k, /*dim=*/-1);
+    auto topk_indices = std::get<1>(topk_result);
+    auto gate_probs = torch::softmax(gate_logits, /*dim=*/-1);
+    auto topk_scores = torch::gather(gate_probs, /*dim=*/-1, topk_indices);
+    auto topk_weights = topk_scores / topk_scores.sum(/*dim=*/-1, /*keepdim=*/true).clamp_min(1e-6);
+
+    // Flatten + sort by expert
+    const int64_t num_tokens = batch_size * seq_len;
+    auto topk_indices_long = topk_indices.to(torch::kLong).contiguous();
+    auto flat_expert_indices = topk_indices_long.reshape({-1});
+    auto flat_routing_weights = topk_weights.reshape({-1});
+
+    auto token_indices = torch::arange(num_tokens, torch::dtype(torch::kLong).device(x.device()));
+    auto expanded_token_indices = token_indices.unsqueeze(-1).expand({num_tokens, top_k}).contiguous().reshape({-1});
+
+    auto sort_tuple = torch::sort(flat_expert_indices);
+    auto sorted_expert_indices = std::get<0>(sort_tuple);
+    auto sort_order = std::get<1>(sort_tuple);
+    auto sorted_token_indices = expanded_token_indices.index_select(0, sort_order);
+    auto sorted_routing_weights = flat_routing_weights.index_select(0, sort_order);
+
+    auto policy_indices_long = policy_indices_for_ops.to(torch::kLong);
+    auto policy_tokens = policy_indices_long.unsqueeze(1).expand({batch_size, seq_len}).reshape({-1});
+    auto flat_policy_indices = policy_tokens.index_select(0, expanded_token_indices);
+    auto sorted_policy_indices = flat_policy_indices.index_select(0, sort_order);
+
+    c10::Dict<std::string, torch::Tensor> out;
+    out.insert("gate_logits", gate_logits);
+    out.insert("topk_indices", topk_indices);
+    out.insert("topk_weights", topk_weights);
+    out.insert("sorted_expert_indices", sorted_expert_indices);
+    out.insert("sorted_token_indices", sorted_token_indices);
+    out.insert("sorted_policy_indices", sorted_policy_indices);
+    out.insert("sorted_routing_weights", sorted_routing_weights);
+    return out;
+}
+
+torch::Tensor test_moe_group_ranges(
+    const torch::Tensor& sorted_expert_indices,
+    const torch::Tensor& sorted_policy_indices
+) {
+    auto sorted_expert_cpu = sorted_expert_indices.to(torch::kCPU);
+    auto sorted_policy_cpu = sorted_policy_indices.to(torch::kCPU);
+    const auto* se = sorted_expert_cpu.data_ptr<int64_t>();
+    const auto* sp = sorted_policy_cpu.data_ptr<int64_t>();
+    const int64_t N = sorted_expert_cpu.size(0);
+
+    std::vector<int64_t> rows;
+    rows.reserve(4 * 1024);
+    int64_t cursor = 0;
+    while (cursor < N) {
+        const int64_t expert_id = se[cursor];
+        const int64_t policy_id = sp[cursor];
+        int64_t end = cursor + 1;
+        while (end < N && se[end] == expert_id && sp[end] == policy_id) {
+            ++end;
+        }
+        const int64_t count = end - cursor;
+        rows.push_back(cursor);
+        rows.push_back(count);
+        rows.push_back(expert_id);
+        rows.push_back(policy_id);
+        cursor = end;
+    }
+    auto tensor = torch::from_blob(rows.data(), {static_cast<long long>(rows.size()/4), 4}, torch::dtype(torch::kInt64)).clone();
+    return tensor;
+}
+c10::Dict<std::string, torch::Tensor>
 test_heads(
     const torch::Tensor& transformer_output,
     const c10::Dict<std::string, torch::Tensor>& batched_weights,

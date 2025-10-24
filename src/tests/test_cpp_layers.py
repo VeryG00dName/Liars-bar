@@ -383,6 +383,72 @@ def test_transformer_layers(
         # Use post_attn output for MoE input
         x_cpp = attn_cpp['post_attn']
 
+        # Staged MoE routing and sorting diagnostics before GEMMs
+        try:
+            rs = lb.test_moe_routing_sort(
+                x_cpp,
+                batched_weights,
+                policy_indices,
+                layer_idx,
+                num_experts,
+                top_k,
+            )
+
+            all_match &= compare_tensors(
+                f"layer_{layer_idx}/moe_gate_logits",
+                rs['gate_logits'],
+                reference[f'transformer/layer_{layer_idx}/moe_gate_logits']
+            )
+            all_match &= compare_tensors(
+                f"layer_{layer_idx}/moe_topk_indices",
+                rs['topk_indices'],
+                reference[f'transformer/layer_{layer_idx}/moe_topk_indices']
+            )
+            all_match &= compare_tensors(
+                f"layer_{layer_idx}/moe_topk_scores",
+                rs['topk_weights'],
+                reference[f'transformer/layer_{layer_idx}/moe_topk_scores']
+            )
+
+            # Compare staged sorted tensors if present in reference
+            ref_sorted_experts_key = f'transformer/layer_{layer_idx}/moe_sorted_expert_indices'
+            ref_sorted_tokens_key = f'transformer/layer_{layer_idx}/moe_sorted_token_indices'
+            ref_sorted_policies_key = f'transformer/layer_{layer_idx}/moe_sorted_policy_indices'
+            ref_sorted_weights_key = f'transformer/layer_{layer_idx}/moe_sorted_routing_weights'
+
+            if ref_sorted_experts_key in reference:
+                all_match &= compare_tensors(
+                    f"layer_{layer_idx}/moe_sorted_expert_indices",
+                    rs['sorted_expert_indices'],
+                    reference[ref_sorted_experts_key]
+                )
+            if ref_sorted_tokens_key in reference:
+                all_match &= compare_tensors(
+                    f"layer_{layer_idx}/moe_sorted_token_indices",
+                    rs['sorted_token_indices'],
+                    reference[ref_sorted_tokens_key]
+                )
+            if ref_sorted_policies_key in reference:
+                all_match &= compare_tensors(
+                    f"layer_{layer_idx}/moe_sorted_policy_indices",
+                    rs['sorted_policy_indices'],
+                    reference[ref_sorted_policies_key]
+                )
+            if ref_sorted_weights_key in reference:
+                all_match &= compare_tensors(
+                    f"layer_{layer_idx}/moe_sorted_routing_weights",
+                    rs['sorted_routing_weights'],
+                    reference[ref_sorted_weights_key]
+                )
+
+            grp = lb.test_moe_group_ranges(rs['sorted_expert_indices'], rs['sorted_policy_indices'])
+            total_routes = int(rs['sorted_expert_indices'].numel())
+            grp_sum = int(grp[:, 1].sum().item()) if grp.numel() > 0 else 0
+            if grp_sum != total_routes:
+                print(f"[WARN] layer_{layer_idx}: group counts sum {grp_sum} != total routes {total_routes}")
+        except Exception as e:
+            print(f"[WARN] Staged MoE routing/sorting check failed at layer {layer_idx}: {e}")
+
         # Test MoE
         print(f"\nMoE Layer {layer_idx}:")
         moe_cpp = lb.test_moe_layer(

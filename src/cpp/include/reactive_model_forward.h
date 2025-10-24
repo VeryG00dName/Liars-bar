@@ -209,6 +209,23 @@ test_moe_layer(
     int64_t hidden_dim
 );
 
+// Diagnostic helpers to split MoE pipeline
+c10::Dict<std::string, torch::Tensor>
+test_moe_routing_sort(
+    const torch::Tensor& x,
+    const c10::Dict<std::string, torch::Tensor>& batched_weights,
+    const torch::Tensor& policy_indices,
+    int64_t layer_idx,
+    int64_t num_experts,
+    int64_t top_k
+);
+
+// Build (start,count,expert,policy) groups from sorted indices
+torch::Tensor test_moe_group_ranges(
+    const torch::Tensor& sorted_expert_indices,
+    const torch::Tensor& sorted_policy_indices
+);
+
 /**
  * Test function: Compute all per-expert heads.
  *

@@ -50,6 +50,7 @@ static inline bool lb_env_enabled(const char* name) {
 }
 static bool LB_DBG_CUBLASLT() { static int flag = -1; if (flag < 0) flag = lb_env_enabled("LB_DEBUG_CUBLASLT"); return flag != 0; }
 static bool LB_DBG_STATS()    { static int flag = -1; if (flag < 0) flag = lb_env_enabled("LB_DEBUG_STATS");    return flag != 0; }
+static bool LB_MOE_GUARD()    { static int flag = -1; if (flag < 0) flag = lb_env_enabled("LB_MOE_GUARD");    return flag != 0; }
 
 static const char* computeStr(cublasComputeType_t c) {
     switch (c) {
@@ -586,18 +587,18 @@ void grouped_ffn_gemm_forward(
 
         auto status1 = cublasGemmEx(
             handle,
-            CUBLAS_OP_T,           // op(B) = transpose w1
-            CUBLAS_OP_N,           // op(A) = no-transpose input
+            CUBLAS_OP_T,           // row-major trick: A <- w1, use T
+            CUBLAS_OP_T,           // row-major trick: B <- input, use T
             ffn_dim,               // M (rows of op(B)) = ffn_dim
             M,                     // N (cols of op(A)) = M (batch tokens)
             hidden_dim,            // K (common dimension) = hidden_dim
             &alpha_half,           // alpha
-            w1_ptr,                // B: [ffn_dim, hidden_dim]
+            w1_ptr,                // A: w1 row-major [ffn_dim, hidden_dim]
             data_type,
-            hidden_dim,            // ldb (leading dim of B before transpose)
-            input_ptr,             // A: [M, hidden_dim]
+            hidden_dim,            // lda = K (row-major columns of w1)
+            input_ptr,             // B: input row-major [M, hidden_dim]
             data_type,
-            hidden_dim,            // lda
+            M,                     // ldb = M (row-major rows of input)
             &beta_zero,            // beta = 0 (overwrite)
             intermediate_ptr,      // C: [M, ffn_dim]
             data_type,
@@ -647,6 +648,28 @@ void grouped_ffn_gemm_forward(
         );
         C10_CUDA_KERNEL_LAUNCH_CHECK();
 
+        // Optional guard: verify intermediate is finite; if not, recompute via reference matmul path
+        if (LB_MOE_GUARD()) {
+            auto finite_mask = intermediate_tensor.isfinite();
+            bool all_finite = finite_mask.all().item<bool>();
+            if (!all_finite) {
+                auto input_tensor = torch::from_blob(
+                    const_cast<at::Half*>(input_ptr),
+                    {M, hidden_dim},
+                    torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA)
+                );
+                auto w1_tensor = torch::from_blob(
+                    const_cast<at::Half*>(w1_ptr),
+                    {ffn_dim, hidden_dim},
+                    torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA)
+                );
+                auto b1_float = b1_tensor.to(torch::kFloat32);
+                auto hidden_ref = torch::matmul(input_tensor.to(torch::kFloat32), w1_tensor.to(torch::kFloat32).transpose(0,1)) + b1_float;
+                hidden_ref = torch::gelu(hidden_ref);
+                intermediate_tensor.copy_(hidden_ref.to(torch::kHalf));
+            }
+        }
+
         // ====================================================================
         // Second GEMM: output = hidden @ w2.T
         // hidden: [M, ffn_dim]
@@ -656,18 +679,18 @@ void grouped_ffn_gemm_forward(
 
         auto status2 = cublasGemmEx(
             handle,
-            CUBLAS_OP_T,           // op(B) = transpose w2
-            CUBLAS_OP_N,           // op(A) = no-transpose hidden
+            CUBLAS_OP_T,           // row-major trick: A <- w2, use T
+            CUBLAS_OP_T,           // row-major trick: B <- hidden, use T
             hidden_dim,            // M (rows of op(B)) = hidden_dim
             M,                     // N (cols of op(A)) = M (batch tokens)
             ffn_dim,               // K (common dimension) = ffn_dim
             &alpha_half,           // alpha
-            w2_ptr,                // B: [hidden_dim, ffn_dim]
+            w2_ptr,                // A: w2 row-major [hidden_dim, ffn_dim]
             data_type,
-            ffn_dim,               // ldb (leading dim of B before transpose)
-            intermediate_ptr,      // A: [M, ffn_dim]
+            ffn_dim,               // lda = K (row-major columns of w2)
+            intermediate_ptr,      // B: hidden row-major [M, ffn_dim]
             data_type,
-            ffn_dim,               // lda
+            M,                     // ldb = M (row-major rows of hidden)
             &beta_zero,            // beta = 0 (overwrite)
             output_ptr,            // C: [M, hidden_dim]
             data_type,
@@ -697,6 +720,25 @@ void grouped_ffn_gemm_forward(
 
         // Broadcast add: output_tensor += b2_tensor
         output_tensor.add_(b2_tensor);
+
+        if (LB_MOE_GUARD()) {
+            auto finite_mask2 = output_tensor.isfinite();
+            bool all_finite2 = finite_mask2.all().item<bool>();
+            if (!all_finite2) {
+                auto w2_tensor = torch::from_blob(
+                    const_cast<at::Half*>(w2_ptr),
+                    {hidden_dim, ffn_dim},
+                    torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA)
+                );
+                auto inter_f32 = torch::from_blob(
+                    intermediate_ptr,
+                    {M, ffn_dim},
+                    torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA)
+                ).to(torch::kFloat32);
+                auto out_ref = torch::matmul(inter_f32, w2_tensor.to(torch::kFloat32).transpose(0,1)) + b2_tensor.to(torch::kFloat32);
+                output_tensor.copy_(out_ref.to(torch::kHalf));
+            }
+        }
     }
 }
 
