@@ -420,56 +420,147 @@ test_moe_layer(
     auto topk_weights = topk_scores / topk_scores.sum(-1, true).clamp_min(1e-6);
     result.insert("topk_scores", topk_weights);
 
-    // For now, use CPU fallback for MoE computation (can be optimized later)
-    // This matches the PyTorch implementation
-    int64_t batch_size = x.size(0);
-    int64_t seq_len = x.size(1);
-    auto y = torch::zeros_like(x);
+    // MoE expert computation
+    const int64_t batch_size = x.size(0);
+    const int64_t seq_len = x.size(1);
 
-    auto expert_w1 = get_weight(batched_weights, layer_prefix + ".moe.experts.w1");
-    auto expert_b1 = get_weight(batched_weights, layer_prefix + ".moe.experts.b1");
-    auto expert_w2 = get_weight(batched_weights, layer_prefix + ".moe.experts.w2");
-    auto expert_b2 = get_weight(batched_weights, layer_prefix + ".moe.experts.b2");
+    // Use fused MoE CUDA kernel path (grouped GEMMs)
+    auto w1_ptrs_gpu = get_weight(batched_weights, layer_prefix + ".moe.experts.w1_ptrs");
+    auto b1_ptrs_gpu = get_weight(batched_weights, layer_prefix + ".moe.experts.b1_ptrs");
+    auto w2_ptrs_gpu = get_weight(batched_weights, layer_prefix + ".moe.experts.w2_ptrs");
+    auto b2_ptrs_gpu = get_weight(batched_weights, layer_prefix + ".moe.experts.b2_ptrs");
 
-    // Keep policy_indices on the same device as expert weights for indexing
-    auto policy_indices_for_indexing = policy_indices_for_ops.to(torch::kLong).contiguous();
+    // Pointer tensors are tiny; move to CPU to read pointer values
+    auto w1_ptrs_cpu = w1_ptrs_gpu.cpu().contiguous();
+    auto b1_ptrs_cpu = b1_ptrs_gpu.cpu().contiguous();
+    auto w2_ptrs_cpu = w2_ptrs_gpu.cpu().contiguous();
+    auto b2_ptrs_cpu = b2_ptrs_gpu.cpu().contiguous();
 
-    for (int64_t expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
-        auto route_mask = (topk_indices == expert_idx).any(-1);
+    const uint64_t* w1_ptr_data = w1_ptrs_cpu.data_ptr<uint64_t>();
+    const uint64_t* b1_ptr_data = b1_ptrs_cpu.data_ptr<uint64_t>();
+    const uint64_t* w2_ptr_data = w2_ptrs_cpu.data_ptr<uint64_t>();
+    const uint64_t* b2_ptr_data = b2_ptrs_cpu.data_ptr<uint64_t>();
+    const int64_t num_policies_in_cache = w1_ptrs_cpu.size(0);
+    const int64_t num_experts_in_cache = w1_ptrs_cpu.size(1);
 
-        if (!route_mask.any().item<bool>()) {
-            continue;
+    auto orig_dtype = x.scalar_type();
+    auto x_fp16 = x.to(torch::kHalf).contiguous();
+
+    const int64_t num_tokens = batch_size * seq_len;
+    auto x_flat = x_fp16.view({num_tokens, hidden_dim});
+
+    auto topk_indices_long = topk_indices.to(torch::kLong).contiguous();
+    auto flat_expert_indices = topk_indices_long.reshape({-1});
+    auto flat_routing_weights = topk_weights.reshape({-1});
+
+    auto token_indices = torch::arange(
+        num_tokens,
+        torch::dtype(torch::kLong).device(x.device())
+    );
+    auto expanded_token_indices = token_indices.unsqueeze(-1)
+                                            .expand({num_tokens, top_k})
+                                            .contiguous()
+                                            .reshape({-1});
+
+    auto sort_tuple = torch::sort(flat_expert_indices);
+    auto sorted_expert_indices = std::get<0>(sort_tuple);
+    auto sort_order = std::get<1>(sort_tuple);
+
+    auto sorted_token_indices = expanded_token_indices.index_select(0, sort_order);
+    auto sorted_routing_weights = flat_routing_weights.index_select(0, sort_order);
+
+    auto policy_indices_long = policy_indices_for_ops.to(torch::kLong);
+    auto policy_tokens = policy_indices_long.unsqueeze(1)
+                                            .expand({batch_size, seq_len})
+                                            .reshape({-1});
+    auto flat_policy_indices = policy_tokens.index_select(0, expanded_token_indices);
+    auto sorted_policy_indices = flat_policy_indices.index_select(0, sort_order);
+
+    auto expert_inputs = x_flat.index_select(0, sorted_token_indices).contiguous();
+    auto expert_outputs = torch::zeros_like(expert_inputs);
+
+    // Build grouped dispatch metadata on CPU to drive grouped GEMM helper
+    auto sorted_expert_cpu = sorted_expert_indices.to(torch::kCPU);
+    auto sorted_policy_cpu = sorted_policy_indices.to(torch::kCPU);
+
+    const auto* sorted_expert_ptr = sorted_expert_cpu.data_ptr<int64_t>();
+    const auto* sorted_policy_ptr = sorted_policy_cpu.data_ptr<int64_t>();
+
+    std::vector<uintptr_t> input_ptrs;
+    std::vector<uintptr_t> output_ptrs;
+    std::vector<uintptr_t> w1_ptrs;
+    std::vector<uintptr_t> b1_ptrs;
+    std::vector<uintptr_t> w2_ptrs;
+    std::vector<uintptr_t> b2_ptrs;
+    std::vector<int64_t> group_m_sizes;
+
+    const int64_t total_routes = sorted_expert_indices.size(0);
+    const uintptr_t input_base = reinterpret_cast<uintptr_t>(expert_inputs.data_ptr<at::Half>());
+    const uintptr_t output_base = reinterpret_cast<uintptr_t>(expert_outputs.data_ptr<at::Half>());
+    const int64_t element_size = static_cast<int64_t>(expert_inputs.element_size());
+
+    int64_t cursor = 0;
+    while (cursor < total_routes) {
+        const int64_t expert_id = sorted_expert_ptr[cursor];
+        const int64_t policy_id = sorted_policy_ptr[cursor];
+
+        int64_t end = cursor + 1;
+        while (end < total_routes &&
+                sorted_expert_ptr[end] == expert_id &&
+                sorted_policy_ptr[end] == policy_id) {
+            ++end;
         }
 
-        auto mask_indices = torch::where(route_mask);
-        auto batch_indices = mask_indices[0];
-        auto time_indices = mask_indices[1];
+        const int64_t count = end - cursor;
+        const uintptr_t input_ptr = input_base + static_cast<uintptr_t>(cursor * hidden_dim * element_size);
+        const uintptr_t output_ptr = output_base + static_cast<uintptr_t>(cursor * hidden_dim * element_size);
 
-        auto expert_inputs = x.index({batch_indices, time_indices});
-        auto expert_mask = (topk_indices.index({batch_indices, time_indices}) == expert_idx);
-        auto rank_in_topk = torch::where(expert_mask)[1];
-        auto expert_routing_weights = topk_weights.index({batch_indices, time_indices, rank_in_topk}).unsqueeze(-1);
+        // Bounds check
+        TORCH_CHECK(policy_id >= 0 && policy_id < num_policies_in_cache,
+            "Policy index out of range: ", policy_id, " / ", num_policies_in_cache);
+        TORCH_CHECK(expert_id >= 0 && expert_id < num_experts,
+            "Expert index out of range: ", expert_id, " / ", num_experts);
 
-        auto policy_for_tokens = policy_indices_for_indexing.index({batch_indices});
+        input_ptrs.push_back(input_ptr);
+        output_ptrs.push_back(output_ptr);
 
-        // Index with batch-first layout: [batch_size, num_experts, ...]
-        auto w1 = expert_w1.index({policy_for_tokens, expert_idx});
-        auto b1 = expert_b1.index({policy_for_tokens, expert_idx});
-        auto w2 = expert_w2.index({policy_for_tokens, expert_idx});
-        auto b2 = expert_b2.index({policy_for_tokens, expert_idx});
+        const int64_t ptr_index = policy_id * num_experts_in_cache + expert_id;
+        w1_ptrs.push_back(w1_ptr_data[ptr_index]);
+        b1_ptrs.push_back(b1_ptr_data[ptr_index]);
+        w2_ptrs.push_back(w2_ptr_data[ptr_index]);
+        b2_ptrs.push_back(b2_ptr_data[ptr_index]);
 
-        auto hidden = torch::gelu(
-            torch::bmm(expert_inputs.unsqueeze(1), w1.transpose(1, 2)) + b1.unsqueeze(1)
-        );
-        auto out = torch::bmm(hidden, w2.transpose(1, 2)) + b2.unsqueeze(1);
-        auto weighted_out = out.squeeze(1) * expert_routing_weights;
-
-        y.index_put_({batch_indices, time_indices},
-                      y.index({batch_indices, time_indices}) + weighted_out);
+        group_m_sizes.push_back(count);
+        cursor = end;
     }
 
-    result.insert("moe_output", y);
+    // Expert FFN dimension from one of the original tensors (shape only)
+    const int64_t ffn_dim = get_weight(batched_weights, layer_prefix + ".moe.experts.w1").size(-2);
 
+    if (!group_m_sizes.empty()) {
+        grouped_ffn_gemm_forward(
+            input_ptrs.data(),
+            w1_ptrs.data(),
+            b1_ptrs.data(),
+            w2_ptrs.data(),
+            b2_ptrs.data(),
+            output_ptrs.data(),
+            group_m_sizes.data(),
+            static_cast<int64_t>(group_m_sizes.size()),
+            hidden_dim,
+            ffn_dim
+        );
+    }
+
+    auto sorted_weights_half = sorted_routing_weights.to(expert_outputs.dtype()).unsqueeze(-1);
+    auto weighted_outputs = expert_outputs * sorted_weights_half;
+
+    auto moe_output_flat = torch::zeros({num_tokens, hidden_dim}, expert_outputs.options());
+    moe_output_flat.index_add_(0, sorted_token_indices, weighted_outputs);
+    auto moe_output_half = moe_output_flat.view({batch_size, seq_len, hidden_dim});
+
+    auto moe_output = moe_output_half.to(orig_dtype);
+    result.insert("moe_output", moe_output);
     return result;
 }
 
@@ -722,21 +813,7 @@ forward_packed_cpp(
     int64_t obs_dim = obs_sequence.size(2);
     int64_t action_seq_len = action_sequence.size(1);
 
-    // DEBUG: Check policy indices distribution
-    static int call_count = 0;
-    if (call_count++ < 3) {  // Only print first 3 calls
-        auto unique_policies = std::get<0>(torch::_unique(policy_indices_cpu));
-        fprintf(stderr, "[DEBUG forward_packed_cpp call %d] batch_size=%ld, num_unique_policies=%ld\n",
-                call_count, batch_size, unique_policies.size(0));
-        if (unique_policies.size(0) <= 20 && unique_policies.size(0) > 0) {
-            fprintf(stderr, "[DEBUG] Unique policy indices: ");
-            auto ptr = unique_policies.data_ptr<int64_t>();
-            for (int64_t i = 0; i < std::min<int64_t>(unique_policies.size(0), 20); ++i) {
-                fprintf(stderr, "%ld ", ptr[i]);
-            }
-            fprintf(stderr, "\n");
-        }
-    }
+    // Silent by default: remove noisy debug prints
 
     // Validate all sequences have matching batch and sequence dimensions
     // CRITICAL: This must happen BEFORE any tensor operations that assume matching shapes
@@ -1091,15 +1168,9 @@ forward_packed_cpp(
             const int64_t num_tokens = batch_size * seq_len;
             auto x_flat = x_fp16.view({num_tokens, hidden_dim});
 
-            std::cout << "[EARLY DEBUG] Starting MoE routing. num_tokens=" << num_tokens
-                      << ", top_k=" << top_k << ", topk_indices.sizes()=" << topk_indices.sizes() << std::endl;
-
             auto topk_indices_long = topk_indices.to(torch::kLong).contiguous();
             auto flat_expert_indices = topk_indices_long.reshape({-1});
             auto flat_routing_weights = topk_weights.reshape({-1});
-
-            std::cout << "[EARLY DEBUG] After reshape: flat_expert_indices.size=" << flat_expert_indices.size(0)
-                      << ", flat_routing_weights.size=" << flat_routing_weights.size(0) << std::endl;
 
             auto token_indices = torch::arange(
                 num_tokens,
@@ -1109,8 +1180,6 @@ forward_packed_cpp(
                                                   .expand({num_tokens, top_k})
                                                   .contiguous()
                                                   .reshape({-1});
-
-            std::cout << "[EARLY DEBUG] After expand: expanded_token_indices.size=" << expanded_token_indices.size(0) << std::endl;
 
             auto sort_tuple = torch::sort(flat_expert_indices);
             auto sorted_expert_indices = std::get<0>(sort_tuple);
@@ -1128,17 +1197,6 @@ forward_packed_cpp(
 
             auto expert_inputs = x_flat.index_select(0, sorted_token_indices).contiguous();
             auto expert_outputs = torch::zeros_like(expert_inputs);
-
-            // DEBUG: Check buffer sizes
-            const int64_t expected_routes = num_tokens * top_k;
-            std::cout << "[CRITICAL MoE] num_tokens=" << num_tokens << ", top_k=" << top_k
-                      << ", expected_routes=" << expected_routes << std::endl;
-            std::cout << "[CRITICAL MoE] sorted_token_indices.size=" << sorted_token_indices.size(0)
-                      << ", expert_inputs.size=" << expert_inputs.sizes()
-                      << ", expert_outputs.size=" << expert_outputs.sizes() << std::endl;
-            std::cout << "[CRITICAL MoE] expert_outputs buffer: "
-                      << (expert_outputs.numel() * expert_outputs.element_size()) << " bytes allocated, "
-                      << (expected_routes * hidden_dim * 2) << " bytes needed" << std::endl;
 
             // Build grouped dispatch metadata on CPU to drive the grouped GEMM helper
             auto sorted_expert_cpu = sorted_expert_indices.to(torch::kCPU);

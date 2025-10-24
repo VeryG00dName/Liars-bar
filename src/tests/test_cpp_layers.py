@@ -79,11 +79,19 @@ def prepare_batched_weights(
     print(f"Pre-stacking MoE expert weights ({num_layers} layers, {num_experts} experts)...")
     state_dict_stacked = lb.prestack_moe_expert_weights(state_dict, num_layers, num_experts)
 
-    batched = {}
+    batched: Dict[str, torch.Tensor] = {}
 
     for key, value in state_dict_stacked.items():
-        # Add batch dimension [1, ...]
-        batched[key] = value.unsqueeze(0).to(device)
+        # Add batch dimension [1, ...] and move to device
+        t = value.unsqueeze(0).to(device)
+        batched[key] = t
+
+    # If using CUDA, convert floating-point weights to FP16 before creating
+    # MoE pointer tensors so that GPU kernels (which expect Half) match dtype.
+    if device.startswith('cuda'):
+        for key, tensor in list(batched.items()):
+            if tensor.is_floating_point():
+                batched[key] = tensor.to(torch.float16).contiguous()
 
     # Create MoE weight pointers (must be done after moving to device)
     print("Creating MoE weight pointers...")
