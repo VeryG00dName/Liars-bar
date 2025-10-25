@@ -8,7 +8,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 os.environ.setdefault("MPLBACKEND", "Agg")
 import numpy as np
@@ -587,7 +587,11 @@ class RichProgressScoreboard:
         self.live.__enter__()
         self._last_snapshot: Optional[Tuple] = None
 
-    def _generate_scoreboard_table(self, differences: Optional[Dict[int, Dict[str, Any]]] = None) -> Table:
+    def _generate_scoreboard_table(
+        self,
+        differences: Optional[Dict[int, Dict[str, Any]]] = None,
+        ordered_players: Optional[List[Tuple[int, Dict[str, Any]]]] = None,
+    ) -> Table:
         table = Table(title="Live Scoreboard", show_header=True, header_style="bold magenta")
         table.add_column("Rank", style="dim")
         table.add_column("Player", min_width=8)
@@ -598,7 +602,7 @@ class RichProgressScoreboard:
         table.add_column("Round Win Rate", justify="right")
         table.add_column("Δ Rank", justify="right")
 
-        sorted_players = sorted(
+        sorted_players = ordered_players or sorted(
             self.players.items(), key=lambda item: item[1].get("conservative", 0.0), reverse=True
         )
         for rank, (pid, data) in enumerate(sorted_players, start=1):
@@ -642,21 +646,23 @@ class RichProgressScoreboard:
             )
         return table
 
+
     def _generate_layout(self, differences: Optional[Dict[int, Dict[str, Any]]] = None) -> Layout:
         # Kept for backward compatibility; not used after refactor
         return self.layout
 
     def _scoreboard_state_key(
-        self, differences: Optional[Dict[int, Dict[str, Any]]] = None
+        self,
+        differences: Optional[Dict[int, Dict[str, Any]]] = None,
+        ordered_players: Optional[List[Tuple[int, Dict[str, Any]]]] = None,
     ) -> Tuple:
-        ordered = sorted(
+        ordered = ordered_players or sorted(
             self.players.items(), key=lambda item: item[1].get("conservative", 0.0), reverse=True
         )
         diff_key: List[Tuple[int, Optional[int]]] = []
         if differences:
-            for pid in self.players.keys():
-                entry = differences.get(pid)
-                rank_change = entry.get("rank_change") if entry else None
+            for pid, payload in differences.items():
+                rank_change = payload.get("rank_change")
                 if isinstance(rank_change, (int, type(None))):
                     diff_key.append((pid, rank_change))
         state: List[Tuple] = []
@@ -675,12 +681,14 @@ class RichProgressScoreboard:
             )
         return (tuple(state), tuple(sorted(diff_key)))
 
+
     def update(
         self,
         increment: int = 1,
         differences: Optional[Dict[int, Dict[str, Any]]] = None,
         description: str | None = None,
         games_per_sec: float | None = None,
+        ordered_players: Optional[List[Tuple[int, Dict[str, Any]]]] = None,
     ) -> None:
         if games_per_sec is not None:
             self.games_per_sec = games_per_sec
@@ -695,13 +703,17 @@ class RichProgressScoreboard:
             description=description or "Evaluating...",
             games_per_sec=f"{self.games_per_sec:.2f} games/sec",
         )
+        ordered_players = ordered_players or sorted(
+            self.players.items(), key=lambda item: item[1].get("conservative", 0.0), reverse=True
+        )
         # Update scoreboard only if any visible value changed
-        new_key = self._scoreboard_state_key(differences)
+        new_key = self._scoreboard_state_key(differences, ordered_players)
         if self._last_snapshot != new_key:
             self._last_snapshot = new_key
-            self.score_layout.update(self._generate_scoreboard_table(differences))
+            self.score_layout.update(self._generate_scoreboard_table(differences, ordered_players))
         # Explicit refresh to draw current frame
         self.live.refresh()
+
 
     def close(self) -> None:
         self.live.__exit__(None, None, None)
@@ -741,28 +753,36 @@ def _compute_ranks(scoreboard: Dict[str, Dict[str, Any]]) -> Dict[str, int]:
     return ranks
 
 
+def compute_scoreboard_ranks(scoreboard: Dict[str, Dict[str, Any]]) -> Dict[str, int]:
+    return _compute_ranks(scoreboard)
+
+
 def compare_scoreboards(
     old_scoreboard: Dict[str, Dict[str, Any]],
     current_players: Dict[int, Dict[str, Any]],
-) -> Dict[int, Dict[str, Any]]:
-    new_scoreboard = {
-        meta["player_id"]: {"conservative": meta.get("conservative", 0.0)}
-        for meta in current_players.values()
-    }
-    old_ranks = _compute_ranks(old_scoreboard)
-    new_ranks = _compute_ranks(new_scoreboard)
+    *,
+    old_ranks: Optional[Dict[str, int]] = None,
+    return_sorted: bool = False,
+) -> Union[
+    Dict[int, Dict[str, Any]],
+    Tuple[Dict[int, Dict[str, Any]], List[Tuple[int, Dict[str, Any]]]],
+]:
+    cached_old_ranks = old_ranks or _compute_ranks(old_scoreboard)
+    ordered_players = sorted(
+        current_players.items(), key=lambda item: item[1].get("conservative", 0.0), reverse=True
+    )
 
     differences: Dict[int, Dict[str, Any]] = {}
-    for pid, meta in current_players.items():
-        player_id = meta["player_id"]
-        old_rank = old_ranks.get(player_id)
-        new_rank = new_ranks.get(player_id)
-        if new_rank is None:
-            continue
-        if old_rank is None:
+    for rank, (pid, meta) in enumerate(ordered_players, start=1):
+        player_id = meta.get("player_id", str(pid))
+        previous_rank = cached_old_ranks.get(player_id)
+        if previous_rank is None:
             differences[pid] = {"rank_change": None}
         else:
-            differences[pid] = {"rank_change": old_rank - new_rank}
+            differences[pid] = {"rank_change": previous_rank - rank}
+
+    if return_sorted:
+        return differences, ordered_players
     return differences
 
 
@@ -890,6 +910,7 @@ __all__ = [
     "RichProgressScoreboard",
     "load_scoreboard",
     "save_scoreboard",
+    "compute_scoreboard_ranks",
     "compare_scoreboards",
     "rich_print_scoreboard",
     "rich_print_expert_activations",

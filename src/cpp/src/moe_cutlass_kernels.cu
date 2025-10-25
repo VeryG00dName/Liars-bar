@@ -109,18 +109,15 @@ constexpr int Stages = 4;
 // W1 GEMM: Epilogue with Bias + GELU
 // ============================================================================
 
-// W1 Epilogue: D = GELU_taylor(alpha * AB + beta * C)
-// Use tanh-based GELU to match original implementation
+// W1 Epilogue: D = GELU(alpha * AB + beta * C)
+// Use erf-based GELU (CUTLASS default)
 // We set alpha=1, beta=1, and pass bias as C with stride to broadcast per-column
-using EpilogueOpW1 = cutlass::epilogue::thread::LinearCombinationGeneric<
-    cutlass::epilogue::thread::GELU_taylor,  // Tanh-based GELU (matches original)
+using EpilogueOpW1 = cutlass::epilogue::thread::LinearCombinationGELU<
     ElementOutput,
     128 / cutlass::sizeof_bits<ElementOutput>::value,  // Elements per vector access
     ElementAccumulator,
     ElementCompute,
-    cutlass::epilogue::thread::ScaleType::Default,  // Use both alpha and beta
-    cutlass::FloatRoundStyle::round_to_nearest,
-    true  // Enable activation
+    cutlass::epilogue::thread::ScaleType::Default  // Use both alpha and beta
 >;
 
 // W1 Grouped GEMM Kernel
