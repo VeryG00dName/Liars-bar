@@ -176,7 +176,7 @@ private:
 }  // namespace
 
 EvalManager::EvalManager()
-    : max_env_batch_(1024), inference_batch_size_(128), rng_(seed_with_optional(0)) {
+    : max_env_batch_(2048), inference_batch_size_(128), rng_(seed_with_optional(0)) {
     if (!torch::cuda::is_available()) {
         throw std::runtime_error(
             "CUDA is not available, but the EvalManager requires it for TorchScript inference.");
@@ -774,7 +774,7 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
     }
 
     // Define BATCH SIZE buckets
-    constexpr std::array<size_t, 8> kBatchSizeBuckets{{8, 16, 32, 64, 128, 256, 512, 1024}};
+    constexpr std::array<size_t, 10> kBatchSizeBuckets{{8, 16, 32, 64, 128, 256, 512, 1024, 1536, 2048}};
     const size_t max_batch_bucket_size = kBatchSizeBuckets.back();
 
     // 3. Process requests in chunks, all using the same target_pad_len
