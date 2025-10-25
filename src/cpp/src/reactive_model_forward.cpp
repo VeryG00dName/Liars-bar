@@ -547,6 +547,22 @@ test_moe_layer(
     // Expert FFN dimension from one of the original tensors (shape only)
     const int64_t ffn_dim = get_weight(batched_weights, layer_prefix + ".moe.experts.w1").size(-2);
 
+    // Build routing weight pointers for each group
+    // Routing weights are applied per-row in the CUTLASS GEMM epilogue
+    std::vector<uintptr_t> routing_weight_ptrs;
+    routing_weight_ptrs.reserve(group_m_sizes.size());
+
+    // Convert routing weights to float for the kernel
+    auto sorted_routing_weights_f32 = sorted_routing_weights.to(torch::kFloat32).contiguous();
+    const float* routing_base = sorted_routing_weights_f32.data_ptr<float>();
+
+    cursor = 0;
+    for (size_t i = 0; i < group_m_sizes.size(); ++i) {
+        const uintptr_t routing_ptr = reinterpret_cast<uintptr_t>(routing_base + cursor);
+        routing_weight_ptrs.push_back(routing_ptr);
+        cursor += group_m_sizes[i];
+    }
+
     if (!group_m_sizes.empty()) {
         grouped_ffn_gemm_forward(
             input_ptrs.data(),
@@ -555,6 +571,7 @@ test_moe_layer(
             w2_ptrs.data(),
             b2_ptrs.data(),
             output_ptrs.data(),
+            routing_weight_ptrs.data(),
             group_m_sizes.data(),
             group_policy_ids.data(),
             group_expert_ids.data(),
@@ -565,11 +582,10 @@ test_moe_layer(
         );
     }
 
-    auto sorted_weights_half = sorted_routing_weights.to(expert_outputs.dtype()).unsqueeze(-1);
-    auto weighted_outputs = expert_outputs * sorted_weights_half;
-
+    // Routing weights already applied in CUTLASS epilogue - no separate scaling needed!
+    // Just scatter-add the expert outputs back to token positions
     auto moe_output_flat = torch::zeros({num_tokens, hidden_dim}, expert_outputs.options());
-    moe_output_flat.index_add_(0, sorted_token_indices, weighted_outputs);
+    moe_output_flat.index_add_(0, sorted_token_indices, expert_outputs);
     auto moe_output_half = moe_output_flat.view({batch_size, seq_len, hidden_dim});
 
     auto moe_output = moe_output_half.to(orig_dtype);
@@ -1271,6 +1287,20 @@ forward_packed(
             // Expert FFN dimension from one of the original tensors (shape only)
             const int64_t ffn_dim = get_weight(batched_weights, layer_prefix + ".moe.experts.w1").size(-2);
 
+            // Build routing weight pointers for each group
+            std::vector<uintptr_t> routing_weight_ptrs;
+            routing_weight_ptrs.reserve(group_m_sizes.size());
+
+            auto sorted_routing_weights_f32 = sorted_routing_weights.to(torch::kFloat32).contiguous();
+            const float* routing_base = sorted_routing_weights_f32.data_ptr<float>();
+
+            cursor = 0;
+            for (size_t i = 0; i < group_m_sizes.size(); ++i) {
+                const uintptr_t routing_ptr = reinterpret_cast<uintptr_t>(routing_base + cursor);
+                routing_weight_ptrs.push_back(routing_ptr);
+                cursor += group_m_sizes[i];
+            }
+
             if (!group_m_sizes.empty()) {
                 grouped_ffn_gemm_forward(
                     input_ptrs.data(),
@@ -1279,6 +1309,7 @@ forward_packed(
                     w2_ptrs.data(),
                     b2_ptrs.data(),
                     output_ptrs.data(),
+                    routing_weight_ptrs.data(),
                     group_m_sizes.data(),
                     group_policy_ids.data(),
                     group_expert_ids.data(),
@@ -1289,11 +1320,9 @@ forward_packed(
                 );
             }
 
-            auto sorted_weights_half = sorted_routing_weights.to(expert_outputs.dtype()).unsqueeze(-1);
-            auto weighted_outputs = expert_outputs * sorted_weights_half;
-
+            // Routing weights already applied in CUTLASS epilogue
             auto moe_output_flat = torch::zeros({num_tokens, hidden_dim}, expert_outputs.options());
-            moe_output_flat.index_add_(0, sorted_token_indices, weighted_outputs);
+            moe_output_flat.index_add_(0, sorted_token_indices, expert_outputs);
             auto moe_output_half = moe_output_flat.view({batch_size, seq_len, hidden_dim});
 
             moe_output = moe_output_half.to(orig_dtype);

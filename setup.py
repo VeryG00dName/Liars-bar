@@ -23,7 +23,7 @@ SOURCES = sorted(
 )
 
 # Toggle with: PROFILE=1 python setup.py build_ext -i
-PROFILE = 1
+PROFILE = 0
 
 def linux_macos_flags(profile: bool):
     if profile:
