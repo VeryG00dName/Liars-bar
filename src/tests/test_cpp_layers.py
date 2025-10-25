@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import pickle
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 import numpy as np
@@ -24,14 +24,19 @@ def load_reference(path: Path) -> Dict[str, torch.Tensor]:
         return pickle.load(f)
 
 
-def load_checkpoint_weights(checkpoint_path: Path, agent_key: str = 'self') -> Dict[str, torch.Tensor]:
+def load_checkpoint_weights(checkpoint_path: Path) -> Dict[str, torch.Tensor]:
     """Load model weights from checkpoint."""
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
 
-    if 'policy_nets' in checkpoint and agent_key in checkpoint['policy_nets']:
-        return checkpoint['policy_nets'][agent_key]
-    elif 'model_state_dict' in checkpoint:
+    if 'model_state_dict' in checkpoint:
         return checkpoint['model_state_dict']
+    elif 'policy_nets' in checkpoint:
+        # Legacy format: try 'self' key
+        if 'self' in checkpoint['policy_nets']:
+            return checkpoint['policy_nets']['self']
+        # Otherwise return first policy
+        first_key = next(iter(checkpoint['policy_nets']))
+        return checkpoint['policy_nets'][first_key]
     else:
         raise ValueError(f"Could not find model state dict in checkpoint (keys: {list(checkpoint.keys())})")
 
@@ -119,6 +124,7 @@ def compare_tensors(
 ) -> bool:
     """
     Compare two tensors and report statistics.
+    Only prints output if there's a failure.
 
     Returns:
         True if tensors match within tolerance, False otherwise
@@ -129,43 +135,25 @@ def compare_tensors(
 
     # Check shapes
     if cpp_np.shape != pytorch_np.shape:
-        print(f"[FAIL] {name}: Shape mismatch! C++: {cpp_np.shape}, PyTorch: {pytorch_np.shape}")
+        print(f"{name}: SHAPE MISMATCH C++={cpp_np.shape} vs PyTorch={pytorch_np.shape}")
         return False
 
     # Compute errors
     abs_diff = np.abs(cpp_np - pytorch_np)
-    rel_diff = abs_diff / (np.abs(pytorch_np) + 1e-8)
 
     max_abs_error = np.max(abs_diff)
     mean_abs_error = np.mean(abs_diff)
-    max_rel_error = np.max(rel_diff)
-    mean_rel_error = np.mean(rel_diff)
 
     # Check if within tolerance
     matches = np.allclose(cpp_np, pytorch_np, rtol=rtol, atol=atol)
 
-    status = "PASS" if matches else "FAIL"
-    print(f"[{status}] {name}:")
-    print(f"  Shape: {cpp_np.shape}")
-    print(f"  Max abs error: {max_abs_error:.6e}")
-    print(f"  Mean abs error: {mean_abs_error:.6e}")
-    print(f"  Max rel error: {max_rel_error:.6e}")
-    print(f"  Mean rel error: {mean_rel_error:.6e}")
-
+    # Only print if failed
     if not matches:
-        # Print some mismatched values
         mismatch_mask = abs_diff > (atol + rtol * np.abs(pytorch_np))
         mismatch_indices = np.where(mismatch_mask)
         num_mismatches = len(mismatch_indices[0])
-        print(f"  Number of mismatches: {num_mismatches} / {cpp_np.size} ({100 * num_mismatches / cpp_np.size:.2f}%)")
-
-        if num_mismatches > 0:
-            # Show first few mismatches
-            num_show = min(5, num_mismatches)
-            print(f"  First {num_show} mismatches:")
-            for i in range(num_show):
-                idx = tuple(ind[i] for ind in mismatch_indices)
-                print(f"    [{idx}] C++: {cpp_np[idx]:.6f}, PyTorch: {pytorch_np[idx]:.6f}, Diff: {abs_diff[idx]:.6e}")
+        mismatch_pct = 100 * num_mismatches / cpp_np.size
+        print(f"{name}: {mismatch_pct:.2f}% mismatch, max_err={max_abs_error:.2e}, mean_err={mean_abs_error:.2e}")
 
     return matches
 
@@ -174,11 +162,8 @@ def test_action_decomposition(
     reference: Dict[str, torch.Tensor],
     batched_weights: Dict[str, torch.Tensor],
     device: str = 'cpu'
-) -> bool:
-    """Test action decomposition layer."""
-    print("\n" + "=" * 80)
-    print("Testing Action Decomposition")
-    print("=" * 80)
+) -> Tuple[bool, Dict[str, torch.Tensor]]:
+    """Test action decomposition layer. Returns (all_match, outputs_dict)."""
 
     # Get inputs from reference
     action_sequence = reference['input/action_sequence'].to(device)
@@ -206,24 +191,32 @@ def test_action_decomposition(
     all_match &= compare_tensors("count_ids", count_ids_cpp, reference['decompose/count_ids'])
     all_match &= compare_tensors("table_flag_ids", table_flag_ids_cpp, reference['decompose/table_flag_ids'])
 
-    return all_match
+    outputs = {
+        'act_kind_ids': act_kind_ids_cpp,
+        'count_ids': count_ids_cpp,
+        'table_flag_ids': table_flag_ids_cpp,
+    }
+    return all_match, outputs
 
 
 def test_embeddings(
     reference: Dict[str, torch.Tensor],
     batched_weights: Dict[str, torch.Tensor],
-    device: str = 'cpu'
-) -> bool:
-    """Test embedding layer."""
-    print("\n" + "=" * 80)
-    print("Testing Embeddings")
-    print("=" * 80)
+    device: str = 'cpu',
+    act_kind_ids_override: Optional[torch.Tensor] = None,
+    count_ids_override: Optional[torch.Tensor] = None,
+    table_flag_ids_override: Optional[torch.Tensor] = None,
+) -> Tuple[bool, Dict[str, torch.Tensor]]:
+    """Test embedding layer. Returns (all_match, embeddings_cpp_dict)."""
 
     # Get inputs
     obs_sequence = reference['input/obs_sequence'].to(device)
-    act_kind_ids = reference['decompose/act_kind_ids'].to(device)
-    count_ids = reference['decompose/count_ids'].to(device)
-    table_flag_ids = reference['decompose/table_flag_ids'].to(device)
+    act_kind_ids = (act_kind_ids_override if act_kind_ids_override is not None
+                    else reference['decompose/act_kind_ids']).to(device)
+    count_ids = (count_ids_override if count_ids_override is not None
+                 else reference['decompose/count_ids']).to(device)
+    table_flag_ids = (table_flag_ids_override if table_flag_ids_override is not None
+                      else reference['decompose/table_flag_ids']).to(device)
     agent_types = reference['input/agent_types'].to(device)
     positions = reference['input/positions'].to(device)
 
@@ -253,27 +246,32 @@ def test_embeddings(
                 'action_embed', 'agent_embed', 'position_embed']:
         all_match &= compare_tensors(key, embeddings_cpp[key], reference[f'embeddings/{key}'])
 
-    return all_match
+    return all_match, embeddings_cpp
 
 
 def test_gating(
     reference: Dict[str, torch.Tensor],
     batched_weights: Dict[str, torch.Tensor],
-    device: str = 'cpu'
-) -> bool:
-    """Test gating layer."""
-    print("\n" + "=" * 80)
-    print("Testing Gating")
-    print("=" * 80)
+    device: str = 'cpu',
+    obs_embed_override: Optional[torch.Tensor] = None,
+    action_embed_override: Optional[torch.Tensor] = None,
+    agent_embed_override: Optional[torch.Tensor] = None,
+    position_embed_override: Optional[torch.Tensor] = None,
+) -> Tuple[bool, Dict[str, torch.Tensor]]:
+    """Test gating layer. Returns (all_match, gating_cpp_dict)."""
 
     # Get inputs from embeddings
-    obs_embed = reference['embeddings/obs_embed'].to(device)
-    action_embed = reference['embeddings/action_embed'].to(device)
-    agent_embed = reference['embeddings/agent_embed'].to(device)
-    position_embed = reference['embeddings/position_embed'].to(device)
+    obs_embed = (obs_embed_override if obs_embed_override is not None
+                 else reference['embeddings/obs_embed']).to(device)
+    action_embed = (action_embed_override if action_embed_override is not None
+                    else reference['embeddings/action_embed']).to(device)
+    agent_embed = (agent_embed_override if agent_embed_override is not None
+                   else reference['embeddings/agent_embed']).to(device)
+    position_embed = (position_embed_override if position_embed_override is not None
+                      else reference['embeddings/position_embed']).to(device)
 
     batch_size = obs_embed.size(0)
-    policy_indices = torch.zeros(batch_size, dtype=torch.long, device=device)
+    policy_indices = reference.get('input/policy_indices', torch.zeros(batch_size, dtype=torch.long)).to(device)
 
     # Call C++ function
     gating_cpp = lb.test_gating(
@@ -290,28 +288,34 @@ def test_gating(
     for key in ['g_obs', 'g_action', 'g_agent', 'g_position']:
         all_match &= compare_tensors(key, gating_cpp[key], reference[f'gating/{key}'])
 
-    return all_match
+    return all_match, gating_cpp
 
 
 def test_fusion(
     reference: Dict[str, torch.Tensor],
     device: str = 'cpu',
-    hidden_dim: int = 256
-) -> bool:
-    """Test fusion layer."""
-    print("\n" + "=" * 80)
-    print("Testing Fusion")
-    print("=" * 80)
+    hidden_dim: int = 256,
+    g_obs_override: Optional[torch.Tensor] = None,
+    g_action_override: Optional[torch.Tensor] = None,
+    g_agent_override: Optional[torch.Tensor] = None,
+    g_position_override: Optional[torch.Tensor] = None,
+    obs_embed_override: Optional[torch.Tensor] = None,
+    action_embed_override: Optional[torch.Tensor] = None,
+    agent_embed_override: Optional[torch.Tensor] = None,
+    position_embed_override: Optional[torch.Tensor] = None,
+) -> tuple[bool, dict]:
+    """Test fusion layer. Returns (all_match, fusion_outputs_dict)."""
 
-    # Get inputs
-    g_obs = reference['gating/g_obs'].to(device)
-    g_action = reference['gating/g_action'].to(device)
-    g_agent = reference['gating/g_agent'].to(device)
-    g_position = reference['gating/g_position'].to(device)
-    obs_embed = reference['embeddings/obs_embed'].to(device)
-    action_embed = reference['embeddings/action_embed'].to(device)
-    agent_embed = reference['embeddings/agent_embed'].to(device)
-    position_embed = reference['embeddings/position_embed'].to(device)
+    # Get inputs (override if provided)
+    g_obs = (g_obs_override if g_obs_override is not None else reference['gating/g_obs']).to(device)
+    g_action = (g_action_override if g_action_override is not None else reference['gating/g_action']).to(device)
+    g_agent = (g_agent_override if g_agent_override is not None else reference['gating/g_agent']).to(device)
+    g_position = (g_position_override if g_position_override is not None else reference['gating/g_position']).to(device)
+
+    obs_embed = (obs_embed_override if obs_embed_override is not None else reference['embeddings/obs_embed']).to(device)
+    action_embed = (action_embed_override if action_embed_override is not None else reference['embeddings/action_embed']).to(device)
+    agent_embed = (agent_embed_override if agent_embed_override is not None else reference['embeddings/agent_embed']).to(device)
+    position_embed = (position_embed_override if position_embed_override is not None else reference['embeddings/position_embed']).to(device)
 
     # Call C++ function
     fusion_cpp = lb.test_fusion(
@@ -325,7 +329,7 @@ def test_fusion(
     all_match &= compare_tensors("fused_raw", fusion_cpp['fused_raw'], reference['fusion/fused_raw'])
     all_match &= compare_tensors("combined", fusion_cpp['combined'], reference['fusion/combined'])
 
-    return all_match
+    return all_match, fusion_cpp
 
 
 def test_transformer_layers(
@@ -336,17 +340,18 @@ def test_transformer_layers(
     num_experts: int = 8,
     top_k: int = 2,
     hidden_dim: int = 256,
-    device: str = 'cpu'
-) -> bool:
-    """Test all transformer layers (attention + MoE)."""
-    print("\n" + "=" * 80)
-    print("Testing Transformer Layers")
-    print("=" * 80)
+    device: str = 'cpu',
+    fusion_combined: torch.Tensor = None
+) -> tuple[bool, torch.Tensor]:
+    """Test all transformer layers (attention + MoE). Returns (all_match, final_output)."""
 
     all_match = True
 
-    # Start with fusion output
-    x_cpp = reference['fusion/combined'].to(device)
+    # Start with fusion output (either passed in or from reference)
+    if fusion_combined is not None:
+        x_cpp = fusion_combined.to(device)
+    else:
+        x_cpp = reference['fusion/combined'].to(device)
 
     batch_size = x_cpp.size(0)
     policy_indices = reference.get('input/policy_indices', torch.zeros(batch_size, dtype=torch.long)).to(device)
@@ -506,22 +511,23 @@ def test_transformer_layers(
     # For now, just verify we can proceed to heads
     print("\nFinal transformer output ready for heads")
 
-    return all_match
+    return all_match, x_cpp
 
 
 def test_heads(
     reference: Dict[str, torch.Tensor],
     batched_weights: Dict[str, torch.Tensor],
     num_experts: int = 8,
-    device: str = 'cpu'
+    device: str = 'cpu',
+    transformer_output: torch.Tensor = None
 ) -> bool:
     """Test head layers."""
-    print("\n" + "=" * 80)
-    print("Testing Heads")
-    print("=" * 80)
 
-    # Get transformer output
-    transformer_output = reference['transformer/final_output'].to(device)
+    # Get transformer output (either passed in or from reference)
+    if transformer_output is not None:
+        transformer_output = transformer_output.to(device)
+    else:
+        transformer_output = reference['transformer/final_output'].to(device)
 
     batch_size = transformer_output.size(0)
     policy_indices = reference.get('input/policy_indices', torch.zeros(batch_size, dtype=torch.long)).to(device)
@@ -549,32 +555,21 @@ def main():
     parser.add_argument('reference', type=str, help='Path to reference outputs pickle file')
     parser.add_argument('checkpoint', type=str, help='Path to checkpoint')
     parser.add_argument('--checkpoint2', type=str, default=None, help='Optional second checkpoint for multi-policy test')
-    parser.add_argument('--agent-key', type=str, default='self', help='Agent key in checkpoint')
-    parser.add_argument('--agent-key2', type=str, default='self', help='Agent key in second checkpoint')
-    parser.add_argument('--device', type=str, default='cpu', help='Device to use (cpu or cuda)')
+    parser.add_argument('--device', type=str, default='cuda', help='Device to use (cpu or cuda)')
+    parser.add_argument('--chain-outputs', action='store_true',
+                        help='Chain outputs through layers instead of using reference inputs for each layer (shows end-to-end error accumulation)')
 
     args = parser.parse_args()
 
-    print("=" * 80)
-    print("C++ Layer Testing Framework")
-    print("=" * 80)
-    print(f"Reference: {args.reference}")
-    print(f"Checkpoint: {args.checkpoint}")
-    print(f"second Checkpoint: {args.checkpoint2}")
-    print(f"Device: {args.device}")
-    print()
-
     # Load reference outputs
-    print("Loading reference outputs...")
     reference = load_reference(Path(args.reference))
-    print(f"Loaded {len(reference)} tensors")
 
     # Load checkpoint weights
     print("Loading checkpoint weights...")
-    state_dict = load_checkpoint_weights(Path(args.checkpoint), args.agent_key)
+    state_dict = load_checkpoint_weights(Path(args.checkpoint))
     state_dict2 = None
     if args.checkpoint2:
-        state_dict2 = load_checkpoint_weights(Path(args.checkpoint2), args.agent_key2)
+        state_dict2 = load_checkpoint_weights(Path(args.checkpoint2))
         print(f"Loaded A: {len(state_dict)} tensors; B: {len(state_dict2)} tensors")
     else:
         print(f"Loaded {len(state_dict)} weight tensors")
@@ -619,30 +614,70 @@ def main():
     # Run tests
     results = {}
 
-    results['action_decomposition'] = test_action_decomposition(reference, batched_weights, args.device)
-    results['embeddings'] = test_embeddings(reference, batched_weights, args.device)
-    results['gating'] = test_gating(reference, batched_weights, args.device)
-    results['fusion'] = test_fusion(reference, args.device)
-    results['transformer'] = test_transformer_layers(reference, batched_weights, device=args.device)
-    results['heads'] = test_heads(reference, batched_weights, device=args.device)
+    # Always run action decomposition first (needed either way)
+    ad_pass, ad_outputs = test_action_decomposition(reference, batched_weights, args.device)
+    results['action_decomposition'] = ad_pass
 
-    # Summary
-    print("\n" + "=" * 80)
-    print("SUMMARY")
-    print("=" * 80)
+    if args.chain_outputs:
+        # Use C++ outputs to chain through embeddings -> gating -> fusion -> transformer -> heads
+        emb_pass, emb_outputs = test_embeddings(
+            reference, batched_weights, args.device,
+            act_kind_ids_override=ad_outputs['act_kind_ids'],
+            count_ids_override=ad_outputs['count_ids'],
+            table_flag_ids_override=ad_outputs['table_flag_ids'],
+        )
+        results['embeddings'] = emb_pass
 
-    for test_name, passed in results.items():
-        status = "PASS" if passed else "FAIL"
-        print(f"{test_name:30s}: {status}")
+        gating_pass, gating_outputs = test_gating(
+            reference, batched_weights, args.device,
+            obs_embed_override=emb_outputs['obs_embed'],
+            action_embed_override=emb_outputs['action_embed'],
+            agent_embed_override=emb_outputs['agent_embed'],
+            position_embed_override=emb_outputs['position_embed'],
+        )
+        results['gating'] = gating_pass
 
-    all_passed = all(results.values())
-    print()
-    if all_passed:
-        print("All tests PASSED!")
-        return 0
+        fusion_pass, fusion_outputs = test_fusion(
+            reference, args.device,
+            g_obs_override=gating_outputs['g_obs'],
+            g_action_override=gating_outputs['g_action'],
+            g_agent_override=gating_outputs['g_agent'],
+            g_position_override=gating_outputs['g_position'],
+            obs_embed_override=emb_outputs['obs_embed'],
+            action_embed_override=emb_outputs['action_embed'],
+            agent_embed_override=emb_outputs['agent_embed'],
+            position_embed_override=emb_outputs['position_embed'],
+        )
+        results['fusion'] = fusion_pass
+
+        transformer_pass, transformer_output = test_transformer_layers(
+            reference, batched_weights, device=args.device,
+            fusion_combined=fusion_outputs['combined']
+        )
+        results['transformer'] = transformer_pass
+
+        results['heads'] = test_heads(
+            reference, batched_weights, device=args.device,
+            transformer_output=transformer_output
+        )
     else:
-        print("Some tests FAILED!")
-        return 1
+        # Use reference inputs for each layer (default)
+        emb_pass, _ = test_embeddings(reference, batched_weights, args.device)
+        results['embeddings'] = emb_pass
+
+        gating_pass, _ = test_gating(reference, batched_weights, args.device)
+        results['gating'] = gating_pass
+
+        fusion_pass, _ = test_fusion(reference, args.device)
+        results['fusion'] = fusion_pass
+
+        transformer_pass, _ = test_transformer_layers(reference, batched_weights, device=args.device)
+        results['transformer'] = transformer_pass
+
+        results['heads'] = test_heads(reference, batched_weights, device=args.device)
+
+    # Return 0 if all passed, 1 if any failed
+    return 0 if all(results.values()) else 1
 
 
 if __name__ == '__main__':
