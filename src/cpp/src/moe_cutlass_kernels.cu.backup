@@ -7,8 +7,7 @@
 #include <cutlass/layout/matrix.h>
 #include <cutlass/numeric_types.h>
 #include <cutlass/epilogue/thread/linear_combination.h>
-#include <cutlass/epilogue/thread/linear_combination_gelu.h>
-#include <cutlass/epilogue/thread/activation.h>
+#include <cutlass/epilogue/threadblock/epilogue.h>
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -18,8 +17,6 @@
 #include <sstream>
 #include <cstdlib>
 #include <cmath>
-#include <vector>
-#include <array>
 
 namespace lb {
 namespace moe {
@@ -77,7 +74,243 @@ static bool LB_MOE_LOG_CUTLASS() {
     }
 
 // ============================================================================
-// CUTLASS Type Definitions
+// Custom CUTLASS Epilogue: Per-Row Routing Weight Scaling
+// ============================================================================
+
+/**
+ * Custom epilogue functor that applies per-row routing weight scaling.
+ *
+ * Computes: output = (accumulator * alpha + bias) * routing_weight[row]
+ *
+ * This is used in the W2 GEMM to fuse the routing weight multiplication
+ * directly into the GEMM epilogue, eliminating a separate kernel launch.
+ */
+template <
+    typename ElementOutput_,
+    typename ElementAccumulator_,
+    typename ElementCompute_,
+    int ElementsPerAccess
+>
+struct PerRowScaleEpilogue {
+    using ElementOutput = ElementOutput_;
+    using ElementAccumulator = ElementAccumulator_;
+    using ElementCompute = ElementCompute_;
+
+    static int const kElementsPerAccess = ElementsPerAccess;
+
+    struct Params {
+        ElementCompute alpha;
+        ElementCompute beta;
+        ElementOutput const* bias_ptr;
+        float const* routing_weights_ptr;
+        int64_t group_offset;  // Offset into routing_weights array for this group
+        int64_t output_stride;
+
+        CUTLASS_HOST_DEVICE
+        Params():
+            alpha(ElementCompute(1)),
+            beta(ElementCompute(0)),
+            bias_ptr(nullptr),
+            routing_weights_ptr(nullptr),
+            group_offset(0),
+            output_stride(0) {}
+
+        CUTLASS_HOST_DEVICE
+        Params(
+            ElementCompute alpha_,
+            ElementCompute beta_,
+            ElementOutput const* bias_ptr_,
+            float const* routing_weights_ptr_,
+            int64_t group_offset_,
+            int64_t output_stride_
+        ):
+            alpha(alpha_),
+            beta(beta_),
+            bias_ptr(bias_ptr_),
+            routing_weights_ptr(routing_weights_ptr_),
+            group_offset(group_offset_),
+            output_stride(output_stride_) {}
+    };
+
+    Params params_;
+
+    CUTLASS_DEVICE
+    PerRowScaleEpilogue(Params const& params): params_(params) {}
+
+    CUTLASS_DEVICE
+    ElementOutput operator()(
+        ElementAccumulator accumulator,
+        int row_idx,
+        int col_idx
+    ) const {
+        ElementCompute compute = ElementCompute(accumulator) * params_.alpha;
+
+        // Add bias
+        if (params_.bias_ptr != nullptr) {
+            compute += ElementCompute(params_.bias_ptr[col_idx]);
+        }
+
+        // Apply per-row routing weight
+        if (params_.routing_weights_ptr != nullptr) {
+            float routing_weight = params_.routing_weights_ptr[params_.group_offset + row_idx];
+            compute *= ElementCompute(routing_weight);
+        }
+
+        return ElementOutput(compute);
+    }
+};
+
+// ============================================================================
+// GELU Activation Functor
+// ============================================================================
+
+template <typename T>
+struct GeluActivation {
+    CUTLASS_DEVICE
+    T operator()(T const& x) const {
+        float x_f = float(x);
+        float kAlpha = 0.7978845608f;  // sqrt(2/pi)
+        float kGamma = 0.044715f;
+        float x_cube = x_f * x_f * x_f;
+        float tanh_arg = kAlpha * (x_f + kGamma * x_cube);
+        float result = 0.5f * x_f * (1.0f + tanhf(tanh_arg));
+        return T(result);
+    }
+};
+
+/**
+ * Epilogue functor for W1 GEMM: applies bias + GELU activation.
+ */
+template <
+    typename ElementOutput_,
+    typename ElementAccumulator_,
+    typename ElementCompute_,
+    int ElementsPerAccess
+>
+struct BiasGeluEpilogue {
+    using ElementOutput = ElementOutput_;
+    using ElementAccumulator = ElementAccumulator_;
+    using ElementCompute = ElementCompute_;
+
+    static int const kElementsPerAccess = ElementsPerAccess;
+
+    struct Params {
+        ElementCompute alpha;
+        ElementCompute beta;
+        ElementOutput const* bias_ptr;
+        int64_t output_stride;
+
+        CUTLASS_HOST_DEVICE
+        Params():
+            alpha(ElementCompute(1)),
+            beta(ElementCompute(0)),
+            bias_ptr(nullptr),
+            output_stride(0) {}
+
+        CUTLASS_HOST_DEVICE
+        Params(
+            ElementCompute alpha_,
+            ElementCompute beta_,
+            ElementOutput const* bias_ptr_,
+            int64_t output_stride_
+        ):
+            alpha(alpha_),
+            beta(beta_),
+            bias_ptr(bias_ptr_),
+            output_stride(output_stride_) {}
+    };
+
+    Params params_;
+    GeluActivation<ElementCompute> gelu_;
+
+    CUTLASS_DEVICE
+    BiasGeluEpilogue(Params const& params): params_(params), gelu_() {}
+
+    CUTLASS_DEVICE
+    ElementOutput operator()(
+        ElementAccumulator accumulator,
+        int row_idx,
+        int col_idx
+    ) const {
+        ElementCompute compute = ElementCompute(accumulator) * params_.alpha;
+
+        // Add bias
+        if (params_.bias_ptr != nullptr) {
+            compute += ElementCompute(params_.bias_ptr[col_idx]);
+        }
+
+        // Apply GELU
+        compute = gelu_(compute);
+
+        return ElementOutput(compute);
+    }
+};
+
+// ============================================================================
+// Grouped GEMM Helper Kernels
+// ============================================================================
+
+/**
+ * Simple GELU kernel for intermediate activations.
+ * Used for W1 output since custom epilogue support varies by CUTLASS version.
+ */
+template <typename T>
+__global__ void gelu_kernel(
+    T* data,
+    int64_t total_elements
+) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) return;
+
+    float x = float(data[idx]);
+    float kAlpha = 0.7978845608f;  // sqrt(2/pi)
+    float kGamma = 0.044715f;
+    float x_cube = x * x * x;
+    float tanh_arg = kAlpha * (x + kGamma * x_cube);
+    float result = 0.5f * x * (1.0f + tanhf(tanh_arg));
+    data[idx] = T(result);
+}
+
+/**
+ * Kernel to add bias to GEMM output.
+ */
+template <typename T>
+__global__ void add_bias_kernel(
+    T* data,
+    const T* bias,
+    int64_t rows,
+    int64_t cols
+) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = rows * cols;
+    if (idx >= total) return;
+
+    int64_t col = idx % cols;
+    data[idx] += bias[col];
+}
+
+/**
+ * Kernel to apply per-row routing weights.
+ * output[i, j] *= routing_weights[i]
+ */
+template <typename T>
+__global__ void apply_routing_weights_kernel(
+    T* data,
+    const float* routing_weights,
+    int64_t rows,
+    int64_t cols
+) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = rows * cols;
+    if (idx >= total) return;
+
+    int64_t row = idx / cols;
+    float scale = routing_weights[row];
+    data[idx] *= T(scale);
+}
+
+// ============================================================================
+// CUTLASS Grouped GEMM Configuration
 // ============================================================================
 
 // FP16 input/output, FP32 accumulation
@@ -90,7 +323,7 @@ using ElementCompute = float;
 // Layouts
 using LayoutA = cutlass::layout::RowMajor;  // Input tokens
 using LayoutB = cutlass::layout::ColumnMajor;  // Weights (transposed)
-using LayoutC = cutlass::layout::RowMajor;  // Output/Bias
+using LayoutC = cutlass::layout::RowMajor;  // Output
 
 // MMA configuration for Ampere (sm_80)
 using MMAOp = cutlass::arch::OpClassTensorOp;
@@ -99,96 +332,38 @@ using ThreadblockShape = cutlass::gemm::GemmShape<128, 128, 32>;
 using WarpShape = cutlass::gemm::GemmShape<64, 64, 32>;
 using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
 
-// Swizzle
-using ThreadblockSwizzle = cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle;
-
-// Stages
-constexpr int Stages = 4;
-
-// ============================================================================
-// W1 GEMM: Epilogue with Bias + GELU
-// ============================================================================
-
-// W1 Epilogue: D = GELU(alpha * AB + beta * C)
-// We set alpha=1, beta=1, and pass bias as C with stride to broadcast per-column
-using EpilogueOpW1 = cutlass::epilogue::thread::LinearCombinationGELU<
-    ElementOutput,
-    128 / cutlass::sizeof_bits<ElementOutput>::value,  // Elements per vector access
-    ElementAccumulator,
-    ElementCompute,
-    cutlass::epilogue::thread::ScaleType::Default  // Use both alpha and beta
->;
-
-// W1 Grouped GEMM Kernel
-using GemmKernelW1 = typename cutlass::gemm::kernel::DefaultGemmGrouped<
-    ElementA, LayoutA, cutlass::ComplexTransform::kNone, 8,  // A
-    ElementB, LayoutB, cutlass::ComplexTransform::kNone, 8,  // B
-    ElementOutput, LayoutC,  // C/D
-    ElementAccumulator,
-    MMAOp, SmArch,
-    ThreadblockShape, WarpShape, InstructionShape,
-    EpilogueOpW1,
-    ThreadblockSwizzle,
-    Stages
->::GemmKernel;
-
-using GroupedGemmW1 = cutlass::gemm::device::GemmGrouped<GemmKernelW1>;
-
-// ============================================================================
-// W2 GEMM: Standard Epilogue (bias + routing weights done separately for now)
-// ============================================================================
-
-// W2 Epilogue: Standard linear combination
-using EpilogueOpW2 = cutlass::epilogue::thread::LinearCombination<
+// Epilogue configuration
+using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
     ElementOutput,
     128 / cutlass::sizeof_bits<ElementOutput>::value,
     ElementAccumulator,
     ElementCompute
 >;
 
-// W2 Grouped GEMM Kernel
-using GemmKernelW2 = typename cutlass::gemm::kernel::DefaultGemmGrouped<
-    ElementA, LayoutA, cutlass::ComplexTransform::kNone, 8,  // A
-    ElementB, LayoutB, cutlass::ComplexTransform::kNone, 8,  // B
-    ElementOutput, LayoutC,  // C/D
+// Grouped GEMM kernel - CUTLASS 4.x API
+using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
+    ElementA,
+    LayoutA,
+    cutlass::ComplexTransform::kNone,
+    8,  // Alignment A
+    ElementB,
+    LayoutB,
+    cutlass::ComplexTransform::kNone,
+    8,  // Alignment B
+    ElementOutput,
+    LayoutC,
     ElementAccumulator,
-    MMAOp, SmArch,
-    ThreadblockShape, WarpShape, InstructionShape,
-    EpilogueOpW2,
-    ThreadblockSwizzle,
-    Stages
+    MMAOp,
+    SmArch,
+    ThreadblockShape,
+    WarpShape,
+    InstructionShape,
+    EpilogueOp,
+    cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,
+    4  // Stages
 >::GemmKernel;
 
-using GroupedGemmW2 = cutlass::gemm::device::GemmGrouped<GemmKernelW2>;
-
-// ============================================================================
-// Helper Kernels for W2 Post-Processing
-// ============================================================================
-
-/**
- * Fused kernel: bias + per-row routing weight scaling
- * output[i, j] = (output[i, j] + bias[j]) * routing_weight[i]
- */
-template <typename T>
-__global__ void fused_bias_routing_kernel(
-    T* data,
-    const T* bias,
-    const float* routing_weights,
-    int64_t rows,
-    int64_t cols
-) {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total = rows * cols;
-    if (idx >= total) return;
-
-    int64_t row = idx / cols;
-    int64_t col = idx % cols;
-
-    // Add bias and apply per-row routing weight in one pass
-    float val = float(data[idx]) + float(bias[col]);
-    val *= routing_weights[row];
-    data[idx] = T(val);
-}
+using GroupedGemm = cutlass::gemm::device::GemmGrouped<GemmKernel>;
 
 // ============================================================================
 // Main Implementation
@@ -212,7 +387,7 @@ void cutlass_grouped_moe_forward(
 ) {
     if (group_count == 0) {
         if (LB_MOE_LOG_GEMM()) {
-            std::cerr << "[LB][MOE_CUTLASS_FUSED] No groups to process" << std::endl;
+            std::cerr << "[LB][MOE_CUTLASS] No groups to process" << std::endl;
         }
         return;
     }
@@ -221,31 +396,31 @@ void cutlass_grouped_moe_forward(
     const bool log_cutlass = LB_MOE_LOG_CUTLASS();
 
     if (log_cutlass) {
-        std::cerr << "[LB][MOE_CUTLASS_FUSED] Starting fused grouped MoE forward:" << std::endl;
+        std::cerr << "[LB][MOE_CUTLASS] Starting grouped MoE forward:" << std::endl;
         std::cerr << "  group_count=" << group_count << std::endl;
         std::cerr << "  hidden_dim=" << hidden_dim << std::endl;
         std::cerr << "  ffn_dim=" << ffn_dim << std::endl;
     }
 
     // Allocate workspace for intermediate hidden states
+    size_t max_tokens = 0;
+    for (int64_t i = 0; i < group_count; ++i) {
+        max_tokens = std::max(max_tokens, static_cast<size_t>(m_sizes[i]));
+    }
+
+    // Allocate intermediate buffer for all groups
     cutlass::half_t* hidden_buffer = nullptr;
     size_t total_intermediate_size = 0;
     for (int64_t i = 0; i < group_count; ++i) {
         total_intermediate_size += m_sizes[i] * ffn_dim;
     }
+
     CUDA_CHECK(cudaMalloc(&hidden_buffer, total_intermediate_size * sizeof(cutlass::half_t)));
 
-    // ========================================================================
-    // W1 GEMM with BIAS + GELU Fusion
-    // ========================================================================
-
-    // Setup problem sizes and pointers for W1 GEMM
+    // Setup problem sizes and pointers for W1 GEMM (input @ W1^T)
     std::vector<cutlass::gemm::GemmCoord> problem_sizes_w1;
-    std::vector<ElementA*> ptr_A_w1;
-    std::vector<ElementB*> ptr_B_w1;
-    std::vector<ElementOutput*> ptr_C_w1;  // Bias
-    std::vector<ElementOutput*> ptr_D_w1;  // Output
-    std::vector<int64_t> lda_w1, ldb_w1, ldc_w1, ldd_w1;
+    std::vector<void*> ptr_A_w1, ptr_B_w1, ptr_C_w1;
+    std::vector<int64_t> lda_w1, ldb_w1, ldc_w1;
 
     size_t hidden_offset = 0;
     for (int64_t i = 0; i < group_count; ++i) {
@@ -256,54 +431,51 @@ void cutlass_grouped_moe_forward(
         if (M == 0) continue;
 
         // GEMM: [M, K] @ [K, N] = [M, N]
+        // With LayoutA=RowMajor, LayoutB=ColumnMajor (transposed weights)
         problem_sizes_w1.push_back(cutlass::gemm::GemmCoord(M, N, K));
 
-        ptr_A_w1.push_back(reinterpret_cast<ElementA*>(input_ptrs[i]));
-        ptr_B_w1.push_back(reinterpret_cast<ElementB*>(w1_ptrs[i]));
-        ptr_C_w1.push_back(reinterpret_cast<ElementOutput*>(b1_ptrs[i]));  // Bias
-        ptr_D_w1.push_back(reinterpret_cast<ElementOutput*>(hidden_buffer + hidden_offset));
+        ptr_A_w1.push_back(reinterpret_cast<void*>(input_ptrs[i]));
+        ptr_B_w1.push_back(reinterpret_cast<void*>(w1_ptrs[i]));
+        ptr_C_w1.push_back(reinterpret_cast<void*>(hidden_buffer + hidden_offset));
 
-        lda_w1.push_back(K);  // Row-major input
-        ldb_w1.push_back(K);  // Column-major weights
-        ldc_w1.push_back(0);  // Bias stride = 0 (broadcast across rows)
-        ldd_w1.push_back(N);  // Row-major output
+        lda_w1.push_back(K);  // Row-major input: stride = K
+        ldb_w1.push_back(K);  // Column-major weights: stride = K
+        ldc_w1.push_back(N);  // Row-major output: stride = N
 
         if (log_gemm) {
-            std::cerr << "[LB][MOE_GEMM_FUSED] W1 group=" << i
+            std::cerr << "[LB][MOE_GEMM] W1 group=" << i
+                      << " policy=" << policy_ids[i]
+                      << " expert=" << expert_ids[i]
                       << " M=" << M << " N=" << N << " K=" << K << std::endl;
         }
 
         hidden_offset += M * N;
     }
 
-    // Execute W1 grouped GEMM with fused BIAS + GELU
+    // Execute W1 grouped GEMM
     if (!problem_sizes_w1.empty()) {
         if (log_cutlass) {
-            std::cerr << "[LB][MOE_CUTLASS_FUSED] Launching W1 fused GEMM (bias+GELU) with "
+            std::cerr << "[LB][MOE_CUTLASS] Launching W1 grouped GEMM with "
                       << problem_sizes_w1.size() << " problems" << std::endl;
         }
 
-        // Device memory for problem metadata
+        // Allocate device memory for problem metadata
         cutlass::gemm::GemmCoord* problem_sizes_device_w1 = nullptr;
         ElementA** ptr_A_device_w1 = nullptr;
         ElementB** ptr_B_device_w1 = nullptr;
         ElementOutput** ptr_C_device_w1 = nullptr;
-        ElementOutput** ptr_D_device_w1 = nullptr;
         int64_t* lda_device_w1 = nullptr;
         int64_t* ldb_device_w1 = nullptr;
         int64_t* ldc_device_w1 = nullptr;
-        int64_t* ldd_device_w1 = nullptr;
 
         size_t num_problems_w1 = problem_sizes_w1.size();
         CUDA_CHECK(cudaMalloc(&problem_sizes_device_w1, num_problems_w1 * sizeof(cutlass::gemm::GemmCoord)));
         CUDA_CHECK(cudaMalloc(&ptr_A_device_w1, num_problems_w1 * sizeof(ElementA*)));
         CUDA_CHECK(cudaMalloc(&ptr_B_device_w1, num_problems_w1 * sizeof(ElementB*)));
         CUDA_CHECK(cudaMalloc(&ptr_C_device_w1, num_problems_w1 * sizeof(ElementOutput*)));
-        CUDA_CHECK(cudaMalloc(&ptr_D_device_w1, num_problems_w1 * sizeof(ElementOutput*)));
         CUDA_CHECK(cudaMalloc(&lda_device_w1, num_problems_w1 * sizeof(int64_t)));
         CUDA_CHECK(cudaMalloc(&ldb_device_w1, num_problems_w1 * sizeof(int64_t)));
         CUDA_CHECK(cudaMalloc(&ldc_device_w1, num_problems_w1 * sizeof(int64_t)));
-        CUDA_CHECK(cudaMalloc(&ldd_device_w1, num_problems_w1 * sizeof(int64_t)));
 
         // Copy to device
         CUDA_CHECK(cudaMemcpy(problem_sizes_device_w1, problem_sizes_w1.data(),
@@ -314,46 +486,43 @@ void cutlass_grouped_moe_forward(
                               num_problems_w1 * sizeof(void*), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(ptr_C_device_w1, ptr_C_w1.data(),
                               num_problems_w1 * sizeof(void*), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(ptr_D_device_w1, ptr_D_w1.data(),
-                              num_problems_w1 * sizeof(void*), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(lda_device_w1, lda_w1.data(),
                               num_problems_w1 * sizeof(int64_t), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(ldb_device_w1, ldb_w1.data(),
                               num_problems_w1 * sizeof(int64_t), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(ldc_device_w1, ldc_w1.data(),
                               num_problems_w1 * sizeof(int64_t), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(ldd_device_w1, ldd_w1.data(),
-                              num_problems_w1 * sizeof(int64_t), cudaMemcpyHostToDevice));
 
-        GroupedGemmW1 gemm_w1;
+        GroupedGemm gemm_w1;
 
-        int threadblock_count_w1 = GroupedGemmW1::sufficient(problem_sizes_w1.data(), num_problems_w1);
+        // CUTLASS 4.x API: create epilogue params and arguments
+        int threadblock_count_w1 = GroupedGemm::sufficient(problem_sizes_w1.data(), num_problems_w1);
+        typename GroupedGemm::EpilogueOutputOp::Params epilogue_params_w1(1.0f, 0.0f);
 
-        // Epilogue params: alpha=1, beta=1 for D = GELU(1*AB + 1*C)
-        typename GroupedGemmW1::EpilogueOutputOp::Params epilogue_params_w1(1.0f, 1.0f);
-
-        typename GroupedGemmW1::Arguments args_w1(
+        typename GroupedGemm::Arguments args_w1(
             problem_sizes_device_w1,
             num_problems_w1,
             threadblock_count_w1,
             epilogue_params_w1,
             ptr_A_device_w1,
             ptr_B_device_w1,
-            ptr_C_device_w1,  // Bias (with stride=0)
-            ptr_D_device_w1,  // Output
+            ptr_C_device_w1,
+            ptr_C_device_w1,  // D = C for in-place
             lda_device_w1,
             ldb_device_w1,
             ldc_device_w1,
-            ldd_device_w1,
-            problem_sizes_w1.data()
+            ldc_device_w1,
+            problem_sizes_w1.data()  // Host pointer for reference
         );
 
+        // Get workspace size and allocate
         size_t workspace_size_w1 = gemm_w1.get_workspace_size(args_w1);
         void* workspace_w1 = nullptr;
         if (workspace_size_w1 > 0) {
             CUDA_CHECK(cudaMalloc(&workspace_w1, workspace_size_w1));
         }
 
+        // Initialize and run
         CUTLASS_CHECK(gemm_w1.initialize(args_w1, workspace_w1));
         CUTLASS_CHECK(gemm_w1.run());
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -364,28 +533,41 @@ void cutlass_grouped_moe_forward(
         cudaFree(ptr_A_device_w1);
         cudaFree(ptr_B_device_w1);
         cudaFree(ptr_C_device_w1);
-        cudaFree(ptr_D_device_w1);
         cudaFree(lda_device_w1);
         cudaFree(ldb_device_w1);
         cudaFree(ldc_device_w1);
-        cudaFree(ldd_device_w1);
 
         if (log_cutlass) {
-            std::cerr << "[LB][MOE_CUTLASS_FUSED] W1 fused GEMM completed (2 kernels → 1)" << std::endl;
+            std::cerr << "[LB][MOE_CUTLASS] W1 grouped GEMM completed" << std::endl;
         }
     }
 
-    // ========================================================================
-    // W2 GEMM + Fused Bias+Routing Weight Post-Processing
-    // ========================================================================
+    // Apply bias + GELU to hidden states
+    hidden_offset = 0;
+    for (int64_t i = 0; i < group_count; ++i) {
+        int64_t M = m_sizes[i];
+        if (M == 0) continue;
 
-    // Setup problem sizes for W2 GEMM
+        cutlass::half_t* hidden_ptr = hidden_buffer + hidden_offset;
+        const cutlass::half_t* bias_ptr = reinterpret_cast<const cutlass::half_t*>(b1_ptrs[i]);
+
+        // Add bias
+        int64_t total = M * ffn_dim;
+        int threads = 256;
+        int blocks = (total + threads - 1) / threads;
+        add_bias_kernel<<<blocks, threads>>>(hidden_ptr, bias_ptr, M, ffn_dim);
+
+        // Apply GELU
+        gelu_kernel<<<blocks, threads>>>(hidden_ptr, total);
+
+        hidden_offset += M * ffn_dim;
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Setup problem sizes and pointers for W2 GEMM (hidden @ W2^T)
     std::vector<cutlass::gemm::GemmCoord> problem_sizes_w2;
-    std::vector<ElementA*> ptr_A_w2;
-    std::vector<ElementB*> ptr_B_w2;
-    std::vector<ElementOutput*> ptr_C_w2;
-    std::vector<ElementOutput*> ptr_D_w2;
-    std::vector<int64_t> lda_w2, ldb_w2, ldc_w2, ldd_w2;
+    std::vector<void*> ptr_A_w2, ptr_B_w2, ptr_C_w2;
+    std::vector<int64_t> lda_w2, ldb_w2, ldc_w2;
 
     hidden_offset = 0;
     for (int64_t i = 0; i < group_count; ++i) {
@@ -395,20 +577,21 @@ void cutlass_grouped_moe_forward(
 
         if (M == 0) continue;
 
+        // GEMM: [M, K] @ [K, N] = [M, N]
         problem_sizes_w2.push_back(cutlass::gemm::GemmCoord(M, N, K));
 
-        ptr_A_w2.push_back(reinterpret_cast<ElementA*>(hidden_buffer + hidden_offset));
-        ptr_B_w2.push_back(reinterpret_cast<ElementB*>(w2_ptrs[i]));
-        ptr_C_w2.push_back(nullptr);  // No C matrix
-        ptr_D_w2.push_back(reinterpret_cast<ElementOutput*>(output_ptrs[i]));
+        ptr_A_w2.push_back(reinterpret_cast<void*>(hidden_buffer + hidden_offset));
+        ptr_B_w2.push_back(reinterpret_cast<void*>(w2_ptrs[i]));
+        ptr_C_w2.push_back(reinterpret_cast<void*>(output_ptrs[i]));
 
         lda_w2.push_back(K);
         ldb_w2.push_back(K);
-        ldc_w2.push_back(0);
-        ldd_w2.push_back(N);
+        ldc_w2.push_back(N);
 
         if (log_gemm) {
-            std::cerr << "[LB][MOE_GEMM_FUSED] W2 group=" << i
+            std::cerr << "[LB][MOE_GEMM] W2 group=" << i
+                      << " policy=" << policy_ids[i]
+                      << " expert=" << expert_ids[i]
                       << " M=" << M << " N=" << N << " K=" << K << std::endl;
         }
 
@@ -418,32 +601,29 @@ void cutlass_grouped_moe_forward(
     // Execute W2 grouped GEMM
     if (!problem_sizes_w2.empty()) {
         if (log_cutlass) {
-            std::cerr << "[LB][MOE_CUTLASS_FUSED] Launching W2 GEMM with "
+            std::cerr << "[LB][MOE_CUTLASS] Launching W2 grouped GEMM with "
                       << problem_sizes_w2.size() << " problems" << std::endl;
         }
 
-        // Device memory
+        // Allocate device memory for problem metadata
         cutlass::gemm::GemmCoord* problem_sizes_device_w2 = nullptr;
         ElementA** ptr_A_device_w2 = nullptr;
         ElementB** ptr_B_device_w2 = nullptr;
         ElementOutput** ptr_C_device_w2 = nullptr;
-        ElementOutput** ptr_D_device_w2 = nullptr;
         int64_t* lda_device_w2 = nullptr;
         int64_t* ldb_device_w2 = nullptr;
         int64_t* ldc_device_w2 = nullptr;
-        int64_t* ldd_device_w2 = nullptr;
 
         size_t num_problems_w2 = problem_sizes_w2.size();
         CUDA_CHECK(cudaMalloc(&problem_sizes_device_w2, num_problems_w2 * sizeof(cutlass::gemm::GemmCoord)));
         CUDA_CHECK(cudaMalloc(&ptr_A_device_w2, num_problems_w2 * sizeof(ElementA*)));
         CUDA_CHECK(cudaMalloc(&ptr_B_device_w2, num_problems_w2 * sizeof(ElementB*)));
         CUDA_CHECK(cudaMalloc(&ptr_C_device_w2, num_problems_w2 * sizeof(ElementOutput*)));
-        CUDA_CHECK(cudaMalloc(&ptr_D_device_w2, num_problems_w2 * sizeof(ElementOutput*)));
         CUDA_CHECK(cudaMalloc(&lda_device_w2, num_problems_w2 * sizeof(int64_t)));
         CUDA_CHECK(cudaMalloc(&ldb_device_w2, num_problems_w2 * sizeof(int64_t)));
         CUDA_CHECK(cudaMalloc(&ldc_device_w2, num_problems_w2 * sizeof(int64_t)));
-        CUDA_CHECK(cudaMalloc(&ldd_device_w2, num_problems_w2 * sizeof(int64_t)));
 
+        // Copy to device
         CUDA_CHECK(cudaMemcpy(problem_sizes_device_w2, problem_sizes_w2.data(),
                               num_problems_w2 * sizeof(cutlass::gemm::GemmCoord), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(ptr_A_device_w2, ptr_A_w2.data(),
@@ -452,23 +632,20 @@ void cutlass_grouped_moe_forward(
                               num_problems_w2 * sizeof(void*), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(ptr_C_device_w2, ptr_C_w2.data(),
                               num_problems_w2 * sizeof(void*), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(ptr_D_device_w2, ptr_D_w2.data(),
-                              num_problems_w2 * sizeof(void*), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(lda_device_w2, lda_w2.data(),
                               num_problems_w2 * sizeof(int64_t), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(ldb_device_w2, ldb_w2.data(),
                               num_problems_w2 * sizeof(int64_t), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(ldc_device_w2, ldc_w2.data(),
                               num_problems_w2 * sizeof(int64_t), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(ldd_device_w2, ldd_w2.data(),
-                              num_problems_w2 * sizeof(int64_t), cudaMemcpyHostToDevice));
 
-        GroupedGemmW2 gemm_w2;
+        GroupedGemm gemm_w2;
 
-        int threadblock_count_w2 = GroupedGemmW2::sufficient(problem_sizes_w2.data(), num_problems_w2);
-        typename GroupedGemmW2::EpilogueOutputOp::Params epilogue_params_w2(1.0f, 0.0f);
+        // CUTLASS 4.x API: create epilogue params and arguments
+        int threadblock_count_w2 = GroupedGemm::sufficient(problem_sizes_w2.data(), num_problems_w2);
+        typename GroupedGemm::EpilogueOutputOp::Params epilogue_params_w2(1.0f, 0.0f);
 
-        typename GroupedGemmW2::Arguments args_w2(
+        typename GroupedGemm::Arguments args_w2(
             problem_sizes_device_w2,
             num_problems_w2,
             threadblock_count_w2,
@@ -476,20 +653,22 @@ void cutlass_grouped_moe_forward(
             ptr_A_device_w2,
             ptr_B_device_w2,
             ptr_C_device_w2,
-            ptr_D_device_w2,
+            ptr_C_device_w2,  // D = C for in-place
             lda_device_w2,
             ldb_device_w2,
             ldc_device_w2,
-            ldd_device_w2,
-            problem_sizes_w2.data()
+            ldc_device_w2,
+            problem_sizes_w2.data()  // Host pointer for reference
         );
 
+        // Get workspace size and allocate
         size_t workspace_size_w2 = gemm_w2.get_workspace_size(args_w2);
         void* workspace_w2 = nullptr;
         if (workspace_size_w2 > 0) {
             CUDA_CHECK(cudaMalloc(&workspace_w2, workspace_size_w2));
         }
 
+        // Initialize and run
         CUTLASS_CHECK(gemm_w2.initialize(args_w2, workspace_w2));
         CUTLASS_CHECK(gemm_w2.run());
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -500,18 +679,16 @@ void cutlass_grouped_moe_forward(
         cudaFree(ptr_A_device_w2);
         cudaFree(ptr_B_device_w2);
         cudaFree(ptr_C_device_w2);
-        cudaFree(ptr_D_device_w2);
         cudaFree(lda_device_w2);
         cudaFree(ldb_device_w2);
         cudaFree(ldc_device_w2);
-        cudaFree(ldd_device_w2);
 
         if (log_cutlass) {
-            std::cerr << "[LB][MOE_CUTLASS_FUSED] W2 GEMM completed" << std::endl;
+            std::cerr << "[LB][MOE_CUTLASS] W2 grouped GEMM completed" << std::endl;
         }
     }
 
-    // Apply fused bias + routing weights to W2 outputs (1 kernel instead of 2)
+    // Apply bias + routing weights to outputs
     for (int64_t i = 0; i < group_count; ++i) {
         int64_t M = m_sizes[i];
         if (M == 0) continue;
@@ -524,8 +701,15 @@ void cutlass_grouped_moe_forward(
         int threads = 256;
         int blocks = (total + threads - 1) / threads;
 
-        // Fused bias + routing weight kernel (replaces 2 separate kernels)
-        fused_bias_routing_kernel<<<blocks, threads>>>(output_ptr, bias_ptr, routing_ptr, M, hidden_dim);
+        // Add bias
+        add_bias_kernel<<<blocks, threads>>>(output_ptr, bias_ptr, M, hidden_dim);
+
+        // Apply routing weights
+        apply_routing_weights_kernel<<<blocks, threads>>>(output_ptr, routing_ptr, M, hidden_dim);
+
+        if (log_cutlass && i < 2) {
+            std::cerr << "[LB][MOE_CUTLASS] Applied bias and routing weights to group " << i << std::endl;
+        }
     }
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -533,10 +717,7 @@ void cutlass_grouped_moe_forward(
     CUDA_CHECK(cudaFree(hidden_buffer));
 
     if (log_cutlass) {
-        std::cerr << "[LB][MOE_CUTLASS_FUSED] Fused MoE forward completed:" << std::endl;
-        std::cerr << "  W1: 3 kernels → 1 (GEMM+bias+GELU fused)" << std::endl;
-        std::cerr << "  W2: 3 kernels → 2 (GEMM + fused bias+routing)" << std::endl;
-        std::cerr << "  Total: 6 kernels → 3 (50% reduction)" << std::endl;
+        std::cerr << "[LB][MOE_CUTLASS] Grouped MoE forward completed successfully" << std::endl;
     }
 }
 
