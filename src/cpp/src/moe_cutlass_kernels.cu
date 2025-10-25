@@ -521,6 +521,18 @@ void cutlass_grouped_moe_forward(
         const cutlass::half_t* bias_ptr = reinterpret_cast<const cutlass::half_t*>(b2_ptrs[i]);
         const float* routing_ptr = reinterpret_cast<const float*>(routing_weight_ptrs[i]);
 
+        // Debug: print first few routing weights for first group
+        if (log_cutlass && i == 0 && M > 0) {
+            std::vector<float> routing_cpu(std::min(M, int64_t(8)));
+            cudaMemcpy(routing_cpu.data(), routing_ptr, routing_cpu.size() * sizeof(float), cudaMemcpyDeviceToHost);
+            std::cerr << "[LB][MOE_CUTLASS_FUSED] Group 0 routing weights (M=" << M << ", hidden_dim=" << hidden_dim << "): [";
+            for (size_t j = 0; j < routing_cpu.size(); ++j) {
+                std::cerr << routing_cpu[j];
+                if (j < routing_cpu.size() - 1) std::cerr << ", ";
+            }
+            std::cerr << "]" << std::endl;
+        }
+
         int64_t total = M * hidden_dim;
         int threads = 256;
         int blocks = (total + threads - 1) / threads;
