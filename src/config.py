@@ -142,8 +142,9 @@ EMBED_LOG_INTERVAL = 50
 # ============================
 ELO_K_FACTOR = 32
 NUM_ROUNDS = 15
-NUM_GAMES_PER_MATCH = 97
-EVAL_VEC_BATCH_SIZE = 2048
+NUM_GAMES_PER_MATCH = 1
+EVAL_VEC_BATCH_SIZE = 3584
+EVAL_INFERENCE_BATCH_SIZE = 896
 CPP_BOT_LABELS = [0, 1, 2, 3, 4, 5, 6]
 # ============================
 # Tournament Configuration

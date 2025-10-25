@@ -269,7 +269,7 @@ def load_evaluation_policies(
     eval_manager.set_max_env_batch(max(1, max_env_batch))
 
     inference_batch = int(getattr(config, "EVAL_INFERENCE_BATCH_SIZE", max_env_batch))
-    eval_manager.set_inference_batch_size(max(1, inference_batch))
+    eval_manager.set_max_inference_batch_size(max(1, inference_batch))
 
     def _discover_generations(run_name: str) -> List[str]:
         run_dir = Path(config.CHECKPOINT_DIR) / run_name

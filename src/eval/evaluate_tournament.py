@@ -43,6 +43,8 @@ set_seed(SEED)
 MIN_GAMES_PER_MATCH = 1
 MAX_GAMES_PER_MATCH = 1
 
+SCOREBOARD_REFRESH_INTERVAL = 10
+
 
 @dataclass
 class MatchStoppingConfig:
@@ -362,27 +364,34 @@ def run_active_league(
             wins_first = h2h_wins.get((a, b), 0)
             stat.wins_first += int(wins_first)
 
-        for quartet, results in zip(quartets, results_list):
+        num_quartets = len(quartets)
+        for quartet_idx, (quartet, results) in enumerate(zip(quartets, results_list)):
             ranks = ranks_from_results(results)
             RATING_BACKEND.update_from_ranks(ranks)
             update_player_metadata(players, results)
 
             for pid in quartet:
-                data = results[pid].get("expert_data")
+                player_entry = players[pid]
+                result_entry = results[pid]
+                data = result_entry.get("expert_data")
                 if data:
-                    key = players[pid]["player_id"]
+                    key = player_entry["player_id"]
                     expert_data[key].update(data if isinstance(data, dict) else {"summary": data})
 
-            # Refresh scoreboard frequently without advancing coverage progress here.
-            differences = compare_scoreboards(historical_scoreboard, players)
-            elapsed = max(1e-6, time.perf_counter() - start_time)
-            games_per_sec = float(total_games_done) / elapsed
-            progress_ui.update(
-                increment=0,
-                differences=differences,
-                description=f"Batch {batch_idx + 1} quartet {quartet}",
-                games_per_sec=games_per_sec,
-            )
+            if (
+                quartet_idx % SCOREBOARD_REFRESH_INTERVAL == 0
+                or quartet_idx + 1 == num_quartets
+            ):
+                # Refresh scoreboard without advancing coverage progress.
+                differences = compare_scoreboards(historical_scoreboard, players)
+                elapsed = max(1e-6, time.perf_counter() - start_time)
+                games_per_sec = float(total_games_done) / elapsed
+                progress_ui.update(
+                    increment=0,
+                    differences=differences,
+                    description=f"Batch {batch_idx + 1} quartet {quartet}",
+                    games_per_sec=games_per_sec,
+                )
 
         # Advance coverage progress once per batch by the amount that counts toward the target.
         if batch_coverage_increment > 0:

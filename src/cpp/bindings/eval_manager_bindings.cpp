@@ -18,7 +18,9 @@ void bind_eval_manager(py::module_& m) {
     py::class_<EvalManager>(m, "EvalManager")
         .def(py::init<>())
         .def("set_max_env_batch", &EvalManager::set_max_env_batch, py::arg("max_batch"))
-        .def("set_inference_batch_size", &EvalManager::set_inference_batch_size, py::arg("batch_size"))
+        .def("set_max_inference_batch_size", [](EvalManager& self, int max_batch_size) {
+            self.set_max_inference_batch_size(static_cast<size_t>(max_batch_size));
+        }, py::arg("max_batch_size"))
         .def(
             "load_model",
             [](EvalManager& self, int policy_id, py::dict state_dict_py, const std::string& original_path) {
@@ -84,4 +86,3 @@ void bind_eval_manager(py::module_& m) {
              py::arg("num_players"),
              py::arg("seed"));
 }
-

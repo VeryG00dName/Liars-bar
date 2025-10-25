@@ -176,7 +176,7 @@ private:
 }  // namespace
 
 EvalManager::EvalManager()
-    : max_env_batch_(2048), inference_batch_size_(128), rng_(seed_with_optional(0)) {
+    : max_env_batch_(2048), max_inference_batch_size_(2048), rng_(seed_with_optional(0)) {
     if (!torch::cuda::is_available()) {
         throw std::runtime_error(
             "CUDA is not available, but the EvalManager requires it for TorchScript inference.");
@@ -190,11 +190,11 @@ void EvalManager::set_max_env_batch(int max_batch) {
     max_env_batch_ = max_batch;
 }
 
-void EvalManager::set_inference_batch_size(int batch_size) {
-    if (batch_size <= 0) {
-        throw std::invalid_argument("inference_batch_size must be positive");
+void EvalManager::set_max_inference_batch_size(size_t max_batch_size) {
+    if (max_batch_size == 0) {
+        throw std::invalid_argument("max_inference_batch_size must be positive");
     }
-    inference_batch_size_ = batch_size;
+    max_inference_batch_size_ = max_batch_size;
 }
 
 void EvalManager::load_model(
@@ -610,7 +610,7 @@ EvalOutcome EvalManager::run_roles(const std::vector<std::vector<int>>& roles,
         actions_by_policy.reserve(pending.size());
 
         std::vector<RequestRef> historical_refs;
-        historical_refs.reserve(pending.size() * 4); // Pre-allocate with a reasonable guess
+        historical_refs.reserve(pending.size() * 4); 
 
         for (const auto& kv : pending) {
             int policy_id = kv.first;
@@ -627,12 +627,15 @@ EvalOutcome EvalManager::run_roles(const std::vector<std::vector<int>>& roles,
                 throw std::runtime_error("No registered model for policy " + std::to_string(policy_id));
             }
             
-            // Add to the batch for historical inference
             actions_by_policy.emplace(policy_id, std::vector<uint8_t>(requests.size()));
             for (size_t i = 0; i < requests.size(); ++i) {
                 historical_refs.push_back({policy_id, i, &requests[i]});
             }
         }
+
+        std::sort(historical_refs.begin(), historical_refs.end(), [](const RequestRef& a, const RequestRef& b) {
+            return a.policy_id < b.policy_id;
+        });
 
         auto model_start = Clock::now();
         if (!historical_refs.empty()) {
@@ -773,17 +776,20 @@ void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>&
         }
     }
 
-    // Define BATCH SIZE buckets
-    constexpr std::array<size_t, 10> kBatchSizeBuckets{{8, 16, 32, 64, 128, 256, 512, 1024, 1536, 2048}};
-    const size_t max_batch_bucket_size = kBatchSizeBuckets.back();
+    std::vector<size_t> batch_size_buckets;
+    for (size_t i = 10; i <= max_inference_batch_size_; i *= 2) {
+        batch_size_buckets.push_back(i);
+    }
+    if (batch_size_buckets.empty() || batch_size_buckets.back() != max_inference_batch_size_) {
+        batch_size_buckets.push_back(max_inference_batch_size_);
+    }
 
-    // 3. Process requests in chunks, all using the same target_pad_len
     size_t offset = 0;
     while (offset < refs.size()) {
-        const size_t num_real_requests = std::min(refs.size() - offset, max_batch_bucket_size);
+        const size_t num_real_requests = std::min(refs.size() - offset, max_inference_batch_size_);
 
         size_t target_batch_size = num_real_requests;
-        for (size_t bucket_size : kBatchSizeBuckets) {
+        for (size_t bucket_size : batch_size_buckets) {
             if (num_real_requests <= bucket_size) {
                 target_batch_size = bucket_size;
                 break;

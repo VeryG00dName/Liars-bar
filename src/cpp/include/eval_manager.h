@@ -53,7 +53,7 @@ public:
     EvalManager();
 
     void set_max_env_batch(int max_batch);
-    void set_inference_batch_size(int batch_size);
+    void set_max_inference_batch_size(size_t max_batch_size);
 
     void load_model(
         int policy_id,
@@ -87,7 +87,7 @@ private:
 
     VecArena arena_;
     int max_env_batch_{512};
-    int inference_batch_size_{128};
+    size_t max_inference_batch_size_{128};
     std::mt19937 rng_;
 
     // Model architecture parameters (inferred from first loaded model)
@@ -134,4 +134,3 @@ private:
     std::unique_ptr<CppBotBase> make_cpp_bot_instance(CppBotKind kind,
                                                       const PolicyRequest& request);
 };
-
