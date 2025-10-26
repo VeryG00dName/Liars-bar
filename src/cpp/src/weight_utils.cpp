@@ -20,6 +20,13 @@ void prestack_moe_expert_weights(
      * into single tensors optimized for the MoE CUDA kernel.
      */
 
+    // Check if already prestacked by looking for stacked keys
+    std::string first_stacked_key = "transformer.layers.0.moe.experts.w1";
+    if (state_dict.find(first_stacked_key) != state_dict.end()) {
+        // Already prestacked, skip
+        return;
+    }
+
     // Check if state_dict already has batched weights (batch dimension present)
     // If any weight has more than 2 dimensions for linear layers, it's likely batched
     bool is_batched = false;
@@ -197,6 +204,27 @@ void create_moe_weight_pointers(
         state_dict[layer_prefix + ".moe.experts.b1_ptrs"] = b1_ptrs.to(device);
         state_dict[layer_prefix + ".moe.experts.w2_ptrs"] = w2_ptrs.to(device);
         state_dict[layer_prefix + ".moe.experts.b2_ptrs"] = b2_ptrs.to(device);
+    }
+}
+
+void create_moe_weight_pointers(
+    c10::Dict<std::string, torch::Tensor>& state_dict,
+    int64_t num_layers,
+    int64_t num_experts
+) {
+    // c10::Dict overload - wrap/unwrap and delegate to unordered_map version
+    std::unordered_map<std::string, torch::Tensor> temp_map;
+    for (const auto& item : state_dict) {
+        temp_map[item.key()] = item.value();
+    }
+
+    create_moe_weight_pointers(temp_map, num_layers, num_experts);
+
+    // Copy back the pointer tensors
+    for (const auto& pair : temp_map) {
+        if (pair.first.find("_ptrs") != std::string::npos) {
+            state_dict.insert(pair.first, pair.second);
+        }
     }
 }
 

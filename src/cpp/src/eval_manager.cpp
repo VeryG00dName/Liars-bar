@@ -472,6 +472,9 @@ void EvalManager::finalize_model_loading() {
     // Unify attention weight processing and aliasing
     process_and_split_attention_weights(batched_weight_cache_);
 
+    // Create weight pointers for MoE experts (must be after GPU transfer)
+    create_moe_weight_pointers(batched_weight_cache_, num_layers_, num_experts_);
+
     // Create orchestrator for unified neural inference
     orchestrator_ = std::make_unique<execution_core::NeuralInferenceOrchestrator>(
         batched_weight_cache_,

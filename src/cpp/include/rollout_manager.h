@@ -36,6 +36,13 @@ struct TrajectoryData {
     std::vector<double> reward;
     std::vector<int> opp_target_action;
     int win{0};
+
+    // Last model input for training (saved before final inference)
+    torch::Tensor last_obs_sequence;
+    torch::Tensor last_action_sequence;
+    torch::Tensor last_agent_types;
+    torch::Tensor last_positions;
+    torch::Tensor last_action_masks;
 };
 
 struct SeatTrajectory {
@@ -51,6 +58,7 @@ struct SeatTrajectory {
     torch::Tensor last_action_sequence;
     torch::Tensor last_agent_types;
     torch::Tensor last_positions;
+    torch::Tensor last_action_masks;
 };
 
 struct EpisodeTracker {

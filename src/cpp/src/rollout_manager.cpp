@@ -618,6 +618,9 @@ void RolloutManager::finalize_model_loading() {
     // Add fixed buffers (LUTs)
     add_fixed_buffers(batched_weight_cache_, /*device=*/kInferenceDevice);
 
+    // Create weight pointers for MoE experts (must be after GPU transfer)
+    create_moe_weight_pointers(batched_weight_cache_, num_layers_, num_experts_);
+
     // Create orchestrator
     orchestrator_ = std::make_unique<execution_core::NeuralInferenceOrchestrator>(
         batched_weight_cache_,
@@ -654,6 +657,70 @@ void RolloutManager::run_neural_inference(
 
     if (!orchestrator_ || !weights_finalized_) {
         throw std::runtime_error("[RolloutManager] Orchestrator not initialized - call finalize_model_loading() first");
+    }
+
+    // Save model inputs for training policies BEFORE inference
+    for (const auto& kv : requests_by_policy) {
+        int policy_id = kv.first;
+        if (!is_training_policy(policy_id)) {
+            continue;  // Only save for training policies
+        }
+
+        const auto& requests = kv.second;
+        for (const auto& req : requests) {
+            int env_idx = req.env;
+            int seat = req.seat;
+
+            if (env_idx < 0 || env_idx >= static_cast<int>(episodes_.size())) {
+                continue;
+            }
+
+            auto& episode = episodes_[env_idx];
+            auto seat_it = episode.training_seats.find(seat);
+            if (seat_it == episode.training_seats.end()) {
+                continue;
+            }
+
+            auto& seat_tracker = seat_it->second;
+
+            // Convert request vectors to tensors and save
+            const int64_t seq_len = req.valid_len;
+            const int64_t obs_dim = 16;
+
+            if (seq_len > 0 && !req.obs_sequence.empty()) {
+                seat_tracker.last_obs_sequence = torch::from_blob(
+                    const_cast<float*>(req.obs_sequence.data()),
+                    {seq_len, obs_dim},
+                    torch::TensorOptions().dtype(torch::kFloat32)
+                ).clone();
+
+                seat_tracker.last_action_sequence = torch::from_blob(
+                    const_cast<int64_t*>(req.action_sequence.data()),
+                    {seq_len},
+                    torch::TensorOptions().dtype(torch::kLong)
+                ).clone();
+
+                seat_tracker.last_agent_types = torch::from_blob(
+                    const_cast<int64_t*>(req.agent_type_sequence.data()),
+                    {seq_len},
+                    torch::TensorOptions().dtype(torch::kLong)
+                ).clone();
+
+                seat_tracker.last_positions = torch::from_blob(
+                    const_cast<int64_t*>(req.position_sequence.data()),
+                    {seq_len},
+                    torch::TensorOptions().dtype(torch::kLong)
+                ).clone();
+
+                if (!req.action_mask_sequence.empty()) {
+                    seat_tracker.last_action_masks = torch::from_blob(
+                        const_cast<uint8_t*>(req.action_mask_sequence.data()),
+                        {seq_len, 7},
+                        torch::TensorOptions().dtype(torch::kUInt8)
+                    ).clone();
+                }
+            }
+        }
     }
 
     // Run unified inference for all neural policies
@@ -904,6 +971,13 @@ void RolloutManager::finalize_seat(EpisodeTracker& tracker, SeatTrajectory& seat
     if (our_last_step_idx >= 0 && our_last_step_idx < static_cast<int>(seat_tracker.data.reward.size())) {
         seat_tracker.data.reward[our_last_step_idx] += is_winner ? 1.0 : -1.0;
     }
+
+    // Copy last model inputs to trajectory data
+    seat_tracker.data.last_obs_sequence = seat_tracker.last_obs_sequence;
+    seat_tracker.data.last_action_sequence = seat_tracker.last_action_sequence;
+    seat_tracker.data.last_agent_types = seat_tracker.last_agent_types;
+    seat_tracker.data.last_positions = seat_tracker.last_positions;
+    seat_tracker.data.last_action_masks = seat_tracker.last_action_masks;
 
     completed_buffer_.push_back(std::move(seat_tracker.data));
     seat_tracker.data = TrajectoryData{};

@@ -22,6 +22,7 @@ def trace_model_from_checkpoint(
 
     metadata_path = Path(str(output_path) + ".max_seq_length")
     try:
+        # Use compile=True to load PPOReactiveModelScript, which is TorchScript-compatible
         agent = LearnerAutoregressiveAgent(device=device, player_id="tracer", compile=True)
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         state_dict = checkpoint.get("model_state_dict", checkpoint)

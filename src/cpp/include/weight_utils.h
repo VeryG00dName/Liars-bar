@@ -61,6 +61,15 @@ void create_moe_weight_pointers(
     int64_t num_experts
 );
 
+/**
+ * Overload for c10::Dict-backed weight dictionaries.
+ */
+void create_moe_weight_pointers(
+    c10::Dict<std::string, torch::Tensor>& state_dict,
+    int64_t num_layers,
+    int64_t num_experts
+);
+
 // Note: Previous C++ .pth loading helper removed.
 
 /**

@@ -42,7 +42,6 @@ class PPOReactiveModelScript(PPOReactiveModelBase):
         num_experts: int = 8,
         top_k: int = 2,
         expert_ffn_dim: Optional[int] = None,
-        use_gradient_checkpointing: bool = False,
     ) -> None:
         super().__init__(
             obs_dim=obs_dim,
@@ -55,8 +54,7 @@ class PPOReactiveModelScript(PPOReactiveModelBase):
             num_agent_types=num_agent_types,
             num_experts=num_experts,
             top_k=top_k,
-            expert_ffn_dim=expert_ffn_dim,
-            use_gradient_checkpointing=use_gradient_checkpointing,
+            expert_ffn_dim=expert_ffn_dim
         )
 
     def forward(
@@ -69,16 +67,30 @@ class PPOReactiveModelScript(PPOReactiveModelBase):
         padding_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Standard forward pass - delegates to base class.
+        Standard forward pass - inlined from base class for TorchScript compatibility.
 
         NOTE: This forward() is kept for TorchScript compatibility and legacy code.
         All new inference code should use C++ forward_packed for consistency.
         """
-        return super().forward(
+        # Inline the base class forward method (TorchScript can't compile super().forward())
+        encoded_inputs = self._encode_inputs(
             obs_sequence=obs_sequence,
             action_sequence=action_sequence,
             agent_types=agent_types,
             positions=positions,
-            action_masks=action_masks,
             padding_mask=padding_mask,
         )
+
+        causal_mask, key_padding = self._prepare_masks(encoded_inputs, padding_mask)
+
+        transformer_output, _, routing = self._run_transformer(
+            encoded_inputs,
+            causal_mask=causal_mask,
+            key_padding=key_padding,
+        )
+
+        action_logits, opp_logits, state_values, win_logits = self._head_outputs(
+            transformer_output, routing
+        )
+
+        return action_logits, opp_logits, state_values, win_logits

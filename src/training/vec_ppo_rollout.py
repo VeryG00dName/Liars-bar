@@ -104,15 +104,21 @@ class PPOVecRolloutManager:
             label for i, label in enumerate(player_labels) if i != training_seat
         )
 
+        # Model inputs are now saved in C++ and returned in TrajectoryData
+        # Add batch dimension [1, ...] to match expected format
         model_input = None
-        training_agent = self.policies.get(int(traj.training_policy_id))
-        if training_agent and hasattr(training_agent, "pop_last_model_input"):
-            model_input_raw = training_agent.pop_last_model_input(
-                int(traj.env_index), training_seat
-            )
-            if model_input_raw is None:
-                raise RuntimeError(f"Missing final model input for env {traj.env_index}, seat {training_seat}")
-            model_input = {k: v.cpu() if torch.is_tensor(v) else v for k, v in model_input_raw.items()}
+        if traj.last_obs_sequence is not None and traj.last_obs_sequence.numel() > 0:
+            seq_len = traj.last_obs_sequence.size(0)
+            model_input = {
+                "obs_sequence": traj.last_obs_sequence.unsqueeze(0).cpu(),  # [1, L, obs_dim]
+                "action_sequence": traj.last_action_sequence.unsqueeze(0).cpu(),  # [1, L]
+                "agent_types": traj.last_agent_types.unsqueeze(0).cpu(),  # [1, L]
+                "positions": traj.last_positions.unsqueeze(0).cpu(),  # [1, L]
+                "action_masks": traj.last_action_masks.unsqueeze(0).cpu() if traj.last_action_masks is not None and traj.last_action_masks.numel() > 0 else None,  # [1, L, 7]
+                "valid_lengths": torch.tensor([seq_len], dtype=torch.long),
+            }
+        else:
+            raise RuntimeError(f"Missing final model input for env {traj.env_index}, seat {training_seat}")
 
         return {
             "training_agent_seat": training_seat,
@@ -172,9 +178,9 @@ class PPOVecRolloutManager:
 
         total_duration = time.perf_counter() - perf_start
 
-        print("--- Python Rollout Performance ---")
-        print(f"  - cpp_rollout_total      : {cpp_duration:.6f}s")
-        print(f"  - py_convert_episodes    : {convert_duration:.6f}s")
-        print(f"  - total_collect_episodes : {total_duration:.6f}s")
+        #print("--- Python Rollout Performance ---")
+        #print(f"  - cpp_rollout_total      : {cpp_duration:.6f}s")
+        #print(f"  - py_convert_episodes    : {convert_duration:.6f}s")
+        #print(f"  - total_collect_episodes : {total_duration:.6f}s")
 
         return episodes

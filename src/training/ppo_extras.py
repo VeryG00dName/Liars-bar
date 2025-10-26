@@ -368,54 +368,26 @@ def ppo_losses_batched(
     episode_mask = torch.ones(our_idx.size(0), dtype=torch.bool, device=our_idx.device)
     step_mask = our_mask
 
-    # Use C++ forward_packed for consistency with eval/rollout
-    # Extract inputs from mi
+    # Use Python model forward for training (needs gradients)
+    # NOTE: Rollouts use C++ forward_packed for consistency, but training needs backprop
     obs_sequence = mi["obs_sequence"]
     action_sequence = mi["action_sequence"]
     agent_types = mi["agent_types"]
     positions = mi["positions"]
+    action_masks = mi.get("action_masks", None)
     padding_mask = mi.get("padding_mask", None)
 
-    # Get model weights (should already be in batched format)
-    # For single-policy training, we need to wrap the state_dict to have batch dim
-    state_dict = model.state_dict()
-
-    # Create batched weights dict with batch dimension [1, ...]
-    batched_weights = {}
-    for key, tensor in state_dict.items():
-        # Add batch dimension
-        batched_weights[key] = tensor.unsqueeze(0)
-
-    # Policy indices: all zeros for single policy
-    batch_size = obs_sequence.size(0)
-    policy_indices = torch.zeros(batch_size, dtype=torch.long, device=obs_sequence.device)
-
-    # Call C++ forward_packed
-    action_logits, opp_logits, state_values, win_logits = lb.forward_packed(
-        obs_sequence,
-        action_sequence,
-        agent_types,
-        positions,
-        batched_weights,
-        policy_indices,
-        padding_mask,
-        num_layers=config.NUM_LAYERS,
-        num_heads=config.NUM_HEADS,
-        hidden_dim=config.HIDDEN_DIM,
-        num_experts=config.NUM_EXPERTS,
-        top_k=config.TOP_K,
-        count_pad=4,
-        tflag_pad=3
+    # Call model's forward method (training model returns 6 values)
+    model_output = model(
+        obs_sequence=obs_sequence,
+        action_sequence=action_sequence,
+        agent_types=agent_types,
+        positions=positions,
+        action_masks=action_masks,
+        padding_mask=padding_mask,
     )
 
-    # Package outputs in the expected format
-    model_output = {
-        "action_logits": action_logits,
-        "opp_logits": opp_logits,
-        "state_values": state_values,
-        "win_logits": win_logits
-    }
-
+    # _single_pass_ppo expects a tuple, not a dict
     total_loss, metrics, moe_info = _single_pass_ppo(
         model_output,
         batch=batch,

@@ -80,7 +80,12 @@ void bind_rollout_manager(py::module_& m) {
         .def_readonly("value", &TrajectoryData::value)
         .def_readonly("reward", &TrajectoryData::reward)
         .def_readonly("opp_target_action", &TrajectoryData::opp_target_action)
-        .def_readonly("win", &TrajectoryData::win);
+        .def_readonly("win", &TrajectoryData::win)
+        .def_readonly("last_obs_sequence", &TrajectoryData::last_obs_sequence)
+        .def_readonly("last_action_sequence", &TrajectoryData::last_action_sequence)
+        .def_readonly("last_agent_types", &TrajectoryData::last_agent_types)
+        .def_readonly("last_positions", &TrajectoryData::last_positions)
+        .def_readonly("last_action_masks", &TrajectoryData::last_action_masks);
 
     py::class_<RolloutManager>(m, "RolloutManager")
         .def(py::init<>())

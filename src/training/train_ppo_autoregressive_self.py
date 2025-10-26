@@ -739,6 +739,7 @@ def train_generation(
     logging.info(f"Loading training policy {training_policy_id} into C++ RolloutManager...")
     try:
         training_state_dict = learner.model.state_dict()
+        # C++ will prestack expert weights during finalize_model_loading()
         rollout_manager.cpp_manager.load_model(training_policy_id, training_state_dict, "")
     except Exception as exc:
         logging.exception(f"Failed to load training policy {training_policy_id} into C++ manager: {exc}")
@@ -868,8 +869,7 @@ def train_generation(
     )
 
     # TEST: Limit to 10 updates for quick profiling
-    actual_max_updates = min(10, max_updates)
-    for update in range(1, actual_max_updates + 1):
+    for update in range(1, max_updates + 1):
         # -------- Rollout --------
         bucket_stats.clear()
         t0 = time.time()
@@ -879,6 +879,7 @@ def train_generation(
         # After gradient updates, we need to reload the training policy into C++ orchestrator
         try:
             updated_state_dict = learner.model.state_dict()
+            # C++ will prestack expert weights during finalize_model_loading()
             rollout_manager.cpp_manager.load_model(training_policy_id, updated_state_dict, "")
             rollout_manager.cpp_manager.finalize_model_loading()
         except Exception as exc:
