@@ -108,75 +108,21 @@ class GroupedMoEFunction(torch.autograd.Function):
         for count in m_sizes[:-1]:
             token_offsets.append(token_offsets[-1] + count)
 
-        # Prepare pointer arrays for C++ grouped GEMM
-        input_ptrs = []
-        w1_ptrs = []
-        w2_ptrs = []
-        b1_ptrs = []
-        b2_ptrs = []
-        output_ptrs = []
-        routing_weight_ptrs = []
-
-        # Allocate output buffer
-        hidden_grouped = torch.empty(total_routed_tokens, ffn_dim,
-                                      dtype=torch.float16, device=input_tensor.device)
-        output_grouped = torch.empty(total_routed_tokens, hidden_dim,
-                                      dtype=torch.float16, device=input_tensor.device)
-
-        offset = 0
-        for i, (M, policy_id, expert_id) in enumerate(zip(m_sizes, policy_ids, expert_ids)):
-            if M == 0:
-                continue
-
-            input_ptrs.append(input_grouped[offset:offset+M].data_ptr())
-            w1_ptrs.append(w1_weights[policy_id, expert_id].data_ptr())
-            w2_ptrs.append(w2_weights[policy_id, expert_id].data_ptr())
-            b1_ptrs.append(b1_biases[policy_id, expert_id].data_ptr())
-            b2_ptrs.append(b2_biases[policy_id, expert_id].data_ptr())
-            output_ptrs.append(output_grouped[offset:offset+M].data_ptr())
-            routing_weight_ptrs.append(routing_weights_grouped[offset:offset+M].data_ptr())
-
-            offset += M
-
-        # Call C++ grouped GEMM forward
-        # This is a simplified interface - actual forward may be more complex
-        # For now, we'll compute it manually using the existing forward logic
-
-        # Since we don't have a simple grouped_moe_forward binding yet,
-        # let's use PyTorch ops for now (this will be replaced with C++ call)
-        # TODO: Add C++ binding for forward that returns intermediate tensors
-
-        # Compute forward manually
-        hidden_grouped_list = []
-        output_grouped_list = []
-
-        offset = 0
-        for M, policy_id, expert_id in zip(m_sizes, policy_ids, expert_ids):
-            if M == 0:
-                continue
-
-            X = input_grouped[offset:offset+M]  # [M, H]
-            W1 = w1_weights[policy_id, expert_id]  # [F, H]
-            b1 = b1_biases[policy_id, expert_id]  # [F]
-            W2 = w2_weights[policy_id, expert_id]  # [H, F]
-            b2 = b2_biases[policy_id, expert_id]  # [H]
-            r = routing_weights_grouped[offset:offset+M]  # [M]
-
-            # W1 forward: Z = X @ W1^T + b1, H = GELU(Z)
-            Z = torch.nn.functional.linear(X, W1, b1)  # [M, F]
-            H = torch.nn.functional.gelu(Z)  # [M, F]
-
-            # W2 forward: Y = (H @ W2^T + b2) * r
-            Y_pre = torch.nn.functional.linear(H, W2, b2)  # [M, H]
-            Y = Y_pre * r.unsqueeze(-1)  # [M, H]
-
-            hidden_grouped_list.append(H)
-            output_grouped_list.append(Y)
-
-            offset += M
-
-        hidden_grouped = torch.cat(hidden_grouped_list, dim=0) if hidden_grouped_list else torch.empty(0, ffn_dim, dtype=torch.float16, device=input_tensor.device)
-        output_grouped = torch.cat(output_grouped_list, dim=0) if output_grouped_list else torch.empty(0, hidden_dim, dtype=torch.float16, device=input_tensor.device)
+        # Call C++ grouped forward binding and get both hidden_grouped and output_grouped
+        input_grouped_half = input_grouped.to(torch.float16)
+        routing_weights_f32 = routing_weights_grouped.to(torch.float32)
+        hidden_grouped, output_grouped = lb.grouped_moe_forward(
+            input_grouped_half,
+            w1_weights,
+            w2_weights,
+            b1_biases,
+            b2_biases,
+            routing_weights_f32,
+            m_sizes,
+            policy_ids,
+            expert_ids,
+            token_offsets,
+        )
 
         # Scatter-add back to original token order
         output_flat = torch.zeros(num_tokens, hidden_dim, dtype=torch.float16, device=input_tensor.device)
@@ -235,8 +181,8 @@ class GroupedMoEFunction(torch.autograd.Function):
         expert_ids = ctx.expert_ids
         token_offsets = ctx.token_offsets
 
-        # Flatten grad_output
-        grad_output_flat = grad_output.reshape(num_tokens, -1).contiguous()
+        # Flatten grad_output (backward kernel expects FP16)
+        grad_output_flat = grad_output.reshape(num_tokens, -1).to(torch.float16).contiguous()
 
         # Allocate gradient tensors (zero-initialized)
         grad_input = torch.zeros_like(grad_output_flat)

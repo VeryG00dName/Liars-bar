@@ -191,6 +191,126 @@ void bind_reactive_model(py::module_& m) {
         )doc"
     );
 
+    // Expose grouped MoE forward (training) that also returns hidden_grouped
+    m.def(
+        "grouped_moe_forward",
+        [](const torch::Tensor& input_grouped,
+           const torch::Tensor& w1_weights,
+           const torch::Tensor& w2_weights,
+           const torch::Tensor& b1_biases,
+           const torch::Tensor& b2_biases,
+           const torch::Tensor& routing_weights_grouped,
+           const std::vector<int64_t>& m_sizes,
+           const std::vector<int64_t>& policy_ids,
+           const std::vector<int64_t>& expert_ids,
+           const std::vector<int64_t>& token_offsets) {
+            TORCH_CHECK(input_grouped.dim() == 2, "input_grouped must be [total_tokens, hidden_dim]");
+            TORCH_CHECK(routing_weights_grouped.dim() == 1, "routing_weights_grouped must be [total_tokens]");
+            TORCH_CHECK(w1_weights.dim() == 4, "w1_weights must be [P,E,F,H]");
+            TORCH_CHECK(w2_weights.dim() == 4, "w2_weights must be [P,E,H,F]");
+            TORCH_CHECK(b1_biases.dim() == 3, "b1_biases must be [P,E,F]");
+            TORCH_CHECK(b2_biases.dim() == 3, "b2_biases must be [P,E,H]");
+
+            TORCH_CHECK(input_grouped.is_cuda(), "input_grouped must be CUDA tensor");
+            TORCH_CHECK(w1_weights.is_cuda() && w2_weights.is_cuda(), "weights must be CUDA tensors");
+            TORCH_CHECK(b1_biases.is_cuda() && b2_biases.is_cuda(), "biases must be CUDA tensors");
+            TORCH_CHECK(routing_weights_grouped.is_cuda(), "routing_weights_grouped must be CUDA tensor");
+
+            TORCH_CHECK(input_grouped.scalar_type() == torch::kFloat16, "input_grouped must be float16");
+            TORCH_CHECK(routing_weights_grouped.scalar_type() == torch::kFloat32, "routing_weights_grouped must be float32");
+            TORCH_CHECK(w1_weights.scalar_type() == torch::kFloat16, "w1_weights must be float16");
+            TORCH_CHECK(w2_weights.scalar_type() == torch::kFloat16, "w2_weights must be float16");
+            TORCH_CHECK(b1_biases.scalar_type() == torch::kFloat16, "b1_biases must be float16");
+            TORCH_CHECK(b2_biases.scalar_type() == torch::kFloat16, "b2_biases must be float16");
+
+            int64_t total_tokens = input_grouped.size(0);
+            int64_t hidden_dim = input_grouped.size(1);
+            int64_t num_policies = w1_weights.size(0);
+            int64_t num_experts = w1_weights.size(1);
+            int64_t ffn_dim = w1_weights.size(2);
+
+            TORCH_CHECK(static_cast<int64_t>(m_sizes.size()) == static_cast<int64_t>(policy_ids.size()), "m_sizes/policy_ids length mismatch");
+            TORCH_CHECK(static_cast<int64_t>(m_sizes.size()) == static_cast<int64_t>(expert_ids.size()), "m_sizes/expert_ids length mismatch");
+            TORCH_CHECK(static_cast<int64_t>(m_sizes.size()) == static_cast<int64_t>(token_offsets.size()), "m_sizes/token_offsets length mismatch");
+
+            // Allocate outputs
+            auto opts_half = input_grouped.options().dtype(torch::kFloat16);
+            torch::Tensor hidden_grouped = torch::empty({total_tokens, ffn_dim}, opts_half);
+            torch::Tensor output_grouped = torch::empty({total_tokens, hidden_dim}, opts_half);
+
+            // Compute per-group forward using ATen ops in FP32 for accumulation
+            // H = GELU(X @ W1^T + b1), Y = (H @ W2^T + b2) * r
+            for (size_t g = 0; g < m_sizes.size(); ++g) {
+                int64_t M = m_sizes[g];
+                if (M == 0) continue;
+
+                int64_t pi = policy_ids[g];
+                int64_t ei = expert_ids[g];
+                int64_t offset = token_offsets[g];
+
+                TORCH_CHECK(pi >= 0 && pi < num_policies, "policy id out of range");
+                TORCH_CHECK(ei >= 0 && ei < num_experts, "expert id out of range");
+                TORCH_CHECK(offset >= 0 && offset + M <= total_tokens, "token offset out of range");
+
+                auto X_half = input_grouped.narrow(0, offset, M).contiguous();
+                auto W1_half = w1_weights.index({pi, ei}).contiguous();   // [F, H]
+                auto b1_half = b1_biases.index({pi, ei}).contiguous();    // [F]
+                auto W2_half = w2_weights.index({pi, ei}).contiguous();   // [H, F]
+                auto b2_half = b2_biases.index({pi, ei}).contiguous();    // [H]
+                auto r = routing_weights_grouped.narrow(0, offset, M).contiguous(); // [M]
+
+                // Cast to FP32 for compute
+                auto X = X_half.to(torch::kFloat32);
+                auto W1 = W1_half.to(torch::kFloat32);
+                auto b1 = b1_half.to(torch::kFloat32);
+                auto W2 = W2_half.to(torch::kFloat32);
+                auto b2 = b2_half.to(torch::kFloat32);
+                auto r_f32 = r; // already float32
+
+                // Z = X @ W1^T + b1
+                auto Z = at::addmm(b1, X, W1.t());
+                auto H = at::gelu(Z);
+
+                // Y = (H @ W2^T + b2) * r
+                auto Y_pre = at::addmm(b2, H, W2.t());
+                auto Y = Y_pre * r_f32.unsqueeze(1);
+
+                // Cast and write to outputs
+                hidden_grouped.narrow(0, offset, M).copy_(H.to(torch::kFloat16));
+                output_grouped.narrow(0, offset, M).copy_(Y.to(torch::kFloat16));
+            }
+
+            return std::make_tuple(hidden_grouped, output_grouped);
+        },
+        py::arg("input_grouped"),
+        py::arg("w1_weights"),
+        py::arg("w2_weights"),
+        py::arg("b1_biases"),
+        py::arg("b2_biases"),
+        py::arg("routing_weights_grouped"),
+        py::arg("m_sizes"),
+        py::arg("policy_ids"),
+        py::arg("expert_ids"),
+        py::arg("token_offsets"),
+        R"doc(
+        Grouped MoE FFN forward used in training.
+
+        Computes per-group FFN in FP32 accumulate and returns both hidden activations (post-GELU)
+        and final outputs after W2 and routing-weight scaling. Shapes:
+          - input_grouped: [total_tokens, hidden_dim] (FP16)
+          - w1_weights:   [P, E, ffn_dim, hidden_dim] (FP16)
+          - w2_weights:   [P, E, hidden_dim, ffn_dim] (FP16)
+          - b1_biases:    [P, E, ffn_dim] (FP16)
+          - b2_biases:    [P, E, hidden_dim] (FP16)
+          - routing_weights_grouped: [total_tokens] (FP32)
+          - m_sizes/policy_ids/expert_ids/token_offsets: lists describing groups
+
+        Returns:
+          (hidden_grouped: [total_tokens, ffn_dim] FP16,
+           output_grouped: [total_tokens, hidden_dim] FP16)
+        )doc"
+    );
+
     // Expose weight utilities
     m.def(
         "prestack_moe_expert_weights",
