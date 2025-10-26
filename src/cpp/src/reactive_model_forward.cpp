@@ -1147,229 +1147,185 @@ forward_packed(
         // Use fused MoE CUDA kernel for expert computation
         torch::Tensor moe_output;
 
-        if (x.is_cuda()) {
-            // Use pre-cached pointer tensors for MoE expert weights
-            auto w1_ptrs_gpu = get_weight(batched_weights, layer_prefix + ".moe.experts.w1_ptrs");
-            auto b1_ptrs_gpu = get_weight(batched_weights, layer_prefix + ".moe.experts.b1_ptrs");
-            auto w2_ptrs_gpu = get_weight(batched_weights, layer_prefix + ".moe.experts.w2_ptrs");
-            auto b2_ptrs_gpu = get_weight(batched_weights, layer_prefix + ".moe.experts.b2_ptrs");
+        // Use pre-cached pointer tensors for MoE expert weights
+        auto w1_ptrs_gpu = get_weight(batched_weights, layer_prefix + ".moe.experts.w1_ptrs");
+        auto b1_ptrs_gpu = get_weight(batched_weights, layer_prefix + ".moe.experts.b1_ptrs");
+        auto w2_ptrs_gpu = get_weight(batched_weights, layer_prefix + ".moe.experts.w2_ptrs");
+        auto b2_ptrs_gpu = get_weight(batched_weights, layer_prefix + ".moe.experts.b2_ptrs");
 
-            // Pointer tensors are tiny; move to CPU for quick indexed lookup
-            auto w1_ptrs_cpu = w1_ptrs_gpu.cpu().contiguous();
-            auto b1_ptrs_cpu = b1_ptrs_gpu.cpu().contiguous();
-            auto w2_ptrs_cpu = w2_ptrs_gpu.cpu().contiguous();
-            auto b2_ptrs_cpu = b2_ptrs_gpu.cpu().contiguous();
+        // Pointer tensors are tiny; move to CPU for quick indexed lookup
+        auto w1_ptrs_cpu = w1_ptrs_gpu.cpu().contiguous();
+        auto b1_ptrs_cpu = b1_ptrs_gpu.cpu().contiguous();
+        auto w2_ptrs_cpu = w2_ptrs_gpu.cpu().contiguous();
+        auto b2_ptrs_cpu = b2_ptrs_gpu.cpu().contiguous();
 
-            const uint64_t* w1_ptr_data = w1_ptrs_cpu.data_ptr<uint64_t>();
-            const uint64_t* b1_ptr_data = b1_ptrs_cpu.data_ptr<uint64_t>();
-            const uint64_t* w2_ptr_data = w2_ptrs_cpu.data_ptr<uint64_t>();
-            const uint64_t* b2_ptr_data = b2_ptrs_cpu.data_ptr<uint64_t>();
-            const int64_t num_policies_in_cache = w1_ptrs_cpu.size(0);
-            const int64_t num_experts_in_cache = w1_ptrs_cpu.size(1);
+        const uint64_t* w1_ptr_data = w1_ptrs_cpu.data_ptr<uint64_t>();
+        const uint64_t* b1_ptr_data = b1_ptrs_cpu.data_ptr<uint64_t>();
+        const uint64_t* w2_ptr_data = w2_ptrs_cpu.data_ptr<uint64_t>();
+        const uint64_t* b2_ptr_data = b2_ptrs_cpu.data_ptr<uint64_t>();
+        const int64_t num_policies_in_cache = w1_ptrs_cpu.size(0);
+        const int64_t num_experts_in_cache = w1_ptrs_cpu.size(1);
 
 
-            auto orig_dtype = x.scalar_type();
-            auto x_fp16 = x.to(torch::kHalf).contiguous();
+        auto orig_dtype = x.scalar_type();
+        auto x_fp16 = x.to(torch::kHalf).contiguous();
 
-            const int64_t num_tokens = batch_size * seq_len;
-            auto x_flat = x_fp16.view({num_tokens, hidden_dim});
+        const int64_t num_tokens = batch_size * seq_len;
+        auto x_flat = x_fp16.view({num_tokens, hidden_dim});
 
-            auto topk_indices_long = topk_indices.to(torch::kLong).contiguous();
-            auto flat_expert_indices = topk_indices_long.reshape({-1});
-            auto flat_routing_weights = topk_weights.reshape({-1});
+        auto topk_indices_long = topk_indices.to(torch::kLong).contiguous();
+        auto flat_expert_indices = topk_indices_long.reshape({-1});
+        auto flat_routing_weights = topk_weights.reshape({-1});
 
-            auto token_indices = torch::arange(
-                num_tokens,
-                torch::dtype(torch::kLong).device(x.device())
-            );
-            auto expanded_token_indices = token_indices.unsqueeze(-1)
-                                                  .expand({num_tokens, top_k})
-                                                  .contiguous()
-                                                  .reshape({-1});
+        auto token_indices = torch::arange(
+            num_tokens,
+            torch::dtype(torch::kLong).device(x.device())
+        );
+        auto expanded_token_indices = token_indices.unsqueeze(-1)
+                                                .expand({num_tokens, top_k})
+                                                .contiguous()
+                                                .reshape({-1});
 
-            auto sort_tuple = torch::sort(flat_expert_indices);
-            auto sorted_expert_indices = std::get<0>(sort_tuple);
-            auto sort_order = std::get<1>(sort_tuple);
+        auto sort_tuple = torch::sort(flat_expert_indices);
+        auto sorted_expert_indices = std::get<0>(sort_tuple);
+        auto sort_order = std::get<1>(sort_tuple);
 
-            auto sorted_token_indices = expanded_token_indices.index_select(0, sort_order);
-            auto sorted_routing_weights = flat_routing_weights.index_select(0, sort_order);
+        auto sorted_token_indices = expanded_token_indices.index_select(0, sort_order);
+        auto sorted_routing_weights = flat_routing_weights.index_select(0, sort_order);
 
-            auto policy_indices_long = policy_indices_for_ops.to(torch::kLong);
-            auto policy_tokens = policy_indices_long.unsqueeze(1)
-                                                     .expand({batch_size, seq_len})
-                                                     .reshape({-1});
-            auto flat_policy_indices = policy_tokens.index_select(0, expanded_token_indices);
-            auto sorted_policy_indices = flat_policy_indices.index_select(0, sort_order);
+        auto policy_indices_long = policy_indices_for_ops.to(torch::kLong);
+        auto policy_tokens = policy_indices_long.unsqueeze(1)
+                                                    .expand({batch_size, seq_len})
+                                                    .reshape({-1});
+        auto flat_policy_indices = policy_tokens.index_select(0, expanded_token_indices);
+        auto sorted_policy_indices = flat_policy_indices.index_select(0, sort_order);
 
-            auto expert_inputs = x_flat.index_select(0, sorted_token_indices).contiguous();
-            auto expert_outputs = torch::zeros_like(expert_inputs);
+        auto expert_inputs = x_flat.index_select(0, sorted_token_indices).contiguous();
+        auto expert_outputs = torch::zeros_like(expert_inputs);
 
-            // Build grouped dispatch metadata on CPU to drive the grouped GEMM helper
-            auto sorted_expert_cpu = sorted_expert_indices.to(torch::kCPU);
-            auto sorted_policy_cpu = sorted_policy_indices.to(torch::kCPU);
+        // Build grouped dispatch metadata on CPU to drive the grouped GEMM helper
+        auto sorted_expert_cpu = sorted_expert_indices.to(torch::kCPU);
+        auto sorted_policy_cpu = sorted_policy_indices.to(torch::kCPU);
 
-            const auto* sorted_expert_ptr = sorted_expert_cpu.data_ptr<int64_t>();
-            const auto* sorted_policy_ptr = sorted_policy_cpu.data_ptr<int64_t>();
+        const auto* sorted_expert_ptr = sorted_expert_cpu.data_ptr<int64_t>();
+        const auto* sorted_policy_ptr = sorted_policy_cpu.data_ptr<int64_t>();
 
-            std::vector<uintptr_t> input_ptrs;
-            std::vector<uintptr_t> output_ptrs;
-            std::vector<uintptr_t> w1_ptrs;
-            std::vector<uintptr_t> b1_ptrs;
-            std::vector<uintptr_t> w2_ptrs;
-            std::vector<uintptr_t> b2_ptrs;
-            std::vector<int64_t> group_m_sizes;
-            std::vector<int64_t> group_policy_ids;
-            std::vector<int64_t> group_expert_ids;
-            std::vector<int64_t> group_token_offsets;
+        std::vector<uintptr_t> input_ptrs;
+        std::vector<uintptr_t> output_ptrs;
+        std::vector<uintptr_t> w1_ptrs;
+        std::vector<uintptr_t> b1_ptrs;
+        std::vector<uintptr_t> w2_ptrs;
+        std::vector<uintptr_t> b2_ptrs;
+        std::vector<int64_t> group_m_sizes;
+        std::vector<int64_t> group_policy_ids;
+        std::vector<int64_t> group_expert_ids;
+        std::vector<int64_t> group_token_offsets;
 
-            struct GroupRange {
-                int64_t start;
-                int64_t count;
-                int64_t expert;
-                int64_t policy;
-            };
-            std::vector<GroupRange> groups;
+        struct GroupRange {
+            int64_t start;
+            int64_t count;
+            int64_t expert;
+            int64_t policy;
+        };
+        std::vector<GroupRange> groups;
 
-            const int64_t total_routes = sorted_expert_indices.size(0);
-            const uintptr_t input_base = reinterpret_cast<uintptr_t>(expert_inputs.data_ptr<at::Half>());
-            const uintptr_t output_base = reinterpret_cast<uintptr_t>(expert_outputs.data_ptr<at::Half>());
-            const int64_t element_size = static_cast<int64_t>(expert_inputs.element_size());
+        const int64_t total_routes = sorted_expert_indices.size(0);
+        const uintptr_t input_base = reinterpret_cast<uintptr_t>(expert_inputs.data_ptr<at::Half>());
+        const uintptr_t output_base = reinterpret_cast<uintptr_t>(expert_outputs.data_ptr<at::Half>());
+        const int64_t element_size = static_cast<int64_t>(expert_inputs.element_size());
 
-            int64_t cursor = 0;
-            while (cursor < total_routes) {
-                const int64_t expert_id = sorted_expert_ptr[cursor];
-                const int64_t policy_id = sorted_policy_ptr[cursor];
+        int64_t cursor = 0;
+        while (cursor < total_routes) {
+            const int64_t expert_id = sorted_expert_ptr[cursor];
+            const int64_t policy_id = sorted_policy_ptr[cursor];
 
-                int64_t end = cursor + 1;
-                while (end < total_routes &&
-                       sorted_expert_ptr[end] == expert_id &&
-                       sorted_policy_ptr[end] == policy_id) {
-                    ++end;
-                }
-
-                const int64_t count = end - cursor;
-                const uintptr_t input_ptr = input_base + static_cast<uintptr_t>(cursor * hidden_dim * element_size);
-                const uintptr_t output_ptr = output_base + static_cast<uintptr_t>(cursor * hidden_dim * element_size);
-
-                // Bounds check: policy_id must be in [0, num_policies_in_cache)
-                TORCH_CHECK(policy_id >= 0 && policy_id < num_policies_in_cache,
-                    "Policy index out of range: policy_id=", policy_id,
-                    ", num_policies_in_cache=", num_policies_in_cache);
-                TORCH_CHECK(expert_id >= 0 && expert_id < num_experts,
-                    "Expert index out of range: expert_id=", expert_id,
-                    ", num_experts=", num_experts);
-
-                input_ptrs.push_back(input_ptr);
-                output_ptrs.push_back(output_ptr);
-
-                // Look up pre-cached, stable GPU pointers with bounds checking
-                const int64_t ptr_index = policy_id * num_experts_in_cache + expert_id;
-                const int64_t max_ptr_index = num_policies_in_cache * num_experts_in_cache;
-                TORCH_CHECK(ptr_index >= 0 && ptr_index < max_ptr_index,
-                    "Pointer table index out of bounds: ptr_index=", ptr_index,
-                    " (policy_id=", policy_id, ", expert_id=", expert_id, ")",
-                    ", max_index=", max_ptr_index,
-                    " (num_policies=", num_policies_in_cache, ", num_experts=", num_experts_in_cache, ")");
-
-                w1_ptrs.push_back(w1_ptr_data[ptr_index]);
-                b1_ptrs.push_back(b1_ptr_data[ptr_index]);
-                w2_ptrs.push_back(w2_ptr_data[ptr_index]);
-                b2_ptrs.push_back(b2_ptr_data[ptr_index]);
-
-                group_m_sizes.push_back(count);
-                group_policy_ids.push_back(policy_id);
-                group_expert_ids.push_back(expert_id);
-                group_token_offsets.push_back(cursor);
-
-                cursor = end;
+            int64_t end = cursor + 1;
+            while (end < total_routes &&
+                    sorted_expert_ptr[end] == expert_id &&
+                    sorted_policy_ptr[end] == policy_id) {
+                ++end;
             }
 
-            // Expert FFN dimension from one of the original tensors (shape only)
-            const int64_t ffn_dim = get_weight(batched_weights, layer_prefix + ".moe.experts.w1").size(-2);
+            const int64_t count = end - cursor;
+            const uintptr_t input_ptr = input_base + static_cast<uintptr_t>(cursor * hidden_dim * element_size);
+            const uintptr_t output_ptr = output_base + static_cast<uintptr_t>(cursor * hidden_dim * element_size);
 
-            // Build routing weight pointers for each group
-            std::vector<uintptr_t> routing_weight_ptrs;
-            routing_weight_ptrs.reserve(group_m_sizes.size());
+            // Bounds check: policy_id must be in [0, num_policies_in_cache)
+            TORCH_CHECK(policy_id >= 0 && policy_id < num_policies_in_cache,
+                "Policy index out of range: policy_id=", policy_id,
+                ", num_policies_in_cache=", num_policies_in_cache);
+            TORCH_CHECK(expert_id >= 0 && expert_id < num_experts,
+                "Expert index out of range: expert_id=", expert_id,
+                ", num_experts=", num_experts);
 
-            auto sorted_routing_weights_f32 = sorted_routing_weights.to(torch::kFloat32).contiguous();
-            const float* routing_base = sorted_routing_weights_f32.data_ptr<float>();
+            input_ptrs.push_back(input_ptr);
+            output_ptrs.push_back(output_ptr);
 
-            cursor = 0;
-            for (size_t i = 0; i < group_m_sizes.size(); ++i) {
-                const uintptr_t routing_ptr = reinterpret_cast<uintptr_t>(routing_base + cursor);
-                routing_weight_ptrs.push_back(routing_ptr);
-                cursor += group_m_sizes[i];
-            }
+            // Look up pre-cached, stable GPU pointers with bounds checking
+            const int64_t ptr_index = policy_id * num_experts_in_cache + expert_id;
+            const int64_t max_ptr_index = num_policies_in_cache * num_experts_in_cache;
+            TORCH_CHECK(ptr_index >= 0 && ptr_index < max_ptr_index,
+                "Pointer table index out of bounds: ptr_index=", ptr_index,
+                " (policy_id=", policy_id, ", expert_id=", expert_id, ")",
+                ", max_index=", max_ptr_index,
+                " (num_policies=", num_policies_in_cache, ", num_experts=", num_experts_in_cache, ")");
 
-            if (!group_m_sizes.empty()) {
-                grouped_ffn_gemm_forward(
-                    input_ptrs.data(),
-                    w1_ptrs.data(),
-                    b1_ptrs.data(),
-                    w2_ptrs.data(),
-                    b2_ptrs.data(),
-                    output_ptrs.data(),
-                    routing_weight_ptrs.data(),
-                    group_m_sizes.data(),
-                    group_policy_ids.data(),
-                    group_expert_ids.data(),
-                    group_token_offsets.data(),
-                    static_cast<int64_t>(group_m_sizes.size()),
-                    hidden_dim,
-                    ffn_dim
-                );
-            }
+            w1_ptrs.push_back(w1_ptr_data[ptr_index]);
+            b1_ptrs.push_back(b1_ptr_data[ptr_index]);
+            w2_ptrs.push_back(w2_ptr_data[ptr_index]);
+            b2_ptrs.push_back(b2_ptr_data[ptr_index]);
 
-            // Routing weights already applied in CUTLASS epilogue
-            auto moe_output_flat = torch::zeros({num_tokens, hidden_dim}, expert_outputs.options());
-            moe_output_flat.index_add_(0, sorted_token_indices, expert_outputs);
-            auto moe_output_half = moe_output_flat.view({batch_size, seq_len, hidden_dim});
+            group_m_sizes.push_back(count);
+            group_policy_ids.push_back(policy_id);
+            group_expert_ids.push_back(expert_id);
+            group_token_offsets.push_back(cursor);
 
-            moe_output = moe_output_half.to(orig_dtype);
-        } else {
-            // CPU fallback: Unrolled MoE computation
-            auto y = torch::zeros_like(x);
-
-            auto expert_w1 = get_weight(batched_weights, layer_prefix + ".moe.experts.w1");
-            auto expert_b1 = get_weight(batched_weights, layer_prefix + ".moe.experts.b1");
-            auto expert_w2 = get_weight(batched_weights, layer_prefix + ".moe.experts.w2");
-            auto expert_b2 = get_weight(batched_weights, layer_prefix + ".moe.experts.b2");
-
-            for (int64_t expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
-                auto route_mask = (topk_indices == expert_idx).any(/*dim=*/-1);
-
-                if (!route_mask.any().item<bool>()) {
-                    continue;
-                }
-
-                auto mask_indices = torch::where(route_mask);
-                auto batch_indices = mask_indices[0];
-                auto time_indices = mask_indices[1];
-
-                auto expert_inputs = x.index({batch_indices, time_indices});
-                auto expert_mask = (topk_indices.index({batch_indices, time_indices}) == expert_idx);
-                auto rank_in_topk = torch::where(expert_mask)[1];
-                auto expert_routing_weights = topk_weights.index({batch_indices, time_indices, rank_in_topk}).unsqueeze(-1);
-
-                auto policy_for_tokens = policy_indices_cpu.index({batch_indices});
-
-                auto w1 = expert_w1.index({expert_idx, policy_for_tokens});
-                auto b1 = expert_b1.index({expert_idx, policy_for_tokens});
-                auto w2 = expert_w2.index({expert_idx, policy_for_tokens});
-                auto b2 = expert_b2.index({expert_idx, policy_for_tokens});
-
-                auto hidden = torch::gelu(
-                    torch::bmm(expert_inputs.unsqueeze(1), w1.transpose(1, 2)) + b1.unsqueeze(1)
-                );
-                auto out = torch::bmm(hidden, w2.transpose(1, 2)) + b2.unsqueeze(1);
-                auto weighted_out = out.squeeze(1) * expert_routing_weights;
-
-                y.index_put_({batch_indices, time_indices},
-                              y.index({batch_indices, time_indices}) + weighted_out);
-            }
-
-            moe_output = y;
+            cursor = end;
         }
+
+        // Expert FFN dimension from one of the original tensors (shape only)
+        const int64_t ffn_dim = get_weight(batched_weights, layer_prefix + ".moe.experts.w1").size(-2);
+
+        // Build routing weight pointers for each group
+        std::vector<uintptr_t> routing_weight_ptrs;
+        routing_weight_ptrs.reserve(group_m_sizes.size());
+
+        auto sorted_routing_weights_f32 = sorted_routing_weights.to(torch::kFloat32).contiguous();
+        const float* routing_base = sorted_routing_weights_f32.data_ptr<float>();
+
+        cursor = 0;
+        for (size_t i = 0; i < group_m_sizes.size(); ++i) {
+            const uintptr_t routing_ptr = reinterpret_cast<uintptr_t>(routing_base + cursor);
+            routing_weight_ptrs.push_back(routing_ptr);
+            cursor += group_m_sizes[i];
+        }
+
+        if (!group_m_sizes.empty()) {
+            grouped_ffn_gemm_forward(
+                input_ptrs.data(),
+                w1_ptrs.data(),
+                b1_ptrs.data(),
+                w2_ptrs.data(),
+                b2_ptrs.data(),
+                output_ptrs.data(),
+                routing_weight_ptrs.data(),
+                group_m_sizes.data(),
+                group_policy_ids.data(),
+                group_expert_ids.data(),
+                group_token_offsets.data(),
+                static_cast<int64_t>(group_m_sizes.size()),
+                hidden_dim,
+                ffn_dim
+            );
+        }
+
+        // Routing weights already applied in CUTLASS epilogue
+        auto moe_output_flat = torch::zeros({num_tokens, hidden_dim}, expert_outputs.options());
+        moe_output_flat.index_add_(0, sorted_token_indices, expert_outputs);
+        auto moe_output_half = moe_output_flat.view({batch_size, seq_len, hidden_dim});
+
+        moe_output = moe_output_half.to(orig_dtype);
+        
         
         auto t_moe_1 = Clock::now();
         timers["fwd_moe_block_us"] += std::chrono::duration_cast<Microseconds>(t_moe_1 - t_moe_0);

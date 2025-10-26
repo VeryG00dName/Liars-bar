@@ -1471,7 +1471,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Master Self-Play Loop for PPO Autoregressive Agent")
     parser.add_argument("--pool-file", type=str, default="opponent_pool.json", help="Path to the opponent pool JSON file.")
     parser.add_argument("--sl-path", type=str, default=config.SL_TEACHER_CKPT, help="Path to the initial supervised learning checkpoint.")
-    parser.add_argument("--max-gens", type=int, default=10, help="Total number of generations to train.")
+    parser.add_argument("--max-gens", type=int, default=100, help="Total number of generations to train.")
     parser.add_argument("--challenger-freq", type=int, default=0, help="Inject a challenger from SL every N generations. Set to 0 to disable.")
     parser.add_argument("--master-run-name", type=str, default=None, help="Overall name for the self-play experiment folder.")
     parser.add_argument("--no-sl", action="store_true", help="Start generation 1 from scratch, without SL warm-start.")

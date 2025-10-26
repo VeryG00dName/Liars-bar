@@ -11,32 +11,52 @@ import argparse
 import math
 import pandas as pd
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+from collections import defaultdict
 
 # ------- CONFIG -------
-BASE_ROOT = r"logs"                     # parent logs folder
+BASE_ROOT = r"logs"
 GEN_PATTERN = re.compile(r"^gen_(\d+)$", re.IGNORECASE)
 
-# win-rate / episodes tags: PerOpponent/win_rate_vs_<i>, PerOpponent/episodes_vs_<i>
+# --- Per-Opponent Tags ---
 WINRATE_TAG = re.compile(r"^PerOpponent/win_rate_vs_(\d+)$")
 EPISODES_TAG = re.compile(r"^PerOpponent/episodes_vs_(\d+)$")
 
-# loss tags (accept / or \ in the TB tag)
-LOSS_TAGS = {
-    "BrickDiversity": re.compile(r"^Loss[\\/]+BrickDiversity$"),
-    "UsageBalance":   re.compile(r"^Loss[\\/]+UsageBalance$"),
-    "L1Sparsity":     re.compile(r"^Loss[\\/]+L1Sparsity$"),
+# --- Core Training Health & Performance Metrics ---
+CORE_METRICS_TAGS = {
+    "Rollout/WinRate": re.compile(r"^Rollout/WinRate$"),
+    "Loss/Policy": re.compile(r"^Loss/Policy$"),
+    "Loss/Value": re.compile(r"^Loss/Value$"),
+    "Loss/Opponent": re.compile(r"^Loss/Opponent$"),
+    "WinProb/Loss": re.compile(r"^WinProb/Loss$"),
+    "WinProb/Accuracy": re.compile(r"^WinProb/Accuracy$"),
+    "Policy/Entropy": re.compile(r"^Policy/Entropy$"),
+    "Policy/ApproxKL": re.compile(r"^Policy/ApproxKL$"),
+    "Policy/ClipFraction": re.compile(r"^Policy/ClipFraction$"),
+    "Acc/OpponentAction": re.compile(r"^Acc/OpponentAction$"),
 }
 
-# time tags
+# --- Time & Throughput Tags ---
 TIME_TAGS = {
-    "Time/Rollout": re.compile(r"^Time[\\/]+Rollout$"),
-    "Time/Optimize": re.compile(r"^Time[\\/]+Optimize$"),
-    "Time/Total": re.compile(r"^Time[\\/]+Total$"),
+    "Time/Rollout": re.compile(r"^Time/Rollout$"),
+    "Time/Optimize": re.compile(r"^Time/Optimize$"),
+    "Time/Total": re.compile(r"^Time/Total$"),
+    "Rollout/TokensPerSecond": re.compile(r"^Rollout/TokensPerSecond$"),
+    "Optimize/TokensPerSecond": re.compile(r"^Optimize/TokensPerSecond$"),
 }
+
+# --- Mixture of Experts (MoE) Tags ---
+MOE_METRICS_TAGS = {
+    "MoE/LoadBalance": re.compile(r"^MoE/LoadBalance$"),
+    "MoE/UsageEntropy": re.compile(r"^MoE/UsageEntropy$"),
+}
+EXPERT_AFFINITY_TAG = re.compile(r"^ExpertAffinity/Opponent_(\d+)_Prefers$")
+
 
 # ------- HELPERS -------
 def find_generation_dirs(base_dir: str):
-    """Yield (gen_name, gen_dir, gen_idx) for immediate subfolders like gen_4."""
+    """Yield (gen_dir, gen_idx) for immediate subfolders like gen_4."""
+    if not os.path.isdir(base_dir):
+        return
     for entry in sorted(os.listdir(base_dir)):
         m = GEN_PATTERN.match(entry)
         if not m:
@@ -48,298 +68,207 @@ def find_generation_dirs(base_dir: str):
 
 def load_scalars_from_dir(run_dir: str):
     """Load all scalar tags from a directory containing TensorBoard event files."""
-    ea = EventAccumulator(run_dir, size_guidance={"scalars": 0})
-    ea.Reload()
-    scalars = {}
-    for tag in ea.Tags().get("scalars", []):
-        scalars[tag] = ea.Scalars(tag)
-    return scalars
-
-def first_last(events):
-    """Return (first_event, last_event) sorted by (step, wall_time)."""
-    if not events:
-        return (None, None)
-    es = sorted(events, key=lambda e: (e.step, e.wall_time))
-    return es[0], es[-1]
-
-def to_float(v):
-    return float(v) if v is not None else float("nan")
-
-def to_int_or_nan(v):
-    if v is None:
-        return float("nan")
-    if isinstance(v, (int,)):
-        return int(v)
     try:
-        f = float(v)
-        if math.isfinite(f) and abs(f - round(f)) < 1e-9:
-            return int(round(f))
-        return f
-    except Exception:
+        ea = EventAccumulator(run_dir, size_guidance={"scalars": 0})
+        ea.Reload()
+        return {tag: ea.Scalars(tag) for tag in ea.Tags().get("scalars", [])}
+    except Exception as e:
+        print(f"Warning: Could not load TensorBoard data from {run_dir}. Error: {e}")
+        return {}
+
+def get_final_value(events):
+    """Return the value of the event with the highest step."""
+    if not events:
         return float("nan")
+    return float(sorted(events, key=lambda e: e.step)[-1].value)
 
-# ------- EXTRACTORS (WIN-RATE + SAMPLES) -------
-def extract_winrates_with_samples(base_dir: str) -> pd.DataFrame:
-    """
-    For each gen_* folder:
-      - Find first/last values for PerOpponent/win_rate_vs_<i>
-      - Also pull 'samples' from PerOpponent/episodes_vs_<i> at the SAME steps as first/last.
-    One row per (generation, opponent_i).
-    """
+def get_avg_of_final_quarter(events):
+    """Return the average value over the last 25% of steps."""
+    if not events:
+        return float("nan")
+    sorted_events = sorted(events, key=lambda e: e.step)
+    quarter_len = max(1, len(sorted_events) // 4)
+    final_quarter_events = sorted_events[-quarter_len:]
+    if not final_quarter_events:
+        return float("nan")
+    return sum(e.value for e in final_quarter_events) / len(final_quarter_events)
+
+# ------- EXTRACTORS -------
+
+def extract_core_metrics(base_dir: str) -> pd.DataFrame:
+    """Extracts key health and performance metrics, averaged over the final quarter of each generation."""
     rows = []
     for gen_dir, gen_idx in find_generation_dirs(base_dir):
         scalars = load_scalars_from_dir(gen_dir)
-
-        # Build maps: i -> events for win_rate and episodes
-        winrate_by_i = {}
-        episodes_by_i_step = {}  # i -> {step: value}
+        row = {"generation": gen_idx}
+        
+        matched_events = defaultdict(list)
         for tag, events in scalars.items():
-            m1 = WINRATE_TAG.match(tag)
-            if m1 and events:
-                winrate_by_i[int(m1.group(1))] = events
-                continue
-            m2 = EPISODES_TAG.match(tag)
-            if m2 and events:
-                i = int(m2.group(1))
-                episodes_by_i_step.setdefault(i, {})
-                for ev in events:
-                    episodes_by_i_step[i][ev.step] = ev.value
-
-        # Now create rows per i present in win-rate
-        for i, wr_events in winrate_by_i.items():
-            first_ev, last_ev = first_last(wr_events)
-            if first_ev is None:
-                continue
-            epi_map = episodes_by_i_step.get(i, {})
-            samples_start = to_int_or_nan(epi_map.get(first_ev.step))
-            samples_end   = to_int_or_nan(epi_map.get(last_ev.step))
-
-            rows.append({
-                "generation": gen_idx,
-                "opponent_i": i,
-                "start_value": to_float(first_ev.value),
-                "end_value":   to_float(last_ev.value),
-                "samples_start": samples_start,
-                "samples_end":   samples_end,
-            })
-
-    cols = [
-        "generation","opponent_i",
-        "start_value","end_value","samples_start","samples_end"
-    ]
-    df = pd.DataFrame(rows, columns=cols).sort_values(
-        ["generation","opponent_i"]
-    ).reset_index(drop=True)
-    return df
-
-# ------- EXTRACTORS (LOSSES) -------
-def extract_losses(base_dir: str) -> pd.DataFrame:
-    """
-    For each gen_* folder, collect start/end for Loss/BrickDiversity, Loss/UsageBalance, Loss/L1Sparsity.
-    One row per generation. Missing tags -> NaN.
-    """
-    def first_last_value(events):
-        f, l = first_last(events)
-        return (to_float(f.value) if f else float("nan"),
-                to_float(l.value) if l else float("nan"))
-
-    rows = []
-    for gen_dir, gen_idx in find_generation_dirs(base_dir):
-        scalars = load_scalars_from_dir(gen_dir)
-
-        matched = {k: [] for k in LOSS_TAGS.keys()}
-        for tag, events in scalars.items():
-            for key, pat in LOSS_TAGS.items():
+            for key, pat in CORE_METRICS_TAGS.items():
                 if pat.match(tag):
-                    matched[key] = events
+                    matched_events[key] = events
+                    break
+        
+        for key, events in matched_events.items():
+            row[f"{key}_avg_final"] = get_avg_of_final_quarter(events)
+            
+        rows.append(row)
 
-        bd_start, bd_end = first_last_value(matched["BrickDiversity"])
-        ub_start, ub_end = first_last_value(matched["UsageBalance"])
-        l1_start, l1_end = first_last_value(matched["L1Sparsity"])
+    if not rows:
+        return pd.DataFrame()
+        
+    df = pd.DataFrame(rows).sort_values("generation").reset_index(drop=True)
+    # Reorder columns for clarity
+    cols = ["generation"] + sorted([col for col in df.columns if col != "generation"])
+    return df[cols]
 
-        rows.append({
-            "generation": gen_idx,
-            "BrickDiversity_start": bd_start,
-            "BrickDiversity_end":   bd_end,
-            "Loss/L1Sparsity_start": l1_start,
-            "Loss/L1Sparsity_end":   l1_end,
-            "Loss/UsageBalance_start": ub_start,
-            "Loss/UsageBalance_end":   ub_end,
-        })
+def extract_moe_metrics(base_dir: str) -> pd.DataFrame:
+    """Extracts final MoE load balancing, entropy, and expert affinity for each generation."""
+    rows = []
+    for gen_dir, gen_idx in find_generation_dirs(base_dir):
+        scalars = load_scalars_from_dir(gen_dir)
+        row = {"generation": gen_idx}
 
-    cols = [
-        "generation",
-        "BrickDiversity_start","BrickDiversity_end",
-        "Loss/L1Sparsity_start","Loss/L1Sparsity_end",
-        "Loss/UsageBalance_start","Loss/UsageBalance_end",
-    ]
-    df = pd.DataFrame(rows, columns=cols).sort_values("generation").reset_index(drop=True)
+        # Handle general MoE metrics
+        for key, pat in MOE_METRICS_TAGS.items():
+            for tag, events in scalars.items():
+                if pat.match(tag):
+                    row[f"{key}_end"] = get_final_value(events)
+                    break
+        
+        # Handle expert affinity
+        affinity = {}
+        for tag, events in scalars.items():
+            m = EXPERT_AFFINITY_TAG.match(tag)
+            if m:
+                opponent_id = int(m.group(1))
+                affinity[opponent_id] = get_final_value(events)
+        
+        # Add affinity to the row, with keys like "Affinity_Opponent_7"
+        for opp_id, expert_id in sorted(affinity.items()):
+            row[f"Affinity_Opponent_{opp_id}"] = int(expert_id) if not math.isnan(expert_id) else float('nan')
+
+        rows.append(row)
+    
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows).sort_values("generation").reset_index(drop=True)
     return df
-
-# ------- EXTRACTORS (TIME WITH OUTLIER REMOVAL) -------
-def clean_step_values(values):
-    """
-    Remove up to 2 outliers in this step that are > 1.5 * step-average.
-    Return the remaining values (or original if nothing qualifies).
-    """
-    if not values:
-        return values
-    avg = sum(values) / len(values)
-    thresh = 1.5 * avg
-    # candidates are values strictly greater than threshold
-    candidates = [v for v in values if v > thresh]
-    # remove up to the 2 largest offenders
-    to_remove = sorted(candidates, reverse=True)[:2]
-    if not to_remove:
-        return values
-    remaining = values.copy()
-    # remove by value (only as many occurrences as listed in to_remove)
-    for v in to_remove:
-        try:
-            remaining.remove(v)
-        except ValueError:
-            pass
-    return remaining if remaining else values  # avoid emptying a step completely
-
-def average_time_over_gen(events):
-    """
-    Given all scalar events for a time tag in one generation:
-      - Group by step (episode)
-      - For each step, compute step-average AFTER removing up to 2 outliers (> 1.5x step-average)
-      - Return overall average across all kept samples (flattened), or NaN if none.
-    """
-    if not events:
-        return float("nan")
-    # group by step
-    by_step = {}
-    for ev in events:
-        by_step.setdefault(ev.step, []).append(float(ev.value))
-    kept = []
-    for step, vals in by_step.items():
-        cleaned = clean_step_values(vals)
-        kept.extend(cleaned)
-    if not kept:
-        return float("nan")
-    return sum(kept) / len(kept)
-
-def relative_minutes_to_last_step(events):
-    """
-    TensorBoard-style 'Relative' duration for a run:
-      - Sort by (step, wall_time)
-      - Take (last.wall_time - first.wall_time) in minutes.
-      - If no events, returns NaN.
-    """
-    if not events:
-        return float("nan")
-    es = sorted(events, key=lambda e: (e.step, e.wall_time))
-    first, last = es[0], es[-1]
-    rel_seconds = float(last.wall_time) - float(first.wall_time)
-    return rel_seconds / 60.0
 
 def extract_time_averages(base_dir: str) -> pd.DataFrame:
-    """
-    For each gen_* folder:
-      - Rollout/Optimize: cleaned averages (existing behavior)
-      - Total: TensorBoard 'Relative' duration (minutes) to final step
-    One row per generation. Missing tags -> NaN.
-    """
+    """Extracts cleaned time and throughput averages for each generation."""
+    rows = []
+    for gen_dir, gen_idx in find_generation_dirs(base_dir):
+        scalars = load_scalars_from_dir(gen_dir)
+        row = {"generation": gen_idx}
+        
+        for key, pat in TIME_TAGS.items():
+            for tag, events in scalars.items():
+                if pat.match(tag):
+                    if "Total" in key:
+                        # For total time, we take the final value which represents the cumulative time
+                        row[key] = get_final_value(events)
+                    else:
+                        # For rates and averages, we average the final quarter
+                        row[key] = get_avg_of_final_quarter(events)
+                    break
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+        
+    df = pd.DataFrame(rows).sort_values("generation").reset_index(drop=True)
+    return df
+
+def extract_winrates_with_samples(base_dir: str) -> pd.DataFrame:
+    """Extracts per-opponent win rates and sample counts at the end of each generation."""
     rows = []
     for gen_dir, gen_idx in find_generation_dirs(base_dir):
         scalars = load_scalars_from_dir(gen_dir)
 
-        # collect events per time tag
-        tag_events = {k: [] for k in TIME_TAGS.keys()}
+        winrate_by_opp = {}
+        episodes_by_opp = {}
         for tag, events in scalars.items():
-            for key, pat in TIME_TAGS.items():
-                if pat.match(tag):
-                    tag_events[key] = events
+            m_wr = WINRATE_TAG.match(tag)
+            if m_wr:
+                winrate_by_opp[int(m_wr.group(1))] = events
+                continue
+            m_ep = EPISODES_TAG.match(tag)
+            if m_ep:
+                episodes_by_opp[int(m_ep.group(1))] = events
+        
+        for opp_id, wr_events in winrate_by_opp.items():
+            ep_events = episodes_by_opp.get(opp_id, [])
+            rows.append({
+                "generation": gen_idx,
+                "opponent_id": opp_id,
+                "win_rate_end": get_final_value(wr_events),
+                "episodes_end": get_final_value(ep_events),
+            })
 
-        rollout_avg  = average_time_over_gen(tag_events["Time/Rollout"])
-        optimize_avg = average_time_over_gen(tag_events["Time/Optimize"])
+    if not rows:
+        return pd.DataFrame()
 
-        # relative duration (minutes) to final step for Total
-        total_relative_min = relative_minutes_to_last_step(tag_events["Time/Total"])
+    return pd.DataFrame(rows).sort_values(["generation", "opponent_id"]).reset_index(drop=True)
 
-        rows.append({
-            "generation": gen_idx,
-            "Time/Rollout_avg": rollout_avg,
-            "Time/Optimize_avg": optimize_avg,
-            "Time/Total_relative_min": total_relative_min,  # <-- renamed/clear
-        })
-
-    df = pd.DataFrame(rows, columns=[
-        "generation",
-        "Time/Rollout_avg",
-        "Time/Optimize_avg",
-        "Time/Total_relative_min",
-    ]).sort_values("generation").reset_index(drop=True)
-    return df
 
 # ------- CLI -------
 def main():
-    ap = argparse.ArgumentParser(description="Extract TB scalars for win rates (+samples), losses, and time averages.")
+    ap = argparse.ArgumentParser(description="Extract key training metrics from TensorBoard logs.")
     ap.add_argument("--target", type=int, required=True,
                     help="Test index, e.g., --target 25 -> logs\\test25")
     ap.add_argument("--root", type=str, default=BASE_ROOT,
-                    help="Root logs directory (default: logs)")
+                    help="Root logs directory (default: %(default)s)")
     args = ap.parse_args()
 
     base_dir = os.path.join(args.root, f"test{args.target}")
     if not os.path.isdir(base_dir):
         raise SystemExit(f"Directory not found: {base_dir}")
 
-    prefix = f"test_{args.target}_"  # <-- add this
+    prefix = f"test_{args.target}_"
 
-    # Win-rate + samples
-    df_win = extract_winrates_with_samples(base_dir)
-    out_win = os.path.join(base_dir, f"{prefix}per_opponent_win_rate_start_end.csv")
-    df_win.to_csv(out_win, index=False)
-
-    # Most-recent (highest opponent_i per generation)
-    if not df_win.empty:
-        # filter first
-        df_win_filtered = df_win[df_win["generation"] > 6]
-
-        if not df_win_filtered.empty:
-            idx = df_win_filtered.groupby("generation")["opponent_i"].idxmax()
-            df_most_recent = (
-                df_win_filtered.loc[idx, [
-                    "generation","opponent_i",
-                    "start_value","end_value","samples_start","samples_end",
-                ]]
-                .sort_values(["generation"])
-                .reset_index(drop=True)
-            )
-            out_most_recent = os.path.join(base_dir, f"{prefix}win_rate_vs_most_recent.csv")
-            df_most_recent.to_csv(out_most_recent, index=False)
-
-    # Losses
-    df_loss = extract_losses(base_dir)
-    out_loss = os.path.join(base_dir, f"{prefix}loss_start_end_by_generation.csv")
-    df_loss.to_csv(out_loss, index=False)
-
-    # Time averages
+    # --- Generate DataFrames ---
+    df_core = extract_core_metrics(base_dir)
     df_time = extract_time_averages(base_dir)
-    out_time = os.path.join(base_dir, f"{prefix}time_averages_by_generation.csv")
-    df_time.to_csv(out_time, index=False)
+    df_win = extract_winrates_with_samples(base_dir)
+    df_moe = extract_moe_metrics(base_dir)
 
-    # Console preview
-    print(f"Wrote: {out_win}  ({len(df_win)} rows)")
-    print(f"Wrote: {out_loss} ({len(df_loss)} rows)")
-    print(f"Wrote: {out_time} ({len(df_time)} rows)")
-    if not df_win.empty:
-        print("\nWin-rate preview:")
-        print(df_win.head(10).to_string(index=False))
-    if not df_loss.empty:
-        print("\nLosses preview:")
-        print(df_loss.head(10).to_string(index=False))
+    # --- Save CSVs ---
+    out_core = os.path.join(base_dir, f"{prefix}core_metrics_by_generation.csv")
+    df_core.to_csv(out_core, index=False, float_format="%.6f")
+
+    out_time = os.path.join(base_dir, f"{prefix}time_throughput_by_generation.csv")
+    df_time.to_csv(out_time, index=False, float_format="%.6f")
+
+    out_win = os.path.join(base_dir, f"{prefix}per_opponent_win_rate_end.csv")
+    df_win.to_csv(out_win, index=False, float_format="%.6f")
+    
+    out_moe = os.path.join(base_dir, f"{prefix}moe_metrics_by_generation.csv")
+    df_moe.to_csv(out_moe, index=False, float_format="%.6f")
+
+    # --- Console Preview ---
+    print(f"--- Results for {base_dir} ---")
+
+    if not df_core.empty:
+        print(f"\n[SUCCESS] Wrote Core Metrics ({len(df_core)} rows) to:\n{out_core}")
+        print("\nCore Metrics Preview:")
+        print(df_core.head(10).to_string(index=False))
+    
     if not df_time.empty:
-        print("\nTime averages preview:")
+        print(f"\n[SUCCESS] Wrote Time & Throughput ({len(df_time)} rows) to:\n{out_time}")
+        print("\nTime & Throughput Preview:")
         print(df_time.head(10).to_string(index=False))
+
     if not df_win.empty:
-        print(f"Wrote: {out_most_recent} ({len(df_most_recent)} rows)")
-        print("\nMost-recent (highest opponent_i) preview:")
-        print(df_most_recent.head(10).to_string(index=False))
+        print(f"\n[SUCCESS] Wrote Per-Opponent Win Rates ({len(df_win)} rows) to:\n{out_win}")
+        print("\nPer-Opponent Win Rate Preview:")
+        print(df_win.head(10).to_string(index=False))
+        
+    if not df_moe.empty:
+        print(f"\n[SUCCESS] Wrote MoE Metrics ({len(df_moe)} rows) to:\n{out_moe}")
+        print("\nMoE Metrics Preview:")
+        print(df_moe.head(10).to_string(index=False))
 
 if __name__ == "__main__":
     main()
