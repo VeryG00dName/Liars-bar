@@ -1,6 +1,7 @@
 #include "reactive_model_forward.h"
 #include "weight_utils.h"
 #include "indexed_kernels.h"
+#include "moe_backward_kernels.h"
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -94,6 +95,99 @@ void bind_reactive_model(py::module_& m) {
                 - opp_logits: [B, T, action_dim]
                 - state_values: [B, T, 1]
                 - win_logits: [B, T, 1]
+        )doc"
+    );
+
+    // Expose MoE backward function
+    m.def(
+        "grouped_moe_backward",
+        [](const torch::Tensor& grad_output,
+           const torch::Tensor& input_grouped,
+           const torch::Tensor& hidden_grouped,
+           const torch::Tensor& routing_weights_grouped,
+           const torch::Tensor& indices_grouped,
+           const torch::Tensor& w1_weights,
+           const torch::Tensor& w2_weights,
+           const torch::Tensor& b1_biases,
+           const torch::Tensor& b2_biases,
+           const std::vector<int64_t>& m_sizes,
+           const std::vector<int64_t>& policy_ids,
+           const std::vector<int64_t>& expert_ids,
+           const std::vector<int64_t>& token_offsets,
+           torch::Tensor& grad_input,
+           torch::Tensor& grad_w1,
+           torch::Tensor& grad_w2,
+           torch::Tensor& grad_b1,
+           torch::Tensor& grad_b2) {
+            lb::moe::cutlass_grouped_moe_backward(
+                grad_output,
+                input_grouped,
+                hidden_grouped,
+                routing_weights_grouped,
+                indices_grouped,
+                w1_weights,
+                w2_weights,
+                b1_biases,
+                b2_biases,
+                m_sizes,
+                policy_ids,
+                expert_ids,
+                token_offsets,
+                grad_input,
+                grad_w1,
+                grad_w2,
+                grad_b1,
+                grad_b2
+            );
+        },
+        py::arg("grad_output"),
+        py::arg("input_grouped"),
+        py::arg("hidden_grouped"),
+        py::arg("routing_weights_grouped"),
+        py::arg("indices_grouped"),
+        py::arg("w1_weights"),
+        py::arg("w2_weights"),
+        py::arg("b1_biases"),
+        py::arg("b2_biases"),
+        py::arg("m_sizes"),
+        py::arg("policy_ids"),
+        py::arg("expert_ids"),
+        py::arg("token_offsets"),
+        py::arg("grad_input"),
+        py::arg("grad_w1"),
+        py::arg("grad_w2"),
+        py::arg("grad_b1"),
+        py::arg("grad_b2"),
+        R"doc(
+        Custom backward pass for grouped MoE FFN layers.
+
+        Phase 1: Computes gradients for W1, W2, b1, b2 and input (dX).
+        Routing weights are FROZEN (no routing gradients).
+
+        Implements save-minimal policy: recomputes Z (pre-GELU activation)
+        instead of saving it from forward pass.
+
+        Args:
+            grad_output: Upstream gradient [batch_size, hidden_dim] FP16
+            input_grouped: Saved input in grouped order [total_tokens, hidden_dim] FP16
+            hidden_grouped: Saved hidden state in grouped order [total_tokens, ffn_dim] FP16
+            routing_weights_grouped: Saved routing weights [total_tokens] FP32
+            indices_grouped: Mapping to original token order [total_tokens] int64
+            w1_weights: W1 weights [num_policies, num_experts, ffn_dim, hidden_dim] FP16
+            w2_weights: W2 weights [num_policies, num_experts, hidden_dim, ffn_dim] FP16
+            b1_biases: b1 biases [num_policies, num_experts, ffn_dim] FP16
+            b2_biases: b2 biases [num_policies, num_experts, hidden_dim] FP16
+            m_sizes: Number of tokens per group
+            policy_ids: Policy ID per group
+            expert_ids: Expert ID per group
+            token_offsets: Token offset per group
+            grad_input: Output gradient w.r.t. input [batch_size, hidden_dim] FP16
+            grad_w1: Output gradient w.r.t. W1 [num_policies, num_experts, ffn_dim, hidden_dim] FP32
+            grad_w2: Output gradient w.r.t. W2 [num_policies, num_experts, hidden_dim, ffn_dim] FP32
+            grad_b1: Output gradient w.r.t. b1 [num_policies, num_experts, ffn_dim] FP32
+            grad_b2: Output gradient w.r.t. b2 [num_policies, num_experts, hidden_dim] FP32
+
+        Note: All gradient tensors must be pre-allocated and zero-initialized.
         )doc"
     );
 
