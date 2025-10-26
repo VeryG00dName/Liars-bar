@@ -1395,7 +1395,7 @@ def train_generation(
         if update % int(config.CHECKPOINT_INTERVAL) == 0:
             path = os.path.join(run_ckpt_dir, f"update_{update}.pth")
             to_save = getattr(learner.train_model, "_orig_mod", learner.train_model)
-            torch.save(model_to_save.state_dict(), final_path_pth)
+            torch.save(to_save.state_dict(), path)
 
     # 5. FINALIZE AND SAVE
     final_path_pth = os.path.join(run_ckpt_dir, "final.pth")
