@@ -38,12 +38,13 @@ class PPOVecRolloutManager:
             pass
 
         self._sync_cpp_max_sequence_lengths()
-        
-        self._last_model_call_stats: Dict[int, Dict[str, float]] = {}
 
     def get_last_model_call_stats(self) -> Dict[int, Dict[str, float]]:
-        """Return a shallow copy of the most recent per-policy model call stats."""
-        return {pid: dict(stats) for pid, stats in self._last_model_call_stats.items()}
+        """
+        Legacy method - returns empty dict since all inference now happens in C++.
+        Use rollout_manager.get_performance_stats() for C++ timing info.
+        """
+        return {}
 
     def _reset_policy_state(self) -> None:
         for policy in self.policies.values():
@@ -137,27 +138,15 @@ class PPOVecRolloutManager:
         max_batch_envs: Optional[int] = None,
         opponent_triplets: Optional[Sequence[Sequence[int]]] = None,
     ) -> List[Dict[str, Any]]:
-        perf = defaultdict(float)
+        """
+        Collect rollout episodes. C++ handles all inference internally via execution_core.
+        """
         perf_start = time.perf_counter()
 
         self._reset_policy_state()
-        self._last_model_call_stats = {}
-        model_call_stats: Dict[int, Dict[str, float]] = {}
-
-        def _record_model_call(policy_id: int, duration: float) -> None:
-            stats = model_call_stats.setdefault(
-                int(policy_id), {"count": 0, "total_time": 0.0, "min": float("inf"), "max": 0.0}
-            )
-            stats["count"] += 1
-            stats["total_time"] += duration
-            stats["min"] = min(stats["min"], duration)
-            stats["max"] = max(stats["max"], duration)
 
         training_policy_list = [int(pid) for pid in training_policy_ids]
-        training_policy_set = set(training_policy_list)
-
         seed = int(self.rng.integers(0, 2**31))
-
         self._sync_cpp_max_sequence_lengths()
 
         triplets_arg: List[List[int]] = []
@@ -165,8 +154,9 @@ class PPOVecRolloutManager:
             for triplet in opponent_triplets:
                 triplets_arg.append([int(x) for x in triplet])
 
-        start_rollouts_t = time.perf_counter()
-        self.rollout_manager.start_rollouts(
+        # C++ runs entire rollout internally (start + inference loop + get results)
+        cpp_start = time.perf_counter()
+        completed = self.rollout_manager.run_rollouts(
             num_episodes=num_episodes,
             num_players=num_players,
             training_policy_ids=training_policy_list,
@@ -174,74 +164,17 @@ class PPOVecRolloutManager:
             seed=seed,
             opponent_triplets=triplets_arg,
         )
-        perf["py_start_rollouts"] = time.perf_counter() - start_rollouts_t
-
-        while True:
-            collect_t = time.perf_counter()
-            requests_by_policy = self.rollout_manager.collect_requests_for_inference()
-            perf["py_collect_requests"] += time.perf_counter() - collect_t
-            if not requests_by_policy:
-                break
-
-            loop_start = time.perf_counter()
-            for policy_id_raw, payload in requests_by_policy.items():
-                policy_id = int(policy_id_raw)
-                agent = self.policies.get(policy_id)
-                if not agent:
-                    raise RuntimeError(f"No policy object for id: {policy_id}")
-
-                tensors_payload = payload.get("tensors")
-                actions = None
-                log_probs = None
-                values = None
-
-                if tensors_payload and hasattr(agent, "compute_actions"):
-                    if policy_id not in training_policy_set:
-                        raise RuntimeError(f"Received tensor payload for non-training policy {policy_id}.")
-
-                    autocast_enabled = self.device.type == "cuda"
-                    model_start = time.perf_counter()
-                    with torch.inference_mode():
-                        autocast_ctx = amp.autocast(
-                            device_type=self.device.type,
-                            dtype=torch.float16,
-                            enabled=autocast_enabled,
-                        )
-                        with autocast_ctx:
-                            actions, log_probs, values = agent.compute_actions(tensors_payload)
-                    duration = time.perf_counter() - model_start
-                    perf["py_model_inference_total"] += duration
-                    _record_model_call(policy_id, duration)
-                else:
-                    raise RuntimeError(f"non training agent asked to run inference id: {policy_id}")
-
-                submit_start = time.perf_counter()
-                self.rollout_manager.submit_inference_results(
-                    policy_id,
-                    np.ascontiguousarray(actions, dtype=np.uint8),
-                    np.ascontiguousarray(log_probs, dtype=np.float32) if log_probs is not None else None,
-                    np.ascontiguousarray(values, dtype=np.float32) if values is not None else None,
-                )
-                perf["py_submit_results"] += time.perf_counter() - submit_start
-
-            perf["py_inference_loop"] += time.perf_counter() - loop_start
-
-        completed_t = time.perf_counter()
-        completed = self.rollout_manager.get_completed_episodes()
-        perf["py_get_completed"] = time.perf_counter() - completed_t
+        cpp_duration = time.perf_counter() - cpp_start
 
         convert_t = time.perf_counter()
         episodes = [self._convert_completed_episode(traj) for traj in completed]
-        perf["py_convert_episodes"] = time.perf_counter() - convert_t
+        convert_duration = time.perf_counter() - convert_t
 
-        self._last_model_call_stats = {
-            pid: {"count": s["count"], "total_time": s["total_time"], "min": s["min"], "max": s["max"]}
-            for pid, s in model_call_stats.items()
-        }
+        total_duration = time.perf_counter() - perf_start
 
-        perf["total_collect_episodes"] = time.perf_counter() - perf_start
         print("--- Python Rollout Performance ---")
-        for key, value in sorted(perf.items()):
-            print(f"  - {key:<25}: {value:.6f}s")
+        print(f"  - cpp_rollout_total      : {cpp_duration:.6f}s")
+        print(f"  - py_convert_episodes    : {convert_duration:.6f}s")
+        print(f"  - total_collect_episodes : {total_duration:.6f}s")
 
         return episodes

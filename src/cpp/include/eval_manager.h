@@ -1,7 +1,7 @@
 #pragma once
 
 #include "vec_arena.h"
-#include "reactive_model_forward.h"
+#include "execution_core.h"
 #include "weight_utils.h"
 
 #include <array>
@@ -104,6 +104,7 @@ private:
     std::unordered_map<int, int> policy_id_to_cache_index_;
     bool weights_finalized_{false};
     std::unordered_map<int, int> policy_max_sequence_lengths_;
+    std::unique_ptr<execution_core::NeuralInferenceOrchestrator> orchestrator_;
     std::unordered_map<int, CppBotRegistryEntry> cpp_bot_registry_;
     static std::unordered_map<std::string, CppBotKind> bot_kind_cache_;
 
@@ -121,14 +122,10 @@ private:
     // Fine-grained timers captured inside forward pass and kernels
     std::unordered_map<std::string, std::chrono::microseconds> detailed_timers_;
 
-    struct RequestRef {
-        int policy_id;
-        size_t request_index;
-        const PolicyRequest* request;
-    };
+    void run_neural_inference(
+        const std::unordered_map<int, std::vector<PolicyRequest>>& requests_by_policy,
+        std::unordered_map<int, std::vector<uint8_t>>& out_actions);
 
-    void run_packed_historical_inference(const std::vector<RequestRef>& refs,
-                                         std::unordered_map<int, std::vector<uint8_t>>& out_actions);
     std::vector<uint8_t> run_cpp_bot(int policy_id, const std::vector<PolicyRequest>& requests);
     static CppBotKind parse_cpp_bot_kind(const std::string& name);
     std::unique_ptr<CppBotBase> make_cpp_bot_instance(CppBotKind kind,

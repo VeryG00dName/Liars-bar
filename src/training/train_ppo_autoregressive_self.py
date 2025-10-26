@@ -408,7 +408,7 @@ def _create_new_agent(agent_type: str, device: torch.device) -> LearnerAutoregre
     if agent_type == 'main':
         model = PPOReactiveModel(
             obs_dim=16,
-            use_gradient_checkpointing=bool(getattr(config, "USE_GRADIENT_CHECKPOINTING", False)),
+            use_gradient_checkpointing=bool(getattr(config, "USE_GRADIENT_CHECKPOINTING", True)),
         )
     else:  # Future branches (e.g., exploiter) can be added here.
         raise ValueError(f"Unknown agent type for creation: {agent_type}")
@@ -735,6 +735,14 @@ def train_generation(
                 f"Failed to register native C++ bot '{name}' (label {label}) with rollout manager: {exc}"
             )
 
+    # Load the training policy model into C++ for unified forward pass
+    logging.info(f"Loading training policy {training_policy_id} into C++ RolloutManager...")
+    try:
+        training_state_dict = learner.model.state_dict()
+        rollout_manager.cpp_manager.load_model(training_policy_id, training_state_dict, "")
+    except Exception as exc:
+        logging.exception(f"Failed to load training policy {training_policy_id} into C++ manager: {exc}")
+
     # Load historical agents from the opponent pool into the C++ manager
     loaded_historical_labels: List[int] = []
     pool_was_updated = False
@@ -804,7 +812,11 @@ def train_generation(
 
         # Now, load the (potentially newly created) model into the C++ manager
         try:
-            rollout_manager.cpp_manager.load_historical_model(policy_id, str(traced_path))
+            # Load TorchScript model and extract state_dict for new API
+            traced_model = torch.jit.load(str(traced_path), map_location=device)
+            state_dict = traced_model.state_dict()
+
+            rollout_manager.cpp_manager.load_model(policy_id, state_dict, str(checkpoint_path))
             loaded_historical_labels.append(policy_id)
             if existing_max_seq is not None:
                 try:
@@ -825,6 +837,10 @@ def train_generation(
         logging.info("Saving updated opponent pool with new TorchScript paths...")
         pool_manager.save()
 
+    # Finalize model loading to create the orchestrator and batch weights
+    # This batches all loaded models (training + historical) for unified forward pass
+    logging.info("Finalizing model loading to create execution orchestrator...")
+    rollout_manager.cpp_manager.finalize_model_loading()
 
     logging.info(
         "Native C++ bots registered: %s; historical TorchScript policies loaded: %s",
@@ -858,6 +874,15 @@ def train_generation(
         bucket_stats.clear()
         t0 = time.time()
         learner.sync_rollout_models()
+
+        # Sync updated training model weights to C++ for rollout inference
+        # After gradient updates, we need to reload the training policy into C++ orchestrator
+        try:
+            updated_state_dict = learner.model.state_dict()
+            rollout_manager.cpp_manager.load_model(training_policy_id, updated_state_dict, "")
+            rollout_manager.cpp_manager.finalize_model_loading()
+        except Exception as exc:
+            logging.exception(f"Failed to sync training policy weights to C++ after update {update}: {exc}")
 
         opponent_expert_affinity: DefaultDict[int, torch.Tensor]
         opponent_expert_affinity = defaultdict(
@@ -1351,19 +1376,8 @@ def train_generation(
         writer.add_scalar("Buffer/Tokens", buffer_token_total, update)
         writer.add_scalar("Acc/OpponentAction", avg.get("opp_action_acc", 0.0), update)
 
-        model_call_stats = rollout_manager.get_last_model_call_stats()
-
-        train_stats = model_call_stats.get(int(training_policy_id), {})
-        train_count = int(train_stats.get("count", 0) or 0)
-        train_total = float(train_stats.get("total_time", 0.0) or 0.0)
-        train_min = float(train_stats.get("min", 0.0) or 0.0) if train_count else 0.0
-        train_max = float(train_stats.get("max", 0.0) or 0.0) if train_count else 0.0
-        train_avg = (train_total / train_count) if train_count else 0.0
-
-        writer.add_scalar("ModelCalls/TrainCount", train_count, update)
-        writer.add_scalar("ModelCalls/TrainAvgMs", train_avg * 1000.0, update)
-        writer.add_scalar("ModelCalls/TrainMinMs", train_min * 1000.0, update)
-        writer.add_scalar("ModelCalls/TrainMaxMs", train_max * 1000.0, update)
+        # Note: Model call timing is now handled entirely in C++
+        # C++ performance stats can be retrieved via rollout_manager.cpp_manager.get_performance_stats()
 
         # Finalize logging timings and write time scalars
         if device.type == "cuda" and FORCE_CUDA_SYNC_FOR_TIMING:

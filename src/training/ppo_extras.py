@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from src import config
-
+from src.misc import lb
 
 def set_seed(seed: int = 42) -> None:
     """Seed Python, NumPy and Torch without forcing deterministic backends."""
@@ -357,20 +357,67 @@ def ppo_losses_batched(
     update_num: int = 0,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
     """
-    Batched PPO objective. This version is simplified and does not contain
-    the old compositional pressure (DCP) or dictionary regularization logic.
+    Batched PPO objective using C++ forward_packed for consistency with eval/rollout.
     """
     mi = batch["mi"]
     our_idx = batch["our_idx"].long()
     our_mask = batch["mask"].bool()
     actions = batch["actions"].long()
     old_logp = batch["old_logp"].float()
-    
+
     episode_mask = torch.ones(our_idx.size(0), dtype=torch.bool, device=our_idx.device)
     step_mask = our_mask
 
+    # Use C++ forward_packed for consistency with eval/rollout
+    # Extract inputs from mi
+    obs_sequence = mi["obs_sequence"]
+    action_sequence = mi["action_sequence"]
+    agent_types = mi["agent_types"]
+    positions = mi["positions"]
+    padding_mask = mi.get("padding_mask", None)
+
+    # Get model weights (should already be in batched format)
+    # For single-policy training, we need to wrap the state_dict to have batch dim
+    state_dict = model.state_dict()
+
+    # Create batched weights dict with batch dimension [1, ...]
+    batched_weights = {}
+    for key, tensor in state_dict.items():
+        # Add batch dimension
+        batched_weights[key] = tensor.unsqueeze(0)
+
+    # Policy indices: all zeros for single policy
+    batch_size = obs_sequence.size(0)
+    policy_indices = torch.zeros(batch_size, dtype=torch.long, device=obs_sequence.device)
+
+    # Call C++ forward_packed
+    action_logits, opp_logits, state_values, win_logits = lb.forward_packed(
+        obs_sequence,
+        action_sequence,
+        agent_types,
+        positions,
+        batched_weights,
+        policy_indices,
+        padding_mask,
+        num_layers=config.NUM_LAYERS,
+        num_heads=config.NUM_HEADS,
+        hidden_dim=config.HIDDEN_DIM,
+        num_experts=config.NUM_EXPERTS,
+        top_k=config.TOP_K,
+        count_pad=4,
+        tflag_pad=3
+    )
+
+    # Package outputs in the expected format
+    model_output = {
+        "action_logits": action_logits,
+        "opp_logits": opp_logits,
+        "state_values": state_values,
+        "win_logits": win_logits
+    }
+
     total_loss, metrics, moe_info = _single_pass_ppo(
-        model(**mi),
+        model_output,
         batch=batch,
         mi=mi,
         our_idx=our_idx,

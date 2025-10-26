@@ -85,6 +85,15 @@ void bind_rollout_manager(py::module_& m) {
     py::class_<RolloutManager>(m, "RolloutManager")
         .def(py::init<>())
 
+        .def("run_rollouts", &RolloutManager::run_rollouts,
+             py::arg("num_episodes"),
+             py::arg("num_players"),
+             py::arg("training_policy_ids"),
+             py::arg("max_batch_envs") = -1,
+             py::arg("seed") = 0,
+             py::arg("opponent_triplets") = std::vector<std::vector<int>>{},
+             "Run complete rollout cycle internally in C++. Returns completed episodes.")
+
         .def("start_rollouts", &RolloutManager::start_rollouts,
              py::arg("num_episodes"),
              py::arg("num_players"),
@@ -94,27 +103,6 @@ void bind_rollout_manager(py::module_& m) {
              py::arg("opponent_labels") = std::vector<int>{},
              py::arg("opponent_weights") = std::vector<double>{},
              py::arg("opponent_triplets") = std::vector<std::vector<int>>{})
-        
-        .def("collect_requests_for_inference", [](RolloutManager& self) {
-            auto grouped = self.collect_requests_for_inference();
-            py::dict out;
-            for (auto const& [policy_id, req_vec] : grouped) {
-                py::dict payload;
-                py::list req_list;
-                for (const auto& req : req_vec) {
-                    req_list.append(policy_request_to_dict(req));
-                }
-                payload["requests"] = req_list;
-                if (self.is_training_policy(policy_id) && !req_vec.empty()) {
-                    auto prepared = self.prepare_training_batch(req_vec, policy_id);
-                    payload["tensors"] = prepared_batch_to_dict(prepared);
-                } else {
-                    payload["tensors"] = py::none();
-                }
-                out[py::int_(policy_id)] = payload;
-            }
-            return out;
-        })
 
         .def("submit_inference_results",
              [](RolloutManager& self,
@@ -170,12 +158,20 @@ void bind_rollout_manager(py::module_& m) {
              py::arg("values") = py::none())
              
         .def("get_completed_episodes", &RolloutManager::get_completed_episodes)
-        .def("load_historical_model",
-            [](RolloutManager& self, int policy_id, const std::string& path) {
-                self.load_historical_model(policy_id, path);
+        .def("load_model",
+            [](RolloutManager& self, int policy_id, const py::dict& state_dict, const std::string& path) {
+                std::unordered_map<std::string, torch::Tensor> cpp_state_dict;
+                for (auto item : state_dict) {
+                    std::string key = py::str(item.first);
+                    torch::Tensor value = item.second.cast<torch::Tensor>();
+                    cpp_state_dict[key] = value;
+                }
+                self.load_model(policy_id, cpp_state_dict, path);
             },
             py::arg("policy_id"),
-            py::arg("path"))
+            py::arg("state_dict"),
+            py::arg("path") = "")
+        .def("finalize_model_loading", &RolloutManager::finalize_model_loading)
         .def("register_cpp_bot",
              [](RolloutManager& self, int policy_id, const std::string& name) {
                  self.register_cpp_bot(policy_id, name);

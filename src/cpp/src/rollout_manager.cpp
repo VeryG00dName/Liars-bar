@@ -124,6 +124,44 @@ RolloutManager::RolloutManager()
     arena_.set_max_sequence_length(default_max_sequence_length_);
 }
 
+std::vector<TrajectoryData> RolloutManager::run_rollouts(
+    int num_episodes,
+    int num_players,
+    const std::vector<int>& training_policy_ids,
+    int max_batch_envs,
+    uint32_t seed,
+    const std::vector<std::vector<int>>& opponent_triplets
+) {
+    // Initialize rollout
+    start_rollouts(num_episodes, num_players, training_policy_ids, max_batch_envs, seed,
+                   {}, {}, opponent_triplets);
+
+    // Run inference loop internally in C++
+    while (true) {
+        auto requests_by_policy = collect_requests_for_inference();
+        if (requests_by_policy.empty()) {
+            break;
+        }
+
+        // Run all inference (training + historical + cpp bots) via execution_core
+        std::unordered_map<int, std::vector<uint8_t>> actions_by_policy;
+        std::unordered_map<int, std::vector<float>> log_probs_by_policy;
+        std::unordered_map<int, std::vector<float>> values_by_policy;
+
+        run_neural_inference(requests_by_policy, actions_by_policy, log_probs_by_policy, values_by_policy);
+
+        // Submit results back for trajectory tracking
+        for (const auto& [policy_id, actions] : actions_by_policy) {
+            const auto& log_probs = log_probs_by_policy[policy_id];
+            const auto& values = values_by_policy[policy_id];
+            submit_inference_results(policy_id, actions, log_probs, values);
+        }
+    }
+
+    // Return completed episodes
+    return get_completed_episodes();
+}
+
 void RolloutManager::start_rollouts(int num_episodes,
                                     int num_players,
                                     const std::vector<int>& training_policy_ids,
@@ -136,11 +174,7 @@ void RolloutManager::start_rollouts(int num_episodes,
     timer_total_collect_ = std::chrono::microseconds(0);
     timer_log_rewards_ = std::chrono::microseconds(0);
     timer_cpp_bots_ = std::chrono::microseconds(0);
-    timer_historical_total_ = std::chrono::microseconds(0);
-    timer_hist_prep_ = std::chrono::microseconds(0);
-    timer_hist_weights_ = std::chrono::microseconds(0);
-    timer_hist_model_ = std::chrono::microseconds(0);
-    timer_hist_post_ = std::chrono::microseconds(0);
+    timer_neural_inference_ = std::chrono::microseconds(0);
     target_episodes_ = num_episodes * std::max(1, num_players);
     num_players_ = num_players;
     training_policy_ids_ = training_policy_ids;
@@ -308,36 +342,44 @@ std::unordered_map<int, std::vector<PolicyRequest>> RolloutManager::collect_requ
                 continue;
             }
 
-            auto model_it = historical_models_.find(policy_id);
-            if (model_it == historical_models_.end() || !model_it->second.module) {
-                continue;
+            // Check if this policy has neural weights loaded
+            auto cache_it = policy_id_to_cache_index_.find(policy_id);
+            if (cache_it == policy_id_to_cache_index_.end()) {
+                continue;  // Not a neural policy, skip
             }
 
             historical_groups.emplace_back(policy_id, &requests);
         }
 
+        // Run unified neural inference for all neural policies (historical + learner)
         if (!historical_groups.empty()) {
             bool success = false;
             auto h0 = std::chrono::high_resolution_clock::now();
             try {
-                auto action_map = run_batched_historical_inference(historical_groups,
-                                                                   timer_hist_prep_,
-                                                                   timer_hist_weights_,
-                                                                   timer_hist_model_,
-                                                                   timer_hist_post_);
+                std::unordered_map<int, std::vector<PolicyRequest>> neural_requests;
+                for (const auto& group : historical_groups) {
+                    neural_requests[group.first] = *group.second;
+                }
+
+                std::unordered_map<int, std::vector<uint8_t>> action_map;
+                std::unordered_map<int, std::vector<float>> log_prob_map;
+                std::unordered_map<int, std::vector<float>> value_map;
+
+                run_neural_inference(neural_requests, action_map, log_prob_map, value_map);
+
                 for (auto& kv : action_map) {
                     arena_.submit_actions(kv.first, kv.second);
                 }
                 success = true;
             } catch (const std::exception& ex) {
-                std::cerr << "[RolloutManager] Historical batch inference failed: " << ex.what()
+                std::cerr << "[RolloutManager] Neural inference failed: " << ex.what()
                           << std::endl;
             } catch (...) {
-                std::cerr << "[RolloutManager] Historical batch inference failed: unknown error"
+                std::cerr << "[RolloutManager] Neural inference failed: unknown error"
                           << std::endl;
             }
             auto h1 = std::chrono::high_resolution_clock::now();
-            timer_historical_total_ += std::chrono::duration_cast<std::chrono::microseconds>(h1 - h0);
+            timer_neural_inference_ += std::chrono::duration_cast<std::chrono::microseconds>(h1 - h0);
 
             if (!success) {
                 for (const auto& group : historical_groups) {
@@ -465,33 +507,130 @@ std::unordered_map<std::string, int64_t> RolloutManager::get_performance_stats()
     stats["total_collect_us"] = timer_total_collect_.count();
     stats["log_rewards_us"] = timer_log_rewards_.count();
     stats["cpp_bots_us"] = timer_cpp_bots_.count();
-    stats["historical_total_us"] = timer_historical_total_.count();
-    stats["hist_prep_batch_us"] = timer_hist_prep_.count();
-    stats["hist_prep_weights_us"] = timer_hist_weights_.count();
-    stats["hist_model_us"] = timer_hist_model_.count();
-    stats["hist_post_us"] = timer_hist_post_.count();
+    stats["neural_inference_us"] = timer_neural_inference_.count();
     return stats;
 }
 
-void RolloutManager::load_historical_model(int policy_id, const std::string& path) {
+void RolloutManager::load_model(
+    int policy_id,
+    const std::unordered_map<std::string, torch::Tensor>& state_dict,
+    const std::string& original_path) {
     try {
-        auto module = std::make_shared<torch::jit::Module>(torch::jit::load(path));
-        module->to(kInferenceDevice);
-        module->eval();
-        HistoricalModelEntry entry;
-        entry.module = std::move(module);
-        entry.cache_index = -1;
-        historical_models_[policy_id] = std::move(entry);
-        historical_weight_cache_dirty_ = true;
-    } catch (const c10::Error& err) {
-        std::cerr << "[RolloutManager] Failed to load TorchScript module from '" << path
-                  << "': " << err.what_without_backtrace() << std::endl;
-        throw;
+        torch::NoGradGuard guard;
+
+        // LUT keys that should be skipped (will be added by add_fixed_buffers)
+        const std::unordered_set<std::string> lut_keys = {
+            "lut_act_kind", "lut_count", "lut_table_flag"
+        };
+
+        // Store CPU FP32 weights as-is (skip LUTs)
+        std::unordered_map<std::string, torch::Tensor> processed_dict;
+        processed_dict.reserve(state_dict.size());
+        for (auto& kv : state_dict) {
+            if (lut_keys.find(kv.first) != lut_keys.end()) {
+                continue;
+            }
+
+            auto tensor = kv.second.detach();
+            if (!tensor.device().is_cpu()) {
+                tensor = tensor.to(torch::kCPU, /*non_blocking=*/false, /*copy=*/true);
+            }
+            if (tensor.dtype() != torch::kFloat32) {
+                tensor = tensor.to(torch::kFloat32);
+            }
+            tensor = tensor.contiguous();
+            processed_dict.emplace(kv.first, std::move(tensor));
+        }
+
+        staged_state_dicts_[policy_id] = std::move(processed_dict);
+        weights_finalized_ = false;
+
     } catch (const std::exception& err) {
-        std::cerr << "[RolloutManager] Failed to load TorchScript module from '" << path
-                  << "': " << err.what() << std::endl;
+        std::cerr << "[RolloutManager] Failed to load model for policy " << policy_id
+                  << ": " << err.what() << std::endl;
         throw;
     }
+}
+
+void RolloutManager::finalize_model_loading() {
+    torch::NoGradGuard guard;
+
+    batched_weight_cache_.clear();
+    policy_id_to_cache_index_.clear();
+    orchestrator_.reset();
+
+    if (staged_state_dicts_.empty()) {
+        weights_finalized_ = true;
+        return;
+    }
+
+    std::vector<int> policy_ids;
+    policy_ids.reserve(staged_state_dicts_.size());
+    for (const auto& kv : staged_state_dicts_) {
+        policy_ids.push_back(kv.first);
+    }
+    std::sort(policy_ids.begin(), policy_ids.end());
+
+    // Pre-stack MoE expert weights in each individual state_dict before batching (CPU)
+    for (auto& kv : staged_state_dicts_) {
+        prestack_moe_expert_weights(kv.second, num_layers_, num_experts_);
+    }
+
+    // Build mapping policy_id -> index used during inference
+    for (size_t idx = 0; idx < policy_ids.size(); ++idx) {
+        policy_id_to_cache_index_[policy_ids[idx]] = static_cast<int>(idx);
+    }
+
+    // Determine keys to process from the first policy's dict
+    const auto& first_dict = staged_state_dicts_.at(policy_ids[0]);
+    std::vector<std::string> keys;
+    keys.reserve(first_dict.size());
+    for (const auto& kv : first_dict) {
+        keys.push_back(kv.first);
+    }
+
+    // For each key, gather CPU tensors across policies, stack on CPU, then transfer to GPU as FP16
+    for (const auto& key : keys) {
+        std::vector<torch::Tensor> cpu_tensors;
+        cpu_tensors.reserve(policy_ids.size());
+        for (int policy_id : policy_ids) {
+            auto dict_it = staged_state_dicts_.find(policy_id);
+            if (dict_it == staged_state_dicts_.end()) {
+                throw std::runtime_error("Missing staged weights for policy " + std::to_string(policy_id));
+            }
+            auto& per_policy = dict_it->second;
+            auto itw = per_policy.find(key);
+            if (itw == per_policy.end()) {
+                throw std::runtime_error("Missing key '" + key + "' in staged weights for policy " + std::to_string(policy_id));
+            }
+            cpu_tensors.push_back(itw->second);
+        }
+
+        auto stacked_cpu = torch::stack(cpu_tensors, /*dim=*/0).contiguous();
+        auto stacked_gpu = stacked_cpu
+                               .to(kInferenceDevice, /*non_blocking=*/false, /*copy=*/true)
+                               .to(torch::kFloat16)
+                               .contiguous();
+
+        batched_weight_cache_.insert(key, stacked_gpu);
+    }
+
+    // Add fixed buffers (LUTs)
+    add_fixed_buffers(batched_weight_cache_, /*device=*/kInferenceDevice);
+
+    // Create orchestrator
+    orchestrator_ = std::make_unique<execution_core::NeuralInferenceOrchestrator>(
+        batched_weight_cache_,
+        policy_id_to_cache_index_,
+        max_inference_batch_size_,
+        num_layers_,
+        num_heads_,
+        hidden_dim_,
+        num_experts_,
+        top_k_
+    );
+
+    weights_finalized_ = true;
 }
 
 void RolloutManager::register_cpp_bot(int policy_id, const std::string& bot_name) {
@@ -504,6 +643,51 @@ void RolloutManager::register_cpp_bot(int policy_id, const std::string& bot_name
         std::cerr << "[RolloutManager] Failed to register C++ bot '" << bot_name
                   << "' for policy " << policy_id << ": " << err.what() << std::endl;
         throw;
+    }
+}
+
+void RolloutManager::run_neural_inference(
+    const std::unordered_map<int, std::vector<PolicyRequest>>& requests_by_policy,
+    std::unordered_map<int, std::vector<uint8_t>>& out_actions,
+    std::unordered_map<int, std::vector<float>>& out_log_probs,
+    std::unordered_map<int, std::vector<float>>& out_values) {
+
+    if (!orchestrator_ || !weights_finalized_) {
+        throw std::runtime_error("[RolloutManager] Orchestrator not initialized - call finalize_model_loading() first");
+    }
+
+    // Run unified inference for all neural policies
+    auto results = orchestrator_->run_inference(requests_by_policy);
+
+    // Unpack results by policy
+    for (const auto& kv : requests_by_policy) {
+        int policy_id = kv.first;
+        const auto& requests = kv.second;
+
+        std::vector<uint8_t> actions;
+        std::vector<float> log_probs;
+        std::vector<float> values;
+
+        actions.reserve(requests.size());
+        log_probs.reserve(requests.size());
+        values.reserve(requests.size());
+
+        for (size_t i = 0; i < requests.size(); ++i) {
+            auto result_it = results.find({policy_id, static_cast<int>(i)});
+            if (result_it == results.end()) {
+                throw std::runtime_error("[RolloutManager] Missing inference result for policy " +
+                                       std::to_string(policy_id) + " request " + std::to_string(i));
+            }
+
+            const auto& result = result_it->second;
+            actions.push_back(result.action);
+            log_probs.push_back(result.log_prob);
+            values.push_back(result.state_value);
+        }
+
+        out_actions[policy_id] = std::move(actions);
+        out_log_probs[policy_id] = std::move(log_probs);
+        out_values[policy_id] = std::move(values);
     }
 }
 
@@ -742,6 +926,7 @@ bool RolloutManager::is_training_policy(int policy_id) const {
     return training_policy_id_set_.find(policy_id) != training_policy_id_set_.end();
 }
 
+#if 0  // DEPRECATED: Replaced by batched weight cache in finalize_model_loading()
 void RolloutManager::rebuild_historical_weight_cache() {
     if (!historical_weight_cache_dirty_) {
         return;
@@ -892,6 +1077,9 @@ void RolloutManager::rebuild_historical_weight_cache() {
     historical_weight_cache_dirty_ = false;
 }
 
+#endif  // DEPRECATED rebuild_historical_weight_cache
+
+#if 0  // DEPRECATED: Replaced by run_neural_inference()
 std::unordered_map<int, std::vector<uint8_t>> RolloutManager::run_batched_historical_inference(
     const std::vector<std::pair<int, const std::vector<PolicyRequest>*>>& grouped,
     std::chrono::microseconds& prep_time_acc,
@@ -1172,6 +1360,9 @@ std::unordered_map<int, std::vector<uint8_t>> RolloutManager::run_batched_histor
     return results;
 }
 
+#endif  // DEPRECATED run_batched_historical_inference
+
+#if 0  // DEPRECATED: Replaced by run_neural_inference()
 std::vector<uint8_t> RolloutManager::run_historical_inference(torch::jit::Module& module,
                                                               const std::vector<PolicyRequest>& requests) {
     if (requests.empty()) {
@@ -1281,6 +1472,8 @@ std::vector<uint8_t> RolloutManager::run_historical_inference(torch::jit::Module
 
     return chosen;
 }
+
+#endif  // DEPRECATED run_historical_inference
 
 std::vector<uint8_t> RolloutManager::run_cpp_bot(int policy_id, const std::vector<PolicyRequest>& requests) {
     if (requests.empty()) {

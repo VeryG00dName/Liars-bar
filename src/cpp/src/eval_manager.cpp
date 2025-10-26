@@ -472,6 +472,18 @@ void EvalManager::finalize_model_loading() {
     // Unify attention weight processing and aliasing
     process_and_split_attention_weights(batched_weight_cache_);
 
+    // Create orchestrator for unified neural inference
+    orchestrator_ = std::make_unique<execution_core::NeuralInferenceOrchestrator>(
+        batched_weight_cache_,
+        policy_id_to_cache_index_,
+        max_inference_batch_size_,
+        num_layers_,
+        num_heads_,
+        hidden_dim_,
+        num_experts_,
+        top_k_
+    );
+
     weights_finalized_ = true;
 }
 
@@ -609,8 +621,7 @@ EvalOutcome EvalManager::run_roles(const std::vector<std::vector<int>>& roles,
         std::unordered_map<int, std::vector<uint8_t>> actions_by_policy;
         actions_by_policy.reserve(pending.size());
 
-        std::vector<RequestRef> historical_refs;
-        historical_refs.reserve(pending.size() * 4); 
+        std::unordered_map<int, std::vector<PolicyRequest>> neural_requests;
 
         for (const auto& kv : pending) {
             int policy_id = kv.first;
@@ -622,27 +633,20 @@ EvalOutcome EvalManager::run_roles(const std::vector<std::vector<int>>& roles,
                 continue;
             }
 
-            // If not a C++ bot, it must be a historical model
+            // If not a C++ bot, it must be a neural model
             if (policy_id_to_cache_index_.find(policy_id) == policy_id_to_cache_index_.end()) {
                 throw std::runtime_error("No registered model for policy " + std::to_string(policy_id));
             }
-            
-            actions_by_policy.emplace(policy_id, std::vector<uint8_t>(requests.size()));
-            for (size_t i = 0; i < requests.size(); ++i) {
-                historical_refs.push_back({policy_id, i, &requests[i]});
-            }
+
+            neural_requests[policy_id] = requests;
         }
 
-        std::sort(historical_refs.begin(), historical_refs.end(), [](const RequestRef& a, const RequestRef& b) {
-            return a.policy_id < b.policy_id;
-        });
-
         auto model_start = Clock::now();
-        if (!historical_refs.empty()) {
+        if (!neural_requests.empty()) {
             if (!weights_finalized_) {
                 finalize_model_loading();
             }
-            run_packed_historical_inference(historical_refs, actions_by_policy);
+            run_neural_inference(neural_requests, actions_by_policy);
         }
         auto model_end = Clock::now();
         timer_model_inference_ += std::chrono::duration_cast<Microseconds>(model_end - model_start);
@@ -741,189 +745,53 @@ EvalOutcome EvalManager::run_roles(const std::vector<std::vector<int>>& roles,
     return outcome;
 }
 
-void EvalManager::run_packed_historical_inference(const std::vector<RequestRef>& refs,
-                                                  std::unordered_map<int, std::vector<uint8_t>>& out_actions) {
-    if (refs.empty()) {
+void EvalManager::run_neural_inference(
+    const std::unordered_map<int, std::vector<PolicyRequest>>& requests_by_policy,
+    std::unordered_map<int, std::vector<uint8_t>>& out_actions) {
+
+    if (requests_by_policy.empty()) {
         return;
     }
 
     using Clock = std::chrono::high_resolution_clock;
     using Microseconds = std::chrono::microseconds;
 
-    if (batched_weight_cache_.empty()) {
-        throw std::runtime_error("Historical weight cache is empty");
+    if (!orchestrator_ || !weights_finalized_) {
+        throw std::runtime_error("[EvalManager] Orchestrator not initialized - call finalize_model_loading() first");
     }
 
-    torch::NoGradGuard no_grad;
+    auto t0 = Clock::now();
 
-    auto opts_long_device = torch::TensorOptions().dtype(torch::kInt64).device(kInferenceDevice);
+    // Run unified inference for all neural policies
+    auto results = orchestrator_->run_inference(requests_by_policy);
 
-    // --- Single Padded Sequence Length Strategy ---
+    auto t1 = Clock::now();
+    timer_hist_model_exec_ += std::chrono::duration_cast<Microseconds>(t1 - t0);
 
-    // 1. Find max sequence length in this entire group of requests
-    int64_t max_len = 1;
-    for (const auto& ref : refs) {
-        max_len = std::max(max_len, static_cast<int64_t>(ref.request->valid_len));
+    // Unpack results by policy
+    auto post_t0 = Clock::now();
+    for (const auto& kv : requests_by_policy) {
+        int policy_id = kv.first;
+        const auto& requests = kv.second;
+
+        std::vector<uint8_t> actions;
+        actions.reserve(requests.size());
+
+        for (size_t i = 0; i < requests.size(); ++i) {
+            auto result_it = results.find({policy_id, static_cast<int>(i)});
+            if (result_it == results.end()) {
+                throw std::runtime_error("[EvalManager] Missing inference result for policy " +
+                                       std::to_string(policy_id) + " request " + std::to_string(i));
+            }
+
+            const auto& result = result_it->second;
+            actions.push_back(result.action);
+        }
+
+        out_actions[policy_id] = std::move(actions);
     }
-
-    // 2. Pad this max length to the nearest "good" bucket size
-    constexpr std::array<int64_t, 8> kSeqLenBuckets = {{8 , 16, 32, 64, 128, 192, 256, 480}};
-    int64_t target_pad_len = kSeqLenBuckets.back();
-    for (int64_t b : kSeqLenBuckets) {
-        if (max_len <= b) {
-            target_pad_len = b;
-            break;
-        }
-    }
-
-    std::vector<size_t> batch_size_buckets;
-    for (size_t i = 10; i <= max_inference_batch_size_; i *= 2) {
-        batch_size_buckets.push_back(i);
-    }
-    if (batch_size_buckets.empty() || batch_size_buckets.back() != max_inference_batch_size_) {
-        batch_size_buckets.push_back(max_inference_batch_size_);
-    }
-
-    size_t offset = 0;
-    while (offset < refs.size()) {
-        const size_t num_real_requests = std::min(refs.size() - offset, max_inference_batch_size_);
-
-        size_t target_batch_size = num_real_requests;
-        for (size_t bucket_size : batch_size_buckets) {
-            if (num_real_requests <= bucket_size) {
-                target_batch_size = bucket_size;
-                break;
-            }
-        }
-        const size_t num_padding_requests = target_batch_size - num_real_requests;
-
-        auto prep_t0 = Clock::now();
-        std::vector<PolicyRequest> batch_requests;
-        batch_requests.reserve(target_batch_size);
-        std::vector<const RequestRef*> current_batch_refs;
-        current_batch_refs.reserve(num_real_requests);
-        std::vector<int64_t> cache_indices;
-        cache_indices.reserve(target_batch_size);
-        std::vector<size_t> sequential_indices;
-        sequential_indices.reserve(target_batch_size);
-
-        for (size_t i = 0; i < num_real_requests; ++i) {
-            const RequestRef& ref = refs[offset + i];
-            batch_requests.push_back(*ref.request);
-            current_batch_refs.push_back(&ref);
-            sequential_indices.push_back(i);
-            auto cache_it = policy_id_to_cache_index_.find(ref.policy_id);
-            if (cache_it == policy_id_to_cache_index_.end()) {
-                throw std::runtime_error("Missing cache index for policy " + std::to_string(ref.policy_id));
-            }
-            cache_indices.push_back(static_cast<int64_t>(cache_it->second));
-        }
-
-        if (num_padding_requests > 0 && num_real_requests > 0) {
-            const PolicyRequest& padding_template = *refs[offset].request;
-            int64_t last_valid_cache_index = cache_indices.back();
-            for (size_t i = 0; i < num_padding_requests; ++i) {
-                batch_requests.push_back(padding_template);
-                cache_indices.push_back(last_valid_cache_index);
-                sequential_indices.push_back(num_real_requests + i);
-            }
-        }
-        
-        // 4. Prepare batch with the UNIFIED target_pad_len and correct indices
-        auto tensor_batch = prepare_inference_batch(batch_requests, target_pad_len, kInferenceDevice, sequential_indices);
-        
-        if (!tensor_batch.obs_sequence.defined()) {
-            offset += num_real_requests;
-            continue;
-        }
-
-        if (tensor_batch.obs_sequence.dtype() != torch::kFloat16) {
-            tensor_batch.obs_sequence = tensor_batch.obs_sequence.to(torch::kFloat16);
-        }
-        
-        auto policy_index_tensor = torch::tensor(cache_indices, opts_long_device);
-        
-        auto prep_t1 = Clock::now();
-        timer_hist_prep_batch_ += std::chrono::duration_cast<Microseconds>(prep_t1 - prep_t0);
-
-        auto model_t0 = Clock::now();
-        auto [action_logits, opp_logits, state_values, win_logits] = forward_packed(
-            tensor_batch.obs_sequence,
-            tensor_batch.action_sequence,
-            tensor_batch.agent_types,
-            tensor_batch.positions,
-            batched_weight_cache_,
-            policy_index_tensor,
-            tensor_batch.padding_mask,
-            num_layers_,
-            num_heads_,
-            hidden_dim_,
-            num_experts_,
-            top_k_,
-            count_pad_,
-            tflag_pad_,
-            detailed_timers_
-        );
-        torch::cuda::synchronize();
-        auto model_t1 = Clock::now();
-        timer_hist_model_exec_ += std::chrono::duration_cast<Microseconds>(model_t1 - model_t0);
-
-        auto post_t0 = Clock::now();
-        action_logits = action_logits.contiguous();
-        auto valid_lengths_device = tensor_batch.valid_lengths;
-
-        const int64_t current_batch_size = static_cast<int64_t>(target_batch_size);
-        auto batch_indices = torch::arange(current_batch_size, opts_long_device);
-        auto last_indices = (valid_lengths_device - 1).clamp_min(0);
-        auto last_logits = action_logits.index({batch_indices, last_indices}).contiguous();
-        auto last_masks = tensor_batch.action_masks.index({batch_indices, last_indices}).contiguous();
-
-        if (num_real_requests > 0) {
-            auto real_has_legal = last_masks.slice(0, 0, num_real_requests).any(1);
-            if (!real_has_legal.all().item<bool>()) {
-                auto fallback_indices = real_has_legal.logical_not().nonzero().flatten();
-                for (int64_t i = 0; i < fallback_indices.size(0); ++i) {
-                    const int64_t row = fallback_indices[i].item<int64_t>();
-                    auto mask_row_tensor = last_masks.select(0, row);
-                    mask_row_tensor.fill_(false);
-                    bool assigned = false;
-                    const auto& ref = *current_batch_refs[static_cast<size_t>(row)];
-                    const auto& req = *ref.request;
-                    for (int j = 0; j < 7; ++j) {
-                        if (req.mask[j]) {
-                            mask_row_tensor.index_put_({j}, true);
-                            assigned = true;
-                        }
-                    }
-                    if (!assigned) mask_row_tensor.fill_(true);
-                    last_logits.select(0, row).fill_(0.0f);
-                }
-            }
-        }
-
-        last_logits.masked_fill_(~last_masks, -std::numeric_limits<float>::infinity());
-        auto probs = torch::softmax(last_logits.to(torch::kFloat32), /*dim=*/1);
-        auto actions_tensor = torch::multinomial(probs, /*num_samples=*/1);
-        actions_tensor = actions_tensor.squeeze(-1).to(torch::kCPU);
-
-        auto actions_ptr = actions_tensor.data_ptr<int64_t>();
-        for (size_t i = 0; i < num_real_requests; ++i) {
-            const auto& ref = *current_batch_refs[i];
-            auto out_it = out_actions.find(ref.policy_id);
-            if (out_it == out_actions.end()) {
-                throw std::runtime_error("Missing output buffer for policy " + std::to_string(ref.policy_id));
-            }
-            if (ref.request_index >= out_it->second.size()) {
-                out_it->second.resize(ref.request_index + 1);
-            }
-            out_it->second[ref.request_index] = static_cast<uint8_t>(actions_ptr[i]);
-        }
-
-        auto post_t1 = Clock::now();
-        timer_hist_post_ += std::chrono::duration_cast<Microseconds>(post_t1 - post_t0);
-        
-        offset += num_real_requests;
-    }
+    auto post_t1 = Clock::now();
+    timer_hist_post_ += std::chrono::duration_cast<Microseconds>(post_t1 - post_t0);
 }
 
 std::vector<uint8_t> EvalManager::run_cpp_bot(int policy_id,

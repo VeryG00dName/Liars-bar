@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vec_arena.h"
+#include "execution_core.h"
 
 #include <array>
 #include <cstddef>
@@ -14,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-#include <torch/script.h>
+#include <torch/torch.h>
 
 class CppBotBase {
 public:
@@ -44,6 +45,12 @@ struct SeatTrajectory {
     int last_training_step_idx{-1};
     std::array<uint8_t, Env::MAX_PLAYERS> last_penalties{};
     TrajectoryData data;
+
+    // Last model input (for training with C++ forward pass)
+    torch::Tensor last_obs_sequence;
+    torch::Tensor last_action_sequence;
+    torch::Tensor last_agent_types;
+    torch::Tensor last_positions;
 };
 
 struct EpisodeTracker {
@@ -70,6 +77,16 @@ class RolloutManager {
 public:
     RolloutManager();
 
+    // New unified API - runs entire rollout internally
+    std::vector<TrajectoryData> run_rollouts(
+        int num_episodes,
+        int num_players,
+        const std::vector<int>& training_policy_ids,
+        int max_batch_envs = -1,
+        uint32_t seed = 0,
+        const std::vector<std::vector<int>>& opponent_triplets = {});
+
+    // Legacy API for backwards compatibility
     void start_rollouts(int num_episodes,
                         int num_players,
                         const std::vector<int>& training_policy_ids,
@@ -96,7 +113,10 @@ public:
 
     std::vector<TrajectoryData> get_completed_episodes();
 
-    void load_historical_model(int policy_id, const std::string& path);
+    void load_model(int policy_id,
+                    const std::unordered_map<std::string, torch::Tensor>& state_dict,
+                    const std::string& original_path = "");
+    void finalize_model_loading();
     void register_cpp_bot(int policy_id, const std::string& bot_name);
 
     PreparedBatch prepare_training_batch(const std::vector<PolicyRequest>& requests,
@@ -142,18 +162,22 @@ private:
 
     std::vector<EpisodeTracker> episodes_;
     std::vector<TrajectoryData> completed_buffer_;
-    struct HistoricalModelEntry {
-        std::shared_ptr<torch::jit::Module> module;
-        int cache_index{-1};
-        // Cache for single-policy weight dict (when batch contains only this policy)
-        c10::Dict<std::string, torch::Tensor> single_policy_weight_dict;
-        bool single_policy_dict_cached{false};
-    };
 
-    std::unordered_map<int, HistoricalModelEntry> historical_models_;
-    std::vector<int> historical_weight_policy_order_;
-    std::unordered_map<std::string, torch::Tensor> historical_weight_cache_fp16_;
-    bool historical_weight_cache_dirty_{false};
+    // Model architecture parameters (inferred from first loaded model)
+    int64_t num_layers_{2};
+    int64_t num_heads_{4};
+    int64_t hidden_dim_{256};
+    int64_t num_experts_{8};
+    int64_t top_k_{2};
+    int64_t max_inference_batch_size_{512};
+
+    // Batched weights for all policies (learner + historical + bots use IDs)
+    std::unordered_map<int, std::unordered_map<std::string, torch::Tensor>> staged_state_dicts_;
+    c10::Dict<std::string, torch::Tensor> batched_weight_cache_;
+    std::unordered_map<int, int> policy_id_to_cache_index_;
+    bool weights_finalized_{false};
+
+    std::unique_ptr<execution_core::NeuralInferenceOrchestrator> orchestrator_;
     std::unordered_map<int, CppBotRegistryEntry> cpp_bot_registry_;
     static std::unordered_map<std::string, CppBotKind> bot_kind_cache_;
     std::vector<uint8_t> training_env_inactive_;
@@ -166,11 +190,7 @@ private:
     std::chrono::microseconds timer_total_collect_{0};
     std::chrono::microseconds timer_log_rewards_{0};
     std::chrono::microseconds timer_cpp_bots_{0};
-    std::chrono::microseconds timer_historical_total_{0};
-    std::chrono::microseconds timer_hist_prep_{0};
-    std::chrono::microseconds timer_hist_weights_{0};
-    std::chrono::microseconds timer_hist_model_{0};
-    std::chrono::microseconds timer_hist_post_{0};
+    std::chrono::microseconds timer_neural_inference_{0};
 
     std::vector<std::vector<int>> build_roles(int batch_size,
                                               int num_players,
@@ -186,15 +206,13 @@ private:
     void finalize_episode(EpisodeTracker& tracker);
     void mark_training_env_inactive(int env_idx);
     void finalize_seat(EpisodeTracker& tracker, SeatTrajectory& seat_tracker, Env& env);
-    void rebuild_historical_weight_cache();
-    std::unordered_map<int, std::vector<uint8_t>> run_batched_historical_inference(
-        const std::vector<std::pair<int, const std::vector<PolicyRequest>*>>& grouped,
-        std::chrono::microseconds& prep_time_acc,
-        std::chrono::microseconds& weight_time_acc,
-        std::chrono::microseconds& model_time_acc,
-        std::chrono::microseconds& post_time_acc);
-    std::vector<uint8_t> run_historical_inference(torch::jit::Module& module,
-                                                  const std::vector<PolicyRequest>& requests);
+
+    void run_neural_inference(
+        const std::unordered_map<int, std::vector<PolicyRequest>>& requests_by_policy,
+        std::unordered_map<int, std::vector<uint8_t>>& out_actions,
+        std::unordered_map<int, std::vector<float>>& out_log_probs,
+        std::unordered_map<int, std::vector<float>>& out_values);
+
     std::vector<uint8_t> run_cpp_bot(int policy_id, const std::vector<PolicyRequest>& requests);
     static CppBotKind parse_cpp_bot_kind(const std::string& name);
     std::unique_ptr<CppBotBase> make_cpp_bot_instance(CppBotKind kind,
