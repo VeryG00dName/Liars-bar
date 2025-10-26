@@ -1,4 +1,5 @@
 #include "moe_backward_kernels.h"
+#include "moe_cutlass_backward.h"
 #include "gelu_constants.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -426,15 +427,8 @@ __global__ void scatter_add_backward_kernel(
         // Load gradient value
         __half grad_val = grad_x_grouped[i];
 
-        // Atomic add to original gradient
-        // Requires sm_70+ (Volta/Ampere/Hopper) for native FP16 atomicAdd
-        #if __CUDA_ARCH__ >= 700
-            atomicAdd(&grad_x_original[dest_idx], grad_val);
-        #else
-            // ERROR: This code requires sm_70+ (Volta/Ampere/Hopper architecture)
-            // Compile with -gencode arch=compute_70,code=sm_70 or higher
-            #error "scatter_add_backward requires CUDA compute capability 7.0+ for FP16 atomics"
-        #endif
+        atomicAdd(&grad_x_original[dest_idx], grad_val);
+
     }
 }
 
