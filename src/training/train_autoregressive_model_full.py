@@ -24,7 +24,7 @@ from typing import List, Tuple
 from torch.utils.tensorboard import SummaryWriter
 from src.model.ppo_reactive_model_single import PPOReactiveModelSingle
 from src import config
-from src.training.train_extras import set_seed
+from src.training.ppo_extras import set_seed
 
 def setup_logging(log_file=None, level=logging.INFO):
     """Configure logging for the training script."""

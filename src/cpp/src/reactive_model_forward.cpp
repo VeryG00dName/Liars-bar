@@ -1,6 +1,5 @@
 #include "reactive_model_forward.h"
-#include "indexed_kernels.h"
-#include "moe_autograd_function.h"
+#include "indexed_kernels.h"#include "moe_autograd_function.h"
 
 #include <torch/torch.h>
 #include <ATen/ATen.h>
@@ -1086,6 +1085,21 @@ forward_packed_train(
       get_weight(batched_weights, "win_prob_heads." + std::to_string(i) + ".weight"),
       get_weight(batched_weights, "win_prob_heads." + std::to_string(i) + ".bias"),
       policy_indices_for_ops, timers_dummy));
+      get_weight(batched_weights, "action_heads." + std::to_string(i) + ".weight"),
+      get_weight(batched_weights, "action_heads." + std::to_string(i) + ".bias"),
+      policy_indices_for_ops)));
+    opp_logits_list.push_back(indexed_batched_linear_autograd(transformer_output,
+      get_weight(batched_weights, "opp_action_heads." + std::to_string(i) + ".weight"),
+      get_weight(batched_weights, "opp_action_heads." + std::to_string(i) + ".bias"),
+      policy_indices_for_ops)));
+    state_values_list.push_back(indexed_batched_linear_autograd(transformer_output,
+      get_weight(batched_weights, "reward_stream_heads." + std::to_string(i) + ".weight"),
+      get_weight(batched_weights, "reward_stream_heads." + std::to_string(i) + ".bias"),
+      policy_indices_for_ops)));
+    win_logits_list.push_back(indexed_batched_linear_autograd(transformer_output,
+      get_weight(batched_weights, "win_prob_heads." + std::to_string(i) + ".weight"),
+      get_weight(batched_weights, "win_prob_heads." + std::to_string(i) + ".bias"),
+      policy_indices_for_ops)));
   }
 
   auto action_stacked = torch::stack(action_logits_list, 2);

@@ -909,3 +909,46 @@ torch::Tensor indexed_batched_linear(
 
     return output.to(input.scalar_type());
 }
+
+/**
+ * Autograd-friendly version of indexed_batched_linear.
+ *
+ * Uses native PyTorch operations (F.linear) which automatically preserve gradients.
+ * Suitable for training forward pass where gradient flow is required.
+ *
+ * Trade-off: Slightly slower than custom CUDA kernels, but enables backpropagation.
+ */
+torch::Tensor indexed_batched_linear_autograd(
+    const torch::Tensor& input,           // [B, T, in_dim]
+    const torch::Tensor& weight_cache,    // [W, out_dim, in_dim]
+    const torch::Tensor& bias_cache,      // [W, out_dim]
+    const torch::Tensor& policy_indices   // [B]
+) {
+    TORCH_CHECK(input.dim() == 3, "input must be [B, T, in_dim]");
+    TORCH_CHECK(weight_cache.dim() == 3, "weight_cache must be [W, out_dim, in_dim]");
+    TORCH_CHECK(bias_cache.dim() == 2, "bias_cache must be [W, out_dim]");
+    TORCH_CHECK(policy_indices.dim() == 1, "policy_indices must be [B]");
+
+    const int64_t B = input.size(0);
+    const int64_t T = input.size(1);
+    const int64_t in_dim = input.size(2);
+    const int64_t out_dim = weight_cache.size(1);
+
+    // Index weights and biases for each batch element
+    // policy_indices: [B] -> select [B, out_dim, in_dim] and [B, out_dim]
+    auto weight_selected = weight_cache.index_select(0, policy_indices.to(torch::kLong));  // [B, out_dim, in_dim]
+    auto bias_selected = bias_cache.index_select(0, policy_indices.to(torch::kLong));      // [B, out_dim]
+
+    // Apply linear: output[b, t] = input[b, t] @ weight[b].T + bias[b]
+    // Flatten batch and sequence for einsum
+    auto input_flat = input.view({B * T, in_dim});                    // [B*T, in_dim]
+    auto weight_expanded = weight_selected.unsqueeze(1).expand({B, T, out_dim, in_dim}).reshape({B * T, out_dim, in_dim});  // [B*T, out_dim, in_dim]
+    auto bias_expanded = bias_selected.unsqueeze(1).expand({B, T, out_dim}).reshape({B * T, out_dim});  // [B*T, out_dim]
+
+    // Linear operation using torch.bmm (batched matrix multiply)
+    // output = input_flat @ weight_expanded.transpose(-2, -1) + bias_expanded
+    auto output_flat = torch::bmm(input_flat.unsqueeze(0).expand({B * T, 1, in_dim}),
+                                   weight_expanded.transpose(1, 2)).squeeze(1) + bias_expanded;
+
+    return output_flat.view({B, T, out_dim});
+}

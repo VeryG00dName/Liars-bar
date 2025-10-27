@@ -46,6 +46,19 @@ torch::Tensor indexed_batched_linear(
     std::unordered_map<std::string, std::chrono::microseconds>& timers,
     IndexedLinearEpilogue epilogue = IndexedLinearEpilogue::Bias);
 
+// Autograd-friendly version of indexed_batched_linear for training.
+// Uses native PyTorch operations which automatically preserve gradients.
+// input: [B, T, in_dim]
+// weight_cache: [W, out_dim, in_dim]
+// bias_cache: [W, out_dim]
+// policy_indices: [B]
+// Returns: [B, T, out_dim]
+torch::Tensor indexed_batched_linear_autograd(
+    const torch::Tensor& input,
+    const torch::Tensor& weight_cache,
+    const torch::Tensor& bias_cache,
+    const torch::Tensor& policy_indices);
+
 // Runs the grouped FFN GEMM forward pass using CUTLASS grouped kernels.
 // Each array argument is expected to contain device pointers for the operands.
 // Applies per-row routing weights in the GEMM epilogue (fused).
