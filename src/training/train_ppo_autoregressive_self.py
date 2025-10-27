@@ -561,9 +561,8 @@ def train_generation(
     logging.info(f"    TensorBoard Log Dir: {run_log_dir}")
     
     # =====================================================================
-    # 2. INITIALIZE LEARNER AND COMPILE DUAL MODELS (IF NOT ALREADY DONE)
+    # 2. INITIALIZE LEARNER AND EAGER MODELS (no torch.compile)
     # =====================================================================
-    compile_fn = getattr(torch, "compile", None)
 
     if learner is None:
         # ---- This block runs ONLY when creating a new agent from scratch or disk ----
@@ -590,17 +589,8 @@ def train_generation(
             train_model = type(learner.model)(**getattr(learner.model, "config", {})).to(device)
             train_model.load_state_dict(learner.model.state_dict())
 
-        # 2.3. Compile the TRAINING model (for static shapes)
-        if compile_fn:
-            try:
-                logging.info("Compiling training model (dynamic=False)...")
-                compiled_train = compile_fn(train_model, dynamic=False)
-                learner.train_model = compiled_train
-            except Exception as exc:
-                logging.warning(f"torch.compile (train) failed; using eager model: {exc}")
-                learner.train_model = train_model
-        else:
-            learner.train_model = train_model
+        # 2.3. Use eager TRAINING model (torch.compile disabled)
+        learner.train_model = train_model
         learner.train_model.train()
 
         # 2.4. Create and compile a single ROLLOUT model that supports dynamic sequence lengths
@@ -614,22 +604,8 @@ def train_generation(
         rollout_model = rollout_model.to(device)
         rollout_model.eval()
 
-        compiled_rollout = rollout_model
-        if compile_fn:
-            try:
-                logging.info(
-                    "Compiling rollout model (dynamic=True)..."
-                )
-                compiled_rollout = compile_fn(
-                    rollout_model,
-                    dynamic=True
-                )
-            except Exception as exc:
-                logging.warning(
-                    f"torch.compile (rollout) failed; using eager model: {exc}"
-                )
-
-        learner.rollout_model = compiled_rollout
+        # Use eager ROLLOUT model (torch.compile disabled)
+        learner.rollout_model = rollout_model
 
     else:
         # ---- This block runs for subsequent generations (gen > 1) ----

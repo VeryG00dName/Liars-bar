@@ -592,7 +592,8 @@ void cutlass_grouped_moe_backward(
     // ========================================================================
 
     // Gỹ: scaled gradient [total_tokens_grouped, hidden_dim] FP16
-    torch::Tensor grad_y_tilde = torch::empty_like(grad_output.index({torch::indexing::Slice(0, total_tokens_grouped)}));
+    torch::Tensor grad_y_tilde = torch::empty({total_tokens_grouped, hidden_dim},
+                                              torch::TensorOptions().dtype(torch::kFloat16).device(input_grouped.device()));
 
     // dH: hidden gradient [total_tokens_grouped, ffn_dim] FP16
     torch::Tensor grad_hidden = torch::empty({total_tokens_grouped, ffn_dim},

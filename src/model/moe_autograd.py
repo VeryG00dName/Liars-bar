@@ -134,7 +134,7 @@ class GroupedMoEFunction(torch.autograd.Function):
 
         # Save for backward
         ctx.save_for_backward(
-            input_grouped,
+            input_grouped_half,
             hidden_grouped,
             routing_weights_grouped,
             token_indices_grouped,
