@@ -553,5 +553,320 @@ void cutlass_grouped_moe_forward(
     }
 }
 
+// Variant that writes hidden to external buffer (no internal allocation)
+void cutlass_grouped_moe_forward_with_hidden(
+    const uintptr_t* input_ptrs,
+    const uintptr_t* w1_ptrs,
+    const uintptr_t* b1_ptrs,
+    const uintptr_t* w2_ptrs,
+    const uintptr_t* b2_ptrs,
+    const uintptr_t* hidden_ptrs,
+    const uintptr_t* output_ptrs,
+    const uintptr_t* routing_weight_ptrs,
+    const int64_t* m_sizes,
+    const int64_t* policy_ids,
+    const int64_t* expert_ids,
+    const int64_t* token_offsets,
+    int64_t group_count,
+    int64_t hidden_dim,
+    int64_t ffn_dim
+) {
+    if (group_count == 0) {
+        if (LB_MOE_LOG_GEMM()) {
+            std::cerr << "[LB][MOE_CUTLASS_FUSED] No groups to process" << std::endl;
+        }
+        return;
+    }
+
+    const bool log_gemm = LB_MOE_LOG_GEMM();
+    const bool log_cutlass = LB_MOE_LOG_CUTLASS();
+
+    if (log_cutlass) {
+        std::cerr << "[LB][MOE_CUTLASS_FUSED] Starting fused grouped MoE forward (ext hidden):" << std::endl;
+        std::cerr << "  group_count=" << group_count << std::endl;
+        std::cerr << "  hidden_dim=" << hidden_dim << std::endl;
+        std::cerr << "  ffn_dim=" << ffn_dim << std::endl;
+    }
+
+    // ========================================================================
+    // W1 GEMM with BIAS + GELU Fusion
+    // ========================================================================
+
+    // Setup problem sizes and pointers for W1 GEMM
+    std::vector<cutlass::gemm::GemmCoord> problem_sizes_w1;
+    std::vector<ElementA*> ptr_A_w1;
+    std::vector<ElementB*> ptr_B_w1;
+    std::vector<ElementOutput*> ptr_C_w1;  // Bias
+    std::vector<ElementOutput*> ptr_D_w1;  // Output -> external hidden buffer
+    std::vector<int64_t> lda_w1, ldb_w1, ldc_w1, ldd_w1;
+
+    for (int64_t i = 0; i < group_count; ++i) {
+        int64_t M = m_sizes[i];
+        int64_t K = hidden_dim;
+        int64_t N = ffn_dim;
+
+        if (M == 0) continue;
+
+        // GEMM: [M, K] @ [K, N] = [M, N]
+        problem_sizes_w1.push_back(cutlass::gemm::GemmCoord(M, N, K));
+
+        ptr_A_w1.push_back(reinterpret_cast<ElementA*>(input_ptrs[i]));
+        ptr_B_w1.push_back(reinterpret_cast<ElementB*>(w1_ptrs[i]));
+        ptr_C_w1.push_back(reinterpret_cast<ElementOutput*>(b1_ptrs[i]));  // Bias
+        ptr_D_w1.push_back(reinterpret_cast<ElementOutput*>(hidden_ptrs[i]));
+
+        lda_w1.push_back(K);  // Row-major input
+        ldb_w1.push_back(K);  // Column-major weights
+        ldc_w1.push_back(0);  // Bias stride = 0 (broadcast across rows)
+        ldd_w1.push_back(N);  // Row-major output
+
+        if (log_gemm) {
+            std::cerr << "[LB][MOE_GEMM_FUSED] W1 group=" << i
+                      << " M=" << M << " N=" << N << " K=" << K << std::endl;
+        }
+    }
+
+    // Execute W1 grouped GEMM with fused BIAS + GELU
+    if (!problem_sizes_w1.empty()) {
+        if (log_cutlass) {
+            std::cerr << "[LB][MOE_CUTLASS_FUSED] Launching W1 fused GEMM (bias+GELU) with "
+                      << problem_sizes_w1.size() << " problems" << std::endl;
+        }
+
+        // Device memory for problem metadata
+        cutlass::gemm::GemmCoord* problem_sizes_device_w1 = nullptr;
+        ElementA** ptr_A_device_w1 = nullptr;
+        ElementB** ptr_B_device_w1 = nullptr;
+        ElementOutput** ptr_C_device_w1 = nullptr;
+        ElementOutput** ptr_D_device_w1 = nullptr;
+        int64_t* lda_device_w1 = nullptr;
+        int64_t* ldb_device_w1 = nullptr;
+        int64_t* ldc_device_w1 = nullptr;
+        int64_t* ldd_device_w1 = nullptr;
+
+        size_t num_problems_w1 = problem_sizes_w1.size();
+        CUDA_CHECK(cudaMalloc(&problem_sizes_device_w1, num_problems_w1 * sizeof(cutlass::gemm::GemmCoord)));
+        CUDA_CHECK(cudaMalloc(&ptr_A_device_w1, num_problems_w1 * sizeof(ElementA*)));
+        CUDA_CHECK(cudaMalloc(&ptr_B_device_w1, num_problems_w1 * sizeof(ElementB*)));
+        CUDA_CHECK(cudaMalloc(&ptr_C_device_w1, num_problems_w1 * sizeof(ElementOutput*)));
+        CUDA_CHECK(cudaMalloc(&ptr_D_device_w1, num_problems_w1 * sizeof(ElementOutput*)));
+        CUDA_CHECK(cudaMalloc(&lda_device_w1, num_problems_w1 * sizeof(int64_t)));
+        CUDA_CHECK(cudaMalloc(&ldb_device_w1, num_problems_w1 * sizeof(int64_t)));
+        CUDA_CHECK(cudaMalloc(&ldc_device_w1, num_problems_w1 * sizeof(int64_t)));
+        CUDA_CHECK(cudaMalloc(&ldd_device_w1, num_problems_w1 * sizeof(int64_t)));
+
+        // Copy to device
+        CUDA_CHECK(cudaMemcpy(problem_sizes_device_w1, problem_sizes_w1.data(),
+                              num_problems_w1 * sizeof(cutlass::gemm::GemmCoord), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(ptr_A_device_w1, ptr_A_w1.data(),
+                              num_problems_w1 * sizeof(void*), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(ptr_B_device_w1, ptr_B_w1.data(),
+                              num_problems_w1 * sizeof(void*), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(ptr_C_device_w1, ptr_C_w1.data(),
+                              num_problems_w1 * sizeof(void*), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(ptr_D_device_w1, ptr_D_w1.data(),
+                              num_problems_w1 * sizeof(void*), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(lda_device_w1, lda_w1.data(),
+                              num_problems_w1 * sizeof(int64_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(ldb_device_w1, ldb_w1.data(),
+                              num_problems_w1 * sizeof(int64_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(ldc_device_w1, ldc_w1.data(),
+                              num_problems_w1 * sizeof(int64_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(ldd_device_w1, ldd_w1.data(),
+                              num_problems_w1 * sizeof(int64_t), cudaMemcpyHostToDevice));
+
+        GroupedGemmW1 gemm_w1;
+
+        int threadblock_count_w1 = GroupedGemmW1::sufficient(problem_sizes_w1.data(), num_problems_w1);
+
+        // Epilogue params: alpha=1, beta=1 for D = GELU(1*AB + 1*C)
+        typename GroupedGemmW1::EpilogueOutputOp::Params epilogue_params_w1(1.0f, 1.0f);
+
+        typename GroupedGemmW1::Arguments args_w1(
+            problem_sizes_device_w1,
+            num_problems_w1,
+            threadblock_count_w1,
+            epilogue_params_w1,
+            ptr_A_device_w1,
+            ptr_B_device_w1,
+            ptr_C_device_w1,
+            ptr_D_device_w1,
+            lda_device_w1,
+            ldb_device_w1,
+            ldc_device_w1,
+            ldd_device_w1,
+            problem_sizes_w1.data()
+        );
+
+        size_t workspace_size_w1 = gemm_w1.get_workspace_size(args_w1);
+        void* workspace_w1 = nullptr;
+        if (workspace_size_w1 > 0) {
+            CUDA_CHECK(cudaMalloc(&workspace_w1, workspace_size_w1));
+        }
+
+        CUTLASS_CHECK(gemm_w1.initialize(args_w1, workspace_w1));
+        CUTLASS_CHECK(gemm_w1.run());
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // Cleanup
+        if (workspace_w1) cudaFree(workspace_w1);
+        cudaFree(problem_sizes_device_w1);
+        cudaFree(ptr_A_device_w1);
+        cudaFree(ptr_B_device_w1);
+        cudaFree(ptr_C_device_w1);
+        cudaFree(ptr_D_device_w1);
+        cudaFree(lda_device_w1);
+        cudaFree(ldb_device_w1);
+        cudaFree(ldc_device_w1);
+        cudaFree(ldd_device_w1);
+
+        if (log_cutlass) {
+            std::cerr << "[LB][MOE_CUTLASS_FUSED] W1 fused GEMM completed" << std::endl;
+        }
+    }
+
+    // ========================================================================
+    // W2 GEMM
+    // ========================================================================
+
+    std::vector<cutlass::gemm::GemmCoord> problem_sizes_w2;
+    std::vector<ElementA*> ptr_A_w2;
+    std::vector<ElementB*> ptr_B_w2;
+    std::vector<ElementOutput*> ptr_C_w2;  // Bias (unused, beta=0)
+    std::vector<ElementOutput*> ptr_D_w2;  // Output
+    std::vector<int64_t> lda_w2, ldb_w2, ldc_w2, ldd_w2;
+
+    for (int64_t i = 0; i < group_count; ++i) {
+        int64_t M = m_sizes[i];
+        int64_t K = ffn_dim;
+        int64_t N = hidden_dim;
+
+        if (M == 0) continue;
+
+        problem_sizes_w2.push_back(cutlass::gemm::GemmCoord(M, N, K));
+        ptr_A_w2.push_back(reinterpret_cast<ElementA*>(hidden_ptrs[i]));
+        ptr_B_w2.push_back(reinterpret_cast<ElementB*>(w2_ptrs[i]));
+        ptr_C_w2.push_back(nullptr);  // No C matrix
+        ptr_D_w2.push_back(reinterpret_cast<ElementOutput*>(output_ptrs[i]));
+
+        lda_w2.push_back(K);
+        ldb_w2.push_back(K);
+        ldc_w2.push_back(N);
+        ldd_w2.push_back(N);
+    }
+
+    if (!problem_sizes_w2.empty()) {
+        if (log_cutlass) {
+            std::cerr << "[LB][MOE_CUTLASS_FUSED] Launching W2 GEMM with "
+                      << problem_sizes_w2.size() << " problems" << std::endl;
+        }
+
+        cutlass::gemm::GemmCoord* problem_sizes_device_w2 = nullptr;
+        ElementA** ptr_A_device_w2 = nullptr;
+        ElementB** ptr_B_device_w2 = nullptr;
+        ElementOutput** ptr_C_device_w2 = nullptr;
+        ElementOutput** ptr_D_device_w2 = nullptr;
+        int64_t* lda_device_w2 = nullptr;
+        int64_t* ldb_device_w2 = nullptr;
+        int64_t* ldc_device_w2 = nullptr;
+        int64_t* ldd_device_w2 = nullptr;
+
+        size_t num_problems_w2 = problem_sizes_w2.size();
+        CUDA_CHECK(cudaMalloc(&problem_sizes_device_w2, num_problems_w2 * sizeof(cutlass::gemm::GemmCoord)));
+        CUDA_CHECK(cudaMalloc(&ptr_A_device_w2, num_problems_w2 * sizeof(ElementA*)));
+        CUDA_CHECK(cudaMalloc(&ptr_B_device_w2, num_problems_w2 * sizeof(ElementB*)));
+        CUDA_CHECK(cudaMalloc(&ptr_C_device_w2, num_problems_w2 * sizeof(ElementOutput*)));
+        CUDA_CHECK(cudaMalloc(&ptr_D_device_w2, num_problems_w2 * sizeof(ElementOutput*)));
+        CUDA_CHECK(cudaMalloc(&lda_device_w2, num_problems_w2 * sizeof(int64_t)));
+        CUDA_CHECK(cudaMalloc(&ldb_device_w2, num_problems_w2 * sizeof(int64_t)));
+        CUDA_CHECK(cudaMalloc(&ldc_device_w2, num_problems_w2 * sizeof(int64_t)));
+        CUDA_CHECK(cudaMalloc(&ldd_device_w2, num_problems_w2 * sizeof(int64_t)));
+
+        CUDA_CHECK(cudaMemcpy(problem_sizes_device_w2, problem_sizes_w2.data(),
+                              num_problems_w2 * sizeof(cutlass::gemm::GemmCoord), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(ptr_A_device_w2, ptr_A_w2.data(),
+                              num_problems_w2 * sizeof(void*), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(ptr_B_device_w2, ptr_B_w2.data(),
+                              num_problems_w2 * sizeof(void*), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(ptr_C_device_w2, ptr_C_w2.data(),
+                              num_problems_w2 * sizeof(void*), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(ptr_D_device_w2, ptr_D_w2.data(),
+                              num_problems_w2 * sizeof(void*), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(lda_device_w2, lda_w2.data(),
+                              num_problems_w2 * sizeof(int64_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(ldb_device_w2, ldb_w2.data(),
+                              num_problems_w2 * sizeof(int64_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(ldc_device_w2, ldc_w2.data(),
+                              num_problems_w2 * sizeof(int64_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(ldd_device_w2, ldd_w2.data(),
+                              num_problems_w2 * sizeof(int64_t), cudaMemcpyHostToDevice));
+
+        GroupedGemmW2 gemm_w2;
+        int threadblock_count_w2 = GroupedGemmW2::sufficient(problem_sizes_w2.data(), num_problems_w2);
+        typename GroupedGemmW2::EpilogueOutputOp::Params epilogue_params_w2(1.0f, 0.0f);
+
+        typename GroupedGemmW2::Arguments args_w2(
+            problem_sizes_device_w2,
+            num_problems_w2,
+            threadblock_count_w2,
+            epilogue_params_w2,
+            ptr_A_device_w2,
+            ptr_B_device_w2,
+            ptr_C_device_w2,
+            ptr_D_device_w2,
+            lda_device_w2,
+            ldb_device_w2,
+            ldc_device_w2,
+            ldd_device_w2,
+            problem_sizes_w2.data()
+        );
+
+        size_t workspace_size_w2 = gemm_w2.get_workspace_size(args_w2);
+        void* workspace_w2 = nullptr;
+        if (workspace_size_w2 > 0) {
+            CUDA_CHECK(cudaMalloc(&workspace_w2, workspace_size_w2));
+        }
+
+        CUTLASS_CHECK(gemm_w2.initialize(args_w2, workspace_w2));
+        CUTLASS_CHECK(gemm_w2.run());
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        if (workspace_w2) cudaFree(workspace_w2);
+        cudaFree(problem_sizes_device_w2);
+        cudaFree(ptr_A_device_w2);
+        cudaFree(ptr_B_device_w2);
+        cudaFree(ptr_C_device_w2);
+        cudaFree(ptr_D_device_w2);
+        cudaFree(lda_device_w2);
+        cudaFree(ldb_device_w2);
+        cudaFree(ldc_device_w2);
+        cudaFree(ldd_device_w2);
+
+        if (log_cutlass) {
+            std::cerr << "[LB][MOE_CUTLASS_FUSED] W2 GEMM completed" << std::endl;
+        }
+    }
+
+    // Apply fused bias + routing weights to W2 outputs
+    for (int64_t i = 0; i < group_count; ++i) {
+        int64_t M = m_sizes[i];
+        if (M == 0) continue;
+
+        cutlass::half_t* output_ptr = reinterpret_cast<cutlass::half_t*>(output_ptrs[i]);
+        const cutlass::half_t* bias_ptr = reinterpret_cast<const cutlass::half_t*>(b2_ptrs[i]);
+        const float* routing_ptr = reinterpret_cast<const float*>(routing_weight_ptrs[i]);
+
+        int64_t total = M * hidden_dim;
+        int threads = 256;
+        int blocks = (total + threads - 1) / threads;
+        fused_bias_routing_kernel<<<blocks, threads>>>(output_ptr, bias_ptr, routing_ptr, M, hidden_dim);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    if (log_cutlass) {
+        std::cerr << "[LB][MOE_CUTLASS_FUSED] Fused MoE forward (ext hidden) completed" << std::endl;
+    }
+}
+
 } // namespace moe
 } // namespace lb

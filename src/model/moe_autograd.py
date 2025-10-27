@@ -138,6 +138,7 @@ class GroupedMoEFunction(torch.autograd.Function):
             hidden_grouped,
             routing_weights_grouped,
             token_indices_grouped,
+            expert_indices_grouped,
             w1_weights,
             w2_weights,
             b1_biases,
@@ -151,6 +152,9 @@ class GroupedMoEFunction(torch.autograd.Function):
         ctx.seq_len = seq_len
         ctx.num_tokens = num_tokens
         ctx.compute_routing_grads = compute_routing_grads
+        # Save top-k mapping for routing gradient backprop
+        ctx.topk_indices = topk_indices  # [num_tokens, K]
+        ctx.topk_weights = topk_weights  # [num_tokens, K]
 
         return output
 
@@ -171,7 +175,8 @@ class GroupedMoEFunction(torch.autograd.Function):
         """
         # Retrieve saved tensors
         (input_grouped, hidden_grouped, routing_weights_grouped,
-         token_indices_grouped, w1_weights, w2_weights, b1_biases, b2_biases) = ctx.saved_tensors
+         token_indices_grouped, expert_indices_grouped,
+         w1_weights, w2_weights, b1_biases, b2_biases) = ctx.saved_tensors
 
         batch_size = ctx.batch_size
         seq_len = ctx.seq_len
@@ -216,6 +221,78 @@ class GroupedMoEFunction(torch.autograd.Function):
         # Reshape grad_input back to [B, T, H]
         grad_input = grad_input.reshape(batch_size, seq_len, -1)
 
+        # Optional: compute routing gradients and map to routing_scores
+        grad_routing_scores = None
+        if ctx.compute_routing_grads:
+            # Build Gy in grouped order: each routed token uses gradient of its source token
+            Gy_grouped = grad_output_flat.index_select(0, token_indices_grouped)
+
+            # Recompute Y_pre_grouped = H @ W2^T + b2 per group (FP32 accumulate)
+            hidden_dim = grad_output_flat.size(1)
+            ffn_dim = hidden_grouped.size(1)
+            device = hidden_grouped.device
+            dtype_half = hidden_grouped.dtype
+
+            # We'll compute in chunks per group to avoid extra kernels and cast at end
+            Y_pre_grouped = torch.empty_like(Gy_grouped)
+            offset = 0
+            for g, M in enumerate(m_sizes):
+                if M == 0:
+                    continue
+                pi = policy_ids[g]
+                ei = expert_ids[g]
+                # Slices
+                H_g = hidden_grouped.narrow(0, offset, M).to(torch.float32)
+                W2 = w2_weights[pi, ei].to(torch.float32)        # [H, F]
+                b2 = b2_biases[pi, ei].to(torch.float32)         # [H]
+                # Y_pre = H @ W2^T + b2
+                Y_pre = torch.addmm(b2, H_g, W2.t())             # [M, H]
+                Y_pre_grouped.narrow(0, offset, M).copy_(Y_pre.to(dtype=Y_pre_grouped.dtype))
+                offset += M
+
+            # dr per routed token: rowwise dot(Gy_grouped, Y_pre_grouped)
+            dr_grouped = (Gy_grouped.to(torch.float32) * Y_pre_grouped.to(torch.float32)).sum(dim=1)
+
+            # Map dr_grouped back to per-token K positions to apply softmax backward
+            num_tokens = ctx.num_tokens
+            topk_indices = ctx.topk_indices  # [num_tokens, K]
+            topk_weights = ctx.topk_weights  # [num_tokens, K]
+            K = topk_indices.size(1)
+
+            # Build a quick map: for each (token, expert) -> k position
+            # Since K is small (e.g., 2), linear search is fine
+            # Prepare output tensor
+            dr_token_k = torch.zeros((num_tokens, K), device=device, dtype=dr_grouped.dtype)
+
+            # We have expert_indices_grouped and token_indices_grouped aligned with dr_grouped
+            # Fill dr_token_k at the corresponding (token, kpos)
+            # Compute kpos with a simple equality match per token
+            # For efficiency, build a per-token dict via tensor ops
+            # Expand for broadcasting
+            # Note: using a Python loop over groups is acceptable since group_count << total tokens
+            for i in range(dr_grouped.numel()):
+                t = int(token_indices_grouped[i].item())
+                e = int(expert_indices_grouped[i].item())
+                # Find k position for expert e in topk_indices[t]
+                kpos = (topk_indices[t] == e).nonzero(as_tuple=False)
+                if kpos.numel() == 0:
+                    continue
+                k = int(kpos[0].item())
+                dr_token_k[t, k] = dr_grouped[i]
+
+            # Softmax backward on top-k: g_s = w * (g_w - sum_j w_j g_w_j)
+            gw = dr_token_k
+            w = topk_weights
+            dot = (gw * w).sum(dim=1, keepdim=True)
+            g_s = w * (gw - dot)
+
+            # Scatter into full expert dim
+            num_experts = w2_weights.size(1)
+            grad_routing_scores_flat = torch.zeros((num_tokens, num_experts), device=device, dtype=g_s.dtype)
+            # scatter to expert dimension using topk indices
+            grad_routing_scores_flat.scatter_(1, topk_indices, g_s)
+            grad_routing_scores = grad_routing_scores_flat.reshape(batch_size, seq_len, num_experts)
+
         # Return gradients for all forward inputs
         # Order matches forward signature:
         # input_tensor, w1, w2, b1, b2, routing_scores, policy_indices, top_k, compute_routing_grads
@@ -225,7 +302,7 @@ class GroupedMoEFunction(torch.autograd.Function):
             grad_w2,         # w2_weights
             grad_b1,         # b1_biases
             grad_b2,         # b2_biases
-            None,            # routing_scores (Phase 1: no gradient)
+            grad_routing_scores,  # routing_scores gradient (optional)
             None,            # policy_indices (no gradient)
             None,            # top_k (no gradient)
             None             # compute_routing_grads (no gradient)

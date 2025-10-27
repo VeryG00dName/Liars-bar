@@ -2,6 +2,7 @@
 #include "weight_utils.h"
 #include "indexed_kernels.h"
 #include "moe_backward_kernels.h"
+#include "moe_cutlass_kernels.h"
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -238,12 +239,23 @@ void bind_reactive_model(py::module_& m) {
             torch::Tensor hidden_grouped = torch::empty({total_tokens, ffn_dim}, opts_half);
             torch::Tensor output_grouped = torch::empty({total_tokens, hidden_dim}, opts_half);
 
-            // Compute per-group forward using ATen ops in FP32 for accumulation
-            // H = GELU(X @ W1^T + b1), Y = (H @ W2^T + b2) * r
+            // Build pointer arrays (host)
+            std::vector<uintptr_t> input_ptrs(m_sizes.size());
+            std::vector<uintptr_t> w1_ptrs(m_sizes.size());
+            std::vector<uintptr_t> w2_ptrs(m_sizes.size());
+            std::vector<uintptr_t> b1_ptrs(m_sizes.size());
+            std::vector<uintptr_t> b2_ptrs(m_sizes.size());
+            std::vector<uintptr_t> hidden_ptrs(m_sizes.size());
+            std::vector<uintptr_t> output_ptrs(m_sizes.size());
+            std::vector<uintptr_t> routing_ptrs(m_sizes.size());
+
+            auto input_base = reinterpret_cast<uintptr_t>(input_grouped.data_ptr<at::Half>());
+            auto hidden_base = reinterpret_cast<uintptr_t>(hidden_grouped.data_ptr<at::Half>());
+            auto output_base = reinterpret_cast<uintptr_t>(output_grouped.data_ptr<at::Half>());
+            auto routing_base = reinterpret_cast<uintptr_t>(routing_weights_grouped.data_ptr<float>());
+
             for (size_t g = 0; g < m_sizes.size(); ++g) {
                 int64_t M = m_sizes[g];
-                if (M == 0) continue;
-
                 int64_t pi = policy_ids[g];
                 int64_t ei = expert_ids[g];
                 int64_t offset = token_offsets[g];
@@ -252,33 +264,44 @@ void bind_reactive_model(py::module_& m) {
                 TORCH_CHECK(ei >= 0 && ei < num_experts, "expert id out of range");
                 TORCH_CHECK(offset >= 0 && offset + M <= total_tokens, "token offset out of range");
 
-                auto X_half = input_grouped.narrow(0, offset, M).contiguous();
-                auto W1_half = w1_weights.index({pi, ei}).contiguous();   // [F, H]
-                auto b1_half = b1_biases.index({pi, ei}).contiguous();    // [F]
-                auto W2_half = w2_weights.index({pi, ei}).contiguous();   // [H, F]
-                auto b2_half = b2_biases.index({pi, ei}).contiguous();    // [H]
-                auto r = routing_weights_grouped.narrow(0, offset, M).contiguous(); // [M]
+                input_ptrs[g]  = input_base  + static_cast<uintptr_t>(offset) * hidden_dim * sizeof(at::Half);
+                hidden_ptrs[g] = hidden_base + static_cast<uintptr_t>(offset) * ffn_dim   * sizeof(at::Half);
+                output_ptrs[g] = output_base + static_cast<uintptr_t>(offset) * hidden_dim * sizeof(at::Half);
+                routing_ptrs[g]= routing_base+ static_cast<uintptr_t>(offset) * sizeof(float);
 
-                // Cast to FP32 for compute
-                auto X = X_half.to(torch::kFloat32);
-                auto W1 = W1_half.to(torch::kFloat32);
-                auto b1 = b1_half.to(torch::kFloat32);
-                auto W2 = W2_half.to(torch::kFloat32);
-                auto b2 = b2_half.to(torch::kFloat32);
-                auto r_f32 = r; // already float32
+                auto W1 = w1_weights.index({pi, ei});
+                auto W2 = w2_weights.index({pi, ei});
+                auto B1 = b1_biases.index({pi, ei});
+                auto B2 = b2_biases.index({pi, ei});
+                TORCH_CHECK(W1.is_contiguous(), "W1 slice must be contiguous");
+                TORCH_CHECK(W2.is_contiguous(), "W2 slice must be contiguous");
+                TORCH_CHECK(B1.is_contiguous(), "b1 slice must be contiguous");
+                TORCH_CHECK(B2.is_contiguous(), "b2 slice must be contiguous");
 
-                // Z = X @ W1^T + b1
-                auto Z = at::addmm(b1, X, W1.t());
-                auto H = at::gelu(Z);
-
-                // Y = (H @ W2^T + b2) * r
-                auto Y_pre = at::addmm(b2, H, W2.t());
-                auto Y = Y_pre * r_f32.unsqueeze(1);
-
-                // Cast and write to outputs
-                hidden_grouped.narrow(0, offset, M).copy_(H.to(torch::kFloat16));
-                output_grouped.narrow(0, offset, M).copy_(Y.to(torch::kFloat16));
+                w1_ptrs[g] = reinterpret_cast<uintptr_t>(W1.data_ptr<at::Half>());
+                w2_ptrs[g] = reinterpret_cast<uintptr_t>(W2.data_ptr<at::Half>());
+                b1_ptrs[g] = reinterpret_cast<uintptr_t>(B1.data_ptr<at::Half>());
+                b2_ptrs[g] = reinterpret_cast<uintptr_t>(B2.data_ptr<at::Half>());
             }
+
+            // Call fused CUTLASS path that also writes hidden buffer
+            lb::moe::cutlass_grouped_moe_forward_with_hidden(
+                input_ptrs.data(),
+                w1_ptrs.data(),
+                b1_ptrs.data(),
+                w2_ptrs.data(),
+                b2_ptrs.data(),
+                hidden_ptrs.data(),
+                output_ptrs.data(),
+                routing_ptrs.data(),
+                m_sizes.data(),
+                policy_ids.data(),
+                expert_ids.data(),
+                token_offsets.data(),
+                static_cast<int64_t>(m_sizes.size()),
+                hidden_dim,
+                ffn_dim
+            );
 
             return std::make_tuple(hidden_grouped, output_grouped);
         },

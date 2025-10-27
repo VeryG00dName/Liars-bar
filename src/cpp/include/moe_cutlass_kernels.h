@@ -50,5 +50,28 @@ void cutlass_grouped_moe_forward(
     int64_t ffn_dim
 );
 
+/**
+ * Variant of grouped MoE forward that writes the intermediate hidden buffer
+ * (post-GELU, pre-W2) into a caller-provided tensor so Python can save it
+ * for backward without recomputation.
+ */
+void cutlass_grouped_moe_forward_with_hidden(
+    const uintptr_t* input_ptrs,
+    const uintptr_t* w1_ptrs,
+    const uintptr_t* b1_ptrs,
+    const uintptr_t* w2_ptrs,
+    const uintptr_t* b2_ptrs,
+    const uintptr_t* hidden_ptrs,
+    const uintptr_t* output_ptrs,
+    const uintptr_t* routing_weight_ptrs,
+    const int64_t* m_sizes,
+    const int64_t* policy_ids,
+    const int64_t* expert_ids,
+    const int64_t* token_offsets,
+    int64_t group_count,
+    int64_t hidden_dim,
+    int64_t ffn_dim
+);
+
 } // namespace moe
 } // namespace lb
