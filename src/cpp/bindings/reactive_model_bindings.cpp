@@ -192,6 +192,74 @@ void bind_reactive_model(py::module_& m) {
         )doc"
     );
 
+    // Training forward: returns (action, opp, values, win, gate_logits_tensor, routing_dict)
+    m.def(
+        "forward_packed_train",
+        [](const torch::Tensor& obs_sequence,
+           const torch::Tensor& action_sequence,
+           const torch::Tensor& agent_types,
+           const torch::Tensor& positions,
+           py::dict weights_py,
+           const torch::Tensor& policy_indices,
+           const torch::optional<torch::Tensor>& padding_mask,
+           int64_t num_layers,
+           int64_t num_heads,
+           int64_t hidden_dim,
+           int64_t num_experts,
+           int64_t top_k,
+           int64_t count_pad,
+           int64_t tflag_pad) {
+            c10::Dict<std::string, torch::Tensor> weights;
+            for (auto item : weights_py) {
+                std::string key = py::cast<std::string>(item.first);
+                torch::Tensor value = py::cast<torch::Tensor>(item.second);
+                weights.insert(key, value);
+            }
+            auto tup = forward_packed_train(
+                obs_sequence,
+                action_sequence,
+                agent_types,
+                positions,
+                weights,
+                policy_indices,
+                padding_mask,
+                num_layers,
+                num_heads,
+                hidden_dim,
+                num_experts,
+                top_k,
+                count_pad,
+                tflag_pad
+            );
+            auto action_logits = std::get<0>(tup);
+            auto opp_logits = std::get<1>(tup);
+            auto state_values = std::get<2>(tup);
+            auto win_logits = std::get<3>(tup);
+            auto gate_logits_tensor = std::get<4>(tup);
+            auto routing_cpp = std::get<5>(tup);
+            py::dict routing_py;
+            for (const auto& kv : routing_cpp) {
+                routing_py[py::cast(kv.first)] = py::cast(kv.second);
+            }
+            return py::make_tuple(action_logits, opp_logits, state_values, win_logits, gate_logits_tensor, routing_py);
+        },
+        py::arg("obs_sequence"),
+        py::arg("action_sequence"),
+        py::arg("agent_types"),
+        py::arg("positions"),
+        py::arg("weights"),
+        py::arg("policy_indices"),
+        py::arg("padding_mask") = torch::nullopt,
+        py::arg("num_layers") = 2,
+        py::arg("num_heads") = 4,
+        py::arg("hidden_dim") = 256,
+        py::arg("num_experts") = 8,
+        py::arg("top_k") = 2,
+        py::arg("count_pad") = 4,
+        py::arg("tflag_pad") = 3,
+        "Training forward pass with autograd MoE returning routing info"
+    );
+
     // Expose grouped MoE forward (training) that also returns hidden_grouped
     m.def(
         "grouped_moe_forward",

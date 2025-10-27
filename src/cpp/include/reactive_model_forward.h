@@ -53,6 +53,26 @@ forward_packed(
     int64_t tflag_pad = 3
 );
 
+// Training variant that returns extra routing info and uses autograd MoE.
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, std::unordered_map<std::string, torch::Tensor>>
+forward_packed_train(
+    const torch::Tensor& obs_sequence,
+    const torch::Tensor& action_sequence,
+    const torch::Tensor& agent_types,
+    const torch::Tensor& positions,
+    const c10::Dict<std::string, torch::Tensor>& batched_weights,
+    const torch::Tensor& policy_indices,
+    const torch::optional<torch::Tensor>& padding_mask,
+    int64_t num_layers,
+    int64_t num_heads,
+    int64_t hidden_dim,
+    int64_t num_experts,
+    int64_t top_k,
+    int64_t count_pad,
+    int64_t tflag_pad
+);
+
 // Overload with detailed timers map for granular profiling
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 forward_packed(

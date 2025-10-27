@@ -1,5 +1,6 @@
 #include "reactive_model_forward.h"
 #include "indexed_kernels.h"
+#include "moe_autograd_function.h"
 
 #include <torch/torch.h>
 #include <ATen/ATen.h>
@@ -848,7 +849,7 @@ torch::Tensor reduce_expert_heads(
     // Sum over K dimension: [B, T, out_dim]
     auto output = weighted.sum(/*dim=*/2);
 
-    return output;
+  return output;
 }
 
 // ============================================================================
@@ -873,7 +874,7 @@ forward_packed(
     int64_t count_pad,
     int64_t tflag_pad) {
     std::unordered_map<std::string, Microseconds> dummy;
-    return forward_packed(
+  return forward_packed(
         obs_sequence,
         action_sequence,
         agent_types,
@@ -889,7 +890,223 @@ forward_packed(
         count_pad,
         tflag_pad,
         dummy
+  );
+}
+
+// Training variant that uses autograd MoE and returns routing info
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, std::unordered_map<std::string, torch::Tensor>>
+forward_packed_train(
+    const torch::Tensor& obs_sequence,
+    const torch::Tensor& action_sequence,
+    const torch::Tensor& agent_types,
+    const torch::Tensor& positions,
+    const c10::Dict<std::string, torch::Tensor>& batched_weights,
+    const torch::Tensor& policy_indices,
+    const torch::optional<torch::Tensor>& padding_mask,
+    int64_t num_layers,
+    int64_t num_heads,
+    int64_t hidden_dim,
+    int64_t num_experts,
+    int64_t top_k,
+    int64_t count_pad,
+    int64_t tflag_pad
+) {
+  std::unordered_map<std::string, Microseconds> timers_dummy;
+  auto policy_indices_long = policy_indices.to(torch::kLong).contiguous();
+  auto policy_indices_cpu = policy_indices_long.device().is_cpu()
+      ? policy_indices_long
+      : policy_indices_long.cpu();
+  torch::Tensor policy_indices_device = policy_indices_long;
+  if (obs_sequence.is_cuda() && policy_indices_device.device() != obs_sequence.device()) {
+    policy_indices_device = policy_indices_device.to(obs_sequence.device());
+  }
+  const torch::Tensor& policy_indices_for_ops = obs_sequence.is_cuda() ? policy_indices_device : policy_indices_cpu;
+
+  TORCH_CHECK(obs_sequence.dim() == 3);
+  TORCH_CHECK(action_sequence.dim() == 2);
+  TORCH_CHECK(agent_types.dim() == 2);
+  TORCH_CHECK(positions.dim() == 2);
+  int64_t B = obs_sequence.size(0);
+  int64_t T = obs_sequence.size(1);
+
+  auto decomp = test_action_decomposition(
+      action_sequence, batched_weights, policy_indices_for_ops,
+      padding_mask, count_pad, tflag_pad);
+  auto act_kind_ids = std::get<0>(decomp);
+  auto count_ids    = std::get<1>(decomp);
+  auto table_flag_ids = std::get<2>(decomp);
+
+  auto embeddings = test_embeddings(
+      obs_sequence, act_kind_ids, count_ids, table_flag_ids,
+      agent_types, positions, batched_weights, policy_indices_for_ops);
+  auto obs_encoded    = embeddings.at("obs_embed");
+  auto action_embed   = embeddings.at("action_embed");
+  auto agent_embed    = embeddings.at("agent_embed");
+  auto position_embed = embeddings.at("position_embed");
+
+  auto gating = test_gating(
+      obs_encoded, action_embed, agent_embed, position_embed,
+      batched_weights, policy_indices_for_ops);
+
+  auto fusion = test_fusion(
+      gating.at("g_obs"), gating.at("g_action"), gating.at("g_agent"), gating.at("g_position"),
+      obs_encoded, action_embed, agent_embed, position_embed, hidden_dim);
+  auto x = fusion.at("combined");
+
+  torch::Tensor final_topk_indices;  // [B,T,K]
+  torch::Tensor final_topk_scores;   // [B,T,K]
+  std::vector<torch::Tensor> gate_logits_list; // [L,B,T,E]
+
+  int64_t head_dim = hidden_dim / num_heads;
+  for (int64_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
+    std::string layer_prefix = std::string("transformer.layers.") + std::to_string(layer_idx);
+
+    // Attention (identical to inference forward)
+    auto in_proj_weight = get_weight(batched_weights, layer_prefix + ".self_attn.in_proj_weight");
+    auto in_proj_bias   = get_weight(batched_weights, layer_prefix + ".self_attn.in_proj_bias");
+    int64_t weight_chunk_dim = (in_proj_weight.dim() == 3) ? 1 : 0;
+    int64_t bias_chunk_dim   = (in_proj_bias.dim() == 2) ? 1 : 0;
+    auto qkv_weights = in_proj_weight.chunk(3, weight_chunk_dim);
+    auto qkv_biases  = in_proj_bias.chunk(3, bias_chunk_dim);
+    auto q = indexed_batched_linear(x, qkv_weights[0], qkv_biases[0], policy_indices_for_ops, timers_dummy);
+    auto k = indexed_batched_linear(x, qkv_weights[1], qkv_biases[1], policy_indices_for_ops, timers_dummy);
+    auto v = indexed_batched_linear(x, qkv_weights[2], qkv_biases[2], policy_indices_for_ops, timers_dummy);
+    q = q.view({B, T, num_heads, head_dim}).transpose(1, 2);
+    k = k.view({B, T, num_heads, head_dim}).transpose(1, 2);
+    v = v.view({B, T, num_heads, head_dim}).transpose(1, 2);
+    auto attn_output = torch::scaled_dot_product_attention(q, k, v, torch::nullopt, 0.0, true);
+    attn_output = attn_output.transpose(1, 2).contiguous().view({B, T, hidden_dim});
+    attn_output = indexed_batched_linear(attn_output,
+        get_weight(batched_weights, layer_prefix + ".self_attn.out_proj.weight"),
+        get_weight(batched_weights, layer_prefix + ".self_attn.out_proj.bias"),
+        policy_indices_for_ops, timers_dummy);
+    auto residual1 = x + attn_output;
+    x = indexed_batched_layer_norm(residual1,
+        get_weight(batched_weights, layer_prefix + ".norm1.weight"),
+        get_weight(batched_weights, layer_prefix + ".norm1.bias"),
+        policy_indices_for_ops);
+
+    // Gate logits for metrics and routing
+    auto gate_logits = indexed_batched_linear(x,
+        get_weight(batched_weights, layer_prefix + ".moe.gate.weight"),
+        get_weight(batched_weights, layer_prefix + ".moe.gate.bias"),
+        policy_indices_for_ops, timers_dummy);
+    gate_logits_list.push_back(gate_logits);
+    auto probs = torch::softmax(gate_logits, -1);
+    auto topk_vals_idx = torch::topk(gate_logits, top_k, -1);
+    auto topk_indices = std::get<1>(topk_vals_idx);
+    auto topk_scores  = torch::gather(probs, -1, topk_indices);
+
+    // Grouping
+    auto num_tokens = B * T;
+    auto x_fp16 = x.to(torch::kHalf).contiguous();
+    auto x_flat = x_fp16.view({num_tokens, hidden_dim});
+    auto topk_indices_long = topk_indices.to(torch::kLong).contiguous();
+    auto flat_expert_indices = topk_indices_long.reshape({-1});
+    auto flat_routing_weights = topk_scores.reshape({-1});
+    auto token_indices = torch::arange(num_tokens, torch::dtype(torch::kLong).device(x.device()));
+    auto expanded_token_indices = token_indices.unsqueeze(-1).expand({num_tokens, top_k}).reshape({-1});
+    auto sort_tuple = torch::sort(flat_expert_indices);
+    auto sorted_expert_indices = std::get<0>(sort_tuple);
+    auto sort_order = std::get<1>(sort_tuple);
+    auto sorted_token_indices = expanded_token_indices.index_select(0, sort_order);
+    auto sorted_routing_weights = flat_routing_weights.index_select(0, sort_order).to(torch::kFloat32);
+    auto policy_indices_long2 = policy_indices_for_ops.to(torch::kLong);
+    auto policy_tokens = policy_indices_long2.unsqueeze(1).expand({B, T}).reshape({-1});
+    auto flat_policy_indices = policy_tokens.index_select(0, expanded_token_indices);
+    auto sorted_policy_indices = flat_policy_indices.index_select(0, sort_order);
+    auto expert_inputs = x_flat.index_select(0, sorted_token_indices).contiguous();
+
+    // Build groups on CPU
+    auto sorted_expert_cpu = sorted_expert_indices.to(torch::kCPU);
+    auto sorted_policy_cpu = sorted_policy_indices.to(torch::kCPU);
+    const auto* se = sorted_expert_cpu.data_ptr<int64_t>();
+    const auto* sp = sorted_policy_cpu.data_ptr<int64_t>();
+    std::vector<int64_t> m_sizes_v, policy_ids_v, expert_ids_v, token_offsets_v;
+    int64_t cursor = 0; const int64_t total_routes = sorted_expert_indices.size(0);
+    while (cursor < total_routes) {
+      int64_t ei = se[cursor]; int64_t pi = sp[cursor];
+      int64_t end = cursor + 1; while (end < total_routes && se[end] == ei && sp[end] == pi) ++end;
+      m_sizes_v.push_back(end - cursor); policy_ids_v.push_back(pi); expert_ids_v.push_back(ei); token_offsets_v.push_back(cursor);
+      cursor = end;
+    }
+    auto m_sizes_cpu = torch::from_blob(m_sizes_v.data(), {(int64_t)m_sizes_v.size()}, torch::TensorOptions().dtype(torch::kLong)).clone();
+    auto policy_ids_cpu = torch::from_blob(policy_ids_v.data(), {(int64_t)policy_ids_v.size()}, torch::TensorOptions().dtype(torch::kLong)).clone();
+    auto expert_ids_cpu = torch::from_blob(expert_ids_v.data(), {(int64_t)expert_ids_v.size()}, torch::TensorOptions().dtype(torch::kLong)).clone();
+    auto token_offsets_cpu = torch::from_blob(token_offsets_v.data(), {(int64_t)token_offsets_v.size()}, torch::TensorOptions().dtype(torch::kLong)).clone();
+
+    // Expert weights should be provided as stacked tensors in weights dict
+    auto w1_all = get_weight(batched_weights, layer_prefix + ".moe.experts.w1");
+    auto w2_all = get_weight(batched_weights, layer_prefix + ".moe.experts.w2");
+    auto b1_all = get_weight(batched_weights, layer_prefix + ".moe.experts.b1");
+    auto b2_all = get_weight(batched_weights, layer_prefix + ".moe.experts.b2");
+
+    auto expert_outputs = lb::moe::grouped_moe_autograd_forward(
+        expert_inputs, w1_all, w2_all, b1_all, b2_all,
+        sorted_routing_weights, sorted_token_indices,
+        m_sizes_cpu, policy_ids_cpu, expert_ids_cpu, token_offsets_cpu,
+        hidden_dim, w1_all.size(-2)
     );
+
+    auto moe_output_flat = torch::zeros({num_tokens, hidden_dim}, expert_outputs.options());
+    moe_output_flat.index_add_(0, sorted_token_indices, expert_outputs);
+    auto moe_output = moe_output_flat.view({B, T, hidden_dim}).to(x.dtype());
+
+    auto residual2 = x + moe_output;
+    x = indexed_batched_layer_norm(residual2,
+        get_weight(batched_weights, layer_prefix + ".norm2.weight"),
+        get_weight(batched_weights, layer_prefix + ".norm2.bias"),
+        policy_indices_for_ops);
+
+    final_topk_indices = topk_indices; final_topk_scores = topk_scores;
+  }
+
+  auto transformer_output = indexed_batched_layer_norm(
+      x,
+      get_weight(batched_weights, "transformer.norm.weight"),
+      get_weight(batched_weights, "transformer.norm.bias"),
+      policy_indices_for_ops);
+
+  std::vector<torch::Tensor> action_logits_list, opp_logits_list, state_values_list, win_logits_list;
+  for (int64_t i = 0; i < num_experts; ++i) {
+    action_logits_list.push_back(indexed_batched_linear(transformer_output,
+      get_weight(batched_weights, "action_heads." + std::to_string(i) + ".weight"),
+      get_weight(batched_weights, "action_heads." + std::to_string(i) + ".bias"),
+      policy_indices_for_ops, timers_dummy));
+    opp_logits_list.push_back(indexed_batched_linear(transformer_output,
+      get_weight(batched_weights, "opp_action_heads." + std::to_string(i) + ".weight"),
+      get_weight(batched_weights, "opp_action_heads." + std::to_string(i) + ".bias"),
+      policy_indices_for_ops, timers_dummy));
+    state_values_list.push_back(indexed_batched_linear(transformer_output,
+      get_weight(batched_weights, "reward_stream_heads." + std::to_string(i) + ".weight"),
+      get_weight(batched_weights, "reward_stream_heads." + std::to_string(i) + ".bias"),
+      policy_indices_for_ops, timers_dummy));
+    win_logits_list.push_back(indexed_batched_linear(transformer_output,
+      get_weight(batched_weights, "win_prob_heads." + std::to_string(i) + ".weight"),
+      get_weight(batched_weights, "win_prob_heads." + std::to_string(i) + ".bias"),
+      policy_indices_for_ops, timers_dummy));
+  }
+
+  auto action_stacked = torch::stack(action_logits_list, 2);
+  auto opp_stacked    = torch::stack(opp_logits_list,    2);
+  auto reward_stacked = torch::stack(state_values_list,  2);
+  auto win_stacked    = torch::stack(win_logits_list,    2);
+  auto action_logits = reduce_expert_heads(action_stacked, final_topk_indices, final_topk_scores);
+  auto opp_logits    = reduce_expert_heads(opp_stacked,    final_topk_indices, final_topk_scores);
+  auto state_values  = reduce_expert_heads(reward_stacked, final_topk_indices, final_topk_scores);
+  auto win_logits    = reduce_expert_heads(win_stacked,    final_topk_indices, final_topk_scores);
+
+  torch::Tensor gate_logits_tensor;
+  if (!gate_logits_list.empty()) gate_logits_tensor = torch::stack(gate_logits_list, 0);
+  else gate_logits_tensor = transformer_output.new_zeros({0, B, T, num_experts});
+  std::unordered_map<std::string, torch::Tensor> routing;
+  routing["gate_logits"]  = gate_logits_tensor;
+  routing["topk_indices"] = final_topk_indices;
+  routing["topk_scores"]  = final_topk_scores;
+
+  return std::make_tuple(action_logits, opp_logits, state_values, win_logits,
+                         gate_logits_tensor, routing);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>

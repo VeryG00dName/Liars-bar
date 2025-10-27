@@ -6,8 +6,8 @@ from typing import Dict, Optional, Tuple, List
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from src.model.ppo_reactive_model_base import PPOReactiveModelBase, MoETransformerEncoderLayer
-from src.model.moe_autograd import grouped_moe_ffn
+from src.model.ppo_reactive_model_base import PPOReactiveModelBase
+from src.misc import lb
 
 
 class PPOReactiveModel(PPOReactiveModelBase):
@@ -66,71 +66,15 @@ class PPOReactiveModel(PPOReactiveModelBase):
         encoded_inputs: torch.Tensor,
         causal_mask: torch.Tensor,
         key_padding: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
-        
-        hidden = encoded_inputs
-        gate_logits_list = []
-        routing: Dict[str, torch.Tensor] = {}
-
-        def moe_layer_grouped(module: MoETransformerEncoderLayer, inp: torch.Tensor):
-            attn_output, _ = module.self_attn(
-                inp, inp, inp,
-                attn_mask=causal_mask,
-                key_padding_mask=key_padding,
-                need_weights=False,
-            )
-            x1 = module.norm1(inp + module.dropout1(attn_output))
-
-            # Gate logits (logits per expert)
-            B, T, H = x1.shape
-            gate_logits = module.moe.gate(x1.view(-1, H)).view(B, T, self.num_experts)
-            if gate_logits.dtype != x1.dtype:
-                gate_logits = gate_logits.to(dtype=x1.dtype)
-
-            # Pack expert weights to expected shapes for grouped MoE
-            w1_list, b1_list, w2_list, b2_list = [], [], [], []
-            for expert in module.moe.experts:
-                lin1 = expert[0]
-                lin2 = expert[3]
-                w1_list.append(lin1.weight)
-                b1_list.append(lin1.bias)
-                w2_list.append(lin2.weight)
-                b2_list.append(lin2.bias)
-            w1 = torch.stack(w1_list, dim=0).unsqueeze(0).to(dtype=torch.float16, device=x1.device).contiguous()
-            w2 = torch.stack(w2_list, dim=0).unsqueeze(0).to(dtype=torch.float16, device=x1.device).contiguous()
-            b1 = torch.stack(b1_list, dim=0).unsqueeze(0).to(dtype=torch.float16, device=x1.device).contiguous()
-            b2 = torch.stack(b2_list, dim=0).unsqueeze(0).to(dtype=torch.float16, device=x1.device).contiguous()
-
-            policy_indices = torch.zeros((B, T), dtype=torch.long, device=x1.device)
-            y = grouped_moe_ffn(
-                x1,
-                w1, w2, b1, b2,
-                routing_scores=gate_logits,
-                policy_indices=policy_indices,
-                top_k=module.moe.top_k,
-                compute_routing_grads=True,
-            )
-
-            # Routing info from logits
-            probs = torch.softmax(gate_logits, dim=-1)
-            topk = torch.topk(probs, module.moe.top_k, dim=-1)
-            rout = {"gate_logits": gate_logits, "topk_indices": topk.indices, "topk_scores": topk.values}
-
-            x2 = module.norm2(x1 + module.dropout2(y))
-            return x2, rout
-
-        for layer in self.transformer.layers:
-            hidden, layer_routing, = checkpoint(
-                lambda inp: moe_layer_grouped(layer, inp), hidden, use_reentrant=False
-            )
-            gate_logits_list.append(layer_routing["gate_logits"])  # type: ignore[index]
-            routing = layer_routing
-
-        transformer_output = self.transformer.norm(hidden) if self.transformer.norm is not None else hidden
-
-        gate_logits_tensor = self._stack_gate_logits(gate_logits_list, transformer_output)
-
-        return transformer_output, gate_logits_tensor, routing
+        obs_sequence: torch.Tensor,
+        action_sequence: torch.Tensor,
+        agent_types: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        # For simplicity, use eager training path; we don't combine torch.utils.checkpoint
+        # with the C++ training forward.
+        return self._forward_cpp_training(encoded_inputs, causal_mask, key_padding,
+                                          obs_sequence, action_sequence, agent_types, positions)
         
     def _stack_gate_logits(self, gate_logits_list: List[torch.Tensor], ref_tensor: torch.Tensor) -> torch.Tensor:
          return (
@@ -166,69 +110,15 @@ class PPOReactiveModel(PPOReactiveModelBase):
 
         # 2. Run transformer (with or without checkpointing)
         if self.training and self.use_gradient_checkpointing:
-            transformer_output, gate_logits_tensor, routing = self._forward_with_gradient_checkpointing(
-                encoded_inputs, causal_mask, key_padding
+            action_logits, opp_logits, state_values, win_logits, gate_logits_tensor, routing = self._forward_with_gradient_checkpointing(
+                encoded_inputs, causal_mask, key_padding, obs_sequence, action_sequence, agent_types, positions
             )
         else:
-            # Run transformer with grouped MoE autograd per layer
-            gate_logits_list: list[torch.Tensor] = []
-            routing: Dict[str, torch.Tensor] = {}
+            action_logits, opp_logits, state_values, win_logits, gate_logits_tensor, routing = self._forward_cpp_training(
+                encoded_inputs, causal_mask, key_padding, obs_sequence, action_sequence, agent_types, positions
+            )
 
-            x = encoded_inputs
-            for layer in self.transformer.layers:
-                # Reuse the same per-layer logic without checkpointing
-                attn_output, _ = layer.self_attn(
-                    x, x, x,
-                    attn_mask=causal_mask,
-                    key_padding_mask=key_padding,
-                    need_weights=False,
-                )
-                x1 = layer.norm1(x + layer.dropout1(attn_output))
-
-                B, T, H = x1.shape
-                gate_logits = layer.moe.gate(x1.view(-1, H)).view(B, T, self.num_experts)
-                if gate_logits.dtype != x1.dtype:
-                    gate_logits = gate_logits.to(dtype=x1.dtype)
-
-                w1_list, b1_list, w2_list, b2_list = [], [], [], []
-                for expert in layer.moe.experts:
-                    lin1 = expert[0]
-                    lin2 = expert[3]
-                    w1_list.append(lin1.weight)
-                    b1_list.append(lin1.bias)
-                    w2_list.append(lin2.weight)
-                    b2_list.append(lin2.bias)
-                w1 = torch.stack(w1_list, dim=0).unsqueeze(0).to(dtype=torch.float16, device=x1.device).contiguous()
-                w2 = torch.stack(w2_list, dim=0).unsqueeze(0).to(dtype=torch.float16, device=x1.device).contiguous()
-                b1 = torch.stack(b1_list, dim=0).unsqueeze(0).to(dtype=torch.float16, device=x1.device).contiguous()
-                b2 = torch.stack(b2_list, dim=0).unsqueeze(0).to(dtype=torch.float16, device=x1.device).contiguous()
-
-                policy_indices = torch.zeros((B, T), dtype=torch.long, device=x1.device)
-                y = grouped_moe_ffn(
-                    x1,
-                    w1, w2, b1, b2,
-                    routing_scores=gate_logits,
-                    policy_indices=policy_indices,
-                    top_k=layer.moe.top_k,
-                    compute_routing_grads=True,
-                )
-
-                probs = torch.softmax(gate_logits, dim=-1)
-                topk = torch.topk(probs, layer.moe.top_k, dim=-1)
-                routing = {"gate_logits": gate_logits, "topk_indices": topk.indices, "topk_scores": topk.values}
-
-                x = layer.norm2(x1 + layer.dropout2(y))
-                gate_logits_list.append(gate_logits)
-
-            transformer_output = self.transformer.norm(x) if self.transformer.norm is not None else x
-            gate_logits_tensor = self._stack_gate_logits(gate_logits_list, transformer_output)
-        
-        # 3. Get head outputs by calling the base class's method
-        action_logits, opp_logits, state_values, win_logits = self._head_outputs(
-            transformer_output, routing
-        )
-        
-        # 4. Apply training-specific masking
+        # 3. Apply training-specific masking
         action_logits = self._apply_action_mask(action_logits, agent_types, action_masks)
         
         return (
@@ -239,3 +129,115 @@ class PPOReactiveModel(PPOReactiveModelBase):
             gate_logits_tensor,
             routing,
         )
+
+    def _forward_cpp_training(
+        self,
+        encoded_inputs: torch.Tensor,
+        causal_mask: torch.Tensor,
+        key_padding: Optional[torch.Tensor],
+        obs_sequence: torch.Tensor,
+        action_sequence: torch.Tensor,
+        agent_types: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        # Build a minimal batched weight dict [1, ...] from module params using autograd-friendly ops
+        weights: Dict[str, torch.Tensor] = {}
+
+        def add(name: str, t: torch.Tensor) -> None:
+            # Add batch dim [1, ...]; keep dtype/device of t
+            weights[name] = t.unsqueeze(0)
+
+        # Fixed buffers (LUTs) - no batch dim
+        weights["lut_act_kind"] = self.lut_act_kind
+        weights["lut_count"] = self.lut_count
+        weights["lut_table_flag"] = self.lut_table_flag
+
+        # Encoder
+        add("obs_encoder.0.weight", self.obs_encoder[0].weight)
+        add("obs_encoder.0.bias", self.obs_encoder[0].bias)
+        add("obs_encoder.1.weight", self.obs_encoder[1].weight)
+        add("obs_encoder.1.bias", self.obs_encoder[1].bias)
+
+        add("act_kind_embedding.weight", self.act_kind_embedding.weight)
+        add("count_embedding.weight", self.count_embedding.weight)
+        add("table_flag_embedding.weight", self.table_flag_embedding.weight)
+        add("agent_embedding.weight", self.agent_embedding.weight)
+        add("position_embedding.weight", self.position_embedding.weight)
+
+        # Gating nets
+        for pname, module in [("gate_obs", self.gate_obs), ("gate_action", self.gate_action), ("gate_agent", self.gate_agent), ("gate_position", self.gate_position)]:
+            add(f"{pname}.0.weight", module[0].weight)
+            add(f"{pname}.0.bias", module[0].bias)
+            add(f"{pname}.2.weight", module[2].weight)
+            add(f"{pname}.2.bias", module[2].bias)
+
+        # Transformer layers: attention, norms, MoE gate, expert stacks
+        for li, layer in enumerate(self.transformer.layers):
+            prefix = f"transformer.layers.{li}"
+            attn = layer.self_attn
+            add(f"{prefix}.self_attn.in_proj_weight", getattr(attn, "in_proj_weight"))
+            add(f"{prefix}.self_attn.in_proj_bias", getattr(attn, "in_proj_bias"))
+            add(f"{prefix}.self_attn.out_proj.weight", attn.out_proj.weight)
+            add(f"{prefix}.self_attn.out_proj.bias", attn.out_proj.bias)
+            add(f"{prefix}.norm1.weight", layer.norm1.weight)
+            add(f"{prefix}.norm1.bias", layer.norm1.bias)
+            add(f"{prefix}.norm2.weight", layer.norm2.weight)
+            add(f"{prefix}.norm2.bias", layer.norm2.bias)
+            # MoE gate
+            add(f"{prefix}.moe.gate.weight", layer.moe.gate.weight)
+            add(f"{prefix}.moe.gate.bias", layer.moe.gate.bias)
+            # Expert stacks (autograd-friendly): [E, F, H] etc.
+            w1_list = [expert[0].weight for expert in layer.moe.experts]
+            b1_list = [expert[0].bias   for expert in layer.moe.experts]
+            w2_list = [expert[3].weight for expert in layer.moe.experts]
+            b2_list = [expert[3].bias   for expert in layer.moe.experts]
+            w1 = torch.stack(w1_list, dim=0)
+            w2 = torch.stack(w2_list, dim=0)
+            b1 = torch.stack(b1_list, dim=0)
+            b2 = torch.stack(b2_list, dim=0)
+            # Add batch dim and cast to fp16 for kernels
+            weights[f"{prefix}.moe.experts.w1"] = w1.unsqueeze(0).to(torch.float16)
+            weights[f"{prefix}.moe.experts.w2"] = w2.unsqueeze(0).to(torch.float16)
+            weights[f"{prefix}.moe.experts.b1"] = b1.unsqueeze(0).to(torch.float16)
+            weights[f"{prefix}.moe.experts.b2"] = b2.unsqueeze(0).to(torch.float16)
+
+        # Transformer norm
+        if self.transformer.norm is not None:
+            add("transformer.norm.weight", self.transformer.norm.weight)
+            add("transformer.norm.bias", self.transformer.norm.bias)
+        else:
+            # Provide dummy to satisfy forward; won’t be used
+            weights["transformer.norm.weight"] = encoded_inputs.new_zeros((1, self.hidden_dim))
+            weights["transformer.norm.bias"] = encoded_inputs.new_zeros((1, self.hidden_dim))
+
+        # Heads (per-expert linear stacks)
+        def _stack_heads(modlist: torch.nn.ModuleList, name: str) -> None:
+            for i, head in enumerate(modlist):
+                add(f"{name}.{i}.weight", head.weight)
+                add(f"{name}.{i}.bias", head.bias)
+        _stack_heads(self.action_heads, "action_heads")
+        _stack_heads(self.opp_action_heads, "opp_action_heads")
+        _stack_heads(self.reward_stream_heads, "reward_stream_heads")
+        _stack_heads(self.win_prob_heads, "win_prob_heads")
+
+        # Policy indices: single-policy 0
+        B = encoded_inputs.size(0)
+        policy_indices = encoded_inputs.new_zeros((B,), dtype=torch.long)
+        # Call C++ training forward
+        out = lb.forward_packed_train(
+            obs_sequence,
+            action_sequence,
+            agent_types,
+            positions,
+            weights,
+            policy_indices,
+            key_padding if key_padding is not None else None,
+            int(self.transformer.layers.__len__()),
+            int(getattr(self, "num_heads", 4)),
+            int(self.hidden_dim),
+            int(self.num_experts),
+            int(self.top_k),
+            int(self.count_pad),
+            int(self.tflag_pad),
+        )
+        return out
