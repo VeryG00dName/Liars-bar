@@ -1,5 +1,7 @@
 #include "reactive_model_forward.h"
-#include "indexed_kernels.h"#include "moe_autograd_function.h"
+#include "indexed_kernels.h"
+#include "indexed_autograd.h"
+#include "moe_autograd_function.h"
 
 #include <torch/torch.h>
 #include <ATen/ATen.h>
@@ -103,17 +105,16 @@ test_embeddings(
     auto& timer_ref = timers ? *timers : dummy_timers;
 
     // Step 1: Linear
-    auto obs_linear = indexed_batched_linear(
+    auto obs_linear = indexed_batched_linear_autograd(
         obs_sequence,
         get_weight(batched_weights, "obs_encoder.0.weight"),
         get_weight(batched_weights, "obs_encoder.0.bias"),
-        policy_indices_for_ops,
-        timer_ref
+        policy_indices_for_ops
     );
     result.insert("obs_linear", obs_linear);
 
-    // Step 2: LayerNorm
-    auto obs_layernorm = indexed_batched_layer_norm(
+    // Step 2: LayerNorm (autograd-enabled for training)
+    auto obs_layernorm = indexed_batched_layer_norm_autograd(
         obs_linear,
         get_weight(batched_weights, "obs_encoder.1.weight"),
         get_weight(batched_weights, "obs_encoder.1.bias"),
@@ -127,17 +128,17 @@ test_embeddings(
     result.insert("obs_embed", obs_encoded);
 
     // Action embeddings (factorized)
-    auto act_kind_embed = indexed_batched_embedding(
+    auto act_kind_embed = indexed_batched_embedding_autograd(
         get_weight(batched_weights, "act_kind_embedding.weight"),
         act_kind_ids,
         policy_indices_for_ops
     );
-    auto count_embed = indexed_batched_embedding(
+    auto count_embed = indexed_batched_embedding_autograd(
         get_weight(batched_weights, "count_embedding.weight"),
         count_ids,
         policy_indices_for_ops
     );
-    auto table_flag_embed = indexed_batched_embedding(
+    auto table_flag_embed = indexed_batched_embedding_autograd(
         get_weight(batched_weights, "table_flag_embedding.weight"),
         table_flag_ids,
         policy_indices_for_ops
@@ -150,7 +151,7 @@ test_embeddings(
     result.insert("action_embed", action_embed);
 
     // Agent type embedding
-    auto agent_embed = indexed_batched_embedding(
+    auto agent_embed = indexed_batched_embedding_autograd(
         get_weight(batched_weights, "agent_embedding.weight"),
         agent_types.to(torch::kLong),
         policy_indices_for_ops
@@ -158,7 +159,7 @@ test_embeddings(
     result.insert("agent_embed", agent_embed);
 
     // Position embedding
-    auto position_embed = indexed_batched_embedding(
+    auto position_embed = indexed_batched_embedding_autograd(
         get_weight(batched_weights, "position_embedding.weight"),
         positions.to(torch::kLong),
         policy_indices_for_ops
@@ -186,77 +187,69 @@ test_gating(
     auto& timer_ref = timers ? *timers : dummy_timers;
 
     // Gate for observations
-    auto hidden_g_obs = indexed_batched_linear(
+    auto hidden_g_obs = indexed_batched_linear_autograd(
         obs_embed,
         get_weight(batched_weights, "gate_obs.0.weight"),
         get_weight(batched_weights, "gate_obs.0.bias"),
-        policy_indices_for_ops,
-        timer_ref
+        policy_indices_for_ops
     );
     hidden_g_obs = torch::tanh(hidden_g_obs);
-    auto g_obs = indexed_batched_linear(
+    auto g_obs = indexed_batched_linear_autograd(
         hidden_g_obs,
         get_weight(batched_weights, "gate_obs.2.weight"),
         get_weight(batched_weights, "gate_obs.2.bias"),
-        policy_indices_for_ops,
-        timer_ref
+        policy_indices_for_ops
     );
     g_obs = torch::sigmoid(g_obs);
     result.insert("g_obs", g_obs);
 
     // Gate for actions
-    auto hidden_g_action = indexed_batched_linear(
+    auto hidden_g_action = indexed_batched_linear_autograd(
         action_embed,
         get_weight(batched_weights, "gate_action.0.weight"),
         get_weight(batched_weights, "gate_action.0.bias"),
-        policy_indices_for_ops,
-        timer_ref
+        policy_indices_for_ops
     );
     hidden_g_action = torch::tanh(hidden_g_action);
-    auto g_action = indexed_batched_linear(
+    auto g_action = indexed_batched_linear_autograd(
         hidden_g_action,
         get_weight(batched_weights, "gate_action.2.weight"),
         get_weight(batched_weights, "gate_action.2.bias"),
-        policy_indices_for_ops,
-        timer_ref
+        policy_indices_for_ops
     );
     g_action = torch::sigmoid(g_action);
     result.insert("g_action", g_action);
 
     // Gate for agent types
-    auto hidden_g_agent = indexed_batched_linear(
+    auto hidden_g_agent = indexed_batched_linear_autograd(
         agent_embed,
         get_weight(batched_weights, "gate_agent.0.weight"),
         get_weight(batched_weights, "gate_agent.0.bias"),
-        policy_indices_for_ops,
-        timer_ref
+        policy_indices_for_ops
     );
     hidden_g_agent = torch::tanh(hidden_g_agent);
-    auto g_agent = indexed_batched_linear(
+    auto g_agent = indexed_batched_linear_autograd(
         hidden_g_agent,
         get_weight(batched_weights, "gate_agent.2.weight"),
         get_weight(batched_weights, "gate_agent.2.bias"),
-        policy_indices_for_ops,
-        timer_ref
+        policy_indices_for_ops
     );
     g_agent = torch::sigmoid(g_agent);
     result.insert("g_agent", g_agent);
 
     // Gate for positions
-    auto hidden_g_position = indexed_batched_linear(
+    auto hidden_g_position = indexed_batched_linear_autograd(
         position_embed,
         get_weight(batched_weights, "gate_position.0.weight"),
         get_weight(batched_weights, "gate_position.0.bias"),
-        policy_indices_for_ops,
-        timer_ref
+        policy_indices_for_ops
     );
     hidden_g_position = torch::tanh(hidden_g_position);
-    auto g_position = indexed_batched_linear(
+    auto g_position = indexed_batched_linear_autograd(
         hidden_g_position,
         get_weight(batched_weights, "gate_position.2.weight"),
         get_weight(batched_weights, "gate_position.2.bias"),
-        policy_indices_for_ops,
-        timer_ref
+        policy_indices_for_ops
     );
     g_position = torch::sigmoid(g_position);
     result.insert("g_position", g_position);
@@ -399,12 +392,11 @@ test_moe_layer(
     std::string layer_prefix = "transformer.layers." + std::to_string(layer_idx);
 
     // Compute gate logits
-    auto gate_logits = indexed_batched_linear(
+    auto gate_logits = indexed_batched_linear_autograd(
         x,
         get_weight(batched_weights, layer_prefix + ".moe.gate.weight"),
         get_weight(batched_weights, layer_prefix + ".moe.gate.bias"),
-        policy_indices_for_ops,
-        dummy_timers
+        policy_indices_for_ops
     );
 
     // Ensure dtype consistency
@@ -611,12 +603,11 @@ test_moe_routing_sort(
     std::string layer_prefix = "transformer.layers." + std::to_string(layer_idx);
 
     // Gate logits
-    auto gate_logits = indexed_batched_linear(
+    auto gate_logits = indexed_batched_linear_autograd(
         x,
         get_weight(batched_weights, layer_prefix + ".moe.gate.weight"),
         get_weight(batched_weights, layer_prefix + ".moe.gate.bias"),
-        policy_indices_for_ops,
-        dummy_timers
+        policy_indices_for_ops
     );
     if (gate_logits.scalar_type() != x.scalar_type()) gate_logits = gate_logits.to(x.scalar_type());
 
@@ -968,29 +959,30 @@ forward_packed_train(
     int64_t bias_chunk_dim   = (in_proj_bias.dim() == 2) ? 1 : 0;
     auto qkv_weights = in_proj_weight.chunk(3, weight_chunk_dim);
     auto qkv_biases  = in_proj_bias.chunk(3, bias_chunk_dim);
-    auto q = indexed_batched_linear(x, qkv_weights[0], qkv_biases[0], policy_indices_for_ops, timers_dummy);
-    auto k = indexed_batched_linear(x, qkv_weights[1], qkv_biases[1], policy_indices_for_ops, timers_dummy);
-    auto v = indexed_batched_linear(x, qkv_weights[2], qkv_biases[2], policy_indices_for_ops, timers_dummy);
+    auto q = indexed_batched_linear_autograd(x, qkv_weights[0], qkv_biases[0], policy_indices_for_ops);
+    auto k = indexed_batched_linear_autograd(x, qkv_weights[1], qkv_biases[1], policy_indices_for_ops);
+    auto v = indexed_batched_linear_autograd(x, qkv_weights[2], qkv_biases[2], policy_indices_for_ops);
     q = q.view({B, T, num_heads, head_dim}).transpose(1, 2);
     k = k.view({B, T, num_heads, head_dim}).transpose(1, 2);
     v = v.view({B, T, num_heads, head_dim}).transpose(1, 2);
     auto attn_output = torch::scaled_dot_product_attention(q, k, v, torch::nullopt, 0.0, true);
     attn_output = attn_output.transpose(1, 2).contiguous().view({B, T, hidden_dim});
-    attn_output = indexed_batched_linear(attn_output,
+    attn_output = indexed_batched_linear_autograd(attn_output,
         get_weight(batched_weights, layer_prefix + ".self_attn.out_proj.weight"),
         get_weight(batched_weights, layer_prefix + ".self_attn.out_proj.bias"),
-        policy_indices_for_ops, timers_dummy);
+        policy_indices_for_ops);
     auto residual1 = x + attn_output;
-    x = indexed_batched_layer_norm(residual1,
+    x = indexed_batched_layer_norm_autograd(residual1,
         get_weight(batched_weights, layer_prefix + ".norm1.weight"),
         get_weight(batched_weights, layer_prefix + ".norm1.bias"),
-        policy_indices_for_ops);
+        policy_indices_for_ops,
+        1e-5);
 
     // Gate logits for metrics and routing
-    auto gate_logits = indexed_batched_linear(x,
+    auto gate_logits = indexed_batched_linear_autograd(x,
         get_weight(batched_weights, layer_prefix + ".moe.gate.weight"),
         get_weight(batched_weights, layer_prefix + ".moe.gate.bias"),
-        policy_indices_for_ops, timers_dummy);
+        policy_indices_for_ops);
     gate_logits_list.push_back(gate_logits);
     auto probs = torch::softmax(gate_logits, -1);
     auto topk_vals_idx = torch::topk(gate_logits, top_k, -1);
@@ -1053,53 +1045,40 @@ forward_packed_train(
     auto moe_output = moe_output_flat.view({B, T, hidden_dim}).to(x.dtype());
 
     auto residual2 = x + moe_output;
-    x = indexed_batched_layer_norm(residual2,
+    x = indexed_batched_layer_norm_autograd(residual2,
         get_weight(batched_weights, layer_prefix + ".norm2.weight"),
         get_weight(batched_weights, layer_prefix + ".norm2.bias"),
-        policy_indices_for_ops);
+        policy_indices_for_ops,
+        1e-5);
 
     final_topk_indices = topk_indices; final_topk_scores = topk_scores;
   }
 
-  auto transformer_output = indexed_batched_layer_norm(
+  auto transformer_output = indexed_batched_layer_norm_autograd(
       x,
       get_weight(batched_weights, "transformer.norm.weight"),
       get_weight(batched_weights, "transformer.norm.bias"),
-      policy_indices_for_ops);
+      policy_indices_for_ops,
+      1e-5);
 
   std::vector<torch::Tensor> action_logits_list, opp_logits_list, state_values_list, win_logits_list;
   for (int64_t i = 0; i < num_experts; ++i) {
-    action_logits_list.push_back(indexed_batched_linear(transformer_output,
+    action_logits_list.push_back(indexed_batched_linear_autograd(transformer_output,
       get_weight(batched_weights, "action_heads." + std::to_string(i) + ".weight"),
       get_weight(batched_weights, "action_heads." + std::to_string(i) + ".bias"),
-      policy_indices_for_ops, timers_dummy));
-    opp_logits_list.push_back(indexed_batched_linear(transformer_output,
-      get_weight(batched_weights, "opp_action_heads." + std::to_string(i) + ".weight"),
-      get_weight(batched_weights, "opp_action_heads." + std::to_string(i) + ".bias"),
-      policy_indices_for_ops, timers_dummy));
-    state_values_list.push_back(indexed_batched_linear(transformer_output,
-      get_weight(batched_weights, "reward_stream_heads." + std::to_string(i) + ".weight"),
-      get_weight(batched_weights, "reward_stream_heads." + std::to_string(i) + ".bias"),
-      policy_indices_for_ops, timers_dummy));
-    win_logits_list.push_back(indexed_batched_linear(transformer_output,
-      get_weight(batched_weights, "win_prob_heads." + std::to_string(i) + ".weight"),
-      get_weight(batched_weights, "win_prob_heads." + std::to_string(i) + ".bias"),
-      policy_indices_for_ops, timers_dummy));
-      get_weight(batched_weights, "action_heads." + std::to_string(i) + ".weight"),
-      get_weight(batched_weights, "action_heads." + std::to_string(i) + ".bias"),
-      policy_indices_for_ops)));
+      policy_indices_for_ops));
     opp_logits_list.push_back(indexed_batched_linear_autograd(transformer_output,
       get_weight(batched_weights, "opp_action_heads." + std::to_string(i) + ".weight"),
       get_weight(batched_weights, "opp_action_heads." + std::to_string(i) + ".bias"),
-      policy_indices_for_ops)));
+      policy_indices_for_ops));
     state_values_list.push_back(indexed_batched_linear_autograd(transformer_output,
       get_weight(batched_weights, "reward_stream_heads." + std::to_string(i) + ".weight"),
       get_weight(batched_weights, "reward_stream_heads." + std::to_string(i) + ".bias"),
-      policy_indices_for_ops)));
+      policy_indices_for_ops));
     win_logits_list.push_back(indexed_batched_linear_autograd(transformer_output,
       get_weight(batched_weights, "win_prob_heads." + std::to_string(i) + ".weight"),
       get_weight(batched_weights, "win_prob_heads." + std::to_string(i) + ".bias"),
-      policy_indices_for_ops)));
+      policy_indices_for_ops));
   }
 
   auto action_stacked = torch::stack(action_logits_list, 2);

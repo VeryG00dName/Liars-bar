@@ -936,19 +936,21 @@ torch::Tensor indexed_batched_linear_autograd(
 
     // Index weights and biases for each batch element
     // policy_indices: [B] -> select [B, out_dim, in_dim] and [B, out_dim]
-    auto weight_selected = weight_cache.index_select(0, policy_indices.to(torch::kLong));  // [B, out_dim, in_dim]
-    auto bias_selected = bias_cache.index_select(0, policy_indices.to(torch::kLong));      // [B, out_dim]
+    auto policy_long = policy_indices.to(torch::kLong);
+    auto weight_selected = weight_cache.index_select(0, policy_long);  // [B, out_dim, in_dim]
+    auto bias_selected = bias_cache.index_select(0, policy_long);      // [B, out_dim]
 
-    // Apply linear: output[b, t] = input[b, t] @ weight[b].T + bias[b]
-    // Flatten batch and sequence for einsum
-    auto input_flat = input.view({B * T, in_dim});                    // [B*T, in_dim]
-    auto weight_expanded = weight_selected.unsqueeze(1).expand({B, T, out_dim, in_dim}).reshape({B * T, out_dim, in_dim});  // [B*T, out_dim, in_dim]
-    auto bias_expanded = bias_selected.unsqueeze(1).expand({B, T, out_dim}).reshape({B * T, out_dim});  // [B*T, out_dim]
+    // Apply linear per batch element: output[b, t] = input[b, t] @ weight[b].T + bias[b]
+    // Use loop to avoid massive einsum intermediate tensors
+    auto output = torch::empty({B, T, out_dim}, input.options());
 
-    // Linear operation using torch.bmm (batched matrix multiply)
-    // output = input_flat @ weight_expanded.transpose(-2, -1) + bias_expanded
-    auto output_flat = torch::bmm(input_flat.unsqueeze(0).expand({B * T, 1, in_dim}),
-                                   weight_expanded.transpose(1, 2)).squeeze(1) + bias_expanded;
+    for (int64_t b = 0; b < B; ++b) {
+        // input[b]: [T, in_dim]
+        // weight_selected[b]: [out_dim, in_dim]
+        // output[b] = input[b] @ weight_selected[b].T + bias_selected[b]
+        auto out_b = torch::matmul(input[b], weight_selected[b].transpose(0, 1));  // [T, out_dim]
+        output[b] = out_b + bias_selected[b].unsqueeze(0);  // broadcast bias across T
+    }
 
-    return output_flat.view({B, T, out_dim});
+    return output;
 }
