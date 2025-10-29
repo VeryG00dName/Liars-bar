@@ -208,7 +208,8 @@ void bind_reactive_model(py::module_& m) {
            int64_t num_experts,
            int64_t top_k,
            int64_t count_pad,
-           int64_t tflag_pad) {
+           int64_t tflag_pad,
+           bool use_gradient_checkpointing) {
             c10::Dict<std::string, torch::Tensor> weights;
             for (auto item : weights_py) {
                 std::string key = py::cast<std::string>(item.first);
@@ -229,7 +230,8 @@ void bind_reactive_model(py::module_& m) {
                 num_experts,
                 top_k,
                 count_pad,
-                tflag_pad
+                tflag_pad,
+                use_gradient_checkpointing
             );
             auto action_logits = std::get<0>(tup);
             auto opp_logits = std::get<1>(tup);
@@ -257,7 +259,9 @@ void bind_reactive_model(py::module_& m) {
         py::arg("top_k") = 2,
         py::arg("count_pad") = 4,
         py::arg("tflag_pad") = 3,
-        "Training forward pass with autograd MoE returning routing info"
+        py::arg("use_gradient_checkpointing") = false,
+        "Training forward pass with autograd MoE returning routing info.\n\n"
+        "Set use_gradient_checkpointing=True to enable recomputation-based activation checkpointing."
     );
 
     // Expose grouped MoE forward (training) that also returns hidden_grouped

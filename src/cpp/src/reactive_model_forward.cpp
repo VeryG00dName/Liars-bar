@@ -34,6 +34,360 @@ torch::Tensor get_weight(
     return it->value();
 }
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+transformer_layer_forward_impl(
+    const torch::Tensor& x,
+    const torch::Tensor& policy_indices,
+    const torch::Tensor& in_proj_weight,
+    const torch::Tensor& in_proj_bias,
+    const torch::Tensor& out_proj_weight,
+    const torch::Tensor& out_proj_bias,
+    const torch::Tensor& norm1_weight,
+    const torch::Tensor& norm1_bias,
+    const torch::Tensor& gate_weight,
+    const torch::Tensor& gate_bias,
+    const torch::Tensor& w1_all,
+    const torch::Tensor& w2_all,
+    const torch::Tensor& b1_all,
+    const torch::Tensor& b2_all,
+    const torch::Tensor& norm2_weight,
+    const torch::Tensor& norm2_bias,
+    int64_t num_heads,
+    int64_t hidden_dim,
+    int64_t top_k) {
+    const int64_t B = x.size(0);
+    const int64_t T = x.size(1);
+    const int64_t head_dim = hidden_dim / num_heads;
+
+    // --- Attention Block ---
+    int64_t weight_chunk_dim = (in_proj_weight.dim() == 3) ? 1 : 0;
+    int64_t bias_chunk_dim   = (in_proj_bias.dim() == 2) ? 1 : 0;
+    auto qkv_weights = in_proj_weight.chunk(3, weight_chunk_dim);
+    auto qkv_biases  = in_proj_bias.chunk(3, bias_chunk_dim);
+
+    auto q = indexed_batched_linear_autograd(x, qkv_weights[0], qkv_biases[0], policy_indices);
+    auto k = indexed_batched_linear_autograd(x, qkv_weights[1], qkv_biases[1], policy_indices);
+    auto v = indexed_batched_linear_autograd(x, qkv_weights[2], qkv_biases[2], policy_indices);
+
+    q = q.view({B, T, num_heads, head_dim}).transpose(1, 2);
+    k = k.view({B, T, num_heads, head_dim}).transpose(1, 2);
+    v = v.view({B, T, num_heads, head_dim}).transpose(1, 2);
+
+    auto attn_output = torch::scaled_dot_product_attention(q, k, v, torch::nullopt, 0.0, true);
+    attn_output = attn_output.transpose(1, 2).contiguous().view({B, T, hidden_dim});
+    attn_output = indexed_batched_linear_autograd(attn_output, out_proj_weight, out_proj_bias, policy_indices);
+
+    auto residual1 = x + attn_output;
+    auto x_norm = indexed_batched_layer_norm_autograd(residual1, norm1_weight, norm1_bias, policy_indices, 1e-5);
+
+    // --- MoE Block ---
+    auto gate_logits = indexed_batched_linear_autograd(x_norm, gate_weight, gate_bias, policy_indices);
+    auto probs = torch::softmax(gate_logits, -1);
+    auto topk_vals_idx = torch::topk(gate_logits, top_k, -1);
+    auto topk_indices = std::get<1>(topk_vals_idx);
+    auto topk_scores  = torch::gather(probs, -1, topk_indices);
+
+    auto num_tokens = B * T;
+    
+    // The input to the MoE kernels must be float16.
+    auto x_norm_fp16 = x_norm.to(torch::kHalf).contiguous();
+    auto x_flat = x_norm_fp16.view({num_tokens, hidden_dim});
+
+    auto topk_indices_long = topk_indices.to(torch::kLong).contiguous();
+    auto flat_expert_indices = topk_indices_long.reshape({-1});
+    auto flat_routing_weights = topk_scores.reshape({-1});
+    auto token_indices = torch::arange(num_tokens, torch::dtype(torch::kLong).device(x.device()));
+    auto expanded_token_indices = token_indices.unsqueeze(-1).expand({num_tokens, top_k}).reshape({-1});
+    auto sort_tuple = torch::sort(flat_expert_indices);
+    auto sorted_expert_indices = std::get<0>(sort_tuple);
+    auto sort_order = std::get<1>(sort_tuple);
+    auto sorted_token_indices = expanded_token_indices.index_select(0, sort_order);
+    auto sorted_routing_weights = flat_routing_weights.index_select(0, sort_order).to(torch::kFloat32);
+    auto policy_indices_long2 = policy_indices.to(torch::kLong);
+    auto policy_tokens = policy_indices_long2.unsqueeze(1).expand({B, T}).reshape({-1});
+    auto flat_policy_indices = policy_tokens.index_select(0, expanded_token_indices);
+    auto sorted_policy_indices = flat_policy_indices.index_select(0, sort_order);
+    
+    auto expert_inputs = x_flat.index_select(0, sorted_token_indices).contiguous();
+
+    auto sorted_expert_cpu = sorted_expert_indices.to(torch::kCPU);
+    auto sorted_policy_cpu = sorted_policy_indices.to(torch::kCPU);
+    const auto* se = sorted_expert_cpu.data_ptr<int64_t>();
+    const auto* sp = sorted_policy_cpu.data_ptr<int64_t>();
+    std::vector<int64_t> m_sizes_v, policy_ids_v, expert_ids_v, token_offsets_v;
+    int64_t cursor = 0;
+    const int64_t total_routes = sorted_expert_indices.size(0);
+    while (cursor < total_routes) {
+        int64_t ei = se[cursor];
+        int64_t pi = sp[cursor];
+        int64_t end = cursor + 1;
+        while (end < total_routes && se[end] == ei && sp[end] == pi) {
+            ++end;
+        }
+        m_sizes_v.push_back(end - cursor);
+        policy_ids_v.push_back(pi);
+        expert_ids_v.push_back(ei);
+        token_offsets_v.push_back(cursor);
+        cursor = end;
+    }
+
+    auto m_sizes_cpu = torch::from_blob(m_sizes_v.data(), {(int64_t)m_sizes_v.size()}, torch::TensorOptions().dtype(torch::kLong)).clone();
+    auto policy_ids_cpu = torch::from_blob(policy_ids_v.data(), {(int64_t)policy_ids_v.size()}, torch::TensorOptions().dtype(torch::kLong)).clone();
+    auto expert_ids_cpu = torch::from_blob(expert_ids_v.data(), {(int64_t)expert_ids_v.size()}, torch::TensorOptions().dtype(torch::kLong)).clone();
+    auto token_offsets_cpu = torch::from_blob(token_offsets_v.data(), {(int64_t)token_offsets_v.size()}, torch::TensorOptions().dtype(torch::kLong)).clone();
+
+    // The weights passed to the MoE autograd function must also be float16.
+    auto expert_outputs = lb::moe::grouped_moe_autograd_forward(
+        expert_inputs,
+        w1_all.to(torch::kFloat16),
+        w2_all.to(torch::kFloat16),
+        b1_all.to(torch::kFloat16),
+        b2_all.to(torch::kFloat16),
+        sorted_routing_weights,
+        sorted_token_indices,
+        m_sizes_cpu,
+        policy_ids_cpu,
+        expert_ids_cpu,
+        token_offsets_cpu,
+        hidden_dim,
+        w1_all.size(-2)
+    );
+
+    auto moe_output_flat = torch::zeros({num_tokens, hidden_dim}, expert_outputs.options());
+    moe_output_flat.index_add_(0, sorted_token_indices, expert_outputs);
+    auto moe_output = moe_output_flat.view({B, T, hidden_dim}).to(x_norm.dtype());
+
+    auto residual2 = x_norm + moe_output;
+    auto x_next = indexed_batched_layer_norm_autograd(residual2, norm2_weight, norm2_bias, policy_indices, 1e-5);
+
+    return std::make_tuple(x_next, gate_logits, topk_indices, topk_scores);
+}
+
+struct TransformerLayerCheckpointFunction
+    : public torch::autograd::Function<TransformerLayerCheckpointFunction> {
+    static torch::autograd::tensor_list forward(
+        torch::autograd::AutogradContext* ctx,
+        const torch::Tensor& x,
+        const torch::Tensor& policy_indices,
+        const torch::Tensor& in_proj_weight,
+        const torch::Tensor& in_proj_bias,
+        const torch::Tensor& out_proj_weight,
+        const torch::Tensor& out_proj_bias,
+        const torch::Tensor& norm1_weight,
+        const torch::Tensor& norm1_bias,
+        const torch::Tensor& gate_weight,
+        const torch::Tensor& gate_bias,
+        const torch::Tensor& w1_all,
+        const torch::Tensor& w2_all,
+        const torch::Tensor& b1_all,
+        const torch::Tensor& b2_all,
+        const torch::Tensor& norm2_weight,
+        const torch::Tensor& norm2_bias,
+        int64_t num_heads,
+        int64_t hidden_dim,
+        int64_t top_k) {
+        torch::NoGradGuard no_grad;
+
+        auto outputs = transformer_layer_forward_impl(
+            x,
+            policy_indices,
+            in_proj_weight,
+            in_proj_bias,
+            out_proj_weight,
+            out_proj_bias,
+            norm1_weight,
+            norm1_bias,
+            gate_weight,
+            gate_bias,
+            w1_all,
+            w2_all,
+            b1_all,
+            b2_all,
+            norm2_weight,
+            norm2_bias,
+            num_heads,
+            hidden_dim,
+            top_k);
+
+        std::vector<int64_t> requires_grad_flags;
+        requires_grad_flags.reserve(16);
+        auto record_flag = [&](const torch::Tensor& t) {
+            requires_grad_flags.push_back(t.requires_grad() ? 1 : 0);
+        };
+
+        record_flag(x);
+        record_flag(policy_indices);
+        record_flag(in_proj_weight);
+        record_flag(in_proj_bias);
+        record_flag(out_proj_weight);
+        record_flag(out_proj_bias);
+        record_flag(norm1_weight);
+        record_flag(norm1_bias);
+        record_flag(gate_weight);
+        record_flag(gate_bias);
+        record_flag(w1_all);
+        record_flag(w2_all);
+        record_flag(b1_all);
+        record_flag(b2_all);
+        record_flag(norm2_weight);
+        record_flag(norm2_bias);
+
+        ctx->saved_data["requires_grad_flags"] = requires_grad_flags;
+        ctx->saved_data["num_heads"] = num_heads;
+        ctx->saved_data["hidden_dim"] = hidden_dim;
+        ctx->saved_data["top_k"] = top_k;
+
+        ctx->save_for_backward({
+            x.detach(),
+            policy_indices.detach(),
+            in_proj_weight.detach(),
+            in_proj_bias.detach(),
+            out_proj_weight.detach(),
+            out_proj_bias.detach(),
+            norm1_weight.detach(),
+            norm1_bias.detach(),
+            gate_weight.detach(),
+            gate_bias.detach(),
+            w1_all.detach(),
+            w2_all.detach(),
+            b1_all.detach(),
+            b2_all.detach(),
+            norm2_weight.detach(),
+            norm2_bias.detach()
+        });
+
+        torch::autograd::tensor_list result(4);
+        result[0] = std::get<0>(outputs);
+        result[1] = std::get<1>(outputs);
+        result[2] = std::get<2>(outputs);
+        result[3] = std::get<3>(outputs);
+        return result;
+    }
+
+    static torch::autograd::tensor_list backward(
+        torch::autograd::AutogradContext* ctx,
+        torch::autograd::tensor_list grad_outputs) {
+        auto saved = ctx->get_saved_variables();
+        auto requires_grad_flags = ctx->saved_data["requires_grad_flags"].toIntVector();
+        int64_t num_heads = ctx->saved_data["num_heads"].toInt();
+        int64_t hidden_dim = ctx->saved_data["hidden_dim"].toInt();
+        int64_t top_k = ctx->saved_data["top_k"].toInt();
+
+        // ========================================================================
+        // STAGE 1: Prepare inputs for recomputation.
+        // This is the core of the fix. We manually emulate what `autocast` would do
+        // by upcasting all floating-point inputs to float32 for the recomputation.
+        // This ensures the temporary graph used for the backward pass is numerically stable.
+        // ========================================================================
+        std::vector<torch::Tensor> inputs_for_recompute;
+        std::vector<torch::Tensor> inputs_to_grad; // A filtered list of only the tensors that require gradients.
+        inputs_for_recompute.reserve(saved.size());
+        inputs_to_grad.reserve(saved.size());
+
+        for (size_t i = 0; i < saved.size(); ++i) {
+            auto tensor = saved[i].detach();
+            // If it's a floating point tensor, cast it to float32 for stability during recomputation.
+            // Integer tensors (like policy_indices) are left as-is.
+            if (tensor.is_floating_point()) {
+                tensor = tensor.to(torch::kFloat32);
+            }
+
+            // If the original tensor required a gradient, set requires_grad on our new (potentially upcast) copy.
+            if (requires_grad_flags[i]) {
+                tensor.set_requires_grad(true);
+                // We only add tensors to `inputs_to_grad` if they are differentiable.
+                if (tensor.is_floating_point()) {
+                    inputs_to_grad.push_back(tensor);
+                }
+            }
+            inputs_for_recompute.push_back(tensor);
+        }
+
+        // ========================================================================
+        // STAGE 2: Recompute the forward pass in a grad-enabled context.
+        // This builds a new, temporary computation graph using our stable float32 tensors.
+        // ========================================================================
+        torch::AutoGradMode enable_grad(true);
+        auto recomputed = transformer_layer_forward_impl(
+            inputs_for_recompute[0],  // x
+            inputs_for_recompute[1],  // policy_indices
+            inputs_for_recompute[2],  // in_proj_weight
+            inputs_for_recompute[3],  // in_proj_bias
+            inputs_for_recompute[4],  // out_proj_weight
+            inputs_for_recompute[5],  // out_proj_bias
+            inputs_for_recompute[6],  // norm1_weight
+            inputs_for_recompute[7],  // norm1_bias
+            inputs_for_recompute[8],  // gate_weight
+            inputs_for_recompute[9],  // gate_bias
+            inputs_for_recompute[10], // w1_all
+            inputs_for_recompute[11], // w2_all
+            inputs_for_recompute[12], // b1_all
+            inputs_for_recompute[13], // b2_all
+            inputs_for_recompute[14], // norm2_weight
+            inputs_for_recompute[15], // norm2_bias
+            num_heads,
+            hidden_dim,
+            top_k);
+
+        // ========================================================================
+        // STAGE 3: Prepare the outputs and their corresponding upstream gradients for the grad() call.
+        // The upstream gradients must also be cast to float32 to match the recomputed outputs' dtype.
+        // ========================================================================
+        std::vector<torch::Tensor> outputs_for_grad;
+        std::vector<torch::Tensor> grad_outputs_for_grad;
+
+        // Output 0: x_next
+        outputs_for_grad.push_back(std::get<0>(recomputed));
+        grad_outputs_for_grad.push_back(grad_outputs[0].defined() ? grad_outputs[0].to(torch::kFloat32) : torch::zeros_like(std::get<0>(recomputed)));
+
+        // Output 1: gate_logits
+        outputs_for_grad.push_back(std::get<1>(recomputed));
+        grad_outputs_for_grad.push_back(grad_outputs[1].defined() ? grad_outputs[1].to(torch::kFloat32) : torch::zeros_like(std::get<1>(recomputed)));
+
+        // Output 2: topk_indices is non-differentiable and not returned by forward_impl, so we skip it.
+
+        // Output 3: topk_scores
+        outputs_for_grad.push_back(std::get<3>(recomputed));
+        grad_outputs_for_grad.push_back(grad_outputs[3].defined() ? grad_outputs[3].to(torch::kFloat32) : torch::zeros_like(std::get<3>(recomputed)));
+
+        // ========================================================================
+        // STAGE 4: Call torch::autograd::grad on the stable float32 graph.
+        // This will produce float32 gradients.
+        // ========================================================================
+        auto grads = torch::autograd::grad(
+            outputs_for_grad,
+            inputs_to_grad, // Use the filtered list of tensors that require grad
+            grad_outputs_for_grad,
+            /*retain_graph=*/false,
+            /*create_graph=*/false,
+            /*allow_unused=*/true);
+
+        // ========================================================================
+        // STAGE 5: Map the computed gradients back to the full list of results.
+        // Gradients are cast back to the original dtype of the parameters.
+        // ========================================================================
+        torch::autograd::tensor_list results(saved.size() + 3); // +3 for num_heads, hidden_dim, top_k
+        int grad_idx = 0;
+        for (size_t i = 0; i < saved.size(); ++i) {
+            if (requires_grad_flags[i]) {
+                // Check if the input was actually differentiable (floating point)
+                if (saved[i].is_floating_point()) {
+                    if (grad_idx < grads.size() && grads[grad_idx].defined()) {
+                        // Cast the float32 gradient back to the original parameter's dtype (e.g., float16)
+                        results[i] = grads[grad_idx].to(saved[i].scalar_type());
+                    }
+                    grad_idx++;
+                }
+                // If requires_grad was true but it wasn't a float tensor (e.g. a bug),
+                // we do nothing, leaving an undefined tensor in results, which is correct.
+            }
+            // else, results[i] is already an undefined tensor (torch::Tensor())
+        }
+
+        return results;
+    }
+};
+
 } // anonymous namespace
 
 // ============================================================================
@@ -900,7 +1254,8 @@ forward_packed_train(
     int64_t num_experts,
     int64_t top_k,
     int64_t count_pad,
-    int64_t tflag_pad
+    int64_t tflag_pad,
+    bool use_gradient_checkpointing
 ) {
   std::unordered_map<std::string, Microseconds> timers_dummy;
   auto policy_indices_long = policy_indices.to(torch::kLong).contiguous();
@@ -948,110 +1303,83 @@ forward_packed_train(
   torch::Tensor final_topk_scores;   // [B,T,K]
   std::vector<torch::Tensor> gate_logits_list; // [L,B,T,E]
 
-  int64_t head_dim = hidden_dim / num_heads;
   for (int64_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
     std::string layer_prefix = std::string("transformer.layers.") + std::to_string(layer_idx);
 
-    // Attention (identical to inference forward)
     auto in_proj_weight = get_weight(batched_weights, layer_prefix + ".self_attn.in_proj_weight");
     auto in_proj_bias   = get_weight(batched_weights, layer_prefix + ".self_attn.in_proj_bias");
-    int64_t weight_chunk_dim = (in_proj_weight.dim() == 3) ? 1 : 0;
-    int64_t bias_chunk_dim   = (in_proj_bias.dim() == 2) ? 1 : 0;
-    auto qkv_weights = in_proj_weight.chunk(3, weight_chunk_dim);
-    auto qkv_biases  = in_proj_bias.chunk(3, bias_chunk_dim);
-    auto q = indexed_batched_linear_autograd(x, qkv_weights[0], qkv_biases[0], policy_indices_for_ops);
-    auto k = indexed_batched_linear_autograd(x, qkv_weights[1], qkv_biases[1], policy_indices_for_ops);
-    auto v = indexed_batched_linear_autograd(x, qkv_weights[2], qkv_biases[2], policy_indices_for_ops);
-    q = q.view({B, T, num_heads, head_dim}).transpose(1, 2);
-    k = k.view({B, T, num_heads, head_dim}).transpose(1, 2);
-    v = v.view({B, T, num_heads, head_dim}).transpose(1, 2);
-    auto attn_output = torch::scaled_dot_product_attention(q, k, v, torch::nullopt, 0.0, true);
-    attn_output = attn_output.transpose(1, 2).contiguous().view({B, T, hidden_dim});
-    attn_output = indexed_batched_linear_autograd(attn_output,
-        get_weight(batched_weights, layer_prefix + ".self_attn.out_proj.weight"),
-        get_weight(batched_weights, layer_prefix + ".self_attn.out_proj.bias"),
-        policy_indices_for_ops);
-    auto residual1 = x + attn_output;
-    x = indexed_batched_layer_norm_autograd(residual1,
-        get_weight(batched_weights, layer_prefix + ".norm1.weight"),
-        get_weight(batched_weights, layer_prefix + ".norm1.bias"),
-        policy_indices_for_ops,
-        1e-5);
+    auto out_proj_weight = get_weight(batched_weights, layer_prefix + ".self_attn.out_proj.weight");
+    auto out_proj_bias   = get_weight(batched_weights, layer_prefix + ".self_attn.out_proj.bias");
+    auto norm1_weight = get_weight(batched_weights, layer_prefix + ".norm1.weight");
+    auto norm1_bias   = get_weight(batched_weights, layer_prefix + ".norm1.bias");
+    auto gate_weight  = get_weight(batched_weights, layer_prefix + ".moe.gate.weight");
+    auto gate_bias    = get_weight(batched_weights, layer_prefix + ".moe.gate.bias");
+    auto w1_all       = get_weight(batched_weights, layer_prefix + ".moe.experts.w1");
+    auto w2_all       = get_weight(batched_weights, layer_prefix + ".moe.experts.w2");
+    auto b1_all       = get_weight(batched_weights, layer_prefix + ".moe.experts.b1");
+    auto b2_all       = get_weight(batched_weights, layer_prefix + ".moe.experts.b2");
+    auto norm2_weight = get_weight(batched_weights, layer_prefix + ".norm2.weight");
+    auto norm2_bias   = get_weight(batched_weights, layer_prefix + ".norm2.bias");
 
-    // Gate logits for metrics and routing
-    auto gate_logits = indexed_batched_linear_autograd(x,
-        get_weight(batched_weights, layer_prefix + ".moe.gate.weight"),
-        get_weight(batched_weights, layer_prefix + ".moe.gate.bias"),
-        policy_indices_for_ops);
-    gate_logits_list.push_back(gate_logits);
-    auto probs = torch::softmax(gate_logits, -1);
-    auto topk_vals_idx = torch::topk(gate_logits, top_k, -1);
-    auto topk_indices = std::get<1>(topk_vals_idx);
-    auto topk_scores  = torch::gather(probs, -1, topk_indices);
+    torch::Tensor gate_logits;
+    torch::Tensor topk_indices;
+    torch::Tensor topk_scores;
+    if (use_gradient_checkpointing) {
+      auto layer_outputs = TransformerLayerCheckpointFunction::apply(
+          x,
+          policy_indices_for_ops,
+          in_proj_weight,
+          in_proj_bias,
+          out_proj_weight,
+          out_proj_bias,
+          norm1_weight,
+          norm1_bias,
+          gate_weight,
+          gate_bias,
+          w1_all,
+          w2_all,
+          b1_all,
+          b2_all,
+          norm2_weight,
+          norm2_bias,
+          num_heads,
+          hidden_dim,
+          top_k);
 
-    // Grouping
-    auto num_tokens = B * T;
-    auto x_fp16 = x.to(torch::kHalf).contiguous();
-    auto x_flat = x_fp16.view({num_tokens, hidden_dim});
-    auto topk_indices_long = topk_indices.to(torch::kLong).contiguous();
-    auto flat_expert_indices = topk_indices_long.reshape({-1});
-    auto flat_routing_weights = topk_scores.reshape({-1});
-    auto token_indices = torch::arange(num_tokens, torch::dtype(torch::kLong).device(x.device()));
-    auto expanded_token_indices = token_indices.unsqueeze(-1).expand({num_tokens, top_k}).reshape({-1});
-    auto sort_tuple = torch::sort(flat_expert_indices);
-    auto sorted_expert_indices = std::get<0>(sort_tuple);
-    auto sort_order = std::get<1>(sort_tuple);
-    auto sorted_token_indices = expanded_token_indices.index_select(0, sort_order);
-    auto sorted_routing_weights = flat_routing_weights.index_select(0, sort_order).to(torch::kFloat32);
-    auto policy_indices_long2 = policy_indices_for_ops.to(torch::kLong);
-    auto policy_tokens = policy_indices_long2.unsqueeze(1).expand({B, T}).reshape({-1});
-    auto flat_policy_indices = policy_tokens.index_select(0, expanded_token_indices);
-    auto sorted_policy_indices = flat_policy_indices.index_select(0, sort_order);
-    auto expert_inputs = x_flat.index_select(0, sorted_token_indices).contiguous();
-
-    // Build groups on CPU
-    auto sorted_expert_cpu = sorted_expert_indices.to(torch::kCPU);
-    auto sorted_policy_cpu = sorted_policy_indices.to(torch::kCPU);
-    const auto* se = sorted_expert_cpu.data_ptr<int64_t>();
-    const auto* sp = sorted_policy_cpu.data_ptr<int64_t>();
-    std::vector<int64_t> m_sizes_v, policy_ids_v, expert_ids_v, token_offsets_v;
-    int64_t cursor = 0; const int64_t total_routes = sorted_expert_indices.size(0);
-    while (cursor < total_routes) {
-      int64_t ei = se[cursor]; int64_t pi = sp[cursor];
-      int64_t end = cursor + 1; while (end < total_routes && se[end] == ei && sp[end] == pi) ++end;
-      m_sizes_v.push_back(end - cursor); policy_ids_v.push_back(pi); expert_ids_v.push_back(ei); token_offsets_v.push_back(cursor);
-      cursor = end;
+      x = layer_outputs[0];
+      gate_logits = layer_outputs[1];
+      topk_indices = layer_outputs[2];
+      topk_scores = layer_outputs[3];
+    } else {
+      auto layer_outputs = transformer_layer_forward_impl(
+          x,
+          policy_indices_for_ops,
+          in_proj_weight,
+          in_proj_bias,
+          out_proj_weight,
+          out_proj_bias,
+          norm1_weight,
+          norm1_bias,
+          gate_weight,
+          gate_bias,
+          w1_all,
+          w2_all,
+          b1_all,
+          b2_all,
+          norm2_weight,
+          norm2_bias,
+          num_heads,
+          hidden_dim,
+          top_k);
+      x = std::get<0>(layer_outputs);
+      gate_logits = std::get<1>(layer_outputs);
+      topk_indices = std::get<2>(layer_outputs);
+      topk_scores = std::get<3>(layer_outputs);
     }
-    auto m_sizes_cpu = torch::from_blob(m_sizes_v.data(), {(int64_t)m_sizes_v.size()}, torch::TensorOptions().dtype(torch::kLong)).clone();
-    auto policy_ids_cpu = torch::from_blob(policy_ids_v.data(), {(int64_t)policy_ids_v.size()}, torch::TensorOptions().dtype(torch::kLong)).clone();
-    auto expert_ids_cpu = torch::from_blob(expert_ids_v.data(), {(int64_t)expert_ids_v.size()}, torch::TensorOptions().dtype(torch::kLong)).clone();
-    auto token_offsets_cpu = torch::from_blob(token_offsets_v.data(), {(int64_t)token_offsets_v.size()}, torch::TensorOptions().dtype(torch::kLong)).clone();
 
-    // Expert weights should be provided as stacked tensors in weights dict
-    auto w1_all = get_weight(batched_weights, layer_prefix + ".moe.experts.w1");
-    auto w2_all = get_weight(batched_weights, layer_prefix + ".moe.experts.w2");
-    auto b1_all = get_weight(batched_weights, layer_prefix + ".moe.experts.b1");
-    auto b2_all = get_weight(batched_weights, layer_prefix + ".moe.experts.b2");
-
-    auto expert_outputs = lb::moe::grouped_moe_autograd_forward(
-        expert_inputs, w1_all, w2_all, b1_all, b2_all,
-        sorted_routing_weights, sorted_token_indices,
-        m_sizes_cpu, policy_ids_cpu, expert_ids_cpu, token_offsets_cpu,
-        hidden_dim, w1_all.size(-2)
-    );
-
-    auto moe_output_flat = torch::zeros({num_tokens, hidden_dim}, expert_outputs.options());
-    moe_output_flat.index_add_(0, sorted_token_indices, expert_outputs);
-    auto moe_output = moe_output_flat.view({B, T, hidden_dim}).to(x.dtype());
-
-    auto residual2 = x + moe_output;
-    x = indexed_batched_layer_norm_autograd(residual2,
-        get_weight(batched_weights, layer_prefix + ".norm2.weight"),
-        get_weight(batched_weights, layer_prefix + ".norm2.bias"),
-        policy_indices_for_ops,
-        1e-5);
-
-    final_topk_indices = topk_indices; final_topk_scores = topk_scores;
+    gate_logits_list.push_back(gate_logits);
+    final_topk_indices = topk_indices;
+    final_topk_scores = topk_scores;
   }
 
   auto transformer_output = indexed_batched_layer_norm_autograd(

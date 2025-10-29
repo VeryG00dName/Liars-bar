@@ -162,14 +162,15 @@ class PPOVecRolloutManager:
 
         # C++ runs entire rollout internally (start + inference loop + get results)
         cpp_start = time.perf_counter()
-        completed = self.rollout_manager.run_rollouts(
-            num_episodes=num_episodes,
-            num_players=num_players,
-            training_policy_ids=training_policy_list,
-            max_batch_envs=max_batch_envs or -1,
-            seed=seed,
-            opponent_triplets=triplets_arg,
-        )
+        with torch.no_grad():
+            completed = self.rollout_manager.run_rollouts(
+                num_episodes=num_episodes,
+                num_players=num_players,
+                training_policy_ids=training_policy_list,
+                max_batch_envs=max_batch_envs or -1,
+                seed=seed,
+                opponent_triplets=triplets_arg,
+            )
         cpp_duration = time.perf_counter() - cpp_start
 
         convert_t = time.perf_counter()

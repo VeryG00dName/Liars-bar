@@ -1,10 +1,9 @@
 # src/model/ppo_reactive_model.py
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, List, Optional, Tuple
 
 import torch
-from torch.utils.checkpoint import checkpoint
 
 from src.model.ppo_reactive_model_base import PPOReactiveModelBase
 from src.misc import lb
@@ -61,23 +60,8 @@ class PPOReactiveModel(PPOReactiveModelBase):
         invalid = (~action_masks.bool()) & our_turns
         return torch.where(invalid, neg, action_logits)
 
-    def _forward_with_gradient_checkpointing(
-        self,
-        encoded_inputs: torch.Tensor,
-        causal_mask: torch.Tensor,
-        key_padding: Optional[torch.Tensor],
-        obs_sequence: torch.Tensor,
-        action_sequence: torch.Tensor,
-        agent_types: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
-        # For simplicity, use eager training path; we don't combine torch.utils.checkpoint
-        # with the C++ training forward.
-        return self._forward_cpp_training(encoded_inputs, causal_mask, key_padding,
-                                          obs_sequence, action_sequence, agent_types, positions)
-        
     def _stack_gate_logits(self, gate_logits_list: List[torch.Tensor], ref_tensor: torch.Tensor) -> torch.Tensor:
-         return (
+        return (
             torch.stack(gate_logits_list, dim=0)
             if gate_logits_list
             else ref_tensor.new_zeros(
@@ -109,14 +93,16 @@ class PPOReactiveModel(PPOReactiveModelBase):
         causal_mask, key_padding = self._prepare_masks(encoded_inputs, padding_mask)
 
         # 2. Run transformer (with or without checkpointing)
-        if self.training and self.use_gradient_checkpointing:
-            action_logits, opp_logits, state_values, win_logits, gate_logits_tensor, routing = self._forward_with_gradient_checkpointing(
-                encoded_inputs, causal_mask, key_padding, obs_sequence, action_sequence, agent_types, positions
-            )
-        else:
-            action_logits, opp_logits, state_values, win_logits, gate_logits_tensor, routing = self._forward_cpp_training(
-                encoded_inputs, causal_mask, key_padding, obs_sequence, action_sequence, agent_types, positions
-            )
+        action_logits, opp_logits, state_values, win_logits, gate_logits_tensor, routing = self._forward_cpp_training(
+            encoded_inputs,
+            causal_mask,
+            key_padding,
+            obs_sequence,
+            action_sequence,
+            agent_types,
+            positions,
+            use_gradient_checkpointing=self.training and self.use_gradient_checkpointing,
+        )
 
         # 3. Apply training-specific masking
         action_logits = self._apply_action_mask(action_logits, agent_types, action_masks)
@@ -139,6 +125,8 @@ class PPOReactiveModel(PPOReactiveModelBase):
         action_sequence: torch.Tensor,
         agent_types: torch.Tensor,
         positions: torch.Tensor,
+        *,
+        use_gradient_checkpointing: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         # Build a minimal batched weight dict [1, ...] from module params using autograd-friendly ops
         weights: Dict[str, torch.Tensor] = {}
@@ -239,5 +227,6 @@ class PPOReactiveModel(PPOReactiveModelBase):
             int(self.top_k),
             int(self.count_pad),
             int(self.tflag_pad),
+            bool(use_gradient_checkpointing),
         )
         return out

@@ -54,6 +54,8 @@ forward_packed(
 );
 
 // Training variant that returns extra routing info and uses autograd MoE.
+// Optional gradient checkpointing recomputes transformer layers during backward
+// to reduce activation memory.
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
            torch::Tensor, std::unordered_map<std::string, torch::Tensor>>
 forward_packed_train(
@@ -70,7 +72,8 @@ forward_packed_train(
     int64_t num_experts,
     int64_t top_k,
     int64_t count_pad,
-    int64_t tflag_pad
+    int64_t tflag_pad,
+    bool use_gradient_checkpointing
 );
 
 // Overload with detailed timers map for granular profiling
