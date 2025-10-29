@@ -1098,9 +1098,12 @@ def train_generation(
                     group_count >= group_target
                     or processed_minibatches == num_minibatches
                 )
+                
                 if should_step:
                     scaler.unscale_(optimizer)
-
+                    for name, p in learner.train_model.named_parameters():
+                        if p.grad is None:
+                            print(f"[grad-norm] {name}: None")
                     # Clip gradients for the main part of the network
                     if main_params:
                         clip_grad_norm_(main_params, max_norm=float(config.MAX_NORM))

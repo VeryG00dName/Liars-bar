@@ -86,6 +86,8 @@ transformer_layer_forward_impl(
     auto topk_vals_idx = torch::topk(gate_logits, top_k, -1);
     auto topk_indices = std::get<1>(topk_vals_idx);
     auto topk_scores  = torch::gather(probs, -1, topk_indices);
+    // Normalize selected top-k scores to sum to 1 for numerical stability
+    auto topk_weights = topk_scores / topk_scores.sum(-1, /*keepdim=*/true).clamp_min(1e-6);
 
     auto num_tokens = B * T;
     
@@ -95,20 +97,24 @@ transformer_layer_forward_impl(
 
     auto topk_indices_long = topk_indices.to(torch::kLong).contiguous();
     auto flat_expert_indices = topk_indices_long.reshape({-1});
-    auto flat_routing_weights = topk_scores.reshape({-1});
+    auto flat_routing_weights = topk_weights.reshape({-1});
     auto token_indices = torch::arange(num_tokens, torch::dtype(torch::kLong).device(x.device()));
     auto expanded_token_indices = token_indices.unsqueeze(-1).expand({num_tokens, top_k}).reshape({-1});
-    auto sort_tuple = torch::sort(flat_expert_indices);
-    auto sorted_expert_indices = std::get<0>(sort_tuple);
-    auto sort_order = std::get<1>(sort_tuple);
-    auto sorted_token_indices = expanded_token_indices.index_select(0, sort_order);
-    auto sorted_routing_weights = flat_routing_weights.index_select(0, sort_order).to(torch::kFloat32);
     auto policy_indices_long2 = policy_indices.to(torch::kLong);
     auto policy_tokens = policy_indices_long2.unsqueeze(1).expand({B, T}).reshape({-1});
     auto flat_policy_indices = policy_tokens.index_select(0, expanded_token_indices);
+    // Stable grouping by (expert, policy): sort with combined key
+    int64_t num_policies_for_key = w1_all.size(0);
+    auto combined_key = flat_expert_indices * num_policies_for_key + flat_policy_indices;
+    auto sort_order = torch::argsort(combined_key);
+    auto sorted_expert_indices = flat_expert_indices.index_select(0, sort_order);
+    auto sorted_token_indices = expanded_token_indices.index_select(0, sort_order);
+    auto sorted_routing_weights = flat_routing_weights.index_select(0, sort_order).to(torch::kFloat32);
     auto sorted_policy_indices = flat_policy_indices.index_select(0, sort_order);
     
     auto expert_inputs = x_flat.index_select(0, sorted_token_indices).contiguous();
+    // Clamp to finite FP16 range to avoid INF in kernels
+    expert_inputs = expert_inputs.clamp(-65504.0, 65504.0);
 
     auto sorted_expert_cpu = sorted_expert_indices.to(torch::kCPU);
     auto sorted_policy_cpu = sorted_policy_indices.to(torch::kCPU);
@@ -116,12 +122,12 @@ transformer_layer_forward_impl(
     const auto* sp = sorted_policy_cpu.data_ptr<int64_t>();
     std::vector<int64_t> m_sizes_v, policy_ids_v, expert_ids_v, token_offsets_v;
     int64_t cursor = 0;
-    const int64_t total_routes = sorted_expert_indices.size(0);
-    while (cursor < total_routes) {
+    const int64_t total_expert_routes = sorted_expert_indices.size(0);
+    while (cursor < total_expert_routes) {
         int64_t ei = se[cursor];
         int64_t pi = sp[cursor];
         int64_t end = cursor + 1;
-        while (end < total_routes && se[end] == ei && sp[end] == pi) {
+        while (end < total_expert_routes && se[end] == ei && sp[end] == pi) {
             ++end;
         }
         m_sizes_v.push_back(end - cursor);
@@ -160,7 +166,7 @@ transformer_layer_forward_impl(
     auto residual2 = x_norm + moe_output;
     auto x_next = indexed_batched_layer_norm_autograd(residual2, norm2_weight, norm2_bias, policy_indices, 1e-5);
 
-    return std::make_tuple(x_next, gate_logits, topk_indices, topk_scores);
+    return std::make_tuple(x_next, gate_logits, topk_indices, topk_weights);
 }
 
 struct TransformerLayerCheckpointFunction
@@ -812,18 +818,21 @@ test_moe_layer(
                                             .contiguous()
                                             .reshape({-1});
 
-    auto sort_tuple = torch::sort(flat_expert_indices);
-    auto sorted_expert_indices = std::get<0>(sort_tuple);
-    auto sort_order = std::get<1>(sort_tuple);
-
-    auto sorted_token_indices = expanded_token_indices.index_select(0, sort_order);
-    auto sorted_routing_weights = flat_routing_weights.index_select(0, sort_order);
-
+    // Build per-token policy indices first (flat) for keying
     auto policy_indices_long = policy_indices_for_ops.to(torch::kLong);
     auto policy_tokens = policy_indices_long.unsqueeze(1)
                                             .expand({batch_size, seq_len})
                                             .reshape({-1});
     auto flat_policy_indices = policy_tokens.index_select(0, expanded_token_indices);
+
+    // Sort by combined (expert, policy) key to ensure single group per pair
+    int64_t num_policies_for_key = num_policies_in_cache;
+    auto combined_key = flat_expert_indices * num_policies_for_key + flat_policy_indices;
+    auto sort_order = torch::argsort(combined_key);
+    auto sorted_expert_indices = flat_expert_indices.index_select(0, sort_order);
+
+    auto sorted_token_indices = expanded_token_indices.index_select(0, sort_order);
+    auto sorted_routing_weights = flat_routing_weights.index_select(0, sort_order);
     auto sorted_policy_indices = flat_policy_indices.index_select(0, sort_order);
 
     auto expert_inputs = x_flat.index_select(0, sorted_token_indices).contiguous();
@@ -981,15 +990,17 @@ test_moe_routing_sort(
     auto token_indices = torch::arange(num_tokens, torch::dtype(torch::kLong).device(x.device()));
     auto expanded_token_indices = token_indices.unsqueeze(-1).expand({num_tokens, top_k}).contiguous().reshape({-1});
 
-    auto sort_tuple = torch::sort(flat_expert_indices);
-    auto sorted_expert_indices = std::get<0>(sort_tuple);
-    auto sort_order = std::get<1>(sort_tuple);
-    auto sorted_token_indices = expanded_token_indices.index_select(0, sort_order);
-    auto sorted_routing_weights = flat_routing_weights.index_select(0, sort_order);
-
     auto policy_indices_long = policy_indices_for_ops.to(torch::kLong);
     auto policy_tokens = policy_indices_long.unsqueeze(1).expand({batch_size, seq_len}).reshape({-1});
     auto flat_policy_indices = policy_tokens.index_select(0, expanded_token_indices);
+
+    // Sort by combined (expert, policy) key to ensure one group per pair
+    int64_t num_policies_for_key = get_weight(batched_weights, layer_prefix + ".moe.experts.w1").size(0);
+    auto combined_key = flat_expert_indices * num_policies_for_key + flat_policy_indices;
+    auto sort_order = torch::argsort(combined_key);
+    auto sorted_expert_indices = flat_expert_indices.index_select(0, sort_order);
+    auto sorted_token_indices = expanded_token_indices.index_select(0, sort_order);
+    auto sorted_routing_weights = flat_routing_weights.index_select(0, sort_order);
     auto sorted_policy_indices = flat_policy_indices.index_select(0, sort_order);
 
     c10::Dict<std::string, torch::Tensor> out;
@@ -1724,21 +1735,25 @@ forward_packed(
                                                 .contiguous()
                                                 .reshape({-1});
 
-        auto sort_tuple = torch::sort(flat_expert_indices);
-        auto sorted_expert_indices = std::get<0>(sort_tuple);
-        auto sort_order = std::get<1>(sort_tuple);
-
-        auto sorted_token_indices = expanded_token_indices.index_select(0, sort_order);
-        auto sorted_routing_weights = flat_routing_weights.index_select(0, sort_order);
-
         auto policy_indices_long = policy_indices_for_ops.to(torch::kLong);
         auto policy_tokens = policy_indices_long.unsqueeze(1)
                                                     .expand({batch_size, seq_len})
                                                     .reshape({-1});
         auto flat_policy_indices = policy_tokens.index_select(0, expanded_token_indices);
+
+        // Sort by combined (expert, policy) key to ensure single group per pair
+        int64_t num_policies_for_key = num_policies_in_cache;
+        auto combined_key = flat_expert_indices * num_policies_for_key + flat_policy_indices;
+        auto sort_order = torch::argsort(combined_key);
+        auto sorted_expert_indices = flat_expert_indices.index_select(0, sort_order);
+
+        auto sorted_token_indices = expanded_token_indices.index_select(0, sort_order);
+        auto sorted_routing_weights = flat_routing_weights.index_select(0, sort_order);
         auto sorted_policy_indices = flat_policy_indices.index_select(0, sort_order);
 
         auto expert_inputs = x_flat.index_select(0, sorted_token_indices).contiguous();
+        // Clamp to finite FP16 range to avoid INF in kernels
+        expert_inputs = expert_inputs.clamp(-65504.0, 65504.0);
         auto expert_outputs = torch::zeros_like(expert_inputs);
 
         // Build grouped dispatch metadata on CPU to drive the grouped GEMM helper

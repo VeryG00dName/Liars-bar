@@ -11,7 +11,27 @@ import traceback
 # Import model
 from src.model.ppo_reactive_model import PPOReactiveModel
 
-def run_test(checkpointing: bool):
+def create_dummy_inputs(batch_size=128, seq_len=256, obs_dim=16, device="cuda", obs_dtype=torch.float32, gen: torch.Generator | None = None):
+    """Create dummy inputs matching real inference patterns (profile_cpp_forward)."""
+    print(f"\nCreating dummy inputs: batch={batch_size}, seq_len={seq_len}, obs_dim={obs_dim}")
+
+    # Use float32 by default to match model weights; set to float16 only if model supports it
+    obs_sequence    = torch.randn(batch_size, seq_len, obs_dim, dtype=obs_dtype, device=device, generator=gen)
+    action_sequence = torch.randint(0, 11, (batch_size, seq_len), dtype=torch.long, device=device, generator=gen)
+    agent_types     = torch.randint(0, 3,  (batch_size, seq_len), dtype=torch.long, device=device, generator=gen)
+    positions       = torch.randint(0, 4,  (batch_size, seq_len), dtype=torch.long, device=device, generator=gen)
+    padding_mask    = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
+
+    # Mark some positions as padding (last 30% of sequence)
+    pad_start = int(seq_len * 0.7)
+    padding_mask[:, pad_start:] = True
+
+    # Action mask (all valid for this test)
+    action_masks = torch.ones(batch_size, seq_len, 7, dtype=torch.bool, device=device)
+    return obs_sequence, action_sequence, agent_types, positions, action_masks, padding_mask
+
+
+def run_one(model, inputs, checkpointing: bool):
     header = f"Testing Gradient Flow (use_gradient_checkpointing={checkpointing})"
     print("\n" + "=" * 60)
     print(header)
@@ -20,37 +40,15 @@ def run_test(checkpointing: bool):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Create small model and set the checkpointing flag
-    model = PPOReactiveModel(
-        obs_dim=16,
-        action_dim=7,
-        hidden_dim=64,
-        num_heads=2,
-        num_layers=2,
-        dropout_rate=0.0,
-        max_seq_length=32,
-        num_agent_types=4,
-        num_experts=4,
-        top_k=2,
-        expert_ffn_dim=128,
-        use_gradient_checkpointing=checkpointing  # <-- Key change here
-    ).to(device)
-    model.train() # Ensure we are in training mode
+    # Unpack inputs created outside so both runs share the same batch
+    obs_sequence, action_sequence, agent_types, positions, action_masks, padding_mask = inputs
 
-    # Create dummy inputs
-    B, T = 2, 8
-    obs_sequence = torch.randn(B, T, 16, device=device)
-    action_sequence = torch.randint(0, 7, (B, T), device=device)
-    agent_types = torch.zeros(B, T, device=device, dtype=torch.long)
-    positions = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
-    action_masks = torch.ones(B, T, 7, device=device, dtype=torch.bool)
-    padding_mask = torch.zeros(B, T, device=device, dtype=torch.bool)
-
+    # Print shapes for visibility
     print(f"\nInput shapes:")
     print(f"  obs_sequence: {obs_sequence.shape}")
     print(f"  action_sequence: {action_sequence.shape}")
 
-    # --- Forward pass ---
+    # Forward pass
     print("\n" + "-" * 20 + " Forward Pass " + "-" * 20)
     try:
         outputs = model(
@@ -66,29 +64,27 @@ def run_test(checkpointing: bool):
         print(f"Forward pass successful!")
         if torch.isnan(action_logits).any() or torch.isnan(state_values).any():
             print("  ❌ NaN detected in forward outputs!")
-            return False
+            return False, {}
         print("  ✓ No NaN in forward outputs")
 
     except Exception as e:
         print(f"❌ Forward pass failed: {e}")
         traceback.print_exc()
-        return False
+        return False, {}
 
-    # --- Backward pass ---
+    # Backward pass
     print("\n" + "-" * 20 + " Backward Pass " + "-" * 20)
     try:
-        # Create dummy loss that uses all outputs
         loss = action_logits.sum() + state_values.sum() + win_logits.sum() + opp_logits.sum()
         print(f"Loss: {loss.item():.4f}")
-
-        # Backward
         loss.backward()
         print("Backward pass successful!")
 
-        # --- Check gradients ---
+        # Gradient check with per-parameter NaN counts
         print("\n" + "-" * 20 + " Gradient Check " + "-" * 20)
         has_nan = False
         no_grad_count = 0
+        nan_params = {}
         all_params = list(model.named_parameters())
         print(f"Checking {len(all_params)} parameters...")
 
@@ -97,42 +93,91 @@ def run_test(checkpointing: bool):
                 no_grad_count += 1
                 print(f"⚠️  {name:50s} has no gradient")
                 continue
-
-            if torch.isnan(param.grad).any():
-                print(f"❌ {name:50s} has NaN gradients!")
+            n_nans = torch.isnan(param.grad).sum().item()
+            if n_nans > 0:
                 has_nan = True
+                nan_params[name] = int(n_nans)
 
-        if no_grad_count > 0:
-            print(f"\n⚠️  {no_grad_count} parameters have no gradient")
-        
-        if has_nan:
-            print("\n❌ FAILED: NaN gradients detected!")
-            return False
-        elif no_grad_count > 0:
-            print("\n❌ FAILED: Some parameters have no gradient!")
-            return False
-        else:
-            print("\n✅ SUCCESS: All gradients are finite and present!")
-            return True
+        return (not has_nan and no_grad_count == 0), nan_params
 
     except Exception as e:
         print(f"❌ Backward pass failed: {e}")
         traceback.print_exc()
-        return False
+        return False, {}
+
+
+def run_test_suite(num_trials: int = 5, batch_size: int = 128, seq_len: int = 256):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # One model instance toggling checkpoint flag for comparable params/grads
+    def make_model(use_ckpt: bool):
+        m = PPOReactiveModel(
+            obs_dim=16,
+            use_gradient_checkpointing=use_ckpt
+        ).to(device)
+        m.train()
+        return m
+
+    results = []
+    for trial in range(1, num_trials + 1):
+        print(f"\n===== Trial {trial}/{num_trials} =====")
+        # Seed per trial for reproducibility
+        seed = 1337 + trial
+        gen = torch.Generator(device=device)
+        gen.manual_seed(seed)
+        inputs = create_dummy_inputs(batch_size=batch_size, seq_len=seq_len, obs_dim=16, device=device, gen=gen)
+
+        # Non-checkpoint run
+        model_no = make_model(False)
+        ok_no, nans_no = run_one(model_no, inputs, checkpointing=False)
+
+        # Checkpoint run on the exact same inputs
+        model_ckpt = make_model(True)
+        ok_ck, nans_ck = run_one(model_ckpt, inputs, checkpointing=True)
+
+        results.append({
+            "trial": trial,
+            "seed": seed,
+            "ok_no": ok_no,
+            "ok_ck": ok_ck,
+            "nan_count_no": sum(nans_no.values()) if nans_no else 0,
+            "nan_count_ck": sum(nans_ck.values()) if nans_ck else 0,
+            "nans_no": nans_no,
+            "nans_ck": nans_ck,
+        })
+
+    # Summary
+    print("\n" + "=" * 60)
+    print("NaN Summary over trials (same inputs per trial)")
+    print("=" * 60)
+    total_no = sum(1 for r in results if r["ok_no"]) \
+               , sum(r["nan_count_no"] for r in results)
+    total_ck = sum(1 for r in results if r["ok_ck"]) \
+               , sum(r["nan_count_ck"] for r in results)
+    ok_no_trials, nan_no_total = total_no
+    ok_ck_trials, nan_ck_total = total_ck
+    print(f"Non-ckpt: ok={ok_no_trials}/{num_trials}, total_nan_elems={nan_no_total}")
+    print(f"Ckpt    : ok={ok_ck_trials}/{num_trials}, total_nan_elems={nan_ck_total}")
+    for r in results:
+        print(f"Trial {r['trial']} (seed={r['seed']}): no-ckpt ok={r['ok_no']} (nan_elems={r['nan_count_no']}), "
+              f"ckpt ok={r['ok_ck']} (nan_elems={r['nan_count_ck']})")
+        # Print top offending parameters (up to 8) when NaNs present
+        if r['nan_count_no']:
+            top_no = sorted(r['nans_no'].items(), key=lambda kv: kv[1], reverse=True)[:8]
+            print("  Non-ckpt NaNs (top):")
+            for name, cnt in top_no:
+                print(f"    {name}: {cnt}")
+        if r['nan_count_ck']:
+            top_ck = sorted(r['nans_ck'].items(), key=lambda kv: kv[1], reverse=True)[:8]
+            print("  Ckpt NaNs (top):")
+            for name, cnt in top_ck:
+                print(f"    {name}: {cnt}")
+
+    # Return overall pass/fail
+    return (ok_no_trials == num_trials) and (ok_ck_trials == num_trials)
 
 if __name__ == "__main__":
-    # Run the test without checkpointing first
-    success_no_checkpoint = run_test(checkpointing=False)
-    
-    # Run the test with checkpointing
-    success_checkpoint = run_test(checkpointing=True)
-
-    print("\n" + "=" * 60)
-    print("                 Test Summary")
-    print("=" * 60)
-    print(f"Standard Backward Pass (checkpointing=False): {'✅ SUCCESS' if success_no_checkpoint else '❌ FAILED'}")
-    print(f"Checkpointing Backward Pass (checkpointing=True): {'✅ SUCCESS' if success_checkpoint else '❌ FAILED'}")
-    print("=" * 60)
-
-    # Exit with failure code if either test failed
-    sys.exit(0 if (success_no_checkpoint and success_checkpoint) else 1)
+    # Smaller defaults to iterate fast; bump as needed
+    all_ok = run_test_suite(num_trials=5, batch_size=64, seq_len=64)
+    sys.exit(0 if all_ok else 1)

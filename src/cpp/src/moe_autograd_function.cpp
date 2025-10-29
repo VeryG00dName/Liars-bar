@@ -3,6 +3,7 @@
 #include "moe_backward_kernels.h"
 
 #include <vector>
+#include <cstdlib>
 
 namespace lb {
 namespace moe {
@@ -96,6 +97,13 @@ struct GroupedMoEAutograd : public torch::autograd::Function<GroupedMoEAutograd>
             ffn_dim
         );
 
+        // Optional runtime guard: assert outputs are finite to catch instability early
+        static bool assert_finite = std::getenv("LB_MOE_ASSERT_FINITE") != nullptr;
+        if (assert_finite) {
+            TORCH_CHECK(torch::isfinite(hidden_grouped).all().item<bool>(), "MoE forward hidden_grouped has non-finite values");
+            TORCH_CHECK(torch::isfinite(output_grouped).all().item<bool>(), "MoE forward output_grouped has non-finite values");
+        }
+
         // Save for backward
         ctx->save_for_backward({
             input_grouped,
@@ -122,6 +130,7 @@ struct GroupedMoEAutograd : public torch::autograd::Function<GroupedMoEAutograd>
         torch::autograd::AutogradContext* ctx,
         torch::autograd::tensor_list grad_outputs
     ) {
+        const bool assert_finite = std::getenv("LB_MOE_ASSERT_FINITE") != nullptr;
         auto saved = ctx->get_saved_variables();
         size_t idx = 0;
         auto input_grouped = saved[idx++];
@@ -143,7 +152,11 @@ struct GroupedMoEAutograd : public torch::autograd::Function<GroupedMoEAutograd>
         auto grad_out = grad_outputs[0];
         auto total_tokens = input_grouped.size(0);
         // Cast upstream grad to Half as kernels expect
-        auto grad_out_half = grad_out.to(torch::kFloat16).contiguous();
+        // Guard against FP16 overflow when converting upstream gradients
+        // Clamp to representable FP16 range before cast to avoid inf->nan in kernels
+        auto grad_out_f32_cast = grad_out.to(torch::kFloat32);
+        auto grad_out_clamped = grad_out_f32_cast.clamp(-65504.0f, 65504.0f);
+        auto grad_out_half = grad_out_clamped.to(torch::kFloat16).contiguous();
 
         auto grad_input = torch::zeros_like(input_grouped);
         auto grad_w1 = torch::zeros_like(w1_weights, torch::dtype(torch::kFloat32));
@@ -179,9 +192,17 @@ struct GroupedMoEAutograd : public torch::autograd::Function<GroupedMoEAutograd>
             grad_b2
         );
 
+        if (assert_finite) {
+            TORCH_CHECK(torch::isfinite(grad_input).all().item<bool>(), "MoE backward grad_input has non-finite values");
+            TORCH_CHECK(torch::isfinite(grad_w1).all().item<bool>(), "MoE backward grad_w1 has non-finite values");
+            TORCH_CHECK(torch::isfinite(grad_w2).all().item<bool>(), "MoE backward grad_w2 has non-finite values");
+            TORCH_CHECK(torch::isfinite(grad_b1).all().item<bool>(), "MoE backward grad_b1 has non-finite values");
+            TORCH_CHECK(torch::isfinite(grad_b2).all().item<bool>(), "MoE backward grad_b2 has non-finite values");
+        }
+
         // Compute dr = rowwise_dot(Gy, Y_pre) to propagate into routing weights
-        auto grad_out_f32 = grad_out.to(torch::kFloat32).contiguous();
-        auto dr = torch::empty({total_tokens}, grad_out_f32.options());
+        auto grad_out_f32_dr = grad_out.to(torch::kFloat32).contiguous();
+        auto dr = torch::empty({total_tokens}, grad_out_f32_dr.options());
         int64_t cursor = 0;
         for (int64_t g = 0; g < m_sizes.size(0); ++g) {
             int64_t M = m_sizes.data_ptr<int64_t>()[g];
@@ -192,7 +213,7 @@ struct GroupedMoEAutograd : public torch::autograd::Function<GroupedMoEAutograd>
             auto W2 = w2_weights.index({pi, ei}).to(torch::kFloat32); // [H, F]
             auto b2 = b2_biases.index({pi, ei}).to(torch::kFloat32);  // [H]
             auto Y_pre = at::addmm(b2, H_g, W2.t());          // [M, H]
-            auto Gy = grad_out_f32.narrow(0, cursor, M);
+            auto Gy = grad_out_f32_dr.narrow(0, cursor, M);
             auto dot = (Gy * Y_pre).sum(/*dim=*/1);
             dr.narrow(0, cursor, M).copy_(dot);
             cursor += M;

@@ -7,6 +7,8 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cstdio>
 #include <stdexcept>
+#include <algorithm>
+#include <cstdlib>
 
 namespace lb {
 namespace moe {
@@ -45,6 +47,11 @@ __global__ void route_scale_backward_kernel(
 
         // Compute scaled gradient
         float gy_tilde = gy * r;
+        // Handle NaN by zeroing
+        if (!(gy_tilde == gy_tilde)) gy_tilde = 0.0f;
+        // Clamp to FP16 finite range to avoid inf
+        if (gy_tilde > 65504.0f) gy_tilde = 65504.0f;
+        else if (gy_tilde < -65504.0f) gy_tilde = -65504.0f;
 
         // Store output
         grad_y_tilde[i] = __float2half(gy_tilde);
@@ -171,11 +178,43 @@ __global__ void gelu_backward_elementwise_kernel(
 
         // Apply chain rule: dZ = dH * GELU'(Z)
         float dz = dh * gelu_grad;
+        // Handle NaN by zeroing
+        if (!(dz == dz)) dz = 0.0f;
+        // Clamp to FP16 finite range to avoid inf
+        if (dz > 65504.0f) dz = 65504.0f;
+        else if (dz < -65504.0f) dz = -65504.0f;
 
         // Store output
         grad_z[i] = __float2half(dz);
     }
 }
+
+// Utility: clamp a half tensor in-place to finite FP16 range
+__global__ void clamp_half_inplace_kernel(__half* data, int64_t n) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    for (int64_t i = idx; i < n; i += blockDim.x * gridDim.x) {
+        float v = __half2float(data[i]);
+        // Convert NaN to zero
+        if (!(v == v)) v = 0.0f;
+        // Saturate to finite FP16 range
+        if (v > 65504.0f) v = 65504.0f;
+        else if (v < -65504.0f) v = -65504.0f;
+        data[i] = __float2half(v);
+    }
+}
+
+static inline void clamp_half_inplace(torch::Tensor& t, cudaStream_t stream) {
+    if (t.scalar_type() != torch::kFloat16) return;
+    int64_t n = t.numel();
+    if (n == 0) return;
+    const int threads = 256;
+    int64_t blocks = (n + threads - 1) / threads;
+    const int64_t max_blocks = 65535;
+    blocks = std::min(blocks, max_blocks);
+    __half* ptr = reinterpret_cast<__half*>(t.data_ptr<at::Half>());
+    clamp_half_inplace_kernel<<<blocks, threads, 0, stream>>>(ptr, n);
+}
+ 
 
 /**
  * Host wrapper for GELU backward kernel.
@@ -616,7 +655,7 @@ void cutlass_grouped_moe_backward(
     }
 
     // ========================================================================
-    // Build per-group pointer arrays
+    // Build compact per-group arrays (skip empty groups) and pointer arrays
     // ========================================================================
 
     std::vector<uintptr_t> input_ptrs, hidden_ptrs, routing_weight_ptrs;
@@ -624,22 +663,34 @@ void cutlass_grouped_moe_backward(
     std::vector<uintptr_t> grad_y_tilde_ptrs, grad_hidden_ptrs, z_recomputed_ptrs, grad_z_ptrs, grad_x_grouped_ptrs;
     std::vector<uintptr_t> grad_w1_ptrs, grad_w2_ptrs, grad_b1_ptrs, grad_b2_ptrs;
 
-    int64_t token_offset = 0;
+    std::vector<int64_t> m_sizes_compact;
+    std::vector<int64_t> policy_ids_compact;
+    std::vector<int64_t> expert_ids_compact;
+    std::vector<int64_t> token_offsets_compact;
+
+    m_sizes_compact.reserve(group_count);
+    policy_ids_compact.reserve(group_count);
+    expert_ids_compact.reserve(group_count);
+    token_offsets_compact.reserve(group_count);
+
     for (int64_t g = 0; g < group_count; ++g) {
         int64_t M = m_sizes[g];
+        if (M == 0) continue;
+
         int64_t policy_id = policy_ids[g];
         int64_t expert_id = expert_ids[g];
+        int64_t offset = token_offsets[g];
 
-        if (M == 0) {
-            // Skip empty groups but maintain array structure
-            token_offset += 0;
-            continue;
-        }
+        // Save compact metadata
+        m_sizes_compact.push_back(M);
+        policy_ids_compact.push_back(policy_id);
+        expert_ids_compact.push_back(expert_id);
+        token_offsets_compact.push_back(offset);
 
         // Input/saved tensors (grouped order)
-        auto input_ptr = reinterpret_cast<uintptr_t>(input_grouped.data_ptr<at::Half>()) + token_offset * hidden_dim * sizeof(at::Half);
-        auto hidden_ptr = reinterpret_cast<uintptr_t>(hidden_grouped.data_ptr<at::Half>()) + token_offset * ffn_dim * sizeof(at::Half);
-        auto routing_weight_ptr = reinterpret_cast<uintptr_t>(routing_weights_grouped.data_ptr<float>()) + token_offset * sizeof(float);
+        auto input_ptr = reinterpret_cast<uintptr_t>(input_grouped.data_ptr<at::Half>()) + offset * hidden_dim * sizeof(at::Half);
+        auto hidden_ptr = reinterpret_cast<uintptr_t>(hidden_grouped.data_ptr<at::Half>()) + offset * ffn_dim * sizeof(at::Half);
+        auto routing_weight_ptr = reinterpret_cast<uintptr_t>(routing_weights_grouped.data_ptr<float>()) + offset * sizeof(float);
 
         input_ptrs.push_back(input_ptr);
         hidden_ptrs.push_back(hidden_ptr);
@@ -657,11 +708,11 @@ void cutlass_grouped_moe_backward(
         b2_ptrs.push_back(b2_ptr);
 
         // Intermediate buffers
-        auto grad_y_tilde_ptr = reinterpret_cast<uintptr_t>(grad_y_tilde.data_ptr<at::Half>()) + token_offset * hidden_dim * sizeof(at::Half);
-        auto grad_hidden_ptr = reinterpret_cast<uintptr_t>(grad_hidden.data_ptr<at::Half>()) + token_offset * ffn_dim * sizeof(at::Half);
-        auto z_recomputed_ptr = reinterpret_cast<uintptr_t>(z_recomputed.data_ptr<at::Half>()) + token_offset * ffn_dim * sizeof(at::Half);
-        auto grad_z_ptr = reinterpret_cast<uintptr_t>(grad_z.data_ptr<at::Half>()) + token_offset * ffn_dim * sizeof(at::Half);
-        auto grad_x_grouped_ptr = reinterpret_cast<uintptr_t>(grad_x_grouped.data_ptr<at::Half>()) + token_offset * hidden_dim * sizeof(at::Half);
+        auto grad_y_tilde_ptr = reinterpret_cast<uintptr_t>(grad_y_tilde.data_ptr<at::Half>()) + offset * hidden_dim * sizeof(at::Half);
+        auto grad_hidden_ptr = reinterpret_cast<uintptr_t>(grad_hidden.data_ptr<at::Half>()) + offset * ffn_dim * sizeof(at::Half);
+        auto z_recomputed_ptr = reinterpret_cast<uintptr_t>(z_recomputed.data_ptr<at::Half>()) + offset * ffn_dim * sizeof(at::Half);
+        auto grad_z_ptr = reinterpret_cast<uintptr_t>(grad_z.data_ptr<at::Half>()) + offset * ffn_dim * sizeof(at::Half);
+        auto grad_x_grouped_ptr = reinterpret_cast<uintptr_t>(grad_x_grouped.data_ptr<at::Half>()) + offset * hidden_dim * sizeof(at::Half);
 
         grad_y_tilde_ptrs.push_back(grad_y_tilde_ptr);
         grad_hidden_ptrs.push_back(grad_hidden_ptr);
@@ -679,8 +730,6 @@ void cutlass_grouped_moe_backward(
         grad_w2_ptrs.push_back(grad_w2_ptr);
         grad_b1_ptrs.push_back(grad_b1_ptr);
         grad_b2_ptrs.push_back(grad_b2_ptr);
-
-        token_offset += M;
     }
 
     if (log_backward) {
@@ -695,19 +744,16 @@ void cutlass_grouped_moe_backward(
         printf("  [Step 1] Route-scale: Gỹ = Gy ⊙ r\n");
     }
 
-    // Gather grad_output into grouped order first
-    // grad_output is in original order [batch_size, hidden_dim]
-    // We need to gather it into grouped order using indices_grouped
-    torch::Tensor grad_output_grouped = grad_output.index_select(0, indices_grouped);
-
     route_scale_backward(
-        grad_output_grouped,
+        grad_output,
         routing_weights_grouped,
         grad_y_tilde,
         total_tokens_grouped,
         hidden_dim,
         stream
     );
+    // Safety clamp
+    clamp_half_inplace(grad_y_tilde, stream);
 
     // ========================================================================
     // Step 2: dW2 GEMM + db2 reduction
@@ -722,22 +768,21 @@ void cutlass_grouped_moe_backward(
         grad_y_tilde_ptrs.data(),
         hidden_ptrs.data(),
         grad_w2_ptrs.data(),
-        m_sizes.data(),
-        input_ptrs.size(),  // non-empty group count
+        m_sizes_compact.data(),
+        m_sizes_compact.size(),
         hidden_dim,
         ffn_dim
     );
 
     // Bias reduction: db2 = sum(Gỹ, dim=0) for each group
-    for (size_t g = 0; g < input_ptrs.size(); ++g) {
-        int64_t M = m_sizes[g];
+    for (size_t g = 0; g < m_sizes_compact.size(); ++g) {
+        int64_t M = m_sizes_compact[g];
         if (M == 0) continue;
-
-        int64_t policy_id = policy_ids[g];
-        int64_t expert_id = expert_ids[g];
+        int64_t policy_id = policy_ids_compact[g];
+        int64_t expert_id = expert_ids_compact[g];
 
         // Slice Gỹ for this group
-        auto grad_y_tilde_slice = grad_y_tilde.narrow(0, token_offsets[g], M);
+        auto grad_y_tilde_slice = grad_y_tilde.narrow(0, token_offsets_compact[g], M);
 
         // Reduce to grad_b2
         auto grad_b2_slice = grad_b2[policy_id][expert_id];
@@ -763,11 +808,13 @@ void cutlass_grouped_moe_backward(
         grad_y_tilde_ptrs.data(),
         w2_ptrs.data(),
         grad_hidden_ptrs.data(),
-        m_sizes.data(),
-        input_ptrs.size(),
+        m_sizes_compact.data(),
+        m_sizes_compact.size(),
         hidden_dim,
         ffn_dim
     );
+    // Safety clamp
+    clamp_half_inplace(grad_hidden, stream);
 
     // ========================================================================
     // Step 4: Recompute Z (Z = X @ W1ᵀ + b1)
@@ -782,8 +829,8 @@ void cutlass_grouped_moe_backward(
         w1_ptrs.data(),
         b1_ptrs.data(),
         z_recomputed_ptrs.data(),
-        m_sizes.data(),
-        input_ptrs.size(),
+        m_sizes_compact.data(),
+        m_sizes_compact.size(),
         hidden_dim,
         ffn_dim
     );
@@ -804,6 +851,8 @@ void cutlass_grouped_moe_backward(
         ffn_dim,
         stream
     );
+    // Safety clamp
+    clamp_half_inplace(grad_z, stream);
 
     // ========================================================================
     // Step 6: dW1 GEMM + db1 reduction
@@ -818,22 +867,21 @@ void cutlass_grouped_moe_backward(
         grad_z_ptrs.data(),
         input_ptrs.data(),
         grad_w1_ptrs.data(),
-        m_sizes.data(),
-        input_ptrs.size(),
+        m_sizes_compact.data(),
+        m_sizes_compact.size(),
         hidden_dim,
         ffn_dim
     );
 
     // Bias reduction: db1 = sum(dZ, dim=0) for each group
-    for (size_t g = 0; g < input_ptrs.size(); ++g) {
-        int64_t M = m_sizes[g];
+    for (size_t g = 0; g < m_sizes_compact.size(); ++g) {
+        int64_t M = m_sizes_compact[g];
         if (M == 0) continue;
-
-        int64_t policy_id = policy_ids[g];
-        int64_t expert_id = expert_ids[g];
+        int64_t policy_id = policy_ids_compact[g];
+        int64_t expert_id = expert_ids_compact[g];
 
         // Slice dZ for this group
-        auto grad_z_slice = grad_z.narrow(0, token_offsets[g], M);
+        auto grad_z_slice = grad_z.narrow(0, token_offsets_compact[g], M);
 
         // Reduce to grad_b1
         auto grad_b1_slice = grad_b1[policy_id][expert_id];
@@ -859,28 +907,27 @@ void cutlass_grouped_moe_backward(
         grad_z_ptrs.data(),
         w1_ptrs.data(),
         grad_x_grouped_ptrs.data(),
-        m_sizes.data(),
-        input_ptrs.size(),
+        m_sizes_compact.data(),
+        m_sizes_compact.size(),
         hidden_dim,
         ffn_dim
     );
+    // Safety clamp
+    clamp_half_inplace(grad_x_grouped, stream);
 
     // ========================================================================
-    // Step 8: Scatter-add (dX = scatter_add(dX_grouped, indices))
+    // Step 8: Return dInput in grouped order
     // ========================================================================
 
     if (log_backward) {
-        printf("  [Step 8] dX = scatter_add(dX_grouped, indices)\n");
+        printf("  [Step 8] dX (grouped) passthrough to autograd\n");
     }
 
-    scatter_add_backward(
-        grad_x_grouped,
-        indices_grouped,
-        grad_input,
-        total_tokens_grouped,
-        hidden_dim,
-        stream
-    );
+    // Autograd of the prior index_select will scatter-add from grouped order
+    // into the original token order. We must return dX in grouped order here.
+    grad_input.copy_(grad_x_grouped);
+    // Safety clamp to finite FP16
+    clamp_half_inplace(grad_input, stream);
 
     // ========================================================================
     // Final synchronization
