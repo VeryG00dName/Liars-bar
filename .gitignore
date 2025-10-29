@@ -195,3 +195,4 @@ CLAUDE.md
 *.txt
 .github/copilot-instructions.md
 /third_party
+/.claude
