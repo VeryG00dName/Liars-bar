@@ -113,8 +113,11 @@ transformer_layer_forward_impl(
     auto sorted_policy_indices = flat_policy_indices.index_select(0, sort_order);
     
     auto expert_inputs = x_flat.index_select(0, sorted_token_indices).contiguous();
-    // Clamp to finite FP16 range to avoid INF in kernels
-    expert_inputs = expert_inputs.clamp(-65504.0, 65504.0);
+    // Clamp to finite FP16 range to avoid INF in kernels (debug only)
+    static bool LB_MOE_SANITIZE = std::getenv("LB_MOE_SANITIZE") != nullptr;
+    if (LB_MOE_SANITIZE) {
+        expert_inputs = expert_inputs.clamp(-65504.0, 65504.0);
+    }
 
     auto sorted_expert_cpu = sorted_expert_indices.to(torch::kCPU);
     auto sorted_policy_cpu = sorted_policy_indices.to(torch::kCPU);

@@ -937,20 +937,13 @@ torch::Tensor indexed_batched_linear_autograd(
     // Index weights and biases for each batch element
     // policy_indices: [B] -> select [B, out_dim, in_dim] and [B, out_dim]
     auto policy_long = policy_indices.to(torch::kLong);
-    auto weight_selected = weight_cache.index_select(0, policy_long);  // [B, out_dim, in_dim]
-    auto bias_selected = bias_cache.index_select(0, policy_long);      // [B, out_dim]
+    auto weight_selected = weight_cache.index_select(0, policy_long).contiguous();  // [B, out_dim, in_dim]
+    auto bias_selected = bias_cache.index_select(0, policy_long).contiguous();      // [B, out_dim]
 
-    // Apply linear per batch element: output[b, t] = input[b, t] @ weight[b].T + bias[b]
-    // Use loop to avoid massive einsum intermediate tensors
-    auto output = torch::empty({B, T, out_dim}, input.options());
-
-    for (int64_t b = 0; b < B; ++b) {
-        // input[b]: [T, in_dim]
-        // weight_selected[b]: [out_dim, in_dim]
-        // output[b] = input[b] @ weight_selected[b].T + bias_selected[b]
-        auto out_b = torch::matmul(input[b], weight_selected[b].transpose(0, 1));  // [T, out_dim]
-        output[b] = out_b + bias_selected[b].unsqueeze(0);  // broadcast bias across T
-    }
+    // Batched matmul: [B, T, in] x [B, in, out] -> [B, T, out]
+    auto weight_bt = weight_selected.transpose(1, 2).contiguous(); // [B, in_dim, out_dim]
+    auto output = at::bmm(input, weight_bt); // [B, T, out_dim]
+    output.add_(bias_selected.unsqueeze(1)); // broadcast bias across T
 
     return output;
 }

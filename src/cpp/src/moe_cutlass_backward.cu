@@ -45,6 +45,11 @@ static bool LB_MOE_LOG_BACKWARD_GEMM() {
     return value != 0;
 }
 
+static bool LB_MOE_SYNC() {
+    static int value = lb_env_int("LB_MOE_SYNC", 0);
+    return value != 0;
+}
+
 // ============================================================================
 // Error Checking Macros
 // ============================================================================
@@ -259,7 +264,9 @@ void cutlass_grouped_gemm_dW2(
 
     CUTLASS_CHECK(gemm.initialize(args, workspace));
     CUTLASS_CHECK(gemm.run());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    if (LB_MOE_SYNC()) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
 
     // Cleanup
     if (workspace) cudaFree(workspace);
@@ -417,7 +424,9 @@ void cutlass_grouped_gemm_dH(
 
     CUTLASS_CHECK(gemm.initialize(args, workspace));
     CUTLASS_CHECK(gemm.run());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    if (LB_MOE_SYNC()) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
 
     if (workspace) cudaFree(workspace);
     cudaFree(problem_sizes_device);
@@ -578,7 +587,9 @@ void cutlass_grouped_gemm_recompute_Z(
 
     CUTLASS_CHECK(gemm.initialize(args, workspace));
     CUTLASS_CHECK(gemm.run());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    if (LB_MOE_SYNC()) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
 
     if (workspace) cudaFree(workspace);
     cudaFree(problem_sizes_device);
@@ -734,7 +745,9 @@ void cutlass_grouped_gemm_dW1(
 
     CUTLASS_CHECK(gemm.initialize(args, workspace));
     CUTLASS_CHECK(gemm.run());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    if (LB_MOE_SYNC()) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
 
     if (workspace) cudaFree(workspace);
     cudaFree(problem_sizes_device);
