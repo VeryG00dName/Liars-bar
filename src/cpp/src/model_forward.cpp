@@ -52,13 +52,10 @@ forward_packed_train(
     int64_t top_k,
     int64_t count_pad,
     int64_t tflag_pad) {
-    // Note: use_gradient_checkpointing will be removed in Task 1.3
-    // For now, pass true (always checkpoint)
     return ::forward_packed_train(obs_sequence, action_sequence, agent_types, positions,
                                   batched_weights, policy_indices, padding_mask,
                                   num_layers, num_heads, hidden_dim, num_experts, top_k,
-                                  count_pad, tflag_pad,
-                                  true);  // Always use gradient checkpointing
+                                  count_pad, tflag_pad);
 }
 
 } // namespace forward

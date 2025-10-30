@@ -408,7 +408,6 @@ def _create_new_agent(agent_type: str, device: torch.device) -> LearnerAutoregre
     if agent_type == 'main':
         model = PPOReactiveModel(
             obs_dim=16,
-            use_gradient_checkpointing=bool(getattr(config, "USE_GRADIENT_CHECKPOINTING", True)),
         )
     else:  # Future branches (e.g., exploiter) can be added here.
         raise ValueError(f"Unknown agent type for creation: {agent_type}")

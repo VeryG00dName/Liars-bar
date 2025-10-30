@@ -72,8 +72,7 @@ forward_packed_train(
     int64_t num_experts,
     int64_t top_k,
     int64_t count_pad,
-    int64_t tflag_pad,
-    bool use_gradient_checkpointing
+    int64_t tflag_pad
 );
 
 // Overload with detailed timers map for granular profiling

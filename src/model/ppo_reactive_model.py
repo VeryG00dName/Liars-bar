@@ -25,8 +25,7 @@ class PPOReactiveModel(PPOReactiveModelBase):
         *,
         num_experts: int = 8,
         top_k: int = 2,
-        expert_ffn_dim: Optional[int] = None,
-        use_gradient_checkpointing: bool = False,
+        expert_ffn_dim: Optional[int] = None
     ) -> None:
         super().__init__(
             obs_dim=obs_dim,
@@ -41,7 +40,6 @@ class PPOReactiveModel(PPOReactiveModelBase):
             top_k=top_k,
             expert_ffn_dim=expert_ffn_dim,
         )
-        self.use_gradient_checkpointing = bool(use_gradient_checkpointing)
 
     @staticmethod
     def _apply_action_mask(
@@ -101,7 +99,6 @@ class PPOReactiveModel(PPOReactiveModelBase):
             action_sequence,
             agent_types,
             positions,
-            use_gradient_checkpointing=self.training and self.use_gradient_checkpointing,
         )
 
         # 3. Apply training-specific masking
@@ -125,8 +122,6 @@ class PPOReactiveModel(PPOReactiveModelBase):
         action_sequence: torch.Tensor,
         agent_types: torch.Tensor,
         positions: torch.Tensor,
-        *,
-        use_gradient_checkpointing: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         # Build a minimal batched weight dict [1, ...] from module params using autograd-friendly ops
         weights: Dict[str, torch.Tensor] = {}
@@ -227,6 +222,5 @@ class PPOReactiveModel(PPOReactiveModelBase):
             int(self.top_k),
             int(self.count_pad),
             int(self.tflag_pad),
-            bool(use_gradient_checkpointing),
         )
         return out

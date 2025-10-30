@@ -37,8 +37,7 @@ def main() -> int:
 
     # Model with standard dims
     model = PPOReactiveModel(
-        obs_dim=16,
-        use_gradient_checkpointing=True,
+        obs_dim=16
     ).to(device)
     model.eval()
 
@@ -68,7 +67,7 @@ def main() -> int:
         num_experts=model.num_experts,
         top_k=model.top_k,
         count_pad=model.count_pad,
-        tflag_pad=model.tflag_pad,
+        tflag_pad=model.tflag_pad
     )
 
     # Metrics helper

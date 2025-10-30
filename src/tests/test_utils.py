@@ -446,7 +446,6 @@ def create_test_model(
     num_experts: int = 8,
     top_k: int = 2,
     device: str = "cuda",
-    use_gradient_checkpointing: bool = True,
 ) -> PPOReactiveModel:
     """Construct a standard test model configuration.
 
@@ -457,7 +456,6 @@ def create_test_model(
         num_experts: Number of experts per MoE layer.
         top_k: Top-k experts to route tokens to.
         device: Target device (default: "cuda").
-        use_gradient_checkpointing: Enable gradient checkpointing for training forward.
 
     Returns:
         ``PPOReactiveModel`` moved to ``device`` and set to ``train()`` mode.
@@ -467,8 +465,7 @@ def create_test_model(
         hidden_dim=hidden_dim,
         num_layers=num_layers,
         num_experts=num_experts,
-        top_k=top_k,
-        use_gradient_checkpointing=use_gradient_checkpointing,
+        top_k=top_k
     ).to(device)
     model.train()
     return model

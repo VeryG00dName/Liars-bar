@@ -1,6 +1,7 @@
 #include "reactive_model_forward.h"
+#include "model_forward.h"
 #include "weight_utils.h"
-#include "indexed_kernels.h"
+#include "lb_kernels.h"
 #include "moe_backward_kernels.h"
 #include "moe_cutlass_kernels.h"
 
@@ -36,8 +37,8 @@ void bind_reactive_model(py::module_& m) {
                 weights.insert(key, value);
             }
 
-            // Call C++ function
-            return forward_packed(
+            // Call unified forward orchestrator (delegates internally for now)
+            return lb::forward::forward_packed(
                 obs_sequence,
                 action_sequence,
                 agent_types,
@@ -208,15 +209,14 @@ void bind_reactive_model(py::module_& m) {
            int64_t num_experts,
            int64_t top_k,
            int64_t count_pad,
-           int64_t tflag_pad,
-           bool use_gradient_checkpointing) {
+           int64_t tflag_pad) {
             c10::Dict<std::string, torch::Tensor> weights;
             for (auto item : weights_py) {
                 std::string key = py::cast<std::string>(item.first);
                 torch::Tensor value = py::cast<torch::Tensor>(item.second);
                 weights.insert(key, value);
             }
-            auto tup = forward_packed_train(
+            auto tup = lb::forward::forward_packed_train(
                 obs_sequence,
                 action_sequence,
                 agent_types,
@@ -230,8 +230,7 @@ void bind_reactive_model(py::module_& m) {
                 num_experts,
                 top_k,
                 count_pad,
-                tflag_pad,
-                use_gradient_checkpointing
+                tflag_pad
             );
             auto action_logits = std::get<0>(tup);
             auto opp_logits = std::get<1>(tup);
@@ -259,9 +258,7 @@ void bind_reactive_model(py::module_& m) {
         py::arg("top_k") = 2,
         py::arg("count_pad") = 4,
         py::arg("tflag_pad") = 3,
-        py::arg("use_gradient_checkpointing") = false,
-        "Training forward pass with autograd MoE returning routing info.\n\n"
-        "Set use_gradient_checkpointing=True to enable recomputation-based activation checkpointing."
+        "Training forward pass with autograd MoE returning routing info."
     );
 
     // Expose grouped MoE forward (training) that also returns hidden_grouped
@@ -827,7 +824,7 @@ void bind_reactive_model(py::module_& m) {
            const torch::Tensor& bias_cache,
            const torch::Tensor& policy_indices) {
             std::unordered_map<std::string, std::chrono::microseconds> timers;
-            return indexed_batched_linear(input, weight_cache, bias_cache, policy_indices, timers);
+            return lb::kernels::indexed_batched_linear(input, weight_cache, bias_cache, policy_indices, timers);
         },
         py::arg("input"),
         py::arg("weight_cache"),

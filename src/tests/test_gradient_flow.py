@@ -13,8 +13,8 @@ from src.tests import test_utils as tu
 from src.model.ppo_reactive_model import PPOReactiveModel
 
 
-def run_one(model, inputs, checkpointing: bool):
-    header = f"Testing Gradient Flow (use_gradient_checkpointing={checkpointing})"
+def run_one(model, inputs):
+    header = "Testing Gradient Flow (checkpointed path)"
     print("\n" + "=" * 60)
     print(header)
     print("=" * 60)
@@ -93,11 +93,10 @@ def run_test_suite(num_trials: int = 5, batch_size: int = 128, seq_len: int = 25
     print(f"Using device: {device}")
 
     # One model instance toggling checkpoint flag for comparable params/grads
-    def make_model(use_ckpt: bool):
+    def make_model():
         m = PPOReactiveModel(
             obs_dim=16,
-            dropout_rate=0.1,
-            use_gradient_checkpointing=use_ckpt
+            dropout_rate=0.1
         ).to(device)
         m.train()
         return m
@@ -118,22 +117,15 @@ def run_test_suite(num_trials: int = 5, batch_size: int = 128, seq_len: int = 25
             dtype=torch.float32,
         )
 
-        # Non-checkpoint run
-        model_no = make_model(False)
-        ok_no, nans_no = run_one(model_no, inputs, checkpointing=False)
-
-        # Checkpoint run on the exact same inputs
-        model_ckpt = make_model(True)
-        ok_ck, nans_ck = run_one(model_ckpt, inputs, checkpointing=True)
+        # Single checkpointed run (C++ path is always checkpointed now)
+        model_ckpt = make_model()
+        ok_ck, nans_ck = run_one(model_ckpt, inputs)
 
         results.append({
             "trial": trial,
             "seed": seed,
-            "ok_no": ok_no,
             "ok_ck": ok_ck,
-            "nan_count_no": sum(nans_no.values()) if nans_no else 0,
             "nan_count_ck": sum(nans_ck.values()) if nans_ck else 0,
-            "nans_no": nans_no,
             "nans_ck": nans_ck,
         })
 
@@ -141,23 +133,12 @@ def run_test_suite(num_trials: int = 5, batch_size: int = 128, seq_len: int = 25
     print("\n" + "=" * 60)
     print("NaN Summary over trials (same inputs per trial)")
     print("=" * 60)
-    total_no = sum(1 for r in results if r["ok_no"]) \
-               , sum(r["nan_count_no"] for r in results)
     total_ck = sum(1 for r in results if r["ok_ck"]) \
                , sum(r["nan_count_ck"] for r in results)
-    ok_no_trials, nan_no_total = total_no
     ok_ck_trials, nan_ck_total = total_ck
-    print(f"Non-ckpt: ok={ok_no_trials}/{num_trials}, total_nan_elems={nan_no_total}")
     print(f"Ckpt    : ok={ok_ck_trials}/{num_trials}, total_nan_elems={nan_ck_total}")
     for r in results:
-        print(f"Trial {r['trial']} (seed={r['seed']}): no-ckpt ok={r['ok_no']} (nan_elems={r['nan_count_no']}), "
-              f"ckpt ok={r['ok_ck']} (nan_elems={r['nan_count_ck']})")
-        # Print top offending parameters (up to 8) when NaNs present
-        if r['nan_count_no']:
-            top_no = sorted(r['nans_no'].items(), key=lambda kv: kv[1], reverse=True)[:8]
-            print("  Non-ckpt NaNs (top):")
-            for name, cnt in top_no:
-                print(f"    {name}: {cnt}")
+        print(f"Trial {r['trial']} (seed={r['seed']}): ckpt ok={r['ok_ck']} (nan_elems={r['nan_count_ck']})")
         if r['nan_count_ck']:
             top_ck = sorted(r['nans_ck'].items(), key=lambda kv: kv[1], reverse=True)[:8]
             print("  Ckpt NaNs (top):")
@@ -165,7 +146,7 @@ def run_test_suite(num_trials: int = 5, batch_size: int = 128, seq_len: int = 25
                 print(f"    {name}: {cnt}")
 
     # Return overall pass/fail
-    return (ok_no_trials == num_trials) and (ok_ck_trials == num_trials)
+    return ok_ck_trials == num_trials
 
 if __name__ == "__main__":
     # Smaller defaults to iterate fast; bump as needed
