@@ -752,11 +752,8 @@ void cutlass_grouped_moe_backward(
         hidden_dim,
         stream
     );
-    // Safety clamp (debug only)
-    static bool LB_MOE_SANITIZE = std::getenv("LB_MOE_SANITIZE") != nullptr;
-    if (LB_MOE_SANITIZE) {
-        clamp_half_inplace(grad_y_tilde, stream);
-    }
+    // Safety clamp gradients to prevent NaN/Inf propagation (unconditional for training stability)
+    clamp_half_inplace(grad_y_tilde, stream);
 
     // ========================================================================
     // Step 2: dW2 GEMM + db2 reduction
@@ -816,9 +813,8 @@ void cutlass_grouped_moe_backward(
         hidden_dim,
         ffn_dim
     );
-    if (LB_MOE_SANITIZE) {
-        clamp_half_inplace(grad_hidden, stream);
-    }
+    // Safety clamp gradients (unconditional)
+    clamp_half_inplace(grad_hidden, stream);
 
     // ========================================================================
     // Step 4: Recompute Z (Z = X @ W1ᵀ + b1)
@@ -855,9 +851,8 @@ void cutlass_grouped_moe_backward(
         ffn_dim,
         stream
     );
-    if (LB_MOE_SANITIZE) {
-        clamp_half_inplace(grad_z, stream);
-    }
+    // Safety clamp gradients (unconditional)
+    clamp_half_inplace(grad_z, stream);
 
     // ========================================================================
     // Step 6: dW1 GEMM + db1 reduction
@@ -917,9 +912,8 @@ void cutlass_grouped_moe_backward(
         hidden_dim,
         ffn_dim
     );
-    if (LB_MOE_SANITIZE) {
-        clamp_half_inplace(grad_x_grouped, stream);
-    }
+    // Safety clamp gradients (unconditional)
+    clamp_half_inplace(grad_x_grouped, stream);
 
     // ========================================================================
     // Step 8: Return dInput in grouped order
@@ -932,10 +926,8 @@ void cutlass_grouped_moe_backward(
     // Autograd of the prior index_select will scatter-add from grouped order
     // into the original token order. We must return dX in grouped order here.
     grad_input.copy_(grad_x_grouped);
-    // Safety clamp to finite FP16 (debug only)
-    if (LB_MOE_SANITIZE) {
-        clamp_half_inplace(grad_input, stream);
-    }
+    // Safety clamp to finite FP16 (unconditional)
+    clamp_half_inplace(grad_input, stream);
 
     // ========================================================================
     // Final synchronization (debug only)

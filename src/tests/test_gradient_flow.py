@@ -7,28 +7,10 @@ both with and without gradient checkpointing.
 import torch
 import sys
 import traceback
+from src.tests import test_utils as tu
 
 # Import model
 from src.model.ppo_reactive_model import PPOReactiveModel
-
-def create_dummy_inputs(batch_size=128, seq_len=256, obs_dim=16, device="cuda", obs_dtype=torch.float32, gen: torch.Generator | None = None):
-    """Create dummy inputs matching real inference patterns (profile_cpp_forward)."""
-    print(f"\nCreating dummy inputs: batch={batch_size}, seq_len={seq_len}, obs_dim={obs_dim}")
-
-    # Use float32 by default to match model weights; set to float16 only if model supports it
-    obs_sequence    = torch.randn(batch_size, seq_len, obs_dim, dtype=obs_dtype, device=device, generator=gen)
-    action_sequence = torch.randint(0, 11, (batch_size, seq_len), dtype=torch.long, device=device, generator=gen)
-    agent_types     = torch.randint(0, 3,  (batch_size, seq_len), dtype=torch.long, device=device, generator=gen)
-    positions       = torch.randint(0, 4,  (batch_size, seq_len), dtype=torch.long, device=device, generator=gen)
-    padding_mask    = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
-
-    # Mark some positions as padding (last 30% of sequence)
-    pad_start = int(seq_len * 0.7)
-    padding_mask[:, pad_start:] = True
-
-    # Action mask (all valid for this test)
-    action_masks = torch.ones(batch_size, seq_len, 7, dtype=torch.bool, device=device)
-    return obs_sequence, action_sequence, agent_types, positions, action_masks, padding_mask
 
 
 def run_one(model, inputs, checkpointing: bool):
@@ -114,6 +96,7 @@ def run_test_suite(num_trials: int = 5, batch_size: int = 128, seq_len: int = 25
     def make_model(use_ckpt: bool):
         m = PPOReactiveModel(
             obs_dim=16,
+            dropout_rate=0.1,
             use_gradient_checkpointing=use_ckpt
         ).to(device)
         m.train()
@@ -124,9 +107,16 @@ def run_test_suite(num_trials: int = 5, batch_size: int = 128, seq_len: int = 25
         print(f"\n===== Trial {trial}/{num_trials} =====")
         # Seed per trial for reproducibility
         seed = 1337 + trial
-        gen = torch.Generator(device=device)
-        gen.manual_seed(seed)
-        inputs = create_dummy_inputs(batch_size=batch_size, seq_len=seq_len, obs_dim=16, device=device, gen=gen)
+        # Use padding_ratio=0.3 to mark last 30% as padding like before
+        inputs = tu.create_dummy_inputs(
+            batch_size=batch_size,
+            seq_len=seq_len,
+            obs_dim=16,
+            device=str(device),
+            seed=seed,
+            padding_ratio=0.3,
+            dtype=torch.float32,
+        )
 
         # Non-checkpoint run
         model_no = make_model(False)

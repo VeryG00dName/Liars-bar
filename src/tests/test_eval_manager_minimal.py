@@ -3,29 +3,7 @@
 import torch
 import numpy as np
 from src.misc import lb
-
-
-def _pad_obs_encoder_input_inplace(state_dict: dict, target_in_dim: int = 16) -> bool:
-    """Pad obs_encoder.0.weight from [out,9] -> [out,16] if needed (mutates in place).
-
-    Returns True if any padding was applied.
-    """
-    key = "obs_encoder.0.weight"
-    if key not in state_dict:
-        return False
-    w = state_dict[key]
-    if not torch.is_tensor(w) or w.ndim != 2:
-        return False
-    in_dim = int(w.size(1))
-    if in_dim >= target_in_dim:
-        return False
-    out_dim = int(w.size(0))
-    pad = target_in_dim - in_dim
-    w_cpu = w.detach().to("cpu")
-    zeros = torch.zeros((out_dim, pad), dtype=w_cpu.dtype, device=w_cpu.device)
-    state_dict[key] = torch.cat([w_cpu, zeros], dim=1)
-    print(f"[INFO] Padded {key} from [{out_dim},{in_dim}] to [{out_dim},{target_in_dim}] (tests)")
-    return True
+from src.tests import test_utils as tu
 
 
 def test_1_load_single_policy():
@@ -43,7 +21,7 @@ def test_1_load_single_policy():
     data = torch.load(ckpt_path, map_location="cpu")
     state_dict = data if not isinstance(data, dict) else data.get("model_state_dict", data)
     try:
-        _pad_obs_encoder_input_inplace(state_dict, target_in_dim=16)
+        tu.pad_model_weights(state_dict, pad_obs_to=16)
     except Exception as e:
         print(f"[WARN] Padding obs_encoder.0.weight failed for {ckpt_path}: {e}")
 

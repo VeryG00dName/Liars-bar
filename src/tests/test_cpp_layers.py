@@ -16,6 +16,7 @@ import torch
 import numpy as np
 
 from src.misc import lb
+from src.tests import test_utils as tu
 
 
 def load_reference(path: Path) -> Dict[str, torch.Tensor]:
@@ -25,47 +26,13 @@ def load_reference(path: Path) -> Dict[str, torch.Tensor]:
 
 
 def load_checkpoint_weights(checkpoint_path: Path) -> Dict[str, torch.Tensor]:
-    """Load model weights from checkpoint."""
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
-
-    if 'model_state_dict' in checkpoint:
-        return checkpoint['model_state_dict']
-    elif 'policy_nets' in checkpoint:
-        # Legacy format: try 'self' key
-        if 'self' in checkpoint['policy_nets']:
-            return checkpoint['policy_nets']['self']
-        # Otherwise return first policy
-        first_key = next(iter(checkpoint['policy_nets']))
-        return checkpoint['policy_nets'][first_key]
-    else:
-        raise ValueError(f"Could not find model state dict in checkpoint (keys: {list(checkpoint.keys())})")
+    """Thin wrapper to shared loader in test_utils."""
+    return tu.load_checkpoint_weights(Path(checkpoint_path))
 
 
 def pad_model_weights(model_state_dict: Dict[str, torch.Tensor], pad_obs_to: int = 16) -> Dict[str, torch.Tensor]:
-    """
-    Pad observation encoder weights for CUDA alignment.
-
-    Args:
-        model_state_dict: Model state dictionary
-        pad_obs_to: Target dimension for padding (default 16)
-
-    Returns:
-        Modified state dict with padded weights
-    """
-    # Pad obs_encoder.0.weight from [hidden_dim, obs_dim] to [hidden_dim, pad_obs_to]
-    obs_linear_weight_key = "obs_encoder.0.weight"
-    if obs_linear_weight_key in model_state_dict:
-        weight = model_state_dict[obs_linear_weight_key]
-        hidden_dim, obs_dim = weight.shape
-
-        if obs_dim < pad_obs_to:
-            # Pad with zeros
-            padding = torch.zeros(hidden_dim, pad_obs_to - obs_dim, dtype=weight.dtype, device=weight.device)
-            padded_weight = torch.cat([weight, padding], dim=1)
-            model_state_dict[obs_linear_weight_key] = padded_weight
-            print(f"Padded {obs_linear_weight_key} from [{hidden_dim}, {obs_dim}] to [{hidden_dim}, {pad_obs_to}]")
-
-    return model_state_dict
+    """Delegate to shared pad function in test_utils (in-place)."""
+    return tu.pad_model_weights(model_state_dict, pad_obs_to=pad_obs_to)
 
 
 def prepare_batched_weights(
@@ -75,43 +42,27 @@ def prepare_batched_weights(
     device: str = 'cpu',
     state_dict2: Optional[Dict[str, torch.Tensor]] = None,
 ) -> Dict[str, torch.Tensor]:
-    """
-    Prepare batched weights for C++ testing.
+    """Prepare batched weights using shared utils; supports two-policy stacking.
 
-    For single-policy testing, we add a batch dimension to all weights.
-    Also pre-stacks MoE expert weights and creates pointer tensors.
+    Single-policy path delegates to ``test_utils.prepare_batched_weights``.
+    Two-policy path keeps local batching then pointer/buffer creation.
     """
-    # First, prestack MoE expert weights (must be done before adding batch dim)
     print(f"Pre-stacking MoE expert weights ({num_layers} layers, {num_experts} experts)...")
     if state_dict2 is None:
-        state_dict_stacked = lb.prestack_moe_expert_weights(state_dict, num_layers, num_experts)
-        batched: Dict[str, torch.Tensor] = {}
-        for key, value in state_dict_stacked.items():
-            # Add batch dimension [1, ...] and move to device
-            t = value.unsqueeze(0).to(device)
-            batched[key] = t
-    else:
-        # Two-policy: prestack individually then stack across policies
-        sd1 = lb.prestack_moe_expert_weights(dict(state_dict), num_layers, num_experts)
-        sd2 = lb.prestack_moe_expert_weights(dict(state_dict2), num_layers, num_experts)
-        batched = lb.batch_state_dicts([sd1, sd2])
-        for k in list(batched.keys()):
-            batched[k] = batched[k].to(device)
+        return tu.prepare_batched_weights(
+            state_dict=state_dict, num_layers=num_layers, num_experts=num_experts, device=device, to_fp16=True
+        )
 
-    # If using CUDA, convert floating-point weights to FP16 before creating
-    # MoE pointer tensors so that GPU kernels (which expect Half) match dtype.
-    if device.startswith('cuda'):
-        for key, tensor in list(batched.items()):
-            if tensor.is_floating_point():
-                batched[key] = tensor.to(torch.float16).contiguous()
+    # Two-policy: prestack individually then stack across policies
+    sd1 = lb.prestack_moe_expert_weights(dict(state_dict), num_layers, num_experts)
+    sd2 = lb.prestack_moe_expert_weights(dict(state_dict2), num_layers, num_experts)
+    batched = lb.batch_state_dicts([sd1, sd2])
+    for k in list(batched.keys()):
+        batched[k] = batched[k].to(device)
 
-    # Create MoE weight pointers (must be done after moving to device)
     print("Creating MoE weight pointers...")
     batched_with_ptrs = lb.create_moe_weight_pointers(batched, num_layers, num_experts)
-
-    # Add fixed buffers (action decomposition LUTs)
     batched_final = lb.add_fixed_buffers(batched_with_ptrs, device)
-
     return batched_final
 
 
@@ -120,42 +71,10 @@ def compare_tensors(
     cpp_output: torch.Tensor,
     pytorch_output: torch.Tensor,
     rtol: float = 1e-3,
-    atol: float = 1e-4
+    atol: float = 1e-4,
 ) -> bool:
-    """
-    Compare two tensors and report statistics.
-    Only prints output if there's a failure.
-
-    Returns:
-        True if tensors match within tolerance, False otherwise
-    """
-    # Move to CPU and convert to float32 for comparison
-    cpp_np = cpp_output.detach().cpu().float().numpy()
-    pytorch_np = pytorch_output.detach().cpu().float().numpy()
-
-    # Check shapes
-    if cpp_np.shape != pytorch_np.shape:
-        print(f"{name}: SHAPE MISMATCH C++={cpp_np.shape} vs PyTorch={pytorch_np.shape}")
-        return False
-
-    # Compute errors
-    abs_diff = np.abs(cpp_np - pytorch_np)
-
-    max_abs_error = np.max(abs_diff)
-    mean_abs_error = np.mean(abs_diff)
-
-    # Check if within tolerance
-    matches = np.allclose(cpp_np, pytorch_np, rtol=rtol, atol=atol)
-
-    # Only print if failed
-    if not matches:
-        mismatch_mask = abs_diff > (atol + rtol * np.abs(pytorch_np))
-        mismatch_indices = np.where(mismatch_mask)
-        num_mismatches = len(mismatch_indices[0])
-        mismatch_pct = 100 * num_mismatches / cpp_np.size
-        print(f"{name}: {mismatch_pct:.2f}% mismatch, max_err={max_abs_error:.2e}, mean_err={mean_abs_error:.2e}")
-
-    return matches
+    """Delegate to shared tensor comparison utility."""
+    return tu.compare_tensors(name, cpp_output, pytorch_output, rtol=rtol, atol=atol, verbose=True)
 
 
 def test_action_decomposition(
