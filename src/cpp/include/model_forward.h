@@ -40,7 +40,9 @@ forward_packed(
     int64_t num_experts = 8,
     int64_t top_k = 2,
     int64_t count_pad = 4,
-    int64_t tflag_pad = 3);
+    int64_t tflag_pad = 3,
+    std::unordered_map<std::string, std::chrono::microseconds>* timers = nullptr
+);
 
 /**
  * Training forward pass (with autograd).
@@ -49,7 +51,7 @@ forward_packed(
  * Returns routing information for auxiliary losses.
  *
  * @return Tuple of (action_logits, opp_logits, state_values, win_logits,
- *                   topk_indices, routing_info_dict)
+ *                   gate_logits_tensor, routing_info_dict)
  */
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
            torch::Tensor, std::unordered_map<std::string, torch::Tensor>>

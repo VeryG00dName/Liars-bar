@@ -19,9 +19,65 @@ namespace lb {
 namespace model {
 
 /**
+ * Decompose actions into (kind, count, table_flag) using lookup tables.
+ */
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+action_decomposition(
+    const torch::Tensor& action_sequence,
+    const c10::Dict<std::string, torch::Tensor>& batched_weights,
+    const torch::Tensor& policy_indices,
+    const torch::optional<torch::Tensor>& padding_mask,
+    int64_t count_pad,
+    int64_t tflag_pad);
+
+/**
+ * Compute all embeddings (observation, action factorized, agent, position).
+ */
+c10::Dict<std::string, torch::Tensor>
+compute_embeddings(
+    const torch::Tensor& obs_sequence,
+    const torch::Tensor& action_sequence,
+    const torch::Tensor& agent_types,
+    const torch::Tensor& positions,
+    const c10::Dict<std::string, torch::Tensor>& batched_weights,
+    const torch::Tensor& policy_indices,
+    const torch::optional<torch::Tensor>& padding_mask,
+    int64_t count_pad,
+    int64_t tflag_pad,
+    std::unordered_map<std::string, std::chrono::microseconds>* timers = nullptr);
+
+/**
+ * Compute modality gates (obs/action/agent/position) using per-policy MLPs.
+ */
+c10::Dict<std::string, torch::Tensor>
+gating(
+    const torch::Tensor& obs_embed,
+    const torch::Tensor& action_embed,
+    const torch::Tensor& agent_embed,
+    const torch::Tensor& position_embed,
+    const c10::Dict<std::string, torch::Tensor>& batched_weights,
+    const torch::Tensor& policy_indices,
+    std::unordered_map<std::string, std::chrono::microseconds>* timers = nullptr);
+
+/**
+ * Fuse gated embeddings and apply a final LayerNorm.
+ */
+c10::Dict<std::string, torch::Tensor>
+fuse_embeddings(
+    const torch::Tensor& g_obs,
+    const torch::Tensor& g_action,
+    const torch::Tensor& g_agent,
+    const torch::Tensor& g_position,
+    const torch::Tensor& obs_embed,
+    const torch::Tensor& action_embed,
+    const torch::Tensor& agent_embed,
+    const torch::Tensor& position_embed,
+    int64_t hidden_dim);
+
+/**
  * Single transformer layer forward pass (non-autograd version).
  *
- * Used for inference. Training uses the autograd variant with checkpointing.
+ * Used for inference and recomputation during backward pass.
  *
  * @return Tuple of (output, gate_logits, topk_indices, topk_scores)
  */
@@ -41,82 +97,64 @@ transformer_layer(
     const torch::Tensor& w2_all,
     const torch::Tensor& b1_all,
     const torch::Tensor& b2_all,
-    const torch::Tensor& w1_ptrs,
-    const torch::Tensor& w2_ptrs,
-    const torch::Tensor& b1_ptrs,
-    const torch::Tensor& b2_ptrs,
     const torch::Tensor& norm2_weight,
     const torch::Tensor& norm2_bias,
     int64_t num_heads,
     int64_t hidden_dim,
-    int64_t top_k,
-    std::unordered_map<std::string, std::chrono::microseconds>* timers = nullptr);
+    int64_t top_k);
 
 /**
- * Compute all embeddings (observation, action factorized, agent, position).
- *
- * Handles action decomposition into (kind, count, table_flag) and sums them.
+ * Compute all per-expert heads.
  */
 c10::Dict<std::string, torch::Tensor>
-compute_embeddings(
-    const torch::Tensor& obs_sequence,
-    const torch::Tensor& action_sequence,
-    const torch::Tensor& agent_types,
-    const torch::Tensor& positions,
+compute_heads(
+    const torch::Tensor& transformer_output,
     const c10::Dict<std::string, torch::Tensor>& batched_weights,
     const torch::Tensor& policy_indices,
-    const torch::optional<torch::Tensor>& padding_mask,
-    int64_t count_pad,
-    int64_t tflag_pad,
+    int64_t num_experts,
     std::unordered_map<std::string, std::chrono::microseconds>* timers = nullptr);
 
 /**
  * Reduce per-expert head outputs using MoE routing weights.
- *
- * @param stacked [B, T, num_experts, out_dim] - Expert outputs
- * @param topk_indices [B, T, K] - Selected expert indices
- * @param topk_scores [B, T, K] - Routing weights
- * @return [B, T, out_dim] - Weighted combination
  */
 torch::Tensor reduce_expert_heads(
     const torch::Tensor& stacked,
     const torch::Tensor& topk_indices,
     const torch::Tensor& topk_scores);
 
-/**
- * Compute modality gates (obs/action/agent/position) using per-policy MLPs.
- *
- * Returns keys:
- *  - "g_obs", "g_action", "g_agent", "g_position" (each [B, T, H])
- */
+
+// --- Diagnostic Functions (for testing/debugging) ---
+
 c10::Dict<std::string, torch::Tensor>
-gating(
-    const torch::Tensor& obs_embed,
-    const torch::Tensor& action_embed,
-    const torch::Tensor& agent_embed,
-    const torch::Tensor& position_embed,
+attention_block(
+    const torch::Tensor& x,
     const c10::Dict<std::string, torch::Tensor>& batched_weights,
     const torch::Tensor& policy_indices,
-    std::unordered_map<std::string, std::chrono::microseconds>* timers = nullptr);
-
-/**
- * Fuse gated embeddings and apply a final LayerNorm.
- *
- * Returns keys:
- *  - "fused_raw": before norm
- *  - "combined": after norm
- */
-c10::Dict<std::string, torch::Tensor>
-fuse_embeddings(
-    const torch::Tensor& g_obs,
-    const torch::Tensor& g_action,
-    const torch::Tensor& g_agent,
-    const torch::Tensor& g_position,
-    const torch::Tensor& obs_embed,
-    const torch::Tensor& action_embed,
-    const torch::Tensor& agent_embed,
-    const torch::Tensor& position_embed,
+    int64_t layer_idx,
+    int64_t num_heads,
     int64_t hidden_dim);
+
+c10::Dict<std::string, torch::Tensor>
+moe_block(
+    const torch::Tensor& x,
+    const c10::Dict<std::string, torch::Tensor>& batched_weights,
+    const torch::Tensor& policy_indices,
+    int64_t layer_idx,
+    int64_t top_k,
+    int64_t hidden_dim);
+
+c10::Dict<std::string, torch::Tensor>
+moe_routing_sort(
+    const torch::Tensor& x,
+    const c10::Dict<std::string, torch::Tensor>& batched_weights,
+    const torch::Tensor& policy_indices,
+    int64_t layer_idx,
+    int64_t top_k);
+
+torch::Tensor moe_group_ranges(
+    const torch::Tensor& sorted_expert_indices,
+    const torch::Tensor& sorted_policy_indices);
+
 
 } // namespace model
 } // namespace lb

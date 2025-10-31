@@ -123,6 +123,7 @@ void Env::valid_actions(uint8_t out[7]) const {
 
 int Env::observe_vector(float out[3 + MAX_PLAYERS]) const {
     int idx = 0;
+    if (cur < 0 || cur >= n_players) return 0; // Safety check
     out[idx++] = static_cast<float>(count_in_hand(cur, 1));
     out[idx++] = static_cast<float>(count_in_hand(cur, 0));
     out[idx++] = static_cast<float>(last_action_count);

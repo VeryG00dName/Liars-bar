@@ -555,8 +555,9 @@ def binary_entropy(p: float) -> float:
 class RichProgressScoreboard:
     """Combined progress bar and scoreboard for live tournament monitoring."""
 
-    def __init__(self, total_steps: int, players: Dict[int, Dict[str, Any]]):
-        self.console = Console()
+    def __init__(self, total_steps: int, players: Dict[int, Dict[str, Any]], console: Optional[Console] = None):
+        # Allow caller to provide a Console targeting a specific stream (e.g., real TTY only)
+        self.console = console if console is not None else Console()
         self.total = total_steps
         self.current = 0
         self.players = players
@@ -583,7 +584,15 @@ class RichProgressScoreboard:
         self.layout.split_column(self.progress_layout, self.score_layout)
 
         # Disable auto refresh; we will refresh explicitly on updates to avoid idle flicker
-        self.live = Live(self.layout, console=self.console, auto_refresh=False)
+        # Explicitly keep stdout/stderr redirect enabled so standard prints during Live
+        # are routed via the provided console (which we can bind to a filtered stream).
+        self.live = Live(
+            self.layout,
+            console=self.console,
+            auto_refresh=False,
+            redirect_stdout=True,
+            redirect_stderr=True,
+        )
         self.live.__enter__()
         self._last_snapshot: Optional[Tuple] = None
 
@@ -790,8 +799,10 @@ def rich_print_scoreboard(
     players: Dict[int, Dict[str, Any]],
     differences: Optional[Dict[int, Dict[str, Any]]] = None,
     save_csv: Optional[str] = None,
+    *,
+    console: Optional[Console] = None,
 ) -> None:
-    console = Console()
+    console = console if console is not None else Console()
     table = Table(title="Final Scoreboard", show_header=True, header_style="bold magenta")
     table.add_column("Rank", style="dim")
     table.add_column("Player")
@@ -886,10 +897,10 @@ def rich_print_scoreboard(
             print(f"[WARN] Failed to save CSV '{save_csv}': {exc}")
 
 
-def rich_print_expert_activations(expert_activations: Dict[int, Any]) -> None:
+def rich_print_expert_activations(expert_activations: Dict[int, Any], *, console: Optional[Console] = None) -> None:
     if not expert_activations:
         return
-    console = Console()
+    console = console if console is not None else Console()
     table = Table(title="MoE Expert Activations")
     table.add_column("Agent", style="bold")
     table.add_column("Details", style="green")

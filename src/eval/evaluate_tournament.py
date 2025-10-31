@@ -4,6 +4,11 @@ from __future__ import annotations
 import argparse
 import time
 import os
+import sys
+import re
+import shutil
+from datetime import datetime
+from pathlib import Path
 from collections import defaultdict
 from dataclasses import dataclass
 from itertools import combinations
@@ -36,6 +41,7 @@ from src.eval.evaluate_utils import (
     save_scoreboard,
 )
 from src.training.ppo_extras import set_seed, apply_determinism_settings
+from rich.console import Console
 
 SEED = int(getattr(config, "SEED", 42))
 set_seed(SEED)
@@ -261,6 +267,7 @@ def run_active_league(
     scheduler: SchedulerConfig,
     stopping: MatchStoppingConfig,
     track_experts: bool = False,
+    live_console: Optional[Console] = None,
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
     pairwise_counts: Dict[Tuple[int, int], int] = defaultdict(int)
     pairwise_wins: Dict[Tuple[int, int], int] = defaultdict(int)
@@ -277,7 +284,7 @@ def run_active_league(
     n_players_total = len(players)
     n_pairs_total = max(0, n_players_total * (n_players_total - 1) // 2)
     total_coverage_units = max(1, n_pairs_total * scheduler.pair_coverage_target)
-    progress_ui = RichProgressScoreboard(total_steps=total_coverage_units, players=players)
+    progress_ui = RichProgressScoreboard(total_steps=total_coverage_units, players=players, console=live_console)
     rng = np.random.default_rng(SEED)
 
     expert_data: Dict[int, Dict[str, Any]] = defaultdict(dict)
@@ -506,49 +513,230 @@ def main() -> None:
         help="Configure PyTorch determinism knobs; defaults to the fastest ('none').",
     )
     args = parser.parse_args()
-    apply_determinism_settings(args.determinism_level)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    run_specs = parse_run_specs(args.eval_runs)
-    if not args.cpp_bots:
-        cpp_bot_labels = list(getattr(config, "CPP_BOT_LABELS", []))
-    else:
-        cpp_bot_labels = parse_cpp_labels(args.cpp_bots)
+    # Setup per-run logging folder and tee stdout/stderr
+    logs_root = Path("eval_logs")
+    try:
+        logs_root.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    run_log_dir = logs_root / f"run_{ts}"
+    try:
+        run_log_dir.mkdir(parents=False, exist_ok=False)
+    except FileExistsError:
+        # Extremely unlikely collision; append pid
+        run_log_dir = logs_root / f"run_{ts}_{os.getpid()}"
+        run_log_dir.mkdir(parents=False, exist_ok=False)
 
-    eval_manager, players = load_evaluation_policies(
-        run_specs,
-        cpp_bot_labels,
-        device,
-        fair=args.fair,
-    )
-    num_players = config.NUM_PLAYERS
-    if len(players) < num_players:
-        raise ValueError(
-            f"Need at least {num_players} agents to run the tournament; got {len(players)}."
+    command_str = f"{sys.executable} {' '.join(sys.argv)}"
+    try:
+        (run_log_dir / "command.txt").write_text(
+            f"CWD: {os.getcwd()}\n" f"Started: {datetime.now().isoformat()}\n" f"Command: {command_str}\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+    class _Tee:
+        def __init__(self, stream, file_handle):
+            self._stream = stream
+            self._fh = file_handle
+            # Expose typical stream attributes Rich inspects
+            self.encoding = getattr(stream, "encoding", "utf-8")
+            self.errors = getattr(stream, "errors", "replace")
+        def write(self, data):
+            try:
+                self._fh.write(data)
+            except Exception:
+                pass
+            return self._stream.write(data)
+        def flush(self):
+            try:
+                self._fh.flush()
+            except Exception:
+                pass
+            return self._stream.flush()
+        def isatty(self):
+            try:
+                return bool(self._stream.isatty())
+            except Exception:
+                return False
+        def readable(self):
+            return False
+        def writable(self):
+            return True
+        def seekable(self):
+            return False
+        def fileno(self):
+            try:
+                return self._stream.fileno()
+            except Exception as _e:
+                raise _e
+        def __getattr__(self, name):
+            # Fallback any other attribute access to the underlying stream
+            return getattr(self._stream, name)
+
+    # Filtered console stream: mirrors Rich output to terminal, and logs only non-Rich, non-ANSI lines
+    ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+    BOX_CHARS = set("┏┓┗┛┳┻┫┣━│┃╭╮╯╰─═║╔╗╚╝╠╣╦╩╬┡┩┈┉┄┅┆┇┊┋┌┐┘└╱╲╳")
+
+    def _looks_like_box_line(s: str) -> bool:
+        t = s.strip()
+        if not t:
+            return True
+        # Skip any line that contains any box-drawing characters
+        return any((ch in BOX_CHARS) for ch in t)
+
+    def _should_skip_log_line(s: str) -> bool:
+        t = s.strip()
+        if not t:
+            return True
+        if _looks_like_box_line(t):
+            return True
+        # Skip common Rich headings for the live UI and any scoreboard banners
+        if (
+            t.startswith("Live Scoreboard")
+            or t.startswith("Progress")
+            or t.startswith("Evaluating...")
+            or "Scoreboard" in t
+            or "games/sec" in t
+            or t.startswith("Coverage ")
+        ):
+            return True
+        return False
+
+    class _FilteredConsoleStream:
+        def __init__(self, console_stream, log_stream):
+            self._console = console_stream
+            self._log = log_stream
+            self.encoding = getattr(console_stream, "encoding", "utf-8")
+            self.errors = getattr(console_stream, "errors", "replace")
+            self._buf = ""
+        def write(self, data):
+            # Always write to the real console
+            try:
+                self._console.write(data)
+            except Exception:
+                pass
+            # Accumulate and log filtered, line by line
+            try:
+                self._buf += data
+                parts = re.split(r"[\r\n]+", self._buf)
+                if self._buf.endswith("\n") or self._buf.endswith("\r"):
+                    self._buf = ""
+                else:
+                    self._buf = parts.pop()  # keep incomplete tail
+                for line in parts:
+                    text = ANSI_RE.sub("", line)
+                    if not _should_skip_log_line(text):
+                        self._log.write(text + "\n")
+            except Exception:
+                pass
+            return len(data)
+        def flush(self):
+            try:
+                self._console.flush()
+            except Exception:
+                pass
+            try:
+                self._log.flush()
+            except Exception:
+                pass
+        def isatty(self):
+            try:
+                return bool(self._console.isatty())
+            except Exception:
+                return True
+        def fileno(self):
+            try:
+                return self._console.fileno()
+            except Exception as _e:
+                raise _e
+        def __getattr__(self, name):
+            return getattr(self._console, name)
+
+    log_fh = open(run_log_dir / "console_output.log", "w", encoding="utf-8")
+    orig_stdout, orig_stderr = sys.stdout, sys.stderr
+    sys.stdout = _Tee(sys.stdout, log_fh)
+    sys.stderr = _Tee(sys.stderr, log_fh)
+    # Rich should render live UI to real TTY only (not mirrored to file)
+    # Live Rich UI to terminal; filtered copy of prints to log
+    live_console = Console(file=_FilteredConsoleStream(orig_stdout, log_fh))
+    copy_targets: List[Path] = []
+    try:
+        apply_determinism_settings(args.determinism_level)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        run_specs = parse_run_specs(args.eval_runs)
+        if not args.cpp_bots:
+            cpp_bot_labels = list(getattr(config, "CPP_BOT_LABELS", []))
+        else:
+            cpp_bot_labels = parse_cpp_labels(args.cpp_bots)
+
+        eval_manager, players = load_evaluation_policies(
+            run_specs,
+            cpp_bot_labels,
+            device,
+            fair=args.fair,
+        )
+        num_players = config.NUM_PLAYERS
+        if len(players) < num_players:
+            raise ValueError(
+                f"Need at least {num_players} agents to run the tournament; got {len(players)}."
+            )
+
+
+        batch_size = max(1, args.batch_size)
+
+        stopping = MatchStoppingConfig(games_per_match=args.games_per_quartet)
+        batch_size = max(batch_size, stopping.games_per_match)
+        scheduler = SchedulerConfig(
+            batch_size=batch_size,
+            pair_coverage_target=max(1, args.pair_coverage_target),
+            degree_cap_margin=max(0, args.degree_cap_margin),
+            max_candidate_quartets=max(0, args.max_candidate_quartets),
+        )
+        expert_data, baseline_scoreboard = run_active_league(
+            eval_manager,
+            players,
+            scheduler=scheduler,
+            stopping=stopping,
+            track_experts=args.track_experts,
+            live_console=live_console,
         )
 
+        final_differences = compare_scoreboards(baseline_scoreboard, players)
+        save_csv_path = args.save_final_csv if args.save_final_csv else None
+        rich_print_scoreboard(players, final_differences, save_csv=save_csv_path, console=live_console)
+        rich_print_expert_activations(expert_data, console=live_console)
 
-    batch_size = max(1, args.batch_size)
+        # Collect and mirror key outputs into the run log directory
+        potential_files = [
+            Path("tournament_scoreboard.json"),
+            Path("h2h_winrate_heatmap.png"),
+            Path("h2h_winrate_matrix.csv"),
+        ]
+        if save_csv_path:
+            potential_files.append(Path(save_csv_path))
+        for p in potential_files:
+            try:
+                if p.exists():
+                    shutil.copy2(p, run_log_dir / p.name)
+                    copy_targets.append(p)
+            except Exception as _e:
+                print(f"[WARN] Failed to copy '{p}' to '{run_log_dir}': {_e}")
 
-    stopping = MatchStoppingConfig(games_per_match=args.games_per_quartet)
-    batch_size = max(batch_size, stopping.games_per_match)
-    scheduler = SchedulerConfig(
-        batch_size=batch_size,
-        pair_coverage_target=max(1, args.pair_coverage_target),
-        degree_cap_margin=max(0, args.degree_cap_margin),
-        max_candidate_quartets=max(0, args.max_candidate_quartets),
-    )
-    expert_data, baseline_scoreboard = run_active_league(
-        eval_manager,
-        players,
-        scheduler=scheduler,
-        stopping=stopping,
-        track_experts=args.track_experts
-    )
-
-    final_differences = compare_scoreboards(baseline_scoreboard, players)
-    save_csv_path = args.save_final_csv if args.save_final_csv else None
-    rich_print_scoreboard(players, final_differences, save_csv=save_csv_path)
-    rich_print_expert_activations(expert_data)
+        print(f"[INFO] Run artifacts mirrored to: {run_log_dir}")
+    finally:
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        sys.stdout, sys.stderr = orig_stdout, orig_stderr
+        try:
+            log_fh.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

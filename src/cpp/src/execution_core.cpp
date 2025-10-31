@@ -1,5 +1,5 @@
 #include "execution_core.h"
-#include "reactive_model_forward.h"
+#include "model_forward.h"
 
 #include <algorithm>
 #include <random>
@@ -256,7 +256,7 @@ NeuralInferenceOrchestrator::run_inference(
             prepare_batch_tensors(batch_requests, max_seq_len);
 
         // Run forward_packed
-        auto [action_logits, opp_logits, state_values, win_logits] = forward_packed(
+        auto [action_logits, opp_logits, state_values, win_logits] = lb::forward::forward_packed(
             obs_seq,
             action_seq,
             agent_types,
