@@ -87,11 +87,87 @@ def main() -> int:
     ok = ok_action and ok_opp and ok_value and ok_win
     if ok:
         print("\nTrain forward parity: OK")
-        return 0
+    # Also run a focused backward parity check for indexed_batched_linear
+    print("\nChecking backward parity: indexed_batched_linear (autograd vs PyTorch)")
+    ok_bwd = _check_linear_backward_parity(device)
+    if ok_bwd:
+        print("Linear backward parity: OK")
     else:
-        print("\nTrain forward parity: FAILED")
+        print("Linear backward parity: FAILED")
         return 1
 
+
+# ------------------------------
+# Backward parity helpers
+# ------------------------------
+
+def _linear_forward_ref(input, weight_cache, bias_cache, policy_indices):
+    # Baseline using PyTorch ops with autograd
+    B, T, in_dim = input.shape
+    W, out_dim, _ = weight_cache.shape
+    pol = policy_indices.to(torch.long)
+    w_sel = weight_cache.index_select(0, pol)        # [B, out, in]
+    b_sel = bias_cache.index_select(0, pol)          # [B, out]
+    w_t = w_sel.transpose(1, 2)                      # [B, in, out]
+    bias_expanded = b_sel.unsqueeze(1).expand(B, T, out_dim)
+    out = torch.baddbmm(bias_expanded, input, w_t, beta=1.0, alpha=1.0)
+    return out
+
+
+def _check_linear_backward_parity(device: str) -> bool:
+    torch.manual_seed(0)
+    B, T, W = 8, 16, 4
+    in_dim, out_dim = 32, 48
+
+    # Create a single set of base tensors to share between both paths
+    base_input = torch.randn(B, T, in_dim, device=device, dtype=torch.float32)
+    base_weight = torch.randn(W, out_dim, in_dim, device=device, dtype=torch.float32)
+    base_bias = torch.randn(W, out_dim, device=device, dtype=torch.float32)
+    pol = torch.randint(0, W, (B,), device=device)
+
+    def clone_with_grad(x):
+        y = x.detach().clone()
+        y.requires_grad_(True)
+        return y
+
+    # Reference grads (PyTorch autograd only)
+    inp_ref = clone_with_grad(base_input)
+    w_ref   = clone_with_grad(base_weight)
+    b_ref   = clone_with_grad(base_bias)
+    out_ref = _linear_forward_ref(inp_ref, w_ref, b_ref, pol)
+    loss_ref = out_ref.sum()
+    loss_ref.backward()
+    grads_ref = {
+        'input': inp_ref.grad.detach().clone(),
+        'weight': w_ref.grad.detach().clone(),
+        'bias': b_ref.grad.detach().clone(),
+    }
+
+    # Test grads (our autograd function)
+    inp_t = clone_with_grad(base_input)
+    w_t   = clone_with_grad(base_weight)
+    b_t   = clone_with_grad(base_bias)
+    out_t = lb.autograd.indexed_batched_linear_autograd(inp_t, w_t, b_t, pol)
+    loss_t = out_t.sum()
+    loss_t.backward()
+    grads_t = {
+        'input': inp_t.grad.detach().clone(),
+        'weight': w_t.grad.detach().clone(),
+        'bias': b_t.grad.detach().clone(),
+    }
+
+    # Compare
+    rtol, atol = 1e-4, 1e-5
+    ok = True
+    for name in ('input', 'weight', 'bias'):
+        ref = grads_ref[name]
+        got = grads_t[name]
+        if not torch.allclose(ref, got, rtol=rtol, atol=atol):
+            max_abs = (ref - got).abs().max().item()
+            mean_abs = (ref - got).abs().mean().item()
+            print(f"  Grad mismatch {name}: max|Δ|={max_abs:.3e}, mean|Δ|={mean_abs:.3e}")
+            ok = False
+    return ok
 
 if __name__ == "__main__":
     raise SystemExit(main())

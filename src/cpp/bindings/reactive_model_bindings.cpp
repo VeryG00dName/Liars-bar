@@ -2,6 +2,7 @@
 #include "model_forward.h"
 #include "weight_utils.h"
 #include "lb_kernels.h"
+#include "model_autograd.h"
 #include "moe_backward_kernels.h"
 #include "moe_cutlass_kernels.h"
 
@@ -12,6 +13,23 @@
 namespace py = pybind11;
 
 void bind_reactive_model(py::module_& m) {
+    // Autograd submodule for unit tests (expose core autograd functions)
+    py::module_ autograd = m.def_submodule("autograd", "Autograd-enabled wrappers");
+    autograd.def(
+        "indexed_batched_linear_autograd",
+        [](const torch::Tensor& input,
+           const torch::Tensor& weight_cache,
+           const torch::Tensor& bias_cache,
+           const torch::Tensor& policy_indices) {
+            return lb::autograd::indexed_batched_linear_autograd(
+                input, weight_cache, bias_cache, policy_indices);
+        },
+        py::arg("input"),
+        py::arg("weight_cache"),
+        py::arg("bias_cache"),
+        py::arg("policy_indices"),
+        "Autograd linear with per-sample indexed weights (training forward)."
+    );
     // Expose the main forward function
     m.def(
         "forward_packed",

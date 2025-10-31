@@ -392,18 +392,19 @@ torch::Tensor indexed_batched_linear(
     // Batched matmul
     auto gemm_t0 = Clock::now();
     auto weight_transposed = weight_batched.transpose(1, 2);  // [B, In_Dim, Out_Dim]
-    auto output = torch::matmul(input_f32, weight_transposed);  // [B, T, Out_Dim]
+    // Fused bias add + batched GEMM
+    auto bias_expanded = bias_batched.unsqueeze(1).expand({B, T, Out_Dim});
+    auto output = torch::baddbmm(bias_expanded, input_f32, weight_transposed, /*beta=*/1.0, /*alpha=*/1.0);
     auto gemm_t1 = Clock::now();
     timers["linear_cublas_matmul_us"] += std::chrono::duration_cast<Microseconds>(gemm_t1 - gemm_t0);
 
-    // Epilogue
-    auto epi_t0 = Clock::now();
-    output.add_(bias_batched.unsqueeze(1));
+    // Optional GELU epilogue
     if (epilogue == IndexedLinearEpilogue::BiasGELU) {
+        auto epi_t0 = Clock::now();
         output = torch::gelu(output);
+        auto epi_t1 = Clock::now();
+        timers["linear_epilogue_us"] += std::chrono::duration_cast<Microseconds>(epi_t1 - epi_t0);
     }
-    auto epi_t1 = Clock::now();
-    timers["linear_epilogue_us"] += std::chrono::duration_cast<Microseconds>(epi_t1 - epi_t0);
 
     return output.to(input.scalar_type());
 }

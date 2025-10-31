@@ -408,6 +408,7 @@ def _create_new_agent(agent_type: str, device: torch.device) -> LearnerAutoregre
     if agent_type == 'main':
         model = PPOReactiveModel(
             obs_dim=16,
+            dropout_rate=0.0
         )
     else:  # Future branches (e.g., exploiter) can be added here.
         raise ValueError(f"Unknown agent type for creation: {agent_type}")
@@ -592,7 +593,7 @@ def train_generation(
         learner.train_model = train_model
         learner.train_model.train()
 
-        # 2.4. Create and compile a single ROLLOUT model that supports dynamic sequence lengths
+        # 2.4. Create and compile a single ROLLOUT model that supports dynamic sequence lengths ( we don't use that anymore)
         try:
             rollout_model = copy.deepcopy(learner.model)
         except Exception as exc:

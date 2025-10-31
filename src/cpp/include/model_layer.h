@@ -41,6 +41,10 @@ transformer_layer(
     const torch::Tensor& w2_all,
     const torch::Tensor& b1_all,
     const torch::Tensor& b2_all,
+    const torch::Tensor& w1_ptrs,
+    const torch::Tensor& w2_ptrs,
+    const torch::Tensor& b1_ptrs,
+    const torch::Tensor& b2_ptrs,
     const torch::Tensor& norm2_weight,
     const torch::Tensor& norm2_bias,
     int64_t num_heads,
@@ -78,6 +82,41 @@ torch::Tensor reduce_expert_heads(
     const torch::Tensor& stacked,
     const torch::Tensor& topk_indices,
     const torch::Tensor& topk_scores);
+
+/**
+ * Compute modality gates (obs/action/agent/position) using per-policy MLPs.
+ *
+ * Returns keys:
+ *  - "g_obs", "g_action", "g_agent", "g_position" (each [B, T, H])
+ */
+c10::Dict<std::string, torch::Tensor>
+gating(
+    const torch::Tensor& obs_embed,
+    const torch::Tensor& action_embed,
+    const torch::Tensor& agent_embed,
+    const torch::Tensor& position_embed,
+    const c10::Dict<std::string, torch::Tensor>& batched_weights,
+    const torch::Tensor& policy_indices,
+    std::unordered_map<std::string, std::chrono::microseconds>* timers = nullptr);
+
+/**
+ * Fuse gated embeddings and apply a final LayerNorm.
+ *
+ * Returns keys:
+ *  - "fused_raw": before norm
+ *  - "combined": after norm
+ */
+c10::Dict<std::string, torch::Tensor>
+fuse_embeddings(
+    const torch::Tensor& g_obs,
+    const torch::Tensor& g_action,
+    const torch::Tensor& g_agent,
+    const torch::Tensor& g_position,
+    const torch::Tensor& obs_embed,
+    const torch::Tensor& action_embed,
+    const torch::Tensor& agent_embed,
+    const torch::Tensor& position_embed,
+    int64_t hidden_dim);
 
 } // namespace model
 } // namespace lb

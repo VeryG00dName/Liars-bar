@@ -7,6 +7,7 @@
 #include "model_layer.h"
 #include "reactive_model_forward.h"
 #include "lb_kernels.h"
+#include "lb_kernels.h"
 
 namespace lb {
 namespace model {
@@ -27,6 +28,10 @@ transformer_layer(
     const torch::Tensor& w2_all,
     const torch::Tensor& b1_all,
     const torch::Tensor& b2_all,
+    const torch::Tensor& w1_ptrs_gpu,
+    const torch::Tensor& w2_ptrs_gpu,
+    const torch::Tensor& b1_ptrs_gpu,
+    const torch::Tensor& b2_ptrs_gpu,
     const torch::Tensor& norm2_weight,
     const torch::Tensor& norm2_bias,
     int64_t num_heads,
@@ -111,16 +116,18 @@ transformer_layer(
     const auto* se = sorted_expert_cpu.data_ptr<int64_t>();
     const auto* sp = sorted_policy_cpu.data_ptr<int64_t>();
 
-    // Base pointers for weights/biases
-    const at::Half* w1_base = w1_all.data_ptr<at::Half>();
-    const at::Half* w2_base = w2_all.data_ptr<at::Half>();
-    const at::Half* b1_base = b1_all.data_ptr<at::Half>();
-    const at::Half* b2_base = b2_all.data_ptr<at::Half>();
-    const int64_t w1_stride_pe = ffn_dim * H;            // elements per (policy,expert) for W1
-    const int64_t w2_stride_pe = H * ffn_dim;            // elements per (policy,expert) for W2
-    const int64_t b1_stride_pe = ffn_dim;                // elements per (policy,expert) for b1
-    const int64_t b2_stride_pe = H;                      // elements per (policy,expert) for b2
-    const int64_t pe_stride = num_experts;               // experts per policy
+    // Use prebuilt GPU pointer tables (created by weight_utils) to satisfy
+    // CUTLASS ColumnMajor expectations and layout alignment.
+    auto w1_ptrs_cpu = w1_ptrs_gpu.cpu().contiguous();
+    auto w2_ptrs_cpu = w2_ptrs_gpu.cpu().contiguous();
+    auto b1_ptrs_cpu = b1_ptrs_gpu.cpu().contiguous();
+    auto b2_ptrs_cpu = b2_ptrs_gpu.cpu().contiguous();
+    const uint64_t* w1_ptr_data = w1_ptrs_cpu.data_ptr<uint64_t>();
+    const uint64_t* w2_ptr_data = w2_ptrs_cpu.data_ptr<uint64_t>();
+    const uint64_t* b1_ptr_data = b1_ptrs_cpu.data_ptr<uint64_t>();
+    const uint64_t* b2_ptr_data = b2_ptrs_cpu.data_ptr<uint64_t>();
+    const int64_t num_policies_in_cache = w1_ptrs_cpu.size(0);
+    const int64_t num_experts_in_cache = w1_ptrs_cpu.size(1);
 
     std::vector<uintptr_t> input_ptrs;
     std::vector<uintptr_t> output_ptrs;
@@ -152,11 +159,12 @@ transformer_layer(
         input_ptrs.push_back(in_ptr);
         output_ptrs.push_back(out_ptr);
 
-        const int64_t pe_index = pi * pe_stride + ei;
-        w1_ptrs.push_back(reinterpret_cast<uintptr_t>(w1_base + pe_index * w1_stride_pe));
-        b1_ptrs.push_back(reinterpret_cast<uintptr_t>(b1_base + pe_index * b1_stride_pe));
-        w2_ptrs.push_back(reinterpret_cast<uintptr_t>(w2_base + pe_index * w2_stride_pe));
-        b2_ptrs.push_back(reinterpret_cast<uintptr_t>(b2_base + pe_index * b2_stride_pe));
+        // Bounds check against pointer tables
+        const int64_t ptr_index = pi * num_experts_in_cache + ei;
+        w1_ptrs.push_back(static_cast<uintptr_t>(w1_ptr_data[ptr_index]));
+        b1_ptrs.push_back(static_cast<uintptr_t>(b1_ptr_data[ptr_index]));
+        w2_ptrs.push_back(static_cast<uintptr_t>(w2_ptr_data[ptr_index]));
+        b2_ptrs.push_back(static_cast<uintptr_t>(b2_ptr_data[ptr_index]));
 
         group_m_sizes.push_back(count);
         group_policy_ids.push_back(pi);
@@ -288,6 +296,84 @@ torch::Tensor reduce_expert_heads(
     const torch::Tensor& topk_indices,
     const torch::Tensor& topk_scores) {
     return ::reduce_expert_heads(stacked, topk_indices, topk_scores);
+}
+
+c10::Dict<std::string, torch::Tensor>
+gating(
+    const torch::Tensor& obs_embed,
+    const torch::Tensor& action_embed,
+    const torch::Tensor& agent_embed,
+    const torch::Tensor& position_embed,
+    const c10::Dict<std::string, torch::Tensor>& batched_weights,
+    const torch::Tensor& policy_indices,
+    std::unordered_map<std::string, std::chrono::microseconds>* timers) {
+
+    using Microseconds = std::chrono::microseconds;
+    std::unordered_map<std::string, Microseconds> dummy;
+    auto& t = timers ? *timers : dummy;
+
+    auto device = obs_embed.device();
+    auto pol = policy_indices.to(device).to(torch::kLong).contiguous();
+
+    c10::Dict<std::string, torch::Tensor> result;
+
+    auto lin = [&](const torch::Tensor& x, const std::string& base){
+        auto h = lb::kernels::indexed_batched_linear(
+            x,
+            batched_weights.at(base + ".0.weight"),
+            batched_weights.at(base + ".0.bias"),
+            pol, t);
+        h = torch::tanh(h);
+        auto g = lb::kernels::indexed_batched_linear(
+            h,
+            batched_weights.at(base + ".2.weight"),
+            batched_weights.at(base + ".2.bias"),
+            pol, t);
+        return torch::sigmoid(g);
+    };
+
+    auto g_obs      = lin(obs_embed,       "gate_obs");
+    auto g_action   = lin(action_embed,    "gate_action");
+    auto g_agent    = lin(agent_embed,     "gate_agent");
+    auto g_position = lin(position_embed,  "gate_position");
+
+    result.insert("g_obs", g_obs);
+    result.insert("g_action", g_action);
+    result.insert("g_agent", g_agent);
+    result.insert("g_position", g_position);
+    return result;
+}
+
+c10::Dict<std::string, torch::Tensor>
+fuse_embeddings(
+    const torch::Tensor& g_obs,
+    const torch::Tensor& g_action,
+    const torch::Tensor& g_agent,
+    const torch::Tensor& g_position,
+    const torch::Tensor& obs_embed,
+    const torch::Tensor& action_embed,
+    const torch::Tensor& agent_embed,
+    const torch::Tensor& position_embed,
+    int64_t hidden_dim) {
+    c10::Dict<std::string, torch::Tensor> result;
+
+    // Cast embeddings to common dtype of obs_embed to avoid type promotion
+    auto cast_like = [&](const torch::Tensor& t){
+        return t.scalar_type() == obs_embed.scalar_type() ? t : t.to(obs_embed.scalar_type());
+    };
+    auto action_embed_c   = cast_like(action_embed);
+    auto agent_embed_c    = cast_like(agent_embed);
+    auto position_embed_c = cast_like(position_embed);
+
+    auto fused = g_obs * obs_embed
+               + g_action * action_embed_c
+               + g_agent * agent_embed_c
+               + g_position * position_embed_c;
+    result.insert("fused_raw", fused);
+
+    auto combined = torch::layer_norm(fused, {hidden_dim});
+    result.insert("combined", combined);
+    return result;
 }
 
 } // namespace model
