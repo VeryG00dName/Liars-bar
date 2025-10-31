@@ -61,7 +61,8 @@ public:
         int64_t num_heads = 4,
         int64_t hidden_dim = 256,
         int64_t num_experts = 8,
-        int64_t top_k = 2
+        int64_t top_k = 2,
+        bool use_argmax = false
     );
 
     /**
@@ -94,6 +95,7 @@ private:
     int64_t hidden_dim_;
     int64_t num_experts_;
     int64_t top_k_;
+    bool use_argmax_ = false;
 
     /**
      * Find the maximum sequence length across all requests.

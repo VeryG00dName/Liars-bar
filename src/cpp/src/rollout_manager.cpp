@@ -630,7 +630,8 @@ void RolloutManager::finalize_model_loading() {
         num_heads_,
         hidden_dim_,
         num_experts_,
-        top_k_
+        top_k_,
+        /*use_argmax=*/false
     );
 
     weights_finalized_ = true;

@@ -16,7 +16,8 @@ NeuralInferenceOrchestrator::NeuralInferenceOrchestrator(
     int64_t num_heads,
     int64_t hidden_dim,
     int64_t num_experts,
-    int64_t top_k
+    int64_t top_k,
+    bool use_argmax
 )
     : batched_weights_(batched_weights),
       policy_id_to_index_(policy_id_to_index),
@@ -25,7 +26,8 @@ NeuralInferenceOrchestrator::NeuralInferenceOrchestrator(
       num_heads_(num_heads),
       hidden_dim_(hidden_dim),
       num_experts_(num_experts),
-      top_k_(top_k)
+      top_k_(top_k),
+      use_argmax_(use_argmax)
 {
 }
 
@@ -183,13 +185,27 @@ uint8_t NeuralInferenceOrchestrator::sample_action(
         probs[i] /= sum_exp;
     }
 
-    // Sample using categorical distribution
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::discrete_distribution<> dist(probs.begin(), probs.end());
-    int action = dist(gen);
+    int action = 0;
+    if (use_argmax_) {
+        // Greedy selection by argmax over masked logits
+        float best = -std::numeric_limits<float>::infinity();
+        int best_idx = 0;
+        for (int i = 0; i < 7; ++i) {
+            if (mask[i] && masked_logits[i] > best) {
+                best = masked_logits[i];
+                best_idx = i;
+            }
+        }
+        action = best_idx;
+    } else {
+        // Sample using categorical distribution
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::discrete_distribution<> dist(probs.begin(), probs.end());
+        action = dist(gen);
+    }
 
-    // Compute log probability
+    // Compute log probability of chosen action
     log_prob = std::log(probs[action] + 1e-8f);
 
     return static_cast<uint8_t>(action);
