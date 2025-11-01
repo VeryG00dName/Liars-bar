@@ -176,7 +176,7 @@ private:
 }  // namespace
 
 EvalManager::EvalManager()
-    : max_env_batch_(2048), max_inference_batch_size_(2048), rng_(seed_with_optional(0)) {
+    : max_env_batch_(3584), max_inference_batch_size_(896), rng_(seed_with_optional(0)) {
     if (!torch::cuda::is_available()) {
         throw std::runtime_error(
             "CUDA is not available, but the EvalManager requires it for TorchScript inference.");
@@ -338,39 +338,6 @@ void EvalManager::finalize_model_loading() {
                 const int64_t stride_expert = stacked_gpu.stride(1);
                 const int64_t element_size = static_cast<int64_t>(stacked_gpu.element_size());
 
-                // Debug: print stride information for first weight tensor
-                static bool printed_strides = false;
-                if (!printed_strides && key.find(".w1") != std::string::npos) {
-                    fprintf(stderr, "[DEBUG eval_manager] %s shape: [%ld, %ld, %ld, %ld]\n",
-                            key.c_str(),
-                            stacked_gpu.size(0), stacked_gpu.size(1),
-                            stacked_gpu.size(2), stacked_gpu.size(3));
-                    fprintf(stderr, "[DEBUG eval_manager] stride(0)=%ld, stride(1)=%ld, element_size=%ld\n",
-                            stride_policy, stride_expert, element_size);
-
-                    // Verify pointer calculation for policy 0, expert 0
-                    auto test_tensor_indexed = stacked_gpu[0][0];
-                    uintptr_t ptr_via_index = reinterpret_cast<uintptr_t>(test_tensor_indexed.data_ptr<at::Half>());
-                    uintptr_t ptr_via_stride = base_address + (0 * stride_policy + 0 * stride_expert) * element_size;
-                    fprintf(stderr, "[DEBUG eval_manager] [0][0] ptr via index: 0x%lx, via stride: 0x%lx, match: %s\n",
-                            ptr_via_index, ptr_via_stride,
-                            (ptr_via_index == ptr_via_stride) ? "YES" : "NO");
-
-                    // Test for policy 1, expert 0 (only if at least 2 policies are present)
-                    if (num_policies >= 2) {
-                        auto test_tensor_p1e0 = stacked_gpu[1][0];
-                        uintptr_t ptr_p1e0_index = reinterpret_cast<uintptr_t>(test_tensor_p1e0.data_ptr<at::Half>());
-                        uintptr_t ptr_p1e0_stride = base_address + (1 * stride_policy + 0 * stride_expert) * element_size;
-                        fprintf(stderr, "[DEBUG eval_manager] [1][0] ptr via index: 0x%lx, via stride: 0x%lx, match: %s\n",
-                                ptr_p1e0_index, ptr_p1e0_stride,
-                                (ptr_p1e0_index == ptr_p1e0_stride) ? "YES" : "NO");
-                    } else {
-                        fprintf(stderr, "[DEBUG eval_manager] single-policy load detected; skipping [1][0] pointer check.\n");
-                    }
-
-                    printed_strides = true;
-                }
-
                 auto ptr_data = ptr_tensor_cpu.data_ptr<uint64_t>();
 
                 // Use PyTorch indexing (same as weight_utils.cpp) to get data pointers
@@ -384,22 +351,6 @@ void EvalManager::finalize_model_loading() {
                             expert_tensor.data_ptr<at::Half>()
                         );
                     }
-                }
-
-                // Validation: sample first weight value from pointer vs direct indexing
-                static bool validated_once = false;
-                if (!validated_once && key.find(".w1") != std::string::npos && num_policies > 0 && num_experts > 0) {
-                    // Get pointer for policy 0, expert 0
-                    uint64_t ptr_p0e0 = ptr_data[0 * num_experts + 0];
-                    auto direct_tensor = stacked_gpu[0][0];
-
-                    // Sample first value via direct access
-                    at::Half val_direct = direct_tensor.flatten()[0].item<at::Half>();
-
-                    fprintf(stderr, "[DEBUG] Pointer validation for %s [0][0]: ptr=0x%lx, val_direct=%f\n",
-                            key.c_str(), ptr_p0e0, static_cast<float>(val_direct));
-
-                    validated_once = true;
                 }
 
                 // Move pointer tensor to same device as weights (CUDA)
@@ -419,25 +370,6 @@ void EvalManager::finalize_model_loading() {
             if (dit != staged_state_dicts_.end()) {
                 dit->second.erase(key);
             }
-        }
-    }
-
-    // DEBUG: Verify weights are actually different between policies
-    if (batched_weight_cache_.contains("obs_encoder.0.weight")) {
-        auto stacked_weight = batched_weight_cache_.at("obs_encoder.0.weight");
-        fprintf(stderr, "[EvalManager] Stacked weight verification: obs_encoder.0.weight shape=[");
-        for (int i = 0; i < stacked_weight.dim(); ++i) {
-            fprintf(stderr, "%ld%s", stacked_weight.size(i), i < stacked_weight.dim()-1 ? "," : "");
-        }
-        fprintf(stderr, "]\n");
-
-        // Check if all policies have same weights (would indicate a bug)
-        if (stacked_weight.size(0) >= 2) {
-            auto policy0 = stacked_weight[0].flatten();
-            auto policy1 = stacked_weight[1].flatten();
-            auto diff = (policy0 - policy1).abs().max().item<float>();
-            fprintf(stderr, "[EvalManager] Max abs diff between policy 0 and 1 weights: %.6f %s\n",
-                    diff, diff < 1e-6 ? "(IDENTICAL - BUG!)" : "(different - OK)");
         }
     }
 
@@ -485,7 +417,7 @@ void EvalManager::finalize_model_loading() {
         hidden_dim_,
         num_experts_,
         top_k_,
-        /*use_argmax=*/true
+        /*use_argmax=*/false
     );
 
     weights_finalized_ = true;

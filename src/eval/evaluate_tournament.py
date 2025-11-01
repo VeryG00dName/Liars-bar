@@ -59,7 +59,7 @@ class MatchStoppingConfig:
 
 @dataclass
 class SchedulerConfig:
-    batch_size: int = 1024
+    batch_size: int = config.EVAL_VEC_BATCH_SIZE
     pair_coverage_target: int = 64
     degree_cap_margin: int = 2
     max_candidate_quartets: int = 4096
@@ -316,6 +316,7 @@ def run_active_league(
             track_experts=track_experts,
             base_seed=batch_seed,
         )
+        print("games per run",len(quartets))
         total_games_done += int(total_games)
 
         if perf_stats:
@@ -466,7 +467,7 @@ def main() -> None:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=1024,
+        default=config.EVAL_VEC_BATCH_SIZE,
         help="Target number of games to schedule per batch (used to derive quartets per batch).",
     )
     parser.add_argument(

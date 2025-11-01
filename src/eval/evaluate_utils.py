@@ -451,7 +451,7 @@ def run_batched_lineups(
         num_players_in_env,
         int(seed),
     )
-
+    print(f"[INFO] Completed {total_games} games across {len(lineups)} lineups.")
     results_typed: List[Dict[int, Dict[str, Any]]] = []
     for lineup_idx in range(len(lineups)):
         lineup_results = results_list[lineup_idx] if lineup_idx < len(results_list) else {}
@@ -477,27 +477,6 @@ def run_batched_lineups(
     }
 
     return results_typed, counts_typed, wins_typed, int(total_games), perf_stats_typed
-
-def run_batched_games(
-    eval_manager: "lb.EvalManager",
-    matchup_policy_ids: List[int],
-    num_games_per_match: int,
-    num_players_in_env: int,
-    track_experts: bool = False,
-    base_seed: Optional[int] = None,
-) -> Tuple[Dict[int, Dict[str, Any]], Dict[Tuple[int, int], int], Dict[Tuple[int, int], int]]:
-    """Wrapper around :func:`run_batched_lineups` for a single matchup."""
-
-    results, counts, wins, _, _ = run_batched_lineups(
-        eval_manager,
-        [matchup_policy_ids],
-        num_games_per_match,
-        num_players_in_env,
-        track_experts=track_experts,
-        base_seed=base_seed,
-    )
-    return (results[0] if results else {}), counts, wins
-
 
 # ---------------------------------------------------------------------------
 # Statistical helpers
