@@ -176,7 +176,7 @@ private:
 }  // namespace
 
 EvalManager::EvalManager()
-    : max_env_batch_(3584), max_inference_batch_size_(896), rng_(seed_with_optional(0)) {
+    : max_env_batch_(3584), max_inference_batch_size_(512), rng_(seed_with_optional(0)) {
     if (!torch::cuda::is_available()) {
         throw std::runtime_error(
             "CUDA is not available, but the EvalManager requires it for TorchScript inference.");

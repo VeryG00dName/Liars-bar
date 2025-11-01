@@ -23,7 +23,8 @@ struct GroupedMoEAutograd : public torch::autograd::Function<GroupedMoEAutograd>
         const torch::Tensor& expert_ids_cpu,
         const torch::Tensor& token_offsets_cpu,
         int64_t hidden_dim,
-        int64_t ffn_dim
+        int64_t ffn_dim,
+        lb::moe::MoEWorkspace* workspace
     ) {
         TORCH_CHECK(input_grouped.scalar_type() == torch::kFloat16 && input_grouped.is_cuda());
         TORCH_CHECK(w1_weights.scalar_type() == torch::kFloat16 && w1_weights.is_cuda());
@@ -94,7 +95,8 @@ struct GroupedMoEAutograd : public torch::autograd::Function<GroupedMoEAutograd>
             off_ptr,
             group_count,
             hidden_dim,
-            ffn_dim
+            ffn_dim,
+            workspace  // Optional pre-allocated workspace from orchestrator
         );
 
         // Optional runtime guard: assert outputs are finite to catch instability early
@@ -233,7 +235,8 @@ struct GroupedMoEAutograd : public torch::autograd::Function<GroupedMoEAutograd>
             torch::Tensor(), // expert_ids_cpu
             torch::Tensor(), // token_offsets_cpu
             torch::Tensor(), // hidden_dim
-            torch::Tensor()  // ffn_dim
+            torch::Tensor(), // ffn_dim
+            torch::Tensor()  // workspace (no grad)
         };
     }
 };
@@ -251,7 +254,8 @@ torch::Tensor grouped_moe_autograd_forward(
     const torch::Tensor& expert_ids_cpu,
     const torch::Tensor& token_offsets_cpu,
     int64_t hidden_dim,
-    int64_t ffn_dim
+    int64_t ffn_dim,
+    lb::moe::MoEWorkspace* workspace
 ) {
     return GroupedMoEAutograd::apply(
         input_grouped,
@@ -266,7 +270,8 @@ torch::Tensor grouped_moe_autograd_forward(
         expert_ids_cpu,
         token_offsets_cpu,
         hidden_dim,
-        ffn_dim
+        ffn_dim,
+        workspace
     );
 }
 

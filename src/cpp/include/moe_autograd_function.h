@@ -5,6 +5,9 @@
 namespace lb {
 namespace moe {
 
+// Forward declaration to avoid including heavy headers here
+struct MoEWorkspace;
+
 // C++ autograd front for grouped MoE FFN. Returns output_grouped [T, H] (Half).
 // Backward computes grads for input_grouped and expert weights/biases, and
 // also returns gradient for routing_weights (dr) so it can flow to gate logits.
@@ -24,9 +27,9 @@ torch::Tensor grouped_moe_autograd_forward(
     const torch::Tensor& expert_ids_cpu,            // [G] Long (CPU)
     const torch::Tensor& token_offsets_cpu,         // [G] Long (CPU)
     int64_t hidden_dim,
-    int64_t ffn_dim
+    int64_t ffn_dim,
+    MoEWorkspace* workspace = nullptr               // Optional pre-allocated workspace
 );
 
 } // namespace moe
 } // namespace lb
-

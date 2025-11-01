@@ -16,6 +16,7 @@
  */
 
 namespace lb {
+namespace moe { struct MoEWorkspace; }
 namespace model {
 
 /**
@@ -101,7 +102,8 @@ transformer_layer(
     const torch::Tensor& norm2_bias,
     int64_t num_heads,
     int64_t hidden_dim,
-    int64_t top_k);
+    int64_t top_k,
+    lb::moe::MoEWorkspace* workspace = nullptr);
 
 /**
  * Compute all per-expert heads.

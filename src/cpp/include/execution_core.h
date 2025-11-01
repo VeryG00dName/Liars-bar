@@ -6,6 +6,7 @@
 #include <cstdint>
 
 #include "vec_arena.h"  // For PolicyRequest
+#include "moe_cutlass_kernels.h"  // For MoEWorkspace
 
 namespace execution_core {
 
@@ -65,6 +66,8 @@ public:
         bool use_argmax = false
     );
 
+    ~NeuralInferenceOrchestrator();
+
     /**
      * Run batched inference for all neural network requests.
      *
@@ -96,6 +99,10 @@ private:
     int64_t num_experts_;
     int64_t top_k_;
     bool use_argmax_ = false;
+
+    // Pre-allocated workspace for CUTLASS kernels (per-layer)
+    // Allocated once in constructor, reused for all forward passes
+    std::vector<lb::moe::MoEWorkspace> moe_workspaces_;
 
     /**
      * Find the maximum sequence length across all requests.

@@ -15,6 +15,7 @@
  */
 
 namespace lb {
+namespace moe { struct MoEWorkspace; }
 namespace forward {
 
 /**
@@ -41,8 +42,28 @@ forward_packed(
     int64_t top_k = 2,
     int64_t count_pad = 4,
     int64_t tflag_pad = 3,
-    std::unordered_map<std::string, std::chrono::microseconds>* timers = nullptr
+    std::unordered_map<std::string, std::chrono::microseconds>* timers = nullptr,
+    const lb::moe::MoEWorkspace* moe_workspaces = nullptr  // Optional per-layer workspaces (array of size num_layers)
 );
+
+/**
+ * Enable thread-local MoE workspace cache for forward_packed callers.
+ *
+ * Allocates per-layer CUTLASS workspaces sized for the provided max batch/seq.
+ * If forward_packed is called with moe_workspaces == nullptr, it will use this
+ * thread-local cache automatically.
+ */
+void enable_forward_workspace_cache(
+    int64_t num_layers,
+    int64_t max_batch_size,
+    int64_t max_seq_length,
+    int64_t hidden_dim,
+    int64_t top_k);
+
+/**
+ * Disable and free the thread-local MoE workspace cache.
+ */
+void disable_forward_workspace_cache();
 
 /**
  * Training forward pass (with autograd).

@@ -209,7 +209,8 @@ void cutlass_grouped_moe_forward(
     const int64_t* token_offsets,
     int64_t group_count,
     int64_t hidden_dim,
-    int64_t ffn_dim
+    int64_t ffn_dim,
+    MoEWorkspace* workspace
 ) {
     if (group_count == 0) {
         if (LB_MOE_LOG_GEMM()) {
@@ -228,13 +229,34 @@ void cutlass_grouped_moe_forward(
         std::cerr << "  ffn_dim=" << ffn_dim << std::endl;
     }
 
-    // Allocate workspace for intermediate hidden states
+    // Allocate or reuse workspace for intermediate hidden states
     cutlass::half_t* hidden_buffer = nullptr;
+    bool owns_hidden_buffer = false;
     size_t total_intermediate_size = 0;
     for (int64_t i = 0; i < group_count; ++i) {
         total_intermediate_size += m_sizes[i] * ffn_dim;
     }
-    CUDA_CHECK(cudaMalloc(&hidden_buffer, total_intermediate_size * sizeof(cutlass::half_t)));
+    size_t required_hidden_size = total_intermediate_size * sizeof(cutlass::half_t);
+
+    if (workspace && workspace->hidden_buffer && workspace->hidden_buffer_size >= required_hidden_size) {
+        // Use pre-allocated workspace
+        hidden_buffer = reinterpret_cast<cutlass::half_t*>(workspace->hidden_buffer);
+    } else if (workspace && workspace->hidden_buffer) {
+        // Workspace too small - grow it
+        cudaFree(workspace->hidden_buffer);
+        CUDA_CHECK(cudaMalloc(&workspace->hidden_buffer, required_hidden_size));
+        workspace->hidden_buffer_size = required_hidden_size;
+        hidden_buffer = reinterpret_cast<cutlass::half_t*>(workspace->hidden_buffer);
+    } else if (workspace) {
+        // Workspace provided but no buffer allocated yet
+        CUDA_CHECK(cudaMalloc(&workspace->hidden_buffer, required_hidden_size));
+        workspace->hidden_buffer_size = required_hidden_size;
+        hidden_buffer = reinterpret_cast<cutlass::half_t*>(workspace->hidden_buffer);
+    } else {
+        // No workspace - allocate temporary buffer
+        CUDA_CHECK(cudaMalloc(&hidden_buffer, required_hidden_size));
+        owns_hidden_buffer = true;
+    }
 
     // ========================================================================
     // W1 GEMM with BIAS + GELU Fusion
@@ -294,17 +316,67 @@ void cutlass_grouped_moe_forward(
         int64_t* ldb_device_w1 = nullptr;
         int64_t* ldc_device_w1 = nullptr;
         int64_t* ldd_device_w1 = nullptr;
+        bool owns_w1_descriptors = false;
 
         size_t num_problems_w1 = problem_sizes_w1.size();
-        CUDA_CHECK(cudaMalloc(&problem_sizes_device_w1, num_problems_w1 * sizeof(cutlass::gemm::GemmCoord)));
-        CUDA_CHECK(cudaMalloc(&ptr_A_device_w1, num_problems_w1 * sizeof(ElementA*)));
-        CUDA_CHECK(cudaMalloc(&ptr_B_device_w1, num_problems_w1 * sizeof(ElementB*)));
-        CUDA_CHECK(cudaMalloc(&ptr_C_device_w1, num_problems_w1 * sizeof(ElementOutput*)));
-        CUDA_CHECK(cudaMalloc(&ptr_D_device_w1, num_problems_w1 * sizeof(ElementOutput*)));
-        CUDA_CHECK(cudaMalloc(&lda_device_w1, num_problems_w1 * sizeof(int64_t)));
-        CUDA_CHECK(cudaMalloc(&ldb_device_w1, num_problems_w1 * sizeof(int64_t)));
-        CUDA_CHECK(cudaMalloc(&ldc_device_w1, num_problems_w1 * sizeof(int64_t)));
-        CUDA_CHECK(cudaMalloc(&ldd_device_w1, num_problems_w1 * sizeof(int64_t)));
+
+        if (workspace && workspace->descriptor_capacity_w1 >= num_problems_w1) {
+            // Use pre-allocated workspace
+            problem_sizes_device_w1 = reinterpret_cast<cutlass::gemm::GemmCoord*>(workspace->problem_sizes_device_w1);
+            ptr_A_device_w1 = reinterpret_cast<ElementA**>(workspace->ptr_A_device_w1);
+            ptr_B_device_w1 = reinterpret_cast<ElementB**>(workspace->ptr_B_device_w1);
+            ptr_C_device_w1 = reinterpret_cast<ElementOutput**>(workspace->ptr_C_device_w1);
+            ptr_D_device_w1 = reinterpret_cast<ElementOutput**>(workspace->ptr_D_device_w1);
+            lda_device_w1 = reinterpret_cast<int64_t*>(workspace->lda_device_w1);
+            ldb_device_w1 = reinterpret_cast<int64_t*>(workspace->ldb_device_w1);
+            ldc_device_w1 = reinterpret_cast<int64_t*>(workspace->ldc_device_w1);
+            ldd_device_w1 = reinterpret_cast<int64_t*>(workspace->ldd_device_w1);
+        } else if (workspace) {
+            // Workspace too small - grow it
+            if (workspace->problem_sizes_device_w1) {
+                cudaFree(workspace->problem_sizes_device_w1);
+                cudaFree(workspace->ptr_A_device_w1);
+                cudaFree(workspace->ptr_B_device_w1);
+                cudaFree(workspace->ptr_C_device_w1);
+                cudaFree(workspace->ptr_D_device_w1);
+                cudaFree(workspace->lda_device_w1);
+                cudaFree(workspace->ldb_device_w1);
+                cudaFree(workspace->ldc_device_w1);
+                cudaFree(workspace->ldd_device_w1);
+            }
+            CUDA_CHECK(cudaMalloc(&workspace->problem_sizes_device_w1, num_problems_w1 * sizeof(cutlass::gemm::GemmCoord)));
+            CUDA_CHECK(cudaMalloc(&workspace->ptr_A_device_w1, num_problems_w1 * sizeof(ElementA*)));
+            CUDA_CHECK(cudaMalloc(&workspace->ptr_B_device_w1, num_problems_w1 * sizeof(ElementB*)));
+            CUDA_CHECK(cudaMalloc(&workspace->ptr_C_device_w1, num_problems_w1 * sizeof(ElementOutput*)));
+            CUDA_CHECK(cudaMalloc(&workspace->ptr_D_device_w1, num_problems_w1 * sizeof(ElementOutput*)));
+            CUDA_CHECK(cudaMalloc(&workspace->lda_device_w1, num_problems_w1 * sizeof(int64_t)));
+            CUDA_CHECK(cudaMalloc(&workspace->ldb_device_w1, num_problems_w1 * sizeof(int64_t)));
+            CUDA_CHECK(cudaMalloc(&workspace->ldc_device_w1, num_problems_w1 * sizeof(int64_t)));
+            CUDA_CHECK(cudaMalloc(&workspace->ldd_device_w1, num_problems_w1 * sizeof(int64_t)));
+            workspace->descriptor_capacity_w1 = num_problems_w1;
+
+            problem_sizes_device_w1 = reinterpret_cast<cutlass::gemm::GemmCoord*>(workspace->problem_sizes_device_w1);
+            ptr_A_device_w1 = reinterpret_cast<ElementA**>(workspace->ptr_A_device_w1);
+            ptr_B_device_w1 = reinterpret_cast<ElementB**>(workspace->ptr_B_device_w1);
+            ptr_C_device_w1 = reinterpret_cast<ElementOutput**>(workspace->ptr_C_device_w1);
+            ptr_D_device_w1 = reinterpret_cast<ElementOutput**>(workspace->ptr_D_device_w1);
+            lda_device_w1 = reinterpret_cast<int64_t*>(workspace->lda_device_w1);
+            ldb_device_w1 = reinterpret_cast<int64_t*>(workspace->ldb_device_w1);
+            ldc_device_w1 = reinterpret_cast<int64_t*>(workspace->ldc_device_w1);
+            ldd_device_w1 = reinterpret_cast<int64_t*>(workspace->ldd_device_w1);
+        } else {
+            // No workspace - allocate temporary buffers
+            CUDA_CHECK(cudaMalloc(&problem_sizes_device_w1, num_problems_w1 * sizeof(cutlass::gemm::GemmCoord)));
+            CUDA_CHECK(cudaMalloc(&ptr_A_device_w1, num_problems_w1 * sizeof(ElementA*)));
+            CUDA_CHECK(cudaMalloc(&ptr_B_device_w1, num_problems_w1 * sizeof(ElementB*)));
+            CUDA_CHECK(cudaMalloc(&ptr_C_device_w1, num_problems_w1 * sizeof(ElementOutput*)));
+            CUDA_CHECK(cudaMalloc(&ptr_D_device_w1, num_problems_w1 * sizeof(ElementOutput*)));
+            CUDA_CHECK(cudaMalloc(&lda_device_w1, num_problems_w1 * sizeof(int64_t)));
+            CUDA_CHECK(cudaMalloc(&ldb_device_w1, num_problems_w1 * sizeof(int64_t)));
+            CUDA_CHECK(cudaMalloc(&ldc_device_w1, num_problems_w1 * sizeof(int64_t)));
+            CUDA_CHECK(cudaMalloc(&ldd_device_w1, num_problems_w1 * sizeof(int64_t)));
+            owns_w1_descriptors = true;
+        }
 
         // Copy to device
         CUDA_CHECK(cudaMemcpy(problem_sizes_device_w1, problem_sizes_w1.data(),
@@ -351,25 +423,44 @@ void cutlass_grouped_moe_forward(
 
         size_t workspace_size_w1 = gemm_w1.get_workspace_size(args_w1);
         void* workspace_w1 = nullptr;
-        if (workspace_size_w1 > 0) {
+        bool owns_workspace_w1 = false;
+
+        if (workspace && workspace->workspace_w1 && workspace->workspace_w1_size >= workspace_size_w1) {
+            // Use pre-allocated workspace
+            workspace_w1 = workspace->workspace_w1;
+        } else if (workspace && workspace->workspace_w1) {
+            // Workspace too small - grow it
+            cudaFree(workspace->workspace_w1);
+            CUDA_CHECK(cudaMalloc(&workspace->workspace_w1, workspace_size_w1));
+            workspace->workspace_w1_size = workspace_size_w1;
+            workspace_w1 = workspace->workspace_w1;
+        } else if (workspace && workspace_size_w1 > 0) {
+            // Workspace provided but no buffer allocated yet
+            CUDA_CHECK(cudaMalloc(&workspace->workspace_w1, workspace_size_w1));
+            workspace->workspace_w1_size = workspace_size_w1;
+            workspace_w1 = workspace->workspace_w1;
+        } else if (workspace_size_w1 > 0) {
+            // No workspace - allocate temporary buffer
             CUDA_CHECK(cudaMalloc(&workspace_w1, workspace_size_w1));
+            owns_workspace_w1 = true;
         }
 
         CUTLASS_CHECK(gemm_w1.initialize(args_w1, workspace_w1));
         CUTLASS_CHECK(gemm_w1.run());
-        CUDA_CHECK(cudaDeviceSynchronize());
 
-        // Cleanup
-        if (workspace_w1) cudaFree(workspace_w1);
-        cudaFree(problem_sizes_device_w1);
-        cudaFree(ptr_A_device_w1);
-        cudaFree(ptr_B_device_w1);
-        cudaFree(ptr_C_device_w1);
-        cudaFree(ptr_D_device_w1);
-        cudaFree(lda_device_w1);
-        cudaFree(ldb_device_w1);
-        cudaFree(ldc_device_w1);
-        cudaFree(ldd_device_w1);
+        // Cleanup (only if we own the buffers)
+        if (owns_workspace_w1 && workspace_w1) cudaFree(workspace_w1);
+        if (owns_w1_descriptors) {
+            cudaFree(problem_sizes_device_w1);
+            cudaFree(ptr_A_device_w1);
+            cudaFree(ptr_B_device_w1);
+            cudaFree(ptr_C_device_w1);
+            cudaFree(ptr_D_device_w1);
+            cudaFree(lda_device_w1);
+            cudaFree(ldb_device_w1);
+            cudaFree(ldc_device_w1);
+            cudaFree(ldd_device_w1);
+        }
 
         if (log_cutlass) {
             std::cerr << "[LB][MOE_CUTLASS_FUSED] W1 fused GEMM completed (2 kernels → 1)" << std::endl;
@@ -433,17 +524,67 @@ void cutlass_grouped_moe_forward(
         int64_t* ldb_device_w2 = nullptr;
         int64_t* ldc_device_w2 = nullptr;
         int64_t* ldd_device_w2 = nullptr;
+        bool owns_w2_descriptors = false;
 
         size_t num_problems_w2 = problem_sizes_w2.size();
-        CUDA_CHECK(cudaMalloc(&problem_sizes_device_w2, num_problems_w2 * sizeof(cutlass::gemm::GemmCoord)));
-        CUDA_CHECK(cudaMalloc(&ptr_A_device_w2, num_problems_w2 * sizeof(ElementA*)));
-        CUDA_CHECK(cudaMalloc(&ptr_B_device_w2, num_problems_w2 * sizeof(ElementB*)));
-        CUDA_CHECK(cudaMalloc(&ptr_C_device_w2, num_problems_w2 * sizeof(ElementOutput*)));
-        CUDA_CHECK(cudaMalloc(&ptr_D_device_w2, num_problems_w2 * sizeof(ElementOutput*)));
-        CUDA_CHECK(cudaMalloc(&lda_device_w2, num_problems_w2 * sizeof(int64_t)));
-        CUDA_CHECK(cudaMalloc(&ldb_device_w2, num_problems_w2 * sizeof(int64_t)));
-        CUDA_CHECK(cudaMalloc(&ldc_device_w2, num_problems_w2 * sizeof(int64_t)));
-        CUDA_CHECK(cudaMalloc(&ldd_device_w2, num_problems_w2 * sizeof(int64_t)));
+
+        if (workspace && workspace->descriptor_capacity_w2 >= num_problems_w2) {
+            // Use pre-allocated workspace
+            problem_sizes_device_w2 = reinterpret_cast<cutlass::gemm::GemmCoord*>(workspace->problem_sizes_device_w2);
+            ptr_A_device_w2 = reinterpret_cast<ElementA**>(workspace->ptr_A_device_w2);
+            ptr_B_device_w2 = reinterpret_cast<ElementB**>(workspace->ptr_B_device_w2);
+            ptr_C_device_w2 = reinterpret_cast<ElementOutput**>(workspace->ptr_C_device_w2);
+            ptr_D_device_w2 = reinterpret_cast<ElementOutput**>(workspace->ptr_D_device_w2);
+            lda_device_w2 = reinterpret_cast<int64_t*>(workspace->lda_device_w2);
+            ldb_device_w2 = reinterpret_cast<int64_t*>(workspace->ldb_device_w2);
+            ldc_device_w2 = reinterpret_cast<int64_t*>(workspace->ldc_device_w2);
+            ldd_device_w2 = reinterpret_cast<int64_t*>(workspace->ldd_device_w2);
+        } else if (workspace) {
+            // Workspace too small - grow it
+            if (workspace->problem_sizes_device_w2) {
+                cudaFree(workspace->problem_sizes_device_w2);
+                cudaFree(workspace->ptr_A_device_w2);
+                cudaFree(workspace->ptr_B_device_w2);
+                cudaFree(workspace->ptr_C_device_w2);
+                cudaFree(workspace->ptr_D_device_w2);
+                cudaFree(workspace->lda_device_w2);
+                cudaFree(workspace->ldb_device_w2);
+                cudaFree(workspace->ldc_device_w2);
+                cudaFree(workspace->ldd_device_w2);
+            }
+            CUDA_CHECK(cudaMalloc(&workspace->problem_sizes_device_w2, num_problems_w2 * sizeof(cutlass::gemm::GemmCoord)));
+            CUDA_CHECK(cudaMalloc(&workspace->ptr_A_device_w2, num_problems_w2 * sizeof(ElementA*)));
+            CUDA_CHECK(cudaMalloc(&workspace->ptr_B_device_w2, num_problems_w2 * sizeof(ElementB*)));
+            CUDA_CHECK(cudaMalloc(&workspace->ptr_C_device_w2, num_problems_w2 * sizeof(ElementOutput*)));
+            CUDA_CHECK(cudaMalloc(&workspace->ptr_D_device_w2, num_problems_w2 * sizeof(ElementOutput*)));
+            CUDA_CHECK(cudaMalloc(&workspace->lda_device_w2, num_problems_w2 * sizeof(int64_t)));
+            CUDA_CHECK(cudaMalloc(&workspace->ldb_device_w2, num_problems_w2 * sizeof(int64_t)));
+            CUDA_CHECK(cudaMalloc(&workspace->ldc_device_w2, num_problems_w2 * sizeof(int64_t)));
+            CUDA_CHECK(cudaMalloc(&workspace->ldd_device_w2, num_problems_w2 * sizeof(int64_t)));
+            workspace->descriptor_capacity_w2 = num_problems_w2;
+
+            problem_sizes_device_w2 = reinterpret_cast<cutlass::gemm::GemmCoord*>(workspace->problem_sizes_device_w2);
+            ptr_A_device_w2 = reinterpret_cast<ElementA**>(workspace->ptr_A_device_w2);
+            ptr_B_device_w2 = reinterpret_cast<ElementB**>(workspace->ptr_B_device_w2);
+            ptr_C_device_w2 = reinterpret_cast<ElementOutput**>(workspace->ptr_C_device_w2);
+            ptr_D_device_w2 = reinterpret_cast<ElementOutput**>(workspace->ptr_D_device_w2);
+            lda_device_w2 = reinterpret_cast<int64_t*>(workspace->lda_device_w2);
+            ldb_device_w2 = reinterpret_cast<int64_t*>(workspace->ldb_device_w2);
+            ldc_device_w2 = reinterpret_cast<int64_t*>(workspace->ldc_device_w2);
+            ldd_device_w2 = reinterpret_cast<int64_t*>(workspace->ldd_device_w2);
+        } else {
+            // No workspace - allocate temporary buffers
+            CUDA_CHECK(cudaMalloc(&problem_sizes_device_w2, num_problems_w2 * sizeof(cutlass::gemm::GemmCoord)));
+            CUDA_CHECK(cudaMalloc(&ptr_A_device_w2, num_problems_w2 * sizeof(ElementA*)));
+            CUDA_CHECK(cudaMalloc(&ptr_B_device_w2, num_problems_w2 * sizeof(ElementB*)));
+            CUDA_CHECK(cudaMalloc(&ptr_C_device_w2, num_problems_w2 * sizeof(ElementOutput*)));
+            CUDA_CHECK(cudaMalloc(&ptr_D_device_w2, num_problems_w2 * sizeof(ElementOutput*)));
+            CUDA_CHECK(cudaMalloc(&lda_device_w2, num_problems_w2 * sizeof(int64_t)));
+            CUDA_CHECK(cudaMalloc(&ldb_device_w2, num_problems_w2 * sizeof(int64_t)));
+            CUDA_CHECK(cudaMalloc(&ldc_device_w2, num_problems_w2 * sizeof(int64_t)));
+            CUDA_CHECK(cudaMalloc(&ldd_device_w2, num_problems_w2 * sizeof(int64_t)));
+            owns_w2_descriptors = true;
+        }
 
         CUDA_CHECK(cudaMemcpy(problem_sizes_device_w2, problem_sizes_w2.data(),
                               num_problems_w2 * sizeof(cutlass::gemm::GemmCoord), cudaMemcpyHostToDevice));
@@ -487,25 +628,44 @@ void cutlass_grouped_moe_forward(
 
         size_t workspace_size_w2 = gemm_w2.get_workspace_size(args_w2);
         void* workspace_w2 = nullptr;
-        if (workspace_size_w2 > 0) {
+        bool owns_workspace_w2 = false;
+
+        if (workspace && workspace->workspace_w2 && workspace->workspace_w2_size >= workspace_size_w2) {
+            // Use pre-allocated workspace
+            workspace_w2 = workspace->workspace_w2;
+        } else if (workspace && workspace->workspace_w2) {
+            // Workspace too small - grow it
+            cudaFree(workspace->workspace_w2);
+            CUDA_CHECK(cudaMalloc(&workspace->workspace_w2, workspace_size_w2));
+            workspace->workspace_w2_size = workspace_size_w2;
+            workspace_w2 = workspace->workspace_w2;
+        } else if (workspace && workspace_size_w2 > 0) {
+            // Workspace provided but no buffer allocated yet
+            CUDA_CHECK(cudaMalloc(&workspace->workspace_w2, workspace_size_w2));
+            workspace->workspace_w2_size = workspace_size_w2;
+            workspace_w2 = workspace->workspace_w2;
+        } else if (workspace_size_w2 > 0) {
+            // No workspace - allocate temporary buffer
             CUDA_CHECK(cudaMalloc(&workspace_w2, workspace_size_w2));
+            owns_workspace_w2 = true;
         }
 
         CUTLASS_CHECK(gemm_w2.initialize(args_w2, workspace_w2));
         CUTLASS_CHECK(gemm_w2.run());
-        CUDA_CHECK(cudaDeviceSynchronize());
 
-        // Cleanup
-        if (workspace_w2) cudaFree(workspace_w2);
-        cudaFree(problem_sizes_device_w2);
-        cudaFree(ptr_A_device_w2);
-        cudaFree(ptr_B_device_w2);
-        cudaFree(ptr_C_device_w2);
-        cudaFree(ptr_D_device_w2);
-        cudaFree(lda_device_w2);
-        cudaFree(ldb_device_w2);
-        cudaFree(ldc_device_w2);
-        cudaFree(ldd_device_w2);
+        // Cleanup (only if we own the buffers)
+        if (owns_workspace_w2 && workspace_w2) cudaFree(workspace_w2);
+        if (owns_w2_descriptors) {
+            cudaFree(problem_sizes_device_w2);
+            cudaFree(ptr_A_device_w2);
+            cudaFree(ptr_B_device_w2);
+            cudaFree(ptr_C_device_w2);
+            cudaFree(ptr_D_device_w2);
+            cudaFree(lda_device_w2);
+            cudaFree(ldb_device_w2);
+            cudaFree(ldc_device_w2);
+            cudaFree(ldd_device_w2);
+        }
 
         if (log_cutlass) {
             std::cerr << "[LB][MOE_CUTLASS_FUSED] W2 GEMM completed" << std::endl;
@@ -540,10 +700,11 @@ void cutlass_grouped_moe_forward(
         // Fused bias + routing weight kernel (replaces 2 separate kernels)
         fused_bias_routing_kernel<<<blocks, threads>>>(output_ptr, bias_ptr, routing_ptr, M, hidden_dim);
     }
-    CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Cleanup
-    CUDA_CHECK(cudaFree(hidden_buffer));
+    // Cleanup (only if we own the buffer)
+    if (owns_hidden_buffer && hidden_buffer) {
+        CUDA_CHECK(cudaFree(hidden_buffer));
+    }
 
     if (log_cutlass) {
         std::cerr << "[LB][MOE_CUTLASS_FUSED] Fused MoE forward completed:" << std::endl;
@@ -569,7 +730,8 @@ void cutlass_grouped_moe_forward_with_hidden(
     const int64_t* token_offsets,
     int64_t group_count,
     int64_t hidden_dim,
-    int64_t ffn_dim
+    int64_t ffn_dim,
+    MoEWorkspace* workspace
 ) {
     if (group_count == 0) {
         if (LB_MOE_LOG_GEMM()) {
@@ -643,17 +805,67 @@ void cutlass_grouped_moe_forward_with_hidden(
         int64_t* ldb_device_w1 = nullptr;
         int64_t* ldc_device_w1 = nullptr;
         int64_t* ldd_device_w1 = nullptr;
+        bool owns_w1_descriptors = false;
 
         size_t num_problems_w1 = problem_sizes_w1.size();
-        CUDA_CHECK(cudaMalloc(&problem_sizes_device_w1, num_problems_w1 * sizeof(cutlass::gemm::GemmCoord)));
-        CUDA_CHECK(cudaMalloc(&ptr_A_device_w1, num_problems_w1 * sizeof(ElementA*)));
-        CUDA_CHECK(cudaMalloc(&ptr_B_device_w1, num_problems_w1 * sizeof(ElementB*)));
-        CUDA_CHECK(cudaMalloc(&ptr_C_device_w1, num_problems_w1 * sizeof(ElementOutput*)));
-        CUDA_CHECK(cudaMalloc(&ptr_D_device_w1, num_problems_w1 * sizeof(ElementOutput*)));
-        CUDA_CHECK(cudaMalloc(&lda_device_w1, num_problems_w1 * sizeof(int64_t)));
-        CUDA_CHECK(cudaMalloc(&ldb_device_w1, num_problems_w1 * sizeof(int64_t)));
-        CUDA_CHECK(cudaMalloc(&ldc_device_w1, num_problems_w1 * sizeof(int64_t)));
-        CUDA_CHECK(cudaMalloc(&ldd_device_w1, num_problems_w1 * sizeof(int64_t)));
+
+        if (workspace && workspace->descriptor_capacity_w1 >= num_problems_w1) {
+            // Use pre-allocated workspace
+            problem_sizes_device_w1 = reinterpret_cast<cutlass::gemm::GemmCoord*>(workspace->problem_sizes_device_w1);
+            ptr_A_device_w1 = reinterpret_cast<ElementA**>(workspace->ptr_A_device_w1);
+            ptr_B_device_w1 = reinterpret_cast<ElementB**>(workspace->ptr_B_device_w1);
+            ptr_C_device_w1 = reinterpret_cast<ElementOutput**>(workspace->ptr_C_device_w1);
+            ptr_D_device_w1 = reinterpret_cast<ElementOutput**>(workspace->ptr_D_device_w1);
+            lda_device_w1 = reinterpret_cast<int64_t*>(workspace->lda_device_w1);
+            ldb_device_w1 = reinterpret_cast<int64_t*>(workspace->ldb_device_w1);
+            ldc_device_w1 = reinterpret_cast<int64_t*>(workspace->ldc_device_w1);
+            ldd_device_w1 = reinterpret_cast<int64_t*>(workspace->ldd_device_w1);
+        } else if (workspace) {
+            // Workspace too small - grow it
+            if (workspace->problem_sizes_device_w1) {
+                cudaFree(workspace->problem_sizes_device_w1);
+                cudaFree(workspace->ptr_A_device_w1);
+                cudaFree(workspace->ptr_B_device_w1);
+                cudaFree(workspace->ptr_C_device_w1);
+                cudaFree(workspace->ptr_D_device_w1);
+                cudaFree(workspace->lda_device_w1);
+                cudaFree(workspace->ldb_device_w1);
+                cudaFree(workspace->ldc_device_w1);
+                cudaFree(workspace->ldd_device_w1);
+            }
+            CUDA_CHECK(cudaMalloc(&workspace->problem_sizes_device_w1, num_problems_w1 * sizeof(cutlass::gemm::GemmCoord)));
+            CUDA_CHECK(cudaMalloc(&workspace->ptr_A_device_w1, num_problems_w1 * sizeof(ElementA*)));
+            CUDA_CHECK(cudaMalloc(&workspace->ptr_B_device_w1, num_problems_w1 * sizeof(ElementB*)));
+            CUDA_CHECK(cudaMalloc(&workspace->ptr_C_device_w1, num_problems_w1 * sizeof(ElementOutput*)));
+            CUDA_CHECK(cudaMalloc(&workspace->ptr_D_device_w1, num_problems_w1 * sizeof(ElementOutput*)));
+            CUDA_CHECK(cudaMalloc(&workspace->lda_device_w1, num_problems_w1 * sizeof(int64_t)));
+            CUDA_CHECK(cudaMalloc(&workspace->ldb_device_w1, num_problems_w1 * sizeof(int64_t)));
+            CUDA_CHECK(cudaMalloc(&workspace->ldc_device_w1, num_problems_w1 * sizeof(int64_t)));
+            CUDA_CHECK(cudaMalloc(&workspace->ldd_device_w1, num_problems_w1 * sizeof(int64_t)));
+            workspace->descriptor_capacity_w1 = num_problems_w1;
+
+            problem_sizes_device_w1 = reinterpret_cast<cutlass::gemm::GemmCoord*>(workspace->problem_sizes_device_w1);
+            ptr_A_device_w1 = reinterpret_cast<ElementA**>(workspace->ptr_A_device_w1);
+            ptr_B_device_w1 = reinterpret_cast<ElementB**>(workspace->ptr_B_device_w1);
+            ptr_C_device_w1 = reinterpret_cast<ElementOutput**>(workspace->ptr_C_device_w1);
+            ptr_D_device_w1 = reinterpret_cast<ElementOutput**>(workspace->ptr_D_device_w1);
+            lda_device_w1 = reinterpret_cast<int64_t*>(workspace->lda_device_w1);
+            ldb_device_w1 = reinterpret_cast<int64_t*>(workspace->ldb_device_w1);
+            ldc_device_w1 = reinterpret_cast<int64_t*>(workspace->ldc_device_w1);
+            ldd_device_w1 = reinterpret_cast<int64_t*>(workspace->ldd_device_w1);
+        } else {
+            // No workspace - allocate temporary buffers
+            CUDA_CHECK(cudaMalloc(&problem_sizes_device_w1, num_problems_w1 * sizeof(cutlass::gemm::GemmCoord)));
+            CUDA_CHECK(cudaMalloc(&ptr_A_device_w1, num_problems_w1 * sizeof(ElementA*)));
+            CUDA_CHECK(cudaMalloc(&ptr_B_device_w1, num_problems_w1 * sizeof(ElementB*)));
+            CUDA_CHECK(cudaMalloc(&ptr_C_device_w1, num_problems_w1 * sizeof(ElementOutput*)));
+            CUDA_CHECK(cudaMalloc(&ptr_D_device_w1, num_problems_w1 * sizeof(ElementOutput*)));
+            CUDA_CHECK(cudaMalloc(&lda_device_w1, num_problems_w1 * sizeof(int64_t)));
+            CUDA_CHECK(cudaMalloc(&ldb_device_w1, num_problems_w1 * sizeof(int64_t)));
+            CUDA_CHECK(cudaMalloc(&ldc_device_w1, num_problems_w1 * sizeof(int64_t)));
+            CUDA_CHECK(cudaMalloc(&ldd_device_w1, num_problems_w1 * sizeof(int64_t)));
+            owns_w1_descriptors = true;
+        }
 
         // Copy to device
         CUDA_CHECK(cudaMemcpy(problem_sizes_device_w1, problem_sizes_w1.data(),
@@ -700,25 +912,44 @@ void cutlass_grouped_moe_forward_with_hidden(
 
         size_t workspace_size_w1 = gemm_w1.get_workspace_size(args_w1);
         void* workspace_w1 = nullptr;
-        if (workspace_size_w1 > 0) {
+        bool owns_workspace_w1 = false;
+
+        if (workspace && workspace->workspace_w1 && workspace->workspace_w1_size >= workspace_size_w1) {
+            // Use pre-allocated workspace
+            workspace_w1 = workspace->workspace_w1;
+        } else if (workspace && workspace->workspace_w1) {
+            // Workspace too small - grow it
+            cudaFree(workspace->workspace_w1);
+            CUDA_CHECK(cudaMalloc(&workspace->workspace_w1, workspace_size_w1));
+            workspace->workspace_w1_size = workspace_size_w1;
+            workspace_w1 = workspace->workspace_w1;
+        } else if (workspace && workspace_size_w1 > 0) {
+            // Workspace provided but no buffer allocated yet
+            CUDA_CHECK(cudaMalloc(&workspace->workspace_w1, workspace_size_w1));
+            workspace->workspace_w1_size = workspace_size_w1;
+            workspace_w1 = workspace->workspace_w1;
+        } else if (workspace_size_w1 > 0) {
+            // No workspace - allocate temporary buffer
             CUDA_CHECK(cudaMalloc(&workspace_w1, workspace_size_w1));
+            owns_workspace_w1 = true;
         }
 
         CUTLASS_CHECK(gemm_w1.initialize(args_w1, workspace_w1));
         CUTLASS_CHECK(gemm_w1.run());
-        CUDA_CHECK(cudaDeviceSynchronize());
 
-        // Cleanup
-        if (workspace_w1) cudaFree(workspace_w1);
-        cudaFree(problem_sizes_device_w1);
-        cudaFree(ptr_A_device_w1);
-        cudaFree(ptr_B_device_w1);
-        cudaFree(ptr_C_device_w1);
-        cudaFree(ptr_D_device_w1);
-        cudaFree(lda_device_w1);
-        cudaFree(ldb_device_w1);
-        cudaFree(ldc_device_w1);
-        cudaFree(ldd_device_w1);
+        // Cleanup (only if we own the buffers)
+        if (owns_workspace_w1 && workspace_w1) cudaFree(workspace_w1);
+        if (owns_w1_descriptors) {
+            cudaFree(problem_sizes_device_w1);
+            cudaFree(ptr_A_device_w1);
+            cudaFree(ptr_B_device_w1);
+            cudaFree(ptr_C_device_w1);
+            cudaFree(ptr_D_device_w1);
+            cudaFree(lda_device_w1);
+            cudaFree(ldb_device_w1);
+            cudaFree(ldc_device_w1);
+            cudaFree(ldd_device_w1);
+        }
 
         if (log_cutlass) {
             std::cerr << "[LB][MOE_CUTLASS_FUSED] W1 fused GEMM completed" << std::endl;
@@ -770,17 +1001,67 @@ void cutlass_grouped_moe_forward_with_hidden(
         int64_t* ldb_device_w2 = nullptr;
         int64_t* ldc_device_w2 = nullptr;
         int64_t* ldd_device_w2 = nullptr;
+        bool owns_w2_descriptors = false;
 
         size_t num_problems_w2 = problem_sizes_w2.size();
-        CUDA_CHECK(cudaMalloc(&problem_sizes_device_w2, num_problems_w2 * sizeof(cutlass::gemm::GemmCoord)));
-        CUDA_CHECK(cudaMalloc(&ptr_A_device_w2, num_problems_w2 * sizeof(ElementA*)));
-        CUDA_CHECK(cudaMalloc(&ptr_B_device_w2, num_problems_w2 * sizeof(ElementB*)));
-        CUDA_CHECK(cudaMalloc(&ptr_C_device_w2, num_problems_w2 * sizeof(ElementOutput*)));
-        CUDA_CHECK(cudaMalloc(&ptr_D_device_w2, num_problems_w2 * sizeof(ElementOutput*)));
-        CUDA_CHECK(cudaMalloc(&lda_device_w2, num_problems_w2 * sizeof(int64_t)));
-        CUDA_CHECK(cudaMalloc(&ldb_device_w2, num_problems_w2 * sizeof(int64_t)));
-        CUDA_CHECK(cudaMalloc(&ldc_device_w2, num_problems_w2 * sizeof(int64_t)));
-        CUDA_CHECK(cudaMalloc(&ldd_device_w2, num_problems_w2 * sizeof(int64_t)));
+
+        if (workspace && workspace->descriptor_capacity_w2 >= num_problems_w2) {
+            // Use pre-allocated workspace
+            problem_sizes_device_w2 = reinterpret_cast<cutlass::gemm::GemmCoord*>(workspace->problem_sizes_device_w2);
+            ptr_A_device_w2 = reinterpret_cast<ElementA**>(workspace->ptr_A_device_w2);
+            ptr_B_device_w2 = reinterpret_cast<ElementB**>(workspace->ptr_B_device_w2);
+            ptr_C_device_w2 = reinterpret_cast<ElementOutput**>(workspace->ptr_C_device_w2);
+            ptr_D_device_w2 = reinterpret_cast<ElementOutput**>(workspace->ptr_D_device_w2);
+            lda_device_w2 = reinterpret_cast<int64_t*>(workspace->lda_device_w2);
+            ldb_device_w2 = reinterpret_cast<int64_t*>(workspace->ldb_device_w2);
+            ldc_device_w2 = reinterpret_cast<int64_t*>(workspace->ldc_device_w2);
+            ldd_device_w2 = reinterpret_cast<int64_t*>(workspace->ldd_device_w2);
+        } else if (workspace) {
+            // Workspace too small - grow it
+            if (workspace->problem_sizes_device_w2) {
+                cudaFree(workspace->problem_sizes_device_w2);
+                cudaFree(workspace->ptr_A_device_w2);
+                cudaFree(workspace->ptr_B_device_w2);
+                cudaFree(workspace->ptr_C_device_w2);
+                cudaFree(workspace->ptr_D_device_w2);
+                cudaFree(workspace->lda_device_w2);
+                cudaFree(workspace->ldb_device_w2);
+                cudaFree(workspace->ldc_device_w2);
+                cudaFree(workspace->ldd_device_w2);
+            }
+            CUDA_CHECK(cudaMalloc(&workspace->problem_sizes_device_w2, num_problems_w2 * sizeof(cutlass::gemm::GemmCoord)));
+            CUDA_CHECK(cudaMalloc(&workspace->ptr_A_device_w2, num_problems_w2 * sizeof(ElementA*)));
+            CUDA_CHECK(cudaMalloc(&workspace->ptr_B_device_w2, num_problems_w2 * sizeof(ElementB*)));
+            CUDA_CHECK(cudaMalloc(&workspace->ptr_C_device_w2, num_problems_w2 * sizeof(ElementOutput*)));
+            CUDA_CHECK(cudaMalloc(&workspace->ptr_D_device_w2, num_problems_w2 * sizeof(ElementOutput*)));
+            CUDA_CHECK(cudaMalloc(&workspace->lda_device_w2, num_problems_w2 * sizeof(int64_t)));
+            CUDA_CHECK(cudaMalloc(&workspace->ldb_device_w2, num_problems_w2 * sizeof(int64_t)));
+            CUDA_CHECK(cudaMalloc(&workspace->ldc_device_w2, num_problems_w2 * sizeof(int64_t)));
+            CUDA_CHECK(cudaMalloc(&workspace->ldd_device_w2, num_problems_w2 * sizeof(int64_t)));
+            workspace->descriptor_capacity_w2 = num_problems_w2;
+
+            problem_sizes_device_w2 = reinterpret_cast<cutlass::gemm::GemmCoord*>(workspace->problem_sizes_device_w2);
+            ptr_A_device_w2 = reinterpret_cast<ElementA**>(workspace->ptr_A_device_w2);
+            ptr_B_device_w2 = reinterpret_cast<ElementB**>(workspace->ptr_B_device_w2);
+            ptr_C_device_w2 = reinterpret_cast<ElementOutput**>(workspace->ptr_C_device_w2);
+            ptr_D_device_w2 = reinterpret_cast<ElementOutput**>(workspace->ptr_D_device_w2);
+            lda_device_w2 = reinterpret_cast<int64_t*>(workspace->lda_device_w2);
+            ldb_device_w2 = reinterpret_cast<int64_t*>(workspace->ldb_device_w2);
+            ldc_device_w2 = reinterpret_cast<int64_t*>(workspace->ldc_device_w2);
+            ldd_device_w2 = reinterpret_cast<int64_t*>(workspace->ldd_device_w2);
+        } else {
+            // No workspace - allocate temporary buffers
+            CUDA_CHECK(cudaMalloc(&problem_sizes_device_w2, num_problems_w2 * sizeof(cutlass::gemm::GemmCoord)));
+            CUDA_CHECK(cudaMalloc(&ptr_A_device_w2, num_problems_w2 * sizeof(ElementA*)));
+            CUDA_CHECK(cudaMalloc(&ptr_B_device_w2, num_problems_w2 * sizeof(ElementB*)));
+            CUDA_CHECK(cudaMalloc(&ptr_C_device_w2, num_problems_w2 * sizeof(ElementOutput*)));
+            CUDA_CHECK(cudaMalloc(&ptr_D_device_w2, num_problems_w2 * sizeof(ElementOutput*)));
+            CUDA_CHECK(cudaMalloc(&lda_device_w2, num_problems_w2 * sizeof(int64_t)));
+            CUDA_CHECK(cudaMalloc(&ldb_device_w2, num_problems_w2 * sizeof(int64_t)));
+            CUDA_CHECK(cudaMalloc(&ldc_device_w2, num_problems_w2 * sizeof(int64_t)));
+            CUDA_CHECK(cudaMalloc(&ldd_device_w2, num_problems_w2 * sizeof(int64_t)));
+            owns_w2_descriptors = true;
+        }
 
         CUDA_CHECK(cudaMemcpy(problem_sizes_device_w2, problem_sizes_w2.data(),
                               num_problems_w2 * sizeof(cutlass::gemm::GemmCoord), cudaMemcpyHostToDevice));
@@ -823,24 +1104,44 @@ void cutlass_grouped_moe_forward_with_hidden(
 
         size_t workspace_size_w2 = gemm_w2.get_workspace_size(args_w2);
         void* workspace_w2 = nullptr;
-        if (workspace_size_w2 > 0) {
+        bool owns_workspace_w2 = false;
+
+        if (workspace && workspace->workspace_w2 && workspace->workspace_w2_size >= workspace_size_w2) {
+            // Use pre-allocated workspace
+            workspace_w2 = workspace->workspace_w2;
+        } else if (workspace && workspace->workspace_w2) {
+            // Workspace too small - grow it
+            cudaFree(workspace->workspace_w2);
+            CUDA_CHECK(cudaMalloc(&workspace->workspace_w2, workspace_size_w2));
+            workspace->workspace_w2_size = workspace_size_w2;
+            workspace_w2 = workspace->workspace_w2;
+        } else if (workspace && workspace_size_w2 > 0) {
+            // Workspace provided but no buffer allocated yet
+            CUDA_CHECK(cudaMalloc(&workspace->workspace_w2, workspace_size_w2));
+            workspace->workspace_w2_size = workspace_size_w2;
+            workspace_w2 = workspace->workspace_w2;
+        } else if (workspace_size_w2 > 0) {
+            // No workspace - allocate temporary buffer
             CUDA_CHECK(cudaMalloc(&workspace_w2, workspace_size_w2));
+            owns_workspace_w2 = true;
         }
 
         CUTLASS_CHECK(gemm_w2.initialize(args_w2, workspace_w2));
         CUTLASS_CHECK(gemm_w2.run());
-        CUDA_CHECK(cudaDeviceSynchronize());
 
-        if (workspace_w2) cudaFree(workspace_w2);
-        cudaFree(problem_sizes_device_w2);
-        cudaFree(ptr_A_device_w2);
-        cudaFree(ptr_B_device_w2);
-        cudaFree(ptr_C_device_w2);
-        cudaFree(ptr_D_device_w2);
-        cudaFree(lda_device_w2);
-        cudaFree(ldb_device_w2);
-        cudaFree(ldc_device_w2);
-        cudaFree(ldd_device_w2);
+        // Cleanup (only if we own the buffers)
+        if (owns_workspace_w2 && workspace_w2) cudaFree(workspace_w2);
+        if (owns_w2_descriptors) {
+            cudaFree(problem_sizes_device_w2);
+            cudaFree(ptr_A_device_w2);
+            cudaFree(ptr_B_device_w2);
+            cudaFree(ptr_C_device_w2);
+            cudaFree(ptr_D_device_w2);
+            cudaFree(lda_device_w2);
+            cudaFree(ldb_device_w2);
+            cudaFree(ldc_device_w2);
+            cudaFree(ldd_device_w2);
+        }
 
         if (log_cutlass) {
             std::cerr << "[LB][MOE_CUTLASS_FUSED] W2 GEMM completed" << std::endl;
@@ -861,7 +1162,6 @@ void cutlass_grouped_moe_forward_with_hidden(
         int blocks = (total + threads - 1) / threads;
         fused_bias_routing_kernel<<<blocks, threads>>>(output_ptr, bias_ptr, routing_ptr, M, hidden_dim);
     }
-    CUDA_CHECK(cudaDeviceSynchronize());
 
     if (log_cutlass) {
         std::cerr << "[LB][MOE_CUTLASS_FUSED] Fused MoE forward (ext hidden) completed" << std::endl;

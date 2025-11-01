@@ -445,7 +445,8 @@ void grouped_ffn_gemm_forward(
         token_offsets,
         group_count,
         hidden_dim,
-        ffn_dim
+        ffn_dim,
+        nullptr  // No workspace - will allocate temporary buffers
     );
 }
 

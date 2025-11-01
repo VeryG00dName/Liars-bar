@@ -13,9 +13,6 @@
 namespace lb {
 namespace moe {
 
-// Environment variable guards for debug logging
-static bool LB_MOE_LOG_BACKWARD = std::getenv("LB_MOE_LOG_BACKWARD") != nullptr;
-
 /**
  * CUDA kernel: Gỹ[i,j] = Gy[i,j] * r[i]
  *
@@ -92,12 +89,6 @@ void route_scale_backward(
     TORCH_CHECK(grad_y_tilde.is_cuda(), "grad_y_tilde must be CUDA tensor");
     TORCH_CHECK(grad_y_tilde.is_contiguous(), "grad_y_tilde must be contiguous");
 
-    if (LB_MOE_LOG_BACKWARD) {
-        printf("[MoE Backward] route_scale_backward:\n");
-        printf("  total_tokens: %ld, hidden_dim: %ld\n", total_tokens, hidden_dim);
-        printf("  total_elements: %ld\n", total_tokens * hidden_dim);
-    }
-
     // Launch configuration
     int64_t total_elements = total_tokens * hidden_dim;
     const int threads_per_block = 256;
@@ -106,10 +97,6 @@ void route_scale_backward(
     // Cap blocks to avoid excessive grid size
     const int64_t max_blocks = 65535;
     num_blocks = std::min(num_blocks, max_blocks);
-
-    if (LB_MOE_LOG_BACKWARD) {
-        printf("  launch: blocks=%ld, threads=%d\n", num_blocks, threads_per_block);
-    }
 
     // Get raw pointers
     const __half* grad_output_ptr = reinterpret_cast<const __half*>(grad_output.data_ptr<at::Half>());
@@ -132,19 +119,6 @@ void route_scale_backward(
             std::string("route_scale_backward kernel launch failed: ") +
             cudaGetErrorString(err)
         );
-    }
-
-    if (LB_MOE_LOG_BACKWARD) {
-        // Synchronize to catch kernel errors
-        cudaStreamSynchronize(stream);
-        err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            throw std::runtime_error(
-                std::string("route_scale_backward kernel execution failed: ") +
-                cudaGetErrorString(err)
-            );
-        }
-        printf("  route_scale_backward completed successfully\n");
     }
 }
 
@@ -251,12 +225,6 @@ void gelu_backward_kernel(
     TORCH_CHECK(grad_z.is_cuda(), "grad_z must be CUDA tensor");
     TORCH_CHECK(grad_z.is_contiguous(), "grad_z must be contiguous");
 
-    if (LB_MOE_LOG_BACKWARD) {
-        printf("[MoE Backward] gelu_backward_kernel:\n");
-        printf("  total_tokens: %ld, ffn_dim: %ld\n", total_tokens, ffn_dim);
-        printf("  total_elements: %ld\n", total_tokens * ffn_dim);
-    }
-
     // Launch configuration
     int64_t total_elements = total_tokens * ffn_dim;
     const int threads_per_block = 256;
@@ -265,10 +233,6 @@ void gelu_backward_kernel(
     // Cap blocks to avoid excessive grid size
     const int64_t max_blocks = 65535;
     num_blocks = std::min(num_blocks, max_blocks);
-
-    if (LB_MOE_LOG_BACKWARD) {
-        printf("  launch: blocks=%ld, threads=%d\n", num_blocks, threads_per_block);
-    }
 
     // Get raw pointers
     const __half* grad_hidden_ptr = reinterpret_cast<const __half*>(grad_hidden.data_ptr<at::Half>());
@@ -291,19 +255,6 @@ void gelu_backward_kernel(
             std::string("gelu_backward_kernel launch failed: ") +
             cudaGetErrorString(err)
         );
-    }
-
-    if (LB_MOE_LOG_BACKWARD) {
-        // Synchronize to catch kernel errors
-        cudaStreamSynchronize(stream);
-        err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            throw std::runtime_error(
-                std::string("gelu_backward_kernel execution failed: ") +
-                cudaGetErrorString(err)
-            );
-        }
-        printf("  gelu_backward_kernel completed successfully\n");
     }
 }
 
@@ -380,11 +331,6 @@ void bias_reduction_kernel(
     TORCH_CHECK(grad_bias.is_cuda(), "grad_bias must be CUDA tensor");
     TORCH_CHECK(grad_bias.is_contiguous(), "grad_bias must be contiguous");
 
-    if (LB_MOE_LOG_BACKWARD) {
-        printf("[MoE Backward] bias_reduction_kernel:\n");
-        printf("  total_tokens: %ld, feature_dim: %ld\n", total_tokens, feature_dim);
-    }
-
     // Launch configuration
     // One block per feature dimension, threads reduce over tokens
     const int threads_per_block = 256;
@@ -392,11 +338,6 @@ void bias_reduction_kernel(
 
     // Shared memory size
     size_t shared_mem_bytes = threads_per_block * sizeof(float);
-
-    if (LB_MOE_LOG_BACKWARD) {
-        printf("  launch: blocks=%ld, threads=%d, shared_mem=%zu bytes\n",
-               num_blocks, threads_per_block, shared_mem_bytes);
-    }
 
     // Get raw pointers
     const __half* grad_ptr = reinterpret_cast<const __half*>(grad.data_ptr<at::Half>());
@@ -417,19 +358,6 @@ void bias_reduction_kernel(
             std::string("bias_reduction_kernel launch failed: ") +
             cudaGetErrorString(err)
         );
-    }
-
-    if (LB_MOE_LOG_BACKWARD) {
-        // Synchronize to catch kernel errors
-        cudaStreamSynchronize(stream);
-        err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            throw std::runtime_error(
-                std::string("bias_reduction_kernel execution failed: ") +
-                cudaGetErrorString(err)
-            );
-        }
-        printf("  bias_reduction_kernel completed successfully\n");
     }
 }
 
@@ -504,12 +432,6 @@ void scatter_add_backward(
     TORCH_CHECK(grad_x_original.is_cuda(), "grad_x_original must be CUDA tensor");
     TORCH_CHECK(grad_x_original.is_contiguous(), "grad_x_original must be contiguous");
 
-    if (LB_MOE_LOG_BACKWARD) {
-        printf("[MoE Backward] scatter_add_backward:\n");
-        printf("  total_tokens: %ld, hidden_dim: %ld\n", total_tokens, hidden_dim);
-        printf("  batch_size: %ld\n", grad_x_original.size(0));
-    }
-
     // Launch configuration
     int64_t total_elements = total_tokens * hidden_dim;
     const int threads_per_block = 256;
@@ -518,10 +440,6 @@ void scatter_add_backward(
     // Cap blocks to avoid excessive grid size
     const int64_t max_blocks = 65535;
     num_blocks = std::min(num_blocks, max_blocks);
-
-    if (LB_MOE_LOG_BACKWARD) {
-        printf("  launch: blocks=%ld, threads=%d\n", num_blocks, threads_per_block);
-    }
 
     // Get raw pointers
     const __half* grad_x_grouped_ptr = reinterpret_cast<const __half*>(grad_x_grouped.data_ptr<at::Half>());
@@ -544,19 +462,6 @@ void scatter_add_backward(
             std::string("scatter_add_backward kernel launch failed: ") +
             cudaGetErrorString(err)
         );
-    }
-
-    if (LB_MOE_LOG_BACKWARD) {
-        // Synchronize to catch kernel errors
-        cudaStreamSynchronize(stream);
-        err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            throw std::runtime_error(
-                std::string("scatter_add_backward kernel execution failed: ") +
-                cudaGetErrorString(err)
-            );
-        }
-        printf("  scatter_add_backward completed successfully\n");
     }
 }
 
@@ -598,13 +503,8 @@ void cutlass_grouped_moe_backward(
 ) {
     const int64_t group_count = m_sizes.size();
     if (group_count == 0) {
-        if (LB_MOE_LOG_BACKWARD) {
-            printf("[MoE Backward] No groups to process\n");
-        }
         return;
     }
-
-    const bool log_backward = LB_MOE_LOG_BACKWARD;
 
     // Extract dimensions
     const int64_t total_tokens_grouped = input_grouped.size(0);
@@ -613,15 +513,6 @@ void cutlass_grouped_moe_backward(
     const int64_t batch_size = grad_output.size(0);
     const int64_t num_policies = w1_weights.size(0);
     const int64_t num_experts = w1_weights.size(1);
-
-    if (log_backward) {
-        printf("[MoE Backward] Starting backward pass:\n");
-        printf("  group_count: %ld\n", group_count);
-        printf("  total_tokens_grouped: %ld\n", total_tokens_grouped);
-        printf("  hidden_dim: %ld, ffn_dim: %ld\n", hidden_dim, ffn_dim);
-        printf("  batch_size: %ld\n", batch_size);
-        printf("  num_policies: %ld, num_experts: %ld\n", num_policies, num_experts);
-    }
 
     // Get CUDA stream
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -649,10 +540,6 @@ void cutlass_grouped_moe_backward(
 
     // Initialize grad_input to zero (for scatter-add accumulation)
     grad_input.zero_();
-
-    if (log_backward) {
-        printf("  Allocated intermediate buffers\n");
-    }
 
     // ========================================================================
     // Build compact per-group arrays (skip empty groups) and pointer arrays
@@ -732,17 +619,9 @@ void cutlass_grouped_moe_backward(
         grad_b2_ptrs.push_back(grad_b2_ptr);
     }
 
-    if (log_backward) {
-        printf("  Built pointer arrays for %zu non-empty groups\n", input_ptrs.size());
-    }
-
     // ========================================================================
     // Step 1: Route-scale kernel (Gỹ = Gy ⊙ r)
     // ========================================================================
-
-    if (log_backward) {
-        printf("  [Step 1] Route-scale: Gỹ = Gy ⊙ r\n");
-    }
 
     route_scale_backward(
         grad_output,
@@ -758,10 +637,6 @@ void cutlass_grouped_moe_backward(
     // ========================================================================
     // Step 2: dW2 GEMM + db2 reduction
     // ========================================================================
-
-    if (log_backward) {
-        printf("  [Step 2] dW2 = Gỹᵀ @ H, db2 = sum(Gỹ)\n");
-    }
 
     // GEMM: dW2 = Gỹᵀ @ H
     lb::moe::cutlass_grouped_gemm_dW2(
@@ -800,10 +675,6 @@ void cutlass_grouped_moe_backward(
     // Step 3: dH GEMM (dH = Gỹ @ W2)
     // ========================================================================
 
-    if (log_backward) {
-        printf("  [Step 3] dH = Gỹ @ W2\n");
-    }
-
     lb::moe::cutlass_grouped_gemm_dH(
         grad_y_tilde_ptrs.data(),
         w2_ptrs.data(),
@@ -820,10 +691,6 @@ void cutlass_grouped_moe_backward(
     // Step 4: Recompute Z (Z = X @ W1ᵀ + b1)
     // ========================================================================
 
-    if (log_backward) {
-        printf("  [Step 4] Recompute Z = X @ W1ᵀ + b1\n");
-    }
-
     lb::moe::cutlass_grouped_gemm_recompute_Z(
         input_ptrs.data(),
         w1_ptrs.data(),
@@ -839,10 +706,6 @@ void cutlass_grouped_moe_backward(
     // Step 5: GELU' kernel (dZ = dH ⊙ GELU'(Z))
     // ========================================================================
 
-    if (log_backward) {
-        printf("  [Step 5] dZ = dH ⊙ GELU'(Z)\n");
-    }
-
     gelu_backward_kernel(
         grad_hidden,
         z_recomputed,
@@ -857,10 +720,6 @@ void cutlass_grouped_moe_backward(
     // ========================================================================
     // Step 6: dW1 GEMM + db1 reduction
     // ========================================================================
-
-    if (log_backward) {
-        printf("  [Step 6] dW1 = dZᵀ @ X, db1 = sum(dZ)\n");
-    }
 
     // GEMM: dW1 = dZᵀ @ X
     lb::moe::cutlass_grouped_gemm_dW1(
@@ -899,10 +758,6 @@ void cutlass_grouped_moe_backward(
     // Step 7: dX GEMM (dX_grouped = dZ @ W1)
     // ========================================================================
 
-    if (log_backward) {
-        printf("  [Step 7] dX_grouped = dZ @ W1\n");
-    }
-
     lb::moe::cutlass_grouped_gemm_dX(
         grad_z_ptrs.data(),
         w1_ptrs.data(),
@@ -919,28 +774,11 @@ void cutlass_grouped_moe_backward(
     // Step 8: Return dInput in grouped order
     // ========================================================================
 
-    if (log_backward) {
-        printf("  [Step 8] dX (grouped) passthrough to autograd\n");
-    }
-
     // Autograd of the prior index_select will scatter-add from grouped order
     // into the original token order. We must return dX in grouped order here.
     grad_input.copy_(grad_x_grouped);
     // Safety clamp to finite FP16 (unconditional)
     clamp_half_inplace(grad_input, stream);
-
-    // ========================================================================
-    // Final synchronization (debug only)
-    // ========================================================================
-
-    static bool LB_MOE_SYNC = std::getenv("LB_MOE_SYNC") != nullptr;
-    if (LB_MOE_SYNC) {
-        cudaStreamSynchronize(stream);
-    }
-
-    if (log_backward) {
-        printf("[MoE Backward] Backward pass completed successfully\n");
-    }
 }
 
 } // namespace moe

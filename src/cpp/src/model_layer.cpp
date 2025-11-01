@@ -202,7 +202,8 @@ transformer_layer(
     const torch::Tensor& norm2_bias,
     int64_t num_heads,
     int64_t hidden_dim,
-    int64_t top_k) {
+    int64_t top_k,
+    lb::moe::MoEWorkspace* workspace) {
 
     const int64_t B = x.size(0);
     const int64_t T = x.size(1);
@@ -289,7 +290,7 @@ transformer_layer(
         b1_all.to(torch::kFloat16), b2_all.to(torch::kFloat16),
         sorted_routing_weights, sorted_token_indices,
         m_sizes_cpu, policy_ids_cpu, expert_ids_cpu, token_offsets_cpu,
-        hidden_dim, w1_all.size(-2));
+        hidden_dim, w1_all.size(-2), workspace);
 
     auto moe_output_flat = torch::zeros({num_tokens, hidden_dim}, expert_outputs.options());
     moe_output_flat.index_add_(0, sorted_token_indices, expert_outputs);

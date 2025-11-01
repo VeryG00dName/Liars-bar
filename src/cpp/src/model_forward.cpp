@@ -1,6 +1,8 @@
 #include "model_forward.h"
 #include "model_layer.h"
 #include "model_autograd.h"
+#include "moe_cutlass_kernels.h"  // For lb::moe::MoEWorkspace
+#include <cuda_runtime.h>
 #include "lb_kernels.h"
 #include "moe_autograd_function.h"
 
@@ -278,6 +280,105 @@ struct TransformerLayerCheckpointFunction
 namespace lb {
 namespace forward {
 
+namespace {
+// Thread-local workspace cache for direct forward_packed callers (e.g., profiling scripts)
+thread_local bool g_tls_workspace_enabled = false;
+thread_local std::vector<lb::moe::MoEWorkspace> g_tls_workspaces;
+
+inline void free_workspace(lb::moe::MoEWorkspace& ws) {
+    if (ws.hidden_buffer) { cudaFree(ws.hidden_buffer); ws.hidden_buffer = nullptr; ws.hidden_buffer_size = 0; }
+    if (ws.workspace_w1) { cudaFree(ws.workspace_w1); ws.workspace_w1 = nullptr; ws.workspace_w1_size = 0; }
+    if (ws.workspace_w2) { cudaFree(ws.workspace_w2); ws.workspace_w2 = nullptr; ws.workspace_w2_size = 0; }
+
+    if (ws.problem_sizes_device_w1) { cudaFree(ws.problem_sizes_device_w1); ws.problem_sizes_device_w1 = nullptr; }
+    if (ws.ptr_A_device_w1) { cudaFree(ws.ptr_A_device_w1); ws.ptr_A_device_w1 = nullptr; }
+    if (ws.ptr_B_device_w1) { cudaFree(ws.ptr_B_device_w1); ws.ptr_B_device_w1 = nullptr; }
+    if (ws.ptr_C_device_w1) { cudaFree(ws.ptr_C_device_w1); ws.ptr_C_device_w1 = nullptr; }
+    if (ws.ptr_D_device_w1) { cudaFree(ws.ptr_D_device_w1); ws.ptr_D_device_w1 = nullptr; }
+    if (ws.lda_device_w1) { cudaFree(ws.lda_device_w1); ws.lda_device_w1 = nullptr; }
+    if (ws.ldb_device_w1) { cudaFree(ws.ldb_device_w1); ws.ldb_device_w1 = nullptr; }
+    if (ws.ldc_device_w1) { cudaFree(ws.ldc_device_w1); ws.ldc_device_w1 = nullptr; }
+    if (ws.ldd_device_w1) { cudaFree(ws.ldd_device_w1); ws.ldd_device_w1 = nullptr; }
+    ws.descriptor_capacity_w1 = 0;
+
+    if (ws.problem_sizes_device_w2) { cudaFree(ws.problem_sizes_device_w2); ws.problem_sizes_device_w2 = nullptr; }
+    if (ws.ptr_A_device_w2) { cudaFree(ws.ptr_A_device_w2); ws.ptr_A_device_w2 = nullptr; }
+    if (ws.ptr_B_device_w2) { cudaFree(ws.ptr_B_device_w2); ws.ptr_B_device_w2 = nullptr; }
+    if (ws.ptr_C_device_w2) { cudaFree(ws.ptr_C_device_w2); ws.ptr_C_device_w2 = nullptr; }
+    if (ws.ptr_D_device_w2) { cudaFree(ws.ptr_D_device_w2); ws.ptr_D_device_w2 = nullptr; }
+    if (ws.lda_device_w2) { cudaFree(ws.lda_device_w2); ws.lda_device_w2 = nullptr; }
+    if (ws.ldb_device_w2) { cudaFree(ws.ldb_device_w2); ws.ldb_device_w2 = nullptr; }
+    if (ws.ldc_device_w2) { cudaFree(ws.ldc_device_w2); ws.ldc_device_w2 = nullptr; }
+    if (ws.ldd_device_w2) { cudaFree(ws.ldd_device_w2); ws.ldd_device_w2 = nullptr; }
+    ws.descriptor_capacity_w2 = 0;
+}
+} // anonymous namespace
+
+void enable_forward_workspace_cache(
+    int64_t num_layers,
+    int64_t max_batch_size,
+    int64_t max_seq_length,
+    int64_t hidden_dim,
+    int64_t top_k) {
+    // Clean any existing cache first
+    if (!g_tls_workspaces.empty()) {
+        for (auto& ws : g_tls_workspaces) free_workspace(ws);
+        g_tls_workspaces.clear();
+    }
+
+    g_tls_workspaces.resize(num_layers);
+    const int64_t max_tokens = max_batch_size * max_seq_length;
+    const int64_t max_groups = max_tokens * top_k;
+    const int64_t ffn_dim = hidden_dim * 2; // typical expansion ratio
+
+    for (int64_t layer = 0; layer < num_layers; ++layer) {
+        auto& ws = g_tls_workspaces[layer];
+
+        // Hidden buffer
+        ws.hidden_buffer_size = static_cast<size_t>(max_tokens) * static_cast<size_t>(ffn_dim) * sizeof(uint16_t);
+        cudaMalloc(&ws.hidden_buffer, ws.hidden_buffer_size);
+
+        // CUTLASS workspaces
+        ws.workspace_w1_size = 4 * 1024 * 1024;
+        cudaMalloc(&ws.workspace_w1, ws.workspace_w1_size);
+        ws.workspace_w2_size = 4 * 1024 * 1024;
+        cudaMalloc(&ws.workspace_w2, ws.workspace_w2_size);
+
+        // Problem descriptors (capacity per GEMM group)
+        ws.descriptor_capacity_w1 = max_groups;
+        cudaMalloc(&ws.problem_sizes_device_w1, max_groups * sizeof(int) * 3);  // GemmCoord (M,N,K)
+        cudaMalloc(&ws.ptr_A_device_w1, max_groups * sizeof(void*));
+        cudaMalloc(&ws.ptr_B_device_w1, max_groups * sizeof(void*));
+        cudaMalloc(&ws.ptr_C_device_w1, max_groups * sizeof(void*));
+        cudaMalloc(&ws.ptr_D_device_w1, max_groups * sizeof(void*));
+        cudaMalloc(&ws.lda_device_w1, max_groups * sizeof(int64_t));
+        cudaMalloc(&ws.ldb_device_w1, max_groups * sizeof(int64_t));
+        cudaMalloc(&ws.ldc_device_w1, max_groups * sizeof(int64_t));
+        cudaMalloc(&ws.ldd_device_w1, max_groups * sizeof(int64_t));
+
+        ws.descriptor_capacity_w2 = max_groups;
+        cudaMalloc(&ws.problem_sizes_device_w2, max_groups * sizeof(int) * 3);
+        cudaMalloc(&ws.ptr_A_device_w2, max_groups * sizeof(void*));
+        cudaMalloc(&ws.ptr_B_device_w2, max_groups * sizeof(void*));
+        cudaMalloc(&ws.ptr_C_device_w2, max_groups * sizeof(void*));
+        cudaMalloc(&ws.ptr_D_device_w2, max_groups * sizeof(void*));
+        cudaMalloc(&ws.lda_device_w2, max_groups * sizeof(int64_t));
+        cudaMalloc(&ws.ldb_device_w2, max_groups * sizeof(int64_t));
+        cudaMalloc(&ws.ldc_device_w2, max_groups * sizeof(int64_t));
+        cudaMalloc(&ws.ldd_device_w2, max_groups * sizeof(int64_t));
+    }
+
+    g_tls_workspace_enabled = true;
+}
+
+void disable_forward_workspace_cache() {
+    for (auto& ws : g_tls_workspaces) {
+        free_workspace(ws);
+    }
+    g_tls_workspaces.clear();
+    g_tls_workspace_enabled = false;
+}
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 forward_packed(
     const torch::Tensor& obs_sequence,
@@ -294,7 +395,8 @@ forward_packed(
     int64_t top_k,
     int64_t count_pad,
     int64_t tflag_pad,
-    std::unordered_map<std::string, std::chrono::microseconds>* timers) {
+    std::unordered_map<std::string, std::chrono::microseconds>* timers,
+    const lb::moe::MoEWorkspace* moe_workspaces) {
 
     using Microseconds = std::chrono::microseconds;
     std::unordered_map<std::string, Microseconds> dummy_timers;
@@ -323,6 +425,14 @@ forward_packed(
     torch::Tensor last_topk_idx, last_topk_scores;
     for (int64_t i = 0; i < num_layers; ++i) {
         std::string prefix = "transformer.layers." + std::to_string(i);
+        // Select per-layer workspace if provided
+        lb::moe::MoEWorkspace* ws_ptr = nullptr;
+        if (moe_workspaces) {
+            // Pointer is assumed to reference an array of length >= num_layers
+            ws_ptr = const_cast<lb::moe::MoEWorkspace*>(moe_workspaces + i);
+        } else if (g_tls_workspace_enabled && i < static_cast<int64_t>(g_tls_workspaces.size())) {
+            ws_ptr = &g_tls_workspaces[i];
+        }
         auto [x_next, gate_logits, topk_indices, topk_scores] = lb::model::transformer_layer(
             x, pol,
             get_weight(batched_weights, prefix + ".self_attn.in_proj_weight"),
@@ -339,7 +449,8 @@ forward_packed(
             get_weight(batched_weights, prefix + ".moe.experts.b2"),
             get_weight(batched_weights, prefix + ".norm2.weight"),
             get_weight(batched_weights, prefix + ".norm2.bias"),
-            num_heads, hidden_dim, top_k);
+            num_heads, hidden_dim, top_k,
+            ws_ptr);
         x = x_next;
         last_topk_idx = topk_indices;
         last_topk_scores = topk_scores;

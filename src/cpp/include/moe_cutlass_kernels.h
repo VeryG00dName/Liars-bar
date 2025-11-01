@@ -7,6 +7,45 @@ namespace lb {
 namespace moe {
 
 /**
+ * Workspace buffers for CUTLASS grouped MoE operations.
+ * Pre-allocate once and reuse to avoid malloc/free overhead.
+ */
+struct MoEWorkspace {
+    void* hidden_buffer = nullptr;
+    size_t hidden_buffer_size = 0;
+
+    void* workspace_w1 = nullptr;
+    size_t workspace_w1_size = 0;
+
+    void* workspace_w2 = nullptr;
+    size_t workspace_w2_size = 0;
+
+    // Problem descriptor buffers for W1
+    void* problem_sizes_device_w1 = nullptr;
+    void* ptr_A_device_w1 = nullptr;
+    void* ptr_B_device_w1 = nullptr;
+    void* ptr_C_device_w1 = nullptr;
+    void* ptr_D_device_w1 = nullptr;
+    void* lda_device_w1 = nullptr;
+    void* ldb_device_w1 = nullptr;
+    void* ldc_device_w1 = nullptr;
+    void* ldd_device_w1 = nullptr;
+    size_t descriptor_capacity_w1 = 0;
+
+    // Problem descriptor buffers for W2
+    void* problem_sizes_device_w2 = nullptr;
+    void* ptr_A_device_w2 = nullptr;
+    void* ptr_B_device_w2 = nullptr;
+    void* ptr_C_device_w2 = nullptr;
+    void* ptr_D_device_w2 = nullptr;
+    void* lda_device_w2 = nullptr;
+    void* ldb_device_w2 = nullptr;
+    void* ldc_device_w2 = nullptr;
+    void* ldd_device_w2 = nullptr;
+    size_t descriptor_capacity_w2 = 0;
+};
+
+/**
  * Performs grouped MoE FFN forward pass using CUTLASS Grouped GEMM.
  *
  * Single kernel launch handles all expert groups concurrently using persistent CTAs.
@@ -47,7 +86,8 @@ void cutlass_grouped_moe_forward(
     const int64_t* token_offsets,
     int64_t group_count,
     int64_t hidden_dim,
-    int64_t ffn_dim
+    int64_t ffn_dim,
+    MoEWorkspace* workspace = nullptr  // Optional pre-allocated workspace
 );
 
 /**
@@ -70,7 +110,8 @@ void cutlass_grouped_moe_forward_with_hidden(
     const int64_t* token_offsets,
     int64_t group_count,
     int64_t hidden_dim,
-    int64_t ffn_dim
+    int64_t ffn_dim,
+    MoEWorkspace* workspace = nullptr  // Optional pre-allocated workspace
 );
 
 } // namespace moe

@@ -80,6 +80,22 @@ void bind_reactive_model(py::module_& m) {
         py::arg("count_pad") = 4, py::arg("tflag_pad") = 3,
         "Training forward pass with autograd and routing info.");
 
+    // Optional: enable/disable thread-local workspace cache for forward_packed
+    m.def(
+        "enable_forward_moe_workspace_cache",
+        [](int64_t num_layers, int64_t max_batch_size, int64_t max_seq_length, int64_t hidden_dim, int64_t top_k) {
+            lb::forward::enable_forward_workspace_cache(num_layers, max_batch_size, max_seq_length, hidden_dim, top_k);
+        },
+        py::arg("num_layers"), py::arg("max_batch_size"), py::arg("max_seq_length"), py::arg("hidden_dim"), py::arg("top_k"),
+        "Enable thread-local MoE workspace cache for C++ forward_packed.");
+
+    m.def(
+        "disable_forward_moe_workspace_cache",
+        []() {
+            lb::forward::disable_forward_workspace_cache();
+        },
+        "Disable and free the thread-local MoE workspace cache.");
+
     // Expose layer/diagnostic functions for testing
     m.def("action_decomposition",
         [](const torch::Tensor& action_sequence, py::dict weights_py, const torch::Tensor& policy_indices,
