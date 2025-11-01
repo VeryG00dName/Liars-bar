@@ -16,6 +16,10 @@ struct GroupedMoEAutograd : public torch::autograd::Function<GroupedMoEAutograd>
         const torch::Tensor& w2_weights,
         const torch::Tensor& b1_biases,
         const torch::Tensor& b2_biases,
+        const torch::Tensor& w1_ptrs_table,
+        const torch::Tensor& w2_ptrs_table,
+        const torch::Tensor& b1_ptrs_table,
+        const torch::Tensor& b2_ptrs_table,
         const torch::Tensor& routing_weights_grouped,
         const torch::Tensor& indices_grouped,
         const torch::Tensor& m_sizes_cpu,
@@ -47,56 +51,76 @@ struct GroupedMoEAutograd : public torch::autograd::Function<GroupedMoEAutograd>
         torch::Tensor hidden_grouped = torch::empty({total_tokens, ffn_dim}, opts_half);
         torch::Tensor output_grouped = torch::empty({total_tokens, hidden_dim}, opts_half);
 
-        // Build pointer arrays for CUTLASS forward
-        std::vector<uintptr_t> input_ptrs(group_count);
-        std::vector<uintptr_t> hidden_ptrs(group_count);
-        std::vector<uintptr_t> output_ptrs(group_count);
-        std::vector<uintptr_t> routing_ptrs(group_count);
-        std::vector<uintptr_t> w1_ptrs(group_count), w2_ptrs(group_count), b1_ptrs(group_count), b2_ptrs(group_count);
+        // Device-only path: build metadata on device, no host descriptor staging
 
-        const uintptr_t input_base = reinterpret_cast<uintptr_t>(input_grouped.data_ptr<at::Half>());
-        const uintptr_t hidden_base = reinterpret_cast<uintptr_t>(hidden_grouped.data_ptr<at::Half>());
-        const uintptr_t output_base = reinterpret_cast<uintptr_t>(output_grouped.data_ptr<at::Half>());
-        const uintptr_t routing_base = reinterpret_cast<uintptr_t>(routing_weights_grouped.data_ptr<float>());
+        // Build device-side group metadata
+        auto device = input_grouped.device();
+        auto m_sizes_dev = m_sizes.to(device).contiguous();
+        auto policy_ids_dev = policy_ids.to(device).contiguous();
+        auto expert_ids_dev = expert_ids.to(device).contiguous();
+        auto token_offsets_dev = token_offsets.to(device).contiguous();
 
-        auto m_ptr = m_sizes.data_ptr<int64_t>();
-        auto pi_ptr = policy_ids.data_ptr<int64_t>();
-        auto ei_ptr = expert_ids.data_ptr<int64_t>();
-        auto off_ptr = token_offsets.data_ptr<int64_t>();
+        // Base pointers
+        auto input_base = reinterpret_cast<uintptr_t>(input_grouped.data_ptr<at::Half>());
+        auto hidden_base = reinterpret_cast<uintptr_t>(hidden_grouped.data_ptr<at::Half>());
+        auto output_base = reinterpret_cast<uintptr_t>(output_grouped.data_ptr<at::Half>());
+        auto routing_base = reinterpret_cast<uintptr_t>(routing_weights_grouped.data_ptr<float>());
 
-        for (int64_t g = 0; g < group_count; ++g) {
-            int64_t M = m_ptr[g];
-            int64_t offset = off_ptr[g];
-            int64_t pi = pi_ptr[g];
-            int64_t ei = ei_ptr[g];
-            input_ptrs[g]  = input_base  + static_cast<uintptr_t>(offset) * hidden_dim * sizeof(at::Half);
-            hidden_ptrs[g] = hidden_base + static_cast<uintptr_t>(offset) * ffn_dim   * sizeof(at::Half);
-            output_ptrs[g] = output_base + static_cast<uintptr_t>(offset) * hidden_dim * sizeof(at::Half);
-            routing_ptrs[g]= routing_base+ static_cast<uintptr_t>(offset) * sizeof(float);
-            w1_ptrs[g] = reinterpret_cast<uintptr_t>(w1_weights.index({pi, ei}).data_ptr<at::Half>());
-            w2_ptrs[g] = reinterpret_cast<uintptr_t>(w2_weights.index({pi, ei}).data_ptr<at::Half>());
-            b1_ptrs[g] = reinterpret_cast<uintptr_t>(b1_biases.index({pi, ei}).data_ptr<at::Half>());
-            b2_ptrs[g] = reinterpret_cast<uintptr_t>(b2_biases.index({pi, ei}).data_ptr<at::Half>());
-        }
+        // Pointer tables: use provided CUDA tables if defined; otherwise build from stacked weights
+        auto build_ptr_table = [&](const torch::Tensor& stacked) -> torch::Tensor {
+            TORCH_CHECK(stacked.is_cuda(), "Stacked expert weights must be CUDA tensors");
+            TORCH_CHECK(stacked.dim() >= 2, "Stacked expert weights must be at least 2D");
+            const int64_t P = stacked.size(0);
+            const int64_t E = stacked.size(1);
+            auto tbl_cpu = torch::empty({P, E}, torch::dtype(torch::kUInt64).device(torch::kCPU));
+            auto acc = tbl_cpu.accessor<uint64_t, 2>();
+            for (int64_t p = 0; p < P; ++p) {
+                for (int64_t e = 0; e < E; ++e) {
+                    auto slice = stacked.index({p, e});
+                    acc[p][e] = reinterpret_cast<uint64_t>(slice.data_ptr());
+                }
+            }
+            return tbl_cpu.to(stacked.device());
+        };
 
-        // Fused CUTLASS forward that also writes hidden_grouped
-        cutlass_grouped_moe_forward_with_hidden(
-            input_ptrs.data(),
-            w1_ptrs.data(),
-            b1_ptrs.data(),
-            w2_ptrs.data(),
-            b2_ptrs.data(),
-            hidden_ptrs.data(),
-            output_ptrs.data(),
-            routing_ptrs.data(),
-            m_ptr,
-            pi_ptr,
-            ei_ptr,
-            off_ptr,
+        torch::Tensor w1_tbl = (w1_ptrs_table.defined() && w1_ptrs_table.numel() > 0)
+                                    ? w1_ptrs_table
+                                    : build_ptr_table(w1_weights);
+        torch::Tensor w2_tbl = (w2_ptrs_table.defined() && w2_ptrs_table.numel() > 0)
+                                    ? w2_ptrs_table
+                                    : build_ptr_table(w2_weights);
+        torch::Tensor b1_tbl = (b1_ptrs_table.defined() && b1_ptrs_table.numel() > 0)
+                                    ? b1_ptrs_table
+                                    : build_ptr_table(b1_biases);
+        torch::Tensor b2_tbl = (b2_ptrs_table.defined() && b2_ptrs_table.numel() > 0)
+                                    ? b2_ptrs_table
+                                    : build_ptr_table(b2_biases);
+
+        TORCH_CHECK(w1_tbl.is_cuda() && w2_tbl.is_cuda() && b1_tbl.is_cuda() && b2_tbl.is_cuda(),
+                    "Pointer tables must be CUDA tensors");
+        TORCH_CHECK(w1_tbl.scalar_type() == torch::kUInt64 && w2_tbl.scalar_type() == torch::kUInt64,
+                    "Pointer tables must be UInt64");
+        TORCH_CHECK(b1_tbl.scalar_type() == torch::kUInt64 && b2_tbl.scalar_type() == torch::kUInt64,
+                    "Pointer tables must be UInt64");
+
+        int64_t num_policies = w1_tbl.size(0);
+        int64_t num_experts_tbl = w1_tbl.size(1);
+
+        cutlass_grouped_moe_forward_with_hidden_device(
+            input_base, hidden_base, output_base, routing_base,
+            w1_tbl.data_ptr<uint64_t>(),
+            w2_tbl.data_ptr<uint64_t>(),
+            b1_tbl.data_ptr<uint64_t>(),
+            b2_tbl.data_ptr<uint64_t>(),
+            num_policies, num_experts_tbl,
+            m_sizes_dev.data_ptr<int64_t>(),
+            policy_ids_dev.data_ptr<int64_t>(),
+            expert_ids_dev.data_ptr<int64_t>(),
+            token_offsets_dev.data_ptr<int64_t>(),
             group_count,
             hidden_dim,
             ffn_dim,
-            workspace  // Optional pre-allocated workspace from orchestrator
+            workspace
         );
 
         // Optional runtime guard: assert outputs are finite to catch instability early
@@ -228,6 +252,10 @@ struct GroupedMoEAutograd : public torch::autograd::Function<GroupedMoEAutograd>
             grad_w2.to(w2_weights.dtype()),  // w2_weights
             grad_b1.to(b1_biases.dtype()),   // b1_biases
             grad_b2.to(b2_biases.dtype()),   // b2_biases
+            torch::Tensor(), // w1_ptrs_table
+            torch::Tensor(), // w2_ptrs_table
+            torch::Tensor(), // b1_ptrs_table
+            torch::Tensor(), // b2_ptrs_table
             dr.to(routing_weights_grouped.dtype()),  // routing_weights_grouped
             torch::Tensor(), // indices_grouped
             torch::Tensor(), // m_sizes_cpu
@@ -247,6 +275,10 @@ torch::Tensor grouped_moe_autograd_forward(
     const torch::Tensor& w2_weights,
     const torch::Tensor& b1_biases,
     const torch::Tensor& b2_biases,
+    const torch::Tensor& w1_ptrs_table,
+    const torch::Tensor& w2_ptrs_table,
+    const torch::Tensor& b1_ptrs_table,
+    const torch::Tensor& b2_ptrs_table,
     const torch::Tensor& routing_weights_grouped,
     const torch::Tensor& indices_grouped,
     const torch::Tensor& m_sizes_cpu,
@@ -263,6 +295,10 @@ torch::Tensor grouped_moe_autograd_forward(
         w2_weights,
         b1_biases,
         b2_biases,
+        w1_ptrs_table,
+        w2_ptrs_table,
+        b1_ptrs_table,
+        b2_ptrs_table,
         routing_weights_grouped,
         indices_grouped,
         m_sizes_cpu,

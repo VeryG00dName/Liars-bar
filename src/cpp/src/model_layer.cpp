@@ -2,6 +2,7 @@
 #include "lb_kernels.h"
 #include "moe_autograd_function.h" // For grouped_moe_autograd_forward
 #include <sstream>
+#include <torch/torch.h>
 
 namespace lb {
 namespace model {
@@ -262,32 +263,34 @@ transformer_layer(
     
     auto expert_inputs = x_flat.index_select(0, sorted_token_indices).contiguous();
 
-    auto sorted_expert_cpu = sorted_expert_indices.to(torch::kCPU);
-    auto sorted_policy_cpu = sorted_policy_indices.to(torch::kCPU);
-    const auto* se = sorted_expert_cpu.data_ptr<int64_t>();
-    const auto* sp = sorted_policy_cpu.data_ptr<int64_t>();
-    std::vector<int64_t> m_sizes_v, policy_ids_v, expert_ids_v, token_offsets_v;
-    int64_t cursor = 0;
-    const int64_t total_expert_routes = sorted_expert_indices.size(0);
-    while (cursor < total_expert_routes) {
-        int64_t ei = se[cursor]; int64_t pi = sp[cursor];
-        int64_t end = cursor + 1;
-        while (end < total_expert_routes && se[end] == ei && sp[end] == pi) ++end;
-        m_sizes_v.push_back(end - cursor);
-        policy_ids_v.push_back(pi);
-        expert_ids_v.push_back(ei);
-        token_offsets_v.push_back(cursor);
-        cursor = end;
-    }
+    auto [m_sizes_cpu, policy_ids_cpu, expert_ids_cpu, token_offsets_cpu] = lb::model::moe_group_metadata(
+        sorted_expert_indices, sorted_policy_indices);
 
-    auto m_sizes_cpu = torch::from_blob(m_sizes_v.data(), {(int64_t)m_sizes_v.size()}, torch::TensorOptions().dtype(torch::kLong)).clone();
-    auto policy_ids_cpu = torch::from_blob(policy_ids_v.data(), {(int64_t)policy_ids_v.size()}, torch::TensorOptions().dtype(torch::kLong)).clone();
-    auto expert_ids_cpu = torch::from_blob(expert_ids_v.data(), {(int64_t)expert_ids_v.size()}, torch::TensorOptions().dtype(torch::kLong)).clone();
-    auto token_offsets_cpu = torch::from_blob(token_offsets_v.data(), {(int64_t)token_offsets_v.size()}, torch::TensorOptions().dtype(torch::kLong)).clone();
+    // Build pointer tables directly from stacked tensors (device UInt64)
+    auto build_ptr_table = [&](const torch::Tensor& stacked) -> torch::Tensor {
+        TORCH_CHECK(stacked.is_cuda(), "Stacked expert tensors must be CUDA");
+        const int64_t P = stacked.size(0);
+        const int64_t E = stacked.size(1);
+        auto tbl_cpu = torch::empty({P, E}, torch::dtype(torch::kUInt64).device(torch::kCPU));
+        auto acc = tbl_cpu.accessor<uint64_t, 2>();
+        for (int64_t p = 0; p < P; ++p) {
+            for (int64_t e = 0; e < E; ++e) {
+                auto slice = stacked.index({p, e});
+                acc[p][e] = reinterpret_cast<uint64_t>(slice.data_ptr());
+            }
+        }
+        return tbl_cpu.to(stacked.device());
+    };
+
+    auto w1_ptrs_table = build_ptr_table(w1_all.to(torch::kFloat16));
+    auto w2_ptrs_table = build_ptr_table(w2_all.to(torch::kFloat16));
+    auto b1_ptrs_table = build_ptr_table(b1_all.to(torch::kFloat16));
+    auto b2_ptrs_table = build_ptr_table(b2_all.to(torch::kFloat16));
 
     auto expert_outputs = lb::moe::grouped_moe_autograd_forward(
         expert_inputs, w1_all.to(torch::kFloat16), w2_all.to(torch::kFloat16),
         b1_all.to(torch::kFloat16), b2_all.to(torch::kFloat16),
+        w1_ptrs_table, w2_ptrs_table, b1_ptrs_table, b2_ptrs_table,
         sorted_routing_weights, sorted_token_indices,
         m_sizes_cpu, policy_ids_cpu, expert_ids_cpu, token_offsets_cpu,
         hidden_dim, w1_all.size(-2), workspace);
@@ -468,32 +471,19 @@ moe_block(
 
     auto expert_inputs = x_flat.index_select(0, sorted_token_indices).contiguous();
 
-    auto sorted_expert_cpu = sorted_expert_indices.to(torch::kCPU);
-    auto sorted_policy_cpu = sorted_policy_indices.to(torch::kCPU);
-    const auto* se = sorted_expert_cpu.data_ptr<int64_t>();
-    const auto* sp = sorted_policy_cpu.data_ptr<int64_t>();
-    std::vector<int64_t> m_sizes_v, policy_ids_v, expert_ids_v, token_offsets_v;
-    int64_t cursor = 0;
-    const int64_t total_expert_routes = sorted_expert_indices.size(0);
-    while (cursor < total_expert_routes) {
-        int64_t ei = se[cursor]; int64_t pi = sp[cursor];
-        int64_t end = cursor + 1;
-        while (end < total_expert_routes && se[end] == ei && sp[end] == pi) ++end;
-        m_sizes_v.push_back(end - cursor);
-        policy_ids_v.push_back(pi);
-        expert_ids_v.push_back(ei);
-        token_offsets_v.push_back(cursor);
-        cursor = end;
-    }
+    auto [m_sizes_cpu, policy_ids_cpu, expert_ids_cpu, token_offsets_cpu] = lb::model::moe_group_metadata(
+        sorted_expert_indices, sorted_policy_indices);
 
-    auto m_sizes_cpu = torch::from_blob(m_sizes_v.data(), {(int64_t)m_sizes_v.size()}, torch::TensorOptions().dtype(torch::kLong)).clone();
-    auto policy_ids_cpu = torch::from_blob(policy_ids_v.data(), {(int64_t)policy_ids_v.size()}, torch::TensorOptions().dtype(torch::kLong)).clone();
-    auto expert_ids_cpu = torch::from_blob(expert_ids_v.data(), {(int64_t)expert_ids_v.size()}, torch::TensorOptions().dtype(torch::kLong)).clone();
-    auto token_offsets_cpu = torch::from_blob(token_offsets_v.data(), {(int64_t)token_offsets_v.size()}, torch::TensorOptions().dtype(torch::kLong)).clone();
+    // Pointer tables for diagnostic path as well
+    auto w1_ptrs_table2 = get_weight(batched_weights, prefix + ".moe.experts.w1_ptrs");
+    auto w2_ptrs_table2 = get_weight(batched_weights, prefix + ".moe.experts.w2_ptrs");
+    auto b1_ptrs_table2 = get_weight(batched_weights, prefix + ".moe.experts.b1_ptrs");
+    auto b2_ptrs_table2 = get_weight(batched_weights, prefix + ".moe.experts.b2_ptrs");
 
     auto expert_outputs = lb::moe::grouped_moe_autograd_forward(
         expert_inputs, w1_all.to(torch::kHalf), w2_all.to(torch::kHalf),
         b1_all.to(torch::kHalf), b2_all.to(torch::kHalf),
+        w1_ptrs_table2, w2_ptrs_table2, b1_ptrs_table2, b2_ptrs_table2,
         sorted_routing_weights, sorted_token_indices,
         m_sizes_cpu, policy_ids_cpu, expert_ids_cpu, token_offsets_cpu,
         hidden_dim, w1_all.size(-2));
@@ -585,6 +575,72 @@ torch::Tensor moe_group_ranges(
         cursor = end;
     }
     return torch::from_blob(rows.data(), {static_cast<long long>(rows.size()/4), 4}, torch::kInt64).clone();
+}
+
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+moe_group_metadata(
+    const torch::Tensor& sorted_expert_indices,
+    const torch::Tensor& sorted_policy_indices
+) {
+    TORCH_CHECK(sorted_expert_indices.scalar_type() == torch::kLong,
+                "sorted_expert_indices must be int64");
+    TORCH_CHECK(sorted_policy_indices.scalar_type() == torch::kLong,
+                "sorted_policy_indices must be int64");
+    TORCH_CHECK(sorted_expert_indices.dim() == 1 && sorted_policy_indices.dim() == 1,
+                "sorted_* tensors must be 1-D");
+    TORCH_CHECK(sorted_expert_indices.size(0) == sorted_policy_indices.size(0),
+                "sorted_* tensors must have the same length");
+
+    const auto N = sorted_expert_indices.size(0);
+    if (N == 0) {
+        auto opts = torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU);
+        return {
+            torch::empty({0}, opts),  // m_sizes
+            torch::empty({0}, opts),  // policy_ids
+            torch::empty({0}, opts),  // expert_ids
+            torch::empty({0}, opts)   // token_offsets
+        };
+    }
+
+    auto device = sorted_expert_indices.device();
+    using torch::indexing::Slice;
+    using torch::indexing::None;
+
+    auto se = sorted_expert_indices.contiguous();
+    auto sp = sorted_policy_indices.contiguous();
+
+    // starts[i] = true if i==0 or (se[i], sp[i]) != (se[i-1], sp[i-1])
+    auto starts = torch::empty({N}, torch::dtype(torch::kBool).device(device));
+    starts.index_put_({0}, true);
+    auto se_prev = se.index({Slice(0, N - 1)});
+    auto sp_prev = sp.index({Slice(0, N - 1)});
+    auto se_cur = se.index({Slice(1, None)});
+    auto sp_cur = sp.index({Slice(1, None)});
+    auto same_prev = (se_cur.eq(se_prev)) & (sp_cur.eq(sp_prev));
+    auto change = ~same_prev;
+    starts.index_put_({Slice(1, None)}, change);
+
+    // start positions of each group
+    auto start_pos = torch::nonzero(starts).squeeze(-1).to(torch::kLong);
+
+    // lengths = diff(cat(start_pos, [N]))
+    auto N_tensor = torch::tensor({N}, torch::dtype(torch::kLong).device(device));
+    auto cat_pos = torch::cat({start_pos, N_tensor}, /*dim=*/0);
+    auto lengths = cat_pos.index({Slice(1, None)}) - cat_pos.index({Slice(0, -1)});
+
+    // ids at starts
+    auto pol_ids = sp.index_select(0, start_pos);
+    auto exp_ids = se.index_select(0, start_pos);
+
+    // Move to CPU for host-side usage
+    auto opts = torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU);
+    return {
+        lengths.to(opts).contiguous(),     // m_sizes
+        pol_ids.to(opts).contiguous(),     // policy_ids
+        exp_ids.to(opts).contiguous(),     // expert_ids
+        start_pos.to(opts).contiguous()    // token_offsets
+    };
 }
 
 

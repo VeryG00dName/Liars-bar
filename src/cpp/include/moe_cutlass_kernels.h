@@ -43,6 +43,30 @@ struct MoEWorkspace {
     void* ldc_device_w2 = nullptr;
     void* ldd_device_w2 = nullptr;
     size_t descriptor_capacity_w2 = 0;
+
+    // Host-pinned descriptor buffers for faster async uploads (W1)
+    void* host_problem_sizes_w1 = nullptr;
+    void* host_ptr_A_w1 = nullptr;
+    void* host_ptr_B_w1 = nullptr;
+    void* host_ptr_C_w1 = nullptr;
+    void* host_ptr_D_w1 = nullptr;
+    void* host_lda_w1 = nullptr;
+    void* host_ldb_w1 = nullptr;
+    void* host_ldc_w1 = nullptr;
+    void* host_ldd_w1 = nullptr;
+    size_t host_descriptor_capacity_w1 = 0;
+
+    // Host-pinned descriptor buffers for faster async uploads (W2)
+    void* host_problem_sizes_w2 = nullptr;
+    void* host_ptr_A_w2 = nullptr;
+    void* host_ptr_B_w2 = nullptr;
+    void* host_ptr_C_w2 = nullptr;
+    void* host_ptr_D_w2 = nullptr;
+    void* host_lda_w2 = nullptr;
+    void* host_ldb_w2 = nullptr;
+    void* host_ldc_w2 = nullptr;
+    void* host_ldd_w2 = nullptr;
+    size_t host_descriptor_capacity_w2 = 0;
 };
 
 /**
@@ -112,6 +136,31 @@ void cutlass_grouped_moe_forward_with_hidden(
     int64_t hidden_dim,
     int64_t ffn_dim,
     MoEWorkspace* workspace = nullptr  // Optional pre-allocated workspace
+);
+
+/**
+ * Device-metadata variant: builds descriptor arrays entirely on device
+ * using pointer tables and base pointers, avoiding host-side staging.
+ */
+void cutlass_grouped_moe_forward_with_hidden_device(
+    uintptr_t input_base,                 // base pointer of input_grouped [T,H] (Half)
+    uintptr_t hidden_base,                // base pointer of hidden_grouped [T,F] (Half)
+    uintptr_t output_base,                // base pointer of output_grouped [T,H] (Half)
+    uintptr_t routing_base,               // base pointer of routing_weights_grouped [T] (Float)
+    const uint64_t* w1_ptrs_table,        // [P*E] device pointer table
+    const uint64_t* w2_ptrs_table,        // [P*E]
+    const uint64_t* b1_ptrs_table,        // [P*E]
+    const uint64_t* b2_ptrs_table,        // [P*E]
+    int64_t num_policies,                 // P
+    int64_t num_experts,                  // E
+    const int64_t* m_sizes_dev,           // [G] on device
+    const int64_t* policy_ids_dev,        // [G] on device
+    const int64_t* expert_ids_dev,        // [G] on device
+    const int64_t* token_offsets_dev,     // [G] on device
+    int64_t group_count,                  // G
+    int64_t hidden_dim,                   // H
+    int64_t ffn_dim,                      // F
+    MoEWorkspace* workspace               // for descriptor/device buffer reuse
 );
 
 } // namespace moe

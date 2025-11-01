@@ -20,6 +20,10 @@ torch::Tensor grouped_moe_autograd_forward(
     const torch::Tensor& w2_weights,                // [P, E, H, F] Half (CUDA)
     const torch::Tensor& b1_biases,                 // [P, E, F] Half (CUDA)
     const torch::Tensor& b2_biases,                 // [P, E, H] Half (CUDA)
+    const torch::Tensor& w1_ptrs_table,             // [P, E] UInt64 (CUDA) device pointers
+    const torch::Tensor& w2_ptrs_table,             // [P, E] UInt64 (CUDA) device pointers
+    const torch::Tensor& b1_ptrs_table,             // [P, E] UInt64 (CUDA) device pointers
+    const torch::Tensor& b2_ptrs_table,             // [P, E] UInt64 (CUDA) device pointers
     const torch::Tensor& routing_weights_grouped,   // [T] Float (CUDA)
     const torch::Tensor& indices_grouped,           // [T] Long (CUDA)
     const torch::Tensor& m_sizes_cpu,               // [G] Long (CPU)

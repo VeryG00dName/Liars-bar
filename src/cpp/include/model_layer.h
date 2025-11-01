@@ -157,6 +157,18 @@ torch::Tensor moe_group_ranges(
     const torch::Tensor& sorted_expert_indices,
     const torch::Tensor& sorted_policy_indices);
 
+/**
+ * Compute MoE group metadata (m_sizes, policy_ids, expert_ids, token_offsets)
+ * from sorted (expert, policy) indices using GPU ops and return CPU tensors.
+ *
+ * Inputs must be 1-D Long tensors sorted by (expert, policy).
+ * Returns CPU-contiguous tensors suitable for C++ host-side use.
+ */
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+moe_group_metadata(
+    const torch::Tensor& sorted_expert_indices,
+    const torch::Tensor& sorted_policy_indices);
+
 
 } // namespace model
 } // namespace lb
