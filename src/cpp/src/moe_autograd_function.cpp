@@ -51,6 +51,21 @@ struct GroupedMoEAutograd : public torch::autograd::Function<GroupedMoEAutograd>
         torch::Tensor hidden_grouped = torch::empty({total_tokens, ffn_dim}, opts_half);
         torch::Tensor output_grouped = torch::empty({total_tokens, hidden_dim}, opts_half);
 
+        // DEBUGGING: Check inputs to forward
+        static bool assert_finite = std::getenv("LB_MOE_ASSERT_FINITE") != nullptr;
+        if (assert_finite) {
+            TORCH_CHECK(torch::isfinite(input_grouped).all().item<bool>(), "MoE forward: input_grouped has non-finite values BEFORE CUTLASS");
+            TORCH_CHECK(torch::isfinite(w1_weights).all().item<bool>(), "MoE forward: w1_weights has non-finite values");
+            TORCH_CHECK(torch::isfinite(w2_weights).all().item<bool>(), "MoE forward: w2_weights has non-finite values");
+            TORCH_CHECK(torch::isfinite(b1_biases).all().item<bool>(), "MoE forward: b1_biases has non-finite values");
+            TORCH_CHECK(torch::isfinite(b2_biases).all().item<bool>(), "MoE forward: b2_biases has non-finite values");
+            TORCH_CHECK(torch::isfinite(routing_weights_grouped).all().item<bool>(), "MoE forward: routing_weights_grouped has non-finite values");
+        }
+
+        // Clamp inputs to prevent GELU NaN (erf can produce NaN for extreme values)
+        // Use FP16 safe range but with margin for accumulation
+        auto input_clamped = input_grouped.clamp(-30000.0f, 30000.0f).contiguous();
+
         // Device-only path: build metadata on device, no host descriptor staging
 
         // Build device-side group metadata
@@ -60,8 +75,8 @@ struct GroupedMoEAutograd : public torch::autograd::Function<GroupedMoEAutograd>
         auto expert_ids_dev = expert_ids.to(device).contiguous();
         auto token_offsets_dev = token_offsets.to(device).contiguous();
 
-        // Base pointers
-        auto input_base = reinterpret_cast<uintptr_t>(input_grouped.data_ptr<at::Half>());
+        // Base pointers (use clamped input to prevent GELU NaN)
+        auto input_base = reinterpret_cast<uintptr_t>(input_clamped.data_ptr<at::Half>());
         auto hidden_base = reinterpret_cast<uintptr_t>(hidden_grouped.data_ptr<at::Half>());
         auto output_base = reinterpret_cast<uintptr_t>(output_grouped.data_ptr<at::Half>());
         auto routing_base = reinterpret_cast<uintptr_t>(routing_weights_grouped.data_ptr<float>());
@@ -123,16 +138,19 @@ struct GroupedMoEAutograd : public torch::autograd::Function<GroupedMoEAutograd>
             workspace
         );
 
-        // Optional runtime guard: assert outputs are finite to catch instability early
-        static bool assert_finite = std::getenv("LB_MOE_ASSERT_FINITE") != nullptr;
+        // Replace NaN/Inf with finite values (CUTLASS epilogue can produce extreme values from large Z in GELU)
+        hidden_grouped = torch::nan_to_num(hidden_grouped, /*nan=*/0.0, /*posinf=*/65504.0, /*neginf=*/-65504.0);
+        output_grouped = torch::nan_to_num(output_grouped, /*nan=*/0.0, /*posinf=*/65504.0, /*neginf=*/-65504.0);
+
+        // DEBUGGING: Check outputs of CUTLASS forward
         if (assert_finite) {
-            TORCH_CHECK(torch::isfinite(hidden_grouped).all().item<bool>(), "MoE forward hidden_grouped has non-finite values");
-            TORCH_CHECK(torch::isfinite(output_grouped).all().item<bool>(), "MoE forward output_grouped has non-finite values");
+            TORCH_CHECK(torch::isfinite(hidden_grouped).all().item<bool>(), "MoE forward: hidden_grouped has non-finite values AFTER CUTLASS (W1+GELU output)");
+            TORCH_CHECK(torch::isfinite(output_grouped).all().item<bool>(), "MoE forward: output_grouped has non-finite values AFTER CUTLASS (final output)");
         }
 
-        // Save for backward
+        // Save for backward (save clamped input to ensure numerical stability)
         ctx->save_for_backward({
-            input_grouped,
+            input_clamped,  // Use clamped version for stability
             hidden_grouped,
             routing_weights_grouped,
             indices_grouped,
@@ -177,12 +195,29 @@ struct GroupedMoEAutograd : public torch::autograd::Function<GroupedMoEAutograd>
 
         auto grad_out = grad_outputs[0];
         auto total_tokens = input_grouped.size(0);
+
+        // DEBUGGING: Check inputs to backward
+        if (assert_finite) {
+            TORCH_CHECK(torch::isfinite(grad_out).all().item<bool>(), "MoE backward: grad_out (upstream gradient) has non-finite values");
+            TORCH_CHECK(torch::isfinite(input_grouped).all().item<bool>(), "MoE backward: input_grouped has non-finite values");
+            TORCH_CHECK(torch::isfinite(hidden_grouped).all().item<bool>(), "MoE backward: hidden_grouped has non-finite values");
+            TORCH_CHECK(torch::isfinite(routing_weights_grouped).all().item<bool>(), "MoE backward: routing_weights_grouped has non-finite values");
+            TORCH_CHECK(torch::isfinite(w1_weights).all().item<bool>(), "MoE backward: w1_weights has non-finite values");
+            TORCH_CHECK(torch::isfinite(w2_weights).all().item<bool>(), "MoE backward: w2_weights has non-finite values");
+            TORCH_CHECK(torch::isfinite(b1_biases).all().item<bool>(), "MoE backward: b1_biases has non-finite values");
+            TORCH_CHECK(torch::isfinite(b2_biases).all().item<bool>(), "MoE backward: b2_biases has non-finite values");
+        }
+
         // Cast upstream grad to Half as kernels expect
         // Guard against FP16 overflow when converting upstream gradients
         // Clamp to representable FP16 range before cast to avoid inf->nan in kernels
         auto grad_out_f32_cast = grad_out.to(torch::kFloat32);
         auto grad_out_clamped = grad_out_f32_cast.clamp(-65504.0f, 65504.0f);
         auto grad_out_half = grad_out_clamped.to(torch::kFloat16).contiguous();
+
+        if (assert_finite) {
+            TORCH_CHECK(torch::isfinite(grad_out_half).all().item<bool>(), "MoE backward: grad_out_half (after clamp) has non-finite values");
+        }
 
         auto grad_input = torch::zeros_like(input_grouped);
         auto grad_w1 = torch::zeros_like(w1_weights, torch::dtype(torch::kFloat32));

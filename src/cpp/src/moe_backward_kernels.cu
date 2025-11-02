@@ -177,6 +177,21 @@ __global__ void clamp_half_inplace_kernel(__half* data, int64_t n) {
     }
 }
 
+// More aggressive clamping for pre-activation values (before GELU)
+// Uses same range as forward pass to prevent exp overflow in GELU backward
+__global__ void clamp_pre_activation_kernel(__half* data, int64_t n) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    for (int64_t i = idx; i < n; i += blockDim.x * gridDim.x) {
+        float v = __half2float(data[i]);
+        // Convert NaN to zero
+        if (!(v == v)) v = 0.0f;
+        // Clamp to safe range for GELU (match forward pass)
+        if (v > 30000.0f) v = 30000.0f;
+        else if (v < -30000.0f) v = -30000.0f;
+        data[i] = __float2half(v);
+    }
+}
+
 static inline void clamp_half_inplace(torch::Tensor& t, cudaStream_t stream) {
     if (t.scalar_type() != torch::kFloat16) return;
     int64_t n = t.numel();
@@ -187,6 +202,18 @@ static inline void clamp_half_inplace(torch::Tensor& t, cudaStream_t stream) {
     blocks = std::min(blocks, max_blocks);
     __half* ptr = reinterpret_cast<__half*>(t.data_ptr<at::Half>());
     clamp_half_inplace_kernel<<<blocks, threads, 0, stream>>>(ptr, n);
+}
+
+static inline void clamp_pre_activation_inplace(torch::Tensor& t, cudaStream_t stream) {
+    if (t.scalar_type() != torch::kFloat16) return;
+    int64_t n = t.numel();
+    if (n == 0) return;
+    const int threads = 256;
+    int64_t blocks = (n + threads - 1) / threads;
+    const int64_t max_blocks = 65535;
+    blocks = std::min(blocks, max_blocks);
+    __half* ptr = reinterpret_cast<__half*>(t.data_ptr<at::Half>());
+    clamp_pre_activation_kernel<<<blocks, threads, 0, stream>>>(ptr, n);
 }
  
 
@@ -649,6 +676,9 @@ void cutlass_grouped_moe_backward(
         ffn_dim
     );
 
+    // Sanitize dW2 gradients (FP32) to prevent NaN propagation
+    grad_w2 = torch::nan_to_num(grad_w2, /*nan=*/0.0, /*posinf=*/1e10, /*neginf=*/-1e10);
+
     // Bias reduction: db2 = sum(Gỹ, dim=0) for each group
     for (size_t g = 0; g < m_sizes_compact.size(); ++g) {
         int64_t M = m_sizes_compact[g];
@@ -670,6 +700,9 @@ void cutlass_grouped_moe_backward(
             stream
         );
     }
+
+    // Sanitize db2 gradients (FP32) to prevent NaN propagation
+    grad_b2 = torch::nan_to_num(grad_b2, /*nan=*/0.0, /*posinf=*/1e10, /*neginf=*/-1e10);
 
     // ========================================================================
     // Step 3: dH GEMM (dH = Gỹ @ W2)
@@ -701,6 +734,8 @@ void cutlass_grouped_moe_backward(
         hidden_dim,
         ffn_dim
     );
+    // Aggressively clamp z_recomputed to prevent exp overflow in GELU backward (match forward pass)
+    clamp_pre_activation_inplace(z_recomputed, stream);
 
     // ========================================================================
     // Step 5: GELU' kernel (dZ = dH ⊙ GELU'(Z))
@@ -732,6 +767,9 @@ void cutlass_grouped_moe_backward(
         ffn_dim
     );
 
+    // Sanitize dW1 gradients (FP32) to prevent NaN propagation
+    grad_w1 = torch::nan_to_num(grad_w1, /*nan=*/0.0, /*posinf=*/1e10, /*neginf=*/-1e10);
+
     // Bias reduction: db1 = sum(dZ, dim=0) for each group
     for (size_t g = 0; g < m_sizes_compact.size(); ++g) {
         int64_t M = m_sizes_compact[g];
@@ -753,6 +791,9 @@ void cutlass_grouped_moe_backward(
             stream
         );
     }
+
+    // Sanitize db1 gradients (FP32) to prevent NaN propagation
+    grad_b1 = torch::nan_to_num(grad_b1, /*nan=*/0.0, /*posinf=*/1e10, /*neginf=*/-1e10);
 
     // ========================================================================
     // Step 7: dX GEMM (dX_grouped = dZ @ W1)

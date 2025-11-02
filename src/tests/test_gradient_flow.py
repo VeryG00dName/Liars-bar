@@ -13,25 +13,13 @@ from src.tests import test_utils as tu
 from src.model.ppo_reactive_model import PPOReactiveModel
 
 
-def run_one(model, inputs):
-    header = "Testing Gradient Flow (checkpointed path)"
-    print("\n" + "=" * 60)
-    print(header)
-    print("=" * 60)
-
+def run_one(model, inputs, trial_num):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
 
     # Unpack inputs created outside so both runs share the same batch
     obs_sequence, action_sequence, agent_types, positions, action_masks, padding_mask = inputs
 
-    # Print shapes for visibility
-    print(f"\nInput shapes:")
-    print(f"  obs_sequence: {obs_sequence.shape}")
-    print(f"  action_sequence: {action_sequence.shape}")
-
     # Forward pass
-    print("\n" + "-" * 20 + " Forward Pass " + "-" * 20)
     try:
         outputs = model(
             obs_sequence=obs_sequence,
@@ -43,54 +31,48 @@ def run_one(model, inputs):
         )
         action_logits, opp_logits, state_values, win_logits, gate_logits_tensor, routing = outputs
 
-        print(f"Forward pass successful!")
         if torch.isnan(action_logits).any() or torch.isnan(state_values).any():
-            print("  ❌ NaN detected in forward outputs!")
+            print(f"❌ Trial {trial_num}: NaN detected in forward outputs!")
             return False, {}
-        print("  ✓ No NaN in forward outputs")
 
     except Exception as e:
-        print(f"❌ Forward pass failed: {e}")
+        print(f"❌ Trial {trial_num}: Forward pass failed: {e}")
         traceback.print_exc()
         return False, {}
 
     # Backward pass
-    print("\n" + "-" * 20 + " Backward Pass " + "-" * 20)
     try:
         loss = action_logits.sum() + state_values.sum() + win_logits.sum() + opp_logits.sum()
-        print(f"Loss: {loss.item():.4f}")
         loss.backward()
-        print("Backward pass successful!")
 
         # Gradient check with per-parameter NaN counts
-        print("\n" + "-" * 20 + " Gradient Check " + "-" * 20)
         has_nan = False
         no_grad_count = 0
         nan_params = {}
         all_params = list(model.named_parameters())
-        print(f"Checking {len(all_params)} parameters...")
 
         for name, param in all_params:
             if param.grad is None:
                 no_grad_count += 1
-                print(f"⚠️  {name:50s} has no gradient")
+                print(f"❌ Trial {trial_num}: {name} has no gradient")
                 continue
             n_nans = torch.isnan(param.grad).sum().item()
             if n_nans > 0:
                 has_nan = True
                 nan_params[name] = int(n_nans)
+                print(f"❌ Trial {trial_num}: {name} has {n_nans} NaN gradients")
 
         return (not has_nan and no_grad_count == 0), nan_params
 
     except Exception as e:
-        print(f"❌ Backward pass failed: {e}")
+        print(f"❌ Trial {trial_num}: Backward pass failed: {e}")
         traceback.print_exc()
         return False, {}
 
 
-def run_test_suite(num_trials: int = 5, batch_size: int = 128, seq_len: int = 256):
+def run_test_suite(num_trials: int = 50, batch_size: int = 128, seq_len: int = 256):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    print(f"Running {num_trials} trials on {device}...")
 
     # One model instance toggling checkpoint flag for comparable params/grads
     def make_model():
@@ -103,7 +85,6 @@ def run_test_suite(num_trials: int = 5, batch_size: int = 128, seq_len: int = 25
 
     results = []
     for trial in range(1, num_trials + 1):
-        print(f"\n===== Trial {trial}/{num_trials} =====")
         # Seed per trial for reproducibility
         seed = 1337 + trial
         # Use padding_ratio=0.3 to mark last 30% as padding like before
@@ -119,7 +100,7 @@ def run_test_suite(num_trials: int = 5, batch_size: int = 128, seq_len: int = 25
 
         # Single checkpointed run (C++ path is always checkpointed now)
         model_ckpt = make_model()
-        ok_ck, nans_ck = run_one(model_ckpt, inputs)
+        ok_ck, nans_ck = run_one(model_ckpt, inputs, trial)
 
         results.append({
             "trial": trial,
@@ -129,26 +110,34 @@ def run_test_suite(num_trials: int = 5, batch_size: int = 128, seq_len: int = 25
             "nans_ck": nans_ck,
         })
 
+        # Print progress every 10 trials
+        if trial % 10 == 0:
+            passed = sum(1 for r in results if r["ok_ck"])
+            print(f"Progress: {trial}/{num_trials} trials, {passed} passed")
+
     # Summary
     print("\n" + "=" * 60)
-    print("NaN Summary over trials (same inputs per trial)")
+    print("Summary")
     print("=" * 60)
-    total_ck = sum(1 for r in results if r["ok_ck"]) \
-               , sum(r["nan_count_ck"] for r in results)
-    ok_ck_trials, nan_ck_total = total_ck
-    print(f"Ckpt    : ok={ok_ck_trials}/{num_trials}, total_nan_elems={nan_ck_total}")
-    for r in results:
-        print(f"Trial {r['trial']} (seed={r['seed']}): ckpt ok={r['ok_ck']} (nan_elems={r['nan_count_ck']})")
-        if r['nan_count_ck']:
-            top_ck = sorted(r['nans_ck'].items(), key=lambda kv: kv[1], reverse=True)[:8]
-            print("  Ckpt NaNs (top):")
-            for name, cnt in top_ck:
-                print(f"    {name}: {cnt}")
+    ok_ck_trials = sum(1 for r in results if r["ok_ck"])
+    nan_ck_total = sum(r["nan_count_ck"] for r in results)
+    print(f"Passed: {ok_ck_trials}/{num_trials}, total_nan_elems={nan_ck_total}")
+
+    # Only show failed trials
+    failed = [r for r in results if not r["ok_ck"]]
+    if failed:
+        print(f"\n{len(failed)} failed trials:")
+        for r in failed:
+            print(f"  Trial {r['trial']} (seed={r['seed']}): nan_elems={r['nan_count_ck']}")
+            if r['nans_ck']:
+                top_ck = sorted(r['nans_ck'].items(), key=lambda kv: kv[1], reverse=True)[:5]
+                for name, cnt in top_ck:
+                    print(f"    {name}: {cnt}")
 
     # Return overall pass/fail
     return ok_ck_trials == num_trials
 
 if __name__ == "__main__":
-    # Smaller defaults to iterate fast; bump as needed
-    all_ok = run_test_suite(num_trials=5, batch_size=64, seq_len=64)
+    # Run 50 trials to stress test gradient flow
+    all_ok = run_test_suite(num_trials=50, batch_size=64, seq_len=64)
     sys.exit(0 if all_ok else 1)
