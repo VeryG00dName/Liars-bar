@@ -368,6 +368,8 @@ def ppo_losses_batched(
     episode_mask = torch.ones(our_idx.size(0), dtype=torch.bool, device=our_idx.device)
     step_mask = our_mask
 
+    # Use Python model forward for training (needs gradients)
+    # NOTE: Rollouts use C++ forward_packed for consistency, but training needs backprop
     obs_sequence = mi["obs_sequence"]
     action_sequence = mi["action_sequence"]
     agent_types = mi["agent_types"]

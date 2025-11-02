@@ -408,7 +408,7 @@ def _create_new_agent(agent_type: str, device: torch.device) -> LearnerAutoregre
     if agent_type == 'main':
         model = PPOReactiveModel(
             obs_dim=16,
-            dropout_rate=0.0
+            use_gradient_checkpointing=bool(getattr(config, "USE_GRADIENT_CHECKPOINTING", True)),
         )
     else:  # Future branches (e.g., exploiter) can be added here.
         raise ValueError(f"Unknown agent type for creation: {agent_type}")
@@ -561,8 +561,9 @@ def train_generation(
     logging.info(f"    TensorBoard Log Dir: {run_log_dir}")
     
     # =====================================================================
-    # 2. INITIALIZE LEARNER AND EAGER MODELS (no torch.compile)
+    # 2. INITIALIZE LEARNER AND COMPILE (IF NOT ALREADY DONE)
     # =====================================================================
+    compile_fn = getattr(torch, "compile", None)
 
     if learner is None:
         # ---- This block runs ONLY when creating a new agent from scratch or disk ----
@@ -589,11 +590,20 @@ def train_generation(
             train_model = type(learner.model)(**getattr(learner.model, "config", {})).to(device)
             train_model.load_state_dict(learner.model.state_dict())
 
-        # 2.3. Use eager TRAINING model (torch.compile disabled)
-        learner.train_model = train_model
+        # 2.3. Compile the TRAINING model (for static shapes)
+        if compile_fn:
+            try:
+                logging.info("Compiling training model (dynamic=False)...")
+                compiled_train = compile_fn(train_model, dynamic=False)
+                learner.train_model = compiled_train
+            except Exception as exc:
+                logging.warning(f"torch.compile (train) failed; using eager model: {exc}")
+                learner.train_model = train_model
+        else:
+            learner.train_model = train_model
         learner.train_model.train()
 
-        # 2.4. Create and compile a single ROLLOUT model that supports dynamic sequence lengths ( we don't use that anymore)
+        # 2.4. Create and compile a single ROLLOUT model that supports dynamic sequence lengths
         try:
             rollout_model = copy.deepcopy(learner.model)
         except Exception as exc:
@@ -604,8 +614,22 @@ def train_generation(
         rollout_model = rollout_model.to(device)
         rollout_model.eval()
 
-        # Use eager ROLLOUT model (torch.compile disabled)
-        learner.rollout_model = rollout_model
+        compiled_rollout = rollout_model
+        if compile_fn:
+            try:
+                logging.info(
+                    "Compiling rollout model (dynamic=True)..."
+                )
+                compiled_rollout = compile_fn(
+                    rollout_model,
+                    dynamic=True
+                )
+            except Exception as exc:
+                logging.warning(
+                    f"torch.compile (rollout) failed; using eager model: {exc}"
+                )
+
+        learner.rollout_model = compiled_rollout
 
     else:
         # ---- This block runs for subsequent generations (gen > 1) ----
@@ -1098,12 +1122,9 @@ def train_generation(
                     group_count >= group_target
                     or processed_minibatches == num_minibatches
                 )
-                
                 if should_step:
                     scaler.unscale_(optimizer)
-                    for name, p in learner.train_model.named_parameters():
-                        if p.grad is None:
-                            print(f"[grad-norm] {name}: None")
+
                     # Clip gradients for the main part of the network
                     if main_params:
                         clip_grad_norm_(main_params, max_norm=float(config.MAX_NORM))
@@ -1449,7 +1470,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Master Self-Play Loop for PPO Autoregressive Agent")
     parser.add_argument("--pool-file", type=str, default="opponent_pool.json", help="Path to the opponent pool JSON file.")
     parser.add_argument("--sl-path", type=str, default=config.SL_TEACHER_CKPT, help="Path to the initial supervised learning checkpoint.")
-    parser.add_argument("--max-gens", type=int, default=100, help="Total number of generations to train.")
+    parser.add_argument("--max-gens", type=int, default=10, help="Total number of generations to train.")
     parser.add_argument("--challenger-freq", type=int, default=0, help="Inject a challenger from SL every N generations. Set to 0 to disable.")
     parser.add_argument("--master-run-name", type=str, default=None, help="Overall name for the self-play experiment folder.")
     parser.add_argument("--no-sl", action="store_true", help="Start generation 1 from scratch, without SL warm-start.")
