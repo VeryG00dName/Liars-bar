@@ -643,6 +643,109 @@ moe_group_metadata(
     };
 }
 
+/**
+ * Build pointer table on GPU for batched expert weights.
+ *
+ * For a stacked tensor [P, E, ...], computes data pointers for each [p, e] slice.
+ * Returns GPU tensor of uint64 pointers.
+ */
+torch::Tensor build_ptr_table_device(const torch::Tensor& stacked) {
+    TORCH_CHECK(stacked.is_cuda(), "Stacked expert weights must be CUDA tensors");
+    TORCH_CHECK(stacked.dim() >= 2, "Stacked expert weights must be at least 2D");
+
+    const int64_t P = stacked.size(0);
+    const int64_t E = stacked.size(1);
+
+    // Compute inner size (product of all dimensions after first 2)
+    int64_t inner_size = 1;
+    for (int64_t i = 2; i < stacked.dim(); ++i) {
+        inner_size *= stacked.size(i);
+    }
+
+    // Create indices [P, E] grid
+    auto p_idx = torch::arange(P, torch::dtype(torch::kLong).device(stacked.device()))
+                    .unsqueeze(1).expand({P, E});
+    auto e_idx = torch::arange(E, torch::dtype(torch::kLong).device(stacked.device()))
+                    .unsqueeze(0).expand({P, E});
+
+    // Compute linear offset: offset = (p * E * inner_size + e * inner_size)
+    auto offsets = (p_idx * E * inner_size + e_idx * inner_size);
+
+    // Get base pointer and element size
+    auto base_ptr = reinterpret_cast<uintptr_t>(stacked.data_ptr());
+    auto elem_size = stacked.element_size();
+
+    // Compute final pointers: base_ptr + offset * elem_size
+    auto ptr_table = (offsets * elem_size + base_ptr).to(torch::kUInt64);
+
+    return ptr_table.contiguous();
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+moe_group_metadata_device(
+    const torch::Tensor& sorted_expert_indices,
+    const torch::Tensor& sorted_policy_indices
+) {
+    TORCH_CHECK(sorted_expert_indices.scalar_type() == torch::kLong,
+                "sorted_expert_indices must be int64");
+    TORCH_CHECK(sorted_policy_indices.scalar_type() == torch::kLong,
+                "sorted_policy_indices must be int64");
+    TORCH_CHECK(sorted_expert_indices.dim() == 1 && sorted_policy_indices.dim() == 1,
+                "sorted_* tensors must be 1-D");
+    TORCH_CHECK(sorted_expert_indices.size(0) == sorted_policy_indices.size(0),
+                "sorted_* tensors must have the same length");
+
+    const auto N = sorted_expert_indices.size(0);
+    if (N == 0) {
+        auto device = sorted_expert_indices.device();
+        auto opts = torch::TensorOptions().dtype(torch::kLong).device(device);
+        return {
+            torch::empty({0}, opts),  // m_sizes
+            torch::empty({0}, opts),  // policy_ids
+            torch::empty({0}, opts),  // expert_ids
+            torch::empty({0}, opts)   // token_offsets
+        };
+    }
+
+    auto device = sorted_expert_indices.device();
+    using torch::indexing::Slice;
+    using torch::indexing::None;
+
+    auto se = sorted_expert_indices.contiguous();
+    auto sp = sorted_policy_indices.contiguous();
+
+    // starts[i] = true if i==0 or (se[i], sp[i]) != (se[i-1], sp[i-1])
+    auto starts = torch::empty({N}, torch::dtype(torch::kBool).device(device));
+    starts.index_put_({0}, true);
+    auto se_prev = se.index({Slice(0, N - 1)});
+    auto sp_prev = sp.index({Slice(0, N - 1)});
+    auto se_cur = se.index({Slice(1, None)});
+    auto sp_cur = sp.index({Slice(1, None)});
+    auto same_prev = (se_cur.eq(se_prev)) & (sp_cur.eq(sp_prev));
+    auto change = ~same_prev;
+    starts.index_put_({Slice(1, None)}, change);
+
+    // start positions of each group
+    auto start_pos = torch::nonzero(starts).squeeze(-1).to(torch::kLong);
+
+    // lengths = diff(cat(start_pos, [N]))
+    auto N_tensor = torch::tensor({N}, torch::dtype(torch::kLong).device(device));
+    auto cat_pos = torch::cat({start_pos, N_tensor}, /*dim=*/0);
+    auto lengths = cat_pos.index({Slice(1, None)}) - cat_pos.index({Slice(0, -1)});
+
+    // ids at starts
+    auto pol_ids = sp.index_select(0, start_pos);
+    auto exp_ids = se.index_select(0, start_pos);
+
+    // Return GPU tensors - NO CPU transfer
+    return {
+        lengths.contiguous(),     // m_sizes
+        pol_ids.contiguous(),     // policy_ids
+        exp_ids.contiguous(),     // expert_ids
+        start_pos.contiguous()    // token_offsets
+    };
+}
+
 
 } // namespace model
 } // namespace lb

@@ -103,37 +103,80 @@ transformer_layer_forward_impl_autograd(
 
     auto expert_inputs = x_flat.index_select(0, sorted_token_indices).contiguous();
 
-    auto [m_sizes_cpu, policy_ids_cpu, expert_ids_cpu, token_offsets_cpu] = lb::model::moe_group_metadata(
-        sorted_expert_indices, sorted_policy_indices);
+    torch::Tensor expert_outputs;
 
-    // Build pointer tables from stacked tensors to avoid undefined tensor inputs
-    auto build_ptr_table = [&](const torch::Tensor& stacked) -> torch::Tensor {
-        TORCH_CHECK(stacked.is_cuda(), "Stacked expert weights must be CUDA tensors");
-        const int64_t P = stacked.size(0);
-        const int64_t E = stacked.size(1);
-        auto tbl_cpu = torch::empty({P, E}, torch::dtype(torch::kUInt64).device(torch::kCPU));
-        auto acc = tbl_cpu.accessor<uint64_t, 2>();
-        for (int64_t p = 0; p < P; ++p) {
-            for (int64_t e = 0; e < E; ++e) {
-                auto slice = stacked.index({p, e});
-                acc[p][e] = reinterpret_cast<uint64_t>(slice.data_ptr());
+    // Check if we need gradients (training/backward) or not (inference)
+    bool needs_grad = expert_inputs.requires_grad() || w1_all.requires_grad() || w2_all.requires_grad();
+
+    if (needs_grad) {
+        // TRAINING PATH: Use autograd function to maintain gradient flow
+        auto [m_sizes_cpu, policy_ids_cpu, expert_ids_cpu, token_offsets_cpu] =
+            lb::model::moe_group_metadata(sorted_expert_indices, sorted_policy_indices);
+
+        auto build_ptr_table = [&](const torch::Tensor& stacked) -> torch::Tensor {
+            TORCH_CHECK(stacked.is_cuda(), "Stacked expert weights must be CUDA tensors");
+            const int64_t P = stacked.size(0);
+            const int64_t E = stacked.size(1);
+            auto tbl_cpu = torch::empty({P, E}, torch::dtype(torch::kUInt64).device(torch::kCPU));
+            auto acc = tbl_cpu.accessor<uint64_t, 2>();
+            for (int64_t p = 0; p < P; ++p) {
+                for (int64_t e = 0; e < E; ++e) {
+                    auto slice = stacked.index({p, e});
+                    acc[p][e] = reinterpret_cast<uint64_t>(slice.data_ptr());
+                }
             }
-        }
-        return tbl_cpu.to(stacked.device());
-    };
+            return tbl_cpu.to(stacked.device());
+        };
 
-    auto w1_tbl = build_ptr_table(w1_all.to(torch::kFloat16));
-    auto w2_tbl = build_ptr_table(w2_all.to(torch::kFloat16));
-    auto b1_tbl = build_ptr_table(b1_all.to(torch::kFloat16));
-    auto b2_tbl = build_ptr_table(b2_all.to(torch::kFloat16));
+        auto w1_tbl = build_ptr_table(w1_all.to(torch::kFloat16));
+        auto w2_tbl = build_ptr_table(w2_all.to(torch::kFloat16));
+        auto b1_tbl = build_ptr_table(b1_all.to(torch::kFloat16));
+        auto b2_tbl = build_ptr_table(b2_all.to(torch::kFloat16));
 
-    auto expert_outputs = lb::moe::grouped_moe_autograd_forward(
-        expert_inputs, w1_all.to(torch::kFloat16), w2_all.to(torch::kFloat16),
-        b1_all.to(torch::kFloat16), b2_all.to(torch::kFloat16),
-        w1_tbl, w2_tbl, b1_tbl, b2_tbl,
-        sorted_routing_weights, sorted_token_indices,
-        m_sizes_cpu, policy_ids_cpu, expert_ids_cpu, token_offsets_cpu,
-        hidden_dim, w1_all.size(-2));
+        expert_outputs = lb::moe::grouped_moe_autograd_forward(
+            expert_inputs, w1_all.to(torch::kFloat16), w2_all.to(torch::kFloat16),
+            b1_all.to(torch::kFloat16), b2_all.to(torch::kFloat16),
+            w1_tbl, w2_tbl, b1_tbl, b2_tbl,
+            sorted_routing_weights, sorted_token_indices,
+            m_sizes_cpu, policy_ids_cpu, expert_ids_cpu, token_offsets_cpu,
+            hidden_dim, w1_all.size(-2), nullptr);
+    } else {
+        // INFERENCE PATH: Use optimized device-side path (no autograd overhead)
+        auto [m_sizes_dev, policy_ids_dev, expert_ids_dev, token_offsets_dev] =
+            lb::model::moe_group_metadata_device(sorted_expert_indices, sorted_policy_indices);
+
+        auto w1_fp16 = w1_all.to(torch::kFloat16);
+        auto w2_fp16 = w2_all.to(torch::kFloat16);
+        auto b1_fp16 = b1_all.to(torch::kFloat16);
+        auto b2_fp16 = b2_all.to(torch::kFloat16);
+
+        auto w1_tbl = lb::model::build_ptr_table_device(w1_fp16);
+        auto w2_tbl = lb::model::build_ptr_table_device(w2_fp16);
+        auto b1_tbl = lb::model::build_ptr_table_device(b1_fp16);
+        auto b2_tbl = lb::model::build_ptr_table_device(b2_fp16);
+
+        int64_t total_tokens = expert_inputs.size(0);
+        int64_t ffn_dim = w1_all.size(-2);
+        expert_outputs = torch::empty({total_tokens, hidden_dim}, expert_inputs.options());
+        auto hidden_tmp = torch::empty({total_tokens, ffn_dim}, expert_inputs.options());
+        int64_t group_count = m_sizes_dev.size(0);
+
+        lb::moe::cutlass_grouped_moe_forward_with_hidden_device(
+            reinterpret_cast<uintptr_t>(expert_inputs.data_ptr<at::Half>()),
+            reinterpret_cast<uintptr_t>(hidden_tmp.data_ptr<at::Half>()),
+            reinterpret_cast<uintptr_t>(expert_outputs.data_ptr<at::Half>()),
+            reinterpret_cast<uintptr_t>(sorted_routing_weights.data_ptr<float>()),
+            w1_tbl.data_ptr<uint64_t>(),
+            w2_tbl.data_ptr<uint64_t>(),
+            b1_tbl.data_ptr<uint64_t>(),
+            b2_tbl.data_ptr<uint64_t>(),
+            w1_fp16.size(0), w1_fp16.size(1),
+            m_sizes_dev.data_ptr<int64_t>(),
+            policy_ids_dev.data_ptr<int64_t>(),
+            expert_ids_dev.data_ptr<int64_t>(),
+            token_offsets_dev.data_ptr<int64_t>(),
+            group_count, hidden_dim, ffn_dim, nullptr);
+    }
 
     auto moe_output_flat = torch::zeros({num_tokens, hidden_dim}, expert_outputs.options());
     moe_output_flat.index_add_(0, sorted_token_indices, expert_outputs);

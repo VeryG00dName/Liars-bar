@@ -169,6 +169,26 @@ moe_group_metadata(
     const torch::Tensor& sorted_expert_indices,
     const torch::Tensor& sorted_policy_indices);
 
+/**
+ * Device-side variant of moe_group_metadata that returns GPU tensors.
+ *
+ * Eliminates GPU→CPU transfer for use in device-side forward path.
+ * Inputs must be 1-D Long tensors sorted by (expert, policy).
+ * Returns GPU-contiguous tensors.
+ */
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+moe_group_metadata_device(
+    const torch::Tensor& sorted_expert_indices,
+    const torch::Tensor& sorted_policy_indices);
+
+/**
+ * Build pointer table on GPU for batched expert weights.
+ *
+ * For a stacked tensor [P, E, ...], computes data pointers for each [p, e] slice.
+ * Eliminates CPU staging and transfer. Returns GPU tensor of uint64 pointers.
+ */
+torch::Tensor build_ptr_table_device(const torch::Tensor& stacked);
+
 
 } // namespace model
 } // namespace lb
