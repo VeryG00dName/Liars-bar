@@ -452,6 +452,17 @@ def run_batched_lineups(
         int(seed),
     )
     print(f"[INFO] Completed {total_games} games across {len(lineups)} lineups.")
+    
+    # Print forward pass timing stats if available
+    if perf_stats:
+        forward_timings = {k: v for k, v in perf_stats.items() 
+                          if k.startswith("forward_") or k.startswith("layer_") or k.startswith("linear_")}
+        if forward_timings:
+            print("\n--- Eval Forward Pass Timing (microseconds) ---")
+            total_fwd_time = sum(forward_timings.values())
+            for key, value in sorted(forward_timings.items(), key=lambda item: -item[1]):
+                perc = (value / total_fwd_time * 100.0) if total_fwd_time > 0 else 0.0
+                print(f"  - {key:<32}: {value:>12} us ({value / 1e6:.6f}s) [{perc:>5.1f}%]")
     results_typed: List[Dict[int, Dict[str, Any]]] = []
     for lineup_idx in range(len(lineups)):
         lineup_results = results_list[lineup_idx] if lineup_idx < len(results_list) else {}

@@ -4,6 +4,7 @@
 #include <unordered_map>
 #include <vector>
 #include <cstdint>
+#include <chrono>
 
 #include "vec_arena.h"  // For PolicyRequest
 #include "moe_cutlass_kernels.h"  // For MoEWorkspace
@@ -86,6 +87,25 @@ public:
         const std::unordered_map<int, std::vector<PolicyRequest>>& requests_by_policy
     );
 
+    /**
+     * Get accumulated timing statistics from forward passes.
+     * Returns a map of operation name -> total microseconds.
+     */
+    std::unordered_map<std::string, int64_t> get_timing_stats() const {
+        std::unordered_map<std::string, int64_t> result;
+        for (const auto& kv : timing_stats_) {
+            result[kv.first] = kv.second.count();
+        }
+        return result;
+    }
+
+    /**
+     * Reset timing statistics.
+     */
+    void reset_timing_stats() {
+        timing_stats_.clear();
+    }
+
 private:
     // Model weights and configuration
     c10::Dict<std::string, torch::Tensor> batched_weights_;
@@ -103,6 +123,9 @@ private:
     // Pre-allocated workspace for CUTLASS kernels (per-layer)
     // Allocated once in constructor, reused for all forward passes
     std::vector<lb::moe::MoEWorkspace> moe_workspaces_;
+
+    // Timing statistics (accumulated across all inference calls)
+    mutable std::unordered_map<std::string, std::chrono::microseconds> timing_stats_;
 
     /**
      * Find the maximum sequence length across all requests.

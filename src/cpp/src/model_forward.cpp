@@ -444,25 +444,36 @@ forward_packed(
     const lb::moe::MoEWorkspace* moe_workspaces) {
 
     using Microseconds = std::chrono::microseconds;
+    using Clock = std::chrono::high_resolution_clock;
     std::unordered_map<std::string, Microseconds> dummy_timers;
     auto& t = timers ? *timers : dummy_timers;
+    
     auto pol = policy_indices.to(obs_sequence.device()).to(torch::kLong).contiguous();
 
     // 1. Embeddings
+    auto t0 = Clock::now();
     auto embeds = lb::model::compute_embeddings(
         obs_sequence, action_sequence, agent_types, positions,
         batched_weights, pol, padding_mask, count_pad, tflag_pad, &t);
+    auto t1 = Clock::now();
+    t["forward_embeddings_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
 
     // 2. Gating and Fusion
+    t0 = Clock::now();
     auto gating = lb::model::gating(
         embeds.at("obs_embed"), embeds.at("action_embed"),
         embeds.at("agent_embed"), embeds.at("position_embed"),
         batched_weights, pol, &t);
+    t1 = Clock::now();
+    t["forward_gating_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
 
+    t0 = Clock::now();
     auto fused = lb::model::fuse_embeddings(
         gating.at("g_obs"), gating.at("g_action"), gating.at("g_agent"), gating.at("g_position"),
         embeds.at("obs_embed"), embeds.at("action_embed"), embeds.at("agent_embed"), embeds.at("position_embed"),
         hidden_dim);
+    t1 = Clock::now();
+    t["forward_fusion_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
 
     auto x = fused.at("combined");
 
@@ -470,6 +481,8 @@ forward_packed(
     torch::Tensor last_topk_idx, last_topk_scores;
     for (int64_t i = 0; i < num_layers; ++i) {
         std::string prefix = "transformer.layers." + std::to_string(i);
+        std::string layer_key = "forward_layer_" + std::to_string(i) + "_us";
+        
         // Select per-layer workspace if provided
         lb::moe::MoEWorkspace* ws_ptr = nullptr;
         if (moe_workspaces) {
@@ -478,6 +491,8 @@ forward_packed(
         } else if (g_tls_workspace_enabled && i < static_cast<int64_t>(g_tls_workspaces.size())) {
             ws_ptr = &g_tls_workspaces[i];
         }
+        
+        t0 = Clock::now();
         auto [x_next, gate_logits, topk_indices, topk_scores] = lb::model::transformer_layer(
             x, pol,
             get_weight(batched_weights, prefix + ".self_attn.in_proj_weight"),
@@ -495,22 +510,32 @@ forward_packed(
             get_weight(batched_weights, prefix + ".norm2.weight"),
             get_weight(batched_weights, prefix + ".norm2.bias"),
             num_heads, hidden_dim, top_k,
-            ws_ptr);
+            ws_ptr, &t);
+        t1 = Clock::now();
+        t[layer_key] += std::chrono::duration_cast<Microseconds>(t1 - t0);
+        
         x = x_next;
         last_topk_idx = topk_indices;
         last_topk_scores = topk_scores;
     }
 
     // 4. Final Norm
+    t0 = Clock::now();
     auto transformer_output = lb::kernels::indexed_batched_layer_norm(
         x, get_weight(batched_weights, "transformer.norm.weight"),
         get_weight(batched_weights, "transformer.norm.bias"), pol);
+    t1 = Clock::now();
+    t["forward_final_norm_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
 
     // 5. Heads
+    t0 = Clock::now();
     auto heads_stacked = lb::model::compute_heads(
         transformer_output, batched_weights, pol, num_experts, &t);
+    t1 = Clock::now();
+    t["forward_heads_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
 
     // 6. Reduce Heads
+    t0 = Clock::now();
     auto action_logits = lb::model::reduce_expert_heads(
         heads_stacked.at("action_heads_stacked"), last_topk_idx, last_topk_scores);
     auto opp_logits = lb::model::reduce_expert_heads(
@@ -519,6 +544,8 @@ forward_packed(
         heads_stacked.at("reward_heads_stacked"), last_topk_idx, last_topk_scores);
     auto win_logits = lb::model::reduce_expert_heads(
         heads_stacked.at("win_heads_stacked"), last_topk_idx, last_topk_scores);
+    t1 = Clock::now();
+    t["forward_reduce_heads_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
 
     return std::make_tuple(action_logits, opp_logits, state_values, win_logits);
 }

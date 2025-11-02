@@ -103,7 +103,8 @@ transformer_layer(
     int64_t num_heads,
     int64_t hidden_dim,
     int64_t top_k,
-    lb::moe::MoEWorkspace* workspace = nullptr);
+    lb::moe::MoEWorkspace* workspace = nullptr,
+    std::unordered_map<std::string, std::chrono::microseconds>* timers = nullptr);
 
 /**
  * Compute all per-expert heads.

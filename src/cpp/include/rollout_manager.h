@@ -133,6 +133,11 @@ public:
     void set_max_sequence_length(int max_len);
     void set_policy_max_sequence_length(int policy_id, int max_len);
     std::unordered_map<std::string, int64_t> get_performance_stats() const;
+    /**
+     * Get accumulated timing statistics from forward passes.
+     * Returns a map of operation name -> total microseconds.
+     */
+    std::unordered_map<std::string, int64_t> get_timing_stats() const;
     int training_policy_id() const {
         return training_policy_ids_.empty() ? -1 : training_policy_ids_.front();
     }

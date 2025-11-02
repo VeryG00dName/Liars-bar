@@ -449,6 +449,11 @@ EvalOutcome EvalManager::run_roles(const std::vector<std::vector<int>>& roles,
 
     // Reset detailed timers for this run
     detailed_timers_.clear();
+    
+    // Reset orchestrator timing stats at start of run
+    if (orchestrator_) {
+        orchestrator_->reset_timing_stats();
+    }
 
     auto total_start = Clock::now();
 
@@ -776,6 +781,15 @@ std::unordered_map<std::string, int64_t> EvalManager::get_last_performance_stats
     for (const auto& kv : detailed_timers_) {
         stats[kv.first] = kv.second.count();
     }
+
+    // Merge orchestrator timing stats if available
+    if (orchestrator_) {
+        auto orchestrator_stats = orchestrator_->get_timing_stats();
+        for (const auto& kv : orchestrator_stats) {
+            stats[kv.first] = kv.second;
+        }
+    }
+
     return stats;
 }
 

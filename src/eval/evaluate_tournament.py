@@ -321,18 +321,19 @@ def run_active_league(
 
         if perf_stats:
             print("--- EvalManager Performance (microseconds) ---")
-            main_timers = {k: v for k, v in perf_stats.items() if not k.startswith("fwd_") and not k.startswith("linear_")}
-            detailed_timers = {k: v for k, v in perf_stats.items() if k.startswith("fwd_") or k.startswith("linear_")}
+            forward_timings = {k: v for k, v in perf_stats.items() 
+                              if k.startswith("forward_") or k.startswith("layer_") or k.startswith("linear_")}
+            main_timers = {k: v for k, v in perf_stats.items() if k not in forward_timings}
 
             for key, value in sorted(main_timers.items()):
-                print(f"  - {key:<24}: {value} us ({value / 1e6:.6f}s)")
+                print(f"  - {key:<32}: {value:>12} us ({value / 1e6:.6f}s)")
 
-            if detailed_timers:
+            if forward_timings:
                 print("\n--- Forward Pass Breakdown (microseconds) ---")
-                total_fwd_time = sum(detailed_timers.values())
-                for key, value in sorted(detailed_timers.items(), key=lambda item: -item[1]):
+                total_fwd_time = sum(forward_timings.values())
+                for key, value in sorted(forward_timings.items(), key=lambda item: -item[1]):
                     perc = (value / total_fwd_time * 100.0) if total_fwd_time > 0 else 0.0
-                    print(f"  - {key:<24}: {value} us ({value / 1e6:.6f}s) [{perc:.1f}%]")
+                    print(f"  - {key:<32}: {value:>12} us ({value / 1e6:.6f}s) [{perc:>5.1f}%]")
 
         if len(results_list) != len(quartets):
             raise RuntimeError(

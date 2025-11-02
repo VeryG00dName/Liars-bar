@@ -189,5 +189,7 @@ void bind_rollout_manager(py::module_& m) {
              py::arg("max_seq_length"))
         .def("set_policy_max_sequence_length", &RolloutManager::set_policy_max_sequence_length,
              py::arg("policy_id"), py::arg("max_seq_length"))
-        .def("get_performance_stats", &RolloutManager::get_performance_stats);
+        .def("get_performance_stats", &RolloutManager::get_performance_stats)
+        .def("get_timing_stats", &RolloutManager::get_timing_stats,
+             "Get accumulated timing statistics from forward passes.");
 }

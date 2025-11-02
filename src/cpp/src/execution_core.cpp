@@ -333,7 +333,8 @@ NeuralInferenceOrchestrator::run_inference(
         auto [obs_seq, action_seq, agent_types, positions, padding_mask, policy_indices] =
             prepare_batch_tensors(batch_requests, max_seq_len);
 
-        // Run forward_packed
+        // Run forward_packed with timing
+        std::unordered_map<std::string, std::chrono::microseconds> batch_timers;
         auto [action_logits, opp_logits, state_values, win_logits] = lb::forward::forward_packed(
             obs_seq,
             action_seq,
@@ -349,9 +350,14 @@ NeuralInferenceOrchestrator::run_inference(
             top_k_,
             /*count_pad=*/4,
             /*tflag_pad=*/3,
-            /*timers=*/nullptr,
+            /*timers=*/&batch_timers,
             moe_workspaces_.empty() ? nullptr : moe_workspaces_.data()
         );
+
+        // Accumulate timing stats
+        for (const auto& kv : batch_timers) {
+            timing_stats_[kv.first] += kv.second;
+        }
 
         // Process results for each request in the batch
         for (int64_t i = 0; i < actual_batch_size; ++i) {

@@ -179,9 +179,27 @@ class PPOVecRolloutManager:
 
         total_duration = time.perf_counter() - perf_start
 
-        #print("--- Python Rollout Performance ---")
-        #print(f"  - cpp_rollout_total      : {cpp_duration:.6f}s")
-        #print(f"  - py_convert_episodes    : {convert_duration:.6f}s")
-        #print(f"  - total_collect_episodes : {total_duration:.6f}s")
+        # Print timing stats if enabled via environment variable
+        import os
+        if os.getenv("LB_PRINT_ROLLOUT_TIMING"):
+            timing_stats = self.rollout_manager.get_timing_stats()
+            if timing_stats:
+                print("--- Rollout Forward Pass Timing (microseconds) ---")
+                # Separate forward pass timings from other stats
+                forward_timings = {k: v for k, v in timing_stats.items() 
+                                 if k.startswith("forward_") or k.startswith("layer_") or k.startswith("linear_")}
+                other_stats = {k: v for k, v in timing_stats.items() 
+                             if k not in forward_timings}
+                
+                if forward_timings:
+                    total_fwd_time = sum(forward_timings.values())
+                    for key, value in sorted(forward_timings.items(), key=lambda item: -item[1]):
+                        perc = (value / total_fwd_time * 100.0) if total_fwd_time > 0 else 0.0
+                        print(f"  - {key:<32}: {value:>12} us ({value / 1e6:.6f}s) [{perc:>5.1f}%]")
+                    
+                    if other_stats:
+                        print("\n--- Other Rollout Stats (microseconds) ---")
+                        for key, value in sorted(other_stats.items()):
+                            print(f"  - {key:<32}: {value:>12} us ({value / 1e6:.6f}s)")
 
         return episodes

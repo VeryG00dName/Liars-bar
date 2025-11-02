@@ -1,6 +1,7 @@
 #include "model_layer.h"
 #include "lb_kernels.h"
 #include "moe_autograd_function.h" // For grouped_moe_autograd_forward
+#include "moe_cutlass_kernels.h" // For cutlass_grouped_moe_forward_with_hidden_device
 #include <sstream>
 #include <torch/torch.h>
 
@@ -204,22 +205,28 @@ transformer_layer(
     int64_t num_heads,
     int64_t hidden_dim,
     int64_t top_k,
-    lb::moe::MoEWorkspace* workspace) {
+    lb::moe::MoEWorkspace* workspace,
+    std::unordered_map<std::string, std::chrono::microseconds>* timers) {
+
+    using Microseconds = std::chrono::microseconds;
+    using Clock = std::chrono::high_resolution_clock;
+    std::unordered_map<std::string, Microseconds> dummy_timers;
+    auto& t = timers ? *timers : dummy_timers;
 
     const int64_t B = x.size(0);
     const int64_t T = x.size(1);
     const int64_t head_dim = hidden_dim / num_heads;
-    std::unordered_map<std::string, std::chrono::microseconds> dummy_timers;
 
     // --- Attention Block ---
+    auto t0 = Clock::now();
     int64_t weight_chunk_dim = (in_proj_weight.dim() == 3) ? 1 : 0;
     int64_t bias_chunk_dim   = (in_proj_bias.dim() == 2) ? 1 : 0;
     auto qkv_weights = in_proj_weight.chunk(3, weight_chunk_dim);
     auto qkv_biases  = in_proj_bias.chunk(3, bias_chunk_dim);
 
-    auto q = lb::kernels::indexed_batched_linear(x, qkv_weights[0], qkv_biases[0], policy_indices, dummy_timers);
-    auto k = lb::kernels::indexed_batched_linear(x, qkv_weights[1], qkv_biases[1], policy_indices, dummy_timers);
-    auto v = lb::kernels::indexed_batched_linear(x, qkv_weights[2], qkv_biases[2], policy_indices, dummy_timers);
+    auto q = lb::kernels::indexed_batched_linear(x, qkv_weights[0], qkv_biases[0], policy_indices, t);
+    auto k = lb::kernels::indexed_batched_linear(x, qkv_weights[1], qkv_biases[1], policy_indices, t);
+    auto v = lb::kernels::indexed_batched_linear(x, qkv_weights[2], qkv_biases[2], policy_indices, t);
 
     q = q.view({B, T, num_heads, head_dim}).transpose(1, 2);
     k = k.view({B, T, num_heads, head_dim}).transpose(1, 2);
@@ -227,13 +234,17 @@ transformer_layer(
 
     auto attn_output = torch::scaled_dot_product_attention(q, k, v, torch::nullopt, 0.0, true);
     attn_output = attn_output.transpose(1, 2).contiguous().view({B, T, hidden_dim});
-    attn_output = lb::kernels::indexed_batched_linear(attn_output, out_proj_weight, out_proj_bias, policy_indices, dummy_timers);
+    attn_output = lb::kernels::indexed_batched_linear(attn_output, out_proj_weight, out_proj_bias, policy_indices, t);
 
     auto residual1 = x + attn_output;
     auto x_norm = lb::kernels::indexed_batched_layer_norm(residual1, norm1_weight, norm1_bias, policy_indices, 1e-5);
+    
+    auto t1 = Clock::now();
+    t["layer_attention_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
 
     // --- MoE Block ---
-    auto gate_logits = lb::kernels::indexed_batched_linear(x_norm, gate_weight, gate_bias, policy_indices, dummy_timers);
+    t0 = Clock::now();
+    auto gate_logits = lb::kernels::indexed_batched_linear(x_norm, gate_weight, gate_bias, policy_indices, t);
     auto probs = torch::softmax(gate_logits, -1);
     auto topk_vals_idx = torch::topk(gate_logits, top_k, -1);
     auto topk_indices = std::get<1>(topk_vals_idx);
@@ -263,37 +274,41 @@ transformer_layer(
     
     auto expert_inputs = x_flat.index_select(0, sorted_token_indices).contiguous();
 
-    auto [m_sizes_cpu, policy_ids_cpu, expert_ids_cpu, token_offsets_cpu] = lb::model::moe_group_metadata(
-        sorted_expert_indices, sorted_policy_indices);
+    // Use GPU-only path since forward_packed never needs grads
+    auto [m_sizes_dev, policy_ids_dev, expert_ids_dev, token_offsets_dev] = 
+        lb::model::moe_group_metadata_device(sorted_expert_indices, sorted_policy_indices);
 
-    // Build pointer tables directly from stacked tensors (device UInt64)
-    auto build_ptr_table = [&](const torch::Tensor& stacked) -> torch::Tensor {
-        TORCH_CHECK(stacked.is_cuda(), "Stacked expert tensors must be CUDA");
-        const int64_t P = stacked.size(0);
-        const int64_t E = stacked.size(1);
-        auto tbl_cpu = torch::empty({P, E}, torch::dtype(torch::kUInt64).device(torch::kCPU));
-        auto acc = tbl_cpu.accessor<uint64_t, 2>();
-        for (int64_t p = 0; p < P; ++p) {
-            for (int64_t e = 0; e < E; ++e) {
-                auto slice = stacked.index({p, e});
-                acc[p][e] = reinterpret_cast<uint64_t>(slice.data_ptr());
-            }
-        }
-        return tbl_cpu.to(stacked.device());
-    };
+    auto w1_fp16 = w1_all.to(torch::kFloat16);
+    auto w2_fp16 = w2_all.to(torch::kFloat16);
+    auto b1_fp16 = b1_all.to(torch::kFloat16);
+    auto b2_fp16 = b2_all.to(torch::kFloat16);
 
-    auto w1_ptrs_table = build_ptr_table(w1_all.to(torch::kFloat16));
-    auto w2_ptrs_table = build_ptr_table(w2_all.to(torch::kFloat16));
-    auto b1_ptrs_table = build_ptr_table(b1_all.to(torch::kFloat16));
-    auto b2_ptrs_table = build_ptr_table(b2_all.to(torch::kFloat16));
+    auto w1_ptrs_table = lb::model::build_ptr_table_device(w1_fp16);
+    auto w2_ptrs_table = lb::model::build_ptr_table_device(w2_fp16);
+    auto b1_ptrs_table = lb::model::build_ptr_table_device(b1_fp16);
+    auto b2_ptrs_table = lb::model::build_ptr_table_device(b2_fp16);
 
-    auto expert_outputs = lb::moe::grouped_moe_autograd_forward(
-        expert_inputs, w1_all.to(torch::kFloat16), w2_all.to(torch::kFloat16),
-        b1_all.to(torch::kFloat16), b2_all.to(torch::kFloat16),
-        w1_ptrs_table, w2_ptrs_table, b1_ptrs_table, b2_ptrs_table,
-        sorted_routing_weights, sorted_token_indices,
-        m_sizes_cpu, policy_ids_cpu, expert_ids_cpu, token_offsets_cpu,
-        hidden_dim, w1_all.size(-2), workspace);
+    int64_t total_tokens = expert_inputs.size(0);
+    int64_t ffn_dim = w1_all.size(-2);
+    auto expert_outputs = torch::empty({total_tokens, hidden_dim}, expert_inputs.options());
+    auto hidden_tmp = torch::empty({total_tokens, ffn_dim}, expert_inputs.options());
+    int64_t group_count = m_sizes_dev.size(0);
+
+    lb::moe::cutlass_grouped_moe_forward_with_hidden_device(
+        reinterpret_cast<uintptr_t>(expert_inputs.data_ptr<at::Half>()),
+        reinterpret_cast<uintptr_t>(hidden_tmp.data_ptr<at::Half>()),
+        reinterpret_cast<uintptr_t>(expert_outputs.data_ptr<at::Half>()),
+        reinterpret_cast<uintptr_t>(sorted_routing_weights.data_ptr<float>()),
+        w1_ptrs_table.data_ptr<uint64_t>(),
+        w2_ptrs_table.data_ptr<uint64_t>(),
+        b1_ptrs_table.data_ptr<uint64_t>(),
+        b2_ptrs_table.data_ptr<uint64_t>(),
+        w1_fp16.size(0), w1_fp16.size(1),
+        m_sizes_dev.data_ptr<int64_t>(),
+        policy_ids_dev.data_ptr<int64_t>(),
+        expert_ids_dev.data_ptr<int64_t>(),
+        token_offsets_dev.data_ptr<int64_t>(),
+        group_count, hidden_dim, ffn_dim, workspace);
 
     auto moe_output_flat = torch::zeros({num_tokens, hidden_dim}, expert_outputs.options());
     moe_output_flat.index_add_(0, sorted_token_indices, expert_outputs);
@@ -301,6 +316,9 @@ transformer_layer(
 
     auto residual2 = x_norm + moe_output;
     auto x_next = lb::kernels::indexed_batched_layer_norm(residual2, norm2_weight, norm2_bias, policy_indices, 1e-5);
+    
+    t1 = Clock::now();
+    t["layer_moe_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
 
     return std::make_tuple(x_next, gate_logits, topk_indices, topk_weights);
 }
@@ -319,9 +337,17 @@ compute_heads(
     auto pol = policy_indices.to(transformer_output.device()).to(torch::kLong).contiguous();
     c10::Dict<std::string, torch::Tensor> result;
 
+    // Process all experts for each head type
     std::vector<torch::Tensor> action_logits_list, opp_logits_list, state_values_list, win_logits_list;
+    action_logits_list.reserve(num_experts);
+    opp_logits_list.reserve(num_experts);
+    state_values_list.reserve(num_experts);
+    win_logits_list.reserve(num_experts);
+
     for (int64_t i = 0; i < num_experts; ++i) {
         auto idx_str = std::to_string(i);
+        // Process all 4 head types for this expert in sequence
+        // They can't be batched due to different output dims, but we avoid extra overhead
         action_logits_list.push_back(lb::kernels::indexed_batched_linear(transformer_output,
             get_weight(batched_weights, "action_heads." + idx_str + ".weight"),
             get_weight(batched_weights, "action_heads." + idx_str + ".bias"), pol, t));

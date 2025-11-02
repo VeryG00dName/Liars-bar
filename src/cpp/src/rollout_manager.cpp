@@ -132,6 +132,11 @@ std::vector<TrajectoryData> RolloutManager::run_rollouts(
     uint32_t seed,
     const std::vector<std::vector<int>>& opponent_triplets
 ) {
+    // Reset timing stats at start of rollout
+    if (orchestrator_) {
+        orchestrator_->reset_timing_stats();
+    }
+    
     // Initialize rollout
     start_rollouts(num_episodes, num_players, training_policy_ids, max_batch_envs, seed,
                    {}, {}, opponent_triplets);
@@ -509,6 +514,13 @@ std::unordered_map<std::string, int64_t> RolloutManager::get_performance_stats()
     stats["cpp_bots_us"] = timer_cpp_bots_.count();
     stats["neural_inference_us"] = timer_neural_inference_.count();
     return stats;
+}
+
+std::unordered_map<std::string, int64_t> RolloutManager::get_timing_stats() const {
+    if (!orchestrator_) {
+        return {};
+    }
+    return orchestrator_->get_timing_stats();
 }
 
 void RolloutManager::load_model(
