@@ -48,13 +48,6 @@ class PPOVecRolloutManager:
             except AttributeError:
                 logging.warning("set_use_greedy_stepping not available in C++ RolloutManager")
 
-    def get_last_model_call_stats(self) -> Dict[int, Dict[str, float]]:
-        """
-        Legacy method - returns empty dict since all inference now happens in C++.
-        Use rollout_manager.get_performance_stats() for C++ timing info.
-        """
-        return {}
-
     def _reset_policy_state(self) -> None:
         for policy in self.policies.values():
             try:
