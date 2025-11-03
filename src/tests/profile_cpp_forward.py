@@ -228,7 +228,7 @@ def benchmark_pytorch_forward(
     obs, acts, agent_types, positions, action_masks, padding_mask = tu.create_dummy_inputs(
         batch_size=batch_size,
         seq_len=seq_len,
-        obs_dim=9,  # TorchScript expects original 9-dim obs
+        obs_dim=16,  # TorchScript expects original 9-dim obs
         device=device,
         dtype=torch.float32,  # TorchScript uses float32, not float16
     )
