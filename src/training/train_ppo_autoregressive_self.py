@@ -534,6 +534,23 @@ def _find_traced_artifact_for_checkpoint(checkpoint_path: str) -> Optional[Path]
 # SECTION 2: THE CORE TRAIN FUNCTION
 # ==============================================================================
 
+def _extract_generation_number(run_name: str) -> Optional[int]:
+    """
+    Extract generation number from run_name.
+    Pattern: "gen_N" -> N
+    Returns None if pattern doesn't match.
+    """
+    if not run_name:
+        return None
+    if run_name.startswith("gen_"):
+        try:
+            gen_str = run_name[4:]  # Remove "gen_" prefix
+            gen_num = int(gen_str)
+            return gen_num
+        except ValueError:
+            return None
+    return None
+
 def train_generation(
     run_name: str,
     master_run_name: str,
@@ -706,11 +723,20 @@ def train_generation(
         f"Assigned training policy id {training_policy_id}; existing opponent labels: {sorted(existing_labels)}"
     )
 
+    # Extract generation number for hybrid mode
+    gen_number = _extract_generation_number(run_name)
+    use_legacy_mode = (gen_number is not None and gen_number <= config.HYBRID_TRAINING_THRESHOLD)
+    if use_legacy_mode:
+        logging.info(f"Using legacy rollout mode for generation {gen_number} (gen <= {config.HYBRID_TRAINING_THRESHOLD})")
+    else:
+        logging.info(f"Using optimized rollout mode for generation {gen_number if gen_number else 'unknown'}")
+
      # 3. INITIALIZE ROLLOUT MANAGER
     rollout_manager = PPOVecRolloutManager(
         policy_map,
         device,
         rng=(rng or _GLOBAL_RNG),
+        use_legacy_mode=use_legacy_mode,
     )
 
     cpp_bot_names = {
@@ -735,14 +761,17 @@ def train_generation(
                 f"Failed to register native C++ bot '{name}' (label {label}) with rollout manager: {exc}"
             )
 
-    # Load the training policy model into C++ for unified forward pass
-    logging.info(f"Loading training policy {training_policy_id} into C++ RolloutManager...")
-    try:
-        training_state_dict = learner.model.state_dict()
-        # C++ will prestack expert weights during finalize_model_loading()
-        rollout_manager.cpp_manager.load_model(training_policy_id, training_state_dict, "")
-    except Exception as exc:
-        logging.exception(f"Failed to load training policy {training_policy_id} into C++ manager: {exc}")
+    # Load the training policy model into C++ for unified forward pass (only for optimized mode)
+    if not use_legacy_mode:
+        logging.info(f"Loading training policy {training_policy_id} into C++ RolloutManager...")
+        try:
+            training_state_dict = learner.model.state_dict()
+            # C++ will prestack expert weights during finalize_model_loading()
+            rollout_manager.cpp_manager.load_model(training_policy_id, training_state_dict, "")
+        except Exception as exc:
+            logging.exception(f"Failed to load training policy {training_policy_id} into C++ manager: {exc}")
+    else:
+        logging.info(f"Skipping training policy {training_policy_id} loading into C++ (legacy mode uses Python inference)")
 
     # Load historical agents from the opponent pool into the C++ manager
     loaded_historical_labels: List[int] = []
@@ -811,37 +840,60 @@ def train_generation(
             agent_def['path_max_seq'] = resolved_metadata_path
             pool_was_updated = True
 
-        # Now, load the (potentially newly created) model into the C++ manager
-        try:
-            # Load TorchScript model and extract state_dict for new API
-            traced_model = torch.jit.load(str(traced_path), map_location=device)
-            state_dict = traced_model.state_dict()
+        # Load historical models differently based on mode
+        if use_legacy_mode:
+            # Legacy mode: Load as torch.jit.Module for greedy stepping
+            try:
+                rollout_manager.cpp_manager.load_historical_model(policy_id, str(traced_path))
+                loaded_historical_labels.append(policy_id)
+                if existing_max_seq is not None:
+                    try:
+                        rollout_manager.cpp_manager.set_policy_max_sequence_length(policy_id, existing_max_seq)
+                    except Exception:
+                        logging.exception(
+                            "Failed to set max sequence length %s for historical policy %s",
+                            existing_max_seq,
+                            policy_id,
+                        )
+            except Exception as exc:
+                logging.exception(
+                    f"Failed to load historical policy {policy_id} from {traced_path} (legacy mode): {exc}"
+                )
+        else:
+            # Optimized mode: Load state_dict for forward_packed
+            try:
+                # Load TorchScript model and extract state_dict for new API
+                traced_model = torch.jit.load(str(traced_path), map_location=device)
+                state_dict = traced_model.state_dict()
 
-            rollout_manager.cpp_manager.load_model(policy_id, state_dict, str(checkpoint_path))
-            loaded_historical_labels.append(policy_id)
-            if existing_max_seq is not None:
-                try:
-                    rollout_manager.cpp_manager.set_policy_max_sequence_length(policy_id, existing_max_seq)
-                except Exception:
-                    logging.exception(
-                        "Failed to set max sequence length %s for historical policy %s",
-                        existing_max_seq,
-                        policy_id,
-                    )
-        except Exception as exc:
-            logging.exception(
-                f"Failed to load traced historical policy {policy_id} from {traced_path}: {exc}"
-            )
+                rollout_manager.cpp_manager.load_model(policy_id, state_dict, str(checkpoint_path))
+                loaded_historical_labels.append(policy_id)
+                if existing_max_seq is not None:
+                    try:
+                        rollout_manager.cpp_manager.set_policy_max_sequence_length(policy_id, existing_max_seq)
+                    except Exception:
+                        logging.exception(
+                            "Failed to set max sequence length %s for historical policy %s",
+                            existing_max_seq,
+                            policy_id,
+                        )
+            except Exception as exc:
+                logging.exception(
+                    f"Failed to load traced historical policy {policy_id} from {traced_path}: {exc}"
+                )
 
     # If we generated any new traces, save the updated opponent pool file
     if pool_was_updated:
         logging.info("Saving updated opponent pool with new TorchScript paths...")
         pool_manager.save()
 
-    # Finalize model loading to create the orchestrator and batch weights
-    # This batches all loaded models (training + historical) for unified forward pass
-    logging.info("Finalizing model loading to create execution orchestrator...")
-    rollout_manager.cpp_manager.finalize_model_loading()
+    # Finalize model loading to create the orchestrator and batch weights (only for optimized mode)
+    if not use_legacy_mode:
+        # This batches all loaded models (training + historical) for unified forward pass
+        logging.info("Finalizing model loading to create execution orchestrator...")
+        rollout_manager.cpp_manager.finalize_model_loading()
+    else:
+        logging.info("Skipping finalize_model_loading (legacy mode uses torch.jit.Module per policy)")
 
     logging.info(
         "Native C++ bots registered: %s; historical TorchScript policies loaded: %s",
@@ -872,17 +924,20 @@ def train_generation(
         # -------- Rollout --------
         bucket_stats.clear()
         t0 = time.time()
-        learner.sync_rollout_models()
-
-        # Sync updated training model weights to C++ for rollout inference
-        # After gradient updates, we need to reload the training policy into C++ orchestrator
-        try:
-            updated_state_dict = learner.model.state_dict()
-            # C++ will prestack expert weights during finalize_model_loading()
-            rollout_manager.cpp_manager.load_model(training_policy_id, updated_state_dict, "")
-            rollout_manager.cpp_manager.finalize_model_loading()
-        except Exception as exc:
-            logging.exception(f"Failed to sync training policy weights to C++ after update {update}: {exc}")
+        
+        if use_legacy_mode:
+            # Legacy mode: Sync rollout models in Python
+            learner.sync_rollout_models()
+        else:
+            # Optimized mode: Sync updated training model weights to C++ for rollout inference
+            # After gradient updates, we need to reload the training policy into C++ orchestrator
+            try:
+                updated_state_dict = learner.model.state_dict()
+                # C++ will prestack expert weights during finalize_model_loading()
+                rollout_manager.cpp_manager.load_model(training_policy_id, updated_state_dict, "")
+                rollout_manager.cpp_manager.finalize_model_loading()
+            except Exception as exc:
+                logging.exception(f"Failed to sync training policy weights to C++ after update {update}: {exc}")
 
         opponent_expert_affinity: DefaultDict[int, torch.Tensor]
         opponent_expert_affinity = defaultdict(

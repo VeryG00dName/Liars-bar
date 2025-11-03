@@ -132,6 +132,8 @@ public:
     void set_training_device(const std::string& device_str);
     void set_max_sequence_length(int max_len);
     void set_policy_max_sequence_length(int policy_id, int max_len);
+    void set_use_greedy_stepping(bool use_greedy);
+    void load_historical_model(int policy_id, const std::string& path);
     std::unordered_map<std::string, int64_t> get_performance_stats() const;
     /**
      * Get accumulated timing statistics from forward passes.
@@ -198,6 +200,10 @@ private:
     std::vector<int> weighted_opponent_labels_;
     std::vector<double> weighted_opponent_weights_;
     std::vector<std::vector<int>> fixed_opponent_triplets_;
+    
+    // Legacy mode: greedy stepping and torch.jit.Module for historical models
+    bool use_greedy_stepping_{false};
+    std::unordered_map<int, std::shared_ptr<torch::jit::Module>> historical_models_;
 
     // --- Profiling Timers ---
     std::chrono::microseconds timer_total_collect_{0};
@@ -227,8 +233,9 @@ private:
         std::unordered_map<int, std::vector<float>>& out_values);
 
     std::vector<uint8_t> run_cpp_bot(int policy_id, const std::vector<PolicyRequest>& requests);
+    std::vector<uint8_t> run_historical_inference(torch::jit::Module& module,
+                                                  const std::vector<PolicyRequest>& requests);
     static CppBotKind parse_cpp_bot_kind(const std::string& name);
     std::unique_ptr<CppBotBase> make_cpp_bot_instance(CppBotKind kind,
                                                       const PolicyRequest& request);
 };
-

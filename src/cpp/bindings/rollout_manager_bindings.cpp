@@ -162,6 +162,23 @@ void bind_rollout_manager(py::module_& m) {
              py::arg("log_probs") = py::none(),
              py::arg("values") = py::none())
              
+        .def("collect_requests_for_inference",
+             [](RolloutManager& self) {
+                 // Store the result to keep PolicyRequest objects alive during conversion
+                 const auto requests_by_policy = self.collect_requests_for_inference();
+                 py::dict result;
+                 for (const auto& kv : requests_by_policy) {
+                     py::list requests_list;
+                     for (const PolicyRequest& req : kv.second) {
+                         // Copy the PolicyRequest object (including its vectors) for Python
+                         // Using copy policy - Python will own a copy of the object
+                         requests_list.append(py::cast(req, py::return_value_policy::copy));
+                     }
+                     result[py::int_(kv.first)] = requests_list;
+                 }
+                 return result;
+             },
+             "Collect inference requests grouped by policy. Returns dict mapping policy_id -> list of PolicyRequest.")
         .def("get_completed_episodes", &RolloutManager::get_completed_episodes)
         .def("load_model",
             [](RolloutManager& self, int policy_id, const py::dict& state_dict, const std::string& path) {
@@ -189,6 +206,26 @@ void bind_rollout_manager(py::module_& m) {
              py::arg("max_seq_length"))
         .def("set_policy_max_sequence_length", &RolloutManager::set_policy_max_sequence_length,
              py::arg("policy_id"), py::arg("max_seq_length"))
+        .def("set_use_greedy_stepping", &RolloutManager::set_use_greedy_stepping,
+             py::arg("use_greedy"),
+             "Enable/disable greedy stepping mode for legacy rollout (gen <= 15).")
+        .def("load_historical_model", &RolloutManager::load_historical_model,
+             py::arg("policy_id"), py::arg("path"),
+             "Load a TorchScript model for legacy mode historical inference.")
+        .def("prepare_training_batch",
+             [](RolloutManager& self, py::list requests_list, int policy_id) {
+                 std::vector<PolicyRequest> requests;
+                 requests.reserve(py::len(requests_list));
+                 for (py::handle req_obj : requests_list) {
+                     // Copy the PolicyRequest object (not a reference) to avoid lifetime issues
+                     PolicyRequest req = req_obj.cast<PolicyRequest>();
+                     requests.push_back(std::move(req));
+                 }
+                 return prepared_batch_to_dict(self.prepare_training_batch(requests, policy_id));
+             },
+             py::arg("requests"),
+             py::arg("policy_id"),
+             "Prepare a batch of PolicyRequests for training inference.")
         .def("get_performance_stats", &RolloutManager::get_performance_stats)
         .def("get_timing_stats", &RolloutManager::get_timing_stats,
              "Get accumulated timing statistics from forward passes.");

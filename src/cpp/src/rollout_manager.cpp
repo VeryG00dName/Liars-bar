@@ -15,6 +15,7 @@
 #include <c10/util/Optional.h>
 
 #include <torch/torch.h>
+#include <torch/script.h>
 
 #include "bots.h"
 #include "torch_utils.h"
@@ -330,87 +331,182 @@ std::unordered_map<int, std::vector<PolicyRequest>> RolloutManager::collect_requ
         if (progressed_bot) {
             continue;
         }
-        historical_groups.clear();
-        historical_groups.reserve(policy_ids.size());
-        for (int policy_id : policy_ids) {
-            if (is_training_policy(policy_id)) {
-                continue;
-            }
 
-            auto raw_it = raw.find(policy_id);
-            if (raw_it == raw.end()) {
-                continue;
-            }
-
-            const auto& requests = raw_it->second;
-            if (requests.empty()) {
-                continue;
-            }
-
-            // Check if this policy has neural weights loaded
-            auto cache_it = policy_id_to_cache_index_.find(policy_id);
-            if (cache_it == policy_id_to_cache_index_.end()) {
-                continue;  // Not a neural policy, skip
-            }
-
-            historical_groups.emplace_back(policy_id, &requests);
-        }
-
-        // Run unified neural inference for all neural policies (historical + learner)
-        if (!historical_groups.empty()) {
-            bool success = false;
-            auto h0 = std::chrono::high_resolution_clock::now();
-            try {
-                std::unordered_map<int, std::vector<PolicyRequest>> neural_requests;
-                for (const auto& group : historical_groups) {
-                    neural_requests[group.first] = *group.second;
+        if (use_greedy_stepping_) {
+            // Legacy greedy stepping mode: process historical policies one at a time
+            // Reference: src/temp_legacy_ref/legacy_rollout_manager.cpp:263-331
+            int best_policy = -1;
+            size_t best_count = 0;
+            const std::vector<PolicyRequest>* best_requests = nullptr;
+            for (int policy_id : policy_ids) {
+                if (is_training_policy(policy_id)) {
+                    continue;
                 }
 
-                std::unordered_map<int, std::vector<uint8_t>> action_map;
-                std::unordered_map<int, std::vector<float>> log_prob_map;
-                std::unordered_map<int, std::vector<float>> value_map;
-
-                run_neural_inference(neural_requests, action_map, log_prob_map, value_map);
-
-                for (auto& kv : action_map) {
-                    arena_.submit_actions(kv.first, kv.second);
+                auto raw_it = raw.find(policy_id);
+                if (raw_it == raw.end()) {
+                    continue;
                 }
-                success = true;
-            } catch (const std::exception& ex) {
-                std::cerr << "[RolloutManager] Neural inference failed: " << ex.what()
-                          << std::endl;
-            } catch (...) {
-                std::cerr << "[RolloutManager] Neural inference failed: unknown error"
-                          << std::endl;
-            }
-            auto h1 = std::chrono::high_resolution_clock::now();
-            timer_neural_inference_ += std::chrono::duration_cast<std::chrono::microseconds>(h1 - h0);
 
-            if (!success) {
-                for (const auto& group : historical_groups) {
-                    const auto& requests = *group.second;
-                    auto& dst = learner_requests[group.first];
+                const auto& requests = raw_it->second;
+                if (requests.empty()) {
+                    continue;
+                }
+
+                auto model_it = historical_models_.find(policy_id);
+                if (model_it == historical_models_.end() || !model_it->second) {
+                    continue;
+                }
+
+                const size_t request_count = requests.size();
+                if (best_policy < 0 || request_count > best_count) {
+                    best_policy = policy_id;
+                    best_count = request_count;
+                    best_requests = &requests;
+                }
+            }
+
+            if (best_policy < 0 || best_requests == nullptr) {
+                // No historical policies found, return training policy requests to Python
+                for (int policy_id : policy_ids) {
+                    auto raw_it = raw.find(policy_id);
+                    if (raw_it == raw.end()) {
+                        continue;
+                    }
+                    const auto& requests = raw_it->second;
+                    if (requests.empty()) {
+                        continue;
+                    }
+                    auto& dst = learner_requests[policy_id];
                     dst.insert(dst.end(), requests.begin(), requests.end());
                 }
                 break;
             }
 
-            continue;
-        }
+            // Process the best historical policy
+            auto model_it = historical_models_.find(best_policy);
+            if (model_it != historical_models_.end() && model_it->second) {
+                bool success = false;
+                try {
+                    auto actions = run_historical_inference(*model_it->second, *best_requests);
+                    arena_.submit_actions(best_policy, actions);
+                    success = true;
+                } catch (const std::exception& ex) {
+                    std::cerr << "[RolloutManager] Historical inference failed for policy " << best_policy
+                              << ": " << ex.what() << std::endl;
+                } catch (...) {
+                    std::cerr << "[RolloutManager] Historical inference failed for policy " << best_policy
+                              << ": unknown error" << std::endl;
+                }
 
-        for (int policy_id : policy_ids) {
-            auto raw_it = raw.find(policy_id);
-            if (raw_it == raw.end()) {
+                if (!success && best_requests != nullptr) {
+                    auto& dst = learner_requests[best_policy];
+                    dst.insert(dst.end(), best_requests->begin(), best_requests->end());
+                    break;
+                }
+
+                // Continue loop to collect new requests (greedy stepping)
                 continue;
             }
-            const auto& requests = raw_it->second;
-            if (requests.empty()) {
+
+            // Fall through to return training policy requests
+            for (int policy_id : policy_ids) {
+                auto raw_it = raw.find(policy_id);
+                if (raw_it == raw.end()) {
+                    continue;
+                }
+                const auto& requests = raw_it->second;
+                if (requests.empty()) {
+                    continue;
+                }
+                auto& dst = learner_requests[policy_id];
+                dst.insert(dst.end(), requests.begin(), requests.end());
+            }
+            break;
+        } else {
+            // Optimized mode: batch all historical policies together
+            historical_groups.clear();
+            historical_groups.reserve(policy_ids.size());
+            for (int policy_id : policy_ids) {
+                if (is_training_policy(policy_id)) {
+                    continue;
+                }
+
+                auto raw_it = raw.find(policy_id);
+                if (raw_it == raw.end()) {
+                    continue;
+                }
+
+                const auto& requests = raw_it->second;
+                if (requests.empty()) {
+                    continue;
+                }
+
+                // Check if this policy has neural weights loaded
+                auto cache_it = policy_id_to_cache_index_.find(policy_id);
+                if (cache_it == policy_id_to_cache_index_.end()) {
+                    continue;  // Not a neural policy, skip
+                }
+
+                historical_groups.emplace_back(policy_id, &requests);
+            }
+
+            // Run unified neural inference for all neural policies (historical + learner)
+            if (!historical_groups.empty()) {
+                bool success = false;
+                auto h0 = std::chrono::high_resolution_clock::now();
+                try {
+                    std::unordered_map<int, std::vector<PolicyRequest>> neural_requests;
+                    for (const auto& group : historical_groups) {
+                        neural_requests[group.first] = *group.second;
+                    }
+
+                    std::unordered_map<int, std::vector<uint8_t>> action_map;
+                    std::unordered_map<int, std::vector<float>> log_prob_map;
+                    std::unordered_map<int, std::vector<float>> value_map;
+
+                    run_neural_inference(neural_requests, action_map, log_prob_map, value_map);
+
+                    for (auto& kv : action_map) {
+                        arena_.submit_actions(kv.first, kv.second);
+                    }
+                    success = true;
+                } catch (const std::exception& ex) {
+                    std::cerr << "[RolloutManager] Neural inference failed: " << ex.what()
+                              << std::endl;
+                } catch (...) {
+                    std::cerr << "[RolloutManager] Neural inference failed: unknown error"
+                              << std::endl;
+                }
+                auto h1 = std::chrono::high_resolution_clock::now();
+                timer_neural_inference_ += std::chrono::duration_cast<std::chrono::microseconds>(h1 - h0);
+
+                if (!success) {
+                    for (const auto& group : historical_groups) {
+                        const auto& requests = *group.second;
+                        auto& dst = learner_requests[group.first];
+                        dst.insert(dst.end(), requests.begin(), requests.end());
+                    }
+                    break;
+                }
+
                 continue;
             }
-            auto& dst = learner_requests[policy_id];
-            dst.insert(dst.end(), requests.begin(), requests.end());
+
+            for (int policy_id : policy_ids) {
+                auto raw_it = raw.find(policy_id);
+                if (raw_it == raw.end()) {
+                    continue;
+                }
+                const auto& requests = raw_it->second;
+                if (requests.empty()) {
+                    continue;
+                }
+                auto& dst = learner_requests[policy_id];
+                dst.insert(dst.end(), requests.begin(), requests.end());
+            }
+            break;
         }
-        break;
     }
 
     auto total_end = std::chrono::high_resolution_clock::now();
@@ -658,6 +754,27 @@ void RolloutManager::register_cpp_bot(int policy_id, const std::string& bot_name
     } catch (const std::exception& err) {
         std::cerr << "[RolloutManager] Failed to register C++ bot '" << bot_name
                   << "' for policy " << policy_id << ": " << err.what() << std::endl;
+        throw;
+    }
+}
+
+void RolloutManager::set_use_greedy_stepping(bool use_greedy) {
+    use_greedy_stepping_ = use_greedy;
+}
+
+void RolloutManager::load_historical_model(int policy_id, const std::string& path) {
+    try {
+        auto module = std::make_shared<torch::jit::Module>(torch::jit::load(path));
+        module->to(kInferenceDevice);
+        module->eval();
+        historical_models_[policy_id] = std::move(module);
+    } catch (const c10::Error& err) {
+        std::cerr << "[RolloutManager] Failed to load TorchScript module from '" << path
+                  << "': " << err.what_without_backtrace() << std::endl;
+        throw;
+    } catch (const std::exception& err) {
+        std::cerr << "[RolloutManager] Failed to load TorchScript module from '" << path
+                  << "': " << err.what() << std::endl;
         throw;
     }
 }
@@ -1449,7 +1566,7 @@ std::unordered_map<int, std::vector<uint8_t>> RolloutManager::run_batched_histor
 
 #endif  // DEPRECATED run_batched_historical_inference
 
-#if 0  // DEPRECATED: Replaced by run_neural_inference()
+// Legacy mode: run_historical_inference for greedy stepping with torch.jit.Module
 std::vector<uint8_t> RolloutManager::run_historical_inference(torch::jit::Module& module,
                                                               const std::vector<PolicyRequest>& requests) {
     if (requests.empty()) {
@@ -1559,8 +1676,6 @@ std::vector<uint8_t> RolloutManager::run_historical_inference(torch::jit::Module
 
     return chosen;
 }
-
-#endif  // DEPRECATED run_historical_inference
 
 std::vector<uint8_t> RolloutManager::run_cpp_bot(int policy_id, const std::vector<PolicyRequest>& requests) {
     if (requests.empty()) {
