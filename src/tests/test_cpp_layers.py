@@ -95,7 +95,7 @@ def test_action_decomposition(
     policy_indices = reference.get('input/policy_indices', torch.zeros(batch_size, dtype=torch.long)).to(device)
 
     # Call C++ function
-    act_kind_ids_cpp, count_ids_cpp, table_flag_ids_cpp = lb.test_action_decomposition(
+    act_kind_ids_cpp, count_ids_cpp, table_flag_ids_cpp = lb.action_decomposition(
         action_sequence,
         batched_weights,
         policy_indices,
@@ -143,7 +143,7 @@ def test_embeddings(
     policy_indices = reference.get('input/policy_indices', torch.zeros(batch_size, dtype=torch.long)).to(device)
 
     # Call C++ function
-    embeddings_cpp = lb.test_embeddings(
+    embeddings_cpp = lb.compute_embeddings(
         obs_sequence,
         act_kind_ids,
         count_ids,
@@ -193,7 +193,7 @@ def test_gating(
     policy_indices = reference.get('input/policy_indices', torch.zeros(batch_size, dtype=torch.long)).to(device)
 
     # Call C++ function
-    gating_cpp = lb.test_gating(
+    gating_cpp = lb.gating(
         obs_embed,
         action_embed,
         agent_embed,
@@ -237,7 +237,7 @@ def test_fusion(
     position_embed = (position_embed_override if position_embed_override is not None else reference['embeddings/position_embed']).to(device)
 
     # Call C++ function
-    fusion_cpp = lb.test_fusion(
+    fusion_cpp = lb.fuse_embeddings(
         g_obs, g_action, g_agent, g_position,
         obs_embed, action_embed, agent_embed, position_embed,
         hidden_dim
@@ -281,148 +281,36 @@ def test_transformer_layers(
     for layer_idx in range(num_layers):
         print(f"\n--- Layer {layer_idx} ---")
 
-        # Test attention
-        print(f"\nAttention Layer {layer_idx}:")
-        attn_cpp = lb.test_attention_layer(
+        # Call transformer_layer (combines attention + MoE + residuals + norms)
+        x_next, gate_logits, topk_indices, topk_scores = lb.transformer_layer(
             x_cpp,
-            batched_weights,
             policy_indices,
-            padding_mask,
+            batched_weights,
             layer_idx,
             num_heads,
-            hidden_dim
+            hidden_dim,
+            top_k
         )
 
-        all_match &= compare_tensors(
-            f"layer_{layer_idx}/attn_output",
-            attn_cpp['attn_output'],
-            reference[f'transformer/layer_{layer_idx}/attn_output']
-        )
-        all_match &= compare_tensors(
-            f"layer_{layer_idx}/post_attn",
-            attn_cpp['post_attn'],
-            reference[f'transformer/layer_{layer_idx}/post_attn']
-        )
-
-        # Use post_attn output for MoE input
-        x_cpp = attn_cpp['post_attn']
-
-        # Staged MoE routing and sorting diagnostics before GEMMs
-        try:
-            rs = lb.test_moe_routing_sort(
-                x_cpp,
-                batched_weights,
-                policy_indices,
-                layer_idx,
-                num_experts,
-                top_k,
-            )
-
-            all_match &= compare_tensors(
-                f"layer_{layer_idx}/moe_gate_logits",
-                rs['gate_logits'],
-                reference[f'transformer/layer_{layer_idx}/moe_gate_logits']
-            )
-            all_match &= compare_tensors(
-                f"layer_{layer_idx}/moe_topk_indices",
-                rs['topk_indices'],
-                reference[f'transformer/layer_{layer_idx}/moe_topk_indices']
-            )
-            all_match &= compare_tensors(
-                f"layer_{layer_idx}/moe_topk_scores",
-                rs['topk_weights'],
-                reference[f'transformer/layer_{layer_idx}/moe_topk_scores']
-            )
-
-            # Compare staged sorted tensors if present in reference
-            ref_sorted_experts_key = f'transformer/layer_{layer_idx}/moe_sorted_expert_indices'
-            ref_sorted_tokens_key = f'transformer/layer_{layer_idx}/moe_sorted_token_indices'
-            ref_sorted_policies_key = f'transformer/layer_{layer_idx}/moe_sorted_policy_indices'
-            ref_sorted_weights_key = f'transformer/layer_{layer_idx}/moe_sorted_routing_weights'
-
-            if ref_sorted_experts_key in reference:
-                all_match &= compare_tensors(
-                    f"layer_{layer_idx}/moe_sorted_expert_indices",
-                    rs['sorted_expert_indices'],
-                    reference[ref_sorted_experts_key]
-                )
-            if ref_sorted_tokens_key in reference:
-                all_match &= compare_tensors(
-                    f"layer_{layer_idx}/moe_sorted_token_indices",
-                    rs['sorted_token_indices'],
-                    reference[ref_sorted_tokens_key]
-                )
-            if ref_sorted_policies_key in reference:
-                all_match &= compare_tensors(
-                    f"layer_{layer_idx}/moe_sorted_policy_indices",
-                    rs['sorted_policy_indices'],
-                    reference[ref_sorted_policies_key]
-                )
-            if ref_sorted_weights_key in reference:
-                all_match &= compare_tensors(
-                    f"layer_{layer_idx}/moe_sorted_routing_weights",
-                    rs['sorted_routing_weights'],
-                    reference[ref_sorted_weights_key]
-                )
-
-            grp = lb.test_moe_group_ranges(rs['sorted_expert_indices'], rs['sorted_policy_indices'])
-            total_routes = int(rs['sorted_expert_indices'].numel())
-            grp_sum = int(grp[:, 1].sum().item()) if grp.numel() > 0 else 0
-            if grp_sum != total_routes:
-                print(f"[WARN] layer_{layer_idx}: group counts sum {grp_sum} != total routes {total_routes}")
-        except Exception as e:
-            print(f"[WARN] Staged MoE routing/sorting check failed at layer {layer_idx}: {e}")
-
-        # Test MoE
-        print(f"\nMoE Layer {layer_idx}:")
-        moe_cpp = lb.test_moe_layer(
-            x_cpp,
-            batched_weights,
-            policy_indices,
-            layer_idx,
-            num_experts,
-            top_k,
-            hidden_dim
-        )
-
+        # Compare MoE outputs
         all_match &= compare_tensors(
             f"layer_{layer_idx}/moe_gate_logits",
-            moe_cpp['gate_logits'],
+            gate_logits,
             reference[f'transformer/layer_{layer_idx}/moe_gate_logits']
         )
         all_match &= compare_tensors(
             f"layer_{layer_idx}/moe_topk_indices",
-            moe_cpp['topk_indices'],
+            topk_indices,
             reference[f'transformer/layer_{layer_idx}/moe_topk_indices']
         )
         all_match &= compare_tensors(
             f"layer_{layer_idx}/moe_topk_scores",
-            moe_cpp['topk_scores'],
+            topk_scores,
             reference[f'transformer/layer_{layer_idx}/moe_topk_scores']
         )
-        all_match &= compare_tensors(
-            f"layer_{layer_idx}/moe_output",
-            moe_cpp['moe_output'],
-            reference[f'transformer/layer_{layer_idx}/moe_output']
-        )
 
-        # Residual + LayerNorm for next layer (use per-policy LN params)
-        residual2 = x_cpp + moe_cpp['moe_output']
-
-        # Gather per-sample gamma/beta for norm2
-        ln_gamma = batched_weights[f'transformer.layers.{layer_idx}.norm2.weight'].to(device)
-        ln_beta = batched_weights[f'transformer.layers.{layer_idx}.norm2.bias'].to(device)
-        # ln_gamma/beta shape: [W, H] -> select per policy -> [B, H]
-        gamma_sel = ln_gamma.index_select(0, policy_indices)
-        beta_sel = ln_beta.index_select(0, policy_indices)
-        # Compute LN manually for [B, T, H]
-        eps = 1e-5
-        mean = residual2.mean(dim=-1, keepdim=True)
-        var = residual2.var(dim=-1, unbiased=False, keepdim=True)
-        inv_std = torch.rsqrt(var + eps)
-        normed = (residual2 - mean) * inv_std
-        # Broadcast gamma/beta to [B, T, H]
-        x_cpp = normed * gamma_sel.unsqueeze(1) + beta_sel.unsqueeze(1)
+        # Update x for next layer
+        x_cpp = x_next
 
     # Test final norm (uses reference since we're chaining layers)
     transformer_output_ref = reference['transformer/final_output'].to(device)
@@ -452,7 +340,7 @@ def test_heads(
     policy_indices = reference.get('input/policy_indices', torch.zeros(batch_size, dtype=torch.long)).to(device)
 
     # Call C++ function
-    heads_cpp = lb.test_heads(
+    heads_cpp = lb.compute_heads(
         transformer_output,
         batched_weights,
         policy_indices,

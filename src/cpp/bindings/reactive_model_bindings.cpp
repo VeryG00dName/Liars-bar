@@ -2,8 +2,6 @@
 #include "model_layer.h"
 #include "weight_utils.h"
 #include "lb_kernels.h"
-#include "model_autograd.h"
-#include "moe_backward_kernels.h"
 #include "moe_cutlass_kernels.h"
 
 #include <pybind11/pybind11.h>
@@ -52,33 +50,6 @@ void bind_reactive_model(py::module_& m) {
         py::arg("num_experts") = 8, py::arg("top_k") = 2,
         py::arg("count_pad") = 4, py::arg("tflag_pad") = 3,
         "Inference forward pass for the reactive model.");
-
-    m.def("forward_packed_train",
-        [](const torch::Tensor& obs_sequence, const torch::Tensor& action_sequence,
-           const torch::Tensor& agent_types, const torch::Tensor& positions,
-           py::dict weights_py, const torch::Tensor& policy_indices,
-           const torch::optional<torch::Tensor>& padding_mask,
-           int64_t num_layers, int64_t num_heads, int64_t hidden_dim,
-           int64_t num_experts, int64_t top_k, int64_t count_pad, int64_t tflag_pad) {
-            auto tup = lb::forward::forward_packed_train(
-                obs_sequence, action_sequence, agent_types, positions,
-                py_dict_to_c10_dict(weights_py), policy_indices, padding_mask,
-                num_layers, num_heads, hidden_dim, num_experts, top_k, count_pad, tflag_pad);
-            
-            py::dict routing_py;
-            for(const auto& kv : std::get<5>(tup)) {
-                routing_py[py::cast(kv.first)] = py::cast(kv.second);
-            }
-            return py::make_tuple(std::get<0>(tup), std::get<1>(tup), std::get<2>(tup),
-                                  std::get<3>(tup), std::get<4>(tup), routing_py);
-        },
-        py::arg("obs_sequence"), py::arg("action_sequence"), py::arg("agent_types"),
-        py::arg("positions"), py::arg("weights"), py::arg("policy_indices"),
-        py::arg("padding_mask") = torch::nullopt, py::arg("num_layers") = 2,
-        py::arg("num_heads") = 4, py::arg("hidden_dim") = 256,
-        py::arg("num_experts") = 8, py::arg("top_k") = 2,
-        py::arg("count_pad") = 4, py::arg("tflag_pad") = 3,
-        "Training forward pass with autograd and routing info.");
 
     // Optional: enable/disable thread-local workspace cache for forward_packed
     m.def(
@@ -137,35 +108,33 @@ void bind_reactive_model(py::module_& m) {
            py::arg("obs_embed"), py::arg("action_embed"), py::arg("agent_embed"), py::arg("position_embed"),
            py::arg("hidden_dim"));
 
-    m.def("attention_block",
-        [](const torch::Tensor& x, py::dict weights_py, const torch::Tensor& policy_indices,
-           int64_t layer_idx, int64_t num_heads, int64_t hidden_dim) {
-            auto result = lb::model::attention_block(x, py_dict_to_c10_dict(weights_py), policy_indices,
-                layer_idx, num_heads, hidden_dim);
-            return c10_dict_to_py_dict(result);
-        }, py::arg("x"), py::arg("weights"), py::arg("policy_indices"), py::arg("layer_idx"),
-           py::arg("num_heads"), py::arg("hidden_dim"));
+    m.def("transformer_layer",
+        [](const torch::Tensor& x, const torch::Tensor& policy_indices,
+           py::dict weights_py, int64_t layer_idx, int64_t num_heads, int64_t hidden_dim, int64_t top_k) {
+            auto weights = py_dict_to_c10_dict(weights_py);
+            std::string prefix = "transformer.layers." + std::to_string(layer_idx);
+            return lb::model::transformer_layer(
+                x, policy_indices,
+                weights.at(prefix + ".self_attn.in_proj_weight"),
+                weights.at(prefix + ".self_attn.in_proj_bias"),
+                weights.at(prefix + ".self_attn.out_proj.weight"),
+                weights.at(prefix + ".self_attn.out_proj.bias"),
+                weights.at(prefix + ".norm1.weight"),
+                weights.at(prefix + ".norm1.bias"),
+                weights.at(prefix + ".moe.gate.weight"),
+                weights.at(prefix + ".moe.gate.bias"),
+                weights.at(prefix + ".moe.experts.w1"),
+                weights.at(prefix + ".moe.experts.w2"),
+                weights.at(prefix + ".moe.experts.b1"),
+                weights.at(prefix + ".moe.experts.b2"),
+                weights.at(prefix + ".norm2.weight"),
+                weights.at(prefix + ".norm2.bias"),
+                num_heads, hidden_dim, top_k);
+        },
+        py::arg("x"), py::arg("policy_indices"), py::arg("weights"), py::arg("layer_idx"),
+        py::arg("num_heads"), py::arg("hidden_dim"), py::arg("top_k"),
+        "Single transformer layer (attention + MoE). Returns (x_next, gate_logits, topk_indices, topk_scores).");
 
-    m.def("moe_block",
-        [](const torch::Tensor& x, py::dict weights_py, const torch::Tensor& policy_indices,
-           int64_t layer_idx, int64_t top_k, int64_t hidden_dim) {
-            auto result = lb::model::moe_block(x, py_dict_to_c10_dict(weights_py), policy_indices,
-                layer_idx, top_k, hidden_dim);
-            return c10_dict_to_py_dict(result);
-        }, py::arg("x"), py::arg("weights"), py::arg("policy_indices"), py::arg("layer_idx"),
-           py::arg("top_k"), py::arg("hidden_dim"));
-
-    m.def("moe_routing_sort",
-        [](const torch::Tensor& x, py::dict weights_py, const torch::Tensor& policy_indices,
-           int64_t layer_idx, int64_t top_k) {
-            auto result = lb::model::moe_routing_sort(x, py_dict_to_c10_dict(weights_py),
-                policy_indices, layer_idx, top_k);
-            return c10_dict_to_py_dict(result);
-        }, py::arg("x"), py::arg("weights"), py::arg("policy_indices"), py::arg("layer_idx"), py::arg("top_k"));
-
-    m.def("moe_group_ranges", &lb::model::moe_group_ranges,
-        py::arg("sorted_expert_indices"), py::arg("sorted_policy_indices"));
-    
     m.def("compute_heads",
         [](const torch::Tensor& transformer_output, py::dict weights_py, const torch::Tensor& policy_indices, int64_t num_experts) {
             auto result = lb::model::compute_heads(transformer_output, py_dict_to_c10_dict(weights_py), policy_indices, num_experts);

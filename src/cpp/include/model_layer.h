@@ -126,38 +126,6 @@ torch::Tensor reduce_expert_heads(
     const torch::Tensor& topk_scores);
 
 
-// --- Diagnostic Functions (for testing/debugging) ---
-
-c10::Dict<std::string, torch::Tensor>
-attention_block(
-    const torch::Tensor& x,
-    const c10::Dict<std::string, torch::Tensor>& batched_weights,
-    const torch::Tensor& policy_indices,
-    int64_t layer_idx,
-    int64_t num_heads,
-    int64_t hidden_dim);
-
-c10::Dict<std::string, torch::Tensor>
-moe_block(
-    const torch::Tensor& x,
-    const c10::Dict<std::string, torch::Tensor>& batched_weights,
-    const torch::Tensor& policy_indices,
-    int64_t layer_idx,
-    int64_t top_k,
-    int64_t hidden_dim);
-
-c10::Dict<std::string, torch::Tensor>
-moe_routing_sort(
-    const torch::Tensor& x,
-    const c10::Dict<std::string, torch::Tensor>& batched_weights,
-    const torch::Tensor& policy_indices,
-    int64_t layer_idx,
-    int64_t top_k);
-
-torch::Tensor moe_group_ranges(
-    const torch::Tensor& sorted_expert_indices,
-    const torch::Tensor& sorted_policy_indices);
-
 /**
  * Compute MoE group metadata (m_sizes, policy_ids, expert_ids, token_offsets)
  * from sorted (expert, policy) indices using GPU ops and return CPU tensors.
