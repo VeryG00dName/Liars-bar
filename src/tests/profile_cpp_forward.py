@@ -184,19 +184,31 @@ def benchmark_cpp_forward(
         policy_indices = torch.randint(0, num_policies, (batch_size,), dtype=torch.long, device=device)
 
     # Profile using test_utils
+    timers_dict = {}
+    
     def forward_fn():
         with torch.no_grad():
-            return lb.forward_packed(
+            result = lb.forward_packed(
                 obs, acts, agent_types, positions,
                 weights, policy_indices, padding_mask,
                 arch["num_layers"], arch["num_heads"], arch["hidden_dim"],
                 arch["num_experts"], arch["top_k"],
                 arch["count_pad"], arch["tflag_pad"],
             )
+            # Handle new return signature: (action_logits, opp_logits, state_values, win_logits, timers_dict)
+            if isinstance(result, tuple) and len(result) == 5:
+                # Accumulate timers across iterations
+                for key, value in result[4].items():
+                    timers_dict[key] = timers_dict.get(key, 0) + value
+                return result[:4]  # Return just the tensors for profiling
+            return result
 
     results = tu.profile_cuda_execution(forward_fn, warmup=10, iterations=num_iters)
     # Free cached workspaces after benchmark
     lb.disable_forward_moe_workspace_cache()
+    
+    # Add timers to results
+    results["timers"] = timers_dict
     return results
 
 def benchmark_pytorch_forward(
@@ -248,6 +260,31 @@ def print_benchmark_results(name: str, results: Dict, batch_size: int, seq_len: 
     print(f"\nBatch size: {batch_size}")
     print(f"Sequence length: {seq_len}")
     print(f"Tokens per batch: {tokens_per_batch:,}")
+    
+    # Print timer breakdown if available
+    if "timers" in results and results["timers"]:
+        print(f"\n{'='*80}")
+        print("PER-LAYER TIMING BREAKDOWN (microseconds, per iteration)")
+        print(f"{'='*80}")
+        
+        timers = results["timers"]
+        num_iters = results.get("iterations", 100)
+        
+        # Average timers per iteration
+        avg_timers = {k: v / num_iters for k, v in timers.items()}
+        
+        # Sort by time descending
+        sorted_timers = sorted(avg_timers.items(), key=lambda x: -x[1])
+        
+        total_us = sum(avg_timers.values())
+        
+        for key, value_us in sorted_timers:
+            ms = value_us / 1000.0
+            percentage = (value_us / total_us * 100.0) if total_us > 0 else 0.0
+            print(f"  {key:<40}: {value_us:>12.0f} us ({ms:>8.3f} ms) [{percentage:>5.1f}%]")
+        
+        total_ms = total_us / 1000.0
+        print(f"\n  {'TOTAL':<40}: {total_us:>12.0f} us ({total_ms:>8.3f} ms)")
 
 # ============================================================================
 # Main

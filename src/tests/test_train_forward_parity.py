@@ -59,7 +59,7 @@ def main() -> int:
     # C++ inference forward with the same weights
     bw = _prepare_batched_from_model(model, device=device)
     policy_indices = torch.zeros(obs.size(0), dtype=torch.long, device=device)
-    a_inf, o_inf, v_inf, w_inf = lb.forward_packed(
+    result = lb.forward_packed(
         obs, acts, agent, pos, bw, policy_indices, pad,
         num_layers=len(model.transformer.layers),
         num_heads=4,
@@ -69,6 +69,8 @@ def main() -> int:
         count_pad=model.count_pad,
         tflag_pad=model.tflag_pad
     )
+    # Unpack: (action_logits, opp_logits, state_values, win_logits, timers_dict)
+    a_inf, o_inf, v_inf, w_inf = result[:4]
 
     # Metrics helper
     # Compare (prints metrics regardless, fails if any mismatches)

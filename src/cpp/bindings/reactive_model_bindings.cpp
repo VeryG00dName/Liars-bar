@@ -38,10 +38,25 @@ void bind_reactive_model(py::module_& m) {
            int64_t num_layers, int64_t num_heads, int64_t hidden_dim,
            int64_t num_experts, int64_t top_k, int64_t count_pad, int64_t tflag_pad) {
             std::unordered_map<std::string, std::chrono::microseconds> timers;
-            return lb::forward::forward_packed(
+            auto result = lb::forward::forward_packed(
                 obs_sequence, action_sequence, agent_types, positions,
                 py_dict_to_c10_dict(weights_py), policy_indices, padding_mask,
                 num_layers, num_heads, hidden_dim, num_experts, top_k, count_pad, tflag_pad, &timers);
+            
+            // Convert timers to Python dict (microseconds as int64)
+            py::dict timers_py;
+            for (const auto& kv : timers) {
+                timers_py[py::cast(kv.first)] = static_cast<int64_t>(kv.second.count());
+            }
+            
+            // Return tuple: (forward_results, timers_dict)
+            return py::make_tuple(
+                std::get<0>(result),  // action_logits
+                std::get<1>(result), // opp_logits
+                std::get<2>(result), // state_values
+                std::get<3>(result), // win_logits
+                timers_py            // timers dict
+            );
         },
         py::arg("obs_sequence"), py::arg("action_sequence"), py::arg("agent_types"),
         py::arg("positions"), py::arg("weights"), py::arg("policy_indices"),
@@ -49,7 +64,7 @@ void bind_reactive_model(py::module_& m) {
         py::arg("num_heads") = 4, py::arg("hidden_dim") = 256,
         py::arg("num_experts") = 8, py::arg("top_k") = 2,
         py::arg("count_pad") = 4, py::arg("tflag_pad") = 3,
-        "Inference forward pass for the reactive model.");
+        "Inference forward pass for the reactive model. Returns (action_logits, opp_logits, state_values, win_logits, timers_dict).");
 
     // Optional: enable/disable thread-local workspace cache for forward_packed
     m.def(

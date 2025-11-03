@@ -78,11 +78,13 @@ def run_parity(checkpoint: Path, script_pt: Path, reference_pkl: Path, device: s
     bw = prepare_batched_weights(sd, num_layers=2, num_experts=8, device=device)
 
     # C++ forward
-    a_cpp, o_cpp, v_cpp, w_cpp = lb.forward_packed(
+    result = lb.forward_packed(
         obs, acts, agent, pos, bw, policy_indices, pad,
         num_layers=2, num_heads=4, hidden_dim=256, num_experts=8, top_k=2,
         count_pad=4, tflag_pad=3,
     )
+    # Unpack: (action_logits, opp_logits, state_values, win_logits, timers_dict)
+    a_cpp, o_cpp, v_cpp, w_cpp = result[:4]
 
     print("\nEval parity (TorchScript vs C++):")
     ok = True
