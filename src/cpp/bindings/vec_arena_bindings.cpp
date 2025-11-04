@@ -64,7 +64,7 @@ void bind_vec_arena(py::module_& m) {
             }
             return self.envs.at(i);
         }, py::return_value_policy::reference_internal, "Get a reference to an environment by index.")
-        .def("set_roles", [](VecArena& arena, const py::list& roles_list) {
+        .def("set_roles", [](VecArena& arena, const py::list& roles_list, const py::list& trajectory_ids_list) {
             std::vector<std::vector<int>> roles;
             roles.resize(py::len(roles_list));
             for (size_t b = 0; b < roles.size(); ++b) {
@@ -74,8 +74,17 @@ void bind_vec_arena(py::module_& m) {
                     roles[b][s] = py::cast<int>(row[s]);
                 }
             }
-            arena.set_roles(roles);
-        }, py::arg("roles"))
+            std::vector<std::vector<int>> trajectory_ids;
+            trajectory_ids.resize(py::len(trajectory_ids_list));
+            for (size_t b = 0; b < trajectory_ids.size(); ++b) {
+                auto row = trajectory_ids_list[b].cast<py::list>();
+                trajectory_ids[b].resize(py::len(row));
+                for (size_t s = 0; s < py::len(row); ++s) {
+                    trajectory_ids[b][s] = py::cast<int>(row[s]);
+                }
+            }
+            arena.set_roles(roles, trajectory_ids);
+        }, py::arg("roles"), py::arg("trajectory_ids"))
         .def("collect_requests", [](VecArena& arena) {
             py::dict out;
             const auto& grouped = arena.collect_requests();

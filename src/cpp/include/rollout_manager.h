@@ -27,6 +27,7 @@ struct TrajectoryData {
     int env_index{-1};
     int training_policy_id{-1};
     int training_agent_seat{-1};
+    int trajectory_id{-1};  // Stable unique ID for this trajectory within the env
     std::vector<int> player_policy_ids;
 
     std::vector<int> agent_id;
@@ -48,6 +49,7 @@ struct TrajectoryData {
 struct SeatTrajectory {
     int seat{-1};
     int policy_id{-1};
+    int trajectory_id{-1};  // Stable unique ID for this trajectory within the env
     bool active{false};
     int last_training_step_idx{-1};
     std::array<uint8_t, Env::MAX_PLAYERS> last_penalties{};
@@ -92,7 +94,8 @@ public:
         const std::vector<int>& training_policy_ids,
         int max_batch_envs = -1,
         uint32_t seed = 0,
-        const std::vector<std::vector<int>>& opponent_triplets = {});
+        const std::vector<std::vector<int>>& opponent_triplets = {},
+        double shuffle_percentage = 0.0);
 
     // Legacy API for backwards compatibility
     void start_rollouts(int num_episodes,
@@ -102,7 +105,8 @@ public:
                         uint32_t seed = 0,
                         const std::vector<int>& opponent_labels = {},
                         const std::vector<double>& opponent_weights = {},
-                        const std::vector<std::vector<int>>& opponent_triplets = {});
+                        const std::vector<std::vector<int>>& opponent_triplets = {},
+                        double shuffle_percentage = 0.0);
 
     std::unordered_map<int, std::vector<PolicyRequest>> collect_requests_for_inference();
 
@@ -201,6 +205,11 @@ private:
     std::vector<double> weighted_opponent_weights_;
     std::vector<std::vector<int>> fixed_opponent_triplets_;
     
+    // Seat shuffling per environment
+    std::vector<bool> env_shuffle_enabled_;  // per-env: whether to shuffle seats every round
+    std::vector<std::vector<int>> env_seat_permutation_;  // per-env: logical_seat -> physical_seat mapping
+    std::vector<int> env_last_round_history_len_;  // per-env: track last round's history length to detect new rounds
+    
     // Legacy mode: greedy stepping and torch.jit.Module for historical models
     bool use_greedy_stepping_{false};
     std::unordered_map<int, std::shared_ptr<torch::jit::Module>> historical_models_;
@@ -225,6 +234,9 @@ private:
     void finalize_episode(EpisodeTracker& tracker);
     void mark_training_env_inactive(int env_idx);
     void finalize_seat(EpisodeTracker& tracker, SeatTrajectory& seat_tracker, Env& env);
+    void check_and_apply_seat_shuffle(int env_idx);
+    int map_logical_to_physical_seat(int env_idx, int logical_seat) const;
+    int map_physical_to_logical_seat(int env_idx, int physical_seat) const;
 
     void run_neural_inference(
         const std::unordered_map<int, std::vector<PolicyRequest>>& requests_by_policy,

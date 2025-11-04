@@ -16,7 +16,8 @@ static constexpr int OBS_DIM = ((BASE_OBS_DIM + 7) / 8) * 8;
 
 struct PolicyRequest {
         int env = -1;    // env index [0..B)
-        int seat = -1;   // seat in [0..n_players)
+        int seat = -1;   // seat in [0..n_players) - physical seat (may change with shuffling)
+        int trajectory_id = -1;  // stable unique ID for training trajectory (-1 for bots/historical)
         std::array<uint8_t, 7> mask{};
         uint8_t done = 0;  // 1 if env already terminal
 
@@ -52,7 +53,8 @@ struct VecArena {
 
 	// ---- API ----
         void reset(int B_, int n_players_, uint32_t seed0);
-        void set_roles(const std::vector<std::vector<int>>& policy_ids_per_env);
+        void set_roles(const std::vector<std::vector<int>>& policy_ids_per_env,
+                       const std::vector<std::vector<int>>& trajectory_ids_per_env);
         void set_max_sequence_length(int max_len);
         void set_policy_max_sequence_length(int policy_id, int max_len);
 

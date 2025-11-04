@@ -73,6 +73,7 @@ void bind_rollout_manager(py::module_& m) {
         .def_readonly("env_index", &TrajectoryData::env_index)
         .def_readonly("training_policy_id", &TrajectoryData::training_policy_id)
         .def_readonly("training_agent_seat", &TrajectoryData::training_agent_seat)
+        .def_readonly("trajectory_id", &TrajectoryData::trajectory_id)
         .def_readonly("player_policy_ids", &TrajectoryData::player_policy_ids)
         .def_readonly("agent_id", &TrajectoryData::agent_id)
         .def_readonly("our_action", &TrajectoryData::our_action)
@@ -97,6 +98,7 @@ void bind_rollout_manager(py::module_& m) {
              py::arg("max_batch_envs") = -1,
              py::arg("seed") = 0,
              py::arg("opponent_triplets") = std::vector<std::vector<int>>{},
+             py::arg("shuffle_percentage") = 0.0,
              "Run complete rollout cycle internally in C++. Returns completed episodes.")
 
         .def("start_rollouts", &RolloutManager::start_rollouts,
@@ -107,7 +109,8 @@ void bind_rollout_manager(py::module_& m) {
              py::arg("seed"),
              py::arg("opponent_labels") = std::vector<int>{},
              py::arg("opponent_weights") = std::vector<double>{},
-             py::arg("opponent_triplets") = std::vector<std::vector<int>>{})
+             py::arg("opponent_triplets") = std::vector<std::vector<int>>{},
+             py::arg("shuffle_percentage") = 0.0)
 
         .def("submit_inference_results",
              [](RolloutManager& self,

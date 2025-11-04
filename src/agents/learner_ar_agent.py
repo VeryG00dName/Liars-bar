@@ -159,7 +159,14 @@ class LearnerAutoregressiveAgent:
                 break
 
             env_idx = int(env_tensor[idx].item())
-            seat_idx = int(seat_tensor[idx].item())
+            # seat_idx is actually trajectory_id (stable unique ID for this trajectory)
+            # populated by C++ in collect_requests_for_inference
+            trajectory_id = int(seat_tensor[idx].item())
+            
+            # Skip storing if trajectory_id is invalid (-1 indicates bot/historical, not a training agent)
+            if trajectory_id < 0:
+                continue
+                
             used_len = int(valid_lengths_cpu[idx].item())
             used_len = max(used_len, 1)
 
@@ -180,7 +187,7 @@ class LearnerAutoregressiveAgent:
                 "valid_lengths": torch.tensor([used_len], dtype=torch.long),
             }
 
-            self._last_inputs[(env_idx, seat_idx)] = snapshot
+            self._last_inputs[(env_idx, trajectory_id)] = snapshot
 
     def sync_rollout_models(self) -> None:
         if self.train_model is None:

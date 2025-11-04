@@ -110,14 +110,35 @@ class PPOVecRolloutManager:
         model_input = None
         if self.use_legacy_mode:
             # Legacy mode: Get model input from Python agent's _last_inputs dict
+            # Note: _last_inputs is keyed by (env_idx, trajectory_id)
+            # where trajectory_id is a stable unique ID assigned at episode start
             training_agent = self.policies.get(int(traj.training_policy_id))
             if training_agent and hasattr(training_agent, "_last_inputs"):
-                model_input_raw = training_agent._last_inputs.get((int(traj.env_index), training_seat))
+                env_idx = int(traj.env_index)
+                trajectory_id = int(getattr(traj, 'trajectory_id', -1))
+                if trajectory_id < 0:
+                    raise RuntimeError(f"Trajectory missing trajectory_id for env {env_idx}, policy {traj.training_policy_id}")
+                model_input_raw = training_agent._last_inputs.get((env_idx, trajectory_id))
                 if model_input_raw is None:
-                    raise RuntimeError(f"Missing final model input for env {traj.env_index}, seat {training_seat}")
+                    # Check if trajectory has any steps - if not, this training seat never acted
+                    if not traj.agent_id or len(traj.agent_id) == 0:
+                        # Training seat never acted, skip this trajectory
+                        return None
+                    # No fallback needed with trajectory_id - it's a unique stable ID
+                    # If we don't have inputs for this trajectory_id, the agent never acted
+                    logging.error(
+                        f"Missing final model input for env {env_idx}, trajectory_id {trajectory_id}. "
+                        f"Trajectory has {len(traj.agent_id)} steps. "
+                        f"Available trajectory IDs for this env: {[k[1] for k in training_agent._last_inputs.keys() if k[0] == env_idx]}"
+                    )
+                    raise RuntimeError(
+                        f"Missing final model input for env {env_idx}, trajectory_id {trajectory_id}. "
+                        f"This should not happen - the agent must have acted at least once."
+                    )
                 model_input = {k: v.cpu() if torch.is_tensor(v) else v for k, v in model_input_raw.items()}
             else:
-                raise RuntimeError(f"Training agent missing or lacks _last_inputs for env {traj.env_index}, seat {training_seat}")
+                trajectory_id = int(getattr(traj, 'trajectory_id', -1))
+                raise RuntimeError(f"Training agent missing or lacks _last_inputs for env {traj.env_index}, trajectory_id {trajectory_id}")
         else:
             # Optimized mode: Model inputs are saved in C++ and returned in TrajectoryData
             # Add batch dimension [1, ...] to match expected format
@@ -193,6 +214,7 @@ class PPOVecRolloutManager:
                     max_batch_envs=max_batch_envs or -1,
                     seed=seed,
                     opponent_triplets=triplets_arg,
+                    shuffle_percentage=getattr(config, "SHUFFLE_PERCENTAGE", 0.0),
                 )
             cpp_duration = time.perf_counter() - cpp_start
 
@@ -250,6 +272,7 @@ class PPOVecRolloutManager:
             max_batch_envs=max_batch_envs or -1,
             seed=seed,
             opponent_triplets=triplets_arg,
+            shuffle_percentage=getattr(config, "SHUFFLE_PERCENTAGE", 0.0),
         )
 
         model_call_stats: Dict[int, Dict[str, float]] = {}
@@ -305,5 +328,7 @@ class PPOVecRolloutManager:
 
         completed = self.rollout_manager.get_completed_episodes()
         episodes = [self._convert_completed_episode(traj) for traj in completed]
+        # Filter out None values (trajectories where training seat never acted)
+        episodes = [ep for ep in episodes if ep is not None]
 
         return episodes

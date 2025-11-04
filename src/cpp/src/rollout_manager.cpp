@@ -131,7 +131,8 @@ std::vector<TrajectoryData> RolloutManager::run_rollouts(
     const std::vector<int>& training_policy_ids,
     int max_batch_envs,
     uint32_t seed,
-    const std::vector<std::vector<int>>& opponent_triplets
+    const std::vector<std::vector<int>>& opponent_triplets,
+    double shuffle_percentage
 ) {
     // Reset timing stats at start of rollout
     if (orchestrator_) {
@@ -140,7 +141,7 @@ std::vector<TrajectoryData> RolloutManager::run_rollouts(
     
     // Initialize rollout
     start_rollouts(num_episodes, num_players, training_policy_ids, max_batch_envs, seed,
-                   {}, {}, opponent_triplets);
+                   {}, {}, opponent_triplets, shuffle_percentage);
 
     // Run inference loop internally in C++
     while (true) {
@@ -175,7 +176,8 @@ void RolloutManager::start_rollouts(int num_episodes,
                                     uint32_t seed,
                                     const std::vector<int>& opponent_labels,
                                     const std::vector<double>& opponent_weights,
-                                    const std::vector<std::vector<int>>& opponent_triplets) {
+                                    const std::vector<std::vector<int>>& opponent_triplets,
+                                    double shuffle_percentage) {
     // Reset profiling timers at the start of a rollout cycle
     timer_total_collect_ = std::chrono::microseconds(0);
     timer_log_rewards_ = std::chrono::microseconds(0);
@@ -207,6 +209,18 @@ void RolloutManager::start_rollouts(int num_episodes,
 
     arena_.reset(batch_size_, num_players_, rng_());
 
+    // Initialize seat shuffling per environment
+    env_shuffle_enabled_.assign(batch_size_, false);
+    env_seat_permutation_.assign(batch_size_, std::vector<int>());
+    env_last_round_history_len_.assign(batch_size_, 0);
+    std::uniform_real_distribution<double> shuffle_dist(0.0, 1.0);
+    for (int env_idx = 0; env_idx < batch_size_; ++env_idx) {
+        env_shuffle_enabled_[env_idx] = (shuffle_dist(rng_) < shuffle_percentage);
+        // Initialize identity permutation
+        env_seat_permutation_[env_idx].resize(num_players_);
+        std::iota(env_seat_permutation_[env_idx].begin(), env_seat_permutation_[env_idx].end(), 0);
+    }
+
     std::vector<std::vector<int>> roles;
     if (!fixed_opponent_triplets_.empty()) {
         roles.assign(batch_size_, std::vector<int>(num_players_, training_policy_id()));
@@ -236,7 +250,6 @@ void RolloutManager::start_rollouts(int num_episodes,
                              weighted_opponent_labels_,
                              weighted_opponent_weights_);
     }
-    arena_.set_roles(roles);
 
     episodes_.clear();
     episodes_.resize(batch_size_);
@@ -246,6 +259,27 @@ void RolloutManager::start_rollouts(int num_episodes,
         episodes_[env_idx] = new_episode_tracker(env_idx, roles[env_idx]);
         active_training_counts_[env_idx] = static_cast<int>(episodes_[env_idx].training_seats.size());
     }
+
+    // Build trajectory_ids mapping from episodes
+    // NOTE: roles vector is indexed by logical seat (from build_roles), but VecArena stores by physical seat
+    // At episode start, logical = physical (identity permutation), so we can use logical seat indexing
+    // The trajectory_id will be stored in Role and move with the player during shuffling
+    std::vector<std::vector<int>> trajectory_ids_per_env(batch_size_);
+    for (int env_idx = 0; env_idx < batch_size_; ++env_idx) {
+        trajectory_ids_per_env[env_idx].assign(num_players_, -1);  // Default -1 for bots
+        for (const auto& kv : episodes_[env_idx].training_seats) {
+            int logical_seat = kv.second.seat;
+            int traj_id = kv.second.trajectory_id;
+            if (logical_seat >= 0 && logical_seat < num_players_) {
+                // At episode start, logical seat = physical seat (identity permutation)
+                // So we can store by logical seat index, which VecArena will interpret as physical seat initially
+                // After shuffling, the Role objects move, so trajectory_id stays with the player
+                trajectory_ids_per_env[env_idx][logical_seat] = traj_id;
+            }
+        }
+    }
+    // Set roles with trajectory_ids - trajectory_id is stored in Role and moves with player during shuffling
+    arena_.set_roles(roles, trajectory_ids_per_env);
 
     for (auto& kv : cpp_bot_registry_) {
         kv.second.instances.clear();
@@ -545,7 +579,7 @@ void RolloutManager::submit_inference_results_array(int policy_id,
         if (is_training_policy(policy_id)) {
             for (size_t i = 0; i < count; ++i) {
                 const int env_idx = reqs[i].env;
-                const int seat = reqs[i].seat;
+                const int physical_seat = reqs[i].seat;
                 if (env_idx < 0 || env_idx >= static_cast<int>(episodes_.size())) {
                     continue;
                 }
@@ -553,14 +587,26 @@ void RolloutManager::submit_inference_results_array(int policy_id,
                 if (tracker.done) {
                     continue;
                 }
-                auto seat_it = tracker.training_seats.find(seat);
-                if (seat_it == tracker.training_seats.end()) {
+
+                // Find which trajectory corresponds to this physical seat
+                // Iterate through all training seats and check which one maps to physical_seat
+                SeatTrajectory* seat_tracker_ptr = nullptr;
+                for (auto& kv : tracker.training_seats) {
+                    if (!kv.second.active || kv.second.policy_id != policy_id) {
+                        continue;
+                    }
+                    // Check if this logical seat maps to the physical seat
+                    int phys = map_logical_to_physical_seat(env_idx, kv.second.seat);
+                    if (phys == physical_seat) {
+                        seat_tracker_ptr = &kv.second;
+                        break;
+                    }
+                }
+
+                if (seat_tracker_ptr == nullptr) {
                     continue;
                 }
-                SeatTrajectory& seat_tracker = seat_it->second;
-                if (!seat_tracker.active || seat_tracker.policy_id != policy_id) {
-                    continue;
-                }
+                SeatTrajectory& seat_tracker = *seat_tracker_ptr;
 
                 const int step_idx = append_training_step(seat_tracker);
                 if (step_idx >= 0 && step_idx < static_cast<int>(seat_tracker.data.our_action.size()) &&
@@ -799,14 +845,16 @@ void RolloutManager::run_neural_inference(
         const auto& requests = kv.second;
         for (const auto& req : requests) {
             int env_idx = req.env;
-            int seat = req.seat;
+            int physical_seat = req.seat;
+            // Convert physical seat to logical seat for lookup in training_seats
+            int logical_seat = map_physical_to_logical_seat(env_idx, physical_seat);
 
             if (env_idx < 0 || env_idx >= static_cast<int>(episodes_.size())) {
                 continue;
             }
 
             auto& episode = episodes_[env_idx];
-            auto seat_it = episode.training_seats.find(seat);
+            auto seat_it = episode.training_seats.find(logical_seat);
             if (seat_it == episode.training_seats.end()) {
                 continue;
             }
@@ -960,7 +1008,8 @@ PreparedBatch RolloutManager::prepare_training_batch(const std::vector<PolicyReq
 
         valid_lengths[b] = used_len;
         env_indices[b] = static_cast<int64_t>(req.env);
-        seat_indices[b] = static_cast<int64_t>(req.seat);
+        // Use trajectory_id which is the stable unique identifier
+        seat_indices[b] = static_cast<int64_t>(req.trajectory_id);
 
         // Get direct pointers to the tensor data for fast writing.
         float* obs_ptr = obs_sequence[b].data_ptr<float>();
@@ -1093,8 +1142,10 @@ void RolloutManager::finalize_seat(EpisodeTracker& tracker, SeatTrajectory& seat
             ++alive;
         }
     }
-    const bool seat_alive = seat_tracker.seat >= 0 && seat_tracker.seat < env.num_players() &&
-                            !env.terminations[seat_tracker.seat];
+    // Map logical seat to physical seat for checking alive status
+    const int physical_seat = map_logical_to_physical_seat(tracker.env_idx, seat_tracker.seat);
+    const bool seat_alive = physical_seat >= 0 && physical_seat < env.num_players() &&
+                            !env.terminations[physical_seat];
     const bool is_winner = seat_alive && alive == 1;
     seat_tracker.data.win = is_winner ? 1 : 0;
 
@@ -1852,6 +1903,7 @@ EpisodeTracker RolloutManager::new_episode_tracker(int env_idx, const std::vecto
     tracker.last_history_len = 0;
     tracker.last_processed_history_len = 0;
 
+    int next_trajectory_id = 0;  // Sequential ID assignment within this env
     for (size_t i = 0; i < roles.size(); ++i) {
         const int policy_id = roles[i];
         if (training_policy_id_set_.find(policy_id) == training_policy_id_set_.end()) {
@@ -1860,12 +1912,14 @@ EpisodeTracker RolloutManager::new_episode_tracker(int env_idx, const std::vecto
         SeatTrajectory seat_tracker;
         seat_tracker.seat = static_cast<int>(i);
         seat_tracker.policy_id = policy_id;
+        seat_tracker.trajectory_id = next_trajectory_id++;  // Assign unique ID
         seat_tracker.active = true;
         seat_tracker.last_training_step_idx = -1;
         seat_tracker.last_penalties.fill(0);
         seat_tracker.data.env_index = env_idx;
         seat_tracker.data.training_policy_id = policy_id;
         seat_tracker.data.training_agent_seat = static_cast<int>(i);
+        seat_tracker.data.trajectory_id = seat_tracker.trajectory_id;  // Copy to data
         seat_tracker.data.player_policy_ids = roles;
         tracker.training_seats.emplace(seat_tracker.seat, std::move(seat_tracker));
     }
@@ -1927,26 +1981,138 @@ void RolloutManager::update_penalty_rewards(SeatTrajectory& seat_tracker,
     seat_tracker.last_penalties = penalties;
 }
 
+int RolloutManager::map_logical_to_physical_seat(int env_idx, int logical_seat) const {
+    if (env_idx < 0 || env_idx >= static_cast<int>(env_seat_permutation_.size())) {
+        return logical_seat;
+    }
+    if (logical_seat < 0 || logical_seat >= static_cast<int>(env_seat_permutation_[env_idx].size())) {
+        return logical_seat;
+    }
+    return env_seat_permutation_[env_idx][logical_seat];
+}
+
+int RolloutManager::map_physical_to_logical_seat(int env_idx, int physical_seat) const {
+    if (env_idx < 0 || env_idx >= static_cast<int>(env_seat_permutation_.size())) {
+        return physical_seat;
+    }
+    const auto& perm = env_seat_permutation_[env_idx];
+    if (perm.empty()) {
+        return physical_seat;
+    }
+    // Search for logical seat i where perm[i] == physical_seat
+    for (size_t i = 0; i < perm.size(); ++i) {
+        if (perm[i] == physical_seat) {
+            return static_cast<int>(i);
+        }
+    }
+    // If not found, return physical_seat as fallback
+    // This can happen if the permutation is incomplete or corrupted
+    return physical_seat;
+}
+
+void RolloutManager::check_and_apply_seat_shuffle(int env_idx) {
+    if (env_idx < 0 || env_idx >= static_cast<int>(arena_.envs.size())) {
+        return;
+    }
+    if (!env_shuffle_enabled_[env_idx]) {
+        return;
+    }
+    
+    Env& env = arena_.envs[env_idx];
+    
+    // Check if all alive players have full hands (5 cards) - indicates a new round
+    bool all_full_hands = true;
+    for (int p = 0; p < env.num_players(); ++p) {
+        if (!env.terminations[p] && env.hand_len[p] != 5) {
+            all_full_hands = false;
+            break;
+        }
+    }
+    
+    // Check if we're at the start of a new round by checking if history length changed
+    // and all hands are full (indicating a fresh round start)
+    const int current_history_len = env.get_total_history_entries();
+    const bool history_changed = (current_history_len != env_last_round_history_len_[env_idx]);
+    const bool new_round = history_changed && all_full_hands;
+    
+    if (new_round) {
+        // Shuffle seats 1-3 (keep seat 0 fixed)
+        auto& perm = env_seat_permutation_[env_idx];
+        // Ensure permutation is properly sized
+        if (perm.size() != static_cast<size_t>(num_players_)) {
+            perm.resize(num_players_);
+            std::iota(perm.begin(), perm.end(), 0);
+        }
+        if (num_players_ > 1) {
+            std::vector<int> seats_to_shuffle;
+            for (int s = 1; s < num_players_; ++s) {
+                seats_to_shuffle.push_back(s);
+            }
+            std::shuffle(seats_to_shuffle.begin(), seats_to_shuffle.end(), rng_);
+            
+            // Update permutation: keep seat 0 fixed, shuffle others
+            perm[0] = 0;
+            for (size_t i = 0; i < seats_to_shuffle.size(); ++i) {
+                perm[i + 1] = seats_to_shuffle[i];
+            }
+            // Validate permutation: ensure it's a valid bijection
+            // Check that all physical seats 0..num_players-1 appear exactly once
+            std::vector<bool> seen(num_players_, false);
+            for (int i = 0; i < num_players_; ++i) {
+                if (perm[i] < 0 || perm[i] >= num_players_ || seen[perm[i]]) {
+                    // Invalid permutation - reset to identity
+                    std::iota(perm.begin(), perm.end(), 0);
+                    break;
+                }
+                seen[perm[i]] = true;
+            }
+            
+            // Remap roles based on new permutation
+            // Before shuffle: roles[physical i] = role for logical i (where perm[i] = i)
+            // After shuffle: we want roles[new_physical perm[i]] = role for logical i
+            // So: new_roles[perm[i]] = old_roles[i] for each logical seat i
+            if (env_idx < static_cast<int>(arena_.roles.size())) {
+                auto& env_roles = arena_.roles[env_idx];
+                std::vector<Role> old_roles = env_roles;  // Copy old roles (indexed by old physical seat)
+                for (int logical = 0; logical < num_players_; ++logical) {
+                    int new_physical = perm[logical];
+                    if (new_physical >= 0 && new_physical < num_players_) {
+                        // Before shuffle, logical seat i was at physical seat i
+                        env_roles[new_physical] = old_roles[logical];
+                    }
+                }
+            }
+        }
+        env_last_round_history_len_[env_idx] = current_history_len;
+    }
+}
+
 void RolloutManager::log_rewards_and_dones() {
     for (auto& tracker : episodes_) {
         if (tracker.done || tracker.env_idx < 0 || tracker.env_idx >= static_cast<int>(arena_.envs.size())) {
             continue;
         }
         Env& env = arena_.envs[tracker.env_idx];
+        
+        // Check for new round and apply seat shuffling if needed
+        check_and_apply_seat_shuffle(tracker.env_idx);
         const int total_len = env.get_total_history_entries();
         const int start_idx = tracker.last_processed_history_len;
         if (start_idx < total_len) {
             auto history = env.get_history_entries_slice(start_idx, total_len);
             for (const auto& entry : history) {
                 tracker.last_history_len += 1;
-                const int actor = entry.player;
+                const int physical_actor = entry.player;
+                // Map physical seat to logical seat for tracking
+                const int logical_actor = map_physical_to_logical_seat(tracker.env_idx, physical_actor);
                 for (auto& kv : tracker.training_seats) {
                     SeatTrajectory& seat_tracker = kv.second;
                     if (!seat_tracker.active) {
                         continue;
                     }
-                    if (seat_tracker.seat != actor) {
-                        const int idx = append_opponent_step(seat_tracker, actor);
+                    // seat_tracker.seat is already in logical space
+                    if (seat_tracker.seat != logical_actor) {
+                        const int idx = append_opponent_step(seat_tracker, logical_actor);
                         if (idx >= 0 && idx < static_cast<int>(seat_tracker.data.opp_target_action.size())) {
                             seat_tracker.data.opp_target_action[idx] = static_cast<int>(entry.action);
                         }

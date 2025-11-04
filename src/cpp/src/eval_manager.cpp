@@ -493,7 +493,10 @@ EvalOutcome EvalManager::run_roles(const std::vector<std::vector<int>>& roles,
 
     uint32_t base_seed = static_cast<uint32_t>(seed_with_optional(seed));
     arena_.reset(static_cast<int>(total_games), num_players, base_seed);
-    arena_.set_roles(roles);
+    // Evaluation doesn't use trajectory_ids (all -1 for bots/historical)
+    std::vector<std::vector<int>> trajectory_ids(static_cast<size_t>(total_games), 
+                                                   std::vector<int>(num_players, -1));
+    arena_.set_roles(roles, trajectory_ids);
 
     std::vector<uint8_t> env_completed(static_cast<size_t>(arena_.B), 0);
     int completed_games = 0;

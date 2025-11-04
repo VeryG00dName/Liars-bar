@@ -163,11 +163,19 @@ int VecArena::max_sequence_length_for_policy(int policy_id) const {
     return max_sequence_length;
 }
 
-void VecArena::set_roles(const std::vector<std::vector<int>>& policy_ids_per_env) {
+void VecArena::set_roles(const std::vector<std::vector<int>>& policy_ids_per_env,
+                           const std::vector<std::vector<int>>& trajectory_ids_per_env) {
     roles.assign(B, std::vector<Role>(n_players));
     for (int b = 0; b < B; ++b) {
         for (int s = 0; s < n_players; ++s) {
             roles[b][s].policy_id = policy_ids_per_env[b][s];
+            // Set trajectory_id from the provided mapping (-1 for bots/historical)
+            if (b < static_cast<int>(trajectory_ids_per_env.size()) && 
+                s < static_cast<int>(trajectory_ids_per_env[b].size())) {
+                roles[b][s].trajectory_id = trajectory_ids_per_env[b][s];
+            } else {
+                roles[b][s].trajectory_id = -1;
+            }
         }
     }
     pending.clear();
@@ -213,7 +221,16 @@ void VecArena::advance_env_until_policy_or_done(
     int policy_id = roles[env_index][cur].policy_id;
 
     PolicyRequest req;
-    req.env = env_index; req.seat = cur; req.done = 0;
+    req.env = env_index;
+    req.seat = cur;
+    req.done = 0;
+    // Set trajectory_id from the Role (moves with player during shuffling)
+    if (env_index >= 0 && env_index < static_cast<int>(roles.size()) &&
+        cur >= 0 && cur < static_cast<int>(roles[env_index].size())) {
+        req.trajectory_id = roles[env_index][cur].trajectory_id;
+    } else {
+        req.trajectory_id = -1;
+    }
     fill_mask_for_current(e, req.mask.data());
     if (policy_id < 7) {
         // classic obs for C++ bots

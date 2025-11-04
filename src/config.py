@@ -161,6 +161,8 @@ SEED = 42
 DEVICE = "cuda"
 FORCE_CUDA_SYNC_FOR_TIMING = True
 CPP_BOT_MAX_LABEL = 6
+# Probability that a game will shuffle seats (other than seat 0) every round
+SHUFFLE_PERCENTAGE = 0.5
 # ============================
 # Everything past this is depreated, kept for compatiblty!
 # ============================
