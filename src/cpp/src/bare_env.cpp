@@ -209,10 +209,9 @@ int Env::observe_vector_newerest(int observer_agent_id, float* out) const {
             out[idx++] = static_cast<float>(sz) / 5.0f;
         }
 
-        // 2) Penalties in the same rotated order, but include self (observer is first)
-        for (int i = 0; i < n_players; ++i) {
-            const int p = (observer_seat + i) % n_players;
-            const int agent_id = agent_index[p];
+        // 2) Penalties indexed by absolute agent_id (not rotated by seat)
+        //    This prevents trivially tracking opponents across seat shuffles
+        for (int agent_id = 0; agent_id < n_players; ++agent_id) {
             out[idx++] = static_cast<float>(penalties[agent_id]) / 6.0f;
         }
 

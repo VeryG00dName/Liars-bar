@@ -417,7 +417,7 @@ void EvalManager::finalize_model_loading() {
         hidden_dim_,
         num_experts_,
         top_k_,
-        /*use_argmax=*/false
+        /*use_argmax=*/true
     );
 
     weights_finalized_ = true;
