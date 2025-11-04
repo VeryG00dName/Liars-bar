@@ -85,7 +85,7 @@ py::dict history_entry_to_py(const HistoryEntry& h) {
         mask7.append(static_cast<int>(h.mask[i]));
     }
     py::dict d;
-    d["player"] = h.player;
+    d["agent_id"] = h.agent_id;
     d["action"] = static_cast<int>(h.action);
     d["step"] = h.step;
     d["observations"] = obs_map;
@@ -137,7 +137,7 @@ py::array_t<int32_t> env_game_history_slice_basic(const Env& e, int start_index,
     auto buf = out.mutable_unchecked<2>();
     for (int i = 0; i < count; ++i) {
         const auto& entry = e.game_history[start_index + i];
-        buf(i, 0) = entry.player;
+        buf(i, 0) = entry.agent_id;
         buf(i, 1) = static_cast<int32_t>(entry.action);
     }
     return out;

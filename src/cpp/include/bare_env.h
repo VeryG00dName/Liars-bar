@@ -6,7 +6,7 @@
 #include <string>
 struct VecArena;
 struct HistoryEntry {
-  int player = -1;               // seat index who acted
+  int agent_id = -1;             // agent index who acted
   uint8_t action = 6;            // 0..6 (0..5 = Play, 6 = Challenge)
   int step = 0;                  // global step counter
 
@@ -25,6 +25,7 @@ public:
   static constexpr int HAND_CAP    = 5;   // fixed hand size per round
 
   // ---- Public state ----
+  // NOTE: All of these are indexed by AGENT_ID, not seat index.
   std::array<std::array<uint8_t, HAND_CAP>, MAX_PLAYERS> hands{};
   std::array<uint8_t, MAX_PLAYERS> hand_len{};
   std::array<uint8_t, MAX_PLAYERS> penalties{};
@@ -35,9 +36,12 @@ public:
   // Seat 0 remains fixed; seats 1..n-1 are randomly permuted.
   bool shuffle_seats_each_round = false;
   
-  // Stable agent indices - never change for a player, only reordered when seats shuffle
-  // agent_index[physical_seat] = stable agent_index (0, 1, 2, 3...) for the agent at that physical position
+  // Mappings between stable agent IDs and physical seats.
+  // These are updated when seats are shuffled.
+  // agent_index[physical_seat] -> agent_id
+  // seat_for_agent[agent_id] -> physical_seat
   std::array<int, MAX_PLAYERS> agent_index{-1, -1, -1, -1};
+  std::array<int, MAX_PLAYERS> seat_for_agent{-1, -1, -1, -1};
 
   // ---- History ----
   int global_step = 0;

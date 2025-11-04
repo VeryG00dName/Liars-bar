@@ -51,7 +51,7 @@ inline bool PerfectSearch::game_over(const Env& e) {
 inline int PerfectSearch::alive_players(const Env& e) {
     int alive = 0;
     for (int p = 0; p < e.num_players(); ++p)
-        if (!e.terminations[p]) ++alive;
+        if (!e.terminations[e.agent_index[p]]) ++alive;
     return alive;
 }
 
@@ -91,50 +91,42 @@ float PerfectSearch::simulate(
 
     const int my_index = me_;
 
-    // Initial ones (table cards) in *my* hand before applying first_action
     const int initial_ones = count_ones_from_obs(env);
 
-    // First action properties
     const bool first_is_non_table = (first_action >= 3 && first_action <= 5);
-    const int  first_k = (int)(first_action % 3) + 1;     // 1..3
+    const int  first_k = (int)(first_action % 3) + 1;
     const uint8_t first_equiv_table = first_is_non_table
-        ? (uint8_t)(first_action - 3)            // 3->0, 4->1, 5->2
+        ? (uint8_t)(first_action - 3)
         : first_action;
     PSDBG("[sim] first_k=%d first_equiv_table=%u initial_ones=%d",
         first_k, (unsigned)first_equiv_table, initial_ones);
 
-    // Plan starts with our first step
     seq_out.clear();
     seq_out.push_back({ my_index, first_action });
 
     const bool my_term_before = (env.terminations[my_index] != 0);
 
-    // Track last play for heuristics
     int  last_play_by = -1;
-    int  last_play_k = 0;     // 1..3
+    int  last_play_k = 0;
     bool last_play_non_table = false;
 
-    // --- Apply our first action ---
-    // snapshot everyone's penalties BEFORE our move
     const int N = env.num_players();
     uint8_t pen_before_all[Env::MAX_PLAYERS] = {};
-    for (int i = 0; i < N; ++i) pen_before_all[i] = env.penalties[i];
+    for (int i = 0; i < N; ++i) pen_before_all[i] = env.penalties[env.agent_index[i]];
 
     env.step(first_action);
     last_play_by = my_index;
     last_play_k = (int)(first_action % 3) + 1;
     last_play_non_table = (first_action >= 3);
 
-    // immediate outcomes after first action
     if (!my_term_before && env.terminations[my_index]) {
         PSDBG("[sim] self-elim right after first action");
         return LOSE_VALUE;
     }
 
-    // detect any penalty caused by our first action
     int penalized_player = -1;
     for (int i = 0; i < N; ++i) {
-        if (env.penalties[i] > pen_before_all[i]) { penalized_player = i; break; }
+        if (env.penalties[env.agent_index[i]] > pen_before_all[i]) { penalized_player = env.agent_index[i]; break; }
     }
     if (penalized_player >= 0) {
         if (penalized_player == my_index) {
@@ -151,20 +143,18 @@ float PerfectSearch::simulate(
     if (game_over(env)) {
         int winner = -1, alive = 0;
         for (int p = 0; p < env.num_players(); ++p)
-            if (!env.terminations[p]) { winner = p; ++alive; }
+            if (!env.terminations[env.agent_index[p]]) { winner = env.agent_index[p]; ++alive; }
         return (alive == 1 && winner == my_index) ? WIN_VALUE : LOSE_VALUE;
     }
 
 
-    // main loop: continue until a penalty occurs or game over
     int steps = 0;
     const int MAX_STEPS = 40;
     while (steps++ < MAX_STEPS) {
         int p = env.current_player();
         PSDBG("[sim] step=%d curP=%d", steps, p);
 
-        if (p == my_index) {
-            // Our turn: branch on actions using configured order
+        if (env.agent_index[p] == my_index) {
             uint8_t mask[7]; env.valid_actions(mask);
             bool any = false;
             for (int i = 0; i < 7; ++i) any |= (mask[i] != 0);
@@ -177,7 +167,7 @@ float PerfectSearch::simulate(
             for (uint8_t a : sim_order_) {
                 if (!mask[a]) continue;
                 PSDBG("[sim] recurse a=%u", (unsigned)a);
-                Env branch = env; // copy
+                Env branch = env;
                 float v = simulate(branch, a, depth + 1, tmp_seq);
                 if (v >= OPP_PENALTY_THRESHOLD) {
                     seq_out.insert(seq_out.end(), tmp_seq.begin(), tmp_seq.end());
@@ -192,15 +182,13 @@ float PerfectSearch::simulate(
 
         }
         else {
-            // Opponent turn
-            const BotFn& fn = (p >= 0 && p < (int)bot_fns_.size())
-                ? bot_fns_[p] : BotFn();
+            const BotFn& fn = (env.agent_index[p] >= 0 && env.agent_index[p] < (int)bot_fns_.size())
+                ? bot_fns_[env.agent_index[p]] : BotFn();
             uint8_t pen_before[Env::MAX_PLAYERS] = {};
-            for (int i = 0; i < env.num_players(); ++i) pen_before[i] = env.penalties[i];
+            for (int i = 0; i < env.num_players(); ++i) pen_before[i] = env.penalties[env.agent_index[i]];
 
             uint8_t a = pick_opponent_action(env, fn);
 
-            // V5 rule: uncontested 3-table
             if (v5_penalize_uncontested_3table_
                 && last_play_by == my_index
                 && !last_play_non_table
@@ -209,14 +197,13 @@ float PerfectSearch::simulate(
                 const bool could_challenge = (mtmp[6] != 0);
                 const bool did_not_challenge = (a != 6);
                 if (could_challenge && did_not_challenge) {
-                    seq_out.push_back({ p, a });
+                    seq_out.push_back({ env.agent_index[p], a });
                     PSDBG("[sim] V5 penalty: uncontested 3-table -> %.1f",
                         v5_penalty_value_);
                     return v5_penalty_value_;
                 }
             }
 
-            // Swap heuristic
             if (swap_heuristic_
                 && a == 6
                 && last_play_by == my_index
@@ -226,35 +213,32 @@ float PerfectSearch::simulate(
                     if (!seq_out.empty() && seq_out[0].first == my_index) {
                         seq_out[0].second = first_equiv_table;
                     }
-                    seq_out.push_back({ p, a });
+                    seq_out.push_back({ env.agent_index[p], a });
                     PSDBG("[sim] swap-heuristic (current ones) -> opponent penalized (threshold)");
                     return OPP_PENALTY_THRESHOLD;
                 }
                 else {
-                    seq_out.push_back({ p, a });
+                    seq_out.push_back({ env.agent_index[p], a });
                     PSDBG("[sim] our bluff caught (current ones insufficient) -> -5000");
                     return -5000.0f;
                 }
             }
 
-            // apply opponent action
             uint8_t mask_dbg[7]; env.valid_actions(mask_dbg);
             print_mask7("[sim] opp-turn", mask_dbg);
             PSDBG("[sim] opp p=%d picks a=%u", p, (unsigned)a);
 
             env.step(a);
-            seq_out.push_back({ p, a });
+            seq_out.push_back({ env.agent_index[p], a });
 
-            // detect who (if anyone) got penalized by this action
             int penalized_player = -1;
             for (int i = 0; i < env.num_players(); ++i) {
-                if (env.penalties[i] > pen_before[i]) { penalized_player = i; break; }
+                if (env.penalties[env.agent_index[i]] > pen_before[i]) { penalized_player = env.agent_index[i]; break; }
             }
 
             if (penalized_player >= 0) {
                 if (penalized_player == my_index) {
                     PSDBG("[sim] we were penalized by opponent action");
-                    // keep your severity logic; this mirrors your existing behavior
                     return -5000.0f;
                 }
                 else {
@@ -264,7 +248,7 @@ float PerfectSearch::simulate(
             }
 
             if (a <= 5) {
-                last_play_by = p;
+                last_play_by = env.agent_index[p];
                 last_play_k = (int)(a % 3) + 1;
                 last_play_non_table = (a >= 3);
             }
@@ -272,7 +256,7 @@ float PerfectSearch::simulate(
             if (game_over(env)) {
                 int winner = -1, alive = 0;
                 for (int q = 0; q < env.num_players(); ++q)
-                    if (!env.terminations[q]) { winner = q; ++alive; }
+                    if (!env.terminations[env.agent_index[q]]) { winner = env.agent_index[q]; ++alive; }
                 PSDBG("[sim] game over on opponent branch (winner=%d alive=%d)", winner, alive);
                 return (alive == 1 && winner == my_index) ? WIN_VALUE : LOSE_VALUE;
             }

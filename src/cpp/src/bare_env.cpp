@@ -19,27 +19,29 @@ inline void Env::shuffle(std::array<uint8_t, N>& a) {
 
 // ---------------- Hand helpers ----------------
 inline int Env::count_in_hand(int p, uint8_t v) const {
-    int c = 0, L = hand_len[p];
-    for (int i = 0; i < L; ++i) c += (hands[p][i] == v);
+    const int agent_id = agent_index[p];
+    int c = 0, L = hand_len[agent_id];
+    for (int i = 0; i < L; ++i) c += (hands[agent_id][i] == v);
     return c;
 }
 
 inline void Env::remove_k(int p, uint8_t v, int k) {
-    int L = hand_len[p];
+    const int agent_id = agent_index[p];
+    int L = hand_len[agent_id];
     int w = 0;
     for (int i = 0; i < L; ++i) {
-        uint8_t keep = !(k > 0 && hands[p][i] == v);
-        if (keep) hands[p][w++] = hands[p][i];
+        uint8_t keep = !(k > 0 && hands[agent_id][i] == v);
+        if (keep) hands[agent_id][w++] = hands[agent_id][i];
         else --k;
     }
-    hand_len[p] = static_cast<uint8_t>(w);
+    hand_len[agent_id] = static_cast<uint8_t>(w);
 }
 
 // ---------------- Turn helpers ----------------
 inline bool Env::advance_to_next_active() {
     for (int step = 0; step < n_players; ++step) {
         cur = (cur + 1) % n_players;
-        if (!terminations[cur] && !round_eliminated[cur]) return true;
+        if (!terminations[agent_index[cur]] && !round_eliminated[agent_index[cur]]) return true;
     }
     return false; // no active players found
 }
@@ -50,8 +52,9 @@ inline void Env::penalize(int p) {
             "[BUG] penalize called with p=%d (pending_claimant may be unset)\n", p);
         return;
     }
-    if (++penalties[p] >= penalty_limits[p]) {
-        terminations[p] = 1;
+    const int agent_id = agent_index[p];
+    if (++penalties[agent_id] >= penalty_limits[agent_id]) {
+        terminations[agent_id] = 1;
     }
 }
 
@@ -86,15 +89,9 @@ void Env::start_round() {
                 agent_index[new_physical] = old_agent_index[logical];
             }
 
-            // Apply permutation to persistent per-player state so it moves with agents
-            std::array<uint8_t, MAX_PLAYERS> old_penalties = penalties;
-            std::array<uint8_t, MAX_PLAYERS> old_terminations = terminations;
-            std::array<uint8_t, MAX_PLAYERS> old_limits = penalty_limits;
-            for (int logical = 0; logical < n_players; ++logical) {
-                int new_physical = perm_full[logical];
-                penalties[new_physical] = old_penalties[logical];
-                terminations[new_physical] = old_terminations[logical];
-                penalty_limits[new_physical] = old_limits[logical];
+            // Update inverse mapping from agent_id to seat
+            for (int s = 0; s < n_players; ++s) {
+                seat_for_agent[agent_index[s]] = s;
             }
 
             // Preserve who should start next round if previously set: map old seat to new seat
@@ -104,7 +101,7 @@ void Env::start_round() {
         }
     }
 
-    for (int p = 0; p < n_players; ++p) round_eliminated[p] = 0;
+    for (int p = 0; p < n_players; ++p) round_eliminated[agent_index[p]] = 0;
     pending_exists = 0; pending_claimant = -1; pending_count = 0; pending_bluff = 0;
     last_action_count = 0;
     force_challenge_mode = 0; force_claimant = -1;
@@ -116,15 +113,16 @@ void Env::start_round() {
 
     int idx = 0;
     for (int p = 0; p < n_players; ++p) {
-        if (terminations[p]) { hand_len[p] = 0; continue; }
-        for (int i = 0; i < HAND_CAP; ++i) hands[p][i] = deck[idx++];
-        hand_len[p] = HAND_CAP;
+        const int agent_id = agent_index[p];
+        if (terminations[agent_id]) { hand_len[agent_id] = 0; continue; }
+        for (int i = 0; i < HAND_CAP; ++i) hands[agent_id][i] = deck[idx++];
+        hand_len[agent_id] = HAND_CAP;
     }
 
     int start_from = (starter_hint >= 0 ? starter_hint : 0);
     cur = start_from;
     for (int t = 0; t < n_players; ++t) {
-        if (!terminations[cur]) break;
+        if (!terminations[agent_index[cur]]) break;
         cur = (cur + 1) % n_players;
     }
     starter_hint = -1;
@@ -141,6 +139,11 @@ void Env::reset(int players, uint32_t seed) {
     force_challenge_mode = 0;
     force_claimant = -1;
 
+    for (int i = 0; i < n_players; ++i) {
+        agent_index[i] = i;
+        seat_for_agent[i] = i;
+    }
+
     for (int p = 0; p < n_players; ++p) {
         penalty_limits[p] = static_cast<uint8_t>((rnd() % 6u) + 1u);
     }
@@ -156,7 +159,7 @@ void Env::set_seed(uint32_t seed) { rng = seed ? seed : 0xC001BEEF; }
 
 // ---------------- Observations / Masks ----------------
 void Env::valid_actions(uint8_t out[7]) const {
-    if (terminations[cur] || round_eliminated[cur]) { for (int i = 0; i < 7; ++i) out[i] = 0; return; }
+    if (terminations[agent_index[cur]] || round_eliminated[agent_index[cur]]) { for (int i = 0; i < 7; ++i) out[i] = 0; return; }
     const int c1 = count_in_hand(cur, 1);
     const int c0 = count_in_hand(cur, 0);
     out[0] = (c1 >= 1); out[1] = (c1 >= 2); out[2] = (c1 >= 3);
@@ -175,29 +178,32 @@ int Env::observe_vector(float out[3 + MAX_PLAYERS]) const {
     out[idx++] = static_cast<float>(count_in_hand(cur, 0));
     out[idx++] = static_cast<float>(last_action_count);
     for (int p = 0; p < n_players; ++p) {
-        const float live = (!terminations[p] && !round_eliminated[p]) ? static_cast<float>(hand_len[p]) : 0.0f;
+        const int agent_id = agent_index[p];
+        const float live = (!terminations[agent_id] && !round_eliminated[agent_id]) ? static_cast<float>(hand_len[agent_id]) : 0.0f;
         out[idx++] = live;
     }
     return idx;
 }
 
-int Env::observe_vector_newerest(int agent_index, float* out) const {
+int Env::observe_vector_newerest(int observer_agent_id, float* out) const {
     // Base dimension and padded dimension (to multiple of 8)
     const int baseD = 2 + (n_players - 1) + n_players;
     const int D = ((baseD + 7) / 8) * 8;
     if (out) {
         int idx = 0;
+        const int observer_seat = seat_for_agent[observer_agent_id];
 
         // 0) Observer's own features (unchanged)
-        out[idx++] = static_cast<float>(count_in_hand(agent_index, 1)) / 5.0f;
-        out[idx++] = static_cast<float>(count_in_hand(agent_index, 0)) / 5.0f;
+        out[idx++] = static_cast<float>(count_in_hand(observer_seat, 1)) / 5.0f;
+        out[idx++] = static_cast<float>(count_in_hand(observer_seat, 0)) / 5.0f;
 
         // Build a rotated player order: self first, then next in turn order
-        // order[0] == agent_index, order[1] == (agent_index+1) % n_players, ...
+        // order[0] == observer_seat, order[1] == (observer_seat+1) % n_players, ...
         for (int i = 1; i < n_players; ++i) {
-            const int p = (agent_index + i) % n_players;
-            const int sz = (!terminations[p] && !round_eliminated[p])
-                ? static_cast<int>(hand_len[p])
+            const int p = (observer_seat + i) % n_players;
+            const int agent_id = agent_index[p];
+            const int sz = (!terminations[agent_id] && !round_eliminated[agent_id])
+                ? static_cast<int>(hand_len[agent_id])
                 : 0;
             // 1) Opponent hand sizes in rotated order (self excluded)
             out[idx++] = static_cast<float>(sz) / 5.0f;
@@ -205,8 +211,9 @@ int Env::observe_vector_newerest(int agent_index, float* out) const {
 
         // 2) Penalties in the same rotated order, but include self (observer is first)
         for (int i = 0; i < n_players; ++i) {
-            const int p = (agent_index + i) % n_players;
-            out[idx++] = static_cast<float>(penalties[p]) / 6.0f;
+            const int p = (observer_seat + i) % n_players;
+            const int agent_id = agent_index[p];
+            out[idx++] = static_cast<float>(penalties[agent_id]) / 6.0f;
         }
 
         // Zero-pad remaining slots up to padded D
@@ -222,7 +229,7 @@ bool Env::round_and_game_checks() {
     // Game over iff ≤1 non-terminated players remain.
     int alive = 0;
     for (int p = 0; p < n_players; ++p)
-        if (!terminations[p]) ++alive;
+        if (!terminations[agent_index[p]]) ++alive;
     return (alive <= 1);
 }
 
@@ -230,7 +237,7 @@ bool Env::round_and_game_checks() {
 bool Env::step(uint8_t a) {
     // ---- History Logging: Capture pre-action state ----
     HistoryEntry H;
-    H.player = cur;
+    H.agent_id = agent_index[cur];
     H.action = a;
     H.step = global_step;
     valid_actions(H.mask.data());
@@ -258,10 +265,10 @@ bool Env::step(uint8_t a) {
         pending_count = static_cast<uint8_t>(k); pending_bluff = (want == 0);
         last_action_count = static_cast<uint8_t>(k);
 
-        if (hand_len[player] == 0) {
-            int alive = 0; for (int q = 0; q < n_players; ++q) if (!terminations[q] && !round_eliminated[q]) ++alive;
+        if (hand_len[agent_index[player]] == 0) {
+            int alive = 0; for (int q = 0; q < n_players; ++q) if (!terminations[agent_index[q]] && !round_eliminated[agent_index[q]]) ++alive;
             if (alive == 2) { force_challenge_mode = 1; force_claimant = player; }
-            else { round_eliminated[player] = 1; }
+            else { round_eliminated[agent_index[player]] = 1; }
         }
         if (!advance_to_next_active()) start_round();
         game_is_over = false;

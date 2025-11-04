@@ -64,13 +64,15 @@ void VecArena::prepare_ai_sequence(const Env& e, int ai_seat, int seq_cap, Polic
             std::fill(dst_obs, dst_obs + OBS_DIM, 0.0f);
         }
 
-        int rel = (h.player - ai_seat + n_players) % n_players;
+        const int h_seat = e.seat_for_agent.at(h.agent_id);
+        int rel = (h_seat - ai_seat + n_players) % n_players;
         agent_ptr[idx] = rel;
         if (idx == 0) {
             action_ptr[idx] = 10; // PAD first token
         } else {
             const HistoryEntry& prev_h = e.game_history[i - 1];
-            action_ptr[idx] = transform_action(prev_h.player, prev_h.action);
+            const int prev_h_seat = e.seat_for_agent.at(prev_h.agent_id);
+            action_ptr[idx] = transform_action(prev_h_seat, prev_h.action);
         }
 
         if (rel == 0) {
@@ -83,12 +85,14 @@ void VecArena::prepare_ai_sequence(const Env& e, int ai_seat, int seq_cap, Polic
 
     if (idx < max_valid) {
         float cur_obs[OBS_DIM];
-        e.observe_vector_newerest(ai_seat, cur_obs);
+        const int ai_agent_id = e.agent_index.at(ai_seat);
+        e.observe_vector_newerest(ai_agent_id, cur_obs);
         std::memcpy(obs_ptr + idx * OBS_DIM, cur_obs, sizeof(float) * OBS_DIM);
         agent_ptr[idx] = 0; // me
         if (total > 0) {
             const HistoryEntry& last_h = e.game_history[total - 1];
-            action_ptr[idx] = transform_action(last_h.player, last_h.action);
+            const int last_h_seat = e.seat_for_agent.at(last_h.agent_id);
+            action_ptr[idx] = transform_action(last_h_seat, last_h.action);
         } else {
             action_ptr[idx] = 10;
         }
@@ -208,7 +212,7 @@ void VecArena::advance_env_until_policy_or_done(
     }
 
     int alive = 0;
-    for (int p = 0; p < e.num_players(); ++p) if (!e.terminations[p]) ++alive;
+    for (int p = 0; p < e.num_players(); ++p) if (!e.terminations[e.agent_index[p]]) ++alive;
     if (alive <= 1) { done[env_index] = 1; return; }
 
     int cur = e.current_player();  // physical seat

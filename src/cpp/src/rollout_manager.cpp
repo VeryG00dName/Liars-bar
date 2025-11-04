@@ -1122,7 +1122,6 @@ void RolloutManager::finalize_seat(EpisodeTracker& tracker, SeatTrajectory& seat
 
     update_penalty_rewards(seat_tracker, env.penalties);
 
-    // Identify the last step taken by this training agent by matching stable agent_index
     int our_last_step_idx = -1;
     for (int i = static_cast<int>(seat_tracker.data.agent_id.size()) - 1; i >= 0; --i) {
         if (seat_tracker.data.agent_id[i] == seat_tracker.seat) {
@@ -1133,20 +1132,12 @@ void RolloutManager::finalize_seat(EpisodeTracker& tracker, SeatTrajectory& seat
 
     int alive = 0;
     for (int p = 0; p < env.num_players(); ++p) {
-        if (!env.terminations[p]) {
+        if (!env.terminations[env.agent_index[p]]) {
             ++alive;
         }
     }
-    // Find physical_seat for this agent_index (for checking alive status - env uses physical seats)
-    int physical_seat = -1;
-    for (int s = 0; s < env.num_players(); ++s) {
-        if (arena_.envs[tracker.env_idx].agent_index[s] == seat_tracker.seat) {
-            physical_seat = s;
-            break;
-        }
-    }
-    const bool seat_alive = physical_seat >= 0 && physical_seat < env.num_players() &&
-                            !env.terminations[physical_seat];
+
+    const bool seat_alive = !env.terminations[seat_tracker.seat];
     const bool is_winner = seat_alive && alive == 1;
     seat_tracker.data.win = is_winner ? 1 : 0;
 
@@ -1154,7 +1145,6 @@ void RolloutManager::finalize_seat(EpisodeTracker& tracker, SeatTrajectory& seat
         seat_tracker.data.reward[our_last_step_idx] += is_winner ? 1.0 : -1.0;
     }
 
-    // Copy last model inputs to trajectory data
     seat_tracker.data.last_obs_sequence = seat_tracker.last_obs_sequence;
     seat_tracker.data.last_action_sequence = seat_tracker.last_action_sequence;
     seat_tracker.data.last_agent_types = seat_tracker.last_agent_types;
@@ -2004,18 +1994,13 @@ void RolloutManager::log_rewards_and_dones() {
             auto history = env.get_history_entries_slice(start_idx, total_len);
             for (const auto& entry : history) {
                 tracker.last_history_len += 1;
-                const int physical_actor = entry.player;  // Physical seat from env (for play order)
-                // Get agent_index for this physical seat (stable ID)
-                int actor_agent_idx = env.agent_index[physical_actor];
+                const int actor_agent_idx = entry.agent_id;
                 for (auto& kv : tracker.training_seats) {
                     SeatTrajectory& seat_tracker = kv.second;
                     if (!seat_tracker.active) {
                         continue;
                     }
-                    // seat_tracker.seat is agent_index (stable ID)
                     if (seat_tracker.seat != actor_agent_idx) {
-                        // This is an opponent action - append to training agent's trajectory
-                        // Store opponent's stable agent_index in agent_id sequence
                         const int idx = append_opponent_step(seat_tracker, actor_agent_idx);
                         if (idx >= 0 && idx < static_cast<int>(seat_tracker.data.opp_target_action.size())) {
                             seat_tracker.data.opp_target_action[idx] = static_cast<int>(entry.action);
@@ -2040,16 +2025,7 @@ void RolloutManager::log_rewards_and_dones() {
             if (!seat_tracker.active) {
                 continue;
             }
-            // Find physical_seat for this agent_index (env uses physical seats for terminations)
-            int physical_seat = -1;
-            for (int s = 0; s < env.num_players(); ++s) {
-                if (arena_.envs[tracker.env_idx].agent_index[s] == seat_tracker.seat) {
-                    physical_seat = s;
-                    break;
-                }
-            }
-            const bool seat_terminated = physical_seat >= 0 && physical_seat < env.num_players() &&
-                                         env.terminations[physical_seat];
+            const bool seat_terminated = env.terminations[seat_tracker.seat];
             if (seat_terminated || env_done) {
                 finalize_seat(tracker, seat_tracker, env);
             }
