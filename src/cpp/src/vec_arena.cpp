@@ -130,10 +130,16 @@ void VecArena::reset(int B_, int n_players_, uint32_t seed0) {
     base_seed = seed0;
     envs.assign(B, Env{});
     done.assign(B, 0);
-    roles.assign(B, std::vector<Role>(n_players));
+    roles.assign(B, std::unordered_map<int, Role>());
     pending.clear();
 
-    for (int b = 0; b < B; ++b) envs[b].reset(n_players, seed0 + (uint32_t)b);
+    for (int b = 0; b < B; ++b) {
+        envs[b].reset(n_players, seed0 + (uint32_t)b);
+        // Initialize agent_index to identity: agent_index[physical_seat] = physical_seat
+        for (int s = 0; s < n_players; ++s) {
+            envs[b].agent_index[s] = s;
+        }
+    }
 }
 
 void VecArena::set_max_sequence_length(int max_len) {
@@ -163,21 +169,9 @@ int VecArena::max_sequence_length_for_policy(int policy_id) const {
     return max_sequence_length;
 }
 
-void VecArena::set_roles(const std::vector<std::vector<int>>& policy_ids_per_env,
-                           const std::vector<std::vector<int>>& trajectory_ids_per_env) {
-    roles.assign(B, std::vector<Role>(n_players));
-    for (int b = 0; b < B; ++b) {
-        for (int s = 0; s < n_players; ++s) {
-            roles[b][s].policy_id = policy_ids_per_env[b][s];
-            // Set trajectory_id from the provided mapping (-1 for bots/historical)
-            if (b < static_cast<int>(trajectory_ids_per_env.size()) && 
-                s < static_cast<int>(trajectory_ids_per_env[b].size())) {
-                roles[b][s].trajectory_id = trajectory_ids_per_env[b][s];
-            } else {
-                roles[b][s].trajectory_id = -1;
-            }
-        }
-    }
+void VecArena::set_roles(const std::vector<std::unordered_map<int, Role>>& roles_by_agent_index) {
+    // Direct assignment - roles already indexed by agent_index (stable ID)!
+    roles = roles_by_agent_index;
     pending.clear();
 }
 
@@ -217,20 +211,21 @@ void VecArena::advance_env_until_policy_or_done(
     for (int p = 0; p < e.num_players(); ++p) if (!e.terminations[p]) ++alive;
     if (alive <= 1) { done[env_index] = 1; return; }
 
-    int cur = e.current_player();
-    int policy_id = roles[env_index][cur].policy_id;
+    int cur = e.current_player();  // physical seat
+    int agent_idx = e.agent_index[cur];  // get stable agent_index from physical seat
+    
+    // Look up role by agent_index (stable ID)
+    auto role_it = roles[env_index].find(agent_idx);
+    if (role_it == roles[env_index].end()) {
+        return;  // No role found for this agent_index
+    }
+    int policy_id = role_it->second.policy_id;
 
     PolicyRequest req;
     req.env = env_index;
-    req.seat = cur;
+    req.seat = cur;  // physical seat (for compatibility)
     req.done = 0;
-    // Set trajectory_id from the Role (moves with player during shuffling)
-    if (env_index >= 0 && env_index < static_cast<int>(roles.size()) &&
-        cur >= 0 && cur < static_cast<int>(roles[env_index].size())) {
-        req.trajectory_id = roles[env_index][cur].trajectory_id;
-    } else {
-        req.trajectory_id = -1;
-    }
+    req.agent_index = agent_idx;  // Use agent_index directly - no trajectory_id needed!
     fill_mask_for_current(e, req.mask.data());
     if (policy_id < 7) {
         // classic obs for C++ bots

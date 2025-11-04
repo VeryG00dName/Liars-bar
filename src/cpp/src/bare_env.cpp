@@ -57,6 +57,53 @@ inline void Env::penalize(int p) {
 
 // ---------------- Round lifecycle ----------------
 void Env::start_round() {
+    // Optional seat shuffling at round start (except the very first round after reset)
+    if (shuffle_seats_each_round && global_step > 0) {
+        // Shuffle seats 1..(n_players-1); keep seat 0 fixed
+        if (n_players > 1) {
+            std::vector<int> seats_to_shuffle;
+            seats_to_shuffle.reserve(std::max(0, n_players - 1));
+            for (int s = 1; s < n_players; ++s) seats_to_shuffle.push_back(s);
+            // Fisher–Yates using Env RNG
+            for (int i = static_cast<int>(seats_to_shuffle.size()) - 1; i > 0; --i) {
+                int j = static_cast<int>(rnd() % static_cast<uint32_t>(i + 1));
+                std::swap(seats_to_shuffle[i], seats_to_shuffle[j]);
+            }
+
+            // Build full permutation: logical -> new physical
+            // logical seat 0 stays at physical 0; others follow seats_to_shuffle order
+            std::array<int, MAX_PLAYERS> perm_full;
+            for (int i = 0; i < MAX_PLAYERS; ++i) perm_full[i] = i; // init identity
+            perm_full[0] = 0;
+            for (int logical = 1; logical < n_players; ++logical) {
+                perm_full[logical] = seats_to_shuffle[logical - 1];
+            }
+
+            // Apply permutation to agent_index mapping
+            std::array<int, MAX_PLAYERS> old_agent_index = agent_index;
+            for (int logical = 0; logical < n_players; ++logical) {
+                int new_physical = perm_full[logical];
+                agent_index[new_physical] = old_agent_index[logical];
+            }
+
+            // Apply permutation to persistent per-player state so it moves with agents
+            std::array<uint8_t, MAX_PLAYERS> old_penalties = penalties;
+            std::array<uint8_t, MAX_PLAYERS> old_terminations = terminations;
+            std::array<uint8_t, MAX_PLAYERS> old_limits = penalty_limits;
+            for (int logical = 0; logical < n_players; ++logical) {
+                int new_physical = perm_full[logical];
+                penalties[new_physical] = old_penalties[logical];
+                terminations[new_physical] = old_terminations[logical];
+                penalty_limits[new_physical] = old_limits[logical];
+            }
+
+            // Preserve who should start next round if previously set: map old seat to new seat
+            if (starter_hint >= 0 && starter_hint < n_players) {
+                starter_hint = perm_full[starter_hint];
+            }
+        }
+    }
+
     for (int p = 0; p < n_players; ++p) round_eliminated[p] = 0;
     pending_exists = 0; pending_claimant = -1; pending_count = 0; pending_bluff = 0;
     last_action_count = 0;

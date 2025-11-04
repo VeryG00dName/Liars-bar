@@ -30,6 +30,14 @@ public:
   std::array<uint8_t, MAX_PLAYERS> penalties{};
   std::array<uint8_t, MAX_PLAYERS> terminations{};
   std::array<uint8_t, MAX_PLAYERS> round_eliminated{};
+  
+  // If true, shuffle seats at the start of each new round (except initial round after reset).
+  // Seat 0 remains fixed; seats 1..n-1 are randomly permuted.
+  bool shuffle_seats_each_round = false;
+  
+  // Stable agent indices - never change for a player, only reordered when seats shuffle
+  // agent_index[physical_seat] = stable agent_index (0, 1, 2, 3...) for the agent at that physical position
+  std::array<int, MAX_PLAYERS> agent_index{-1, -1, -1, -1};
 
   // ---- History ----
   int global_step = 0;

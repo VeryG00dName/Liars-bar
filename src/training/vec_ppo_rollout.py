@@ -110,35 +110,37 @@ class PPOVecRolloutManager:
         model_input = None
         if self.use_legacy_mode:
             # Legacy mode: Get model input from Python agent's _last_inputs dict
-            # Note: _last_inputs is keyed by (env_idx, trajectory_id)
-            # where trajectory_id is a stable unique ID assigned at episode start
+            # Note: _last_inputs is keyed by (env_idx, agent_index)
+            # where agent_index is a stable unique ID that never changes
             training_agent = self.policies.get(int(traj.training_policy_id))
-            if training_agent and hasattr(training_agent, "_last_inputs"):
+            if training_agent:
                 env_idx = int(traj.env_index)
-                trajectory_id = int(getattr(traj, 'trajectory_id', -1))
-                if trajectory_id < 0:
-                    raise RuntimeError(f"Trajectory missing trajectory_id for env {env_idx}, policy {traj.training_policy_id}")
-                model_input_raw = training_agent._last_inputs.get((env_idx, trajectory_id))
+                agent_index = int(traj.agent_index)
+                if agent_index < 0:
+                    raise RuntimeError(f"Trajectory missing agent_index for env {env_idx}, policy {traj.training_policy_id}")
+                model_input_raw = training_agent._last_inputs.get((env_idx, agent_index))
                 if model_input_raw is None:
-                    # Check if trajectory has any steps - if not, this training seat never acted
-                    if not traj.agent_id or len(traj.agent_id) == 0:
-                        # Training seat never acted, skip this trajectory
+                    # If the training agent never acted in this trajectory, skip it gracefully
+                    try:
+                        agent_steps = list(traj.agent_id)
+                    except Exception:
+                        agent_steps = []
+                    if not any(int(a) == int(agent_index) for a in agent_steps):
                         return None
-                    # No fallback needed with trajectory_id - it's a unique stable ID
-                    # If we don't have inputs for this trajectory_id, the agent never acted
+                    # Otherwise, this indicates a bookkeeping mismatch; keep the detailed error
                     logging.error(
-                        f"Missing final model input for env {env_idx}, trajectory_id {trajectory_id}. "
-                        f"Trajectory has {len(traj.agent_id)} steps. "
-                        f"Available trajectory IDs for this env: {[k[1] for k in training_agent._last_inputs.keys() if k[0] == env_idx]}"
+                        f"Missing final model input for env {env_idx}, agent_index {agent_index}. "
+                        f"Trajectory has {len(agent_steps)} steps. "
+                        f"Available agent_indices for this env: {[k[1] for k in training_agent._last_inputs.keys() if k[0] == env_idx]}"
                     )
                     raise RuntimeError(
-                        f"Missing final model input for env {env_idx}, trajectory_id {trajectory_id}. "
-                        f"This should not happen - the agent must have acted at least once."
+                        f"Missing final model input for env {env_idx}, agent_index {agent_index}. "
+                        f"The agent appears to have acted, but no inputs were recorded."
                     )
                 model_input = {k: v.cpu() if torch.is_tensor(v) else v for k, v in model_input_raw.items()}
             else:
-                trajectory_id = int(getattr(traj, 'trajectory_id', -1))
-                raise RuntimeError(f"Training agent missing or lacks _last_inputs for env {traj.env_index}, trajectory_id {trajectory_id}")
+                agent_index = int(getattr(traj, 'agent_index', -1))
+                raise RuntimeError(f"Training agent missing or lacks _last_inputs for env {traj.env_index}, agent_index {agent_index}")
         else:
             # Optimized mode: Model inputs are saved in C++ and returned in TrajectoryData
             # Add batch dimension [1, ...] to match expected format
@@ -291,40 +293,50 @@ class PPOVecRolloutManager:
             if not requests_by_policy:
                 break
 
-            for policy_id_raw, requests in requests_by_policy.items():
-                policy_id = int(policy_id_raw)
-                agent = self.policies.get(policy_id)
-                if not agent:
-                    raise RuntimeError(f"No policy object for id: {policy_id}")
-
-                if policy_id not in training_policy_set:
-                    raise RuntimeError(f"Received requests for non-training policy {policy_id} in legacy mode.")
-
-                # Prepare batch for training policy
-                prepared_batch_dict = self.rollout_manager.prepare_training_batch(requests, policy_id)
-                
-                # prepared_batch_dict is already in the format expected by compute_actions
-                tensor_inputs = prepared_batch_dict
-
-                start = time.perf_counter()
-                autocast_enabled = self.device.type == "cuda"
-                with torch.inference_mode():
-                    autocast_ctx = amp.autocast(
-                        device_type=self.device.type,
-                        dtype=torch.float16,
-                        enabled=autocast_enabled,
-                    )
-                    with autocast_ctx:
-                        actions, log_probs, values = agent.compute_actions(tensor_inputs)
-                duration = time.perf_counter() - start
-                _record_model_call(policy_id, duration)
-
-                self.rollout_manager.submit_inference_results(
-                    policy_id,
-                    np.ascontiguousarray(actions, dtype=np.uint8),
-                    np.ascontiguousarray(log_probs, dtype=np.float32) if log_probs is not None else None,
-                    np.ascontiguousarray(values, dtype=np.float32) if values is not None else None,
+            # In legacy mode, there should only be one training policy ID
+            if len(requests_by_policy) != 1:
+                policy_ids = list(requests_by_policy.keys())
+                raise RuntimeError(
+                    f"Expected exactly 1 training policy in legacy mode, got {len(requests_by_policy)}: {policy_ids}"
                 )
+            
+            # Get the single policy_id and all requests
+            policy_id_raw = list(requests_by_policy.keys())[0]
+            policy_id = int(policy_id_raw)
+            requests = requests_by_policy[policy_id]
+            
+            agent = self.policies.get(policy_id)
+            if not agent:
+                raise RuntimeError(f"No policy object for id: {policy_id}")
+
+            if policy_id not in training_policy_set:
+                raise RuntimeError(f"Received requests for non-training policy {policy_id} in legacy mode.")
+
+            # Prepare batch for training policy - all requests are for the same policy_id
+            prepared_batch_dict = self.rollout_manager.prepare_training_batch(requests, policy_id)
+            
+            # prepared_batch_dict is already in the format expected by compute_actions
+            tensor_inputs = prepared_batch_dict
+
+            start = time.perf_counter()
+            autocast_enabled = self.device.type == "cuda"
+            with torch.inference_mode():
+                autocast_ctx = amp.autocast(
+                    device_type=self.device.type,
+                    dtype=torch.float16,
+                    enabled=autocast_enabled,
+                )
+                with autocast_ctx:
+                    actions, log_probs, values = agent.compute_actions(tensor_inputs)
+            duration = time.perf_counter() - start
+            _record_model_call(policy_id, duration)
+
+            self.rollout_manager.submit_inference_results(
+                policy_id,
+                np.ascontiguousarray(actions, dtype=np.uint8),
+                np.ascontiguousarray(log_probs, dtype=np.float32) if log_probs is not None else None,
+                np.ascontiguousarray(values, dtype=np.float32) if values is not None else None,
+            )
 
         completed = self.rollout_manager.get_completed_episodes()
         episodes = [self._convert_completed_episode(traj) for traj in completed]

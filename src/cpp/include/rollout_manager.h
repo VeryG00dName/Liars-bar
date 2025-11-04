@@ -27,7 +27,7 @@ struct TrajectoryData {
     int env_index{-1};
     int training_policy_id{-1};
     int training_agent_seat{-1};
-    int trajectory_id{-1};  // Stable unique ID for this trajectory within the env
+    int agent_index{-1};  // Stable ID for this agent (use instead of trajectory_id)
     std::vector<int> player_policy_ids;
 
     std::vector<int> agent_id;
@@ -47,9 +47,9 @@ struct TrajectoryData {
 };
 
 struct SeatTrajectory {
-    int seat{-1};
+    int seat{-1};  // This IS agent_index (stable ID)
     int policy_id{-1};
-    int trajectory_id{-1};  // Stable unique ID for this trajectory within the env
+    // Removed trajectory_id - seat is already agent_index!
     bool active{false};
     int last_training_step_idx{-1};
     std::array<uint8_t, Env::MAX_PLAYERS> last_penalties{};
@@ -205,10 +205,7 @@ private:
     std::vector<double> weighted_opponent_weights_;
     std::vector<std::vector<int>> fixed_opponent_triplets_;
     
-    // Seat shuffling per environment
-    std::vector<bool> env_shuffle_enabled_;  // per-env: whether to shuffle seats every round
-    std::vector<std::vector<int>> env_seat_permutation_;  // per-env: logical_seat -> physical_seat mapping
-    std::vector<int> env_last_round_history_len_;  // per-env: track last round's history length to detect new rounds
+    // Seat shuffling is configured per Env via Env::shuffle_seats_each_round
     
     // Legacy mode: greedy stepping and torch.jit.Module for historical models
     bool use_greedy_stepping_{false};
@@ -226,17 +223,15 @@ private:
                                               const std::vector<int>& weighted_opponents,
                                               const std::vector<double>& opponent_weights);
     EpisodeTracker new_episode_tracker(int env_idx, const std::vector<int>& roles);
-    int append_training_step(SeatTrajectory& seat_tracker);
-    int append_opponent_step(SeatTrajectory& seat_tracker, int seat);
+    int append_training_step(SeatTrajectory& seat_tracker, int env_idx);
+    int append_opponent_step(SeatTrajectory& seat_tracker, int opponent_agent_index);
     void update_penalty_rewards(SeatTrajectory& seat_tracker,
                                 const std::array<uint8_t, Env::MAX_PLAYERS>& penalties);
     void log_rewards_and_dones();
     void finalize_episode(EpisodeTracker& tracker);
     void mark_training_env_inactive(int env_idx);
     void finalize_seat(EpisodeTracker& tracker, SeatTrajectory& seat_tracker, Env& env);
-    void check_and_apply_seat_shuffle(int env_idx);
-    int map_logical_to_physical_seat(int env_idx, int logical_seat) const;
-    int map_physical_to_logical_seat(int env_idx, int physical_seat) const;
+    // Seat shuffling handled within Env
 
     void run_neural_inference(
         const std::unordered_map<int, std::vector<PolicyRequest>>& requests_by_policy,

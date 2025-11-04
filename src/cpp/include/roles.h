@@ -2,5 +2,5 @@
 
 struct Role {
     int policy_id{ -1 };
-    int trajectory_id{ -1 };  // Stable unique ID for training trajectory (-1 for bots/historical)
+    // Removed trajectory_id - we use agent_index (the map key) instead!
 };

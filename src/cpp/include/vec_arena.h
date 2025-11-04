@@ -17,7 +17,7 @@ static constexpr int OBS_DIM = ((BASE_OBS_DIM + 7) / 8) * 8;
 struct PolicyRequest {
         int env = -1;    // env index [0..B)
         int seat = -1;   // seat in [0..n_players) - physical seat (may change with shuffling)
-        int trajectory_id = -1;  // stable unique ID for training trajectory (-1 for bots/historical)
+        int agent_index = -1;  // stable ID for this agent (use instead of trajectory_id)
         std::array<uint8_t, 7> mask{};
         uint8_t done = 0;  // 1 if env already terminal
 
@@ -45,16 +45,15 @@ struct VecArena {
 	std::vector<Env> envs;
 	std::vector<uint8_t> done;                   // per-env terminal flag
 
-	// Roles per env per seat
-        std::vector<std::vector<Role>> roles;
+	// Roles per env per agent_index (stable ID, not physical seat!)
+        std::vector<std::unordered_map<int, Role>> roles;  // [env_idx][agent_index] -> Role
 
         // Pending requests (to match submit_actions)
         std::unordered_map<int, std::vector<PolicyRequest>> pending; // policy_id -> requests (order matters)
 
 	// ---- API ----
         void reset(int B_, int n_players_, uint32_t seed0);
-        void set_roles(const std::vector<std::vector<int>>& policy_ids_per_env,
-                       const std::vector<std::vector<int>>& trajectory_ids_per_env);
+        void set_roles(const std::vector<std::unordered_map<int, Role>>& roles_by_agent_index);
         void set_max_sequence_length(int max_len);
         void set_policy_max_sequence_length(int policy_id, int max_len);
 

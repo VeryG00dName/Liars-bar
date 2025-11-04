@@ -64,27 +64,24 @@ void bind_vec_arena(py::module_& m) {
             }
             return self.envs.at(i);
         }, py::return_value_policy::reference_internal, "Get a reference to an environment by index.")
-        .def("set_roles", [](VecArena& arena, const py::list& roles_list, const py::list& trajectory_ids_list) {
-            std::vector<std::vector<int>> roles;
-            roles.resize(py::len(roles_list));
-            for (size_t b = 0; b < roles.size(); ++b) {
-                auto row = roles_list[b].cast<py::list>();
-                roles[b].resize(py::len(row));
-                for (size_t s = 0; s < py::len(row); ++s) {
-                    roles[b][s] = py::cast<int>(row[s]);
+        .def("set_roles", [](VecArena& arena, const py::list& roles_list) {
+            // roles_list is a list of dicts: [{agent_index: Role}, ...]
+            // Each Role is a dict with "policy_id" (agent_index is the map key, no trajectory_id needed)
+            std::vector<std::unordered_map<int, Role>> roles_by_agent_index;
+            roles_by_agent_index.resize(py::len(roles_list));
+            for (size_t b = 0; b < roles_by_agent_index.size(); ++b) {
+                auto env_roles = roles_list[b].cast<py::dict>();
+                for (auto item : env_roles) {
+                    int agent_idx = py::cast<int>(item.first);
+                    py::dict role_dict = py::cast<py::dict>(item.second);
+                    Role role;
+                    role.policy_id = py::cast<int>(role_dict["policy_id"]);
+                    // No trajectory_id needed - we use agent_index from the map key!
+                    roles_by_agent_index[b][agent_idx] = role;
                 }
             }
-            std::vector<std::vector<int>> trajectory_ids;
-            trajectory_ids.resize(py::len(trajectory_ids_list));
-            for (size_t b = 0; b < trajectory_ids.size(); ++b) {
-                auto row = trajectory_ids_list[b].cast<py::list>();
-                trajectory_ids[b].resize(py::len(row));
-                for (size_t s = 0; s < py::len(row); ++s) {
-                    trajectory_ids[b][s] = py::cast<int>(row[s]);
-                }
-            }
-            arena.set_roles(roles, trajectory_ids);
-        }, py::arg("roles"), py::arg("trajectory_ids"))
+            arena.set_roles(roles_by_agent_index);
+        }, py::arg("roles"))
         .def("collect_requests", [](VecArena& arena) {
             py::dict out;
             const auto& grouped = arena.collect_requests();

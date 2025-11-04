@@ -493,10 +493,18 @@ EvalOutcome EvalManager::run_roles(const std::vector<std::vector<int>>& roles,
 
     uint32_t base_seed = static_cast<uint32_t>(seed_with_optional(seed));
     arena_.reset(static_cast<int>(total_games), num_players, base_seed);
-    // Evaluation doesn't use trajectory_ids (all -1 for bots/historical)
-    std::vector<std::vector<int>> trajectory_ids(static_cast<size_t>(total_games), 
-                                                   std::vector<int>(num_players, -1));
-    arena_.set_roles(roles, trajectory_ids);
+    // Build roles indexed by agent_index (stable ID)
+    // At reset, agent_index[physical_seat] = physical_seat (identity)
+    std::vector<std::unordered_map<int, Role>> roles_by_agent_index(static_cast<size_t>(total_games));
+    for (size_t env_idx = 0; env_idx < roles.size(); ++env_idx) {
+        for (int agent_idx = 0; agent_idx < num_players; ++agent_idx) {
+            Role role;
+            role.policy_id = roles[env_idx][agent_idx];  // At reset, agent_idx == physical_seat
+            // No trajectory_id needed - we use agent_index from the map key!
+            roles_by_agent_index[env_idx][agent_idx] = role;
+        }
+    }
+    arena_.set_roles(roles_by_agent_index);
 
     std::vector<uint8_t> env_completed(static_cast<size_t>(arena_.B), 0);
     int completed_games = 0;
@@ -513,7 +521,12 @@ EvalOutcome EvalManager::run_roles(const std::vector<std::vector<int>>& roles,
 
             while (!arena_.done[env_idx]) {
                 int current_seat = env.current_player();
-                int policy_id = arena_.roles[env_idx][current_seat].policy_id;
+                int agent_idx = env.agent_index[current_seat];
+                auto role_it = arena_.roles[env_idx].find(agent_idx);
+                if (role_it == arena_.roles[env_idx].end()) {
+                    break;  // No role found
+                }
+                int policy_id = role_it->second.policy_id;
 
                 auto bot_it = cpp_bot_registry_.find(policy_id);
                 if (bot_it == cpp_bot_registry_.end()) {

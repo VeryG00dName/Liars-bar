@@ -73,7 +73,7 @@ void bind_rollout_manager(py::module_& m) {
         .def_readonly("env_index", &TrajectoryData::env_index)
         .def_readonly("training_policy_id", &TrajectoryData::training_policy_id)
         .def_readonly("training_agent_seat", &TrajectoryData::training_agent_seat)
-        .def_readonly("trajectory_id", &TrajectoryData::trajectory_id)
+        .def_readonly("agent_index", &TrajectoryData::agent_index)
         .def_readonly("player_policy_ids", &TrajectoryData::player_policy_ids)
         .def_readonly("agent_id", &TrajectoryData::agent_id)
         .def_readonly("our_action", &TrajectoryData::our_action)
