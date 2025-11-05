@@ -30,54 +30,8 @@ NeuralInferenceOrchestrator::NeuralInferenceOrchestrator(
       top_k_(top_k),
       use_argmax_(use_argmax)
 {
-    // Pre-allocate MoE workspaces for each layer
-    // This avoids malloc/free overhead in hot path
+    // Lazily grow MoE workspaces based on observed batch characteristics.
     moe_workspaces_.resize(num_layers_);
-
-    // Calculate maximum workspace sizes based on worst-case scenario:
-    // max_batch_size * max_seq_length * top_k experts per layer
-    const int64_t max_seq_length = 480;  // From config.py MAX_SEQUENCE_LENGTH
-    const int64_t max_tokens = max_inference_batch_size_ * max_seq_length;
-    const int64_t max_groups = max_tokens * top_k_;  // Worst case: all tokens routed differently
-    const int64_t ffn_dim = hidden_dim_ * 2;  // Common FFN expansion ratio
-
-    for (int64_t layer = 0; layer < num_layers_; ++layer) {
-        auto& ws = moe_workspaces_[layer];
-
-        // Hidden buffer: max_tokens * ffn_dim * sizeof(half)
-        ws.hidden_buffer_size = max_tokens * ffn_dim * sizeof(uint16_t);
-        cudaMalloc(&ws.hidden_buffer, ws.hidden_buffer_size);
-
-        // CUTLASS workspaces: allocate conservative size (4MB per GEMM)
-        ws.workspace_w1_size = 4 * 1024 * 1024;
-        cudaMalloc(&ws.workspace_w1, ws.workspace_w1_size);
-
-        ws.workspace_w2_size = 4 * 1024 * 1024;
-        cudaMalloc(&ws.workspace_w2, ws.workspace_w2_size);
-
-        // Problem descriptor buffers: allocate for max_groups
-        ws.descriptor_capacity_w1 = max_groups;
-        cudaMalloc(&ws.problem_sizes_device_w1, max_groups * sizeof(int) * 3);  // GemmCoord (M,N,K)
-        cudaMalloc(&ws.ptr_A_device_w1, max_groups * sizeof(void*));
-        cudaMalloc(&ws.ptr_B_device_w1, max_groups * sizeof(void*));
-        cudaMalloc(&ws.ptr_C_device_w1, max_groups * sizeof(void*));
-        cudaMalloc(&ws.ptr_D_device_w1, max_groups * sizeof(void*));
-        cudaMalloc(&ws.lda_device_w1, max_groups * sizeof(int64_t));
-        cudaMalloc(&ws.ldb_device_w1, max_groups * sizeof(int64_t));
-        cudaMalloc(&ws.ldc_device_w1, max_groups * sizeof(int64_t));
-        cudaMalloc(&ws.ldd_device_w1, max_groups * sizeof(int64_t));
-
-        ws.descriptor_capacity_w2 = max_groups;
-        cudaMalloc(&ws.problem_sizes_device_w2, max_groups * sizeof(int) * 3);
-        cudaMalloc(&ws.ptr_A_device_w2, max_groups * sizeof(void*));
-        cudaMalloc(&ws.ptr_B_device_w2, max_groups * sizeof(void*));
-        cudaMalloc(&ws.ptr_C_device_w2, max_groups * sizeof(void*));
-        cudaMalloc(&ws.ptr_D_device_w2, max_groups * sizeof(void*));
-        cudaMalloc(&ws.lda_device_w2, max_groups * sizeof(int64_t));
-        cudaMalloc(&ws.ldb_device_w2, max_groups * sizeof(int64_t));
-        cudaMalloc(&ws.ldc_device_w2, max_groups * sizeof(int64_t));
-        cudaMalloc(&ws.ldd_device_w2, max_groups * sizeof(int64_t));
-    }
 }
 
 NeuralInferenceOrchestrator::~NeuralInferenceOrchestrator() {
@@ -106,6 +60,25 @@ NeuralInferenceOrchestrator::~NeuralInferenceOrchestrator() {
         if (ws.ldb_device_w2) cudaFree(ws.ldb_device_w2);
         if (ws.ldc_device_w2) cudaFree(ws.ldc_device_w2);
         if (ws.ldd_device_w2) cudaFree(ws.ldd_device_w2);
+    }
+}
+
+void NeuralInferenceOrchestrator::ensure_workspace_capacity(
+    int64_t batch_size,
+    const torch::Tensor& valid_lengths) {
+    if (batch_size <= 0 || moe_workspaces_.empty()) {
+        return;
+    }
+
+    int64_t max_valid = 0;
+    if (valid_lengths.defined() && valid_lengths.numel() > 0) {
+        max_valid = valid_lengths.max().item<int64_t>();
+    }
+    max_valid = std::max<int64_t>(1, max_valid);
+
+    const int64_t token_capacity = batch_size * max_valid;
+    for (auto& ws : moe_workspaces_) {
+        lb::forward::ensure_forward_workspace_capacity(ws, token_capacity, hidden_dim_, top_k_);
     }
 }
 
@@ -289,6 +262,8 @@ NeuralInferenceOrchestrator::run_inference(
 
         auto [obs_seq, action_seq, agent_types, positions, padding_mask, policy_indices, valid_lengths] =
             prepare_batch_tensors(batch_requests, max_seq_len);
+
+        ensure_workspace_capacity(obs_seq.size(0), valid_lengths);
 
         std::unordered_map<std::string, std::chrono::microseconds> batch_timers;
         auto [action_logits, opp_logits, state_values, win_logits] = lb::forward::forward_packed(

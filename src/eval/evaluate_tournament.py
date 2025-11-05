@@ -296,6 +296,7 @@ def run_active_league(
     coverage_done = 0
 
     while not coverage_complete:
+        
         quartets, updated_usage = schedule_quartets(
             sorted(players.keys()),
             pair_stats,
@@ -429,7 +430,7 @@ def run_active_league(
             )
 
         batch_idx += 1
-
+    print(f"Elapsed time: {elapsed:.2f}s, Games/sec: {games_per_sec:.2f}, total games{total_games_done} ")
     progress_ui.close()
     save_scoreboard(scoreboard_file, players)
 

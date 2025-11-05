@@ -110,6 +110,10 @@ private:
         const std::array<uint8_t, 7>& mask,
         float& log_prob
     ) const;
+
+    void ensure_workspace_capacity(
+        int64_t batch_size,
+        const torch::Tensor& valid_lengths);
 };
 
 }  // namespace execution_core

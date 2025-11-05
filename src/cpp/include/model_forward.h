@@ -61,6 +61,18 @@ void enable_forward_workspace_cache(
     int64_t top_k);
 
 /**
+ * Ensure that a workspace has enough capacity for the requested token count.
+ *
+ * Reallocates device buffers only when the new requirement exceeds the
+ * previously reserved capacity.
+ */
+void ensure_forward_workspace_capacity(
+    lb::moe::MoEWorkspace& workspace,
+    int64_t token_capacity,
+    int64_t hidden_dim,
+    int64_t top_k);
+
+/**
  * Disable and free the thread-local MoE workspace cache.
  */
 void disable_forward_workspace_cache();

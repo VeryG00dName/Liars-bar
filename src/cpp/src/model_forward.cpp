@@ -31,11 +31,9 @@ namespace {
 thread_local bool g_tls_workspace_enabled = false;
 thread_local std::vector<lb::moe::MoEWorkspace> g_tls_workspaces;
 
-inline void free_workspace(lb::moe::MoEWorkspace& ws) {
-    if (ws.hidden_buffer) { cudaFree(ws.hidden_buffer); ws.hidden_buffer = nullptr; ws.hidden_buffer_size = 0; }
-    if (ws.workspace_w1) { cudaFree(ws.workspace_w1); ws.workspace_w1 = nullptr; ws.workspace_w1_size = 0; }
-    if (ws.workspace_w2) { cudaFree(ws.workspace_w2); ws.workspace_w2 = nullptr; ws.workspace_w2_size = 0; }
+constexpr size_t kCutlassWorkspaceBytes = 4 * 1024 * 1024;
 
+inline void release_descriptor_buffers_w1(lb::moe::MoEWorkspace& ws) {
     if (ws.problem_sizes_device_w1) { cudaFree(ws.problem_sizes_device_w1); ws.problem_sizes_device_w1 = nullptr; }
     if (ws.ptr_A_device_w1) { cudaFree(ws.ptr_A_device_w1); ws.ptr_A_device_w1 = nullptr; }
     if (ws.ptr_B_device_w1) { cudaFree(ws.ptr_B_device_w1); ws.ptr_B_device_w1 = nullptr; }
@@ -46,7 +44,9 @@ inline void free_workspace(lb::moe::MoEWorkspace& ws) {
     if (ws.ldc_device_w1) { cudaFree(ws.ldc_device_w1); ws.ldc_device_w1 = nullptr; }
     if (ws.ldd_device_w1) { cudaFree(ws.ldd_device_w1); ws.ldd_device_w1 = nullptr; }
     ws.descriptor_capacity_w1 = 0;
+}
 
+inline void release_descriptor_buffers_w2(lb::moe::MoEWorkspace& ws) {
     if (ws.problem_sizes_device_w2) { cudaFree(ws.problem_sizes_device_w2); ws.problem_sizes_device_w2 = nullptr; }
     if (ws.ptr_A_device_w2) { cudaFree(ws.ptr_A_device_w2); ws.ptr_A_device_w2 = nullptr; }
     if (ws.ptr_B_device_w2) { cudaFree(ws.ptr_B_device_w2); ws.ptr_B_device_w2 = nullptr; }
@@ -58,7 +58,108 @@ inline void free_workspace(lb::moe::MoEWorkspace& ws) {
     if (ws.ldd_device_w2) { cudaFree(ws.ldd_device_w2); ws.ldd_device_w2 = nullptr; }
     ws.descriptor_capacity_w2 = 0;
 }
+
+inline void ensure_device_buffer(void*& ptr, size_t& current_size, size_t required_size) {
+    if (required_size == 0) {
+        if (ptr) {
+            cudaFree(ptr);
+            ptr = nullptr;
+        }
+        current_size = 0;
+        return;
+    }
+    if (current_size >= required_size) {
+        return;
+    }
+    if (ptr) {
+        cudaFree(ptr);
+        ptr = nullptr;
+    }
+    cudaMalloc(&ptr, required_size);
+    current_size = required_size;
+}
+
+inline void ensure_descriptor_capacity_w1(lb::moe::MoEWorkspace& ws, size_t required_groups) {
+    if (required_groups == 0) {
+        release_descriptor_buffers_w1(ws);
+        return;
+    }
+    if (ws.descriptor_capacity_w1 >= required_groups) {
+        return;
+    }
+
+    release_descriptor_buffers_w1(ws);
+
+    cudaMalloc(&ws.problem_sizes_device_w1, required_groups * sizeof(int) * 3);  // GemmCoord (M,N,K)
+    cudaMalloc(&ws.ptr_A_device_w1, required_groups * sizeof(void*));
+    cudaMalloc(&ws.ptr_B_device_w1, required_groups * sizeof(void*));
+    cudaMalloc(&ws.ptr_C_device_w1, required_groups * sizeof(void*));
+    cudaMalloc(&ws.ptr_D_device_w1, required_groups * sizeof(void*));
+    cudaMalloc(&ws.lda_device_w1, required_groups * sizeof(int64_t));
+    cudaMalloc(&ws.ldb_device_w1, required_groups * sizeof(int64_t));
+    cudaMalloc(&ws.ldc_device_w1, required_groups * sizeof(int64_t));
+    cudaMalloc(&ws.ldd_device_w1, required_groups * sizeof(int64_t));
+
+    ws.descriptor_capacity_w1 = required_groups;
+}
+
+inline void ensure_descriptor_capacity_w2(lb::moe::MoEWorkspace& ws, size_t required_groups) {
+    if (required_groups == 0) {
+        release_descriptor_buffers_w2(ws);
+        return;
+    }
+    if (ws.descriptor_capacity_w2 >= required_groups) {
+        return;
+    }
+
+    release_descriptor_buffers_w2(ws);
+
+    cudaMalloc(&ws.problem_sizes_device_w2, required_groups * sizeof(int) * 3);
+    cudaMalloc(&ws.ptr_A_device_w2, required_groups * sizeof(void*));
+    cudaMalloc(&ws.ptr_B_device_w2, required_groups * sizeof(void*));
+    cudaMalloc(&ws.ptr_C_device_w2, required_groups * sizeof(void*));
+    cudaMalloc(&ws.ptr_D_device_w2, required_groups * sizeof(void*));
+    cudaMalloc(&ws.lda_device_w2, required_groups * sizeof(int64_t));
+    cudaMalloc(&ws.ldb_device_w2, required_groups * sizeof(int64_t));
+    cudaMalloc(&ws.ldc_device_w2, required_groups * sizeof(int64_t));
+    cudaMalloc(&ws.ldd_device_w2, required_groups * sizeof(int64_t));
+
+    ws.descriptor_capacity_w2 = required_groups;
+}
+
+inline void free_workspace(lb::moe::MoEWorkspace& ws) {
+    ensure_device_buffer(ws.hidden_buffer, ws.hidden_buffer_size, 0);
+    ensure_device_buffer(ws.workspace_w1, ws.workspace_w1_size, 0);
+    ensure_device_buffer(ws.workspace_w2, ws.workspace_w2_size, 0);
+    release_descriptor_buffers_w1(ws);
+    release_descriptor_buffers_w2(ws);
+}
 } // anonymous namespace
+
+void ensure_forward_workspace_capacity(
+    lb::moe::MoEWorkspace& workspace,
+    int64_t token_capacity,
+    int64_t hidden_dim,
+    int64_t top_k) {
+    if (token_capacity <= 0 || hidden_dim <= 0 || top_k <= 0) {
+        ensure_device_buffer(workspace.hidden_buffer, workspace.hidden_buffer_size, 0);
+        ensure_device_buffer(workspace.workspace_w1, workspace.workspace_w1_size, 0);
+        ensure_device_buffer(workspace.workspace_w2, workspace.workspace_w2_size, 0);
+        ensure_descriptor_capacity_w1(workspace, 0);
+        ensure_descriptor_capacity_w2(workspace, 0);
+        return;
+    }
+
+    const int64_t ffn_dim = hidden_dim * 2;
+    const size_t hidden_bytes = static_cast<size_t>(token_capacity) * static_cast<size_t>(ffn_dim) * sizeof(uint16_t);
+    ensure_device_buffer(workspace.hidden_buffer, workspace.hidden_buffer_size, hidden_bytes);
+    ensure_device_buffer(workspace.workspace_w1, workspace.workspace_w1_size, kCutlassWorkspaceBytes);
+    ensure_device_buffer(workspace.workspace_w2, workspace.workspace_w2_size, kCutlassWorkspaceBytes);
+
+    const size_t required_groups = static_cast<size_t>(token_capacity) * static_cast<size_t>(top_k);
+    ensure_descriptor_capacity_w1(workspace, required_groups);
+    ensure_descriptor_capacity_w2(workspace, required_groups);
+}
 
 void enable_forward_workspace_cache(
     int64_t num_layers,
@@ -66,52 +167,18 @@ void enable_forward_workspace_cache(
     int64_t max_seq_length,
     int64_t hidden_dim,
     int64_t top_k) {
-    // Clean any existing cache first
-    if (!g_tls_workspaces.empty()) {
-        for (auto& ws : g_tls_workspaces) free_workspace(ws);
-        g_tls_workspaces.clear();
+    const int64_t max_tokens = max_batch_size * max_seq_length;
+
+    if (static_cast<int64_t>(g_tls_workspaces.size()) > num_layers) {
+        for (int64_t layer = num_layers; layer < static_cast<int64_t>(g_tls_workspaces.size()); ++layer) {
+            free_workspace(g_tls_workspaces[layer]);
+        }
     }
 
     g_tls_workspaces.resize(num_layers);
-    const int64_t max_tokens = max_batch_size * max_seq_length;
-    const int64_t max_groups = max_tokens * top_k;
-    const int64_t ffn_dim = hidden_dim * 2; // typical expansion ratio
 
     for (int64_t layer = 0; layer < num_layers; ++layer) {
-        auto& ws = g_tls_workspaces[layer];
-
-        // Hidden buffer
-        ws.hidden_buffer_size = static_cast<size_t>(max_tokens) * static_cast<size_t>(ffn_dim) * sizeof(uint16_t);
-        cudaMalloc(&ws.hidden_buffer, ws.hidden_buffer_size);
-
-        // CUTLASS workspaces
-        ws.workspace_w1_size = 4 * 1024 * 1024;
-        cudaMalloc(&ws.workspace_w1, ws.workspace_w1_size);
-        ws.workspace_w2_size = 4 * 1024 * 1024;
-        cudaMalloc(&ws.workspace_w2, ws.workspace_w2_size);
-
-        // Problem descriptors (capacity per GEMM group)
-        ws.descriptor_capacity_w1 = max_groups;
-        cudaMalloc(&ws.problem_sizes_device_w1, max_groups * sizeof(int) * 3);  // GemmCoord (M,N,K)
-        cudaMalloc(&ws.ptr_A_device_w1, max_groups * sizeof(void*));
-        cudaMalloc(&ws.ptr_B_device_w1, max_groups * sizeof(void*));
-        cudaMalloc(&ws.ptr_C_device_w1, max_groups * sizeof(void*));
-        cudaMalloc(&ws.ptr_D_device_w1, max_groups * sizeof(void*));
-        cudaMalloc(&ws.lda_device_w1, max_groups * sizeof(int64_t));
-        cudaMalloc(&ws.ldb_device_w1, max_groups * sizeof(int64_t));
-        cudaMalloc(&ws.ldc_device_w1, max_groups * sizeof(int64_t));
-        cudaMalloc(&ws.ldd_device_w1, max_groups * sizeof(int64_t));
-
-        ws.descriptor_capacity_w2 = max_groups;
-        cudaMalloc(&ws.problem_sizes_device_w2, max_groups * sizeof(int) * 3);
-        cudaMalloc(&ws.ptr_A_device_w2, max_groups * sizeof(void*));
-        cudaMalloc(&ws.ptr_B_device_w2, max_groups * sizeof(void*));
-        cudaMalloc(&ws.ptr_C_device_w2, max_groups * sizeof(void*));
-        cudaMalloc(&ws.ptr_D_device_w2, max_groups * sizeof(void*));
-        cudaMalloc(&ws.lda_device_w2, max_groups * sizeof(int64_t));
-        cudaMalloc(&ws.ldb_device_w2, max_groups * sizeof(int64_t));
-        cudaMalloc(&ws.ldc_device_w2, max_groups * sizeof(int64_t));
-        cudaMalloc(&ws.ldd_device_w2, max_groups * sizeof(int64_t));
+        ensure_forward_workspace_capacity(g_tls_workspaces[layer], max_tokens, hidden_dim, top_k);
     }
 
     g_tls_workspace_enabled = true;
@@ -184,6 +251,23 @@ forward_packed(
     t["forward_fusion_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
 
     auto x = fused.at("combined");
+
+    const int64_t workspace_tokens = obs_sequence.size(0) * obs_sequence.size(1);
+    if (moe_workspaces) {
+        for (int64_t layer = 0; layer < num_layers; ++layer) {
+            ensure_forward_workspace_capacity(
+                moe_workspaces[layer], workspace_tokens, hidden_dim, top_k);
+        }
+    } else if (g_tls_workspace_enabled) {
+        int64_t available_layers = static_cast<int64_t>(g_tls_workspaces.size());
+        if (available_layers > num_layers) {
+            available_layers = num_layers;
+        }
+        for (int64_t layer = 0; layer < available_layers; ++layer) {
+            ensure_forward_workspace_capacity(
+                g_tls_workspaces[layer], workspace_tokens, hidden_dim, top_k);
+        }
+    }
 
     // 3. Transformer Layers
     torch::Tensor last_topk_idx, last_topk_scores;
