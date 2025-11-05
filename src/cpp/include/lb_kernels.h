@@ -91,49 +91,5 @@ torch::Tensor indexed_batched_linear(
     std::unordered_map<std::string, std::chrono::microseconds>& timers,
     IndexedLinearEpilogue epilogue = IndexedLinearEpilogue::Bias);
 
-/**
- * Grouped FFN GEMM Forward (Low-level MoE kernel interface)
- *
- * Runs the grouped FFN GEMM forward pass using CUTLASS grouped kernels.
- * This is used internally by the MoE autograd function.
- *
- * Each array argument contains device pointers for the operands.
- * Applies per-row routing weights in the GEMM epilogue (fused).
- *
- * @param input_ptrs Device pointers to input matrices (one per group)
- * @param w1_ptrs Device pointers to W1 weight matrices
- * @param b1_ptrs Device pointers to b1 bias vectors
- * @param w2_ptrs Device pointers to W2 weight matrices
- * @param b2_ptrs Device pointers to b2 bias vectors
- * @param output_ptrs Device pointers to output matrices
- * @param routing_weight_ptrs Device pointers to routing weights
- * @param m_sizes Number of tokens per group
- * @param policy_ids Policy IDs per group (for logging)
- * @param expert_ids Expert IDs per group (for logging)
- * @param token_offsets Token offsets per group (for scatter)
- * @param group_count Number of groups
- * @param hidden_dim Hidden dimension (H)
- * @param ffn_dim FFN intermediate dimension (F)
- *
- * Performance: Uses CUTLASS grouped GEMM with Tensor Core acceleration.
- * Precision: FP32 accumulation, FP16 I/O.
- * Epilogue: W1 bias + GELU, then W2 bias + routing weight scaling.
- */
-void grouped_ffn_gemm_forward(
-    const uintptr_t* input_ptrs,
-    const uintptr_t* w1_ptrs,
-    const uintptr_t* b1_ptrs,
-    const uintptr_t* w2_ptrs,
-    const uintptr_t* b2_ptrs,
-    const uintptr_t* output_ptrs,
-    const uintptr_t* routing_weight_ptrs,
-    const int64_t* m_sizes,
-    const int64_t* policy_ids,
-    const int64_t* expert_ids,
-    const int64_t* token_offsets,
-    int64_t group_count,
-    int64_t hidden_dim,
-    int64_t ffn_dim);
-
 } // namespace kernels
 } // namespace lb

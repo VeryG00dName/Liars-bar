@@ -787,6 +787,20 @@ void RolloutManager::finalize_model_loading() {
     weights_finalized_ = true;
 }
 
+void RolloutManager::register_cpp_bot(int policy_id, const std::string& bot_name) {
+    try {
+        CppBotKind kind = parse_cpp_bot_kind(bot_name);
+        auto& entry = cpp_bot_registry_[policy_id];
+        entry.kind = kind;
+        entry.instances.clear();
+    } catch (const std::exception& err) {
+        std::cerr << "[RolloutManager] Failed to register C++ bot '" << bot_name
+                  << "' for policy " << policy_id << ": " << err.what() << std::endl;
+        throw;
+    }
+}
+
+
 void RolloutManager::set_use_greedy_stepping(bool use_greedy) {
     use_greedy_stepping_ = use_greedy;
 }

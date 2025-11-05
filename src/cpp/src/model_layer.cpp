@@ -243,9 +243,13 @@ transformer_layer(
 
     // --- MoE Block ---
     t0 = Clock::now();
-    auto gate_logits = lb::kernels::indexed_batched_linear(x_norm, gate_weight, gate_bias, policy_indices, t);
+    // Compute gate logits in FP16 (fast linear kernel)
+    auto gate_logits_fp16 = lb::kernels::indexed_batched_linear(x_norm, gate_weight, gate_bias, policy_indices, t);
+    // Convert to FP32 for routing to match reference precision and avoid topk rounding errors
+    auto gate_logits = gate_logits_fp16.to(torch::kFloat);
+    // Both topk and softmax now use FP32, ensuring identical expert selection to Python reference
     auto [topk_scores, topk_indices] = torch::topk(gate_logits, top_k, -1);
-    auto probs = torch::softmax(gate_logits.to(torch::kFloat), -1);
+    auto probs = torch::softmax(gate_logits, -1);
     auto topk_probs = torch::gather(probs, -1, topk_indices);
     auto topk_weights = topk_probs / topk_probs.sum(-1, /*keepdim=*/true).clamp_min(1e-6);
 

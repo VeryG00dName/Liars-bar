@@ -78,14 +78,13 @@ __global__ void indexed_batched_embedding_kernel(
     const int64_t policy_idx = policy_indices[b];
     const int64_t token_idx = indices[linear_index];
 
-    const scalar_t* table_ptr = weight_cache + policy_idx * vocab_size * hidden_dim;
-    const scalar_t* src_ptr = table_ptr + token_idx * hidden_dim;
+    const scalar_t* src_ptr = weight_cache + policy_idx * vocab_size * hidden_dim
+                            + token_idx * hidden_dim;
     scalar_t* dst_ptr = output + linear_index * hidden_dim;
 
-    // Use vector loads for better memory bandwidth
-    const int vec_size = 4;
-    for (int64_t h = threadIdx.x * vec_size; h < hidden_dim; h += blockDim.x * vec_size) {
-        *reinterpret_cast<float4*>(&dst_ptr[h]) = *reinterpret_cast<const float4*>(&src_ptr[h]);
+    // Scalar copy - works for any type (float, half, bfloat16) without alignment issues
+    for (int64_t h = threadIdx.x; h < hidden_dim; h += blockDim.x) {
+        dst_ptr[h] = src_ptr[h];
     }
 }
 
@@ -362,34 +361,6 @@ torch::Tensor indexed_batched_linear(
     }
 
     return output;
-}
-
-void grouped_ffn_gemm_forward(
-    const uintptr_t* input_ptrs,
-    const uintptr_t* w1_ptrs,
-    const uintptr_t* b1_ptrs,
-    const uintptr_t* w2_ptrs,
-    const uintptr_t* b2_ptrs,
-    const uintptr_t* output_ptrs,
-    const uintptr_t* routing_weight_ptrs,
-    const int64_t* m_sizes,
-    const int64_t* policy_ids,
-    const int64_t* expert_ids,
-    const int64_t* token_offsets,
-    int64_t group_count,
-    int64_t hidden_dim,
-    int64_t ffn_dim) {
-
-    TORCH_CHECK(m_sizes != nullptr, "grouped_ffn_gemm_forward: m_sizes must not be null");
-    TORCH_CHECK(policy_ids != nullptr, "grouped_ffn_gemm_forward: policy_ids must not be null");
-    TORCH_CHECK(expert_ids != nullptr, "grouped_ffn_gemm_forward: expert_ids must not be null");
-    TORCH_CHECK(routing_weight_ptrs != nullptr, "grouped_ffn_gemm_forward: routing_weight_ptrs must not be null");
-
-    lb::moe::cutlass_grouped_moe_forward(
-        input_ptrs, w1_ptrs, b1_ptrs, w2_ptrs, b2_ptrs,
-        output_ptrs, routing_weight_ptrs, m_sizes,
-        policy_ids, expert_ids, token_offsets,
-        group_count, hidden_dim, ffn_dim, nullptr);
 }
 
 } // namespace kernels

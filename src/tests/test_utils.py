@@ -96,6 +96,57 @@ def pad_model_weights(state_dict: Dict[str, torch.Tensor], pad_obs_to: int = 16)
     return state_dict
 
 
+def split_attention_weights(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Split fused QKV attention weights into separate Q, K, V projections.
+
+    The C++ code expects separate q_proj, k_proj, v_proj weights but checkpoints
+    may have fused in_proj weights. This function splits them.
+
+    Args:
+        state_dict: State dict with potentially fused attention weights.
+
+    Returns:
+        State dict with split Q/K/V weights.
+    """
+    keys = list(state_dict.keys())
+    for key in keys:
+        # Split in_proj_weight
+        if key.endswith('.self_attn.in_proj_weight') and key in state_dict:
+            w = state_dict[key]
+            if not torch.is_tensor(w) or w.dim() not in (2, 3):
+                continue
+            dim = 1 if w.dim() == 3 else 0
+            if (w.size(dim) % 3) != 0:
+                continue
+            q, k, v = torch.chunk(w, 3, dim=dim)
+            base = key.replace('.self_attn.in_proj_weight', '')
+            state_dict[f"{base}.self_attn.q_proj.weight"] = q.contiguous()
+            state_dict[f"{base}.self_attn.k_proj.weight"] = k.contiguous()
+            state_dict[f"{base}.self_attn.v_proj.weight"] = v.contiguous()
+            state_dict[f"{base}.q_proj.weight"] = q.contiguous()
+            state_dict[f"{base}.k_proj.weight"] = k.contiguous()
+            state_dict[f"{base}.v_proj.weight"] = v.contiguous()
+
+        # Split in_proj_bias
+        if key.endswith('.self_attn.in_proj_bias') and key in state_dict:
+            b = state_dict[key]
+            if not torch.is_tensor(b) or b.dim() not in (1, 2):
+                continue
+            dim = 1 if b.dim() == 2 else 0
+            if (b.size(dim) % 3) != 0:
+                continue
+            q, k, v = torch.chunk(b, 3, dim=dim)
+            base = key.replace('.self_attn.in_proj_bias', '')
+            state_dict[f"{base}.self_attn.q_proj.bias"] = q.contiguous()
+            state_dict[f"{base}.self_attn.k_proj.bias"] = k.contiguous()
+            state_dict[f"{base}.self_attn.v_proj.bias"] = v.contiguous()
+            state_dict[f"{base}.q_proj.bias"] = q.contiguous()
+            state_dict[f"{base}.k_proj.bias"] = k.contiguous()
+            state_dict[f"{base}.v_proj.bias"] = v.contiguous()
+
+    return state_dict
+
+
 def prepare_batched_weights(
     state_dict: Dict[str, torch.Tensor],
     num_layers: int,
@@ -107,18 +158,18 @@ def prepare_batched_weights(
 
     Steps:
     1) Pre-stack MoE expert weights with ``lb.prestack_moe_expert_weights``.
-    2) Add batch dimension ``[1, ...]`` to every tensor and move to ``device``.
-    3) If ``to_fp16`` is True, convert only MoE expert weights (``.moe.experts.``)
-       to ``float16``; leave other tensors in their original dtype.
-    4) Create MoE pointer tensors with ``lb.create_moe_weight_pointers``.
-    5) Add fixed buffers with ``lb.add_fixed_buffers``.
+    2) Split fused attention weights into Q/K/V projections.
+    3) Add batch dimension ``[1, ...]`` to every tensor and move to ``device``.
+    4) If ``to_fp16`` is True, convert all floating point tensors to ``float16``.
+    5) Create MoE pointer tensors with ``lb.create_moe_weight_pointers``.
+    6) Add fixed buffers with ``lb.add_fixed_buffers``.
 
     Args:
         state_dict: Flat parameter mapping (CPU tensors recommended).
         num_layers: Number of transformer layers.
         num_experts: Number of experts per layer.
         device: Target device string (e.g., ``"cuda"`` or ``"cpu"``).
-        to_fp16: Whether to cast MoE expert tensors to ``float16``.
+        to_fp16: Whether to cast all floating point tensors to ``float16``.
 
     Returns:
         A fully prepared batched weight dictionary ready for C++ entrypoints.
@@ -126,26 +177,32 @@ def prepare_batched_weights(
     # 1) Pre-stack MoE expert weights first (before batching)
     sd = lb.prestack_moe_expert_weights(dict(state_dict), num_layers, num_experts)
 
-    # 2) Add batch dimension and move to device
-    batched: Dict[str, torch.Tensor] = {}
-    for k, t in sd.items():
-        if torch.is_tensor(t):
-            bt = t.unsqueeze(0).to(device)
-            batched[k] = bt
-        else:
-            # Non-tensor entries are copied through unmodified
-            batched[k] = t  # type: ignore[assignment]
+    # 2) Split fused attention weights
+    sd = split_attention_weights(sd)
 
-    # 3) Optional: cast ONLY MoE expert tensors to fp16 for CUDA kernels
+    # 3) Add batch dimension (for single policy)
+    for k in list(sd.keys()):
+        if torch.is_tensor(sd[k]):
+            sd[k] = sd[k].unsqueeze(0)
+
+    # 4) Move to device and convert to FP16 in a single step (avoids intermediate copies)
     if to_fp16:
-        for k, t in list(batched.items()):
-            if torch.is_tensor(t) and t.is_floating_point() and ".moe.experts." in k:
-                batched[k] = t.to(torch.float16).contiguous()
+        for k in sd:
+            if torch.is_tensor(sd[k]) and sd[k].is_floating_point():
+                sd[k] = sd[k].to(device, dtype=torch.float16).contiguous()
+            elif torch.is_tensor(sd[k]):
+                sd[k] = sd[k].to(device).contiguous()
+    else:
+        for k in sd:
+            if torch.is_tensor(sd[k]):
+                sd[k] = sd[k].to(device).contiguous()
 
-    # 4) Create pointer tensors for MoE expert stacks
+    batched = sd
+
+    # 5) Create pointer tensors for MoE expert stacks
     batched = lb.create_moe_weight_pointers(batched, num_layers, num_experts)
 
-    # 5) Add fixed buffers (LUTs) expected by the C++ side
+    # 6) Add fixed buffers (LUTs) expected by the C++ side
     batched = lb.add_fixed_buffers(batched, device)
 
     return batched
