@@ -1,6 +1,7 @@
 #include "model_layer.h"
 #include "lb_kernels.h"
 #include "moe_cutlass_kernels.h"
+#include <algorithm>
 #include <sstream>
 #include <torch/torch.h>
 
@@ -270,34 +271,107 @@ transformer_layer(
     auto sorted_routing_weights = flat_routing_weights.index_select(0, sort_order).to(torch::kFloat32);
     auto sorted_policy_indices = flat_policy_indices.index_select(0, sort_order);
     
-    auto expert_inputs = x_flat.index_select(0, sorted_token_indices).contiguous();
-
-    auto [m_sizes_dev, policy_ids_dev, expert_ids_dev, token_offsets_dev] = 
-        lb::model::moe_group_metadata_device(sorted_expert_indices, sorted_policy_indices);
-    
     int64_t ffn_dim = gate_weight.size(-1) * 2; // Infer FFN dim from gate weight
-    int64_t group_count = m_sizes_dev.size(0);
-    auto expert_outputs = torch::empty_like(expert_inputs);
-    auto hidden_tmp = torch::empty({expert_inputs.size(0), ffn_dim}, expert_inputs.options());
-
-    lb::moe::cutlass_grouped_moe_forward(
-        reinterpret_cast<uintptr_t>(expert_inputs.data_ptr()),
-        reinterpret_cast<uintptr_t>(hidden_tmp.data_ptr()),
-        reinterpret_cast<uintptr_t>(expert_outputs.data_ptr()),
-        reinterpret_cast<uintptr_t>(sorted_routing_weights.data_ptr()),
-        w1_ptrs.data_ptr<uint64_t>(),
-        w2_ptrs.data_ptr<uint64_t>(),
-        b1_ptrs.data_ptr<uint64_t>(),
-        b2_ptrs.data_ptr<uint64_t>(),
-        num_policies, num_experts,
-        m_sizes_dev.data_ptr<int64_t>(),
-        policy_ids_dev.data_ptr<int64_t>(),
-        expert_ids_dev.data_ptr<int64_t>(),
-        token_offsets_dev.data_ptr<int64_t>(),
-        group_count, hidden_dim, ffn_dim, workspace);
 
     auto moe_output_flat = torch::zeros_like(x_flat);
-    moe_output_flat.index_add_(0, sorted_token_indices, expert_outputs);
+
+    const auto element_size = static_cast<int64_t>(x_flat.element_size());
+    bool has_workspace_buffer = workspace && workspace->hidden_buffer && workspace->hidden_buffer_size > 0;
+    int64_t workspace_token_capacity = 0;
+    if (has_workspace_buffer) {
+        const int64_t bytes_per_token = element_size * (ffn_dim + 2 * hidden_dim);
+        if (bytes_per_token <= 0) {
+            has_workspace_buffer = false;
+        } else {
+            workspace_token_capacity = static_cast<int64_t>(workspace->hidden_buffer_size / static_cast<size_t>(bytes_per_token));
+            if (workspace_token_capacity <= 0) {
+                has_workspace_buffer = false;
+            }
+        }
+    }
+
+    const int64_t total_sorted_tokens = sorted_token_indices.size(0);
+    if (total_sorted_tokens > 0) {
+        auto tensor_options = x_flat.options();
+
+        int64_t token_cursor = 0;
+        while (token_cursor < total_sorted_tokens) {
+            bool use_workspace_for_chunk = has_workspace_buffer;
+            int64_t chunk_token_count;
+            if (use_workspace_for_chunk) {
+                chunk_token_count = std::min<int64_t>(workspace_token_capacity, total_sorted_tokens - token_cursor);
+                if (chunk_token_count <= 0) {
+                    use_workspace_for_chunk = false;
+                    chunk_token_count = total_sorted_tokens - token_cursor;
+                }
+            } else {
+                chunk_token_count = total_sorted_tokens - token_cursor;
+            }
+
+            auto sorted_token_indices_chunk = sorted_token_indices.narrow(0, token_cursor, chunk_token_count);
+            auto routing_chunk = sorted_routing_weights.narrow(0, token_cursor, chunk_token_count);
+            auto expert_indices_chunk = sorted_expert_indices.narrow(0, token_cursor, chunk_token_count);
+            auto policy_indices_chunk = sorted_policy_indices.narrow(0, token_cursor, chunk_token_count);
+
+            auto [m_sizes_dev_chunk, policy_ids_dev_chunk, expert_ids_dev_chunk, token_offsets_dev_chunk] =
+                lb::model::moe_group_metadata_device(expert_indices_chunk, policy_indices_chunk);
+
+            int64_t chunk_group_count = m_sizes_dev_chunk.size(0);
+            if (chunk_group_count == 0) {
+                token_cursor += chunk_token_count;
+                continue;
+            }
+
+            torch::Tensor chunk_input;
+            torch::Tensor chunk_hidden;
+            torch::Tensor chunk_output;
+
+            if (use_workspace_for_chunk) {
+                size_t bytes_input = static_cast<size_t>(chunk_token_count) * static_cast<size_t>(hidden_dim) * static_cast<size_t>(element_size);
+                size_t bytes_hidden = static_cast<size_t>(chunk_token_count) * static_cast<size_t>(ffn_dim) * static_cast<size_t>(element_size);
+                size_t bytes_output = bytes_input;
+                TORCH_CHECK(bytes_input + bytes_hidden + bytes_output <= workspace->hidden_buffer_size,
+                            "MoE workspace hidden buffer too small for chunk");
+
+                auto base_ptr = static_cast<char*>(workspace->hidden_buffer);
+                auto noop_deleter = [](void*) {};
+                chunk_input = torch::from_blob(base_ptr, {chunk_token_count, hidden_dim}, noop_deleter, tensor_options);
+                chunk_hidden = torch::from_blob(base_ptr + bytes_input, {chunk_token_count, ffn_dim}, noop_deleter, tensor_options);
+                chunk_output = torch::from_blob(base_ptr + bytes_input + bytes_hidden, {chunk_token_count, hidden_dim}, noop_deleter, tensor_options);
+            } else {
+                chunk_input = torch::empty({chunk_token_count, hidden_dim}, tensor_options);
+                chunk_hidden = torch::empty({chunk_token_count, ffn_dim}, tensor_options);
+                chunk_output = torch::empty({chunk_token_count, hidden_dim}, tensor_options);
+            }
+
+            torch::index_select_out(chunk_input, x_flat, 0, sorted_token_indices_chunk);
+
+            lb::moe::cutlass_grouped_moe_forward(
+                reinterpret_cast<uintptr_t>(chunk_input.data_ptr()),
+                reinterpret_cast<uintptr_t>(chunk_hidden.data_ptr()),
+                reinterpret_cast<uintptr_t>(chunk_output.data_ptr()),
+                reinterpret_cast<uintptr_t>(routing_chunk.data_ptr()),
+                w1_ptrs.data_ptr<uint64_t>(),
+                w2_ptrs.data_ptr<uint64_t>(),
+                b1_ptrs.data_ptr<uint64_t>(),
+                b2_ptrs.data_ptr<uint64_t>(),
+                num_policies, num_experts,
+                m_sizes_dev_chunk.data_ptr<int64_t>(),
+                policy_ids_dev_chunk.data_ptr<int64_t>(),
+                expert_ids_dev_chunk.data_ptr<int64_t>(),
+                token_offsets_dev_chunk.data_ptr<int64_t>(),
+                chunk_group_count, hidden_dim, ffn_dim, workspace);
+
+            moe_output_flat.index_add_(0, sorted_token_indices_chunk, chunk_output);
+
+            chunk_input = torch::Tensor();
+            chunk_hidden = torch::Tensor();
+            chunk_output = torch::Tensor();
+
+            token_cursor += chunk_token_count;
+        }
+    }
+
     auto moe_output = moe_output_flat.view({B, T, hidden_dim});
 
     auto residual2 = x_norm + moe_output;
