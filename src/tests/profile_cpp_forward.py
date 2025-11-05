@@ -260,6 +260,20 @@ def print_benchmark_results(name: str, results: Dict, batch_size: int, seq_len: 
     print(f"\nBatch size: {batch_size}")
     print(f"Sequence length: {seq_len}")
     print(f"Tokens per batch: {tokens_per_batch:,}")
+
+    # VRAM usage (if provided by profiler)
+    peak_alloc_mb = results.get("peak_allocated_mb")
+    peak_res_mb = results.get("peak_reserved_mb")
+    start_alloc_mb = results.get("start_allocated_mb")
+    start_res_mb = results.get("start_reserved_mb")
+    if peak_alloc_mb is not None or peak_res_mb is not None:
+        print(f"\nVRAM (timed window)")
+        if start_alloc_mb is not None and start_res_mb is not None:
+            print(f"  Start allocated: {start_alloc_mb:.1f} MB | Start reserved: {start_res_mb:.1f} MB")
+        if peak_alloc_mb is not None:
+            print(f"  Peak allocated: {peak_alloc_mb:.1f} MB")
+        if peak_res_mb is not None:
+            print(f"  Peak reserved:  {peak_res_mb:.1f} MB")
     
     # Print timer breakdown if available
     if "timers" in results and results["timers"]:

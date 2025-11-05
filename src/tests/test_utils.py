@@ -583,7 +583,13 @@ def profile_cuda_execution(
         iterations: Number of timed iterations.
 
     Returns:
-        Dict with ``total_time_ms``, ``avg_time_ms``, and ``throughput_per_sec``.
+        Dict with timing and VRAM stats:
+        - ``total_time_ms``
+        - ``avg_time_ms``
+        - ``throughput_per_sec``
+        - ``iterations`` (timed iterations)
+        - ``peak_allocated_mb`` (CUDA allocator peak, since post-warmup reset)
+        - ``peak_reserved_mb`` (CUDA reserved peak, since post-warmup reset)
     """
     if not torch.cuda.is_available():
         raise RuntimeError("profile_cuda_execution requires CUDA to be available")
@@ -593,6 +599,12 @@ def profile_cuda_execution(
         func()
 
     torch.cuda.synchronize()
+
+    # Record baseline memory and reset peaks so stats reflect the timed region
+    start_allocated = float(torch.cuda.memory_allocated())
+    start_reserved = float(torch.cuda.memory_reserved())
+    torch.cuda.reset_peak_memory_stats()
+
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
 
@@ -605,9 +617,23 @@ def profile_cuda_execution(
     total_ms = float(start.elapsed_time(end))
     avg_ms = total_ms / max(1, int(iterations))
     throughput = 1000.0 / avg_ms if avg_ms > 0 else float("inf")
+
+    # Peak VRAM during the timed region
+    peak_allocated_bytes = float(torch.cuda.max_memory_allocated())
+    peak_reserved_bytes = float(torch.cuda.max_memory_reserved())
+    peak_allocated_mb = peak_allocated_bytes / (1024.0 ** 2)
+    peak_reserved_mb = peak_reserved_bytes / (1024.0 ** 2)
+
     return {
         "total_time_ms": total_ms,
         "avg_time_ms": avg_ms,
         "throughput_per_sec": throughput,
+        "iterations": float(max(1, int(iterations))),
+        # Absolute peak numbers since the post-warmup reset
+        "peak_allocated_mb": peak_allocated_mb,
+        "peak_reserved_mb": peak_reserved_mb,
+        # Baseline (pre-reset) in case callers want context
+        "start_allocated_mb": start_allocated / (1024.0 ** 2),
+        "start_reserved_mb": start_reserved / (1024.0 ** 2),
     }
 

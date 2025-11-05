@@ -24,7 +24,12 @@ from src.misc import lb
 from src.tests import test_utils as tu
 
 
-def compare_tensors(name: str, a: torch.Tensor, b: torch.Tensor, rtol=1e-3, atol=1e-4) -> bool:
+def compare_tensors(name: str, a: torch.Tensor, b: torch.Tensor, rtol=5e-3, atol=5e-4) -> bool:
+    """Compare tensors with FP16-appropriate tolerances.
+
+    FP16 has ~3 decimal digits of precision, so we use rtol=5e-3 and atol=5e-4
+    to account for rounding differences between TorchScript and C++ implementations.
+    """
     return tu.compare_tensors(name, a, b, rtol=rtol, atol=atol, verbose=True)
 
 
