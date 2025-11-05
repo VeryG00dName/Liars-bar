@@ -10,6 +10,7 @@
 
 namespace py = pybind11;
 
+
 // Helper to convert py::dict to c10::Dict
 c10::Dict<std::string, torch::Tensor> py_dict_to_c10_dict(const py::dict& py_dict) {
     c10::Dict<std::string, torch::Tensor> c10_dict;
@@ -129,6 +130,10 @@ void bind_reactive_model(py::module_& m) {
            int64_t num_experts, int64_t num_policies) {
             auto weights = py_dict_to_c10_dict(weights_py);
             std::string prefix = "transformer.layers." + std::to_string(layer_idx);
+
+            // Get cached workspace via accessor function
+            lb::moe::MoEWorkspace* ws_ptr = lb::forward::get_cached_workspace(layer_idx);
+
             return lb::model::transformer_layer(
                 x, policy_indices,
                 weights.at(prefix + ".self_attn.in_proj_weight"),
@@ -139,13 +144,14 @@ void bind_reactive_model(py::module_& m) {
                 weights.at(prefix + ".norm1.bias"),
                 weights.at(prefix + ".moe.gate.weight"),
                 weights.at(prefix + ".moe.gate.bias"),
-                weights.at(prefix + ".moe.experts.w1"),
-                weights.at(prefix + ".moe.experts.w2"),
-                weights.at(prefix + ".moe.experts.b1"),
-                weights.at(prefix + ".moe.experts.b2"),
+                weights.at(prefix + ".moe.experts.w1_ptrs"),
+                weights.at(prefix + ".moe.experts.w2_ptrs"),
+                weights.at(prefix + ".moe.experts.b1_ptrs"),
+                weights.at(prefix + ".moe.experts.b2_ptrs"),
                 weights.at(prefix + ".norm2.weight"),
                 weights.at(prefix + ".norm2.bias"),
-                num_heads, hidden_dim, top_k, num_experts, num_policies);
+                num_heads, hidden_dim, top_k, num_experts, num_policies,
+                ws_ptr, nullptr);
         },
         py::arg("x"), py::arg("policy_indices"), py::arg("weights"), py::arg("layer_idx"),
         py::arg("num_heads"), py::arg("hidden_dim"), py::arg("top_k"),

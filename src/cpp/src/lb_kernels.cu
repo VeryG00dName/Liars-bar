@@ -55,35 +55,102 @@ using Microseconds = std::chrono::microseconds;
 
 namespace {
 
-// Embedding lookup kernel
+// ------------------------------------------------------------------
+//  Helper to turn the PyTorch half type into the CUDA POD half
+// ------------------------------------------------------------------
+template <typename T>
+struct CudaHalfHelper {
+    using type = T;                     // default: identity
+};
+
+template <>
+struct CudaHalfHelper<c10::Half> {
+    using type = __half;                // map to CUDA half
+};
+
+// ------------------------------------------------------------------
+//  Vector‑type traits (only POD types)
+// ------------------------------------------------------------------
+template <typename T> struct VecTraits;   // primary – left undefined
+
+// float  → float4
+template <> struct VecTraits<float> {
+    using Vec   = float4;
+    static constexpr int elems = 4;
+};
+
+// double → double2
+template <> struct VecTraits<double> {
+    using Vec   = double2;
+    static constexpr int elems = 2;
+};
+
+// CUDA half → __half2 (2 × 2‑byte)
+template <> struct VecTraits<__half> {
+    using Vec   = __half2;
+    static constexpr int elems = 2;
+};
+
+// ============================================================================
+// Embedding lookup kernel (type-correct vector loads)
+// ============================================================================
 template <typename scalar_t>
 __global__ void indexed_batched_embedding_kernel(
     const int64_t* __restrict__ indices,
     const int64_t* __restrict__ policy_indices,
-    const scalar_t* __restrict__ weight_cache,
+    const scalar_t* __restrict__ weight_cache,   // may be c10::Half or POD
     scalar_t* __restrict__ output,
     int64_t batch_size,
     int64_t time_steps,
     int64_t hidden_dim,
     int64_t vocab_size) {
-    const int64_t linear_index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // -------------------------------------------------------------
+    //  1️⃣  Convert the scalar type to a CUDA POD half if needed
+    // -------------------------------------------------------------
+    using RealScalar = typename CudaHalfHelper<scalar_t>::type;   // __half for half, otherwise unchanged
+    using Traits      = VecTraits<RealScalar>;
+    using Vec         = typename Traits::Vec;
+    constexpr int VEC_ELEMS = Traits::elems;   // 4 for float, 2 for double/half
+
+    // -------------------------------------------------------------
+    //  2️⃣  Thread-index bookkeeping: ONE BLOCK PER TOKEN
+    //      All threads in the block cooperate to copy one token's embedding
+    // -------------------------------------------------------------
+    const int64_t token_index = blockIdx.x;  // One block handles one token
     const int64_t total_tokens = batch_size * time_steps;
-    if (linear_index >= total_tokens) {
-        return;
+    if (token_index >= total_tokens) return;
+
+    const int64_t b          = token_index / time_steps;
+    const int64_t policy_idx = policy_indices[b];
+    const int64_t token_idx  = indices[token_index];
+
+    // -------------------------------------------------------------
+    //  3️⃣  Pointer arithmetic – reinterpret to the POD type
+    // -------------------------------------------------------------
+    const RealScalar* table_ptr = reinterpret_cast<const RealScalar*>(weight_cache)
+                                + policy_idx * vocab_size * hidden_dim;
+    const RealScalar* src_ptr   = table_ptr + token_idx * hidden_dim;
+    RealScalar*       dst_ptr   = reinterpret_cast<RealScalar*>(output)
+                                + token_index * hidden_dim;
+
+    // -------------------------------------------------------------
+    //  4️⃣  Vectorised copy (if hidden_dim is a multiple of VEC_ELEMS)
+    // -------------------------------------------------------------
+    int64_t vec_end = hidden_dim - (hidden_dim % VEC_ELEMS);
+    for (int64_t h = threadIdx.x * VEC_ELEMS;
+         h < vec_end;
+         h += blockDim.x * VEC_ELEMS) {
+
+        // Safe POD reinterpret‑cast – both src and dst are 4‑byte aligned
+        *reinterpret_cast<Vec*>(&dst_ptr[h]) =
+            *reinterpret_cast<const Vec*>(&src_ptr[h]);
     }
 
-    const int64_t b = linear_index / time_steps;
-    const int64_t t = linear_index % time_steps;
-
-    const int64_t policy_idx = policy_indices[b];
-    const int64_t token_idx = indices[linear_index];
-
-    const scalar_t* src_ptr = weight_cache + policy_idx * vocab_size * hidden_dim
-                            + token_idx * hidden_dim;
-    scalar_t* dst_ptr = output + linear_index * hidden_dim;
-
-    // Scalar copy - works for any type (float, half, bfloat16) without alignment issues
-    for (int64_t h = threadIdx.x; h < hidden_dim; h += blockDim.x) {
+    // -------------------------------------------------------------
+    //  5️⃣  Tail – scalar copy for the remainder (covers odd hidden_dim)
+    // -------------------------------------------------------------
+    for (int64_t h = vec_end + threadIdx.x; h < hidden_dim; h += blockDim.x) {
         dst_ptr[h] = src_ptr[h];
     }
 }
@@ -218,9 +285,10 @@ torch::Tensor indexed_batched_embedding(
 
     auto output = torch::empty({batch_size, time_steps, hidden_dim}, weight_cache.options());
 
+    // Launch configuration: one block per token, all threads cooperate on copying one embedding
     const int threads = 256;
     const int64_t total_tokens = batch_size * time_steps;
-    const dim3 blocks((total_tokens + threads - 1) / threads);
+    const dim3 blocks(total_tokens);  // One block per token
 
     c10::cuda::CUDAGuard guard(weight_cache.device());
     auto stream = at::cuda::getCurrentCUDAStream();

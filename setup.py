@@ -65,7 +65,10 @@ for key in ("cxx", "nvcc"):
         _ensure_flag(extra_compile_args[key], "-DCUTLASS_ENABLE_SM86=1")
         _ensure_flag(extra_compile_args[key], "-DCUTLASS_ENABLE_SM80=1")
         _ensure_flag(extra_compile_args[key], '-DCUTLASS_ARCHS="86"')  # restrict templates to 86
-
+    if key == "nvcc":
+        _ensure_flag(extra_compile_args[key],'-U__CUDA_NO_HALF_OPERATORS__')
+        _ensure_flag(extra_compile_args[key],'-U__CUDA_NO_HALF_CONVERSIONS__')
+        _ensure_flag(extra_compile_args[key],'-U__CUDA_NO_HALF2_OPERATORS__')
 
 # ---- CUDA include/lib dirs (WSL-friendly) ----
 cuda_home = CUDA_HOME or os.environ.get("CUDA_HOME") or "/usr/local/cuda"

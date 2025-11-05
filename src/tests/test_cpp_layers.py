@@ -128,42 +128,48 @@ def test_embeddings(
 ) -> Tuple[bool, Dict[str, torch.Tensor]]:
     """Test embedding layer. Returns (all_match, embeddings_cpp_dict)."""
 
-    # Get inputs
-    obs_sequence = reference['input/obs_sequence'].to(device)
-    act_kind_ids = (act_kind_ids_override if act_kind_ids_override is not None
-                    else reference['decompose/act_kind_ids']).to(device)
-    count_ids = (count_ids_override if count_ids_override is not None
-                 else reference['decompose/count_ids']).to(device)
-    table_flag_ids = (table_flag_ids_override if table_flag_ids_override is not None
-                      else reference['decompose/table_flag_ids']).to(device)
+    # Get inputs and convert to FP16 for C++ kernels
+    obs_sequence = reference['input/obs_sequence'].to(device, dtype=torch.float16)
+    action_sequence = reference['input/action_sequence'].to(device)
     agent_types = reference['input/agent_types'].to(device)
     positions = reference['input/positions'].to(device)
 
     batch_size = obs_sequence.size(0)
     policy_indices = reference.get('input/policy_indices', torch.zeros(batch_size, dtype=torch.long)).to(device)
 
-    # Call C++ function
+    # Get padding mask if available
+    padding_mask = reference.get('input/padding_mask')
+    if padding_mask is not None:
+        padding_mask = padding_mask.to(device)
+
+    # Keep decomposed IDs for comparison (not used by C++ anymore)
+    act_kind_ids = (act_kind_ids_override if act_kind_ids_override is not None
+                    else reference['decompose/act_kind_ids']).to(device)
+    count_ids = (count_ids_override if count_ids_override is not None
+                 else reference['decompose/count_ids']).to(device)
+    table_flag_ids = (table_flag_ids_override if table_flag_ids_override is not None
+                      else reference['decompose/table_flag_ids']).to(device)
     embeddings_cpp = lb.compute_embeddings(
         obs_sequence,
-        act_kind_ids,
-        count_ids,
-        table_flag_ids,
+        action_sequence,
         agent_types,
         positions,
         batched_weights,
-        policy_indices
+        policy_indices,
+        padding_mask,
+        4,  # count_pad
+        3   # tflag_pad
     )
 
     # Compare outputs
     all_match = True
-    # Test obs_encoder intermediate outputs first
-    for key in ['obs_linear', 'obs_layernorm', 'obs_embed']:
-        all_match &= compare_tensors(key, embeddings_cpp[key], reference[f'embeddings/{key}'])
-
-    # Then test other embeddings
-    for key in ['act_kind_embed', 'count_embed', 'table_flag_embed',
-                'action_embed', 'agent_embed', 'position_embed']:
-        all_match &= compare_tensors(key, embeddings_cpp[key], reference[f'embeddings/{key}'])
+    # Compare only the keys that C++ actually returns (final embeddings only)
+    for key in ['obs_embed', 'action_embed', 'agent_embed', 'position_embed']:
+        if key in embeddings_cpp and f'embeddings/{key}' in reference:
+            all_match &= compare_tensors(key, embeddings_cpp[key], reference[f'embeddings/{key}'])
+        else:
+            print(f"⚠️  Skipping {key}: not found in C++ output or reference")
+            all_match = False
 
     return all_match, embeddings_cpp
 
@@ -179,15 +185,15 @@ def test_gating(
 ) -> Tuple[bool, Dict[str, torch.Tensor]]:
     """Test gating layer. Returns (all_match, gating_cpp_dict)."""
 
-    # Get inputs from embeddings
+    # Get inputs from embeddings and convert to FP16 for C++ kernels
     obs_embed = (obs_embed_override if obs_embed_override is not None
-                 else reference['embeddings/obs_embed']).to(device)
+                 else reference['embeddings/obs_embed']).to(device, dtype=torch.float16)
     action_embed = (action_embed_override if action_embed_override is not None
-                    else reference['embeddings/action_embed']).to(device)
+                    else reference['embeddings/action_embed']).to(device, dtype=torch.float16)
     agent_embed = (agent_embed_override if agent_embed_override is not None
-                   else reference['embeddings/agent_embed']).to(device)
+                   else reference['embeddings/agent_embed']).to(device, dtype=torch.float16)
     position_embed = (position_embed_override if position_embed_override is not None
-                      else reference['embeddings/position_embed']).to(device)
+                      else reference['embeddings/position_embed']).to(device, dtype=torch.float16)
 
     batch_size = obs_embed.size(0)
     policy_indices = reference.get('input/policy_indices', torch.zeros(batch_size, dtype=torch.long)).to(device)
@@ -266,11 +272,11 @@ def test_transformer_layers(
 
     all_match = True
 
-    # Start with fusion output (either passed in or from reference)
+    # Start with fusion output (either passed in or from reference), convert to FP16 for C++ kernels
     if fusion_combined is not None:
-        x_cpp = fusion_combined.to(device)
+        x_cpp = fusion_combined.to(device, dtype=torch.float16)
     else:
-        x_cpp = reference['fusion/combined'].to(device)
+        x_cpp = reference['fusion/combined'].to(device, dtype=torch.float16)
 
     batch_size = x_cpp.size(0)
     policy_indices = reference.get('input/policy_indices', torch.zeros(batch_size, dtype=torch.long)).to(device)
@@ -281,16 +287,38 @@ def test_transformer_layers(
     for layer_idx in range(num_layers):
         print(f"\n--- Layer {layer_idx} ---")
 
+        # DEBUG: Check weight dtypes for this layer
+        layer_prefix = f"transformer.layers.{layer_idx}"
+        weight_keys = [
+            f"{layer_prefix}.self_attn.in_proj_weight",
+            f"{layer_prefix}.moe.experts.w1_ptrs",
+            f"{layer_prefix}.moe.experts.b1_ptrs",
+        ]
+        print(f"DEBUG: Weight dtypes for layer {layer_idx}:")
+        for key in weight_keys:
+            if key in batched_weights:
+                print(f"  {key}: dtype={batched_weights[key].dtype}, shape={batched_weights[key].shape}")
+
         # Call transformer_layer (combines attention + MoE + residuals + norms)
-        x_next, gate_logits, topk_indices, topk_scores = lb.transformer_layer(
-            x_cpp,
-            policy_indices,
-            batched_weights,
-            layer_idx,
-            num_heads,
-            hidden_dim,
-            top_k
-        )
+        print(f"  x_cpp: shape={x_cpp.shape}, dtype={x_cpp.dtype}, device={x_cpp.device}")
+        print(f"  policy_indices: shape={policy_indices.shape}, dtype={policy_indices.dtype}")
+        print(f"  Calling lb.transformer_layer...")
+        try:
+            x_next, gate_logits, topk_indices, topk_scores = lb.transformer_layer(
+                x_cpp,
+                policy_indices,
+                batched_weights,
+                layer_idx,
+                num_heads,
+                hidden_dim,
+                top_k,
+                8,  # num_experts
+                1   # num_policies
+            )
+            print(f"  Success! x_next: shape={x_next.shape}, dtype={x_next.dtype}")
+        except Exception as e:
+            print(f"  EXCEPTION: {type(e).__name__}: {e}")
+            raise
 
         # Compare MoE outputs
         all_match &= compare_tensors(
@@ -330,11 +358,11 @@ def test_heads(
 ) -> bool:
     """Test head layers."""
 
-    # Get transformer output (either passed in or from reference)
+    # Get transformer output (either passed in or from reference), convert to FP16 for C++ kernels
     if transformer_output is not None:
-        transformer_output = transformer_output.to(device)
+        transformer_output = transformer_output.to(device, dtype=torch.float16)
     else:
-        transformer_output = reference['transformer/final_output'].to(device)
+        transformer_output = reference['transformer/final_output'].to(device, dtype=torch.float16)
 
     batch_size = transformer_output.size(0)
     policy_indices = reference.get('input/policy_indices', torch.zeros(batch_size, dtype=torch.long)).to(device)
@@ -381,13 +409,6 @@ def main():
     else:
         print(f"Loaded {len(state_dict)} weight tensors")
 
-    # Pad model weights for CUDA alignment
-    PAD_OBS_TO = 16
-    print(f"Padding model weights for CUDA alignment (obs_dim -> {PAD_OBS_TO})...")
-    state_dict = pad_model_weights(state_dict, pad_obs_to=PAD_OBS_TO)
-    if state_dict2 is not None:
-        state_dict2 = pad_model_weights(state_dict2, pad_obs_to=PAD_OBS_TO)
-
     # Prepare batched weights for C++ (includes MoE expert weight stacking)
     print("Preparing batched weights...")
     batched_weights = prepare_batched_weights(
@@ -417,6 +438,18 @@ def main():
             print(f"  ... and {len(cpu_tensors) - 10} more")
     else:
         print(f"All {len(batched_weights)} tensors are on {args.device}")
+
+    # Enable MoE workspace cache for transformer layers (required for CUTLASS kernels)
+    batch_size = reference['input/obs_sequence'].size(0)
+    seq_len = reference['input/obs_sequence'].size(1)
+    print(f"\nEnabling MoE workspace cache (batch={batch_size}, seq_len={seq_len})...")
+    lb.enable_forward_moe_workspace_cache(
+        num_layers=2,
+        max_batch_size=batch_size,
+        max_seq_length=seq_len,
+        hidden_dim=256,
+        top_k=2
+    )
 
     # Run tests
     results = {}
@@ -482,6 +515,10 @@ def main():
         results['transformer'] = transformer_pass
 
         results['heads'] = test_heads(reference, batched_weights, device=args.device)
+
+    # Disable MoE workspace cache after tests
+    print("\nDisabling MoE workspace cache...")
+    lb.disable_forward_moe_workspace_cache()
 
     # Return 0 if all passed, 1 if any failed
     return 0 if all(results.values()) else 1

@@ -125,6 +125,12 @@ void disable_forward_workspace_cache() {
     g_tls_workspace_enabled = false;
 }
 
+lb::moe::MoEWorkspace* get_cached_workspace(int64_t layer_idx) {
+    if (!g_tls_workspace_enabled) return nullptr;
+    if (layer_idx < 0 || layer_idx >= static_cast<int64_t>(g_tls_workspaces.size())) return nullptr;
+    return &g_tls_workspaces[layer_idx];
+}
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 forward_packed(
     const torch::Tensor& obs_sequence,

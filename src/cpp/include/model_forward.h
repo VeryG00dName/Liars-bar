@@ -65,6 +65,12 @@ void enable_forward_workspace_cache(
  */
 void disable_forward_workspace_cache();
 
+/**
+ * Get the cached workspace for a given layer (or nullptr if not enabled).
+ * This is used by individual layer testing functions to access the workspace cache.
+ */
+lb::moe::MoEWorkspace* get_cached_workspace(int64_t layer_idx);
+
 
 } // namespace forward
 } // namespace lb

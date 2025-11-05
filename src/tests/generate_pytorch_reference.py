@@ -134,21 +134,13 @@ def main():
         checkpoint2 = torch.load(args.checkpoint2, map_location='cpu')
 
     # Load model using existing infrastructure
-    if 'policy_nets' in checkpoint and args.agent_key in checkpoint['policy_nets']:
-        model_state_dict = checkpoint['policy_nets'][args.agent_key]
-    elif 'model_state_dict' in checkpoint:
-        model_state_dict = checkpoint['model_state_dict']
-    else:
-        raise ValueError(f"Could not find model state dict in checkpoint A (keys: {list(checkpoint.keys())})")
+
+    model_state_dict = checkpoint
+
 
     model_state_dict2 = None
     if checkpoint2 is not None:
-        if 'policy_nets' in checkpoint2 and args.agent_key2 in checkpoint2['policy_nets']:
-            model_state_dict2 = checkpoint2['policy_nets'][args.agent_key2]
-        elif 'model_state_dict' in checkpoint2:
-            model_state_dict2 = checkpoint2['model_state_dict']
-        else:
-            raise ValueError(f"Could not find model state dict in checkpoint B (keys: {list(checkpoint2.keys())})")
+        model_state_dict2 = checkpoint2
 
     # Infer original obs_dim before padding
     obs_linear_weight = model_state_dict.get("obs_encoder.0.weight")

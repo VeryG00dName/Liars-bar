@@ -94,10 +94,13 @@ def run_parity(
     ts = torch.jit.load(str(script_pt), map_location=device)
     ts.eval()
 
-    # Run TorchScript forward (convert to FP32 for TorchScript, which uses standard PyTorch ops)
-    obs_fp32 = obs.to(torch.float32)
+    # Convert TorchScript model to FP16 to match C++ precision
+    ts = ts.half()
+
+    # Run TorchScript forward in FP16 to match C++ precision
+    # (C++ kernels use FP16, so compare apples-to-apples)
     with torch.no_grad():
-        a_ts, o_ts, v_ts, w_ts = ts(obs_fp32, acts, agent, pos, None, pad)
+        a_ts, o_ts, v_ts, w_ts = ts(obs, acts, agent, pos, None, pad)
 
     # Load checkpoint weights and prepare batched weights for C++ forward
     sd = tu.load_checkpoint_weights(checkpoint)
