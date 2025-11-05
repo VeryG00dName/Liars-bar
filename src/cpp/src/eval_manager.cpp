@@ -204,36 +204,20 @@ void EvalManager::load_model(
     try {
         torch::NoGradGuard guard;
 
-        // LUT keys that should be skipped (will be added by add_fixed_buffers)
-        const std::unordered_set<std::string> lut_keys = {
-            "lut_act_kind", "lut_count", "lut_table_flag"
-        };
-
-        // Store CPU FP32 weights as-is (skip LUTs). We'll stack on CPU and
-        // transfer once in finalize_model_loading() to avoid VRAM thrashing.
+        const std::unordered_set<std::string> lut_keys = {"lut_act_kind", "lut_count", "lut_table_flag"};
+        
         std::unordered_map<std::string, torch::Tensor> processed_dict;
         processed_dict.reserve(state_dict.size());
         for (auto& kv : state_dict) {
-            if (lut_keys.find(kv.first) != lut_keys.end()) {
-                continue;
-            }
+            if (lut_keys.count(kv.first)) continue;
 
-            auto tensor = kv.second.detach();
-            if (!tensor.device().is_cpu()) {
-                tensor = tensor.to(torch::kCPU, /*non_blocking=*/false, /*copy=*/true);
-            }
-            if (tensor.dtype() != torch::kFloat32) {
-                tensor = tensor.to(torch::kFloat32);
-            }
-            tensor = tensor.contiguous();
+            auto tensor = kv.second.detach().to(torch::kCPU, false, true).to(torch::kFloat32).contiguous();
             processed_dict.emplace(kv.first, std::move(tensor));
         }
 
         staged_state_dicts_[policy_id] = std::move(processed_dict);
-
-        // Infer max sequence length using the original path metadata if available
         int max_seq_length = infer_max_seq_length_for_model(original_path);
-        policy_max_sequence_lengths_[policy_id] = max_seq_length;
+        policy_max_sequence_length_[policy_id] = max_seq_length;
         arena_.set_policy_max_sequence_length(policy_id, max_seq_length);
         weights_finalized_ = false;
     } catch (const c10::Error& err) {
@@ -265,17 +249,14 @@ void EvalManager::finalize_model_loading() {
     }
     std::sort(policy_ids.begin(), policy_ids.end());
 
-    // Pre-stack MoE expert weights in each individual state_dict before batching (CPU)
     for (auto& kv : staged_state_dicts_) {
         prestack_moe_expert_weights(kv.second, num_layers_, num_experts_);
     }
 
-    // Build mapping policy_id -> index used during inference
     for (size_t idx = 0; idx < policy_ids.size(); ++idx) {
         policy_id_to_cache_index_[policy_ids[idx]] = static_cast<int>(idx);
     }
 
-    // Determine keys to process from the first policy's dict
     const auto& first_dict = staged_state_dicts_.at(policy_ids[0]);
     std::vector<std::string> keys;
     keys.reserve(first_dict.size());
@@ -283,131 +264,28 @@ void EvalManager::finalize_model_loading() {
         keys.push_back(kv.first);
     }
 
-    // For each key, gather CPU tensors across policies, stack on CPU, then
-    // transfer the final stacked tensor to GPU as FP16 and cache it.
     for (const auto& key : keys) {
         std::vector<torch::Tensor> cpu_tensors;
         cpu_tensors.reserve(policy_ids.size());
         for (int policy_id : policy_ids) {
-            auto dict_it = staged_state_dicts_.find(policy_id);
-            if (dict_it == staged_state_dicts_.end()) {
-                throw std::runtime_error("Missing staged weights for policy " + std::to_string(policy_id));
-            }
-            auto& per_policy = dict_it->second;
-            auto itw = per_policy.find(key);
-            if (itw == per_policy.end()) {
-                throw std::runtime_error("Missing key '" + key + "' in staged weights for policy " + std::to_string(policy_id));
-            }
-            cpu_tensors.push_back(itw->second);
+            cpu_tensors.push_back(staged_state_dicts_.at(policy_id).at(key));
         }
 
-        auto stacked_cpu = torch::stack(cpu_tensors, /*dim=*/0).contiguous();
-        auto stacked_gpu = stacked_cpu
-                               .to(kInferenceDevice, /*non_blocking=*/false, /*copy=*/true)
+        auto stacked_gpu = torch::stack(cpu_tensors, 0)
+                               .to(kInferenceDevice, false, true)
                                .to(torch::kFloat16)
                                .contiguous();
-
         batched_weight_cache_.insert(key, stacked_gpu);
-
-        if (stacked_gpu.device().is_cuda()) {
-            auto append_ptrs = [&](const std::string& suffix) {
-                if (key.size() < suffix.size() || key.rfind(suffix) != key.size() - suffix.size()) {
-                    return;
-                }
-
-                TORCH_CHECK(
-                    stacked_gpu.dim() >= 2,
-                    "Expected stacked MoE tensor to have at least 2 dimensions"
-                );
-                TORCH_CHECK(
-                    stacked_gpu.dtype() == torch::kFloat16,
-                    "MoE tensors must be FP16 before pointer caching: " + key
-                );
-
-                const int64_t num_policies = stacked_gpu.size(0);
-                const int64_t num_experts = stacked_gpu.size(1);
-
-                // Create pointer tensor on CPU first
-                auto ptr_tensor_cpu = torch::empty(
-                    {num_policies, num_experts},
-                    torch::dtype(torch::kUInt64).device(torch::kCPU)
-                );
-
-                const uintptr_t base_address = reinterpret_cast<uintptr_t>(stacked_gpu.data_ptr<at::Half>());
-                const int64_t stride_policy = stacked_gpu.stride(0);
-                const int64_t stride_expert = stacked_gpu.stride(1);
-                const int64_t element_size = static_cast<int64_t>(stacked_gpu.element_size());
-
-                auto ptr_data = ptr_tensor_cpu.data_ptr<uint64_t>();
-
-                // Use PyTorch indexing (same as weight_utils.cpp) to get data pointers
-                // The stacked tensor is contiguous, so slices [p][e] should point into it correctly
-                for (int64_t p = 0; p < num_policies; ++p) {
-                    for (int64_t e = 0; e < num_experts; ++e) {
-                        // Get the expert tensor slice
-                        auto expert_tensor = stacked_gpu[p][e];
-
-                        ptr_data[p * num_experts + e] = reinterpret_cast<uint64_t>(
-                            expert_tensor.data_ptr<at::Half>()
-                        );
-                    }
-                }
-
-                // Move pointer tensor to same device as weights (CUDA)
-                auto ptr_tensor_gpu = ptr_tensor_cpu.to(stacked_gpu.device());
-                batched_weight_cache_.insert_or_assign(key + "_ptrs", ptr_tensor_gpu);
-            };
-
-            append_ptrs(".moe.experts.w1");
-            append_ptrs(".moe.experts.b1");
-            append_ptrs(".moe.experts.w2");
-            append_ptrs(".moe.experts.b2");
-        }
-
-        // Proactively free CPU per-policy tensors for this key to reduce RAM
-        for (int policy_id : policy_ids) {
-            auto dit = staged_state_dicts_.find(policy_id);
-            if (dit != staged_state_dicts_.end()) {
-                dit->second.erase(key);
-            }
-        }
     }
 
-    // Clear temporary storage to free memory
-    staged_state_dicts_.clear();  // CRITICAL: Free the per-policy tensors after stacking
+    staged_state_dicts_.clear();
 
-    // Add fixed buffers (LUTs) - these are constant and shared across all policies
     add_fixed_buffers(batched_weight_cache_, kInferenceDevice);
-
-    // Verify ALL 3 LUTs were added correctly
-    const std::vector<std::string> lut_names = {"lut_act_kind", "lut_count", "lut_table_flag"};
-    for (const auto& lut_name : lut_names) {
-        if (batched_weight_cache_.contains(lut_name)) {
-            auto lut = batched_weight_cache_.at(lut_name);
-            fprintf(stderr, "[EvalManager] LUT verification: %s shape=[%ld], dtype=%s, device=%s\n",
-                    lut_name.c_str(), lut.numel(),
-                    torch::toString(lut.dtype()).c_str(), lut.device().str().c_str());
-            if (lut.numel() == 11 && lut.device().is_cuda() && lut.dtype() == torch::kLong) {
-                auto cpu_lut = lut.to(torch::kCPU);
-                auto ptr = cpu_lut.data_ptr<int64_t>();
-                fprintf(stderr, "[EvalManager]   Values: [%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld]\n",
-                        ptr[0],ptr[1],ptr[2],ptr[3],ptr[4],ptr[5],ptr[6],ptr[7],ptr[8],ptr[9],ptr[10]);
-            } else {
-                fprintf(stderr, "[EvalManager] ERROR: %s has wrong size (%ld), device (%s), or dtype!\n",
-                        lut_name.c_str(), lut.numel(), lut.device().str().c_str());
-            }
-        } else {
-            fprintf(stderr, "[EvalManager] ERROR: %s not found in batched_weight_cache!\n", lut_name.c_str());
-        }
-    }
-
-    // Unify attention weight processing and aliasing
     process_and_split_attention_weights(batched_weight_cache_);
 
-    // Create weight pointers for MoE experts (must be after GPU transfer)
+    // Create weight pointers for MoE experts (optimized)
     create_moe_weight_pointers(batched_weight_cache_, num_layers_, num_experts_);
 
-    // Create orchestrator for unified neural inference
     orchestrator_ = std::make_unique<execution_core::NeuralInferenceOrchestrator>(
         batched_weight_cache_,
         policy_id_to_cache_index_,

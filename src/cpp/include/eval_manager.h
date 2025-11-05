@@ -103,7 +103,7 @@ private:
     c10::Dict<std::string, torch::Tensor> batched_weight_cache_;
     std::unordered_map<int, int> policy_id_to_cache_index_;
     bool weights_finalized_{false};
-    std::unordered_map<int, int> policy_max_sequence_lengths_;
+    std::unordered_map<int, int> policy_max_sequence_length_;
     std::unique_ptr<execution_core::NeuralInferenceOrchestrator> orchestrator_;
     std::unordered_map<int, CppBotRegistryEntry> cpp_bot_registry_;
     static std::unordered_map<std::string, CppBotKind> bot_kind_cache_;

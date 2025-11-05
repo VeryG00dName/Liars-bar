@@ -1,6 +1,6 @@
 #include "model_layer.h"
 #include "lb_kernels.h"
-#include "moe_cutlass_kernels.h" // For cutlass_grouped_moe_forward_with_hidden_device
+#include "moe_cutlass_kernels.h"
 #include <sstream>
 #include <torch/torch.h>
 
@@ -195,15 +195,17 @@ transformer_layer(
     const torch::Tensor& norm1_bias,
     const torch::Tensor& gate_weight,
     const torch::Tensor& gate_bias,
-    const torch::Tensor& w1_all,
-    const torch::Tensor& w2_all,
-    const torch::Tensor& b1_all,
-    const torch::Tensor& b2_all,
+    const torch::Tensor& w1_ptrs,
+    const torch::Tensor& w2_ptrs,
+    const torch::Tensor& b1_ptrs,
+    const torch::Tensor& b2_ptrs,
     const torch::Tensor& norm2_weight,
     const torch::Tensor& norm2_bias,
     int64_t num_heads,
     int64_t hidden_dim,
     int64_t top_k,
+    int64_t num_experts,
+    int64_t num_policies,
     lb::moe::MoEWorkspace* workspace,
     std::unordered_map<std::string, std::chrono::microseconds>* timers) {
 
@@ -218,10 +220,8 @@ transformer_layer(
 
     // --- Attention Block ---
     auto t0 = Clock::now();
-    int64_t weight_chunk_dim = (in_proj_weight.dim() == 3) ? 1 : 0;
-    int64_t bias_chunk_dim   = (in_proj_bias.dim() == 2) ? 1 : 0;
-    auto qkv_weights = in_proj_weight.chunk(3, weight_chunk_dim);
-    auto qkv_biases  = in_proj_bias.chunk(3, bias_chunk_dim);
+    auto qkv_weights = in_proj_weight.chunk(3, in_proj_weight.dim() == 3 ? 1 : 0);
+    auto qkv_biases  = in_proj_bias.chunk(3, in_proj_bias.dim() == 2 ? 1 : 0);
 
     auto q = lb::kernels::indexed_batched_linear(x, qkv_weights[0], qkv_biases[0], policy_indices, t);
     auto k = lb::kernels::indexed_batched_linear(x, qkv_weights[1], qkv_biases[1], policy_indices, t);
@@ -244,28 +244,23 @@ transformer_layer(
     // --- MoE Block ---
     t0 = Clock::now();
     auto gate_logits = lb::kernels::indexed_batched_linear(x_norm, gate_weight, gate_bias, policy_indices, t);
-    auto probs = torch::softmax(gate_logits, -1);
-    auto topk_vals_idx = torch::topk(gate_logits, top_k, -1);
-    auto topk_indices = std::get<1>(topk_vals_idx);
-    auto topk_scores  = torch::gather(probs, -1, topk_indices);
-    auto topk_weights = topk_scores / topk_scores.sum(-1, /*keepdim=*/true).clamp_min(1e-6);
+    auto [topk_scores, topk_indices] = torch::topk(gate_logits, top_k, -1);
+    auto probs = torch::softmax(gate_logits.to(torch::kFloat), -1);
+    auto topk_probs = torch::gather(probs, -1, topk_indices);
+    auto topk_weights = topk_probs / topk_probs.sum(-1, /*keepdim=*/true).clamp_min(1e-6);
 
     auto num_tokens = B * T;
-    auto x_norm_fp16 = x_norm.to(torch::kHalf).contiguous();
-    auto x_flat = x_norm_fp16.view({num_tokens, hidden_dim});
+    auto x_flat = x_norm.view({num_tokens, hidden_dim});
 
-    auto topk_indices_long = topk_indices.to(torch::kLong).contiguous();
-    auto flat_expert_indices = topk_indices_long.reshape({-1});
-    auto flat_routing_weights = topk_weights.reshape({-1});
+    auto flat_expert_indices = topk_indices.view({-1});
+    auto flat_routing_weights = topk_weights.view({-1});
     auto token_indices = torch::arange(num_tokens, torch::dtype(torch::kLong).device(x.device()));
     auto expanded_token_indices = token_indices.unsqueeze(-1).expand({num_tokens, top_k}).reshape({-1});
-    auto policy_indices_long = policy_indices.to(torch::kLong);
-    auto policy_tokens = policy_indices_long.unsqueeze(1).expand({B, T}).reshape({-1});
+    auto policy_tokens = policy_indices.unsqueeze(1).expand({B, T}).reshape({-1});
     auto flat_policy_indices = policy_tokens.index_select(0, expanded_token_indices);
 
-    int64_t num_policies_for_key = w1_all.size(0);
-    auto combined_key = flat_expert_indices * num_policies_for_key + flat_policy_indices;
-    auto sort_order = torch::argsort(combined_key);
+    auto combined_key = flat_expert_indices * num_policies + flat_policy_indices;
+    auto sort_order = torch::argsort(combined_key, /*stable=*/true);
     auto sorted_expert_indices = flat_expert_indices.index_select(0, sort_order);
     auto sorted_token_indices = expanded_token_indices.index_select(0, sort_order);
     auto sorted_routing_weights = flat_routing_weights.index_select(0, sort_order).to(torch::kFloat32);
@@ -273,45 +268,33 @@ transformer_layer(
     
     auto expert_inputs = x_flat.index_select(0, sorted_token_indices).contiguous();
 
-    // Use GPU-only path since forward_packed never needs grads
     auto [m_sizes_dev, policy_ids_dev, expert_ids_dev, token_offsets_dev] = 
         lb::model::moe_group_metadata_device(sorted_expert_indices, sorted_policy_indices);
-
-    auto w1_fp16 = w1_all.to(torch::kFloat16);
-    auto w2_fp16 = w2_all.to(torch::kFloat16);
-    auto b1_fp16 = b1_all.to(torch::kFloat16);
-    auto b2_fp16 = b2_all.to(torch::kFloat16);
-
-    auto w1_ptrs_table = lb::model::build_ptr_table_device(w1_fp16);
-    auto w2_ptrs_table = lb::model::build_ptr_table_device(w2_fp16);
-    auto b1_ptrs_table = lb::model::build_ptr_table_device(b1_fp16);
-    auto b2_ptrs_table = lb::model::build_ptr_table_device(b2_fp16);
-
-    int64_t total_tokens = expert_inputs.size(0);
-    int64_t ffn_dim = w1_all.size(-2);
-    auto expert_outputs = torch::empty({total_tokens, hidden_dim}, expert_inputs.options());
-    auto hidden_tmp = torch::empty({total_tokens, ffn_dim}, expert_inputs.options());
+    
+    int64_t ffn_dim = gate_weight.size(-1) * 2; // Infer FFN dim from gate weight
     int64_t group_count = m_sizes_dev.size(0);
+    auto expert_outputs = torch::empty_like(expert_inputs);
+    auto hidden_tmp = torch::empty({expert_inputs.size(0), ffn_dim}, expert_inputs.options());
 
-    lb::moe::cutlass_grouped_moe_forward_with_hidden_device(
-        reinterpret_cast<uintptr_t>(expert_inputs.data_ptr<at::Half>()),
-        reinterpret_cast<uintptr_t>(hidden_tmp.data_ptr<at::Half>()),
-        reinterpret_cast<uintptr_t>(expert_outputs.data_ptr<at::Half>()),
-        reinterpret_cast<uintptr_t>(sorted_routing_weights.data_ptr<float>()),
-        w1_ptrs_table.data_ptr<uint64_t>(),
-        w2_ptrs_table.data_ptr<uint64_t>(),
-        b1_ptrs_table.data_ptr<uint64_t>(),
-        b2_ptrs_table.data_ptr<uint64_t>(),
-        w1_fp16.size(0), w1_fp16.size(1),
+    lb::moe::cutlass_grouped_moe_forward(
+        reinterpret_cast<uintptr_t>(expert_inputs.data_ptr()),
+        reinterpret_cast<uintptr_t>(hidden_tmp.data_ptr()),
+        reinterpret_cast<uintptr_t>(expert_outputs.data_ptr()),
+        reinterpret_cast<uintptr_t>(sorted_routing_weights.data_ptr()),
+        w1_ptrs.data_ptr<uint64_t>(),
+        w2_ptrs.data_ptr<uint64_t>(),
+        b1_ptrs.data_ptr<uint64_t>(),
+        b2_ptrs.data_ptr<uint64_t>(),
+        num_policies, num_experts,
         m_sizes_dev.data_ptr<int64_t>(),
         policy_ids_dev.data_ptr<int64_t>(),
         expert_ids_dev.data_ptr<int64_t>(),
         token_offsets_dev.data_ptr<int64_t>(),
         group_count, hidden_dim, ffn_dim, workspace);
 
-    auto moe_output_flat = torch::zeros({num_tokens, hidden_dim}, expert_outputs.options());
+    auto moe_output_flat = torch::zeros_like(x_flat);
     moe_output_flat.index_add_(0, sorted_token_indices, expert_outputs);
-    auto moe_output = moe_output_flat.view({B, T, hidden_dim}).to(x_norm.dtype());
+    auto moe_output = moe_output_flat.view({B, T, hidden_dim});
 
     auto residual2 = x_norm + moe_output;
     auto x_next = lb::kernels::indexed_batched_layer_norm(residual2, norm2_weight, norm2_bias, policy_indices, 1e-5);

@@ -142,7 +142,7 @@ forward_packed(
     int64_t count_pad,
     int64_t tflag_pad,
     std::unordered_map<std::string, std::chrono::microseconds>* timers,
-    const lb::moe::MoEWorkspace* moe_workspaces) {
+    lb::moe::MoEWorkspace* moe_workspaces) {
 
     using Microseconds = std::chrono::microseconds;
     using Clock = std::chrono::high_resolution_clock;
@@ -150,6 +150,7 @@ forward_packed(
     auto& t = timers ? *timers : dummy_timers;
     
     auto pol = policy_indices.to(obs_sequence.device()).to(torch::kLong).contiguous();
+    const int64_t num_policies = get_weight(batched_weights, "obs_encoder.0.weight").size(0);
 
     // 1. Embeddings
     auto t0 = Clock::now();
@@ -184,11 +185,9 @@ forward_packed(
         std::string prefix = "transformer.layers." + std::to_string(i);
         std::string layer_key = "forward_layer_" + std::to_string(i) + "_us";
         
-        // Select per-layer workspace if provided
         lb::moe::MoEWorkspace* ws_ptr = nullptr;
         if (moe_workspaces) {
-            // Pointer is assumed to reference an array of length >= num_layers
-            ws_ptr = const_cast<lb::moe::MoEWorkspace*>(moe_workspaces + i);
+            ws_ptr = &moe_workspaces[i];
         } else if (g_tls_workspace_enabled && i < static_cast<int64_t>(g_tls_workspaces.size())) {
             ws_ptr = &g_tls_workspaces[i];
         }
@@ -204,13 +203,13 @@ forward_packed(
             get_weight(batched_weights, prefix + ".norm1.bias"),
             get_weight(batched_weights, prefix + ".moe.gate.weight"),
             get_weight(batched_weights, prefix + ".moe.gate.bias"),
-            get_weight(batched_weights, prefix + ".moe.experts.w1"),
-            get_weight(batched_weights, prefix + ".moe.experts.w2"),
-            get_weight(batched_weights, prefix + ".moe.experts.b1"),
-            get_weight(batched_weights, prefix + ".moe.experts.b2"),
+            get_weight(batched_weights, prefix + ".moe.experts.w1_ptrs"),
+            get_weight(batched_weights, prefix + ".moe.experts.w2_ptrs"),
+            get_weight(batched_weights, prefix + ".moe.experts.b1_ptrs"),
+            get_weight(batched_weights, prefix + ".moe.experts.b2_ptrs"),
             get_weight(batched_weights, prefix + ".norm2.weight"),
             get_weight(batched_weights, prefix + ".norm2.bias"),
-            num_heads, hidden_dim, top_k,
+            num_heads, hidden_dim, top_k, num_experts, num_policies,
             ws_ptr, &t);
         t1 = Clock::now();
         t[layer_key] += std::chrono::duration_cast<Microseconds>(t1 - t0);

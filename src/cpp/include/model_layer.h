@@ -78,8 +78,6 @@ fuse_embeddings(
 /**
  * Single transformer layer forward pass (non-autograd version).
  *
- * Used for inference and recomputation during backward pass.
- *
  * @return Tuple of (output, gate_logits, topk_indices, topk_scores)
  */
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
@@ -94,15 +92,17 @@ transformer_layer(
     const torch::Tensor& norm1_bias,
     const torch::Tensor& gate_weight,
     const torch::Tensor& gate_bias,
-    const torch::Tensor& w1_all,
-    const torch::Tensor& w2_all,
-    const torch::Tensor& b1_all,
-    const torch::Tensor& b2_all,
+    const torch::Tensor& w1_ptrs,
+    const torch::Tensor& w2_ptrs,
+    const torch::Tensor& b1_ptrs,
+    const torch::Tensor& b2_ptrs,
     const torch::Tensor& norm2_weight,
     const torch::Tensor& norm2_bias,
     int64_t num_heads,
     int64_t hidden_dim,
     int64_t top_k,
+    int64_t num_experts,
+    int64_t num_policies,
     lb::moe::MoEWorkspace* workspace = nullptr,
     std::unordered_map<std::string, std::chrono::microseconds>* timers = nullptr);
 
@@ -125,13 +125,9 @@ torch::Tensor reduce_expert_heads(
     const torch::Tensor& topk_indices,
     const torch::Tensor& topk_scores);
 
-
 /**
  * Compute MoE group metadata (m_sizes, policy_ids, expert_ids, token_offsets)
  * from sorted (expert, policy) indices using GPU ops and return CPU tensors.
- *
- * Inputs must be 1-D Long tensors sorted by (expert, policy).
- * Returns CPU-contiguous tensors suitable for C++ host-side use.
  */
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 moe_group_metadata(
@@ -140,24 +136,11 @@ moe_group_metadata(
 
 /**
  * Device-side variant of moe_group_metadata that returns GPU tensors.
- *
- * Eliminates GPU→CPU transfer for use in device-side forward path.
- * Inputs must be 1-D Long tensors sorted by (expert, policy).
- * Returns GPU-contiguous tensors.
  */
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 moe_group_metadata_device(
     const torch::Tensor& sorted_expert_indices,
     const torch::Tensor& sorted_policy_indices);
-
-/**
- * Build pointer table on GPU for batched expert weights.
- *
- * For a stacked tensor [P, E, ...], computes data pointers for each [p, e] slice.
- * Eliminates CPU staging and transfer. Returns GPU tensor of uint64 pointers.
- */
-torch::Tensor build_ptr_table_device(const torch::Tensor& stacked);
-
 
 } // namespace model
 } // namespace lb

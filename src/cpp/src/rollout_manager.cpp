@@ -112,7 +112,7 @@ private:
 };
 }
 
-// Static cache for parsed bot kinds (must be at global scope)
+// Static cache for parsed bot kinds
 std::unordered_map<std::string, RolloutManager::CppBotKind> RolloutManager::bot_kind_cache_;
 
 RolloutManager::RolloutManager()
@@ -666,33 +666,30 @@ void RolloutManager::load_model(
     try {
         torch::NoGradGuard guard;
 
-        // LUT keys that should be skipped (will be added by add_fixed_buffers)
-        const std::unordered_set<std::string> lut_keys = {
-            "lut_act_kind", "lut_count", "lut_table_flag"
-        };
+        const std::unordered_set<std::string> lut_keys = {"lut_act_kind", "lut_count", "lut_table_flag"};
 
-        // Store CPU FP32 weights as-is (skip LUTs)
         std::unordered_map<std::string, torch::Tensor> processed_dict;
         processed_dict.reserve(state_dict.size());
         for (auto& kv : state_dict) {
-            if (lut_keys.find(kv.first) != lut_keys.end()) {
-                continue;
-            }
+            if (lut_keys.count(kv.first)) continue;
 
-            auto tensor = kv.second.detach();
-            if (!tensor.device().is_cpu()) {
-                tensor = tensor.to(torch::kCPU, /*non_blocking=*/false, /*copy=*/true);
-            }
-            if (tensor.dtype() != torch::kFloat32) {
-                tensor = tensor.to(torch::kFloat32);
-            }
-            tensor = tensor.contiguous();
+            auto tensor = kv.second.detach().to(torch::kCPU, false, true).to(torch::kFloat32).contiguous();
             processed_dict.emplace(kv.first, std::move(tensor));
         }
 
         staged_state_dicts_[policy_id] = std::move(processed_dict);
+        
+        // Use the class's default sequence length instead of inferring it.
+        // For RolloutManager, this is a fixed value (480) set by the constructor.
+        const int max_seq_length = default_max_sequence_length_;
+        policy_max_sequence_length_[policy_id] = max_seq_length;
+        arena_.set_policy_max_sequence_length(policy_id, max_seq_length);
+        
         weights_finalized_ = false;
-
+    } catch (const c10::Error& err) {
+        std::cerr << "[RolloutManager] Failed to process state_dict for policy " << policy_id
+                  << ": " << err.what_without_backtrace() << std::endl;
+        throw;
     } catch (const std::exception& err) {
         std::cerr << "[RolloutManager] Failed to load model for policy " << policy_id
                   << ": " << err.what() << std::endl;
@@ -703,6 +700,7 @@ void RolloutManager::load_model(
 void RolloutManager::finalize_model_loading() {
     torch::NoGradGuard guard;
 
+    // 1. Clear previous state
     batched_weight_cache_.clear();
     policy_id_to_cache_index_.clear();
     orchestrator_.reset();
@@ -712,6 +710,7 @@ void RolloutManager::finalize_model_loading() {
         return;
     }
 
+    // 2. Get a sorted, stable list of all policies to be batched.
     std::vector<int> policy_ids;
     policy_ids.reserve(staged_state_dicts_.size());
     for (const auto& kv : staged_state_dicts_) {
@@ -719,17 +718,23 @@ void RolloutManager::finalize_model_loading() {
     }
     std::sort(policy_ids.begin(), policy_ids.end());
 
-    // Pre-stack MoE expert weights in each individual state_dict before batching (CPU)
+    // 3. Pre-process weights on CPU before batching.
+    // This stacks MoE experts for each policy individually.
     for (auto& kv : staged_state_dicts_) {
         prestack_moe_expert_weights(kv.second, num_layers_, num_experts_);
     }
 
-    // Build mapping policy_id -> index used during inference
+    // 4. Build the mapping from arbitrary policy_id to a dense index [0, N)
+    // for efficient indexing into the batched weight tensors during inference.
     for (size_t idx = 0; idx < policy_ids.size(); ++idx) {
         policy_id_to_cache_index_[policy_ids[idx]] = static_cast<int>(idx);
     }
 
-    // Determine keys to process from the first policy's dict
+    // 5. Batch all weights. This is the core optimization loop.
+    // For each parameter (e.g., "norm1.weight"), we gather the FP32 CPU tensors
+    // from all policies, stack them into a single CPU tensor, then perform ONE
+    // efficient transfer to the GPU and ONE conversion to FP16. This minimizes
+    // GPU memory fragmentation and H2D bandwidth.
     const auto& first_dict = staged_state_dicts_.at(policy_ids[0]);
     std::vector<std::string> keys;
     keys.reserve(first_dict.size());
@@ -737,39 +742,36 @@ void RolloutManager::finalize_model_loading() {
         keys.push_back(kv.first);
     }
 
-    // For each key, gather CPU tensors across policies, stack on CPU, then transfer to GPU as FP16
     for (const auto& key : keys) {
         std::vector<torch::Tensor> cpu_tensors;
         cpu_tensors.reserve(policy_ids.size());
         for (int policy_id : policy_ids) {
-            auto dict_it = staged_state_dicts_.find(policy_id);
-            if (dict_it == staged_state_dicts_.end()) {
-                throw std::runtime_error("Missing staged weights for policy " + std::to_string(policy_id));
-            }
-            auto& per_policy = dict_it->second;
-            auto itw = per_policy.find(key);
-            if (itw == per_policy.end()) {
-                throw std::runtime_error("Missing key '" + key + "' in staged weights for policy " + std::to_string(policy_id));
-            }
-            cpu_tensors.push_back(itw->second);
+            cpu_tensors.push_back(staged_state_dicts_.at(policy_id).at(key));
         }
 
-        auto stacked_cpu = torch::stack(cpu_tensors, /*dim=*/0).contiguous();
-        auto stacked_gpu = stacked_cpu
-                               .to(kInferenceDevice, /*non_blocking=*/false, /*copy=*/true)
-                               .to(torch::kFloat16)
-                               .contiguous();
+        auto stacked_gpu_fp16 = torch::stack(cpu_tensors, 0)
+                                    .to(kInferenceDevice, /*non_blocking=*/true, /*copy=*/true)
+                                    .to(torch::kFloat16)
+                                    .contiguous();
 
-        batched_weight_cache_.insert(key, stacked_gpu);
+        batched_weight_cache_.insert(key, stacked_gpu_fp16);
     }
+    
+    // 6. Free the temporary CPU-side storage immediately.
+    staged_state_dicts_.clear();
 
-    // Add fixed buffers (LUTs)
-    add_fixed_buffers(batched_weight_cache_, /*device=*/kInferenceDevice);
+    // 7. Add model-constant buffers (LUTs) directly to the GPU cache.
+    add_fixed_buffers(batched_weight_cache_, kInferenceDevice);
 
-    // Create weight pointers for MoE experts (must be after GPU transfer)
+    // 8. Post-process attention weights, splitting fused QKV and creating aliases.
+    process_and_split_attention_weights(batched_weight_cache_);
+
+    // 9. Pre-compute and cache MoE expert pointer tables. This is a critical
+    // optimization that avoids calculating device pointers in the hot path.
     create_moe_weight_pointers(batched_weight_cache_, num_layers_, num_experts_);
 
-    // Create orchestrator
+    // 10. Instantiate the inference orchestrator with the fully prepared,
+    // GPU-resident, FP16 batched weights.
     orchestrator_ = std::make_unique<execution_core::NeuralInferenceOrchestrator>(
         batched_weight_cache_,
         policy_id_to_cache_index_,
@@ -783,19 +785,6 @@ void RolloutManager::finalize_model_loading() {
     );
 
     weights_finalized_ = true;
-}
-
-void RolloutManager::register_cpp_bot(int policy_id, const std::string& bot_name) {
-    try {
-        CppBotKind kind = parse_cpp_bot_kind(bot_name);
-        auto& entry = cpp_bot_registry_[policy_id];
-        entry.kind = kind;
-        entry.instances.clear();
-    } catch (const std::exception& err) {
-        std::cerr << "[RolloutManager] Failed to register C++ bot '" << bot_name
-                  << "' for policy " << policy_id << ": " << err.what() << std::endl;
-        throw;
-    }
 }
 
 void RolloutManager::set_use_greedy_stepping(bool use_greedy) {
@@ -1171,442 +1160,6 @@ void RolloutManager::finalize_seat(EpisodeTracker& tracker, SeatTrajectory& seat
 bool RolloutManager::is_training_policy(int policy_id) const {
     return training_policy_id_set_.find(policy_id) != training_policy_id_set_.end();
 }
-
-#if 0  // DEPRECATED: Replaced by batched weight cache in finalize_model_loading()
-void RolloutManager::rebuild_historical_weight_cache() {
-    if (!historical_weight_cache_dirty_) {
-        return;
-    }
-
-    historical_weight_cache_fp16_.clear();
-    historical_weight_policy_order_.clear();
-
-    if (historical_models_.empty()) {
-        historical_weight_cache_dirty_ = false;
-        return;
-    }
-
-    std::vector<std::pair<int, HistoricalModelEntry*>> entries;
-    entries.reserve(historical_models_.size());
-    for (auto& kv : historical_models_) {
-        entries.emplace_back(kv.first, &kv.second);
-    }
-    std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
-        return a.first < b.first;
-    });
-
-    torch::NoGradGuard guard;
-    std::unordered_map<std::string, std::vector<torch::Tensor>> stacked;
-    stacked.reserve(entries.size());
-
-    for (size_t idx = 0; idx < entries.size(); ++idx) {
-        auto* entry = entries[idx].second;
-        entry->cache_index = static_cast<int>(idx);
-        historical_weight_policy_order_.push_back(entries[idx].first);
-
-        auto params = entry->module->named_parameters(/*recurse=*/true);
-        for (const auto& item : params) {
-            const std::string& name = item.name;
-            auto tensor = item.value
-                              .detach()
-                              .to(kInferenceDevice, /*non_blocking=*/false, /*copy=*/true)
-                              .to(torch::kFloat16)
-                              .contiguous();
-            stacked[name].push_back(tensor);
-        }
-    }
-
-    historical_weight_cache_fp16_.reserve(stacked.size());
-    for (auto& kv : stacked) {
-        historical_weight_cache_fp16_[kv.first] = torch::stack(kv.second).contiguous();
-    }
-
-    // --- START: NEW Pre-stacking Logic ---
-    // Determine number of layers/experts by scanning keys
-    int num_layers = 0;
-    int num_experts = 0;
-    for (const auto& kv : historical_weight_cache_fp16_) {
-        const std::string& key = kv.first;
-        const size_t pos_layer = key.find("transformer.layers.");
-        const size_t pos_moe = key.find(".moe.experts.");
-        if (pos_layer == std::string::npos || pos_moe == std::string::npos) continue;
-
-        size_t layer_start = pos_layer + std::strlen("transformer.layers.");
-        size_t layer_end = key.find('.', layer_start);
-        if (layer_end == std::string::npos) continue;
-        int layer_idx = 0;
-        try { layer_idx = std::stoi(key.substr(layer_start, layer_end - layer_start)); }
-        catch (...) { continue; }
-        num_layers = std::max(num_layers, layer_idx + 1);
-
-        size_t expert_start = pos_moe + std::strlen(".moe.experts.");
-        size_t expert_end = key.find('.', expert_start);
-        if (expert_end == std::string::npos) continue;
-        int expert_idx = 0;
-        try { expert_idx = std::stoi(key.substr(expert_start, expert_end - expert_start)); }
-        catch (...) { continue; }
-        num_experts = std::max(num_experts, expert_idx + 1);
-    }
-
-    if (num_layers > 0 && num_experts > 0) {
-        for (int layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
-            std::vector<torch::Tensor> w1_list, b1_list, w2_list, b2_list;
-            w1_list.reserve(num_experts);
-            b1_list.reserve(num_experts);
-            w2_list.reserve(num_experts);
-            b2_list.reserve(num_experts);
-
-            bool have_all = true;
-            for (int expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
-                const std::string base =
-                    "transformer.layers." + std::to_string(layer_idx) + ".moe.experts." + std::to_string(expert_idx);
-                const std::string w1_key = base + ".0.weight";
-                const std::string b1_key = base + ".0.bias";
-                const std::string w2_key = base + ".3.weight";
-                const std::string b2_key = base + ".3.bias";
-
-                auto it_w1 = historical_weight_cache_fp16_.find(w1_key);
-                auto it_b1 = historical_weight_cache_fp16_.find(b1_key);
-                auto it_w2 = historical_weight_cache_fp16_.find(w2_key);
-                auto it_b2 = historical_weight_cache_fp16_.find(b2_key);
-                if (it_w1 == historical_weight_cache_fp16_.end() || it_b1 == historical_weight_cache_fp16_.end() ||
-                    it_w2 == historical_weight_cache_fp16_.end() || it_b2 == historical_weight_cache_fp16_.end()) {
-                    have_all = false;
-                    break;
-                }
-                w1_list.push_back(it_w1->second);
-                b1_list.push_back(it_b1->second);
-                w2_list.push_back(it_w2->second);
-                b2_list.push_back(it_b2->second);
-            }
-
-            if (have_all && !w1_list.empty()) {
-                const std::string prefix =
-                    "transformer.layers." + std::to_string(layer_idx) + ".moe.experts.";
-                historical_weight_cache_fp16_[prefix + "w1"] = torch::stack(w1_list, 0).contiguous();
-                historical_weight_cache_fp16_[prefix + "b1"] = torch::stack(b1_list, 0).contiguous();
-                historical_weight_cache_fp16_[prefix + "w2"] = torch::stack(w2_list, 0).contiguous();
-                historical_weight_cache_fp16_[prefix + "b2"] = torch::stack(b2_list, 0).contiguous();
-            }
-        }
-    }
-    // --- END: NEW Pre-stacking Logic ---
-
-    // Build single-policy weight dict caches for fast lookup
-    for (size_t idx = 0; idx < entries.size(); ++idx) {
-        auto* entry = entries[idx].second;
-        c10::Dict<std::string, torch::Tensor> single_dict;
-        for (const auto& kv : historical_weight_cache_fp16_) {
-            const std::string& k = kv.first;
-            bool is_moe_expert =
-                (k.find(".moe.experts.w1") != std::string::npos) ||
-                (k.find(".moe.experts.b1") != std::string::npos) ||
-                (k.find(".moe.experts.w2") != std::string::npos) ||
-                (k.find(".moe.experts.b2") != std::string::npos);
-            if (is_moe_expert) {
-                // For pre-stacked MoE tensors [E, B, ...], extract this policy as [E, 1, ...]
-                auto sel = kv.second.index({torch::indexing::Slice(), static_cast<int64_t>(idx)}).contiguous();
-                // Insert with an explicit singleton batch dim at position 1 to ease later expansion
-                single_dict.insert(kv.first, sel.unsqueeze(1));
-            } else {
-                // Extract this policy's weights (at index 'idx' in the stacked tensor)
-                single_dict.insert(kv.first, kv.second[static_cast<int64_t>(idx)].contiguous());
-            }
-        }
-        entry->single_policy_weight_dict = std::move(single_dict);
-        entry->single_policy_dict_cached = true;
-    }
-
-    // Unify attention weight processing and aliasing
-    process_and_split_attention_weights(historical_weight_cache_fp16_);
-
-    historical_weight_cache_dirty_ = false;
-}
-
-#endif  // DEPRECATED rebuild_historical_weight_cache
-
-#if 0  // DEPRECATED: Replaced by run_neural_inference()
-std::unordered_map<int, std::vector<uint8_t>> RolloutManager::run_batched_historical_inference(
-    const std::vector<std::pair<int, const std::vector<PolicyRequest>*>>& grouped,
-    std::chrono::microseconds& prep_time_acc,
-    std::chrono::microseconds& weight_time_acc,
-    std::chrono::microseconds& model_time_acc,
-    std::chrono::microseconds& post_time_acc) {
-    std::unordered_map<int, std::vector<uint8_t>> results;
-    if (grouped.empty()) {
-        return results;
-    }
-
-    rebuild_historical_weight_cache();
-    if (historical_weight_cache_fp16_.empty()) {
-        throw std::runtime_error("No cached historical weights available for batched inference");
-    }
-
-    struct RequestRef {
-        int policy_id;
-        size_t request_index;
-        const PolicyRequest* request;
-    };
-
-    std::vector<RequestRef> refs;
-    refs.reserve(grouped.size() * 4);
-
-    for (const auto& group : grouped) {
-        int policy_id = group.first;
-        const auto* requests = group.second;
-        if (requests == nullptr || requests->empty()) {
-            continue;
-        }
-        results[policy_id] = std::vector<uint8_t>(requests->size(), 0);
-        for (size_t idx = 0; idx < requests->size(); ++idx) {
-            refs.push_back(RequestRef{policy_id, idx, &(*requests)[idx]});
-        }
-    }
-
-    if (refs.empty()) {
-        return results;
-    }
-
-    torch::NoGradGuard no_grad;
-
-    constexpr std::array<int64_t, 7> kBucketBounds{{32, 64, 96, 128, 192, 256, 480}};
-    const int64_t max_limit = std::max<int64_t>(1, static_cast<int64_t>(default_max_sequence_length_));
-
-    auto select_bucket_index = [&](int64_t length) -> size_t {
-        const int64_t clamped = std::max<int64_t>(1, std::min<int64_t>(length, max_limit));
-        for (size_t i = 0; i < kBucketBounds.size(); ++i) {
-            if (clamped <= kBucketBounds[i]) {
-                return i;
-            }
-        }
-        return kBucketBounds.size() - 1;
-    };
-
-    std::array<std::vector<size_t>, kBucketBounds.size()> bucket_indices{};
-    for (size_t idx = 0; idx < refs.size(); ++idx) {
-        const auto& req = refs[idx];
-        const size_t bucket = select_bucket_index(req.request->valid_len);
-        bucket_indices[bucket].push_back(idx);
-    }
-
-    auto opts_long_device = torch::TensorOptions().dtype(torch::kInt64).device(kInferenceDevice);
-
-    for (size_t bucket_idx = 0; bucket_idx < bucket_indices.size(); ++bucket_idx) {
-        const auto& ref_indices = bucket_indices[bucket_idx];
-        if (ref_indices.empty()) {
-            continue;
-        }
-
-        const int64_t target_pad_len = std::min<int64_t>(kBucketBounds[bucket_idx], max_limit);
-
-        // Define batch size buckets to standardize shapes for JIT
-        constexpr std::array<int64_t, 7> kBatchSizeBuckets{{8, 16, 32, 64, 128, 256, 512}};
-
-        size_t offset = 0;
-        while (offset < ref_indices.size()) {
-            const size_t remaining = ref_indices.size() - offset;
-            int64_t take = static_cast<int64_t>(remaining);
-            // Select largest bucket <= remaining
-            for (size_t i = 0; i < kBatchSizeBuckets.size(); ++i) {
-                const int64_t candidate = kBatchSizeBuckets[kBatchSizeBuckets.size() - 1 - i];
-                if (candidate <= static_cast<int64_t>(remaining)) {
-                    take = candidate;
-                    break;
-                }
-            }
-
-            const int64_t batch_size = take;
-
-            std::vector<PolicyRequest> batch_requests;
-            batch_requests.reserve(static_cast<size_t>(take));
-            std::vector<size_t> sequential_indices(static_cast<size_t>(take));
-            std::iota(sequential_indices.begin(), sequential_indices.end(), 0);
-            std::vector<int64_t> policy_cache_indices;
-            policy_cache_indices.reserve(static_cast<size_t>(take));
-
-            auto prep_t0 = std::chrono::high_resolution_clock::now();
-            for (size_t pos = 0; pos < static_cast<size_t>(take); ++pos) {
-                const auto& ref = refs[ref_indices[offset + pos]];
-                batch_requests.push_back(*ref.request);
-                auto model_it = historical_models_.find(ref.policy_id);
-                if (model_it == historical_models_.end() || model_it->second.cache_index < 0) {
-                    throw std::runtime_error("Missing cached weights for historical policy");
-                }
-                policy_cache_indices.push_back(static_cast<int64_t>(model_it->second.cache_index));
-            }
-
-            auto tensor_batch =
-                prepare_inference_batch(batch_requests, target_pad_len, kInferenceDevice, sequential_indices);
-            // Historical weights are cached in FP16; match input dtype to avoid JIT dtype errors.
-            if (tensor_batch.obs_sequence.dtype() != torch::kFloat16) {
-                tensor_batch.obs_sequence = tensor_batch.obs_sequence.to(torch::kFloat16);
-            }
-            auto prep_t1 = std::chrono::high_resolution_clock::now();
-            prep_time_acc += std::chrono::duration_cast<std::chrono::microseconds>(prep_t1 - prep_t0);
-
-            auto weights_t0 = std::chrono::high_resolution_clock::now();
-
-            // Optimization: If all requests in this mini-batch use the same policy,
-            // we can use the pre-cached single-policy weight dict instead of index_select.
-            bool all_same_policy = true;
-            int first_policy_id = refs[ref_indices[offset]].policy_id;
-            for (size_t pos = 1; pos < static_cast<size_t>(take); ++pos) {
-                if (refs[ref_indices[offset + pos]].policy_id != first_policy_id) {
-                    all_same_policy = false;
-                    break;
-                }
-            }
-
-            c10::Dict<std::string, torch::Tensor> weight_dict;
-            if (all_same_policy) {
-                // Fast path: All requests use the same policy, use cached single-policy dict
-                auto model_it = historical_models_.find(first_policy_id);
-                if (model_it != historical_models_.end() && model_it->second.single_policy_dict_cached) {
-                    const auto& cached_dict = model_it->second.single_policy_weight_dict;
-                    // Expand each weight tensor to batch dimension with shape-aware logic
-                    for (const auto& kv : cached_dict) {
-                        const auto& t = kv.value();
-                        torch::Tensor expanded;
-                        const int64_t dims = t.dim();
-                        if (dims == 1) {
-                            // [H] -> [B, H]
-                            expanded = t.unsqueeze(0).expand({batch_size, -1}).contiguous();
-                        } else if (dims == 2) {
-                            // [H, H] or [V, H] -> [B, H, H]
-                            expanded = t.unsqueeze(0).expand({batch_size, -1, -1}).contiguous();
-                        } else if (dims == 3) {
-                            // [B?, ?, ?] already has batch? Keep shape-consistent: [B, ?, ?]
-                            // In practice we don't expect dims==3 here; fall back to broadcasting on leading dim
-                            expanded = t.expand({batch_size, t.size(1), t.size(2)}).contiguous();
-                        } else if (dims == 4) {
-                            // Pre-stacked MoE weights are cached as [E, 1, F, H] or [E, 1, H, F]
-                            // Expand along dim=1 to match current batch size -> [E, B, F, H]/[E, B, H, F]
-                            expanded = t.expand({t.size(0), static_cast<int64_t>(batch_size), t.size(2), t.size(3)}).contiguous();
-                        } else {
-                            // Fallback: try to broadcast a new leading batch dimension
-                            expanded = t;
-                            for (int i = 0; i < dims; ++i) {
-                                (void)i;
-                            }
-                            expanded = t;
-                        }
-                        weight_dict.insert(kv.key(), expanded);
-                    }
-                }
-            } else {
-                // General path: Multiple policies, use index_select
-                auto policy_index_tensor = torch::tensor(policy_cache_indices, opts_long_device);
-                for (const auto& kv : historical_weight_cache_fp16_) {
-                    const std::string& k = kv.first;
-                    bool is_moe_expert =
-                        (k.find(".moe.experts.w1") != std::string::npos) ||
-                        (k.find(".moe.experts.b1") != std::string::npos) ||
-                        (k.find(".moe.experts.w2") != std::string::npos) ||
-                        (k.find(".moe.experts.b2") != std::string::npos);
-                    torch::Tensor selected;
-                    if (is_moe_expert) {
-                        // Select along policy dimension (dim=1)
-                        selected = kv.second.index_select(1, policy_index_tensor).contiguous();
-                    } else {
-                        selected = kv.second.index_select(0, policy_index_tensor).contiguous();
-                    }
-                    weight_dict.insert(kv.first, selected);
-                }
-            }
-
-            auto weights_t1 = std::chrono::high_resolution_clock::now();
-            weight_time_acc += std::chrono::duration_cast<std::chrono::microseconds>(weights_t1 - weights_t0);
-
-            int module_policy = refs[ref_indices[offset]].policy_id;
-            auto module_it = historical_models_.find(module_policy);
-            if (module_it == historical_models_.end() || !module_it->second.module) {
-                throw std::runtime_error("Historical module missing for policy");
-            }
-
-            auto method = module_it->second.module->find_method("forward_packed");
-            if (!method) {
-                throw std::runtime_error("Historical module does not expose forward_packed");
-            }
-
-            std::vector<torch::jit::IValue> inputs;
-            inputs.reserve(7);
-            inputs.emplace_back(tensor_batch.obs_sequence);
-            inputs.emplace_back(tensor_batch.action_sequence);
-            inputs.emplace_back(tensor_batch.agent_types);
-            inputs.emplace_back(tensor_batch.positions);
-            inputs.emplace_back(weight_dict);
-            inputs.emplace_back(tensor_batch.action_masks);
-            inputs.emplace_back(tensor_batch.padding_mask);
-
-            auto model_t0 = std::chrono::high_resolution_clock::now();
-            auto outputs_iv = method->operator()(inputs);
-            auto outputs = outputs_iv.toTuple();
-            if (!outputs || outputs->elements().size() < 3) {
-                throw std::runtime_error("Historical model returned unexpected output shape");
-            }
-            if (kInferenceDevice.is_cuda()) {
-                torch::cuda::synchronize();
-            }
-
-            auto model_t1 = std::chrono::high_resolution_clock::now();
-            model_time_acc += std::chrono::duration_cast<std::chrono::microseconds>(model_t1 - model_t0);
-
-            auto post_t0 = std::chrono::high_resolution_clock::now();
-            auto action_logits = outputs->elements()[0].toTensor().contiguous();
-            auto valid_lengths_device = tensor_batch.valid_lengths;
-
-            auto batch_indices = torch::arange(batch_size, opts_long_device);
-            auto last_indices = (valid_lengths_device - 1).clamp_min(0);
-            auto last_logits = action_logits.index({batch_indices, last_indices}).contiguous();
-            auto last_masks = tensor_batch.action_masks.index({batch_indices, last_indices}).contiguous();
-
-            auto has_legal = last_masks.any(1);
-            if (!has_legal.all().item<bool>()) {
-                auto fallback_indices = has_legal.logical_not().nonzero().flatten();
-                for (int64_t i = 0; i < fallback_indices.size(0); ++i) {
-                    const int64_t row = fallback_indices[i].item<int64_t>();
-                    auto mask_row_tensor = last_masks.select(0, row);
-                    mask_row_tensor.fill_(false);
-                    bool assigned = false;
-                    const auto& ref = refs[ref_indices[offset + static_cast<size_t>(row)]];
-                    const auto& req = *ref.request;
-                    for (int j = 0; j < 7; ++j) {
-                        if (req.mask[j]) {
-                            mask_row_tensor.index_put_({j}, true);
-                            assigned = true;
-                        }
-                    }
-                    if (!assigned) {
-                        mask_row_tensor.fill_(true);
-                    }
-                    last_logits.select(0, row).fill_(0.0f);
-                }
-            }
-
-            last_logits.masked_fill_(~last_masks, -std::numeric_limits<float>::infinity());
-
-            // Sample actions in FP32 for numerical stability.
-            auto probs = torch::softmax(last_logits.to(torch::kFloat32), /*dim=*/1);
-            auto actions_tensor = torch::multinomial(probs, /*num_samples=*/1);
-            actions_tensor = actions_tensor.squeeze(-1).to(torch::kCPU);
-
-            auto actions_ptr = actions_tensor.data_ptr<int64_t>();
-            for (size_t pos = 0; pos < static_cast<size_t>(take); ++pos) {
-                const auto& ref = refs[ref_indices[offset + pos]];
-                results[ref.policy_id][ref.request_index] = static_cast<uint8_t>(actions_ptr[pos]);
-            }
-
-            auto post_t1 = std::chrono::high_resolution_clock::now();
-            post_time_acc += std::chrono::duration_cast<std::chrono::microseconds>(post_t1 - post_t0);
-
-            offset += static_cast<size_t>(take);
-        }
-    }
-
-    return results;
-}
-
-#endif  // DEPRECATED run_batched_historical_inference
 
 // Legacy mode: run_historical_inference for greedy stepping with torch.jit.Module
 std::vector<uint8_t> RolloutManager::run_historical_inference(torch::jit::Module& module,

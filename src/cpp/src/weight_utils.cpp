@@ -13,94 +13,63 @@ void prestack_moe_expert_weights(
     int64_t num_layers,
     int64_t num_experts
 ) {
-    /**
-     * Pre-stack MoE expert weights for batched inference.
-     *
-     * For each transformer layer, gather all expert weights and stack them
-     * into single tensors optimized for the MoE CUDA kernel.
-     */
-
-    // Check if already prestacked by looking for stacked keys
     std::string first_stacked_key = "transformer.layers.0.moe.experts.w1";
-    if (state_dict.find(first_stacked_key) != state_dict.end()) {
-        // Already prestacked, skip
+    if (state_dict.count(first_stacked_key)) {
         return;
-    }
-
-    // Check if state_dict already has batched weights (batch dimension present)
-    // If any weight has more than 2 dimensions for linear layers, it's likely batched
-    bool is_batched = false;
-    for (const auto& pair : state_dict) {
-        if (pair.first.find("obs_encoder.0.weight") != std::string::npos) {
-            if (pair.second.dim() == 3) {  // [B, out_dim, in_dim]
-                is_batched = true;
-                break;
-            }
-        }
-    }
-
-    int64_t batch_size = 1;
-    if (is_batched) {
-        // Infer batch size from any weight
-        for (const auto& pair : state_dict) {
-            if (pair.first.find("obs_encoder.0.weight") != std::string::npos) {
-                batch_size = pair.second.size(0);
-                break;
-            }
-        }
     }
 
     for (int64_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
         std::vector<torch::Tensor> w1_experts, b1_experts, w2_experts, b2_experts;
+        w1_experts.reserve(num_experts);
+        b1_experts.reserve(num_experts);
+        w2_experts.reserve(num_experts);
+        b2_experts.reserve(num_experts);
 
         for (int64_t expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
             std::string expert_prefix =
                 "transformer.layers." + std::to_string(layer_idx) +
                 ".moe.experts." + std::to_string(expert_idx);
-
-            std::string w1_key = expert_prefix + ".0.weight";
-            std::string b1_key = expert_prefix + ".0.bias";
-            std::string w2_key = expert_prefix + ".3.weight";
-            std::string b2_key = expert_prefix + ".3.bias";
-
-            // Check if keys exist
-            if (state_dict.find(w1_key) == state_dict.end()) {
-                std::stringstream ss;
-                ss << "Missing expert weight key: " << w1_key;
-                throw std::runtime_error(ss.str());
-            }
-
-            w1_experts.push_back(state_dict.at(w1_key));
-            b1_experts.push_back(state_dict.at(b1_key));
-            w2_experts.push_back(state_dict.at(w2_key));
-            b2_experts.push_back(state_dict.at(b2_key));
+            
+            w1_experts.push_back(state_dict.at(expert_prefix + ".0.weight"));
+            b1_experts.push_back(state_dict.at(expert_prefix + ".0.bias"));
+            w2_experts.push_back(state_dict.at(expert_prefix + ".3.weight"));
+            b2_experts.push_back(state_dict.at(expert_prefix + ".3.bias"));
         }
 
-        // Stack along expert dimension (dim=0 if unbatched, dim=1 if batched)
         std::string layer_prefix = "transformer.layers." + std::to_string(layer_idx);
-        int64_t stack_dim = is_batched ? 1 : 0;
+        
+        state_dict[layer_prefix + ".moe.experts.w1"] = torch::stack(w1_experts, 0);
+        state_dict[layer_prefix + ".moe.experts.b1"] = torch::stack(b1_experts, 0);
+        state_dict[layer_prefix + ".moe.experts.w2"] = torch::stack(w2_experts, 0);
+        state_dict[layer_prefix + ".moe.experts.b2"] = torch::stack(b2_experts, 0);
 
-        state_dict[layer_prefix + ".moe.experts.w1"] = torch::stack(w1_experts, stack_dim);
-        state_dict[layer_prefix + ".moe.experts.b1"] = torch::stack(b1_experts, stack_dim);
-        state_dict[layer_prefix + ".moe.experts.w2"] = torch::stack(w2_experts, stack_dim);
-        state_dict[layer_prefix + ".moe.experts.b2"] = torch::stack(b2_experts, stack_dim);
-
-        // Cleanup: remove per-expert individual weight keys to avoid ambiguity
         for (int64_t expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
-            std::string expert_prefix =
-                layer_prefix + ".moe.experts." + std::to_string(expert_idx);
-
-            std::string w1_key = expert_prefix + ".0.weight";
-            std::string b1_key = expert_prefix + ".0.bias";
-            std::string w2_key = expert_prefix + ".3.weight";
-            std::string b2_key = expert_prefix + ".3.bias";
-
-            state_dict.erase(w1_key);
-            state_dict.erase(b1_key);
-            state_dict.erase(w2_key);
-            state_dict.erase(b2_key);
+            std::string expert_prefix = layer_prefix + ".moe.experts." + std::to_string(expert_idx);
+            state_dict.erase(expert_prefix + ".0.weight");
+            state_dict.erase(expert_prefix + ".0.bias");
+            state_dict.erase(expert_prefix + ".3.weight");
+            state_dict.erase(expert_prefix + ".3.bias");
         }
     }
+}
+
+torch::Tensor build_ptr_table_device(const torch::Tensor& stacked) {
+    TORCH_CHECK(stacked.is_cuda(), "Stacked expert weights must be CUDA tensors");
+    TORCH_CHECK(stacked.dim() >= 2, "Stacked expert weights must be at least 2D");
+
+    const int64_t P = stacked.size(0);
+    const int64_t E = stacked.size(1);
+
+    auto ptr_tensor_cpu = torch::empty({P, E}, torch::dtype(torch::kUInt64).device(torch::kCPU));
+    auto ptr_data = ptr_tensor_cpu.data_ptr<uint64_t>();
+
+    for (int64_t p = 0; p < P; ++p) {
+        for (int64_t e = 0; e < E; ++e) {
+            auto expert_tensor = stacked.select(0, p).select(0, e);
+            ptr_data[p * E + e] = reinterpret_cast<uint64_t>(expert_tensor.data_ptr());
+        }
+    }
+    return ptr_tensor_cpu.to(stacked.device());
 }
 
 void create_moe_weight_pointers(
@@ -108,102 +77,17 @@ void create_moe_weight_pointers(
     int64_t num_layers,
     int64_t num_experts
 ) {
-    /**
-     * Create pointer tensors for MoE expert weights.
-     *
-     * These pointer tensors store the actual CUDA device pointer addresses
-     * of each expert's weights, enabling efficient grouped GEMM operations.
-     *
-     * For each layer, creates:
-     * - transformer.layers.X.moe.experts.w1_ptrs: [batch_size, num_experts]
-     * - transformer.layers.X.moe.experts.b1_ptrs: [batch_size, num_experts]
-     * - transformer.layers.X.moe.experts.w2_ptrs: [batch_size, num_experts]
-     * - transformer.layers.X.moe.experts.b2_ptrs: [batch_size, num_experts]
-     */
-
-    // Determine if weights are batched
-    bool is_batched = false;
-    int64_t batch_size = 1;
-
-    for (const auto& pair : state_dict) {
-        if (pair.first.find("obs_encoder.0.weight") != std::string::npos) {
-            if (pair.second.dim() == 3) {
-                is_batched = true;
-                batch_size = pair.second.size(0);
-                break;
-            }
-        }
-    }
-
     for (int64_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
-        std::string layer_prefix = "transformer.layers." + std::to_string(layer_idx);
-
-        // Get the stacked expert weights
-        auto& w1_stacked = state_dict.at(layer_prefix + ".moe.experts.w1");
-        auto& b1_stacked = state_dict.at(layer_prefix + ".moe.experts.b1");
-        auto& w2_stacked = state_dict.at(layer_prefix + ".moe.experts.w2");
-        auto& b2_stacked = state_dict.at(layer_prefix + ".moe.experts.b2");
-
-        // Ensure weights are CUDA tensors
-        TORCH_CHECK(w1_stacked.is_cuda(), "Expert weights must be on CUDA device");
-
-        // Detect dimension ordering based on actual shape
-        // Two possible formats:
-        // 1. eval_manager format: [batch_size, num_experts, ...] (batch first)
-        // 2. profile format: [num_experts, batch_size, ...] (expert first)
-        bool expert_first = (w1_stacked.size(0) == num_experts);
-
-        // Create pointer tensors on CPU first, then copy to GPU
-        auto w1_ptrs = torch::zeros({batch_size, num_experts}, torch::dtype(torch::kUInt64).device(torch::kCPU));
-        auto b1_ptrs = torch::zeros({batch_size, num_experts}, torch::dtype(torch::kUInt64).device(torch::kCPU));
-        auto w2_ptrs = torch::zeros({batch_size, num_experts}, torch::dtype(torch::kUInt64).device(torch::kCPU));
-        auto b2_ptrs = torch::zeros({batch_size, num_experts}, torch::dtype(torch::kUInt64).device(torch::kCPU));
-
-        auto w1_ptrs_acc = w1_ptrs.accessor<uint64_t, 2>();
-        auto b1_ptrs_acc = b1_ptrs.accessor<uint64_t, 2>();
-        auto w2_ptrs_acc = w2_ptrs.accessor<uint64_t, 2>();
-        auto b2_ptrs_acc = b2_ptrs.accessor<uint64_t, 2>();
-
-        // Fill in the pointers based on detected format
-        if (expert_first) {
-            // Weights are shaped [num_experts, batch_size, ...]
-            for (int64_t e = 0; e < num_experts; ++e) {
-                for (int64_t b = 0; b < batch_size; ++b) {
-                    // Index as [expert][batch] but store as [batch][expert]
-                    auto w1_expert = w1_stacked[e][b];
-                    auto b1_expert = b1_stacked[e][b];
-                    auto w2_expert = w2_stacked[e][b];
-                    auto b2_expert = b2_stacked[e][b];
-
-                    w1_ptrs_acc[b][e] = reinterpret_cast<uint64_t>(w1_expert.data_ptr());
-                    b1_ptrs_acc[b][e] = reinterpret_cast<uint64_t>(b1_expert.data_ptr());
-                    w2_ptrs_acc[b][e] = reinterpret_cast<uint64_t>(w2_expert.data_ptr());
-                    b2_ptrs_acc[b][e] = reinterpret_cast<uint64_t>(b2_expert.data_ptr());
-                }
-            }
-        } else {
-            // Weights are shaped [batch_size, num_experts, ...]
-            for (int64_t b = 0; b < batch_size; ++b) {
-                for (int64_t e = 0; e < num_experts; ++e) {
-                    auto w1_expert = w1_stacked[b][e];
-                    auto b1_expert = b1_stacked[b][e];
-                    auto w2_expert = w2_stacked[b][e];
-                    auto b2_expert = b2_stacked[b][e];
-
-                    w1_ptrs_acc[b][e] = reinterpret_cast<uint64_t>(w1_expert.data_ptr());
-                    b1_ptrs_acc[b][e] = reinterpret_cast<uint64_t>(b1_expert.data_ptr());
-                    w2_ptrs_acc[b][e] = reinterpret_cast<uint64_t>(w2_expert.data_ptr());
-                    b2_ptrs_acc[b][e] = reinterpret_cast<uint64_t>(b2_expert.data_ptr());
-                }
+        std::string layer_prefix = "transformer.layers." + std::to_string(layer_idx) + ".moe.experts.";
+        
+        const std::vector<std::string> keys = {"w1", "b1", "w2", "b2"};
+        for (const auto& key : keys) {
+            std::string full_key = layer_prefix + key;
+            auto it = state_dict.find(full_key);
+            if (it != state_dict.end()) {
+                state_dict[full_key + "_ptrs"] = build_ptr_table_device(it->second);
             }
         }
-
-        // Move pointer tensors to GPU (keep as UInt64)
-        auto device = w1_stacked.device();
-        state_dict[layer_prefix + ".moe.experts.w1_ptrs"] = w1_ptrs.to(device);
-        state_dict[layer_prefix + ".moe.experts.b1_ptrs"] = b1_ptrs.to(device);
-        state_dict[layer_prefix + ".moe.experts.w2_ptrs"] = w2_ptrs.to(device);
-        state_dict[layer_prefix + ".moe.experts.b2_ptrs"] = b2_ptrs.to(device);
     }
 }
 
@@ -212,61 +96,40 @@ void create_moe_weight_pointers(
     int64_t num_layers,
     int64_t num_experts
 ) {
-    // c10::Dict overload - wrap/unwrap and delegate to unordered_map version
-    std::unordered_map<std::string, torch::Tensor> temp_map;
-    for (const auto& item : state_dict) {
-        temp_map[item.key()] = item.value();
-    }
-
-    create_moe_weight_pointers(temp_map, num_layers, num_experts);
-
-    // Copy back the pointer tensors
-    for (const auto& pair : temp_map) {
-        if (pair.first.find("_ptrs") != std::string::npos) {
-            state_dict.insert(pair.first, pair.second);
+    for (int64_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
+        std::string layer_prefix = "transformer.layers." + std::to_string(layer_idx) + ".moe.experts.";
+        
+        const std::vector<std::string> keys = {"w1", "b1", "w2", "b2"};
+        for (const auto& key : keys) {
+            std::string full_key = layer_prefix + key;
+            auto it = state_dict.find(full_key);
+            if (it != state_dict.end()) {
+                state_dict.insert_or_assign(full_key + "_ptrs", build_ptr_table_device(it->value()));
+            }
         }
     }
 }
 
-// Note: Previous C++ .pth loading helper removed; loading now handled in Python.
-
 c10::Dict<std::string, torch::Tensor> batch_state_dicts(
     const std::vector<std::unordered_map<std::string, torch::Tensor>>& state_dicts
 ) {
-    /**
-     * Batch multiple state_dicts along a new batch dimension.
-     *
-     * All state_dicts must have the same keys and compatible shapes.
-     */
-
     if (state_dicts.empty()) {
         throw std::runtime_error("Cannot batch empty state_dicts");
     }
 
     c10::Dict<std::string, torch::Tensor> batched;
-
-    // Get keys from first state_dict
     const auto& first_dict = state_dicts[0];
 
     for (const auto& pair : first_dict) {
         const std::string& key = pair.first;
         std::vector<torch::Tensor> tensors_to_stack;
+        tensors_to_stack.reserve(state_dicts.size());
 
-        // Gather this parameter from all state_dicts
         for (const auto& state_dict : state_dicts) {
-            if (state_dict.find(key) == state_dict.end()) {
-                std::stringstream ss;
-                ss << "Key '" << key << "' missing in one of the state_dicts";
-                throw std::runtime_error(ss.str());
-            }
             tensors_to_stack.push_back(state_dict.at(key));
         }
-
-        // Stack along batch dimension (dim=0)
-        auto stacked = torch::stack(tensors_to_stack, /*dim=*/0);
-        batched.insert(key, stacked);
+        batched.insert(key, torch::stack(tensors_to_stack, 0));
     }
-
     return batched;
 }
 
@@ -274,51 +137,21 @@ void add_fixed_buffers(
     c10::Dict<std::string, torch::Tensor>& weights,
     const torch::Device& device
 ) {
-    /**
-     * Add fixed lookup table buffers used for action decomposition.
-     *
-     * These are constant tensors defined in the model architecture.
-     */
+    auto lut_act_kind = torch::tensor({1, 1, 1, 1, 1, 1, 2, 1, 1, 1, 0}, torch::dtype(torch::kLong).device(device));
+    auto lut_count = torch::tensor({1, 2, 3, 1, 2, 3, 0, 1, 2, 3, 4}, torch::dtype(torch::kLong).device(device));
+    auto lut_table_flag = torch::tensor({1, 1, 1, 2, 2, 2, 0, 0, 0, 0, 3}, torch::dtype(torch::kLong).device(device));
 
-    // Action kind LUT: maps action ID -> action kind (1=normal, 2=challenge, 0=pad)
-    auto lut_act_kind = torch::tensor(
-        {1, 1, 1, 1, 1, 1, 2, 1, 1, 1, 0},
-        torch::dtype(torch::kLong).device(device)
-    );
-
-    // Count LUT: maps action ID -> count (0-3, 4=pad)
-    auto lut_count = torch::tensor(
-        {1, 2, 3, 1, 2, 3, 0, 1, 2, 3, 4},
-        torch::dtype(torch::kLong).device(device)
-    );
-
-    // Table flag LUT: maps action ID -> table flag (1=table, 2=non-table, 0=challenge, 3=pad)
-    auto lut_table_flag = torch::tensor(
-        {1, 1, 1, 2, 2, 2, 0, 0, 0, 0, 3},
-        torch::dtype(torch::kLong).device(device)
-    );
-
-    // Use insert_or_assign to ensure LUTs are always set correctly
-    // (insert() fails silently if key exists)
     weights.insert_or_assign("lut_act_kind", lut_act_kind);
     weights.insert_or_assign("lut_count", lut_count);
     weights.insert_or_assign("lut_table_flag", lut_table_flag);
 }
 
-// -----------------------------------------------------------------------------
-// Attention weight processing utilities
-// -----------------------------------------------------------------------------
-
 namespace {
 using torch::indexing::Slice;
 
-inline std::string replace_suffix(const std::string& s,
-                                  const std::string& from,
-                                  const std::string& to) {
-    const auto pos = s.rfind(from);
-    if (pos == std::string::npos) {
-        return s;
-    }
+inline std::string replace_suffix(const std::string& s, const std::string& from, const std::string& to) {
+    auto pos = s.rfind(from);
+    if (pos == std::string::npos) return s;
     std::string out = s;
     out.replace(pos, from.size(), to);
     return out;
@@ -326,97 +159,48 @@ inline std::string replace_suffix(const std::string& s,
 
 inline std::string drop_self_attn_alias(const std::string& s) {
     constexpr const char* needle = ".self_attn.";
-    const auto pos = s.find(needle);
-    if (pos == std::string::npos) {
-        return s;
-    }
+    auto pos = s.find(needle);
+    if (pos == std::string::npos) return s;
     std::string out = s;
     out.replace(pos, std::strlen(needle), ".");
     return out;
 }
-}  // namespace
+}
 
-void process_and_split_attention_weights(
-    c10::Dict<std::string, torch::Tensor>& weights
-) {
+void process_and_split_attention_weights(c10::Dict<std::string, torch::Tensor>& weights) {
     std::vector<std::string> original_keys;
     original_keys.reserve(weights.size());
-    for (const auto& kv : weights) {
-        original_keys.push_back(kv.key());
-    }
+    for (const auto& kv : weights) original_keys.push_back(kv.key());
 
     for (const auto& key : original_keys) {
         if (key.find(".self_attn.in_proj_weight") != std::string::npos) {
-            if (!weights.contains(key)) continue;
             const auto& w = weights.at(key);
-            if (!w.defined() || (w.dim() != 3 && w.dim() != 2)) continue;
-
             const int64_t chunk_dim = (w.dim() == 3) ? 1 : 0;
-            if (w.size(chunk_dim) % 3 != 0) continue;
             const int64_t H = w.size(chunk_dim) / 3;
-
-            torch::Tensor q, k, v;
-            if (w.dim() == 3) {
-                q = w.index({Slice(), Slice(0, H), Slice()}).contiguous();
-                k = w.index({Slice(), Slice(H, 2 * H), Slice()}).contiguous();
-                v = w.index({Slice(), Slice(2 * H, 3 * H), Slice()}).contiguous();
-            } else {
-                // Unbatched path: [3*H, H] -> three [H, H]
-                q = w.index({Slice(0, H), Slice()}).contiguous();
-                k = w.index({Slice(H, 2 * H), Slice()}).contiguous();
-                v = w.index({Slice(2 * H, 3 * H), Slice()}).contiguous();
-            }
-
-            const auto q_key = replace_suffix(key, "in_proj_weight", "q_proj.weight");
-            const auto k_key = replace_suffix(key, "in_proj_weight", "k_proj.weight");
-            const auto v_key = replace_suffix(key, "in_proj_weight", "v_proj.weight");
-
-            weights.insert(q_key, q);
-            weights.insert(k_key, k);
-            weights.insert(v_key, v);
-
-            weights.insert(drop_self_attn_alias(q_key), q);
-            weights.insert(drop_self_attn_alias(k_key), k);
-            weights.insert(drop_self_attn_alias(v_key), v);
-            continue;
-        }
-
-        if (key.find(".self_attn.in_proj_bias") != std::string::npos) {
-            if (!weights.contains(key)) continue;
+            auto chunks = w.chunk(3, chunk_dim);
+            auto q_key = replace_suffix(key, "in_proj_weight", "q_proj.weight");
+            auto k_key = replace_suffix(key, "in_proj_weight", "k_proj.weight");
+            auto v_key = replace_suffix(key, "in_proj_weight", "v_proj.weight");
+            weights.insert(q_key, chunks[0].contiguous());
+            weights.insert(k_key, chunks[1].contiguous());
+            weights.insert(v_key, chunks[2].contiguous());
+            weights.insert(drop_self_attn_alias(q_key), chunks[0].contiguous());
+            weights.insert(drop_self_attn_alias(k_key), chunks[1].contiguous());
+            weights.insert(drop_self_attn_alias(v_key), chunks[2].contiguous());
+        } else if (key.find(".self_attn.in_proj_bias") != std::string::npos) {
             const auto& b = weights.at(key);
-            if (!b.defined() || (b.dim() != 2 && b.dim() != 1)) continue;
-
             const int64_t chunk_dim = (b.dim() == 2) ? 1 : 0;
-            if (b.size(chunk_dim) % 3 != 0) continue;
-            const int64_t H = b.size(chunk_dim) / 3;
-
-            torch::Tensor q, k, v;
-            if (b.dim() == 2) {
-                q = b.index({Slice(), Slice(0, H)}).contiguous();
-                k = b.index({Slice(), Slice(H, 2 * H)}).contiguous();
-                v = b.index({Slice(), Slice(2 * H, 3 * H)}).contiguous();
-            } else {
-                // Unbatched path: [3*H] -> three [H]
-                q = b.index({Slice(0, H)}).contiguous();
-                k = b.index({Slice(H, 2 * H)}).contiguous();
-                v = b.index({Slice(2 * H, 3 * H)}).contiguous();
-            }
-
-            const auto q_key = replace_suffix(key, "in_proj_bias", "q_proj.bias");
-            const auto k_key = replace_suffix(key, "in_proj_bias", "k_proj.bias");
-            const auto v_key = replace_suffix(key, "in_proj_bias", "v_proj.bias");
-
-            weights.insert(q_key, q);
-            weights.insert(k_key, k);
-            weights.insert(v_key, v);
-
-            weights.insert(drop_self_attn_alias(q_key), q);
-            weights.insert(drop_self_attn_alias(k_key), k);
-            weights.insert(drop_self_attn_alias(v_key), v);
-            continue;
-        }
-
-        if (key.find(".self_attn.") != std::string::npos) {
+            auto chunks = b.chunk(3, chunk_dim);
+            auto q_key = replace_suffix(key, "in_proj_bias", "q_proj.bias");
+            auto k_key = replace_suffix(key, "in_proj_bias", "k_proj.bias");
+            auto v_key = replace_suffix(key, "in_proj_bias", "v_proj.bias");
+            weights.insert(q_key, chunks[0].contiguous());
+            weights.insert(k_key, chunks[1].contiguous());
+            weights.insert(v_key, chunks[2].contiguous());
+            weights.insert(drop_self_attn_alias(q_key), chunks[0].contiguous());
+            weights.insert(drop_self_attn_alias(k_key), chunks[1].contiguous());
+            weights.insert(drop_self_attn_alias(v_key), chunks[2].contiguous());
+        } else if (key.find(".self_attn.") != std::string::npos) {
             const auto alias = drop_self_attn_alias(key);
             if (alias != key && !weights.contains(alias)) {
                 weights.insert(alias, weights.at(key));
@@ -425,87 +209,42 @@ void process_and_split_attention_weights(
     }
 }
 
-void process_and_split_attention_weights(
-    std::unordered_map<std::string, torch::Tensor>& weights
-) {
+void process_and_split_attention_weights(std::unordered_map<std::string, torch::Tensor>& weights) {
     std::vector<std::string> original_keys;
     original_keys.reserve(weights.size());
-    for (const auto& kv : weights) {
-        original_keys.push_back(kv.first);
-    }
+    for (const auto& kv : weights) original_keys.push_back(kv.first);
 
     for (const auto& key : original_keys) {
-        auto it = weights.find(key);
-        if (it == weights.end()) continue;
-
         if (key.find(".self_attn.in_proj_weight") != std::string::npos) {
-            const auto& w = it->second;
-            if (!w.defined() || (w.dim() != 3 && w.dim() != 2)) continue;
+            const auto& w = weights.at(key);
             const int64_t chunk_dim = (w.dim() == 3) ? 1 : 0;
-            if (w.size(chunk_dim) % 3 != 0) continue;
-            const int64_t H = w.size(chunk_dim) / 3;
-
-            torch::Tensor q, k, v;
-            if (w.dim() == 3) {
-                q = w.index({Slice(), Slice(0, H), Slice()}).contiguous();
-                k = w.index({Slice(), Slice(H, 2 * H), Slice()}).contiguous();
-                v = w.index({Slice(), Slice(2 * H, 3 * H), Slice()}).contiguous();
-            } else {
-                q = w.index({Slice(0, H), Slice()}).contiguous();
-                k = w.index({Slice(H, 2 * H), Slice()}).contiguous();
-                v = w.index({Slice(2 * H, 3 * H), Slice()}).contiguous();
-            }
-
-            const auto q_key = replace_suffix(key, "in_proj_weight", "q_proj.weight");
-            const auto k_key = replace_suffix(key, "in_proj_weight", "k_proj.weight");
-            const auto v_key = replace_suffix(key, "in_proj_weight", "v_proj.weight");
-
-            weights[q_key] = q;
-            weights[k_key] = k;
-            weights[v_key] = v;
-
-            weights[drop_self_attn_alias(q_key)] = q;
-            weights[drop_self_attn_alias(k_key)] = k;
-            weights[drop_self_attn_alias(v_key)] = v;
-            continue;
-        }
-
-        if (key.find(".self_attn.in_proj_bias") != std::string::npos) {
-            const auto& b = it->second;
-            if (!b.defined() || (b.dim() != 2 && b.dim() != 1)) continue;
+            auto chunks = w.chunk(3, chunk_dim);
+            auto q_key = replace_suffix(key, "in_proj_weight", "q_proj.weight");
+            auto k_key = replace_suffix(key, "in_proj_weight", "k_proj.weight");
+            auto v_key = replace_suffix(key, "in_proj_weight", "v_proj.weight");
+            weights[q_key] = chunks[0].contiguous();
+            weights[k_key] = chunks[1].contiguous();
+            weights[v_key] = chunks[2].contiguous();
+            weights[drop_self_attn_alias(q_key)] = chunks[0].contiguous();
+            weights[drop_self_attn_alias(k_key)] = chunks[1].contiguous();
+            weights[drop_self_attn_alias(v_key)] = chunks[2].contiguous();
+        } else if (key.find(".self_attn.in_proj_bias") != std::string::npos) {
+            const auto& b = weights.at(key);
             const int64_t chunk_dim = (b.dim() == 2) ? 1 : 0;
-            if (b.size(chunk_dim) % 3 != 0) continue;
-            const int64_t H = b.size(chunk_dim) / 3;
-
-            torch::Tensor q, k, v;
-            if (b.dim() == 2) {
-                q = b.index({Slice(), Slice(0, H)}).contiguous();
-                k = b.index({Slice(), Slice(H, 2 * H)}).contiguous();
-                v = b.index({Slice(), Slice(2 * H, 3 * H)}).contiguous();
-            } else {
-                q = b.index({Slice(0, H)}).contiguous();
-                k = b.index({Slice(H, 2 * H)}).contiguous();
-                v = b.index({Slice(2 * H, 3 * H)}).contiguous();
-            }
-
-            const auto q_key = replace_suffix(key, "in_proj_bias", "q_proj.bias");
-            const auto k_key = replace_suffix(key, "in_proj_bias", "k_proj.bias");
-            const auto v_key = replace_suffix(key, "in_proj_bias", "v_proj.bias");
-
-            weights[q_key] = q;
-            weights[k_key] = k;
-            weights[v_key] = v;
-
-            weights[drop_self_attn_alias(q_key)] = q;
-            weights[drop_self_attn_alias(k_key)] = k;
-            weights[drop_self_attn_alias(v_key)] = v;
-            continue;
-        }
-
-        if (key.find(".self_attn.") != std::string::npos) {
+            auto chunks = b.chunk(3, chunk_dim);
+            auto q_key = replace_suffix(key, "in_proj_bias", "q_proj.bias");
+            auto k_key = replace_suffix(key, "in_proj_bias", "k_proj.bias");
+            auto v_key = replace_suffix(key, "in_proj_bias", "v_proj.bias");
+            weights[q_key] = chunks[0].contiguous();
+            weights[k_key] = chunks[1].contiguous();
+            weights[v_key] = chunks[2].contiguous();
+            weights[drop_self_attn_alias(q_key)] = chunks[0].contiguous();
+            weights[drop_self_attn_alias(k_key)] = chunks[1].contiguous();
+            weights[drop_self_attn_alias(v_key)] = chunks[2].contiguous();
+        } else if (key.find(".self_attn.") != std::string::npos) {
             const auto alias = drop_self_attn_alias(key);
             if (alias != key && !weights.count(alias)) {
-                weights[alias] = it->second;
+                weights[alias] = weights.at(key);
             }
         }
     }

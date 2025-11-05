@@ -37,6 +37,14 @@ void prestack_moe_expert_weights(
 );
 
 /**
+ * Build a pointer table on the GPU for a stacked tensor.
+ *
+ * For a stacked tensor [P, E, ...], computes data pointers for each [p, e] slice.
+ * Returns a GPU tensor of uint64 pointers with shape [P, E].
+ */
+torch::Tensor build_ptr_table_device(const torch::Tensor& stacked);
+
+/**
  * Create pointer tensors for MoE expert weights.
  *
  * This function creates tensors containing the CUDA device pointer addresses
@@ -69,8 +77,6 @@ void create_moe_weight_pointers(
     int64_t num_layers,
     int64_t num_experts
 );
-
-// Note: Previous C++ .pth loading helper removed.
 
 /**
  * Batch multiple state_dicts into a single batched weight dictionary.

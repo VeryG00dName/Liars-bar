@@ -38,14 +38,12 @@ static inline bool lb_env_enabled(const char* name) {
     return true;
 }
 static bool LB_DBG_STATS() {
-    static int flag = -1;
-    if (flag < 0) flag = lb_env_enabled("LB_DEBUG_STATS");
-    return flag != 0;
+    static const bool flag = lb_env_enabled("LB_DEBUG_STATS");
+    return flag;
 }
 static bool LB_KERNEL_DEBUG_ENABLED() {
-    static int flag = -1;
-    if (flag < 0) flag = lb_env_enabled("LB_ENABLE_KERNEL_DEBUG") ? 1 : 0;
-    return flag != 0;
+    static const bool flag = lb_env_enabled("LB_ENABLE_KERNEL_DEBUG");
+    return flag;
 }
 
 using Clock = std::chrono::high_resolution_clock;
@@ -84,9 +82,10 @@ __global__ void indexed_batched_embedding_kernel(
     const scalar_t* src_ptr = table_ptr + token_idx * hidden_dim;
     scalar_t* dst_ptr = output + linear_index * hidden_dim;
 
-#pragma unroll 4
-    for (int64_t h = 0; h < hidden_dim; ++h) {
-        dst_ptr[h] = src_ptr[h];
+    // Use vector loads for better memory bandwidth
+    const int vec_size = 4;
+    for (int64_t h = threadIdx.x * vec_size; h < hidden_dim; h += blockDim.x * vec_size) {
+        *reinterpret_cast<float4*>(&dst_ptr[h]) = *reinterpret_cast<const float4*>(&src_ptr[h]);
     }
 }
 
@@ -254,27 +253,7 @@ torch::Tensor indexed_batched_layer_norm(
     TORCH_CHECK(input.dim() == 3, "input must be [B, T, H]");
     TORCH_CHECK(gamma_cache.dim() == 2, "gamma cache must be [W, H]");
     TORCH_CHECK(beta_cache.dim() == 2, "beta cache must be [W, H]");
-
-    // Detailed input validation
-    auto check_tensor = [](const torch::Tensor& t, const char* name) {
-        if (t.isnan().any().item<bool>()) {
-            TORCH_CHECK(false, name, " contains NaN values");
-        }
-        if (t.isinf().any().item<bool>()) {
-            TORCH_CHECK(false, name, " contains Inf values");
-        }
-        if (LB_DBG_STATS()) {
-            auto stats = t.to(torch::kFloat32);
-            std::cerr << name << " stats - min: " << stats.min().item<float>()
-                     << " max: " << stats.max().item<float>()
-                     << " mean: " << stats.mean().item<float>()
-                     << " std: " << stats.std().item<float>() << std::endl;
-        }
-    };
-
-    check_tensor(input, "LayerNorm input");
-    check_tensor(gamma_cache, "LayerNorm gamma_cache");
-    check_tensor(beta_cache, "LayerNorm beta_cache");
+    TORCH_CHECK(input.scalar_type() == gamma_cache.scalar_type() && input.scalar_type() == beta_cache.scalar_type(), "All inputs to layer_norm must have the same dtype");
 
     auto batch_size = input.size(0);
     auto time_steps = input.size(1);
@@ -283,31 +262,11 @@ torch::Tensor indexed_batched_layer_norm(
     TORCH_CHECK(input.is_cuda(), "indexed_batched_layer_norm expects CUDA tensors for input");
 
     auto input_contig = input.contiguous();
-    auto gamma_t = gamma_cache;
-    auto beta_t  = beta_cache;
-    if (gamma_t.device() != input.device()) gamma_t = gamma_t.to(input.device());
-    if (beta_t.device() != input.device())  beta_t  = beta_t.to(input.device());
-    if (gamma_t.scalar_type() != input.scalar_type()) gamma_t = gamma_t.to(input.scalar_type());
-    if (beta_t.scalar_type()  != input.scalar_type())  beta_t = beta_t.to(input.scalar_type());
-    auto gamma_contig = gamma_t.contiguous();
-    auto beta_contig  = beta_t.contiguous();
+    auto gamma_contig = gamma_cache.contiguous();
+    auto beta_contig  = beta_cache.contiguous();
     auto policy_contig = policy_indices.to(torch::kLong).contiguous();
     if (policy_contig.device() != input.device()) {
         policy_contig = policy_contig.to(input.device());
-    }
-
-    // Validate policy indices
-    const int64_t num_policies = gamma_contig.size(0);
-    TORCH_CHECK(num_policies == beta_contig.size(0), "LayerNorm caches (gamma/beta) disagree on W dimension");
-    TORCH_CHECK(gamma_contig.size(1) == hidden_dim && beta_contig.size(1) == hidden_dim,
-                "LayerNorm caches must have H == hidden_dim");
-    auto pol_min = policy_contig.min().item<int64_t>();
-    auto pol_max = policy_contig.max().item<int64_t>();
-    if (pol_min < 0 || pol_max >= num_policies) {
-        auto clamped = torch::clamp(policy_contig, 0, num_policies - 1);
-        std::cerr << "[WARN] indexed_batched_layer_norm: clamping policy indices to [0," << (num_policies-1)
-                  << "] (observed min=" << pol_min << ", max=" << pol_max << ")" << std::endl;
-        policy_contig = clamped;
     }
 
     auto output = torch::empty_like(input_contig, input_contig.options());
@@ -351,6 +310,9 @@ torch::Tensor indexed_batched_linear(
     TORCH_CHECK(input.is_cuda(), "indexed_batched_linear expects CUDA tensors for input");
     TORCH_CHECK(weight_cache.is_cuda(), "weight_cache must be on CUDA device");
     TORCH_CHECK(bias_cache.is_cuda(), "bias_cache must be on CUDA device");
+    TORCH_CHECK(input.scalar_type() == torch::kFloat16, "Input must be FP16 for optimized linear");
+    TORCH_CHECK(weight_cache.scalar_type() == torch::kFloat16, "Weight cache must be FP16");
+    TORCH_CHECK(bias_cache.scalar_type() == torch::kFloat16, "Bias cache must be FP16");
 
     TORCH_CHECK(input.dim()        == 3, "Input tensor must be 3D [B, T, in], got ", input.sizes());
     TORCH_CHECK(weight_cache.dim() == 3, "weight_cache must be 3D [W, out, in], got ", weight_cache.sizes());
@@ -367,34 +329,27 @@ torch::Tensor indexed_batched_linear(
     TORCH_CHECK(weight_cache.size(2) == In_Dim, "weight_cache input dim must match input tensor");
     TORCH_CHECK(bias_cache.size(0) == W && bias_cache.size(1) == Out_Dim, "bias_cache shape mismatch");
 
-    // Data preparation
-    auto input_f32 = input.to(torch::kFloat32).contiguous();
-    auto weight_f32 = weight_cache.to(torch::kFloat32).contiguous();
-    auto bias_f32 = bias_cache.to(torch::kFloat32).contiguous();
+    // Data preparation (no dtype conversion)
+    auto input_contig = input.contiguous();
+    auto weight_contig = weight_cache.contiguous();
+    auto bias_contig = bias_cache.contiguous();
 
     auto policy_indices_long = policy_indices.to(torch::kLong).contiguous();
     if (policy_indices_long.device() != input.device()) {
         policy_indices_long = policy_indices_long.to(input.device());
     }
 
-    auto policy_min = policy_indices_long.min().item<int64_t>();
-    auto policy_max = policy_indices_long.max().item<int64_t>();
-    TORCH_CHECK(policy_min >= 0 && policy_max < W,
-                "policy_indices are out of valid range. Got min=", policy_min, ", max=", policy_max,
-                ", but valid range is [0, ", W - 1, "]");
-
     auto t0 = Clock::now();
-    auto weight_batched = weight_f32.index_select(0, policy_indices_long).contiguous();
-    auto bias_batched = bias_f32.index_select(0, policy_indices_long).contiguous();
+    auto weight_batched = weight_contig.index_select(0, policy_indices_long).contiguous();
+    auto bias_batched = bias_contig.index_select(0, policy_indices_long).contiguous();
     auto t1 = Clock::now();
     timers["linear_index_select_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
 
     // Batched matmul
     auto gemm_t0 = Clock::now();
-    auto weight_transposed = weight_batched.transpose(1, 2);  // [B, In_Dim, Out_Dim]
-    // Fused bias add + batched GEMM
+    auto weight_transposed = weight_batched.transpose(1, 2);
     auto bias_expanded = bias_batched.unsqueeze(1).expand({B, T, Out_Dim});
-    auto output = torch::baddbmm(bias_expanded, input_f32, weight_transposed, /*beta=*/1.0, /*alpha=*/1.0);
+    auto output = torch::baddbmm(bias_expanded, input_contig, weight_transposed, /*beta=*/1.0, /*alpha=*/1.0);
     auto gemm_t1 = Clock::now();
     timers["linear_cublas_matmul_us"] += std::chrono::duration_cast<Microseconds>(gemm_t1 - gemm_t0);
 
@@ -406,7 +361,7 @@ torch::Tensor indexed_batched_linear(
         timers["linear_epilogue_us"] += std::chrono::duration_cast<Microseconds>(epi_t1 - epi_t0);
     }
 
-    return output.to(input.scalar_type());
+    return output;
 }
 
 void grouped_ffn_gemm_forward(
@@ -430,24 +385,11 @@ void grouped_ffn_gemm_forward(
     TORCH_CHECK(expert_ids != nullptr, "grouped_ffn_gemm_forward: expert_ids must not be null");
     TORCH_CHECK(routing_weight_ptrs != nullptr, "grouped_ffn_gemm_forward: routing_weight_ptrs must not be null");
 
-    // Delegate to CUTLASS grouped MoE implementation
     lb::moe::cutlass_grouped_moe_forward(
-        input_ptrs,
-        w1_ptrs,
-        b1_ptrs,
-        w2_ptrs,
-        b2_ptrs,
-        output_ptrs,
-        routing_weight_ptrs,
-        m_sizes,
-        policy_ids,
-        expert_ids,
-        token_offsets,
-        group_count,
-        hidden_dim,
-        ffn_dim,
-        nullptr  // No workspace - will allocate temporary buffers
-    );
+        input_ptrs, w1_ptrs, b1_ptrs, w2_ptrs, b2_ptrs,
+        output_ptrs, routing_weight_ptrs, m_sizes,
+        policy_ids, expert_ids, token_offsets,
+        group_count, hidden_dim, ffn_dim, nullptr);
 }
 
 } // namespace kernels

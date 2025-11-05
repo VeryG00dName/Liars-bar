@@ -112,7 +112,7 @@ NeuralInferenceOrchestrator::~NeuralInferenceOrchestrator() {
 int64_t NeuralInferenceOrchestrator::find_max_sequence_length(
     const std::unordered_map<int, std::vector<PolicyRequest>>& requests_by_policy
 ) const {
-    int64_t max_len = 0;
+    int64_t max_len = 1; // Start with 1 to handle empty sequences
     for (const auto& kv : requests_by_policy) {
         for (const auto& req : kv.second) {
             max_len = std::max(max_len, static_cast<int64_t>(req.valid_len));
@@ -122,94 +122,67 @@ int64_t NeuralInferenceOrchestrator::find_max_sequence_length(
 }
 
 std::tuple<
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor
+    torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor
 >
 NeuralInferenceOrchestrator::prepare_batch_tensors(
     const std::vector<std::tuple<int, int, const PolicyRequest*>>& requests,
     int64_t target_seq_len
 ) const {
     const int64_t batch_size = static_cast<int64_t>(requests.size());
-    const int64_t obs_dim = 16;  // Padded observation dimension
+    const int64_t obs_dim = 16;
+    const bool pin_memory = true;
 
-    // Allocate output tensors
-    auto options = torch::TensorOptions().dtype(torch::kFloat16).device(torch::kCUDA);
-    auto obs_sequence = torch::zeros({batch_size, target_seq_len, obs_dim}, options);
-    auto action_sequence = torch::zeros({batch_size, target_seq_len}, torch::TensorOptions().dtype(torch::kLong).device(torch::kCUDA));
-    auto agent_types = torch::zeros({batch_size, target_seq_len}, options);
-    auto positions = torch::zeros({batch_size, target_seq_len}, options);
-    auto padding_mask = torch::ones({batch_size, target_seq_len}, torch::TensorOptions().dtype(torch::kBool).device(torch::kCUDA));
+    // Allocate tensors on pinned CPU memory for fast async transfer
+    auto opts_float_cpu = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(pin_memory);
+    auto opts_long_cpu = torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU).pinned_memory(pin_memory);
+    auto opts_bool_cpu = torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU).pinned_memory(pin_memory);
 
-    auto policy_indices = torch::empty({batch_size}, torch::TensorOptions().dtype(torch::kLong).device(torch::kCUDA));
+    auto obs_sequence_cpu = torch::zeros({batch_size, target_seq_len, obs_dim}, opts_float_cpu);
+    auto action_sequence_cpu = torch::zeros({batch_size, target_seq_len}, opts_long_cpu);
+    auto agent_types_cpu = torch::zeros({batch_size, target_seq_len}, opts_long_cpu);
+    auto positions_cpu = torch::zeros({batch_size, target_seq_len}, opts_long_cpu);
+    auto padding_mask_cpu = torch::ones({batch_size, target_seq_len}, opts_bool_cpu);
+    auto policy_indices_cpu = torch::empty({batch_size}, opts_long_cpu);
+    auto valid_lengths_cpu = torch::empty({batch_size}, opts_long_cpu);
 
-    // Fill tensors from requests
+    // Fill pinned CPU tensors
     for (int64_t i = 0; i < batch_size; ++i) {
         const auto& [policy_id, request_idx, req_ptr] = requests[i];
         const auto& req = *req_ptr;
 
-        // Get policy index from mapping
         auto it = policy_id_to_index_.find(policy_id);
         if (it == policy_id_to_index_.end()) {
-            throw std::runtime_error("Policy ID " + std::to_string(policy_id) + " not found in policy_id_to_index mapping");
+            throw std::runtime_error("Policy ID " + std::to_string(policy_id) + " not found");
         }
-        policy_indices[i] = it->second;
+        policy_indices_cpu[i] = it->second;
 
-        const int64_t seq_len = req.valid_len;
+        const int64_t seq_len = std::max<int64_t>(1, req.valid_len);
+        valid_lengths_cpu[i] = seq_len;
+        
+        padding_mask_cpu[i].slice(0, 0, seq_len).fill_(false);
 
-        // Copy observation sequence from std::vector<float>
-        if (!req.obs_sequence.empty() && seq_len > 0) {
-            // obs_sequence is [valid_len * obs_dim] flattened
-            auto obs_tensor = torch::from_blob(
-                const_cast<float*>(req.obs_sequence.data()),
-                {seq_len, obs_dim},
-                torch::TensorOptions().dtype(torch::kFloat32)
-            ).to(torch::kFloat16).to(torch::kCUDA);
-            obs_sequence[i].narrow(0, 0, seq_len) = obs_tensor;
-        }
-
-        // Copy action sequence from std::vector<int64_t> (no factorization - forward_packed handles that)
-        if (!req.action_sequence.empty() && seq_len > 0) {
-            auto action_tensor = torch::from_blob(
-                const_cast<int64_t*>(req.action_sequence.data()),
-                {seq_len},
-                torch::TensorOptions().dtype(torch::kLong)
-            ).to(torch::kCUDA);
-
-            action_sequence[i].narrow(0, 0, seq_len).copy_(action_tensor);
-        }
-
-        // Copy agent types
-        if (!req.agent_type_sequence.empty() && seq_len > 0) {
-            auto agent_type_tensor = torch::from_blob(
-                const_cast<int64_t*>(req.agent_type_sequence.data()),
-                {seq_len},
-                torch::TensorOptions().dtype(torch::kLong)
-            ).to(torch::kFloat16).to(torch::kCUDA);
-            agent_types[i].narrow(0, 0, seq_len) = agent_type_tensor;
-        }
-
-        // Copy positions
-        if (!req.position_sequence.empty() && seq_len > 0) {
-            auto position_tensor = torch::from_blob(
-                const_cast<int64_t*>(req.position_sequence.data()),
-                {seq_len},
-                torch::TensorOptions().dtype(torch::kLong)
-            ).to(torch::kFloat16).to(torch::kCUDA);
-            positions[i].narrow(0, 0, seq_len) = position_tensor;
-        }
-
-        // Set padding mask (False for valid positions, True for padding)
-        if (seq_len < target_seq_len) {
-            padding_mask[i].narrow(0, 0, seq_len).fill_(false);
-            // Positions [seq_len, target_seq_len) remain True (padding)
-        } else {
-            padding_mask[i].fill_(false);
+        if (req.valid_len > 0) {
+            if (!req.obs_sequence.empty())
+                memcpy(obs_sequence_cpu[i].data_ptr<float>(), req.obs_sequence.data(), seq_len * obs_dim * sizeof(float));
+            if (!req.action_sequence.empty())
+                memcpy(action_sequence_cpu[i].data_ptr<int64_t>(), req.action_sequence.data(), seq_len * sizeof(int64_t));
+            if (!req.agent_type_sequence.empty())
+                memcpy(agent_types_cpu[i].data_ptr<int64_t>(), req.agent_type_sequence.data(), seq_len * sizeof(int64_t));
+            if (!req.position_sequence.empty())
+                memcpy(positions_cpu[i].data_ptr<int64_t>(), req.position_sequence.data(), seq_len * sizeof(int64_t));
         }
     }
+
+    // Async transfer to GPU and convert to FP16
+    const auto device = torch::kCUDA;
+    auto obs_sequence = obs_sequence_cpu.to(device, torch::kFloat16, true, true);
+    auto action_sequence = action_sequence_cpu.to(device, true, true);
+    auto agent_types = agent_types_cpu.to(device, true, true);
+    auto positions = positions_cpu.to(device, true, true);
+    auto padding_mask = padding_mask_cpu.to(device, true, true);
+    auto policy_indices = policy_indices_cpu.to(device, true, true);
+    auto valid_lengths = valid_lengths_cpu.to(device, true, true);
 
     return std::make_tuple(
         obs_sequence,
@@ -217,7 +190,8 @@ NeuralInferenceOrchestrator::prepare_batch_tensors(
         agent_types,
         positions,
         padding_mask,
-        policy_indices
+        policy_indices,
+        valid_lengths
     );
 }
 
@@ -293,102 +267,56 @@ std::unordered_map<std::pair<int, int>, InferenceResult, pair_hash>
 NeuralInferenceOrchestrator::run_inference(
     const std::unordered_map<int, std::vector<PolicyRequest>>& requests_by_policy
 ) {
-    // Result map
     std::unordered_map<std::pair<int, int>, InferenceResult, pair_hash> results;
+    if (requests_by_policy.empty()) return results;
 
-    // Early exit if no requests
-    if (requests_by_policy.empty()) {
-        return results;
-    }
-
-    // Find maximum sequence length across all requests
     int64_t max_seq_len = find_max_sequence_length(requests_by_policy);
-    if (max_seq_len <= 0) {
-        throw std::runtime_error("Invalid maximum sequence length: " + std::to_string(max_seq_len));
-    }
 
-    // Flatten all requests into a single vector with (policy_id, request_index, request_ptr)
     std::vector<std::tuple<int, int, const PolicyRequest*>> all_requests;
     for (const auto& kv : requests_by_policy) {
-        int policy_id = kv.first;
-        const auto& requests = kv.second;
-        for (size_t i = 0; i < requests.size(); ++i) {
-            all_requests.emplace_back(policy_id, static_cast<int>(i), &requests[i]);
+        for (size_t i = 0; i < kv.second.size(); ++i) {
+            all_requests.emplace_back(kv.first, static_cast<int>(i), &kv.second[i]);
         }
     }
 
-    // Process requests in batches
     const int64_t total_requests = static_cast<int64_t>(all_requests.size());
     for (int64_t batch_start = 0; batch_start < total_requests; batch_start += max_inference_batch_size_) {
         const int64_t batch_end = std::min(batch_start + max_inference_batch_size_, total_requests);
         const int64_t actual_batch_size = batch_end - batch_start;
 
-        // Extract batch slice
         std::vector<std::tuple<int, int, const PolicyRequest*>> batch_requests(
-            all_requests.begin() + batch_start,
-            all_requests.begin() + batch_end
-        );
+            all_requests.begin() + batch_start, all_requests.begin() + batch_end);
 
-        // Prepare tensors for this batch
-        auto [obs_seq, action_seq, agent_types, positions, padding_mask, policy_indices] =
+        auto [obs_seq, action_seq, agent_types, positions, padding_mask, policy_indices, valid_lengths] =
             prepare_batch_tensors(batch_requests, max_seq_len);
 
-        // Run forward_packed with timing
         std::unordered_map<std::string, std::chrono::microseconds> batch_timers;
         auto [action_logits, opp_logits, state_values, win_logits] = lb::forward::forward_packed(
-            obs_seq,
-            action_seq,
-            agent_types,
-            positions,
-            batched_weights_,
-            policy_indices,
-            padding_mask,
-            num_layers_,
-            num_heads_,
-            hidden_dim_,
-            num_experts_,
-            top_k_,
-            /*count_pad=*/4,
-            /*tflag_pad=*/3,
-            /*timers=*/&batch_timers,
-            moe_workspaces_.empty() ? nullptr : moe_workspaces_.data()
-        );
+            obs_seq, action_seq, agent_types, positions,
+            batched_weights_, policy_indices, padding_mask,
+            num_layers_, num_heads_, hidden_dim_, num_experts_, top_k_,
+            4, 3, &batch_timers, moe_workspaces_.data());
 
-        // Accumulate timing stats
         for (const auto& kv : batch_timers) {
             timing_stats_[kv.first] += kv.second;
         }
 
-        // Process results for each request in the batch
+        auto last_indices = (valid_lengths - 1).clamp_min(0);
+        auto batch_indices = torch::arange(actual_batch_size, policy_indices.options());
+        auto last_action_logits = action_logits.index({batch_indices, last_indices});
+        auto last_state_values = state_values.index({batch_indices, last_indices});
+        auto last_opp_logits = opp_logits.index({batch_indices, last_indices});
+
         for (int64_t i = 0; i < actual_batch_size; ++i) {
             const auto& [policy_id, request_idx, req_ptr] = batch_requests[i];
-            const auto& req = *req_ptr;
-
-            // Extract logits for the last timestep
-            const int64_t last_pos = req.valid_len - 1;
-            auto logits_at_last_pos = action_logits[i][last_pos];  // [7]
-
-            // Sample action
+            
             float log_prob;
-            uint8_t action = sample_action(logits_at_last_pos, req.mask, log_prob);
+            uint8_t action = sample_action(last_action_logits[i], req_ptr->mask, log_prob);
+            float value = last_state_values[i].item<float>();
 
-            // Extract value
-            float value = state_values[i][last_pos].item<float>();
-
-            // Extract opponent logits
-            auto opp_logits_at_last_pos = opp_logits[i][last_pos];  // [7]
-
-            // Store result
-            InferenceResult result;
-            result.action = action;
-            result.log_prob = log_prob;
-            result.state_value = value;
-            result.opp_logits = opp_logits_at_last_pos.to(torch::kCPU);
-
-            results[{policy_id, request_idx}] = std::move(result);
+            results[{policy_id, request_idx}] = {action, log_prob, value, last_opp_logits[i].to(torch::kCPU)};
         }
     }
-
     return results;
 }
 

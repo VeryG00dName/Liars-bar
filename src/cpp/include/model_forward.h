@@ -43,7 +43,7 @@ forward_packed(
     int64_t count_pad = 4,
     int64_t tflag_pad = 3,
     std::unordered_map<std::string, std::chrono::microseconds>* timers = nullptr,
-    const lb::moe::MoEWorkspace* moe_workspaces = nullptr  // Optional per-layer workspaces (array of size num_layers)
+    lb::moe::MoEWorkspace* moe_workspaces = nullptr  // Optional per-layer workspaces
 );
 
 /**

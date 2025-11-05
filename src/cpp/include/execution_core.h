@@ -6,8 +6,8 @@
 #include <cstdint>
 #include <chrono>
 
-#include "vec_arena.h"  // For PolicyRequest
-#include "moe_cutlass_kernels.h"  // For MoEWorkspace
+#include "vec_arena.h"
+#include "moe_cutlass_kernels.h"
 
 namespace execution_core {
 
@@ -43,18 +43,6 @@ struct InferenceResult {
  */
 class NeuralInferenceOrchestrator {
 public:
-    /**
-     * Constructor.
-     *
-     * @param batched_weights Model weights in batched format [W, ...]
-     * @param policy_id_to_index Mapping from policy_id to weight cache index
-     * @param max_inference_batch_size Maximum batch size for inference
-     * @param num_layers Number of transformer layers
-     * @param num_heads Number of attention heads
-     * @param hidden_dim Hidden dimension size
-     * @param num_experts Number of MoE experts
-     * @param top_k Number of experts to use per token
-     */
     NeuralInferenceOrchestrator(
         const c10::Dict<std::string, torch::Tensor>& batched_weights,
         const std::unordered_map<int, int>& policy_id_to_index,
@@ -69,28 +57,11 @@ public:
 
     ~NeuralInferenceOrchestrator();
 
-    /**
-     * Run batched inference for all neural network requests.
-     *
-     * This is the core method that implements the "Maximal Batching Efficiency" strategy:
-     * - Finds the true maximum sequence length across all requests
-     * - Pads all tensors to this exact length (no bucketing/rounding)
-     * - Splits requests into batches of max_inference_batch_size
-     * - Executes forward_packed for each batch
-     * - Returns results keyed by (policy_id, request_index)
-     *
-     * @param requests_by_policy Map of policy_id -> vector of PolicyRequest
-     * @return Map of (policy_id, request_index) -> InferenceResult
-     */
     std::unordered_map<std::pair<int, int>, InferenceResult, pair_hash>
     run_inference(
         const std::unordered_map<int, std::vector<PolicyRequest>>& requests_by_policy
     );
 
-    /**
-     * Get accumulated timing statistics from forward passes.
-     * Returns a map of operation name -> total microseconds.
-     */
     std::unordered_map<std::string, int64_t> get_timing_stats() const {
         std::unordered_map<std::string, int64_t> result;
         for (const auto& kv : timing_stats_) {
@@ -99,19 +70,13 @@ public:
         return result;
     }
 
-    /**
-     * Reset timing statistics.
-     */
     void reset_timing_stats() {
         timing_stats_.clear();
     }
 
 private:
-    // Model weights and configuration
     c10::Dict<std::string, torch::Tensor> batched_weights_;
     std::unordered_map<int, int> policy_id_to_index_;
-
-    // Inference configuration
     int64_t max_inference_batch_size_;
     int64_t num_layers_;
     int64_t num_heads_;
@@ -119,50 +84,27 @@ private:
     int64_t num_experts_;
     int64_t top_k_;
     bool use_argmax_ = false;
-
-    // Pre-allocated workspace for CUTLASS kernels (per-layer)
-    // Allocated once in constructor, reused for all forward passes
     std::vector<lb::moe::MoEWorkspace> moe_workspaces_;
-
-    // Timing statistics (accumulated across all inference calls)
     mutable std::unordered_map<std::string, std::chrono::microseconds> timing_stats_;
 
-    /**
-     * Find the maximum sequence length across all requests.
-     */
     int64_t find_max_sequence_length(
         const std::unordered_map<int, std::vector<PolicyRequest>>& requests_by_policy
     ) const;
 
-    /**
-     * Prepare batched tensors for a subset of requests.
-     * All tensors will be padded to target_seq_len.
-     *
-     * @param requests Flat list of (policy_id, request_index, request_ptr)
-     * @param target_seq_len Sequence length to pad to
-     * @return Tuple of (obs_seq, action_seq, agent_types, positions, padding_mask, policy_indices)
-     */
     std::tuple<
-        torch::Tensor,  // obs_sequence [B, T, obs_dim]
-        torch::Tensor,  // action_sequence [B, T, 3]
-        torch::Tensor,  // agent_types [B, T]
-        torch::Tensor,  // positions [B, T]
-        torch::Tensor,  // padding_mask [B, T]
-        torch::Tensor   // policy_indices [B]
+        torch::Tensor,  // obs_sequence
+        torch::Tensor,  // action_sequence
+        torch::Tensor,  // agent_types
+        torch::Tensor,  // positions
+        torch::Tensor,  // padding_mask
+        torch::Tensor,  // policy_indices
+        torch::Tensor   // valid_lengths
     >
     prepare_batch_tensors(
         const std::vector<std::tuple<int, int, const PolicyRequest*>>& requests,
         int64_t target_seq_len
     ) const;
 
-    /**
-     * Sample action from logits using the action mask.
-     *
-     * @param logits Action logits [7]
-     * @param mask Valid action mask [7]
-     * @param log_prob Output log probability
-     * @return Sampled action index
-     */
     uint8_t sample_action(
         const torch::Tensor& logits,
         const std::array<uint8_t, 7>& mask,
