@@ -129,6 +129,8 @@ public:
                     const std::unordered_map<std::string, torch::Tensor>& state_dict,
                     const std::string& original_path = "");
     void finalize_model_loading();
+    void update_training_model_weights(int policy_id,
+                                      const std::unordered_map<std::string, torch::Tensor>& state_dict);
     void register_cpp_bot(int policy_id, const std::string& bot_name);
 
     PreparedBatch prepare_training_batch(const std::vector<PolicyRequest>& requests,

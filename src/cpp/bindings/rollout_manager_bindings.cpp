@@ -197,6 +197,19 @@ void bind_rollout_manager(py::module_& m) {
             py::arg("state_dict"),
             py::arg("path") = "")
         .def("finalize_model_loading", &RolloutManager::finalize_model_loading)
+        .def("update_training_model_weights",
+             [](RolloutManager& self, int policy_id, const py::dict& state_dict_py) {
+                 std::unordered_map<std::string, torch::Tensor> state_dict;
+                 for (auto item : state_dict_py) {
+                     std::string key = py::cast<std::string>(item.first);
+                     torch::Tensor value = py::cast<torch::Tensor>(item.second);
+                     state_dict[key] = value;
+                 }
+                 self.update_training_model_weights(policy_id, state_dict);
+             },
+             py::arg("policy_id"),
+             py::arg("state_dict"),
+             "Update weights for a training model without rebuilding the orchestrator")
         .def("register_cpp_bot",
              [](RolloutManager& self, int policy_id, const std::string& name) {
                  self.register_cpp_bot(policy_id, name);

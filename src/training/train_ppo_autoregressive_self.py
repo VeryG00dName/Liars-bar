@@ -933,9 +933,8 @@ def train_generation(
             # After gradient updates, we need to reload the training policy into C++ orchestrator
             try:
                 updated_state_dict = learner.model.state_dict()
-                # C++ will prestack expert weights during finalize_model_loading()
-                rollout_manager.cpp_manager.load_model(training_policy_id, updated_state_dict, "")
-                rollout_manager.cpp_manager.finalize_model_loading()
+                # Use the new update method that only updates this policy's weights without rebuilding
+                rollout_manager.cpp_manager.update_training_model_weights(training_policy_id, updated_state_dict)
             except Exception as exc:
                 logging.exception(f"Failed to sync training policy weights to C++ after update {update}: {exc}")
 

@@ -787,6 +787,97 @@ void RolloutManager::finalize_model_loading() {
     weights_finalized_ = true;
 }
 
+void RolloutManager::update_training_model_weights(
+    int policy_id,
+    const std::unordered_map<std::string, torch::Tensor>& state_dict) {
+
+    torch::NoGradGuard guard;
+
+    if (!weights_finalized_) {
+        throw std::runtime_error(
+            "Cannot update training model weights before finalize_model_loading() has been called");
+    }
+
+    auto cache_idx_it = policy_id_to_cache_index_.find(policy_id);
+    if (cache_idx_it == policy_id_to_cache_index_.end()) {
+        throw std::runtime_error(
+            "Policy ID " + std::to_string(policy_id) + " not found in batched cache. "
+            "Cannot update weights for unloaded policy.");
+    }
+    int batch_idx = cache_idx_it->second;
+
+    // 1. Make a mutable copy of the state_dict for preprocessing
+    std::unordered_map<std::string, torch::Tensor> preprocessed_dict = state_dict;
+
+    // 2. Prestack MoE expert weights (same as finalize does)
+    prestack_moe_expert_weights(preprocessed_dict, num_layers_, num_experts_);
+
+    // 3. Update each weight in the batched cache
+    //    For each key, we replace the slice at index batch_idx
+    for (const auto& kv : preprocessed_dict) {
+        const std::string& key = kv.first;
+        torch::Tensor new_weight_cpu = kv.second;
+
+        // Skip fixed shared buffers (LUTs) - they're not batched per-policy
+        if (key == "lut_act_kind" || key == "lut_count" || key == "lut_table_flag") {
+            continue;
+        }
+
+        // Convert to GPU FP16 (matching the format in batched_weight_cache_)
+        torch::Tensor new_weight_gpu_fp16 = new_weight_cpu
+            .to(kInferenceDevice, /*non_blocking=*/true, /*copy=*/true)
+            .to(torch::kFloat16)
+            .contiguous();
+
+        // Find the corresponding batched tensor in the cache
+        if (!batched_weight_cache_.contains(key)) {
+            // Skip keys that don't exist in cache (e.g., optimizer states)
+            continue;
+        }
+
+        torch::Tensor batched_tensor = batched_weight_cache_.at(key);
+
+        // Replace the slice at batch_idx
+        // batched_tensor shape: [num_policies, ...]
+        // We want to update batched_tensor[batch_idx] = new_weight_gpu_fp16
+        // Use select + copy_ for proper in-place update
+        try {
+            auto selected_slice = batched_tensor.select(0, batch_idx);
+
+            // Validate shapes match before copying
+            if (selected_slice.sizes() != new_weight_gpu_fp16.sizes()) {
+                std::cerr << "[RolloutManager] Shape mismatch for key '" << key << "':\n"
+                         << "  Batched tensor shape: " << batched_tensor.sizes() << "\n"
+                         << "  Selected slice shape: " << selected_slice.sizes() << "\n"
+                         << "  New weight shape: " << new_weight_gpu_fp16.sizes() << "\n"
+                         << "  batch_idx: " << batch_idx << std::endl;
+                throw std::runtime_error(
+                    "Shape mismatch for key '" + key + "': selected slice has shape " +
+                    c10::str(selected_slice.sizes()) + " but new weight has shape " +
+                    c10::str(new_weight_gpu_fp16.sizes()));
+            }
+
+            selected_slice.copy_(new_weight_gpu_fp16);
+        } catch (const std::exception& e) {
+            std::cerr << "[RolloutManager] Error updating weight '" << key << "': " << e.what() << std::endl;
+            throw;
+        }
+    }
+
+    // 4. Re-process attention weights for this policy's slice
+    //    The process_and_split_attention_weights function operates on the entire batch,
+    //    but since we only changed one policy, we need to re-split just that policy's QKV.
+    //    For simplicity, we can re-run the full split (it's idempotent and fast).
+    process_and_split_attention_weights(batched_weight_cache_);
+
+    // 5. Re-create MoE expert pointer tables
+    //    Same reasoning: the function is fast and idempotent.
+    create_moe_weight_pointers(batched_weight_cache_, num_layers_, num_experts_);
+
+    // Note: We do NOT reset the orchestrator. It continues using the updated
+    // batched_weight_cache_ directly (the cache is passed by reference/pointer).
+}
+
 void RolloutManager::register_cpp_bot(int policy_id, const std::string& bot_name) {
     try {
         CppBotKind kind = parse_cpp_bot_kind(bot_name);
