@@ -52,16 +52,6 @@ static inline int lb_env_int(const char* name, int default_value) {
     return static_cast<int>(parsed);
 }
 
-static bool LB_MOE_LOG_GEMM() {
-    static const int value = lb_env_int("LB_MOE_LOG_GEMM", 0);
-    return value != 0;
-}
-
-static bool LB_MOE_LOG_CUTLASS() {
-    static const bool flag = lb_env_enabled("LB_MOE_LOG_CUTLASS");
-    return flag;
-}
-
 // Helper macro for CUTLASS error checking
 #define CUTLASS_CHECK(status)                                                           \
     {\
@@ -86,10 +76,12 @@ static bool LB_MOE_LOG_CUTLASS() {
         }                                                                               \
     }
 
-// ============================================================================ 
+    
+// ============================================================================
 // CUTLASS Type Definitions
-// ============================================================================ 
+// ============================================================================
 
+// FP16 input/output, FP32 accumulation
 using ElementA = cutlass::half_t;
 using ElementB = cutlass::half_t;
 using ElementOutput = cutlass::half_t;
@@ -97,40 +89,43 @@ using ElementAccumulator = float;
 using ElementCompute = float;
 
 // Layouts
-using LayoutA = cutlass::layout::RowMajor;
-using LayoutB = cutlass::layout::ColumnMajor;
-using LayoutC = cutlass::layout::RowMajor;
+using LayoutA = cutlass::layout::RowMajor;  // Input tokens
+using LayoutB = cutlass::layout::ColumnMajor;  // Weights (transposed)
+using LayoutC = cutlass::layout::RowMajor;  // Output/Bias
 
-// MMA configuration for Ampere (sm_86 for RTX 30xx)
+// MMA configuration for Ampere (sm_80)
 using MMAOp = cutlass::arch::OpClassTensorOp;
-using SmArch = cutlass::arch::Sm80; // Updated for RTX 3080
-
-// Let CUTLASS auto-select optimal shapes for Sm86
-using ThreadblockShape = cutlass::gemm::GemmShape<128, 128, 64>;
-using WarpShape = cutlass::gemm::GemmShape<64, 64, 64>;
+using SmArch = cutlass::arch::Sm80;
+using ThreadblockShape = cutlass::gemm::GemmShape<128, 128, 32>;
+using WarpShape = cutlass::gemm::GemmShape<64, 64, 32>;
 using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
 
-// Swizzle for better load balancing with irregular group sizes
+// Swizzle
 using ThreadblockSwizzle = cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle;
 
 // Stages
-constexpr int Stages = 2; // Optimal for 2-stage double-buffered pipeline
+constexpr int Stages = 4;
 
-// ============================================================================ 
+// ============================================================================
 // W1 GEMM: Epilogue with Bias + GELU
-// ============================================================================ 
+// ============================================================================
+
+// W1 Epilogue: D = GELU(alpha * AB + beta * C)
+// Use erf-based GELU (CUTLASS default)
+// We set alpha=1, beta=1, and pass bias as C with stride to broadcast per-column
 using EpilogueOpW1 = cutlass::epilogue::thread::LinearCombinationGELU<
     ElementOutput,
-    128 / cutlass::sizeof_bits<ElementOutput>::value,
+    128 / cutlass::sizeof_bits<ElementOutput>::value,  // Elements per vector access
     ElementAccumulator,
     ElementCompute,
-    cutlass::epilogue::thread::ScaleType::Default
+    cutlass::epilogue::thread::ScaleType::Default  // Use both alpha and beta
 >;
 
+// W1 Grouped GEMM Kernel
 using GemmKernelW1 = typename cutlass::gemm::kernel::DefaultGemmGrouped<
-    ElementA, LayoutA, cutlass::ComplexTransform::kNone, 8,
-    ElementB, LayoutB, cutlass::ComplexTransform::kNone, 8,
-    ElementOutput, LayoutC,
+    ElementA, LayoutA, cutlass::ComplexTransform::kNone, 8,  // A
+    ElementB, LayoutB, cutlass::ComplexTransform::kNone, 8,  // B
+    ElementOutput, LayoutC,  // C/D
     ElementAccumulator,
     MMAOp, SmArch,
     ThreadblockShape, WarpShape, InstructionShape,
@@ -141,9 +136,11 @@ using GemmKernelW1 = typename cutlass::gemm::kernel::DefaultGemmGrouped<
 
 using GroupedGemmW1 = cutlass::gemm::device::GemmGrouped<GemmKernelW1>;
 
-// ============================================================================ 
-// W2 GEMM: Standard Epilogue
-// ============================================================================ 
+// ============================================================================
+// W2 GEMM: Standard Epilogue (bias + routing weights done separately for now)
+// ============================================================================
+
+// W2 Epilogue: Standard linear combination
 using EpilogueOpW2 = cutlass::epilogue::thread::LinearCombination<
     ElementOutput,
     128 / cutlass::sizeof_bits<ElementOutput>::value,
@@ -151,10 +148,11 @@ using EpilogueOpW2 = cutlass::epilogue::thread::LinearCombination<
     ElementCompute
 >;
 
+// W2 Grouped GEMM Kernel
 using GemmKernelW2 = typename cutlass::gemm::kernel::DefaultGemmGrouped<
-    ElementA, LayoutA, cutlass::ComplexTransform::kNone, 8,
-    ElementB, LayoutB, cutlass::ComplexTransform::kNone, 8,
-    ElementOutput, LayoutC,
+    ElementA, LayoutA, cutlass::ComplexTransform::kNone, 8,  // A
+    ElementB, LayoutB, cutlass::ComplexTransform::kNone, 8,  // B
+    ElementOutput, LayoutC,  // C/D
     ElementAccumulator,
     MMAOp, SmArch,
     ThreadblockShape, WarpShape, InstructionShape,
@@ -165,10 +163,58 @@ using GemmKernelW2 = typename cutlass::gemm::kernel::DefaultGemmGrouped<
 
 using GroupedGemmW2 = cutlass::gemm::device::GemmGrouped<GemmKernelW2>;
 
-// ============================================================================ 
-// Helper Kernels
-// ============================================================================ 
+// Host-pinned descriptor buffers (moved inside namespace)
+// (Old copies removed; now defined within reopened namespace above)
+static void ensure_host_pinned_capacity_w1(MoEWorkspace* ws, size_t n) {
+    if (!ws) return;
+    if (ws->host_descriptor_capacity_w1 >= n) return;
+    // Free existing
+    if (ws->host_problem_sizes_w1) cudaFreeHost(ws->host_problem_sizes_w1);
+    if (ws->host_ptr_A_w1) cudaFreeHost(ws->host_ptr_A_w1);
+    if (ws->host_ptr_B_w1) cudaFreeHost(ws->host_ptr_B_w1);
+    if (ws->host_ptr_C_w1) cudaFreeHost(ws->host_ptr_C_w1);
+    if (ws->host_ptr_D_w1) cudaFreeHost(ws->host_ptr_D_w1);
+    if (ws->host_lda_w1) cudaFreeHost(ws->host_lda_w1);
+    if (ws->host_ldb_w1) cudaFreeHost(ws->host_ldb_w1);
+    if (ws->host_ldc_w1) cudaFreeHost(ws->host_ldc_w1);
+    if (ws->host_ldd_w1) cudaFreeHost(ws->host_ldd_w1);
 
+    CUDA_CHECK(cudaHostAlloc(&ws->host_problem_sizes_w1, n * sizeof(cutlass::gemm::GemmCoord), cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc(&ws->host_ptr_A_w1, n * sizeof(ElementA*), cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc(&ws->host_ptr_B_w1, n * sizeof(ElementB*), cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc(&ws->host_ptr_C_w1, n * sizeof(ElementOutput*), cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc(&ws->host_ptr_D_w1, n * sizeof(ElementOutput*), cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc(&ws->host_lda_w1, n * sizeof(int64_t), cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc(&ws->host_ldb_w1, n * sizeof(int64_t), cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc(&ws->host_ldc_w1, n * sizeof(int64_t), cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc(&ws->host_ldd_w1, n * sizeof(int64_t), cudaHostAllocDefault));
+    ws->host_descriptor_capacity_w1 = n;
+}
+
+static void ensure_host_pinned_capacity_w2(MoEWorkspace* ws, size_t n) {
+    if (!ws) return;
+    if (ws->host_descriptor_capacity_w2 >= n) return;
+    if (ws->host_problem_sizes_w2) cudaFreeHost(ws->host_problem_sizes_w2);
+    if (ws->host_ptr_A_w2) cudaFreeHost(ws->host_ptr_A_w2);
+    if (ws->host_ptr_B_w2) cudaFreeHost(ws->host_ptr_B_w2);
+    if (ws->host_ptr_C_w2) cudaFreeHost(ws->host_ptr_C_w2);
+    if (ws->host_ptr_D_w2) cudaFreeHost(ws->host_ptr_D_w2);
+    if (ws->host_lda_w2) cudaFreeHost(ws->host_lda_w2);
+    if (ws->host_ldb_w2) cudaFreeHost(ws->host_ldb_w2);
+    if (ws->host_ldc_w2) cudaFreeHost(ws->host_ldc_w2);
+    if (ws->host_ldd_w2) cudaFreeHost(ws->host_ldd_w2);
+
+    CUDA_CHECK(cudaHostAlloc(&ws->host_problem_sizes_w2, n * sizeof(cutlass::gemm::GemmCoord), cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc(&ws->host_ptr_A_w2, n * sizeof(ElementA*), cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc(&ws->host_ptr_B_w2, n * sizeof(ElementB*), cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc(&ws->host_ptr_C_w2, n * sizeof(ElementOutput*), cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc(&ws->host_ptr_D_w2, n * sizeof(ElementOutput*), cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc(&ws->host_lda_w2, n * sizeof(int64_t), cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc(&ws->host_ldb_w2, n * sizeof(int64_t), cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc(&ws->host_ldc_w2, n * sizeof(int64_t), cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc(&ws->host_ldd_w2, n * sizeof(int64_t), cudaHostAllocDefault));
+    ws->host_descriptor_capacity_w2 = n;
+}
 __global__ void compute_hidden_offsets(const int64_t* __restrict__ m_sizes,
                                        int64_t G, int64_t N,
                                        int64_t* __restrict__ offsets) {
@@ -268,28 +314,23 @@ __global__ void fused_bias_routing_groups_kernel(
     int g = blockIdx.y;
     if (g >= G) return;
     int64_t M = m_sizes[g];
-    if (M == 0) return;
-
     int64_t off = token_offsets[g];
     int64_t pi = policy_ids[g];
     int64_t ei = expert_ids[g];
     const T* __restrict__ bias = reinterpret_cast<const T*>(b2_tbl[pi * E + ei]);
 
-    int64_t row_start = blockIdx.x * blockDim.x;
-    for (int64_t row = row_start + threadIdx.x; row < M; row += gridDim.x * blockDim.x) {
+    int64_t total = M * H;
+    int idx = threadIdx.x;
+    for (; idx < total; idx += blockDim.x) {
+        int64_t row = idx / H;
+        int64_t col = idx % H;
         T* data_row = out_base + (off + row) * H;
+        float val = float(data_row[col]) + float(bias[col]);
         float rw = routing_base[off + row];
-        #pragma unroll
-        for (int64_t col = 0; col < H; ++col) {
-            float val = float(data_row[col]) + float(bias[col]);
-            data_row[col] = T(val * rw);
-        }
+        data_row[col] = T(val * rw);
     }
 }
 
-// ============================================================================ 
-// Main Implementation
-// ============================================================================ 
 void cutlass_grouped_moe_forward(
     uintptr_t input_base,
     uintptr_t hidden_base,
@@ -312,29 +353,78 @@ void cutlass_grouped_moe_forward(
 
     if (group_count == 0) return;
 
-    // Prepare device descriptor buffers
-    cutlass::gemm::GemmCoord* problem_sizes_device_w1 = reinterpret_cast<cutlass::gemm::GemmCoord*>(workspace->problem_sizes_device_w1);
-    ElementA** ptr_A_device_w1 = reinterpret_cast<ElementA**>(workspace->ptr_A_device_w1);
-    ElementB** ptr_B_device_w1 = reinterpret_cast<ElementB**>(workspace->ptr_B_device_w1);
-    ElementOutput** ptr_C_device_w1 = reinterpret_cast<ElementOutput**>(workspace->ptr_C_device_w1);
-    ElementOutput** ptr_D_device_w1 = reinterpret_cast<ElementOutput**>(workspace->ptr_D_device_w1);
-    int64_t* lda_device_w1 = reinterpret_cast<int64_t*>(workspace->lda_device_w1);
-    int64_t* ldb_device_w1 = reinterpret_cast<int64_t*>(workspace->ldb_device_w1);
-    int64_t* ldc_device_w1 = reinterpret_cast<int64_t*>(workspace->ldc_device_w1);
-    int64_t* ldd_device_w1 = reinterpret_cast<int64_t*>(workspace->ldd_device_w1);
+    // Prepare device descriptor buffers (use workspace if available, else allocate temporary)
+    cutlass::gemm::GemmCoord* problem_sizes_device_w1 = nullptr;
+    ElementA** ptr_A_device_w1 = nullptr;
+    ElementB** ptr_B_device_w1 = nullptr;
+    ElementOutput** ptr_C_device_w1 = nullptr;
+    ElementOutput** ptr_D_device_w1 = nullptr;
+    int64_t* lda_device_w1 = nullptr;
+    int64_t* ldb_device_w1 = nullptr;
+    int64_t* ldc_device_w1 = nullptr;
+    int64_t* ldd_device_w1 = nullptr;
 
-    cutlass::gemm::GemmCoord* problem_sizes_device_w2 = reinterpret_cast<cutlass::gemm::GemmCoord*>(workspace->problem_sizes_device_w2);
-    ElementA** ptr_A_device_w2 = reinterpret_cast<ElementA**>(workspace->ptr_A_device_w2);
-    ElementB** ptr_B_device_w2 = reinterpret_cast<ElementB**>(workspace->ptr_B_device_w2);
-    ElementOutput** ptr_C_device_w2 = reinterpret_cast<ElementOutput**>(workspace->ptr_C_device_w2);
-    ElementOutput** ptr_D_device_w2 = reinterpret_cast<ElementOutput**>(workspace->ptr_D_device_w2);
-    int64_t* lda_device_w2 = reinterpret_cast<int64_t*>(workspace->lda_device_w2);
-    int64_t* ldb_device_w2 = reinterpret_cast<int64_t*>(workspace->ldb_device_w2);
-    int64_t* ldc_device_w2 = reinterpret_cast<int64_t*>(workspace->ldc_device_w2);
-    int64_t* ldd_device_w2 = reinterpret_cast<int64_t*>(workspace->ldd_device_w2);
+    cutlass::gemm::GemmCoord* problem_sizes_device_w2 = nullptr;
+    ElementA** ptr_A_device_w2 = nullptr;
+    ElementB** ptr_B_device_w2 = nullptr;
+    ElementOutput** ptr_C_device_w2 = nullptr;
+    ElementOutput** ptr_D_device_w2 = nullptr;
+    int64_t* lda_device_w2 = nullptr;
+    int64_t* ldb_device_w2 = nullptr;
+    int64_t* ldc_device_w2 = nullptr;
+    int64_t* ldd_device_w2 = nullptr;
 
+    bool owns_desc_w1 = false, owns_desc_w2 = false;
+    if (workspace && workspace->descriptor_capacity_w1 >= static_cast<size_t>(group_count) &&
+        workspace->descriptor_capacity_w2 >= static_cast<size_t>(group_count)) {
+        problem_sizes_device_w1 = reinterpret_cast<cutlass::gemm::GemmCoord*>(workspace->problem_sizes_device_w1);
+        ptr_A_device_w1 = reinterpret_cast<ElementA**>(workspace->ptr_A_device_w1);
+        ptr_B_device_w1 = reinterpret_cast<ElementB**>(workspace->ptr_B_device_w1);
+        ptr_C_device_w1 = reinterpret_cast<ElementOutput**>(workspace->ptr_C_device_w1);
+        ptr_D_device_w1 = reinterpret_cast<ElementOutput**>(workspace->ptr_D_device_w1);
+        lda_device_w1 = reinterpret_cast<int64_t*>(workspace->lda_device_w1);
+        ldb_device_w1 = reinterpret_cast<int64_t*>(workspace->ldb_device_w1);
+        ldc_device_w1 = reinterpret_cast<int64_t*>(workspace->ldc_device_w1);
+        ldd_device_w1 = reinterpret_cast<int64_t*>(workspace->ldd_device_w1);
+
+        problem_sizes_device_w2 = reinterpret_cast<cutlass::gemm::GemmCoord*>(workspace->problem_sizes_device_w2);
+        ptr_A_device_w2 = reinterpret_cast<ElementA**>(workspace->ptr_A_device_w2);
+        ptr_B_device_w2 = reinterpret_cast<ElementB**>(workspace->ptr_B_device_w2);
+        ptr_C_device_w2 = reinterpret_cast<ElementOutput**>(workspace->ptr_C_device_w2);
+        ptr_D_device_w2 = reinterpret_cast<ElementOutput**>(workspace->ptr_D_device_w2);
+        lda_device_w2 = reinterpret_cast<int64_t*>(workspace->lda_device_w2);
+        ldb_device_w2 = reinterpret_cast<int64_t*>(workspace->ldb_device_w2);
+        ldc_device_w2 = reinterpret_cast<int64_t*>(workspace->ldc_device_w2);
+        ldd_device_w2 = reinterpret_cast<int64_t*>(workspace->ldd_device_w2);
+    } else {
+        // Allocate temporary descriptor buffers
+        CUDA_CHECK(cudaMalloc(&problem_sizes_device_w1, sizeof(cutlass::gemm::GemmCoord) * group_count));
+        CUDA_CHECK(cudaMalloc(&ptr_A_device_w1, sizeof(ElementA*) * group_count));
+        CUDA_CHECK(cudaMalloc(&ptr_B_device_w1, sizeof(ElementB*) * group_count));
+        CUDA_CHECK(cudaMalloc(&ptr_C_device_w1, sizeof(ElementOutput*) * group_count));
+        CUDA_CHECK(cudaMalloc(&ptr_D_device_w1, sizeof(ElementOutput*) * group_count));
+        CUDA_CHECK(cudaMalloc(&lda_device_w1, sizeof(int64_t) * group_count));
+        CUDA_CHECK(cudaMalloc(&ldb_device_w1, sizeof(int64_t) * group_count));
+        CUDA_CHECK(cudaMalloc(&ldc_device_w1, sizeof(int64_t) * group_count));
+        CUDA_CHECK(cudaMalloc(&ldd_device_w1, sizeof(int64_t) * group_count));
+        owns_desc_w1 = true;
+
+        CUDA_CHECK(cudaMalloc(&problem_sizes_device_w2, sizeof(cutlass::gemm::GemmCoord) * group_count));
+        CUDA_CHECK(cudaMalloc(&ptr_A_device_w2, sizeof(ElementA*) * group_count));
+        CUDA_CHECK(cudaMalloc(&ptr_B_device_w2, sizeof(ElementB*) * group_count));
+        CUDA_CHECK(cudaMalloc(&ptr_C_device_w2, sizeof(ElementOutput*) * group_count));
+        CUDA_CHECK(cudaMalloc(&ptr_D_device_w2, sizeof(ElementOutput*) * group_count));
+        CUDA_CHECK(cudaMalloc(&lda_device_w2, sizeof(int64_t) * group_count));
+        CUDA_CHECK(cudaMalloc(&ldb_device_w2, sizeof(int64_t) * group_count));
+        CUDA_CHECK(cudaMalloc(&ldc_device_w2, sizeof(int64_t) * group_count));
+        CUDA_CHECK(cudaMalloc(&ldd_device_w2, sizeof(int64_t) * group_count));
+        owns_desc_w2 = true;
+    }
+
+    // Allocate device offsets
     int64_t* hidden_offsets_dev = nullptr;
     CUDA_CHECK(cudaMalloc(&hidden_offsets_dev, sizeof(int64_t) * group_count));
+    // Compute exclusive offsets of hidden blocks
     compute_hidden_offsets<<<1,1>>>(m_sizes_dev, group_count, ffn_dim, hidden_offsets_dev);
 
     const int threads = 256;
@@ -347,19 +437,46 @@ void cutlass_grouped_moe_forward(
         input_base, hidden_base, hidden_offsets_dev,
         w1_ptrs_table, b1_ptrs_table, num_policies, num_experts,
         problem_sizes_device_w1,
-        ptr_A_device_w1, ptr_B_device_w1, ptr_C_device_w1, ptr_D_device_w1,
-        lda_device_w1, ldb_device_w1, ldc_device_w1, ldd_device_w1);
+        ptr_A_device_w1,
+        ptr_B_device_w1,
+        ptr_C_device_w1,
+        ptr_D_device_w1,
+        lda_device_w1,
+        ldb_device_w1,
+        ldc_device_w1,
+        ldd_device_w1);
 
     // Run W1 GEMM
     GroupedGemmW1 gemm_w1;
+    int threadblock_count_w1 = static_cast<int>(group_count);
     typename GroupedGemmW1::EpilogueOutputOp::Params epilogue_params_w1(1.0f, 1.0f);
     typename GroupedGemmW1::Arguments args_w1(
-        problem_sizes_device_w1, group_count, static_cast<int>(group_count), epilogue_params_w1,
-        ptr_A_device_w1, ptr_B_device_w1, ptr_C_device_w1, ptr_D_device_w1,
-        lda_device_w1, ldb_device_w1, ldc_device_w1, ldd_device_w1, nullptr);
+        problem_sizes_device_w1,
+        group_count,
+        threadblock_count_w1,
+        epilogue_params_w1,
+        ptr_A_device_w1,
+        ptr_B_device_w1,
+        ptr_C_device_w1,
+        ptr_D_device_w1,
+        lda_device_w1,
+        ldb_device_w1,
+        ldc_device_w1,
+        ldd_device_w1,
+        nullptr);
 
-    CUTLASS_CHECK(gemm_w1.initialize(args_w1, workspace->workspace_w1));
+    size_t workspace_size_w1 = gemm_w1.get_workspace_size(args_w1);
+    void* dev_workspace_w1 = nullptr;
+    bool owns_ws_w1 = false;
+    if (workspace && workspace->workspace_w1 && workspace->workspace_w1_size >= workspace_size_w1) {
+        dev_workspace_w1 = workspace->workspace_w1;
+    } else if (workspace_size_w1 > 0) {
+        CUDA_CHECK(cudaMalloc(&dev_workspace_w1, workspace_size_w1));
+        owns_ws_w1 = true;
+    }
+    CUTLASS_CHECK(gemm_w1.initialize(args_w1, dev_workspace_w1));
     CUTLASS_CHECK(gemm_w1.run());
+    if (owns_ws_w1 && dev_workspace_w1) cudaFree(dev_workspace_w1);
 
     // Build W2 descriptors on device
     build_w2_descriptors_kernel<<<blocks, threads>>>(
@@ -368,26 +485,51 @@ void cutlass_grouped_moe_forward(
         hidden_base, output_base, hidden_offsets_dev,
         w2_ptrs_table, num_policies, num_experts,
         problem_sizes_device_w2,
-        ptr_A_device_w2, ptr_B_device_w2, ptr_C_device_w2, ptr_D_device_w2,
-        lda_device_w2, ldb_device_w2, ldc_device_w2, ldd_device_w2);
+        ptr_A_device_w2,
+        ptr_B_device_w2,
+        ptr_C_device_w2,
+        ptr_D_device_w2,
+        lda_device_w2,
+        ldb_device_w2,
+        ldc_device_w2,
+        ldd_device_w2);
 
     // Run W2 GEMM
     GroupedGemmW2 gemm_w2;
+    int threadblock_count_w2 = static_cast<int>(group_count);
     typename GroupedGemmW2::EpilogueOutputOp::Params epilogue_params_w2(1.0f, 0.0f);
     typename GroupedGemmW2::Arguments args_w2(
-        problem_sizes_device_w2, group_count, static_cast<int>(group_count), epilogue_params_w2,
-        ptr_A_device_w2, ptr_B_device_w2, ptr_C_device_w2, ptr_D_device_w2,
-        lda_device_w2, ldb_device_w2, ldc_device_w2, ldd_device_w2, nullptr);
+        problem_sizes_device_w2,
+        group_count,
+        threadblock_count_w2,
+        epilogue_params_w2,
+        ptr_A_device_w2,
+        ptr_B_device_w2,
+        ptr_C_device_w2,
+        ptr_D_device_w2,
+        lda_device_w2,
+        ldb_device_w2,
+        ldc_device_w2,
+        ldd_device_w2,
+        nullptr);
 
-    CUTLASS_CHECK(gemm_w2.initialize(args_w2, workspace->workspace_w2));
+    size_t workspace_size_w2 = gemm_w2.get_workspace_size(args_w2);
+    void* dev_workspace_w2 = nullptr;
+    bool owns_ws_w2 = false;
+    if (workspace && workspace->workspace_w2 && workspace->workspace_w2_size >= workspace_size_w2) {
+        dev_workspace_w2 = workspace->workspace_w2;
+    } else if (workspace_size_w2 > 0) {
+        CUDA_CHECK(cudaMalloc(&dev_workspace_w2, workspace_size_w2));
+        owns_ws_w2 = true;
+    }
+    CUTLASS_CHECK(gemm_w2.initialize(args_w2, dev_workspace_w2));
     CUTLASS_CHECK(gemm_w2.run());
+    if (owns_ws_w2 && dev_workspace_w2) cudaFree(dev_workspace_w2);
 
-    // Apply fused bias + routing scaling
+    // Apply fused bias + routing scaling across all groups
     {
-        const int threads_per_block = 256;
-        const int max_blocks_per_group = 128; // Heuristic to prevent too many small blocks
-        dim3 block(threads_per_block, 1, 1);
-        dim3 grid(max_blocks_per_group, static_cast<unsigned>(group_count), 1);
+        dim3 block(256, 1, 1);
+        dim3 grid(1, static_cast<unsigned>(group_count), 1);
         fused_bias_routing_groups_kernel<ElementOutput><<<grid, block>>>(
             reinterpret_cast<ElementOutput*>(output_base),
             reinterpret_cast<const float*>(routing_base),
@@ -401,7 +543,30 @@ void cutlass_grouped_moe_forward(
             num_experts);
     }
 
-    CUDA_CHECK(cudaFree(hidden_offsets_dev));
+    // Free temp buffers if owned
+    cudaFree(hidden_offsets_dev);
+    if (owns_desc_w1) {
+        cudaFree(problem_sizes_device_w1);
+        cudaFree(ptr_A_device_w1);
+        cudaFree(ptr_B_device_w1);
+        cudaFree(ptr_C_device_w1);
+        cudaFree(ptr_D_device_w1);
+        cudaFree(lda_device_w1);
+        cudaFree(ldb_device_w1);
+        cudaFree(ldc_device_w1);
+        cudaFree(ldd_device_w1);
+    }
+    if (owns_desc_w2) {
+        cudaFree(problem_sizes_device_w2);
+        cudaFree(ptr_A_device_w2);
+        cudaFree(ptr_B_device_w2);
+        cudaFree(ptr_C_device_w2);
+        cudaFree(ptr_D_device_w2);
+        cudaFree(lda_device_w2);
+        cudaFree(ldb_device_w2);
+        cudaFree(ldc_device_w2);
+        cudaFree(ldd_device_w2);
+    }
 }
 
 } // namespace moe
