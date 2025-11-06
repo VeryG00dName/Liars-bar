@@ -36,7 +36,7 @@ warnings.filterwarnings(
 
 import torch
 from src import config
-from src.model.ppo_reactive_model import PPOReactiveModel
+from src.model.ppo_reactive_model_single import PPOReactiveModelSingle as PPOReactiveModel
 from src.agents.learner_ar_agent import LearnerAutoregressiveAgent
 from src.training.vec_ppo_rollout import PPOVecRolloutManager
 from src.training.tracing_utils import trace_model_from_checkpoint

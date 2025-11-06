@@ -291,7 +291,8 @@ def _single_pass_ppo(
             F.cross_entropy(opp_sel.reshape(-1, A_opp), opp_targets.reshape(-1), ignore_index=-100, reduction="none").view_as(opp_targets),
             w
         )
-        total += AUX_OPP_WEIGHT * opp_loss
+        # Detach opponent loss - keep for logging but don't backprop through it
+        total += AUX_OPP_WEIGHT * opp_loss.detach()
         with torch.no_grad():
             pred = opp_sel.argmax(dim=-1)
             opp_acc = _masked_mean(((pred == opp_targets) & opp_have_label).float(), w)

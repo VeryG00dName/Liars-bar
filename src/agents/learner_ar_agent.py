@@ -11,8 +11,8 @@ import torch.amp as amp
 from src import config
 from src.model.model_factory import ModelFactory as MFactoryUtil
 # --- NEW IMPORT ---
-from src.model.ppo_reactive_model import PPOReactiveModel
-from src.model.ppo_reactive_model_script import PPOReactiveModelScript
+from src.model.ppo_reactive_model_single import PPOReactiveModelSingle as PPOReactiveModel
+from src.model.ppo_reactive_model_single_script import PPOReactiveModelSingleScript as PPOReactiveModelScript
 from src.model.ppo_reactive_model_debug import PPOReactiveModelDebug
 __all__ = ["LearnerAutoregressiveAgent", "build_model_from_state"]
 EXPECTED_MODEL_ARGS = {
@@ -206,7 +206,7 @@ class LearnerAutoregressiveAgent:
 
     def load_models_from_checkpoint(self, checkpoint: Dict[str, Any], agent_key: str):
         """
-        Load model state dict, automatically detect the architecture (reactive, fused, legacy),
+        Load model state dict, automatically detect the architecture (reactive, legacy),
         and re-instantiate the correct model class using inferred dimensions.
         """
         if "policy_nets" not in checkpoint or agent_key not in checkpoint["policy_nets"]:

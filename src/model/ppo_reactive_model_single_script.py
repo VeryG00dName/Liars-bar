@@ -1,18 +1,22 @@
-# src/model/ppo_reactive_model_single.py
+# src/model/ppo_reactive_model_single_script.py
+"""
+TorchScript-compatible version of PPOReactiveModelSingle.
+Removes gradient checkpointing and action masking for JIT compilation.
+"""
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.utils.checkpoint as checkpoint
 
 from .ppo_reactive_model_base import PPOReactiveModelBase
 
 
-class PPOReactiveModelSingle(PPOReactiveModelBase):
+class PPOReactiveModelSingleScript(PPOReactiveModelBase):
     """
-    A dense (non-MoE) version of the reactive model
+    TorchScript-compatible dense (non-MoE) version of the reactive model.
+    No gradient checkpointing, no action masking.
     """
 
     def __init__(
@@ -25,7 +29,6 @@ class PPOReactiveModelSingle(PPOReactiveModelBase):
         dropout_rate: float = 0.1,
         max_seq_length: int = 480,
         num_agent_types: int = 4,
-        use_gradient_checkpointing: bool = True,
         **kwargs,  # Absorb unused MoE kwargs like num_experts, top_k, etc.
     ) -> None:
         # We call the base __init__ but will override the transformer and heads.
@@ -43,9 +46,6 @@ class PPOReactiveModelSingle(PPOReactiveModelBase):
             top_k=1,       # Dummy value
         )
 
-        # Store gradient checkpointing flag
-        self.use_gradient_checkpointing = use_gradient_checkpointing
-
         # === Override Transformer Backbone with a Standard Dense Version ===
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
@@ -62,7 +62,7 @@ class PPOReactiveModelSingle(PPOReactiveModelBase):
         self.reward_stream_head = nn.Linear(hidden_dim, 1)
         self.win_prob_head = nn.Linear(hidden_dim, 1)
         self.opp_action_head = nn.Linear(hidden_dim, action_dim)
-        
+
         # Remove the ModuleLists from the base class to avoid confusion and
         # prevent them from being included in the state_dict.
         del self.action_heads
@@ -79,46 +79,32 @@ class PPOReactiveModelSingle(PPOReactiveModelBase):
         positions: torch.Tensor,
         action_masks: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
-        valid_lengths: Optional[torch.Tensor] = None,
-    ):
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        TorchScript-compatible forward pass.
+        Returns only the 4 main outputs: action_logits, opp_logits, state_values, win_logits.
+        No action masking, no MoE routing info.
+        """
         # 1. Prepare inputs using inherited methods from the base class
         encoded_inputs = self._encode_inputs(
             obs_sequence, action_sequence, agent_types, positions, padding_mask
         )
         causal_mask, key_padding = self._prepare_masks(encoded_inputs, padding_mask)
 
-        # 2. Run data through the standard, dense transformer
-        if self.use_gradient_checkpointing and self.training:
-            # Apply gradient checkpointing to each transformer layer
-            transformer_output = encoded_inputs
-            for layer in self.transformer.layers:
-                transformer_output = checkpoint.checkpoint(
-                    layer,
-                    transformer_output,
-                    causal_mask,
-                    key_padding,
-                    use_reentrant=False
-                )
-        else:
-            transformer_output = self.transformer(
-                encoded_inputs,
-                mask=causal_mask,
-                src_key_padding_mask=key_padding,
-            )
+        # 2. Run data through the standard, dense transformer (no checkpointing)
+        transformer_output = self.transformer(
+            encoded_inputs,
+            mask=causal_mask,
+            src_key_padding_mask=key_padding,
+        )
 
         # 3. Get outputs from the single, dense heads
         action_logits = self.action_head(transformer_output)
         opp_logits = self.opp_action_head(transformer_output)
+        state_values = self.reward_stream_head(transformer_output).squeeze(-1)
+        win_logits = self.win_prob_head(transformer_output).squeeze(-1)
 
-        # 4. (Optional) Apply action mask if provided
-        if action_masks is not None:
-            neg = torch.tensor(
-                torch.finfo(action_logits.dtype).min / 4.0,
-                dtype=action_logits.dtype,
-                device=action_logits.device,
-            )
-            our_turns = (agent_types == 0).unsqueeze(-1)
-            invalid = (~action_masks.bool()) & our_turns
-            action_logits = torch.where(invalid, neg, action_logits)
+        # Note: No action masking in TorchScript version
+        # Action masks will be applied in C++ or Python inference wrapper if needed
 
-        return action_logits, opp_logits, None, None, None, None
+        return action_logits, opp_logits, state_values, win_logits
