@@ -292,7 +292,7 @@ def _single_pass_ppo(
             w
         )
         # Detach opponent loss - keep for logging but don't backprop through it
-        total += AUX_OPP_WEIGHT * opp_loss.detach()
+        total += AUX_OPP_WEIGHT * opp_loss
         with torch.no_grad():
             pred = opp_sel.argmax(dim=-1)
             opp_acc = _masked_mean(((pred == opp_targets) & opp_have_label).float(), w)

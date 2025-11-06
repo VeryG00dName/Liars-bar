@@ -108,8 +108,10 @@ class PPOReactiveModelSingle(PPOReactiveModelBase):
 
         # 3. Get outputs from the single, dense heads
         action_logits = self.action_head(transformer_output)
-        opp_logits = self.opp_action_head(transformer_output)
-
+        state_values = self.reward_stream_head(transformer_output)
+        win_logits = self.win_prob_head(transformer_output)
+        opp_logits = self.opp_action_head(transformer_output.detach())
+        
         # 4. (Optional) Apply action mask if provided
         if action_masks is not None:
             neg = torch.tensor(
@@ -121,4 +123,4 @@ class PPOReactiveModelSingle(PPOReactiveModelBase):
             invalid = (~action_masks.bool()) & our_turns
             action_logits = torch.where(invalid, neg, action_logits)
 
-        return action_logits, opp_logits, None, None, None, None
+        return action_logits, opp_logits, state_values, win_logits, None, None
