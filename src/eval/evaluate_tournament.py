@@ -329,12 +329,12 @@ def run_active_league(
             for key, value in sorted(main_timers.items()):
                 print(f"  - {key:<32}: {value:>12} us ({value / 1e6:.6f}s)")
 
-            if forward_timings:
-                print("\n--- Forward Pass Breakdown (microseconds) ---")
-                total_fwd_time = sum(forward_timings.values())
-                for key, value in sorted(forward_timings.items(), key=lambda item: -item[1]):
-                    perc = (value / total_fwd_time * 100.0) if total_fwd_time > 0 else 0.0
-                    print(f"  - {key:<32}: {value:>12} us ({value / 1e6:.6f}s) [{perc:>5.1f}%]")
+            #if forward_timings:
+             #   print("\n--- Forward Pass Breakdown (microseconds) ---")
+              #  total_fwd_time = sum(forward_timings.values())
+              #  for key, value in sorted(forward_timings.items(), key=lambda item: -item[1]):
+              #      perc = (value / total_fwd_time * 100.0) if total_fwd_time > 0 else 0.0
+              #      print(f"  - {key:<32}: {value:>12} us ({value / 1e6:.6f}s) [{perc:>5.1f}%]")
 
         if len(results_list) != len(quartets):
             raise RuntimeError(
