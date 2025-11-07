@@ -225,6 +225,9 @@ forward_packed(
     auto pol = policy_indices.to(obs_sequence.device()).to(torch::kLong).contiguous();
     const int64_t num_policies = get_weight(batched_weights, "obs_encoder.0.weight").size(0);
 
+    // Detect architecture (MoE vs Dense)
+    const bool use_moe = lb::model::is_moe_model(batched_weights);
+
     // 1. Embeddings
     auto t0 = Clock::now();
     auto embeds = lb::model::compute_embeddings(
@@ -274,68 +277,116 @@ forward_packed(
     for (int64_t i = 0; i < num_layers; ++i) {
         std::string prefix = "transformer.layers." + std::to_string(i);
         std::string layer_key = "forward_layer_" + std::to_string(i) + "_us";
-        
-        lb::moe::MoEWorkspace* ws_ptr = nullptr;
-        if (moe_workspaces) {
-            ws_ptr = &moe_workspaces[i];
-        } else if (g_tls_workspace_enabled && i < static_cast<int64_t>(g_tls_workspaces.size())) {
-            ws_ptr = &g_tls_workspaces[i];
-        }
-        
+
         t0 = Clock::now();
-        auto [x_next, gate_logits, topk_indices, topk_scores] = lb::model::transformer_layer(
-            x, pol,
-            get_weight(batched_weights, prefix + ".self_attn.in_proj_weight"),
-            get_weight(batched_weights, prefix + ".self_attn.in_proj_bias"),
-            get_weight(batched_weights, prefix + ".self_attn.out_proj.weight"),
-            get_weight(batched_weights, prefix + ".self_attn.out_proj.bias"),
-            get_weight(batched_weights, prefix + ".norm1.weight"),
-            get_weight(batched_weights, prefix + ".norm1.bias"),
-            get_weight(batched_weights, prefix + ".moe.gate.weight"),
-            get_weight(batched_weights, prefix + ".moe.gate.bias"),
-            get_weight(batched_weights, prefix + ".moe.experts.w1_ptrs"),
-            get_weight(batched_weights, prefix + ".moe.experts.w2_ptrs"),
-            get_weight(batched_weights, prefix + ".moe.experts.b1_ptrs"),
-            get_weight(batched_weights, prefix + ".moe.experts.b2_ptrs"),
-            get_weight(batched_weights, prefix + ".norm2.weight"),
-            get_weight(batched_weights, prefix + ".norm2.bias"),
-            num_heads, hidden_dim, top_k, num_experts, num_policies,
-            ws_ptr, &t);
+
+        if (use_moe) {
+            // MoE path
+            lb::moe::MoEWorkspace* ws_ptr = nullptr;
+            if (moe_workspaces) {
+                ws_ptr = &moe_workspaces[i];
+            } else if (g_tls_workspace_enabled && i < static_cast<int64_t>(g_tls_workspaces.size())) {
+                ws_ptr = &g_tls_workspaces[i];
+            }
+
+            auto [x_next, gate_logits, topk_indices, topk_scores] = lb::model::transformer_layer(
+                x, pol,
+                get_weight(batched_weights, prefix + ".self_attn.in_proj_weight"),
+                get_weight(batched_weights, prefix + ".self_attn.in_proj_bias"),
+                get_weight(batched_weights, prefix + ".self_attn.out_proj.weight"),
+                get_weight(batched_weights, prefix + ".self_attn.out_proj.bias"),
+                get_weight(batched_weights, prefix + ".norm1.weight"),
+                get_weight(batched_weights, prefix + ".norm1.bias"),
+                get_weight(batched_weights, prefix + ".moe.gate.weight"),
+                get_weight(batched_weights, prefix + ".moe.gate.bias"),
+                get_weight(batched_weights, prefix + ".moe.experts.w1_ptrs"),
+                get_weight(batched_weights, prefix + ".moe.experts.w2_ptrs"),
+                get_weight(batched_weights, prefix + ".moe.experts.b1_ptrs"),
+                get_weight(batched_weights, prefix + ".moe.experts.b2_ptrs"),
+                get_weight(batched_weights, prefix + ".norm2.weight"),
+                get_weight(batched_weights, prefix + ".norm2.bias"),
+                num_heads, hidden_dim, top_k, num_experts, num_policies,
+                ws_ptr, &t);
+
+            x = x_next;
+            last_topk_idx = topk_indices;
+            last_topk_scores = topk_scores;
+        } else {
+            // Dense FFN path
+            auto [x_next, gate_logits, topk_indices, topk_scores] = lb::model::transformer_layer_dense(
+                x, pol,
+                get_weight(batched_weights, prefix + ".self_attn.in_proj_weight"),
+                get_weight(batched_weights, prefix + ".self_attn.in_proj_bias"),
+                get_weight(batched_weights, prefix + ".self_attn.out_proj.weight"),
+                get_weight(batched_weights, prefix + ".self_attn.out_proj.bias"),
+                get_weight(batched_weights, prefix + ".norm1.weight"),
+                get_weight(batched_weights, prefix + ".norm1.bias"),
+                get_weight(batched_weights, prefix + ".linear1.weight"),
+                get_weight(batched_weights, prefix + ".linear1.bias"),
+                get_weight(batched_weights, prefix + ".linear2.weight"),
+                get_weight(batched_weights, prefix + ".linear2.bias"),
+                get_weight(batched_weights, prefix + ".norm2.weight"),
+                get_weight(batched_weights, prefix + ".norm2.bias"),
+                num_heads, hidden_dim, &t);
+
+            x = x_next;
+            last_topk_idx = topk_indices;
+            last_topk_scores = topk_scores;
+        }
+
         t1 = Clock::now();
         t[layer_key] += std::chrono::duration_cast<Microseconds>(t1 - t0);
-        
-        x = x_next;
-        last_topk_idx = topk_indices;
-        last_topk_scores = topk_scores;
     }
 
-    // 4. Final Norm
-    t0 = Clock::now();
-    auto transformer_output = lb::kernels::indexed_batched_layer_norm(
-        x, get_weight(batched_weights, "transformer.norm.weight"),
-        get_weight(batched_weights, "transformer.norm.bias"), pol);
-    t1 = Clock::now();
-    t["forward_final_norm_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
+    // 4. Final Norm (MoE models only - dense models don't have final norm)
+    torch::Tensor transformer_output;
+    if (use_moe) {
+        t0 = Clock::now();
+        transformer_output = lb::kernels::indexed_batched_layer_norm(
+            x, get_weight(batched_weights, "transformer.norm.weight"),
+            get_weight(batched_weights, "transformer.norm.bias"), pol);
+        t1 = Clock::now();
+        t["forward_final_norm_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
+    } else {
+        // Dense models: no final norm, use last layer output directly
+        transformer_output = x;
+    }
 
     // 5. Heads
-    t0 = Clock::now();
-    auto heads_stacked = lb::model::compute_heads(
-        transformer_output, batched_weights, pol, num_experts, &t);
-    t1 = Clock::now();
-    t["forward_heads_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
+    torch::Tensor action_logits, opp_logits, state_values, win_logits;
 
-    // 6. Reduce Heads
-    t0 = Clock::now();
-    auto action_logits = lb::model::reduce_expert_heads(
-        heads_stacked.at("action_heads_stacked"), last_topk_idx, last_topk_scores);
-    auto opp_logits = lb::model::reduce_expert_heads(
-        heads_stacked.at("opp_heads_stacked"), last_topk_idx, last_topk_scores);
-    auto state_values = lb::model::reduce_expert_heads(
-        heads_stacked.at("reward_heads_stacked"), last_topk_idx, last_topk_scores);
-    auto win_logits = lb::model::reduce_expert_heads(
-        heads_stacked.at("win_heads_stacked"), last_topk_idx, last_topk_scores);
-    t1 = Clock::now();
-    t["forward_reduce_heads_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
+    if (use_moe) {
+        // MoE path: compute per-expert heads and reduce
+        t0 = Clock::now();
+        auto heads_stacked = lb::model::compute_heads(
+            transformer_output, batched_weights, pol, num_experts, &t);
+        t1 = Clock::now();
+        t["forward_heads_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
+
+        // 6. Reduce Heads
+        t0 = Clock::now();
+        action_logits = lb::model::reduce_expert_heads(
+            heads_stacked.at("action_heads_stacked"), last_topk_idx, last_topk_scores);
+        opp_logits = lb::model::reduce_expert_heads(
+            heads_stacked.at("opp_heads_stacked"), last_topk_idx, last_topk_scores);
+        state_values = lb::model::reduce_expert_heads(
+            heads_stacked.at("reward_heads_stacked"), last_topk_idx, last_topk_scores);
+        win_logits = lb::model::reduce_expert_heads(
+            heads_stacked.at("win_heads_stacked"), last_topk_idx, last_topk_scores);
+        t1 = Clock::now();
+        t["forward_reduce_heads_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
+    } else {
+        // Dense path: compute single heads directly
+        t0 = Clock::now();
+        auto heads_dict = lb::model::compute_heads_dense(
+            transformer_output, batched_weights, pol, &t);
+        action_logits = heads_dict.at("action_logits");
+        opp_logits = heads_dict.at("opp_logits");
+        state_values = heads_dict.at("state_values");
+        win_logits = heads_dict.at("win_logits");
+        t1 = Clock::now();
+        t["forward_heads_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
+    }
 
     return std::make_tuple(action_logits, opp_logits, state_values, win_logits);
 }

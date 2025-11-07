@@ -104,6 +104,17 @@ private:
     std::unordered_map<int, int> policy_id_to_cache_index_;
     bool weights_finalized_{false};
     std::unordered_map<int, int> policy_max_sequence_length_;
+
+    // Mixed architecture support: separate orchestrators for MoE vs dense models
+    std::unique_ptr<execution_core::NeuralInferenceOrchestrator> orchestrator_moe_;
+    std::unique_ptr<execution_core::NeuralInferenceOrchestrator> orchestrator_dense_;
+    c10::Dict<std::string, torch::Tensor> batched_weight_cache_moe_;
+    c10::Dict<std::string, torch::Tensor> batched_weight_cache_dense_;
+    std::unordered_map<int, int> policy_id_to_cache_index_moe_;
+    std::unordered_map<int, int> policy_id_to_cache_index_dense_;
+    std::unordered_map<int, bool> policy_is_moe_;
+
+    // Legacy single orchestrator
     std::unique_ptr<execution_core::NeuralInferenceOrchestrator> orchestrator_;
     std::unordered_map<int, CppBotRegistryEntry> cpp_bot_registry_;
     static std::unordered_map<std::string, CppBotKind> bot_kind_cache_;

@@ -627,6 +627,132 @@ moe_group_metadata_device(
     };
 }
 
+// =============================================================================
+// Dense (non-MoE) Architecture Support
+// =============================================================================
+
+bool is_moe_model(const c10::Dict<std::string, torch::Tensor>& batched_weights) {
+    // Check if MoE-specific weights exist
+    return batched_weights.contains("transformer.layers.0.moe.gate.weight");
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+transformer_layer_dense(
+    const torch::Tensor& x,
+    const torch::Tensor& policy_indices,
+    const torch::Tensor& in_proj_weight,
+    const torch::Tensor& in_proj_bias,
+    const torch::Tensor& out_proj_weight,
+    const torch::Tensor& out_proj_bias,
+    const torch::Tensor& norm1_weight,
+    const torch::Tensor& norm1_bias,
+    const torch::Tensor& linear1_weight,
+    const torch::Tensor& linear1_bias,
+    const torch::Tensor& linear2_weight,
+    const torch::Tensor& linear2_bias,
+    const torch::Tensor& norm2_weight,
+    const torch::Tensor& norm2_bias,
+    int64_t num_heads,
+    int64_t hidden_dim,
+    std::unordered_map<std::string, std::chrono::microseconds>* timers) {
+
+    using Microseconds = std::chrono::microseconds;
+    using Clock = std::chrono::high_resolution_clock;
+    std::unordered_map<std::string, Microseconds> dummy_timers;
+    auto& t = timers ? *timers : dummy_timers;
+
+    const int64_t B = x.size(0);
+    const int64_t T = x.size(1);
+    const int64_t head_dim = hidden_dim / num_heads;
+
+    // --- Attention Block (same as MoE version) ---
+    auto t0 = Clock::now();
+    auto qkv_weights = in_proj_weight.chunk(3, in_proj_weight.dim() == 3 ? 1 : 0);
+    auto qkv_biases  = in_proj_bias.chunk(3, in_proj_bias.dim() == 2 ? 1 : 0);
+
+    auto q = lb::kernels::indexed_batched_linear(x, qkv_weights[0], qkv_biases[0], policy_indices, t);
+    auto k = lb::kernels::indexed_batched_linear(x, qkv_weights[1], qkv_biases[1], policy_indices, t);
+    auto v = lb::kernels::indexed_batched_linear(x, qkv_weights[2], qkv_biases[2], policy_indices, t);
+
+    q = q.view({B, T, num_heads, head_dim}).transpose(1, 2);
+    k = k.view({B, T, num_heads, head_dim}).transpose(1, 2);
+    v = v.view({B, T, num_heads, head_dim}).transpose(1, 2);
+
+    auto attn_output = torch::scaled_dot_product_attention(q, k, v, torch::nullopt, 0.0, true);
+    attn_output = attn_output.transpose(1, 2).contiguous().view({B, T, hidden_dim});
+    attn_output = lb::kernels::indexed_batched_linear(attn_output, out_proj_weight, out_proj_bias, policy_indices, t);
+
+    auto residual1 = x + attn_output;
+    auto x_norm = lb::kernels::indexed_batched_layer_norm(residual1, norm1_weight, norm1_bias, policy_indices, 1e-5);
+
+    auto t1 = Clock::now();
+    t["layer_attention_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
+
+    // --- Dense FFN Block (no MoE routing) ---
+    t0 = Clock::now();
+
+    // Z = X @ W1^T + b1
+    auto z = lb::kernels::indexed_batched_linear(x_norm, linear1_weight, linear1_bias, policy_indices, t);
+
+    // H = GELU(Z)
+    auto h = torch::gelu(z);
+
+    // Y = H @ W2^T + b2
+    auto ffn_output = lb::kernels::indexed_batched_linear(h, linear2_weight, linear2_bias, policy_indices, t);
+
+    // Residual + LayerNorm
+    auto residual2 = x_norm + ffn_output;
+    auto x_next = lb::kernels::indexed_batched_layer_norm(residual2, norm2_weight, norm2_bias, policy_indices, 1e-5);
+
+    t1 = Clock::now();
+    t["layer_ffn_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
+
+    // Return dummy gate_logits, topk_indices, topk_weights for API compatibility
+    auto dummy_gate_logits = torch::empty({B, T, 1}, x.options());
+    auto dummy_topk_indices = torch::zeros({B, T, 1}, torch::dtype(torch::kLong).device(x.device()));
+    auto dummy_topk_weights = torch::ones({B, T, 1}, x.options().dtype(torch::kFloat32));
+
+    return std::make_tuple(x_next, dummy_gate_logits, dummy_topk_indices, dummy_topk_weights);
+}
+
+c10::Dict<std::string, torch::Tensor>
+compute_heads_dense(
+    const torch::Tensor& transformer_output,
+    const c10::Dict<std::string, torch::Tensor>& batched_weights,
+    const torch::Tensor& policy_indices,
+    std::unordered_map<std::string, std::chrono::microseconds>* timers) {
+
+    using Microseconds = std::chrono::microseconds;
+    std::unordered_map<std::string, Microseconds> dummy;
+    auto& t = timers ? *timers : dummy;
+    auto pol = policy_indices.to(transformer_output.device()).to(torch::kLong).contiguous();
+    c10::Dict<std::string, torch::Tensor> result;
+
+    // Single heads (not per-expert)
+    auto action_logits = lb::kernels::indexed_batched_linear(transformer_output,
+        get_weight(batched_weights, "action_head.weight"),
+        get_weight(batched_weights, "action_head.bias"), pol, t);
+
+    auto opp_logits = lb::kernels::indexed_batched_linear(transformer_output,
+        get_weight(batched_weights, "opp_action_head.weight"),
+        get_weight(batched_weights, "opp_action_head.bias"), pol, t);
+
+    auto state_values = lb::kernels::indexed_batched_linear(transformer_output,
+        get_weight(batched_weights, "reward_stream_head.weight"),
+        get_weight(batched_weights, "reward_stream_head.bias"), pol, t);
+
+    auto win_logits = lb::kernels::indexed_batched_linear(transformer_output,
+        get_weight(batched_weights, "win_prob_head.weight"),
+        get_weight(batched_weights, "win_prob_head.bias"), pol, t);
+
+    result.insert("action_logits", action_logits);
+    result.insert("opp_logits", opp_logits);
+    result.insert("state_values", state_values);
+    result.insert("win_logits", win_logits);
+
+    return result;
+}
+
 
 } // namespace model
 } // namespace lb

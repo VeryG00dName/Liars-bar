@@ -703,86 +703,146 @@ void RolloutManager::finalize_model_loading() {
     // 1. Clear previous state
     batched_weight_cache_.clear();
     policy_id_to_cache_index_.clear();
+    batched_weight_cache_moe_.clear();
+    batched_weight_cache_dense_.clear();
+    policy_id_to_cache_index_moe_.clear();
+    policy_id_to_cache_index_dense_.clear();
+    policy_is_moe_.clear();
     orchestrator_.reset();
+    orchestrator_moe_.reset();
+    orchestrator_dense_.reset();
 
     if (staged_state_dicts_.empty()) {
         weights_finalized_ = true;
         return;
     }
 
-    // 2. Get a sorted, stable list of all policies to be batched.
-    std::vector<int> policy_ids;
-    policy_ids.reserve(staged_state_dicts_.size());
+    // 2. Get a sorted, stable list of all policies and detect architecture for each
+    std::vector<int> all_policy_ids;
+    all_policy_ids.reserve(staged_state_dicts_.size());
     for (const auto& kv : staged_state_dicts_) {
-        policy_ids.push_back(kv.first);
+        all_policy_ids.push_back(kv.first);
     }
-    std::sort(policy_ids.begin(), policy_ids.end());
+    std::sort(all_policy_ids.begin(), all_policy_ids.end());
+
+    // Detect architecture for each policy
+    std::vector<int> moe_policy_ids;
+    std::vector<int> dense_policy_ids;
+    for (int policy_id : all_policy_ids) {
+        const auto& state_dict = staged_state_dicts_.at(policy_id);
+        bool is_moe = state_dict.count("transformer.layers.0.moe.gate.weight") > 0;
+        policy_is_moe_[policy_id] = is_moe;
+
+        if (is_moe) {
+            moe_policy_ids.push_back(policy_id);
+        } else {
+            dense_policy_ids.push_back(policy_id);
+        }
+    }
+
+    std::cout << "[RolloutManager] Detected " << moe_policy_ids.size() << " MoE policies and "
+              << dense_policy_ids.size() << " dense policies" << std::endl;
 
     // 3. Pre-process weights on CPU before batching.
-    // This stacks MoE experts for each policy individually.
-    for (auto& kv : staged_state_dicts_) {
-        prestack_moe_expert_weights(kv.second, num_layers_, num_experts_);
+    // Stack MoE experts for MoE policies only
+    for (int policy_id : moe_policy_ids) {
+        prestack_moe_expert_weights(staged_state_dicts_.at(policy_id), num_layers_, num_experts_);
     }
 
-    // 4. Build the mapping from arbitrary policy_id to a dense index [0, N)
-    // for efficient indexing into the batched weight tensors during inference.
-    for (size_t idx = 0; idx < policy_ids.size(); ++idx) {
-        policy_id_to_cache_index_[policy_ids[idx]] = static_cast<int>(idx);
-    }
+    // Helper lambda to batch policies of one architecture
+    auto batch_policies = [this](
+        const std::vector<int>& policy_ids,
+        c10::Dict<std::string, torch::Tensor>& weight_cache,
+        std::unordered_map<int, int>& id_to_index,
+        bool is_moe) {
 
-    // 5. Batch all weights. This is the core optimization loop.
-    // For each parameter (e.g., "norm1.weight"), we gather the FP32 CPU tensors
-    // from all policies, stack them into a single CPU tensor, then perform ONE
-    // efficient transfer to the GPU and ONE conversion to FP16. This minimizes
-    // GPU memory fragmentation and H2D bandwidth.
-    const auto& first_dict = staged_state_dicts_.at(policy_ids[0]);
-    std::vector<std::string> keys;
-    keys.reserve(first_dict.size());
-    for (const auto& kv : first_dict) {
-        keys.push_back(kv.first);
-    }
+        if (policy_ids.empty()) return;
 
-    for (const auto& key : keys) {
-        std::vector<torch::Tensor> cpu_tensors;
-        cpu_tensors.reserve(policy_ids.size());
-        for (int policy_id : policy_ids) {
-            cpu_tensors.push_back(staged_state_dicts_.at(policy_id).at(key));
+        // Build index mapping
+        for (size_t idx = 0; idx < policy_ids.size(); ++idx) {
+            id_to_index[policy_ids[idx]] = static_cast<int>(idx);
         }
 
-        auto stacked_gpu_fp16 = torch::stack(cpu_tensors, 0)
-                                    .to(kInferenceDevice, /*non_blocking=*/true, /*copy=*/true)
-                                    .to(torch::kFloat16)
-                                    .contiguous();
+        // Get keys from first policy
+        const auto& first_dict = staged_state_dicts_.at(policy_ids[0]);
+        std::vector<std::string> keys;
+        keys.reserve(first_dict.size());
+        for (const auto& kv : first_dict) {
+            keys.push_back(kv.first);
+        }
 
-        batched_weight_cache_.insert(key, stacked_gpu_fp16);
+        // Stack weights
+        for (const auto& key : keys) {
+            std::vector<torch::Tensor> cpu_tensors;
+            cpu_tensors.reserve(policy_ids.size());
+            for (int policy_id : policy_ids) {
+                const auto& policy_dict = staged_state_dicts_.at(policy_id);
+                auto key_it = policy_dict.find(key);
+                if (key_it == policy_dict.end()) {
+                    throw std::runtime_error(
+                        "[RolloutManager] Policy " + std::to_string(policy_id) +
+                        " missing key '" + key + "' expected from first policy in group. "
+                        "All policies in the same architecture group must have identical weight keys.");
+                }
+                cpu_tensors.push_back(key_it->second);
+            }
+
+            auto stacked_gpu_fp16 = torch::stack(cpu_tensors, 0)
+                                        .to(kInferenceDevice, /*non_blocking=*/true, /*copy=*/true)
+                                        .to(torch::kFloat16)
+                                        .contiguous();
+
+            weight_cache.insert(key, stacked_gpu_fp16);
+        }
+
+        // Add fixed buffers
+        add_fixed_buffers(weight_cache, kInferenceDevice);
+
+        // Post-process
+        process_and_split_attention_weights(weight_cache);
+
+        // MoE-specific post-processing
+        if (is_moe) {
+            create_moe_weight_pointers(weight_cache, num_layers_, num_experts_);
+        }
+    };
+
+    // 4. Batch MoE policies
+    if (!moe_policy_ids.empty()) {
+        batch_policies(moe_policy_ids, batched_weight_cache_moe_, policy_id_to_cache_index_moe_, true);
+
+        orchestrator_moe_ = std::make_unique<execution_core::NeuralInferenceOrchestrator>(
+            batched_weight_cache_moe_,
+            policy_id_to_cache_index_moe_,
+            max_inference_batch_size_,
+            num_layers_,
+            num_heads_,
+            hidden_dim_,
+            num_experts_,
+            top_k_,
+            /*use_argmax=*/false
+        );
     }
-    
-    // 6. Free the temporary CPU-side storage immediately.
+
+    // 5. Batch dense policies
+    if (!dense_policy_ids.empty()) {
+        batch_policies(dense_policy_ids, batched_weight_cache_dense_, policy_id_to_cache_index_dense_, false);
+
+        orchestrator_dense_ = std::make_unique<execution_core::NeuralInferenceOrchestrator>(
+            batched_weight_cache_dense_,
+            policy_id_to_cache_index_dense_,
+            max_inference_batch_size_,
+            num_layers_,
+            num_heads_,
+            hidden_dim_,
+            1,  // num_experts (not used for dense, but pass 1)
+            1,  // top_k (not used for dense)
+            /*use_argmax=*/false
+        );
+    }
+
+    // 6. Free the temporary CPU-side storage
     staged_state_dicts_.clear();
-
-    // 7. Add model-constant buffers (LUTs) directly to the GPU cache.
-    add_fixed_buffers(batched_weight_cache_, kInferenceDevice);
-
-    // 8. Post-process attention weights, splitting fused QKV and creating aliases.
-    process_and_split_attention_weights(batched_weight_cache_);
-
-    // 9. Pre-compute and cache MoE expert pointer tables. This is a critical
-    // optimization that avoids calculating device pointers in the hot path.
-    create_moe_weight_pointers(batched_weight_cache_, num_layers_, num_experts_);
-
-    // 10. Instantiate the inference orchestrator with the fully prepared,
-    // GPU-resident, FP16 batched weights.
-    orchestrator_ = std::make_unique<execution_core::NeuralInferenceOrchestrator>(
-        batched_weight_cache_,
-        policy_id_to_cache_index_,
-        max_inference_batch_size_,
-        num_layers_,
-        num_heads_,
-        hidden_dim_,
-        num_experts_,
-        top_k_,
-        /*use_argmax=*/false
-    );
 
     weights_finalized_ = true;
 }
@@ -798,10 +858,24 @@ void RolloutManager::update_training_model_weights(
             "Cannot update training model weights before finalize_model_loading() has been called");
     }
 
-    auto cache_idx_it = policy_id_to_cache_index_.find(policy_id);
-    if (cache_idx_it == policy_id_to_cache_index_.end()) {
+    // Determine architecture of this policy
+    auto arch_it = policy_is_moe_.find(policy_id);
+    if (arch_it == policy_is_moe_.end()) {
         throw std::runtime_error(
-            "Policy ID " + std::to_string(policy_id) + " not found in batched cache. "
+            "Policy ID " + std::to_string(policy_id) + " architecture not tracked. "
+            "Cannot update weights for unloaded policy.");
+    }
+    bool is_moe = arch_it->second;
+
+    // Get the correct cache and index map
+    c10::Dict<std::string, torch::Tensor>& weight_cache = is_moe ? batched_weight_cache_moe_ : batched_weight_cache_dense_;
+    std::unordered_map<int, int>& id_to_index = is_moe ? policy_id_to_cache_index_moe_ : policy_id_to_cache_index_dense_;
+
+    auto cache_idx_it = id_to_index.find(policy_id);
+    if (cache_idx_it == id_to_index.end()) {
+        throw std::runtime_error(
+            "Policy ID " + std::to_string(policy_id) + " not found in " +
+            (is_moe ? "MoE" : "dense") + " batched cache. "
             "Cannot update weights for unloaded policy.");
     }
     int batch_idx = cache_idx_it->second;
@@ -809,8 +883,10 @@ void RolloutManager::update_training_model_weights(
     // 1. Make a mutable copy of the state_dict for preprocessing
     std::unordered_map<std::string, torch::Tensor> preprocessed_dict = state_dict;
 
-    // 2. Prestack MoE expert weights (same as finalize does)
-    prestack_moe_expert_weights(preprocessed_dict, num_layers_, num_experts_);
+    // 2. Prestack MoE expert weights if this is an MoE model
+    if (is_moe) {
+        prestack_moe_expert_weights(preprocessed_dict, num_layers_, num_experts_);
+    }
 
     // 3. Update each weight in the batched cache
     //    For each key, we replace the slice at index batch_idx
@@ -823,19 +899,19 @@ void RolloutManager::update_training_model_weights(
             continue;
         }
 
-        // Convert to GPU FP16 (matching the format in batched_weight_cache_)
+        // Convert to GPU FP16 (matching the format in weight_cache)
         torch::Tensor new_weight_gpu_fp16 = new_weight_cpu
             .to(kInferenceDevice, /*non_blocking=*/true, /*copy=*/true)
             .to(torch::kFloat16)
             .contiguous();
 
         // Find the corresponding batched tensor in the cache
-        if (!batched_weight_cache_.contains(key)) {
+        if (!weight_cache.contains(key)) {
             // Skip keys that don't exist in cache (e.g., optimizer states)
             continue;
         }
 
-        torch::Tensor batched_tensor = batched_weight_cache_.at(key);
+        torch::Tensor batched_tensor = weight_cache.at(key);
 
         // Replace the slice at batch_idx
         // batched_tensor shape: [num_policies, ...]
@@ -868,14 +944,16 @@ void RolloutManager::update_training_model_weights(
     //    The process_and_split_attention_weights function operates on the entire batch,
     //    but since we only changed one policy, we need to re-split just that policy's QKV.
     //    For simplicity, we can re-run the full split (it's idempotent and fast).
-    process_and_split_attention_weights(batched_weight_cache_);
+    process_and_split_attention_weights(weight_cache);
 
-    // 5. Re-create MoE expert pointer tables
+    // 5. Re-create MoE expert pointer tables (only for MoE models)
     //    Same reasoning: the function is fast and idempotent.
-    create_moe_weight_pointers(batched_weight_cache_, num_layers_, num_experts_);
+    if (is_moe) {
+        create_moe_weight_pointers(weight_cache, num_layers_, num_experts_);
+    }
 
     // Note: We do NOT reset the orchestrator. It continues using the updated
-    // batched_weight_cache_ directly (the cache is passed by reference/pointer).
+    // weight_cache directly (the cache is passed by reference/pointer).
 }
 
 void RolloutManager::register_cpp_bot(int policy_id, const std::string& bot_name) {
@@ -919,8 +997,26 @@ void RolloutManager::run_neural_inference(
     std::unordered_map<int, std::vector<float>>& out_log_probs,
     std::unordered_map<int, std::vector<float>>& out_values) {
 
-    if (!orchestrator_ || !weights_finalized_) {
-        throw std::runtime_error("[RolloutManager] Orchestrator not initialized - call finalize_model_loading() first");
+    if (!weights_finalized_) {
+        throw std::runtime_error("[RolloutManager] Weights not finalized - call finalize_model_loading() first");
+    }
+
+    // Split requests by architecture
+    std::unordered_map<int, std::vector<PolicyRequest>> moe_requests;
+    std::unordered_map<int, std::vector<PolicyRequest>> dense_requests;
+
+    for (const auto& kv : requests_by_policy) {
+        int policy_id = kv.first;
+        auto arch_it = policy_is_moe_.find(policy_id);
+        if (arch_it == policy_is_moe_.end()) {
+            throw std::runtime_error("[RolloutManager] Unknown policy ID " + std::to_string(policy_id));
+        }
+
+        if (arch_it->second) {
+            moe_requests[policy_id] = kv.second;
+        } else {
+            dense_requests[policy_id] = kv.second;
+        }
     }
 
     // Save model inputs for training policies BEFORE inference
@@ -989,8 +1085,18 @@ void RolloutManager::run_neural_inference(
         }
     }
 
-    // Run unified inference for all neural policies
-    auto results = orchestrator_->run_inference(requests_by_policy);
+    // Run inference for MoE and dense policies separately
+    std::unordered_map<std::pair<int, int>, execution_core::InferenceResult, execution_core::pair_hash> results;
+
+    if (!moe_requests.empty() && orchestrator_moe_) {
+        auto moe_results = orchestrator_moe_->run_inference(moe_requests);
+        results.insert(moe_results.begin(), moe_results.end());
+    }
+
+    if (!dense_requests.empty() && orchestrator_dense_) {
+        auto dense_results = orchestrator_dense_->run_inference(dense_requests);
+        results.insert(dense_results.begin(), dense_results.end());
+    }
 
     // Unpack results by policy
     for (const auto& kv : requests_by_policy) {

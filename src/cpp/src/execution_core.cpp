@@ -31,6 +31,7 @@ NeuralInferenceOrchestrator::NeuralInferenceOrchestrator(
       use_argmax_(use_argmax)
 {
     // Lazily grow MoE workspaces based on observed batch characteristics.
+    // For dense (non-MoE) models, these workspaces remain empty and unused.
     moe_workspaces_.resize(num_layers_);
 }
 

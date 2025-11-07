@@ -111,7 +111,7 @@ FRONTIER_FOCUS_COUNTS = [128, 96, 64, 32]
 MAX_ENVS_PER_CALL = 512
 # When rounding the total triplets to a multiple of MAX_ENVS_PER_CALL,
 # if the number of triplets to add is <= this threshold, we round up. Otherwise, round down.
-ROUND_UP_OVERAGE_THRESHOLD = 48
+ROUND_UP_OVERAGE_THRESHOLD = 511
 
 # --- Proportional Budgeting ---
 # The target fraction of total opponent slots dedicated to the "focus" group.
@@ -162,7 +162,7 @@ DEVICE = "cuda"
 FORCE_CUDA_SYNC_FOR_TIMING = True
 CPP_BOT_MAX_LABEL = 6
 # Probability that a game will shuffle seats (other than seat 0) every round
-SHUFFLE_PERCENTAGE = 0.5
+SHUFFLE_PERCENTAGE = 0.0
 # ============================
 # Everything past this is depreated, kept for compatiblty!
 # ============================

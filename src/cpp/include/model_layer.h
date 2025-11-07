@@ -142,5 +142,56 @@ moe_group_metadata_device(
     const torch::Tensor& sorted_expert_indices,
     const torch::Tensor& sorted_policy_indices);
 
+// =============================================================================
+// Dense (non-MoE) Architecture Support
+// =============================================================================
+
+/**
+ * Check if the model is MoE-based or dense.
+ *
+ * @param batched_weights The batched weight dictionary
+ * @return true if model has MoE layers, false for dense architecture
+ */
+bool is_moe_model(const c10::Dict<std::string, torch::Tensor>& batched_weights);
+
+/**
+ * Dense transformer layer forward pass (no MoE routing).
+ * Uses standard dense FFN instead of MoE experts.
+ *
+ * @return Tuple of (output, dummy_gate_logits, dummy_topk_indices, dummy_topk_scores)
+ *         Dummy values are returned for API compatibility with MoE version.
+ */
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+transformer_layer_dense(
+    const torch::Tensor& x,
+    const torch::Tensor& policy_indices,
+    const torch::Tensor& in_proj_weight,
+    const torch::Tensor& in_proj_bias,
+    const torch::Tensor& out_proj_weight,
+    const torch::Tensor& out_proj_bias,
+    const torch::Tensor& norm1_weight,
+    const torch::Tensor& norm1_bias,
+    const torch::Tensor& linear1_weight,
+    const torch::Tensor& linear1_bias,
+    const torch::Tensor& linear2_weight,
+    const torch::Tensor& linear2_bias,
+    const torch::Tensor& norm2_weight,
+    const torch::Tensor& norm2_bias,
+    int64_t num_heads,
+    int64_t hidden_dim,
+    std::unordered_map<std::string, std::chrono::microseconds>* timers = nullptr);
+
+/**
+ * Compute single (non-expert) output heads for dense models.
+ *
+ * @return Dict with keys: action_logits, opp_logits, state_values, win_logits
+ */
+c10::Dict<std::string, torch::Tensor>
+compute_heads_dense(
+    const torch::Tensor& transformer_output,
+    const c10::Dict<std::string, torch::Tensor>& batched_weights,
+    const torch::Tensor& policy_indices,
+    std::unordered_map<std::string, std::chrono::microseconds>* timers = nullptr);
+
 } // namespace model
 } // namespace lb
