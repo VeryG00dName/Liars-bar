@@ -86,6 +86,17 @@ VALUE_WEIGHT           = 0.5      # value loss weight
 WIN_PROB_WEIGHT        = 0.25      # win probability head weight
 MOE_LB_WEIGHT          = 0.05
 # ============================
+# Gradient Conflict Resolution (PCGrad/CAGrad)
+# ============================
+# Enable per-opponent gradient conflict resolution to prevent specialization
+USE_GRADIENT_CONFLICT_RESOLUTION = True
+# Method: "pcgrad" (Project Conflicting Gradients) or "cagrad" (Conflict-Averse Gradients)
+CONFLICT_RESOLUTION_METHOD = "pcgrad"
+# CAGrad conflict aversion parameter: 0.0 = equal weighting, 1.0 = minimize worst-case loss
+CAGRAD_C = 0.4
+# Normalize per-opponent gradients to equal L2 norm before projection (prevents one opponent dominating)
+PCGRAD_NORMALIZE_GRADIENTS = True
+# ============================
 # Teacher KL / Behavior Cloning Leash
 # ============================
 BC_KL_WEIGHT = 0  # typical exploration range: 1e-4 .. 1e-2 (decay in code if desired)
