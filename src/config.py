@@ -135,7 +135,7 @@ CULL_INTERVAL = 20001
 CHECKPOINT_INTERVAL = 25
 LOG_INTERVAL = 100
 EMBED_LOG_INTERVAL = 50
-HYBRID_TRAINING_THRESHOLD = 5
+HYBRID_TRAINING_THRESHOLD = 1
 # ============================
 # Evaluation Configuration
 # ============================
