@@ -2,7 +2,7 @@
 
 from collections import defaultdict
 import random
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import os
 
@@ -205,6 +205,11 @@ def _single_pass_ppo(
 
     padding_mask = mi["padding_mask"].to(torch.bool)
     valid_mask = ~padding_mask
+    # Apply episode filter to step/valid masks (restrict loss to selected episodes)
+    if episode_mask is not None:
+        ep_mask_bt = episode_mask.view(B, 1).expand(B, L)
+        valid_mask = valid_mask & ep_mask_bt
+        step_mask = step_mask & ep_mask_bt[:, : step_mask.shape[1]]
 
     rewards_full = batch["rewards_full"].to(device=device, dtype=torch.float32)
     old_values_full = batch["old_values_full"].to(device=device, dtype=torch.float32)
@@ -287,7 +292,7 @@ def _single_pass_ppo(
         B_sel, To, A_opp = opp_logits.shape
         opp_sel = torch.take_along_dim(opp_logits, opp_idx.unsqueeze(-1).expand(-1, -1, A_opp), dim=1)
         
-        w = (opp_have_label & episode_mask.unsqueeze(1)).to(torch.float32)
+        w = (opp_have_label & (episode_mask.unsqueeze(1) if episode_mask is not None else torch.ones_like(opp_have_label))).to(torch.float32)
         opp_loss = _masked_mean(
             F.cross_entropy(opp_sel.reshape(-1, A_opp), opp_targets.reshape(-1), ignore_index=-100, reduction="none").view_as(opp_targets),
             w
@@ -536,6 +541,7 @@ def compute_per_opponent_losses(
     sl_teacher: Optional[torch.nn.Module] = None,
     *,
     update_num: int = 0,
+    restrict_opponents: Optional[Set[int]] = None,
 ) -> Tuple[Dict[int, Tuple[torch.Tensor, Dict[str, torch.Tensor]]], Dict[str, torch.Tensor]]:
     """
     Compute separate loss for each opponent policy in the batch.
@@ -565,6 +571,8 @@ def compute_per_opponent_losses(
     # Get unique opponent IDs (excluding -1)
     unique_ids = torch.unique(others)
     opponent_ids = sorted([int(x.item()) for x in unique_ids if x >= 0])
+    if restrict_opponents is not None:
+        opponent_ids = [oid for oid in opponent_ids if oid in restrict_opponents]
 
     if len(opponent_ids) == 0:
         # No valid opponents, fallback
@@ -631,7 +639,16 @@ def ppo_losses_with_conflict_resolution(
     method: str = "pcgrad",
     cagrad_c: float = 0.4,
     normalize_grads: bool = True,
-) -> Tuple[Dict[int, torch.Tensor], Dict[str, torch.Tensor], Dict[str, torch.Tensor], List[List[torch.Tensor]], Dict[str, float]]:
+    selected_opponents: Optional[Set[int]] = None,
+    collect_grad_vectors: bool = False,
+) -> Tuple[
+    Dict[int, torch.Tensor],
+    Dict[str, torch.Tensor],
+    Dict[str, torch.Tensor],
+    List[List[torch.Tensor]],
+    Dict[str, float],
+    Optional[Dict[int, torch.Tensor]],  # per-opponent flattened grad vectors (scan only)
+]:
     """
     Compute PPO loss with per-opponent gradient conflict resolution.
 
@@ -651,28 +668,37 @@ def ppo_losses_with_conflict_resolution(
         combined_gradients: Conflict-resolved gradients ready to apply (fp32)
         conflict_diagnostics: Conflict statistics
     """
-    # Compute per-opponent losses
+    # Compute per-opponent losses (optionally restricted for cheap path)
+    restrict = None if (collect_grad_vectors or selected_opponents is None) else selected_opponents
     losses_and_metrics_by_opponent, moe_info = compute_per_opponent_losses(
-        model, batch, sl_teacher, update_num=update_num
+        model, batch, sl_teacher, update_num=update_num, restrict_opponents=restrict
     )
 
     if len(losses_and_metrics_by_opponent) <= 1:
         # Single or no opponent, use standard path (no conflict resolution needed)
         if losses_and_metrics_by_opponent:
             loss, metrics = list(losses_and_metrics_by_opponent.values())[0]
-            return {list(losses_and_metrics_by_opponent.keys())[0]: loss}, metrics, moe_info, None, {}
+            return {list(losses_and_metrics_by_opponent.keys())[0]: loss}, metrics, moe_info, None, {}, None
         else:
-            return {}, {}, {}, None, {}
+            return {}, {}, {}, None, {}, None
 
     # Collect trainable parameters once
     params = [p for p in model.parameters() if p.requires_grad]
 
     # Compute gradients for each opponent separately
     opponent_ids = sorted(losses_and_metrics_by_opponent.keys())
+    # Determine the exact list we will compute gradients for
+    selected_list: List[int]
+    if selected_opponents is None:
+        selected_list = opponent_ids
+    else:
+        selected_list = [oid for oid in opponent_ids if oid in selected_opponents]
     gradients_by_opponent = []
+    per_opp_flat: Optional[Dict[int, torch.Tensor]] = {} if collect_grad_vectors else None
     losses_by_opponent = {}
     all_metrics = defaultdict(list)
 
+    last_selected_id = selected_list[-1] if len(selected_list) > 0 else None
     for idx, opp_id in enumerate(opponent_ids):
         loss, metrics = losses_and_metrics_by_opponent[opp_id]
         losses_by_opponent[opp_id] = loss.detach()
@@ -680,36 +706,56 @@ def ppo_losses_with_conflict_resolution(
         for k, v in metrics.items():
             all_metrics[k].append(v)
 
-        # Use autograd.grad for all opponents to avoid touching param.grad before projection
-        # CRITICAL: retain_graph=True for first N-1 opponents (we reuse the same forward pass)
-        is_last = (idx == len(opponent_ids) - 1)
+        if last_selected_id is not None and opp_id in selected_list:
+            # Use autograd.grad to avoid touching param.grad before projection
+            # CRITICAL: retain_graph=True for all but the last SELECTED opponent
+            is_last = (opp_id == last_selected_id)
 
-        grads = torch.autograd.grad(
-            loss,
-            params,
-            retain_graph=(not is_last),  # Keep graph for first N-1 opponents
-            allow_unused=True,           # Some params may not participate due to masking
-        )
-        # Replace None with zeros for unused parameters
-        grads = [g.clone() if g is not None else torch.zeros_like(p) for g, p in zip(grads, params)]
+            grads = torch.autograd.grad(
+                loss,
+                params,
+                retain_graph=(not is_last),  # Keep graph for first N-1 opponents
+                allow_unused=True,           # Some params may not participate due to masking
+            )
+            # Replace None with zeros for unused parameters
+            grads = [g.clone() if g is not None else torch.zeros_like(p) for g, p in zip(grads, params)]
 
-        gradients_by_opponent.append(grads)
+            gradients_by_opponent.append(grads)
+
+            if per_opp_flat is not None:
+                # Flatten to a single fp32 vector for harm scan
+                flat = torch.cat([g.flatten().float() for g in grads])
+                per_opp_flat[opp_id] = flat.detach()
 
     # Clear any remaining gradients
     model.zero_grad()
 
     # Apply gradient projection (in fp32, as handled by projection functions)
     if method == "pcgrad":
-        combined_grads, diagnostics = pcgrad_projection(gradients_by_opponent, normalize=normalize_grads)
+        if gradients_by_opponent:
+            combined_grads, diagnostics = pcgrad_projection(gradients_by_opponent, normalize=normalize_grads)
+        else:
+            # Fallback: no selected gradients; return None and empty diagnostics
+            combined_grads, diagnostics = None, {"conflict_rate": 0.0, "mean_cos_sim": 1.0}
     elif method == "cagrad":
-        combined_grads, diagnostics = cagrad_projection(gradients_by_opponent, c=cagrad_c)
+        if gradients_by_opponent:
+            combined_grads, diagnostics = cagrad_projection(gradients_by_opponent, c=cagrad_c)
+        else:
+            combined_grads, diagnostics = None, {"conflict_rate": 0.0, "mean_cos_sim": 1.0}
     else:
         raise ValueError(f"Unknown conflict resolution method: {method}")
 
     # Average metrics across opponents
     aggregated_metrics = {k: torch.stack(v).mean() for k, v in all_metrics.items() if v}
 
-    return losses_by_opponent, aggregated_metrics, moe_info, combined_grads, diagnostics
+    return (
+        losses_by_opponent,
+        aggregated_metrics,
+        moe_info,
+        combined_grads,
+        diagnostics,
+        per_opp_flat if collect_grad_vectors else None,
+    )
 
 
 # ========================================

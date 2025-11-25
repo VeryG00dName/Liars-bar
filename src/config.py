@@ -88,14 +88,49 @@ MOE_LB_WEIGHT          = 0.05
 # ============================
 # Gradient Conflict Resolution (PCGrad/CAGrad)
 # ============================
-# Enable per-opponent gradient conflict resolution to prevent specialization
+# Enable gradient conflict resolution to prevent specialization
 USE_GRADIENT_CONFLICT_RESOLUTION = True
 # Method: "pcgrad" (Project Conflicting Gradients) or "cagrad" (Conflict-Averse Gradients)
 CONFLICT_RESOLUTION_METHOD = "pcgrad"
 # CAGrad conflict aversion parameter: 0.0 = equal weighting, 1.0 = minimize worst-case loss
 CAGRAD_C = 0.4
-# Normalize per-opponent gradients to equal L2 norm before projection (prevents one opponent dominating)
+# Normalize gradients to equal L2 norm before projection (prevents one task dominating)
 PCGRAD_NORMALIZE_GRADIENTS = True
+
+# Task grouping strategy: "per_opponent" (current broken approach), "hierarchical" (group opponents), or "per_episode" (treat each episode as task)
+PCGRAD_TASK_GROUPING = "hierarchical"
+# Hierarchical grouping bins (only used if PCGRAD_TASK_GROUPING="hierarchical")
+# Format: [(label_min, label_max, "task_name"), ...]
+PCGRAD_HIERARCHICAL_BINS = [
+    (0, 6, "cpp_bots"),      # Hardcoded bots
+    (7, 20, "early_gens"),   # First ~20% of training
+    (21, 35, "mid_gens"),    # Middle generations
+    (36, 51, "recent_gens"), # Recent but not current
+    (52, 999, "self_play"),  # Current generation
+]
+
+# ----------------------------
+# Harm Scoreboard Gating
+# ----------------------------
+# Enable the harm-scoreboard scheduler around PCGrad to reduce cost.
+USE_HARM_SCOREBOARD = True
+# Perform a full scan at the start of every generation (update == 1).
+HARM_SCAN_AT_GEN_START = True
+# If you also want periodic scans within a generation, set > 0 (in updates); 0 disables.
+HARM_SCAN_INTERVAL_UPDATES = 0
+# EMA smoothing for harm score h_j updates.
+HARM_EMA_ALPHA = 0.2
+# Scoring metric: "sign" (EMA of sign(g_j · g_bar)) or "cosine" (EMA of cos with mean grad).
+HARM_SCORE_METRIC = "cosine"
+# Dynamic coverage fraction tau: pick the smallest S that covers ~tau of harmful mass.
+HARM_TAU_COVERAGE = 0.9
+# Clamp S between these bounds.
+HARM_S_MIN = 8
+HARM_S_MAX = 24
+# Goal conflict (vs mean actor grad): try to keep negative mass in [LOW, HIGH].
+# If above HIGH, bias selection larger; if below LOW, bias smaller.
+HARM_NEG_MASS_TARGET_LOW = 0.20
+HARM_NEG_MASS_TARGET_HIGH = 0.30
 # ============================
 # Teacher KL / Behavior Cloning Leash
 # ============================
@@ -146,7 +181,7 @@ CULL_INTERVAL = 20001
 CHECKPOINT_INTERVAL = 25
 LOG_INTERVAL = 100
 EMBED_LOG_INTERVAL = 50
-HYBRID_TRAINING_THRESHOLD = 5
+HYBRID_TRAINING_THRESHOLD = 1
 # ============================
 # Evaluation Configuration
 # ============================
