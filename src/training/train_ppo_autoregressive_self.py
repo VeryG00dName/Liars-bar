@@ -45,7 +45,6 @@ from src.training.ppo_extras import (
     _to_device_batch,
     apply_determinism_settings,
     ppo_losses_batched,
-    ppo_losses_with_conflict_resolution,
     set_seed
 )
 
@@ -1077,9 +1076,6 @@ def train_generation(
             group_count = 0
             processed_minibatches = 0
 
-            # Check if gradient conflict resolution is enabled (read once, use throughout epoch)
-            use_conflict_resolution = getattr(config, "USE_GRADIENT_CONFLICT_RESOLUTION", False)
-
             for bucket_len, mini_eps in bucket_batches:
                 bucket_start_time = time.perf_counter()
                 assert len(mini_eps) == minibatch_size
@@ -1091,57 +1087,15 @@ def train_generation(
                 mini_gpu = _to_device_batch(mini_cpu, device)
 
                 with amp.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == "cuda")):
-                    if use_conflict_resolution:
-                        method = getattr(config, "CONFLICT_RESOLUTION_METHOD", "pcgrad")
-                        cagrad_c = getattr(config, "CAGRAD_C", 0.4)
-                        normalize_grads = getattr(config, "PCGRAD_NORMALIZE_GRADIENTS", True)
-
-                        losses_by_opponent, metrics, moe_info, combined_grads, conflict_diagnostics = ppo_losses_with_conflict_resolution(
-                            learner.train_model,
-                            mini_gpu,
-                            sl_teacher=None,
-                            update_num=update,
-                            method=method,
-                            cagrad_c=cagrad_c,
-                            normalize_grads=normalize_grads,
-                        )
-
-                        # Aggregate opponent losses for logging (average to match standard path scale)
-                        if losses_by_opponent:
-                            total_loss = sum(losses_by_opponent.values()) / len(losses_by_opponent)
-                        else:
-                            total_loss = torch.tensor(0.0, device=device)
-
-                        # Log conflict diagnostics
-                        if conflict_diagnostics:
-                            agg["conflict_rate"] = agg.get("conflict_rate", 0.0) + conflict_diagnostics.get("conflict_rate", 0.0)
-                            agg["mean_cos_sim"] = agg.get("mean_cos_sim", 0.0) + conflict_diagnostics.get("mean_cos_sim", 0.0)
-                    else:
-                        total_loss, metrics, moe_info = ppo_losses_batched(
-                            learner.train_model,
-                            mini_gpu,
-                            sl_teacher=None,
-                            update_num=update,
-                        )
-                        combined_grads = None
+                    total_loss, metrics, moe_info = ppo_losses_batched(
+                        learner.train_model,
+                        mini_gpu,
+                        sl_teacher=None,
+                        update_num=update,
+                    )
 
                 loss_denom = max(group_target, 1)
-
-                if use_conflict_resolution and combined_grads is not None:
-                    # Gradients from PCGrad/CAGrad are unscaled (fp32)
-                    # We need to accumulate them across minibatches, not overwrite
-                    params = [p for p in learner.train_model.parameters() if p.requires_grad]
-                    for param, grad in zip(params, combined_grads):
-                        grad_contribution = (grad / loss_denom).to(param.dtype)
-                        if param.grad is None:
-                            param.grad = grad_contribution
-                        else:
-                            # Accumulate gradients across minibatches
-                            param.grad += grad_contribution
-                    # Note: We skip scaler for PCGrad path - grads are already unscaled
-                else:
-                    # Standard backward pass with AMP scaling
-                    scaler.scale(total_loss / loss_denom).backward()
+                scaler.scale(total_loss / loss_denom).backward()
 
                 processed_minibatches += 1
                 group_count += 1
@@ -1221,34 +1175,19 @@ def train_generation(
                     or processed_minibatches == num_minibatches
                 )
                 if should_step:
-                    if use_conflict_resolution:
-                        # PCGrad path: gradients are already unscaled (fp32), don't use scaler
-                        # Clip gradients for the main part of the network
-                        if main_params:
-                            clip_grad_norm_(main_params, max_norm=float(config.MAX_NORM))
+                    scaler.unscale_(optimizer)
 
-                        # Clip gradients for the auxiliary opponent head separately
-                        if opp_head_params:
-                            clip_grad_norm_(opp_head_params, max_norm=opp_head_max_norm)
+                    # Clip gradients for the main part of the network
+                    if main_params:
+                        clip_grad_norm_(main_params, max_norm=float(config.MAX_NORM))
 
-                        # Direct optimizer step without scaler
-                        optimizer.step()
-                        optimizer.zero_grad(set_to_none=True)
-                    else:
-                        # Standard path: use AMP scaler
-                        scaler.unscale_(optimizer)
+                    # Clip gradients for the auxiliary opponent head separately
+                    if opp_head_params:
+                        clip_grad_norm_(opp_head_params, max_norm=opp_head_max_norm)
 
-                        # Clip gradients for the main part of the network
-                        if main_params:
-                            clip_grad_norm_(main_params, max_norm=float(config.MAX_NORM))
-
-                        # Clip gradients for the auxiliary opponent head separately
-                        if opp_head_params:
-                            clip_grad_norm_(opp_head_params, max_norm=opp_head_max_norm)
-
-                        scaler.step(optimizer)
-                        scaler.update()
-                        optimizer.zero_grad(set_to_none=True)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
 
                     remaining = num_minibatches - processed_minibatches
                     group_target = min(grad_accum_steps, remaining) if remaining > 0 else grad_accum_steps
@@ -1394,12 +1333,6 @@ def train_generation(
         writer.add_scalar("Value/ClipFrac", avg.get("value_clip_frac", 0.0), update)
         writer.add_scalar("MoE/LoadBalance", avg.get("moe_load_balance", 0.0), update)
         writer.add_scalar("MoE/UsageEntropy", avg.get("moe_usage_entropy", 0.0), update)
-
-        # Gradient conflict resolution diagnostics
-        if use_conflict_resolution:
-            writer.add_scalar("GradConflict/ConflictRate", avg.get("conflict_rate", 0.0), update)
-            writer.add_scalar("GradConflict/MeanCosineSim", avg.get("mean_cos_sim", 0.0), update)
-
         writer.add_scalar("Curriculum/TripletCount", current_episode_target, update)
         writer.add_scalar("Curriculum/UniqueOpponents", unique_opponent_count, update)
         writer.add_scalar("Optimizer/WaitlistedEpisodes", skipped_waitlist_total, update)
