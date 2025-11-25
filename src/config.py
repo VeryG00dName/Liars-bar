@@ -89,7 +89,7 @@ MOE_LB_WEIGHT          = 0.05
 # Gradient Conflict Resolution (PCGrad/CAGrad)
 # ============================
 # Enable gradient conflict resolution to prevent specialization
-USE_GRADIENT_CONFLICT_RESOLUTION = True
+USE_GRADIENT_CONFLICT_RESOLUTION = False
 # Method: "pcgrad" (Project Conflicting Gradients) or "cagrad" (Conflict-Averse Gradients)
 CONFLICT_RESOLUTION_METHOD = "pcgrad"
 # CAGrad conflict aversion parameter: 0.0 = equal weighting, 1.0 = minimize worst-case loss
@@ -163,7 +163,7 @@ ROUND_UP_OVERAGE_THRESHOLD = 511
 # The target fraction of total opponent slots dedicated to the "focus" group.
 FOCUS_FRACTION = 0.25
 # The target fraction of total opponent slots dedicated to self-play.
-SELF_PLAY_FRACTION = 0.05
+SELF_PLAY_FRACTION = 0.20
 # The "floor" group (all other opponents) will get the remaining fraction:
 # 1.0 - FOCUS_FRACTION - SELF_PLAY_FRACTION (i.e., 70% with these defaults).
 
@@ -190,7 +190,7 @@ NUM_ROUNDS = 15
 NUM_GAMES_PER_MATCH = 1
 EVAL_VEC_BATCH_SIZE = 1024
 EVAL_INFERENCE_BATCH_SIZE = 512
-CPP_BOT_LABELS = [0, 1, 2, 3, 4, 5, 6]
+CPP_BOT_LABELS = [0, 1, 2, 3, 4, 5, 6, 7]
 # ============================
 # Tournament Configuration
 # ============================
@@ -206,9 +206,9 @@ TOTAL_PLAYERS = 12
 SEED = 42
 DEVICE = "cuda"
 FORCE_CUDA_SYNC_FOR_TIMING = True
-CPP_BOT_MAX_LABEL = 6
+CPP_BOT_MAX_LABEL = 7
 # Probability that a game will shuffle seats (other than seat 0) every round
-SHUFFLE_PERCENTAGE = 0.0
+SHUFFLE_PERCENTAGE = 0.1
 # ============================
 # Everything past this is depreated, kept for compatiblty!
 # ============================

@@ -58,4 +58,18 @@ struct RandomAgent {
   uint8_t act(const float* obs, int len, const uint8_t mask[7]);
 };
 
+struct ParametricBot {
+  const char* name;
+  uint32_t rng;
+  bool has_personality;
+  float bluff_aggressiveness;
+  float volume_aggressiveness;
+  float challenge_threshold;
+
+  explicit ParametricBot(const char* n);
+  void set_seed(uint32_t s);
+  void reset_personality();
+  uint8_t act(const float* obs, int len, const uint8_t mask[7]);
+};
+
 } // namespace bots

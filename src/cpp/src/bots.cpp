@@ -137,4 +137,72 @@ uint8_t RandomAgent::act(const float* /*obs*/, int /*len*/, const uint8_t mask[7
   return (uint8_t)ids[pick];
 }
 
+// -------- ParametricBot --------
+ParametricBot::ParametricBot(const char* n) 
+  : name(n), rng(0xDEADBEEF), has_personality(false), 
+    bluff_aggressiveness(0.0f), volume_aggressiveness(0.0f), challenge_threshold(0.0f) {}
+
+void ParametricBot::set_seed(uint32_t s) { rng = s ? s : 0xDEADBEEF; }
+
+void ParametricBot::reset_personality() {
+  auto rand_float = [&](uint32_t& s) {
+    return (float)(RandomAgent::xorshift32(s)) / 4294967295.0f;
+  };
+  bluff_aggressiveness = rand_float(rng);
+  volume_aggressiveness = rand_float(rng);
+  challenge_threshold = rand_float(rng);
+  has_personality = true;
+}
+
+uint8_t ParametricBot::act(const float* obs, int /*len*/, const uint8_t mask[7]) {
+  if (!has_personality) reset_personality();
+
+  int last_action_count = round_to_int(obs[2]);
+  
+  // 1. Challenge logic
+  if (mask[6]) {
+    float challenge_prob = (last_action_count / 5.0f) * challenge_threshold;
+    float r = (float)(RandomAgent::xorshift32(rng)) / 4294967295.0f;
+    if (r < challenge_prob) return 6;
+  }
+
+  // 2. Action scoring
+  std::vector<int> possible_actions;
+  for (int i=0; i<6; ++i) if (mask[i]) possible_actions.push_back(i);
+  
+  if (possible_actions.empty()) return 6;
+
+  int best_action = -1;
+  float best_score = -1e9f;
+
+  for (int action : possible_actions) {
+    float score = 0.0f;
+    bool is_bluff = (action >= 3);
+    int card_count = 0;
+    if (action == 0 || action == 3) card_count = 1;
+    else if (action == 1 || action == 4) card_count = 2;
+    else if (action == 2 || action == 5) card_count = 3;
+
+    // Bluff bias
+    if (is_bluff) score += bluff_aggressiveness * 10.0f;
+    else score += (1.0f - bluff_aggressiveness) * 10.0f;
+
+    // Volume bias
+    float norm_count = (card_count - 1.0f) / 2.0f;
+    float dist_score = 1.0f - std::abs(norm_count - volume_aggressiveness);
+    score += dist_score * 5.0f;
+
+    // Noise
+    float noise = (float)(RandomAgent::xorshift32(rng)) / 4294967295.0f;
+    score += noise * 2.0f;
+
+    if (score > best_score) {
+      best_score = score;
+      best_action = action;
+    }
+  }
+  
+  return (uint8_t)best_action;
+}
+
 } // namespace bots

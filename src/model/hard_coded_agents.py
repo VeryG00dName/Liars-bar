@@ -297,6 +297,93 @@ class Classic:
         # 4) Fallback: challenge
         return 6
 
+class ParametricBot:
+    def __init__(self, agent_name):
+        self.name = agent_name
+        self.reset_personality()
+        self.has_personality = None
+
+    def reset_personality(self):
+        """
+        Call this at the start of EVERY episode/match.
+        This randomizes the bot's strategy profile.
+        """
+        # 0.0 = Always Truth (Table First), 1.0 = Always Lie (Non-Table First)
+        self.bluff_aggressiveness = random.random() 
+        
+        # 0.0 = Play 1 card, 1.0 = Play Max cards
+        self.volume_aggressiveness = random.random()
+        
+        # 0.0 = Never Challenge, 1.0 = Challenge Everything
+        self.challenge_threshold = random.random() 
+
+    def play_turn(self, observation, action_mask, table_card):
+        if self.has_personality is None:
+            self.has_personality = True
+            self.reset_personality()
+        # 1. Decision: Should I Challenge?
+        # Logic: If last opponent played many cards, higher chance to challenge
+        last_action_count = int(round(observation[2]))
+        if action_mask[6] == 1:
+            # Simple heuristic: Challenge probability scales with opponent's volume and our personality
+            challenge_prob = (last_action_count / 5.0) * self.challenge_threshold
+            if random.random() < challenge_prob:
+                return 6
+
+        # 2. Decision: Which cards to prioritize? (Table vs Non-Table)
+        # We define a preference score for Table vs Non-Table
+        # If bluff_aggressiveness is high, we prefer Non-Table actions
+        
+        # Identify available actions
+        # Actions 0,1,2 = Table (1,2,3 cards)
+        # Actions 3,4,5 = Non-Table (1,2,3 cards)
+        
+        possible_actions = []
+        for i in range(6):
+            if action_mask[i] == 1:
+                possible_actions.append(i)
+        
+        if not possible_actions:
+            return 6 # Fallback to challenge
+
+        # Score the actions based on personality
+        best_action = -1
+        best_score = -float('inf')
+
+        for action in possible_actions:
+            score = 0
+            
+            # Is it a Bluff (Non-Table)?
+            is_bluff = (action >= 3)
+            
+            # Volume: How many cards? (0->1, 1->2, 2->3, 3->1, 4->2, 5->3)
+            # Map action index to card count
+            if action in [0, 3]: card_count = 1
+            elif action in [1, 4]: card_count = 2
+            elif action in [2, 5]: card_count = 3
+            
+            # 1. Apply Bluff Bias
+            if is_bluff:
+                score += self.bluff_aggressiveness * 10 
+            else:
+                score += (1.0 - self.bluff_aggressiveness) * 10
+                
+            # 2. Apply Volume Bias
+            # Normalize count 1-3 to 0.0-1.0
+            norm_count = (card_count - 1) / 2.0 
+            # If we are aggressive, we want higher norm_count
+            dist_score = 1.0 - abs(norm_count - self.volume_aggressiveness)
+            score += dist_score * 5
+            
+            # 3. Add noise so it's not perfectly deterministic
+            score += random.random() * 2
+
+            if score > best_score:
+                best_score = score
+                best_action = action
+                
+        return best_action
+
 class RandomAgent:
     def __init__(self, agent_name):
         self.name = agent_name        

@@ -114,4 +114,18 @@ void bind_bots(py::module_& m) {
             seq_to_mask_7(mask, mask7);
             return static_cast<int>(self.act(v.data(), static_cast<int>(v.size()), mask7));
         });
+    py::class_<bots::ParametricBot>(m, "ParametricBot")
+        .def(py::init<const char*>(), py::arg("name"))
+        .def("set_seed", &bots::ParametricBot::set_seed)
+        .def("reset_personality", &bots::ParametricBot::reset_personality)
+        .def("act", [](bots::ParametricBot& self, py::sequence obs, int length, py::sequence mask) -> int {
+            std::vector<float> v;
+            v.reserve(length);
+            for (auto item : obs) {
+                v.push_back(py::cast<float>(item));
+            }
+            uint8_t mask7[7];
+            seq_to_mask_7(mask, mask7);
+            return static_cast<int>(self.act(v.data(), static_cast<int>(v.size()), mask7));
+        });
 }

@@ -149,6 +149,7 @@ class OpponentPoolManager:
                 {"name": "StrategicChallenger", "type": "cpp_bot", "model_type": "cpp_bot", "label": 4, "path": None},
                 {"name": "TableFirstConservativeChallenger", "type": "cpp_bot", "model_type": "cpp_bot", "label": 5, "path": None},
                 {"name": "TableNonTableAgent", "type": "cpp_bot", "model_type": "cpp_bot", "label": 6, "path": None},
+                {"name": "ParametricBot", "type": "cpp_bot", "model_type": "cpp_bot", "label": 7, "path": None},
             ]
 
             self._save(base_bots)
@@ -748,6 +749,7 @@ def train_generation(
         4: "StrategicChallenger",
         5: "TableFirstConservativeChallenger",
         6: "TableNonTableAgent",
+        7: "ParametricBot",
     }
     registered_cpp_bots: List[int] = []
     for label, name in cpp_bot_names.items():
@@ -1608,7 +1610,7 @@ def train_generation(
             writer.add_scalar(f"PerOpponent/win_rate_vs_{label}", win_rate_val, update)
             writer.add_scalar(f"PerOpponent/episodes_vs_{label}", total, update)
 
-        BOT_MAX_ID = 6
+        BOT_MAX_ID = 7
         per_opponent_totals_int: Dict[int, List[float]] = {}
         for lab_any, (wins_vs, total) in per_opponent_totals.items():
             try:

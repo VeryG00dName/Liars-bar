@@ -110,6 +110,17 @@ public:
 private:
     bots::TableNonTableAgent bot_;
 };
+
+class ParametricBotBot : public CppBotBase {
+public:
+    ParametricBotBot() : bot_("bot") {}
+    uint8_t act(const PolicyRequest& request, VecArena&) override {
+        return bot_.act(request.classic_obs.data(), request.classic_obs_len, request.mask.data());
+    }
+
+private:
+    bots::ParametricBot bot_;
+};
 }
 
 // Static cache for parsed bot kinds
@@ -1538,6 +1549,8 @@ RolloutManager::CppBotKind RolloutManager::parse_cpp_bot_kind(const std::string&
         kind = CppBotKind::TableFirstConservativeChallenger;
     } else if (lower == "tablenontableagent") {
         kind = CppBotKind::TableNonTableAgent;
+    } else if (lower == "parametricbot") {
+        kind = CppBotKind::ParametricBot;
     } else {
         throw std::invalid_argument("Unknown C++ bot name: " + name);
     }
@@ -1568,6 +1581,8 @@ std::unique_ptr<CppBotBase> RolloutManager::make_cpp_bot_instance(RolloutManager
             return std::make_unique<TableFirstConservativeChallengerBot>();
         case RolloutManager::CppBotKind::TableNonTableAgent:
             return std::make_unique<TableNonTableAgentBot>();
+        case RolloutManager::CppBotKind::ParametricBot:
+            return std::make_unique<ParametricBotBot>();
     }
 
     throw std::runtime_error("Unsupported C++ bot kind");
