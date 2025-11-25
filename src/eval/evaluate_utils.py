@@ -59,6 +59,7 @@ CPP_BOT_LABEL_TO_NAME = {
     4: "StrategicChallenger",
     5: "TableFirstConservativeChallenger",
     6: "TableNonTableAgent",
+    7: "ParametricBot",
 }
 
 

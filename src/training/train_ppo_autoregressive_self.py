@@ -181,10 +181,10 @@ class OpponentPoolManager:
             print(f"Agent at path '{path}' already in pool. Skipping.")
             return
 
-        existing_labels = {a['label'] for a in self.pool if a['type'] != 'cpp_bot'}
-        next_label = 7
-        while next_label in existing_labels:
-            next_label += 1
+        # Check ALL labels (including cpp_bots) to find the next available one
+        existing_labels = {a['label'] for a in self.pool if a.get('label') is not None}
+        # Start from the max existing label + 1 (cpp_bots are 0-7, so historical agents start at 8)
+        next_label = max(existing_labels) + 1 if existing_labels else 8
 
         # Create the new agent dictionary
         new_agent_entry = {
@@ -1010,7 +1010,7 @@ def train_generation(
 
             # Determine the sampling fraction based on the age of the oldest data
             oldest_age = max(item[1] for item in ep_buffer)
-            sampling_fraction = 1.0 / oldest_age
+            sampling_fraction = 1.0 #/ oldest_age
             
             num_to_sample = math.ceil(len(ep_buffer) * sampling_fraction)
             

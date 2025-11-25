@@ -78,6 +78,7 @@ private:
         StrategicChallenger,
         TableFirstConservativeChallenger,
         TableNonTableAgent,
+        ParametricBot,
     };
 
     struct CppBotRegistryEntry {

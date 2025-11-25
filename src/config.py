@@ -84,7 +84,7 @@ INIT_ENTROPY_COEF = 0.005
 AUX_OPP_WEIGHT         = 1   # opponent action weight (SL is 1.0)
 VALUE_WEIGHT           = 0.5      # value loss weight
 WIN_PROB_WEIGHT        = 0.25      # win probability head weight
-MOE_LB_WEIGHT          = 0.05
+MOE_LB_WEIGHT          = 0.0
 # ============================
 # Teacher KL / Behavior Cloning Leash
 # ============================
@@ -93,7 +93,7 @@ BC_KL_WEIGHT = 0  # typical exploration range: 1e-4 .. 1e-2 (decay in code if de
 # ============================
 # Off-Policy Data Buffering — Optional
 # ============================
-OFFPOLICY_EP_BUFFER_MULT = 4
+OFFPOLICY_EP_BUFFER_MULT = 2
 
 # ============================
 # Mega-Batch Curriculum Configuration
@@ -115,9 +115,9 @@ ROUND_UP_OVERAGE_THRESHOLD = 511
 
 # --- Proportional Budgeting ---
 # The target fraction of total opponent slots dedicated to the "focus" group.
-FOCUS_FRACTION = 0.25
+FOCUS_FRACTION = 0.50
 # The target fraction of total opponent slots dedicated to self-play.
-SELF_PLAY_FRACTION = 0.20
+SELF_PLAY_FRACTION = 0.25
 # The "floor" group (all other opponents) will get the remaining fraction:
 # 1.0 - FOCUS_FRACTION - SELF_PLAY_FRACTION (i.e., 70% with these defaults).
 
@@ -162,7 +162,7 @@ DEVICE = "cuda"
 FORCE_CUDA_SYNC_FOR_TIMING = True
 CPP_BOT_MAX_LABEL = 7
 # Probability that a game will shuffle seats (other than seat 0) every round
-SHUFFLE_PERCENTAGE = 0.1
+SHUFFLE_PERCENTAGE = 0.0
 # ============================
 # Everything past this is depreated, kept for compatiblty!
 # ============================
