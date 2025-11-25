@@ -605,15 +605,11 @@ def train_generation(
             train_model = type(learner.model)(**getattr(learner.model, "config", {})).to(device)
             train_model.load_state_dict(learner.model.state_dict())
 
-        # 2.3. Compile the TRAINING model (for static shapes, or dynamic if using PCGrad)
+        # 2.3. Compile the TRAINING model (for static shapes)
         if compile_fn:
             try:
-                # Use dynamic=True if PCGrad is enabled (variable batch sizes per opponent)
-                use_pcgrad = getattr(config, "USE_GRADIENT_CONFLICT_RESOLUTION", False)
-                is_dynamic = use_pcgrad  # PCGrad needs dynamic shapes
-
-                logging.info(f"Compiling training model (dynamic={is_dynamic})...")
-                compiled_train = compile_fn(train_model, dynamic=is_dynamic)
+                logging.info("Compiling training model (dynamic=False)...")
+                compiled_train = compile_fn(train_model, dynamic=False)
                 learner.train_model = compiled_train
             except Exception as exc:
                 logging.warning(f"torch.compile (train) failed; using eager model: {exc}")
@@ -923,108 +919,6 @@ def train_generation(
         lambda: {"count": 0, "total_time": 0.0, "total_size": 0}
     )
 
-    # --- Harm Scoreboard (per generation) ---
-    use_harm_sb = bool(getattr(config, "USE_HARM_SCOREBOARD", False)) and bool(getattr(config, "USE_GRADIENT_CONFLICT_RESOLUTION", False))
-
-    class HarmScoreboard:
-        def __init__(self,
-                     alpha: float,
-                     metric: str,
-                     tau: float,
-                     s_min: int,
-                     s_max: int,
-                     low: float,
-                     high: float):
-            self.alpha = float(alpha)
-            self.metric = str(metric).lower()
-            self.tau = float(tau)
-            self.s_min = int(s_min)
-            self.s_max = int(s_max)
-            self.low = float(low)
-            self.high = float(high)
-            self.h: Dict[int, float] = {}
-            self.last_neg_mass_frac: float = 0.0
-
-        def update_from_grad_vectors(self, per_opp_flat: Dict[int, torch.Tensor]) -> None:
-            if not per_opp_flat:
-                return
-            opp_ids = sorted(per_opp_flat.keys())
-            vecs = torch.stack([per_opp_flat[i].float() for i in opp_ids], dim=0)
-            vecs_norm = vecs / (vecs.norm(dim=1, keepdim=True) + 1e-8)
-            mean_vec = vecs_norm.mean(dim=0)
-            mean_norm = mean_vec / (mean_vec.norm() + 1e-8)
-            cos_vals = torch.mv(vecs_norm, mean_norm).clamp(-1.0, 1.0)
-            sign_vals = torch.sign(cos_vals)
-
-            if self.metric == "cosine":
-                neg_mass = (-torch.minimum(cos_vals, torch.zeros_like(cos_vals))).sum().item()
-                denom = (cos_vals.abs().sum().item() + 1e-8)
-                self.last_neg_mass_frac = float(neg_mass / denom)
-            else:
-                self.last_neg_mass_frac = float((sign_vals < 0).float().mean().item())
-
-            for idx, opp_id in enumerate(opp_ids):
-                val = float(cos_vals[idx].item() if self.metric == "cosine" else sign_vals[idx].item())
-                prev = self.h.get(opp_id, 0.0)
-                self.h[opp_id] = (1.0 - self.alpha) * prev + self.alpha * val
-
-        def select(self, present: List[int]) -> List[int]:
-            if not present:
-                return []
-            masses: List[Tuple[int, float]] = []
-            for j in present:
-                hj = float(self.h.get(j, 0.0))
-                masses.append((j, max(0.0, -hj)))
-            masses.sort(key=lambda x: x[1], reverse=True)
-            total_mass = sum(m for _, m in masses)
-            if total_mass > 0:
-                target = self.tau * total_mass
-                cum = 0.0
-                k = 0
-                for k in range(len(masses)):
-                    cum += masses[k][1]
-                    if cum >= target:
-                        k += 1
-                        break
-                S = max(1, k)
-            else:
-                S = max(1, self.s_min)
-
-            if self.last_neg_mass_frac > self.high:
-                S += 2
-            elif self.last_neg_mass_frac < self.low:
-                S -= 1
-
-            S = max(1, min(self.s_max, max(self.s_min, S)))
-            S = min(S, len(masses))
-            return [j for j, _ in masses[:S]]
-
-    harm_sb: Optional[HarmScoreboard] = None
-    if use_harm_sb:
-        harm_sb = HarmScoreboard(
-            alpha=float(getattr(config, "HARM_EMA_ALPHA", 0.2)),
-            metric=str(getattr(config, "HARM_SCORE_METRIC", "sign")),
-            tau=float(getattr(config, "HARM_TAU_COVERAGE", 0.8)),
-            s_min=int(getattr(config, "HARM_S_MIN", 6)),
-            s_max=int(getattr(config, "HARM_S_MAX", 16)),
-            low=float(getattr(config, "HARM_NEG_MASS_TARGET_LOW", 0.2)),
-            high=float(getattr(config, "HARM_NEG_MASS_TARGET_HIGH", 0.3)),
-        )
-
-    def _present_opponent_ids(batch: Dict[str, torch.Tensor]) -> List[int]:
-        player_labels = batch.get("player_labels")
-        training_seat = batch.get("training_seat")
-        if not isinstance(player_labels, torch.Tensor) or not isinstance(training_seat, torch.Tensor):
-            return []
-        mask = torch.ones_like(player_labels, dtype=torch.bool)
-        mask.scatter_(1, training_seat.view(-1, 1), False)
-        others = torch.where(mask, player_labels, torch.full_like(player_labels, -1))
-        unique_ids = torch.unique(others)
-        return sorted([int(x.item()) for x in unique_ids if int(x.item()) >= 0])
-
-    scan_at_gen_start = bool(getattr(config, "HARM_SCAN_AT_GEN_START", True))
-    scan_interval = int(getattr(config, "HARM_SCAN_INTERVAL_UPDATES", 0))
-
     for update in range(1, max_updates + 1):
         # -------- Rollout --------
         bucket_stats.clear()
@@ -1202,35 +1096,7 @@ def train_generation(
                         cagrad_c = getattr(config, "CAGRAD_C", 0.4)
                         normalize_grads = getattr(config, "PCGRAD_NORMALIZE_GRADIENTS", True)
 
-                        # Harm scoreboard scheduling
-                        do_scan = False
-                        if use_harm_sb:
-                            if scan_at_gen_start and update == 1:
-                                do_scan = True
-                            elif scan_interval > 0 and (update - 1) % max(1, scan_interval) == 0:
-                                do_scan = True
-
-                        selected_opps = None
-                        collect_vecs = False
-                        if use_harm_sb:
-                            if do_scan and harm_sb is not None:
-                                collect_vecs = True  # full scan
-                            else:
-                                present = _present_opponent_ids(mini_gpu)
-                                if present and harm_sb is not None:
-                                    chosen = harm_sb.select(present)
-                                    if not chosen and present:
-                                        chosen = present[:1]
-                                    selected_opps = set(chosen)
-
-                        (
-                            losses_by_opponent,
-                            metrics,
-                            moe_info,
-                            combined_grads,
-                            conflict_diagnostics,
-                            per_opp_flat,
-                        ) = ppo_losses_with_conflict_resolution(
+                        losses_by_opponent, metrics, moe_info, combined_grads, conflict_diagnostics = ppo_losses_with_conflict_resolution(
                             learner.train_model,
                             mini_gpu,
                             sl_teacher=None,
@@ -1238,8 +1104,6 @@ def train_generation(
                             method=method,
                             cagrad_c=cagrad_c,
                             normalize_grads=normalize_grads,
-                            selected_opponents=selected_opps,
-                            collect_grad_vectors=collect_vecs,
                         )
 
                         # Aggregate opponent losses for logging (average to match standard path scale)
@@ -1252,12 +1116,6 @@ def train_generation(
                         if conflict_diagnostics:
                             agg["conflict_rate"] = agg.get("conflict_rate", 0.0) + conflict_diagnostics.get("conflict_rate", 0.0)
                             agg["mean_cos_sim"] = agg.get("mean_cos_sim", 0.0) + conflict_diagnostics.get("mean_cos_sim", 0.0)
-                        # Log number of opponents in this batch (for context)
-                        num_opps_in_batch = len(losses_by_opponent) if losses_by_opponent else 0
-                        agg["num_opponents_per_batch"] = agg.get("num_opponents_per_batch", 0.0) + num_opps_in_batch
-                        # Update harm scoreboard EMA on scan
-                        if use_harm_sb and collect_vecs and harm_sb is not None and per_opp_flat:
-                            harm_sb.update_from_grad_vectors({k: v.detach().cpu() for k, v in per_opp_flat.items()})
                     else:
                         total_loss, metrics, moe_info = ppo_losses_batched(
                             learner.train_model,
@@ -1541,7 +1399,6 @@ def train_generation(
         if use_conflict_resolution:
             writer.add_scalar("GradConflict/ConflictRate", avg.get("conflict_rate", 0.0), update)
             writer.add_scalar("GradConflict/MeanCosineSim", avg.get("mean_cos_sim", 0.0), update)
-            writer.add_scalar("GradConflict/AvgOpponentsPerBatch", avg.get("num_opponents_per_batch", 0.0), update)
 
         writer.add_scalar("Curriculum/TripletCount", current_episode_target, update)
         writer.add_scalar("Curriculum/UniqueOpponents", unique_opponent_count, update)
