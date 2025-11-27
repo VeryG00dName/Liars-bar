@@ -115,7 +115,7 @@ ROUND_UP_OVERAGE_THRESHOLD = 511
 
 # --- Proportional Budgeting ---
 # The target fraction of total opponent slots dedicated to the "focus" group.
-FOCUS_FRACTION = 0.50
+FOCUS_FRACTION = 0.25
 # The target fraction of total opponent slots dedicated to self-play.
 SELF_PLAY_FRACTION = 0.25
 # The "floor" group (all other opponents) will get the remaining fraction:
@@ -162,7 +162,7 @@ DEVICE = "cuda"
 FORCE_CUDA_SYNC_FOR_TIMING = True
 CPP_BOT_MAX_LABEL = 7
 # Probability that a game will shuffle seats (other than seat 0) every round
-SHUFFLE_PERCENTAGE = 0.0
+SHUFFLE_PERCENTAGE = 0.05
 # ============================
 # Everything past this is depreated, kept for compatiblty!
 # ============================

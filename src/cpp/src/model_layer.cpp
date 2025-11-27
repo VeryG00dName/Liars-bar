@@ -113,13 +113,21 @@ compute_embeddings(
     auto action_embed = act_kind_embed + count_embed + table_flag_embed;
     result.insert("action_embed", action_embed);
 
-    // Agent + position embeddings
+    // Agent embedding (always present)
     auto agent_embed = lb::kernels::indexed_batched_embedding(
         get_weight(batched_weights, "agent_embedding.weight"), agent_types.to(torch::kLong), pol);
-    auto position_embed = lb::kernels::indexed_batched_embedding(
-        get_weight(batched_weights, "position_embedding.weight"), positions.to(torch::kLong), pol);
     result.insert("agent_embed", agent_embed);
-    result.insert("position_embed", position_embed);
+
+    // Position embedding (optional - not present in RoPE models)
+    if (batched_weights.contains("position_embedding.weight")) {
+        auto position_embed = lb::kernels::indexed_batched_embedding(
+            get_weight(batched_weights, "position_embedding.weight"), positions.to(torch::kLong), pol);
+        result.insert("position_embed", position_embed);
+    } else {
+        // RoPE model: create zero tensor placeholder
+        auto position_embed = torch::zeros_like(agent_embed);
+        result.insert("position_embed", position_embed);
+    }
 
     return result;
 }
@@ -184,6 +192,49 @@ fuse_embeddings(
     return result;
 }
 
+namespace {
+using torch::indexing::Slice;
+
+inline std::pair<torch::Tensor, torch::Tensor> apply_rope_bthd(
+    const torch::Tensor& q_bthd, // [B, T, H, Hd]
+    const torch::Tensor& k_bthd, // [B, T, H, Hd]
+    const torch::Tensor& positions, // [B, T]
+    int64_t head_dim,
+    double base = 10000.0
+) {
+    auto device = q_bthd.device();
+    auto dtype = q_bthd.scalar_type();
+
+    // inv_freq: [Hd/2]
+    auto half = head_dim / 2;
+    auto inv_idx = torch::arange(0, half, torch::dtype(torch::kFloat32).device(device));
+    auto inv_freq = 1.0 / torch::pow(torch::full_like(inv_idx, base), inv_idx / static_cast<float>(head_dim));
+
+    // positions: [B, T] -> [B, T, 1]
+    auto pos_f = positions.to(device, /*dtype=*/torch::kFloat32).unsqueeze(-1);
+    // freqs: [B, T, Hd/2]
+    auto freqs = pos_f * inv_freq.view({1, 1, half});
+    auto cos = torch::cos(freqs);
+    auto sin = torch::sin(freqs);
+    // interleave to [B, T, Hd]
+    auto cos_i = torch::stack({cos, cos}, -1).flatten(-2).to(dtype);
+    auto sin_i = torch::stack({sin, sin}, -1).flatten(-2).to(dtype);
+
+    // expand to [B, T, H, Hd]
+    cos_i = cos_i.unsqueeze(2);
+    sin_i = sin_i.unsqueeze(2);
+
+    auto rot_half = [](const torch::Tensor& x) {
+        auto parts = x.chunk(2, -1);
+        return torch::cat({-parts[1], parts[0]}, -1);
+    };
+
+    auto q_rot = q_bthd * cos_i + rot_half(q_bthd) * sin_i;
+    auto k_rot = k_bthd * cos_i + rot_half(k_bthd) * sin_i;
+    return {q_rot, k_rot};
+}
+} // anonymous namespace
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 transformer_layer(
     const torch::Tensor& x,
@@ -208,6 +259,8 @@ transformer_layer(
     int64_t num_experts,
     int64_t num_policies,
     lb::moe::MoEWorkspace* workspace,
+    const torch::optional<torch::Tensor>& positions,
+    bool use_rope,
     std::unordered_map<std::string, std::chrono::microseconds>* timers) {
 
     using Microseconds = std::chrono::microseconds;
@@ -231,6 +284,14 @@ transformer_layer(
     q = q.view({B, T, num_heads, head_dim}).transpose(1, 2);
     k = k.view({B, T, num_heads, head_dim}).transpose(1, 2);
     v = v.view({B, T, num_heads, head_dim}).transpose(1, 2);
+
+    if (use_rope && positions.has_value()) {
+        auto q_bthd = q.transpose(1, 2);
+        auto k_bthd = k.transpose(1, 2);
+        auto [q_rot, k_rot] = apply_rope_bthd(q_bthd, k_bthd, positions.value(), head_dim);
+        q = q_rot.transpose(1, 2);
+        k = k_rot.transpose(1, 2);
+    }
 
     auto attn_output = torch::scaled_dot_product_attention(q, k, v, torch::nullopt, 0.0, true);
     attn_output = attn_output.transpose(1, 2).contiguous().view({B, T, hidden_dim});
@@ -628,6 +689,29 @@ moe_group_metadata_device(
 }
 
 // =============================================================================
+// Architecture Detection Helpers
+// =============================================================================
+
+bool has_rope(const c10::Dict<std::string, torch::Tensor>& batched_weights) {
+    // Prefer explicit RoPE buffers if present, otherwise fall back to absence of learned positions
+    if (batched_weights.contains("transformer.layers.0.rope.inv_freq") ||
+        batched_weights.contains("transformer_layers.0.rope.inv_freq") ||
+        batched_weights.contains("transformer.layers.0.rope.cos_cache") ||
+        batched_weights.contains("transformer_layers.0.rope.cos_cache")) {
+        return true;
+    }
+    return !batched_weights.contains("position_embedding.weight");
+}
+
+bool has_swiglu(const c10::Dict<std::string, torch::Tensor>& batched_weights) {
+    // SwiGLU models have w_gate/w_up/w_down instead of linear1/linear2
+    return batched_weights.contains("transformer_layers.0.swiglu_ffn.w_gate.weight") ||
+           batched_weights.contains("transformer.layers.0.swiglu_ffn.w_gate.weight") ||
+           batched_weights.contains("transformer_layers.0.ffn.w_gate.weight") ||
+           batched_weights.contains("transformer.layers.0.ffn.w_gate.weight");
+}
+
+// =============================================================================
 // Dense (non-MoE) Architecture Support
 // =============================================================================
 
@@ -654,6 +738,8 @@ transformer_layer_dense(
     const torch::Tensor& norm2_bias,
     int64_t num_heads,
     int64_t hidden_dim,
+    const torch::optional<torch::Tensor>& positions,
+    bool use_rope,
     std::unordered_map<std::string, std::chrono::microseconds>* timers) {
 
     using Microseconds = std::chrono::microseconds;
@@ -677,6 +763,14 @@ transformer_layer_dense(
     q = q.view({B, T, num_heads, head_dim}).transpose(1, 2);
     k = k.view({B, T, num_heads, head_dim}).transpose(1, 2);
     v = v.view({B, T, num_heads, head_dim}).transpose(1, 2);
+
+    if (use_rope && positions.has_value()) {
+        auto q_bthd = q.transpose(1, 2);
+        auto k_bthd = k.transpose(1, 2);
+        auto [q_rot, k_rot] = apply_rope_bthd(q_bthd, k_bthd, positions.value(), head_dim);
+        q = q_rot.transpose(1, 2);
+        k = k_rot.transpose(1, 2);
+    }
 
     auto attn_output = torch::scaled_dot_product_attention(q, k, v, torch::nullopt, 0.0, true);
     attn_output = attn_output.transpose(1, 2).contiguous().view({B, T, hidden_dim});
@@ -756,3 +850,89 @@ compute_heads_dense(
 
 } // namespace model
 } // namespace lb
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+lb::model::transformer_layer_dense_swiglu(
+    const torch::Tensor& x,
+    const torch::Tensor& policy_indices,
+    const torch::Tensor& in_proj_weight,
+    const torch::Tensor& in_proj_bias,
+    const torch::Tensor& out_proj_weight,
+    const torch::Tensor& out_proj_bias,
+    const torch::Tensor& norm1_weight,
+    const torch::Tensor& norm1_bias,
+    const torch::Tensor& w_gate_weight,
+    const torch::Tensor& w_gate_bias,
+    const torch::Tensor& w_up_weight,
+    const torch::Tensor& w_up_bias,
+    const torch::Tensor& w_down_weight,
+    const torch::Tensor& w_down_bias,
+    const torch::Tensor& norm2_weight,
+    const torch::Tensor& norm2_bias,
+    int64_t num_heads,
+    int64_t hidden_dim,
+    const torch::optional<torch::Tensor>& positions,
+    bool use_rope,
+    std::unordered_map<std::string, std::chrono::microseconds>* timers) {
+
+    using Microseconds = std::chrono::microseconds;
+    using Clock = std::chrono::high_resolution_clock;
+    std::unordered_map<std::string, Microseconds> dummy_timers;
+    auto& t = timers ? *timers : dummy_timers;
+
+    const int64_t B = x.size(0);
+    const int64_t T = x.size(1);
+    const int64_t head_dim = hidden_dim / num_heads;
+
+    // Attention block (same as dense)
+    auto t0 = Clock::now();
+    auto qkv_weights = in_proj_weight.chunk(3, in_proj_weight.dim() == 3 ? 1 : 0);
+    auto qkv_biases  = in_proj_bias.chunk(3, in_proj_bias.dim() == 2 ? 1 : 0);
+
+    auto q = lb::kernels::indexed_batched_linear(x, qkv_weights[0], qkv_biases[0], policy_indices, t);
+    auto k = lb::kernels::indexed_batched_linear(x, qkv_weights[1], qkv_biases[1], policy_indices, t);
+    auto v = lb::kernels::indexed_batched_linear(x, qkv_weights[2], qkv_biases[2], policy_indices, t);
+
+    q = q.view({B, T, num_heads, head_dim}).transpose(1, 2);
+    k = k.view({B, T, num_heads, head_dim}).transpose(1, 2);
+    v = v.view({B, T, num_heads, head_dim}).transpose(1, 2);
+
+    if (use_rope && positions.has_value()) {
+        auto q_bthd = q.transpose(1, 2);
+        auto k_bthd = k.transpose(1, 2);
+        auto [q_rot, k_rot] = apply_rope_bthd(q_bthd, k_bthd, positions.value(), head_dim);
+        q = q_rot.transpose(1, 2);
+        k = k_rot.transpose(1, 2);
+    }
+
+    auto attn_output = torch::scaled_dot_product_attention(q, k, v, torch::nullopt, 0.0, true);
+    attn_output = attn_output.transpose(1, 2).contiguous().view({B, T, hidden_dim});
+    attn_output = lb::kernels::indexed_batched_linear(attn_output, out_proj_weight, out_proj_bias, policy_indices, t);
+
+    auto residual1 = x + attn_output;
+    auto x_norm = lb::kernels::indexed_batched_layer_norm(residual1, norm1_weight, norm1_bias, policy_indices, 1e-5);
+
+    auto t1 = Clock::now();
+    t["layer_attention_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
+
+    // SwiGLU FFN block
+    t0 = Clock::now();
+    auto gate = lb::kernels::indexed_batched_linear(x_norm, w_gate_weight, w_gate_bias, policy_indices, t);
+    gate = torch::silu(gate);
+    auto up = lb::kernels::indexed_batched_linear(x_norm, w_up_weight, w_up_bias, policy_indices, t);
+    auto gated = gate * up;
+    auto ffn_output = lb::kernels::indexed_batched_linear(gated, w_down_weight, w_down_bias, policy_indices, t);
+
+    auto residual2 = x_norm + ffn_output;
+    auto x_next = lb::kernels::indexed_batched_layer_norm(residual2, norm2_weight, norm2_bias, policy_indices, 1e-5);
+
+    t1 = Clock::now();
+    t["layer_ffn_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
+
+    // Return dummy routing tensors for API compatibility
+    auto dummy_gate_logits = torch::empty({B, T, 1}, x.options());
+    auto dummy_topk_indices = torch::zeros({B, T, 1}, torch::dtype(torch::kLong).device(x.device()));
+    auto dummy_topk_weights = torch::ones({B, T, 1}, x.options().dtype(torch::kFloat32));
+
+    return std::make_tuple(x_next, dummy_gate_logits, dummy_topk_indices, dummy_topk_weights);
+}

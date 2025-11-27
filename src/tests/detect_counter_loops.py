@@ -385,7 +385,7 @@ def main():
         description="Detect non-transitive counter loops and generational upsets from a H2H win-rate matrix.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument("csv", help="Path to the square H2H win-rate matrix CSV file.")
+    parser.add_argument("--csv", default="h2h_winrate_matrix.csv", help="Path to the square H2H win-rate matrix CSV file.")
     parser.add_argument("--threshold", type=float, default=0.05,
                         help="Minimum win-rate margin (WR_A - WR_B) to be considered a 'beat'.")
     parser.add_argument("--min-len", type=int, default=3, help="Minimum cycle length to report.")

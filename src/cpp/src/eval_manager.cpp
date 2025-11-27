@@ -249,17 +249,38 @@ void EvalManager::finalize_model_loading() {
     batched_weight_cache_.clear();
     policy_id_to_cache_index_.clear();
     batched_weight_cache_moe_.clear();
-    batched_weight_cache_dense_.clear();
+    batched_weight_cache_dense_rope_.clear();
+    batched_weight_cache_dense_classic_.clear();
     policy_id_to_cache_index_moe_.clear();
-    policy_id_to_cache_index_dense_.clear();
+    policy_id_to_cache_index_dense_rope_.clear();
+    policy_id_to_cache_index_dense_classic_.clear();
     policy_is_moe_.clear();
+    policy_is_rope_.clear();
     orchestrator_.reset();
     orchestrator_moe_.reset();
-    orchestrator_dense_.reset();
+    orchestrator_dense_rope_.reset();
+    orchestrator_dense_classic_.reset();
 
     if (staged_state_dicts_.empty()) {
         weights_finalized_ = true;
         return;
+    }
+
+    // Normalize attention weights/aliases and ensure key-set compatibility across dense policies
+    for (auto& kv : staged_state_dicts_) {
+        process_and_split_attention_weights(kv.second);
+        // Ensure position_embedding.weight exists (RoPE models omit it)
+        const int64_t max_seq_len = [this, &kv]() -> int64_t {
+            auto it = policy_max_sequence_length_.find(kv.first);
+            if (it != policy_max_sequence_length_.end()) return it->second;
+            return static_cast<int64_t>(arena_.max_sequence_length);
+        }();
+        if (!kv.second.count("position_embedding.weight")) {
+            kv.second["position_embedding.weight"] = torch::zeros(
+                {max_seq_len, hidden_dim_},
+                torch::dtype(torch::kFloat32)
+            );
+        }
     }
 
     // Detect architecture for each policy and split into groups
@@ -322,12 +343,12 @@ void EvalManager::finalize_model_loading() {
                 const auto& policy_dict = staged_state_dicts_.at(policy_id);
                 auto key_it = policy_dict.find(key);
                 if (key_it == policy_dict.end()) {
-                    throw std::runtime_error(
-                        "[EvalManager] Policy " + std::to_string(policy_id) +
-                        " missing key '" + key + "' expected from first policy in group. "
-                        "All policies in the same architecture group must have identical weight keys.");
+                    // Fill missing key with zeros matching the first policy's shape
+                    const auto& tmpl = first_dict.at(key);
+                    cpu_tensors.push_back(torch::zeros_like(tmpl));
+                } else {
+                    cpu_tensors.push_back(key_it->second);
                 }
-                cpu_tensors.push_back(key_it->second);
             }
 
             auto stacked_gpu_fp16 = torch::stack(cpu_tensors, 0)
@@ -367,13 +388,31 @@ void EvalManager::finalize_model_loading() {
         );
     }
 
-    // Batch dense policies
-    if (!dense_policy_ids.empty()) {
-        batch_policies(dense_policy_ids, batched_weight_cache_dense_, policy_id_to_cache_index_dense_, false);
+    // Split dense policies by RoPE usage to avoid mixing architectures
+    std::vector<int> dense_rope_ids;
+    std::vector<int> dense_classic_ids;
+    for (int pid : dense_policy_ids) {
+        const auto& dict = staged_state_dicts_.at(pid);
+        bool use_rope = dict.count("transformer.layers.0.rope.inv_freq") > 0 ||
+                        dict.count("transformer_layers.0.rope.inv_freq") > 0 ||
+                        !dict.count("position_embedding.weight");
+        policy_is_rope_[pid] = use_rope;
+        if (use_rope) {
+            dense_rope_ids.push_back(pid);
+        } else {
+            dense_classic_ids.push_back(pid);
+        }
+    }
 
-        orchestrator_dense_ = std::make_unique<execution_core::NeuralInferenceOrchestrator>(
-            batched_weight_cache_dense_,
-            policy_id_to_cache_index_dense_,
+    auto maybe_make_dense = [this, &batch_policies](const std::vector<int>& ids,
+                                                    c10::Dict<std::string, torch::Tensor>& cache,
+                                                    std::unordered_map<int, int>& id_to_idx,
+                                                    std::unique_ptr<execution_core::NeuralInferenceOrchestrator>& orch) {
+        if (ids.empty()) return;
+        batch_policies(ids, cache, id_to_idx, false);
+        orch = std::make_unique<execution_core::NeuralInferenceOrchestrator>(
+            cache,
+            id_to_idx,
             max_inference_batch_size_,
             num_layers_,
             num_heads_,
@@ -382,7 +421,10 @@ void EvalManager::finalize_model_loading() {
             1,  // top_k (not used for dense)
             /*use_argmax=*/true
         );
-    }
+    };
+
+    maybe_make_dense(dense_rope_ids, batched_weight_cache_dense_rope_, policy_id_to_cache_index_dense_rope_, orchestrator_dense_rope_);
+    maybe_make_dense(dense_classic_ids, batched_weight_cache_dense_classic_, policy_id_to_cache_index_dense_classic_, orchestrator_dense_classic_);
 
     staged_state_dicts_.clear();
     weights_finalized_ = true;
@@ -558,7 +600,8 @@ EvalOutcome EvalManager::run_roles(const std::vector<std::vector<int>>& roles,
             // If not a C++ bot, it must be a neural model
             // Check both MoE and dense architecture maps
             bool found_in_moe = policy_id_to_cache_index_moe_.find(policy_id) != policy_id_to_cache_index_moe_.end();
-            bool found_in_dense = policy_id_to_cache_index_dense_.find(policy_id) != policy_id_to_cache_index_dense_.end();
+            bool found_in_dense = policy_id_to_cache_index_dense_rope_.find(policy_id) != policy_id_to_cache_index_dense_rope_.end() ||
+                                  policy_id_to_cache_index_dense_classic_.find(policy_id) != policy_id_to_cache_index_dense_classic_.end();
 
             if (!found_in_moe && !found_in_dense) {
                 throw std::runtime_error("No registered model for policy " + std::to_string(policy_id));
@@ -686,9 +729,10 @@ void EvalManager::run_neural_inference(
         throw std::runtime_error("[EvalManager] Weights not finalized - call finalize_model_loading() first");
     }
 
-    // Split requests by architecture (MoE vs Dense)
+    // Split requests by architecture (MoE vs Dense, and Dense by RoPE)
     std::unordered_map<int, std::vector<PolicyRequest>> moe_requests;
-    std::unordered_map<int, std::vector<PolicyRequest>> dense_requests;
+    std::unordered_map<int, std::vector<PolicyRequest>> dense_rope_requests;
+    std::unordered_map<int, std::vector<PolicyRequest>> dense_classic_requests;
 
     for (const auto& kv : requests_by_policy) {
         int policy_id = kv.first;
@@ -700,7 +744,12 @@ void EvalManager::run_neural_inference(
         if (arch_it->second) {
             moe_requests[policy_id] = kv.second;
         } else {
-            dense_requests[policy_id] = kv.second;
+            bool use_rope = policy_is_rope_.count(policy_id) ? policy_is_rope_.at(policy_id) : false;
+            if (use_rope) {
+                dense_rope_requests[policy_id] = kv.second;
+            } else {
+                dense_classic_requests[policy_id] = kv.second;
+            }
         }
     }
 
@@ -717,11 +766,19 @@ void EvalManager::run_neural_inference(
         results.insert(moe_results.begin(), moe_results.end());
     }
 
-    if (!dense_requests.empty()) {
-        if (!orchestrator_dense_) {
-            throw std::runtime_error("[EvalManager] Dense orchestrator not initialized but dense requests present");
+    if (!dense_rope_requests.empty()) {
+        if (!orchestrator_dense_rope_) {
+            throw std::runtime_error("[EvalManager] Dense (RoPE) orchestrator not initialized but dense requests present");
         }
-        auto dense_results = orchestrator_dense_->run_inference(dense_requests);
+        auto dense_results = orchestrator_dense_rope_->run_inference(dense_rope_requests);
+        results.insert(dense_results.begin(), dense_results.end());
+    }
+
+    if (!dense_classic_requests.empty()) {
+        if (!orchestrator_dense_classic_) {
+            throw std::runtime_error("[EvalManager] Dense (classic) orchestrator not initialized but dense requests present");
+        }
+        auto dense_results = orchestrator_dense_classic_->run_inference(dense_classic_requests);
         results.insert(dense_results.begin(), dense_results.end());
     }
 

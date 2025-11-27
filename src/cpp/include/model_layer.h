@@ -104,6 +104,8 @@ transformer_layer(
     int64_t num_experts,
     int64_t num_policies,
     lb::moe::MoEWorkspace* workspace = nullptr,
+    const torch::optional<torch::Tensor>& positions = torch::nullopt,
+    bool use_rope = false,
     std::unordered_map<std::string, std::chrono::microseconds>* timers = nullptr);
 
 /**
@@ -155,6 +157,17 @@ moe_group_metadata_device(
 bool is_moe_model(const c10::Dict<std::string, torch::Tensor>& batched_weights);
 
 /**
+ * Check if model uses RoPE. Prefers explicit RoPE buffers (inv_freq/cos_cache)
+ * and falls back to absence of learned position embeddings.
+ */
+bool has_rope(const c10::Dict<std::string, torch::Tensor>& batched_weights);
+
+/**
+ * Check if model uses SwiGLU activation in FFN.
+ */
+bool has_swiglu(const c10::Dict<std::string, torch::Tensor>& batched_weights);
+
+/**
  * Dense transformer layer forward pass (no MoE routing).
  * Uses standard dense FFN instead of MoE experts.
  *
@@ -179,6 +192,40 @@ transformer_layer_dense(
     const torch::Tensor& norm2_bias,
     int64_t num_heads,
     int64_t hidden_dim,
+    const torch::optional<torch::Tensor>& positions = torch::nullopt,
+    bool use_rope = false,
+    std::unordered_map<std::string, std::chrono::microseconds>* timers = nullptr);
+
+/**
+ * Dense transformer layer forward pass using SwiGLU FFN.
+ *
+ * FFN path:
+ *   gate = SiLU(W_gate x)
+ *   up   = W_up x
+ *   out  = W_down (gate ⊙ up)
+ */
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+transformer_layer_dense_swiglu(
+    const torch::Tensor& x,
+    const torch::Tensor& policy_indices,
+    const torch::Tensor& in_proj_weight,
+    const torch::Tensor& in_proj_bias,
+    const torch::Tensor& out_proj_weight,
+    const torch::Tensor& out_proj_bias,
+    const torch::Tensor& norm1_weight,
+    const torch::Tensor& norm1_bias,
+    const torch::Tensor& w_gate_weight,
+    const torch::Tensor& w_gate_bias,
+    const torch::Tensor& w_up_weight,
+    const torch::Tensor& w_up_bias,
+    const torch::Tensor& w_down_weight,
+    const torch::Tensor& w_down_bias,
+    const torch::Tensor& norm2_weight,
+    const torch::Tensor& norm2_bias,
+    int64_t num_heads,
+    int64_t hidden_dim,
+    const torch::optional<torch::Tensor>& positions = torch::nullopt,
+    bool use_rope = false,
     std::unordered_map<std::string, std::chrono::microseconds>* timers = nullptr);
 
 /**

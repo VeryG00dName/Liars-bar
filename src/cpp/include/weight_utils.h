@@ -118,6 +118,7 @@ void add_fixed_buffers(
 /**
  * Split fused nn.MultiheadAttention in_proj_weight/bias into separate Q/K/V tensors
  * and add compatibility aliases by dropping the ".self_attn." segment.
+ * Also adds dense-model aliases transformer_layers.* -> transformer.layers.*
  *
  * This modifies the provided weight dictionary in-place by:
  *  - For any key matching "*.self_attn.in_proj_weight": splitting [B, 3*H, H]
@@ -126,6 +127,14 @@ void add_fixed_buffers(
  *    into q_proj.bias/k_proj.bias/v_proj.bias each shaped [B, H].
  *  - Adding alias entries where the substring ".self_attn." is removed for all
  *    self-attention related keys to satisfy alternative naming conventions.
+ *  - Adding aliases transformer_layers.* -> transformer.layers.* to support
+ *    dense RoPE/SwiGLU checkpoints that use the Python naming convention.
+ *  - Adding aliases between ".ffn." and ".swiglu_ffn." to bridge Python (ffn)
+ *    and TorchScript (swiglu_ffn) module names.
+ *  - Adding aliases for q/k/v/out projections without self_attn prefix to the
+ *    expected self_attn.* names for compatibility with traced checkpoints.
+ *  - Fusing (or rebuilding) fused in_proj_weight/bias when only split q/k/v
+ *    projections are present after aliasing.
  */
 void process_and_split_attention_weights(
     c10::Dict<std::string, torch::Tensor>& weights

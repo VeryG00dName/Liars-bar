@@ -224,7 +224,7 @@ class LearnerAutoregressiveAgent:
             ModelClass = PPOReactiveModel
 
         
-        # Infer dimensions that are common to all architectures
+        # Infer dimensions and architecture flags
         inferred_obs_dim = MFactoryUtil.get_input_dim_from_state_dict(model_state_dict, 'obs_encoder.0')
         
         # Handle different head structures (MLP vs. Linear)
@@ -232,7 +232,21 @@ class LearnerAutoregressiveAgent:
         inferred_action_dim = MFactoryUtil.get_output_dim_from_state_dict(model_state_dict, action_head_prefix)
         
         inferred_hidden_dim = MFactoryUtil.get_hidden_dim_from_state_dict(model_state_dict, 'obs_encoder.0')
-        inferred_max_seq = model_state_dict.get('position_embedding.weight').shape[0]
+        pos_embed = model_state_dict.get('position_embedding.weight')
+        use_rope = pos_embed is None
+        if pos_embed is not None:
+            inferred_max_seq = pos_embed.shape[0]
+        else:
+            # RoPE models omit position_embedding; fall back to causal mask length or default 480
+            causal_mask = model_state_dict.get('causal_bool_mask_full')
+            inferred_max_seq = int(causal_mask.shape[-1]) if causal_mask is not None else 480
+        
+        # Detect SwiGLU
+        use_swiglu = any(
+            "swiglu" in k or "w_gate" in k
+            for k in model_state_dict.keys()
+        )
+
         num_heads = inferred_hidden_dim // 64
 
 
@@ -244,7 +258,9 @@ class LearnerAutoregressiveAgent:
             action_dim=inferred_action_dim,
             hidden_dim=inferred_hidden_dim,
             num_heads=num_heads,
-            max_seq_length=inferred_max_seq
+            max_seq_length=inferred_max_seq,
+            use_rope=use_rope,
+            use_swiglu=use_swiglu,
         ).to(self.device)
 
             # Use strict=False to handle cases where an agent is loaded into a
@@ -275,7 +291,14 @@ def build_model_from_state(
         action_head_prefix = "action_head.2" if "action_head.2.weight" in model_state_dict else "action_head"
         inferred_action_dim = MFactoryUtil.get_output_dim_from_state_dict(model_state_dict, action_head_prefix)
         inferred_hidden_dim = MFactoryUtil.get_hidden_dim_from_state_dict(model_state_dict, "obs_encoder.0")
-        inferred_max_seq = model_state_dict.get("position_embedding.weight").shape[0]
+        pos_embed = model_state_dict.get("position_embedding.weight")
+        use_rope = pos_embed is None
+        if pos_embed is not None:
+            inferred_max_seq = pos_embed.shape[0]
+        else:
+            causal_mask = model_state_dict.get("causal_bool_mask_full")
+            inferred_max_seq = int(causal_mask.shape[-1]) if causal_mask is not None else 480
+        use_swiglu = any("swiglu" in k or "w_gate" in k for k in model_state_dict.keys())
         num_heads = inferred_hidden_dim // 64
     except Exception as exc:
         logging.error("Failed to infer model dimensions: %s", exc, exc_info=True)
@@ -286,7 +309,9 @@ def build_model_from_state(
         action_dim=inferred_action_dim,
         hidden_dim=inferred_hidden_dim,
         num_heads=num_heads,
-        max_seq_length=inferred_max_seq
+        max_seq_length=inferred_max_seq,
+        use_rope=True,
+        use_swiglu=True,
     ).to(device)
 
     model.load_state_dict(model_state_dict, strict=False)

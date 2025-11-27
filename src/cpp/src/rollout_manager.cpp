@@ -728,6 +728,23 @@ void RolloutManager::finalize_model_loading() {
         return;
     }
 
+    // Normalize attention weights/aliases so all dense policies share key sets
+    for (auto& kv : staged_state_dicts_) {
+        process_and_split_attention_weights(kv.second);
+        // Ensure position_embedding.weight exists for consistent key sets (RoPE models may omit it)
+        const int64_t max_seq_len = [this, &kv]() {
+            auto it = policy_max_sequence_length_.find(kv.first);
+            if (it != policy_max_sequence_length_.end()) return it->second;
+            return default_max_sequence_length_;
+        }();
+        if (!kv.second.count("position_embedding.weight")) {
+            kv.second["position_embedding.weight"] = torch::zeros(
+                {max_seq_len, hidden_dim_},
+                torch::dtype(torch::kFloat32)
+            );
+        }
+    }
+
     // 2. Get a sorted, stable list of all policies and detect architecture for each
     std::vector<int> all_policy_ids;
     all_policy_ids.reserve(staged_state_dicts_.size());
@@ -774,7 +791,7 @@ void RolloutManager::finalize_model_loading() {
             id_to_index[policy_ids[idx]] = static_cast<int>(idx);
         }
 
-        // Get keys from first policy
+        // Get keys from first policy (after ensuring swiglu presence)
         const auto& first_dict = staged_state_dicts_.at(policy_ids[0]);
         std::vector<std::string> keys;
         keys.reserve(first_dict.size());
@@ -835,9 +852,20 @@ void RolloutManager::finalize_model_loading() {
         );
     }
 
-    // 5. Batch dense policies
+    // 5. Batch dense policies (include all dense policies so historical opponents are available)
     if (!dense_policy_ids.empty()) {
-        batch_policies(dense_policy_ids, batched_weight_cache_dense_, policy_id_to_cache_index_dense_, false);
+        std::vector<int> dense_to_batch = dense_policy_ids;
+        std::sort(dense_to_batch.begin(), dense_to_batch.end());
+
+        try {
+            batch_policies(dense_to_batch, batched_weight_cache_dense_, policy_id_to_cache_index_dense_, false);
+        } catch (const std::exception& e) {
+            std::cerr << "[RolloutManager] Failed to batch all dense policies: " << e.what()
+                      << " - falling back to newest dense policy only" << std::endl;
+            int newest_dense = *std::max_element(dense_policy_ids.begin(), dense_policy_ids.end());
+            dense_to_batch = {newest_dense};
+            batch_policies(dense_to_batch, batched_weight_cache_dense_, policy_id_to_cache_index_dense_, false);
+        }
 
         orchestrator_dense_ = std::make_unique<execution_core::NeuralInferenceOrchestrator>(
             batched_weight_cache_dense_,

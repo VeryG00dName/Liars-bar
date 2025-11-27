@@ -15,7 +15,7 @@ from numpy.random import Generator
 import random
 import numpy as np
 import argparse
-
+import sys
 # Quiet Torch compile logs
 os.environ.pop("TORCH_LOGS", None)           # disable extra compile logs
 os.environ.setdefault("TORCHDYNAMO_VERBOSE", "0")
@@ -32,6 +32,12 @@ warnings.filterwarnings(
     "ignore",
     message=".*torch.cpu.amp.autocast.* is deprecated.*",
     category=FutureWarning,
+)
+# Silence Inductor's online softmax warning spam during compile
+warnings.filterwarnings(
+    "ignore",
+    message="Online softmax is disabled on the fly.*",
+    category=UserWarning,
 )
 
 import torch
@@ -817,10 +823,10 @@ def train_generation(
                 pool_was_updated = True
             else:
                 logging.error(
-                    "Failed to generate TorchScript trace for agent '%s'. Skipping.",
+                    "Failed to generate TorchScript trace for agent '%s'. closing training. ",
                     agent_def.get('name', policy_id),
                 )
-                traced_path = None
+                sys.exit(1)
 
         if not traced_path:
             continue
@@ -1411,7 +1417,7 @@ def train_generation(
             acc[0] += float(wins_vs)
             acc[1] += float(total)
         
-        heldout_candidates = [lab for lab in per_opponent_totals_int.keys() if lab > BOT_MAX_ID and lab != training_policy_id]
+        heldout_candidates = [lab for lab in per_opponent_totals_int.keys() if lab > BOT_MAX_ID]
         if heldout_candidates:
             heldout_label = max(heldout_candidates)
             hw, ht = per_opponent_totals_int[heldout_label]

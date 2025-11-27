@@ -16,6 +16,18 @@ torch::Tensor get_weight(
     if (it == weights.end()) {
         std::stringstream ss;
         ss << "Missing weight key: " << key;
+        // Include available keys to aid debugging checkpoint naming mismatches
+        std::vector<std::string> keys;
+        keys.reserve(weights.size());
+        for (const auto& kv : weights) {
+            keys.push_back(kv.key());
+        }
+        std::sort(keys.begin(), keys.end());
+        ss << " | available keys (" << keys.size() << "): ";
+        for (size_t i = 0; i < keys.size(); ++i) {
+            ss << keys[i];
+            if (i + 1 < keys.size()) ss << ", ";
+        }
         throw std::runtime_error(ss.str());
     }
     return it->value();
@@ -225,8 +237,10 @@ forward_packed(
     auto pol = policy_indices.to(obs_sequence.device()).to(torch::kLong).contiguous();
     const int64_t num_policies = get_weight(batched_weights, "obs_encoder.0.weight").size(0);
 
-    // Detect architecture (MoE vs Dense)
+    // Detect architecture
     const bool use_moe = lb::model::is_moe_model(batched_weights);
+    const bool use_rope = lb::model::has_rope(batched_weights);
+    const bool use_swiglu = lb::model::has_swiglu(batched_weights);
 
     // 1. Embeddings
     auto t0 = Clock::now();
@@ -306,32 +320,64 @@ forward_packed(
                 get_weight(batched_weights, prefix + ".norm2.weight"),
                 get_weight(batched_weights, prefix + ".norm2.bias"),
                 num_heads, hidden_dim, top_k, num_experts, num_policies,
-                ws_ptr, &t);
+                ws_ptr, positions, use_rope, &t);
 
             x = x_next;
             last_topk_idx = topk_indices;
             last_topk_scores = topk_scores;
         } else {
-            // Dense FFN path
-            auto [x_next, gate_logits, topk_indices, topk_scores] = lb::model::transformer_layer_dense(
-                x, pol,
-                get_weight(batched_weights, prefix + ".self_attn.in_proj_weight"),
-                get_weight(batched_weights, prefix + ".self_attn.in_proj_bias"),
-                get_weight(batched_weights, prefix + ".self_attn.out_proj.weight"),
-                get_weight(batched_weights, prefix + ".self_attn.out_proj.bias"),
-                get_weight(batched_weights, prefix + ".norm1.weight"),
-                get_weight(batched_weights, prefix + ".norm1.bias"),
-                get_weight(batched_weights, prefix + ".linear1.weight"),
-                get_weight(batched_weights, prefix + ".linear1.bias"),
-                get_weight(batched_weights, prefix + ".linear2.weight"),
-                get_weight(batched_weights, prefix + ".linear2.bias"),
-                get_weight(batched_weights, prefix + ".norm2.weight"),
-                get_weight(batched_weights, prefix + ".norm2.bias"),
-                num_heads, hidden_dim, &t);
+            // Dense FFN path (SwiGLU or GELU)
+            if (use_swiglu) {
+                auto w_gate_w = get_weight(batched_weights, prefix + ".swiglu_ffn.w_gate.weight");
+                auto w_up_w   = get_weight(batched_weights, prefix + ".swiglu_ffn.w_up.weight");
+                auto w_down_w = get_weight(batched_weights, prefix + ".swiglu_ffn.w_down.weight");
 
-            x = x_next;
-            last_topk_idx = topk_indices;
-            last_topk_scores = topk_scores;
+                auto make_bias = [&](const std::string& key, const torch::Tensor& w) {
+                    auto it = batched_weights.find(key);
+                    if (it != batched_weights.end()) return it->value();
+                    // Create zero bias [W, out_dim] on same device/dtype as weight
+                    auto Wpol = w.size(0);
+                    auto out_dim = w.size(1);
+                    return torch::zeros({Wpol, out_dim}, w.options());
+                };
+
+                auto [x_next, gate_logits, topk_indices, topk_scores] = lb::model::transformer_layer_dense_swiglu(
+                    x, pol,
+                    get_weight(batched_weights, prefix + ".self_attn.in_proj_weight"),
+                    get_weight(batched_weights, prefix + ".self_attn.in_proj_bias"),
+                    get_weight(batched_weights, prefix + ".self_attn.out_proj.weight"),
+                    get_weight(batched_weights, prefix + ".self_attn.out_proj.bias"),
+                    get_weight(batched_weights, prefix + ".norm1.weight"),
+                    get_weight(batched_weights, prefix + ".norm1.bias"),
+                    w_gate_w, make_bias(prefix + ".swiglu_ffn.w_gate.bias", w_gate_w),
+                    w_up_w,   make_bias(prefix + ".swiglu_ffn.w_up.bias",   w_up_w),
+                    w_down_w, make_bias(prefix + ".swiglu_ffn.w_down.bias", w_down_w),
+                    get_weight(batched_weights, prefix + ".norm2.weight"),
+                    get_weight(batched_weights, prefix + ".norm2.bias"),
+                    num_heads, hidden_dim, positions, use_rope, &t);
+                x = x_next;
+                last_topk_idx = topk_indices;
+                last_topk_scores = topk_scores;
+            } else {
+                auto [x_next, gate_logits, topk_indices, topk_scores] = lb::model::transformer_layer_dense(
+                    x, pol,
+                    get_weight(batched_weights, prefix + ".self_attn.in_proj_weight"),
+                    get_weight(batched_weights, prefix + ".self_attn.in_proj_bias"),
+                    get_weight(batched_weights, prefix + ".self_attn.out_proj.weight"),
+                    get_weight(batched_weights, prefix + ".self_attn.out_proj.bias"),
+                    get_weight(batched_weights, prefix + ".norm1.weight"),
+                    get_weight(batched_weights, prefix + ".norm1.bias"),
+                    get_weight(batched_weights, prefix + ".linear1.weight"),
+                    get_weight(batched_weights, prefix + ".linear1.bias"),
+                    get_weight(batched_weights, prefix + ".linear2.weight"),
+                    get_weight(batched_weights, prefix + ".linear2.bias"),
+                    get_weight(batched_weights, prefix + ".norm2.weight"),
+                    get_weight(batched_weights, prefix + ".norm2.bias"),
+                    num_heads, hidden_dim, positions, use_rope, &t);
+                x = x_next;
+                last_topk_idx = topk_indices;
+                last_topk_scores = topk_scores;
+            }
         }
 
         t1 = Clock::now();

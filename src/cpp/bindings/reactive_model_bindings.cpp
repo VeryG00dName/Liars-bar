@@ -126,6 +126,8 @@ void bind_reactive_model(py::module_& m) {
 
     m.def("transformer_layer",
         [](const torch::Tensor& x, const torch::Tensor& policy_indices,
+           const torch::optional<torch::Tensor>& positions,
+           bool use_rope,
            py::dict weights_py, int64_t layer_idx, int64_t num_heads, int64_t hidden_dim, int64_t top_k,
            int64_t num_experts, int64_t num_policies) {
             auto weights = py_dict_to_c10_dict(weights_py);
@@ -151,9 +153,10 @@ void bind_reactive_model(py::module_& m) {
                 weights.at(prefix + ".norm2.weight"),
                 weights.at(prefix + ".norm2.bias"),
                 num_heads, hidden_dim, top_k, num_experts, num_policies,
-                ws_ptr, nullptr);
+                ws_ptr, positions, use_rope, nullptr);
         },
-        py::arg("x"), py::arg("policy_indices"), py::arg("weights"), py::arg("layer_idx"),
+        py::arg("x"), py::arg("policy_indices"), py::arg("positions") = torch::nullopt,
+        py::arg("use_rope") = false, py::arg("weights"), py::arg("layer_idx"),
         py::arg("num_heads"), py::arg("hidden_dim"), py::arg("top_k"),
         py::arg("num_experts"), py::arg("num_policies"),
         "Single transformer layer (attention + MoE). Returns (x_next, gate_logits, topk_indices, topk_scores).");

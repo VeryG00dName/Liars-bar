@@ -105,14 +105,18 @@ private:
     std::unordered_map<int, int> policy_id_to_cache_index_;
     bool weights_finalized_{false};
     std::unordered_map<int, int> policy_max_sequence_length_;
+    std::unordered_map<int, bool> policy_is_rope_; // dense policies: true if RoPE-enabled
 
     // Mixed architecture support: separate orchestrators for MoE vs dense models
     std::unique_ptr<execution_core::NeuralInferenceOrchestrator> orchestrator_moe_;
-    std::unique_ptr<execution_core::NeuralInferenceOrchestrator> orchestrator_dense_;
+    std::unique_ptr<execution_core::NeuralInferenceOrchestrator> orchestrator_dense_rope_;
+    std::unique_ptr<execution_core::NeuralInferenceOrchestrator> orchestrator_dense_classic_;
     c10::Dict<std::string, torch::Tensor> batched_weight_cache_moe_;
-    c10::Dict<std::string, torch::Tensor> batched_weight_cache_dense_;
+    c10::Dict<std::string, torch::Tensor> batched_weight_cache_dense_rope_;
+    c10::Dict<std::string, torch::Tensor> batched_weight_cache_dense_classic_;
     std::unordered_map<int, int> policy_id_to_cache_index_moe_;
-    std::unordered_map<int, int> policy_id_to_cache_index_dense_;
+    std::unordered_map<int, int> policy_id_to_cache_index_dense_rope_;
+    std::unordered_map<int, int> policy_id_to_cache_index_dense_classic_;
     std::unordered_map<int, bool> policy_is_moe_;
 
     // Legacy single orchestrator
