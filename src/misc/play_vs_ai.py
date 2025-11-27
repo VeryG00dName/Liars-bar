@@ -31,7 +31,7 @@ logger = logging.getLogger("PlayVsAI")
 class PlayVsAIGUI:
     """Tkinter-based UI for playing against autoregressive PPO agents."""
 
-    CHECKPOINT_RELATIVE_PATH = os.path.join("checkpoints", "test68", "gen_16", "final.pth")
+    CHECKPOINT_RELATIVE_PATH = os.path.join("checkpoints", "test93", "gen_48", "final.pth")
 
     def __init__(self, root):
         self.root = root

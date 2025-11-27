@@ -27,6 +27,7 @@ from src.model.model_factory import ModelFactory as MFactoryUtil
 from src.model.ppo_autoregressive_model import PPOAutoregressiveModel
 from src.model.ppo_fused_model import PPOFusedModel
 from src.model.ppo_reactive_model import PPOReactiveModel
+from src.model.ppo_reactive_model_single_script import PPOReactiveModelSingleScript
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +95,9 @@ class PPOAutoregressiveAgent(BaseAgent):
 
     def _build_model(self, model_state_dict: Dict[str, torch.Tensor]) -> torch.nn.Module:
         """Instantiate the correct model class using inferred dimensions."""
-        if MFactoryUtil.is_reactive_model(model_state_dict):
+        if "action_head.weight" in model_state_dict and MFactoryUtil.is_reactive_model(model_state_dict):
+            ModelClass = PPOReactiveModelSingleScript
+        elif MFactoryUtil.is_reactive_model(model_state_dict):
             ModelClass = PPOReactiveModel
         elif MFactoryUtil.is_fused_model(model_state_dict):
             ModelClass = PPOFusedModel
@@ -130,7 +133,7 @@ class PPOAutoregressiveAgent(BaseAgent):
                 num_bricks = getattr(config, "NUM_BRICKS", 32)
                 brick_dim = getattr(config, "BRICK_DIM", 32)
             extra_kwargs.update({"num_bricks": int(num_bricks), "brick_dim": int(brick_dim)})
-        elif ModelClass is PPOReactiveModel:
+        elif ModelClass in (PPOReactiveModel, PPOReactiveModelSingleScript):
             extra_kwargs.update({"num_agent_types": inferred_num_agent_types})
 
         model = ModelClass(
@@ -316,8 +319,10 @@ class PPOAutoregressiveAgent(BaseAgent):
         )
 
         model_input = self._prepare_model_input(self.sequence_history)
+        #filter out valid lengths
+        model_input_filtered = {k: v for k, v in model_input.items() if k != "valid_lengths"}
         with torch.no_grad():
-            action_logits, opp_logits, state_values, win_logits = self.model(**model_input)
+            action_logits, opp_logits, state_values, win_logits = self.model(**model_input_filtered)
 
         last_idx = model_input["valid_lengths"][0].item() - 1
         logits = action_logits[0, last_idx]

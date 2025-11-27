@@ -5,7 +5,7 @@ import random
 import numpy as np
 from gymnasium import spaces
 from pettingzoo.utils.env import AECEnv
-from pettingzoo.utils import agent_selector
+from pettingzoo.utils.agent_selector import agent_selector
 import copy
 from src import config
 
