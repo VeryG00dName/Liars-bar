@@ -290,7 +290,7 @@ NeuralInferenceOrchestrator::run_inference(
             uint8_t action = sample_action(last_action_logits[i], req_ptr->mask, log_prob);
             float value = last_state_values[i].item<float>();
 
-            results[{policy_id, request_idx}] = {action, log_prob, value, last_opp_logits[i].to(torch::kCPU)};
+            results[{policy_id, request_idx}] = {action, log_prob, value, last_opp_logits[i].to(torch::kCPU), last_action_logits[i].to(torch::kCPU)};
         }
     }
     return results;

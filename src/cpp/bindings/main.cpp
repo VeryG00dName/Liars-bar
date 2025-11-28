@@ -9,6 +9,7 @@ void bind_vec_arena(py::module_& m);
 void bind_rollout_manager(py::module_& m);
 void bind_eval_manager(py::module_& m);
 void bind_reactive_model(py::module_& m);
+void bind_cfr_manager(py::module_& m);
 
 PYBIND11_MODULE(lb, m) {
     m.doc() = "Liar's Bar: Env, Bots, PerfectSearch, VecArena";
@@ -20,4 +21,5 @@ PYBIND11_MODULE(lb, m) {
     bind_rollout_manager(m);
     bind_eval_manager(m);
     bind_reactive_model(m);
+    bind_cfr_manager(m);
 }

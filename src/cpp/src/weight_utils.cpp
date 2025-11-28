@@ -137,9 +137,15 @@ void add_fixed_buffers(
     c10::Dict<std::string, torch::Tensor>& weights,
     const torch::Device& device
 ) {
-    auto lut_act_kind = torch::tensor({1, 1, 1, 1, 1, 1, 2, 1, 1, 1, 0}, torch::dtype(torch::kLong).device(device));
-    auto lut_count = torch::tensor({1, 2, 3, 1, 2, 3, 0, 1, 2, 3, 4}, torch::dtype(torch::kLong).device(device));
-    auto lut_table_flag = torch::tensor({1, 1, 1, 2, 2, 2, 0, 0, 0, 0, 3}, torch::dtype(torch::kLong).device(device));
+    // Actions 0-6: Own actions (Play 1x True, Play 2x True, Play 3x True, Play 1x False, Play 2x False, Play 3x False, Challenge)
+    // Actions 7-9: Opponent actions (Opp Play 1x, Opp Play 2x, Opp Play 3x)
+    // Action 10: Padding token
+    // Note: act_kind: 0=play, 1=challenge
+    // count: actual count (1, 2, 3) or 0 for special actions
+    // table_flag: 1=true cards, 0=false cards (bluff)
+    auto lut_act_kind = torch::tensor({0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0}, torch::dtype(torch::kLong).device(device));
+    auto lut_count = torch::tensor({1, 2, 3, 1, 2, 3, 0, 1, 2, 3, 0}, torch::dtype(torch::kLong).device(device));
+    auto lut_table_flag = torch::tensor({1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0}, torch::dtype(torch::kLong).device(device));
 
     weights.insert_or_assign("lut_act_kind", lut_act_kind);
     weights.insert_or_assign("lut_count", lut_count);

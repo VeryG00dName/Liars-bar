@@ -29,6 +29,7 @@ struct InferenceResult {
     float log_prob;              // Log probability of the action
     float state_value;           // Value prediction
     torch::Tensor opp_logits;    // Opponent action predictions [7]
+    torch::Tensor action_logits; // Action logits [7]
 };
 
 /**

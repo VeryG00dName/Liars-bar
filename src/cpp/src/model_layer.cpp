@@ -17,11 +17,99 @@ torch::Tensor get_weight(
     auto it = weights.find(key);
     if (it == weights.end()) {
         std::stringstream ss;
-        ss << "Missing weight key: " << key;
+        ss << "Missing weight key: " << key << "\n";
+        ss << "Available keys (" << weights.size() << " total):\n";
+        for (const auto& kv : weights) {
+            ss << "  - " << kv.key() << "\n";
+        }
         throw std::runtime_error(ss.str());
     }
     return it->value();
 }
+
+// Optimization wrappers for single-policy case
+torch::Tensor optimized_linear(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& policy_indices,
+    std::unordered_map<std::string, std::chrono::microseconds>& timers) {
+    
+    try {
+        if (weight.size(0) == 1) {
+            // Single-policy optimization: use standard PyTorch functions
+            static bool logged = false;
+            if (!logged) {
+                std::cout << "[INFO] Using single-policy optimized linear (weight batch dim = 1)" << std::endl;
+                logged = true;
+            }
+            auto w = weight.squeeze(0);
+            auto b = bias.defined() ? bias.squeeze(0) : torch::Tensor();
+            // Standard functional API expects matching dtypes - cast input if needed
+            auto input_cast = input.scalar_type() == w.scalar_type() ? input : input.to(w.scalar_type());
+            return torch::nn::functional::linear(input_cast, w, b);
+        }
+        return lb::kernels::indexed_batched_linear(input, weight, bias, policy_indices, timers);
+    } catch (const std::exception& e) {
+        std::stringstream ss;
+        ss << "Error in optimized_linear:\n";
+        ss <<" input shape: [" << input.sizes() << "], dtype: " << input.scalar_type() << "\n";
+        ss << "  weight shape: [" << weight.sizes() << "], dtype: " << weight.scalar_type() << "\n";
+        ss << "  bias defined: " << (bias.defined() ? "yes" : "no");
+        if (bias.defined()) ss << ", dtype: " << bias.scalar_type();
+        ss << "\n  Original error: " << e.what();
+        throw std::runtime_error(ss.str());
+    }
+}
+
+torch::Tensor optimized_layer_norm(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& policy_indices,
+    double eps) {
+    
+    try {
+        if (weight.size(0) == 1) {
+            auto w = weight.squeeze(0);
+            auto b = bias.squeeze(0);
+            // Cast input to match weight dtype if needed
+            auto input_cast = input.scalar_type() == w.scalar_type() ? input : input.to(w.scalar_type());
+            return torch::nn::functional::layer_norm(input_cast, torch::nn::functional::LayerNormFuncOptions({input_cast.size(-1)}).weight(w).bias(b).eps(eps));
+        }
+        return lb::kernels::indexed_batched_layer_norm(input, weight, bias, policy_indices, eps);
+    } catch (const std::exception& e) {
+        std::stringstream ss;
+        ss << "Error in optimized_layer_norm:\n";
+        ss << "  input shape: [" << input.sizes() << "], dtype: " << input.scalar_type() << "\n";
+        ss << "  weight shape: [" << weight.sizes() << "], dtype: " << weight.scalar_type() << "\n";
+        ss << "  bias shape: [" << bias.sizes() << "], dtype: " << bias.scalar_type() << "\n";
+        ss << "  Original error: " << e.what();
+        throw std::runtime_error(ss.str());
+    }
+}
+
+torch::Tensor optimized_embedding(
+    const torch::Tensor& weight,
+    const torch::Tensor& indices,
+    const torch::Tensor& policy_indices) {
+    
+    try {
+        if (weight.size(0) == 1) {
+            auto w = weight.squeeze(0);
+            return torch::nn::functional::embedding(indices, w);
+        }
+        return lb::kernels::indexed_batched_embedding(weight, indices, policy_indices);
+    } catch (const std::exception& e) {
+        std::stringstream ss;
+        ss << "Error in optimized_embedding:\n";
+        ss << "  weight shape: [" << weight.sizes() << "], dtype: " << weight.scalar_type() << "\n";
+        ss << "  indices shape: [" << indices.sizes() << "], dtype: " << indices.scalar_type() << "\n";
+        ss << "  Original error: " << e.what();
+        throw std::runtime_error(ss.str());
+    }
+}
+
 } // anonymous namespace
 
 // -----------------------------
@@ -90,12 +178,12 @@ compute_embeddings(
     c10::Dict<std::string, torch::Tensor> result;
 
     // Obs encoder: Linear -> LayerNorm -> GELU
-    auto obs_linear = lb::kernels::indexed_batched_linear(
+    auto obs_linear = optimized_linear(
         obs_sequence,
         get_weight(batched_weights, "obs_encoder.0.weight"),
         get_weight(batched_weights, "obs_encoder.0.bias"),
         pol, t);
-    auto obs_layernorm = lb::kernels::indexed_batched_layer_norm(
+    auto obs_layernorm = optimized_layer_norm(
         obs_linear,
         get_weight(batched_weights, "obs_encoder.1.weight"),
         get_weight(batched_weights, "obs_encoder.1.bias"),
@@ -104,23 +192,23 @@ compute_embeddings(
     result.insert("obs_embed", obs_embed);
 
     // Factorized action embeddings
-    auto act_kind_embed = lb::kernels::indexed_batched_embedding(
+    auto act_kind_embed = optimized_embedding(
         get_weight(batched_weights, "act_kind_embedding.weight"), act_kind_ids, pol);
-    auto count_embed = lb::kernels::indexed_batched_embedding(
+    auto count_embed = optimized_embedding(
         get_weight(batched_weights, "count_embedding.weight"), count_ids, pol);
-    auto table_flag_embed = lb::kernels::indexed_batched_embedding(
+    auto table_flag_embed = optimized_embedding(
         get_weight(batched_weights, "table_flag_embedding.weight"), table_flag_ids, pol);
     auto action_embed = act_kind_embed + count_embed + table_flag_embed;
     result.insert("action_embed", action_embed);
 
     // Agent embedding (always present)
-    auto agent_embed = lb::kernels::indexed_batched_embedding(
+    auto agent_embed = optimized_embedding(
         get_weight(batched_weights, "agent_embedding.weight"), agent_types.to(torch::kLong), pol);
     result.insert("agent_embed", agent_embed);
 
     // Position embedding (optional - not present in RoPE models)
     if (batched_weights.contains("position_embedding.weight")) {
-        auto position_embed = lb::kernels::indexed_batched_embedding(
+        auto position_embed = optimized_embedding(
             get_weight(batched_weights, "position_embedding.weight"), positions.to(torch::kLong), pol);
         result.insert("position_embed", position_embed);
     } else {
@@ -149,10 +237,10 @@ gating(
     c10::Dict<std::string, torch::Tensor> result;
 
     auto lin = [&](const torch::Tensor& x, const std::string& base){
-        auto h = lb::kernels::indexed_batched_linear(
+        auto h = optimized_linear(
             x, get_weight(batched_weights, base + ".0.weight"), get_weight(batched_weights, base + ".0.bias"), pol, t);
         h = torch::tanh(h);
-        auto g = lb::kernels::indexed_batched_linear(
+        auto g = optimized_linear(
             h, get_weight(batched_weights, base + ".2.weight"), get_weight(batched_weights, base + ".2.bias"), pol, t);
         return torch::sigmoid(g);
     };
@@ -160,7 +248,14 @@ gating(
     result.insert("g_obs", lin(obs_embed, "gate_obs"));
     result.insert("g_action", lin(action_embed, "gate_action"));
     result.insert("g_agent", lin(agent_embed, "gate_agent"));
-    result.insert("g_position", lin(position_embed, "gate_position"));
+    
+    // gate_position is optional (not present in RoPE models)
+    if (batched_weights.contains("gate_position.0.weight")) {
+        result.insert("g_position", lin(position_embed, "gate_position"));
+    } else {
+        // Return zeros for RoPE models (will be multiplied by zero position_embed anyway)
+        result.insert("g_position", torch::zeros_like(agent_embed));
+    }
     return result;
 }
 
@@ -187,7 +282,14 @@ fuse_embeddings(
                + g_position * cast_like(position_embed);
     result.insert("fused_raw", fused);
 
-    auto combined = torch::layer_norm(fused, {hidden_dim});
+    
+    // layer_norm without weight/bias expects FP32, so cast if needed
+    auto fused_for_norm = fused.scalar_type() == torch::kFloat32 ? fused : fused.to(torch::kFloat32);
+    auto combined = torch::layer_norm(fused_for_norm, {hidden_dim});
+    // Cast back to original dtype
+    if (combined.scalar_type() != fused.scalar_type()) {
+        combined = combined.to(fused.scalar_type());
+    }
     result.insert("combined", combined);
     return result;
 }
@@ -277,9 +379,9 @@ transformer_layer(
     auto qkv_weights = in_proj_weight.chunk(3, in_proj_weight.dim() == 3 ? 1 : 0);
     auto qkv_biases  = in_proj_bias.chunk(3, in_proj_bias.dim() == 2 ? 1 : 0);
 
-    auto q = lb::kernels::indexed_batched_linear(x, qkv_weights[0], qkv_biases[0], policy_indices, t);
-    auto k = lb::kernels::indexed_batched_linear(x, qkv_weights[1], qkv_biases[1], policy_indices, t);
-    auto v = lb::kernels::indexed_batched_linear(x, qkv_weights[2], qkv_biases[2], policy_indices, t);
+    auto q = optimized_linear(x, qkv_weights[0], qkv_biases[0], policy_indices, t);
+    auto k = optimized_linear(x, qkv_weights[1], qkv_biases[1], policy_indices, t);
+    auto v = optimized_linear(x, qkv_weights[2], qkv_biases[2], policy_indices, t);
 
     q = q.view({B, T, num_heads, head_dim}).transpose(1, 2);
     k = k.view({B, T, num_heads, head_dim}).transpose(1, 2);
@@ -295,10 +397,10 @@ transformer_layer(
 
     auto attn_output = torch::scaled_dot_product_attention(q, k, v, torch::nullopt, 0.0, true);
     attn_output = attn_output.transpose(1, 2).contiguous().view({B, T, hidden_dim});
-    attn_output = lb::kernels::indexed_batched_linear(attn_output, out_proj_weight, out_proj_bias, policy_indices, t);
+    attn_output = optimized_linear(attn_output, out_proj_weight, out_proj_bias, policy_indices, t);
 
     auto residual1 = x + attn_output;
-    auto x_norm = lb::kernels::indexed_batched_layer_norm(residual1, norm1_weight, norm1_bias, policy_indices, 1e-5);
+    auto x_norm = optimized_layer_norm(residual1, norm1_weight, norm1_bias, policy_indices, 1e-5);
     
     auto t1 = Clock::now();
     t["layer_attention_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
@@ -756,9 +858,9 @@ transformer_layer_dense(
     auto qkv_weights = in_proj_weight.chunk(3, in_proj_weight.dim() == 3 ? 1 : 0);
     auto qkv_biases  = in_proj_bias.chunk(3, in_proj_bias.dim() == 2 ? 1 : 0);
 
-    auto q = lb::kernels::indexed_batched_linear(x, qkv_weights[0], qkv_biases[0], policy_indices, t);
-    auto k = lb::kernels::indexed_batched_linear(x, qkv_weights[1], qkv_biases[1], policy_indices, t);
-    auto v = lb::kernels::indexed_batched_linear(x, qkv_weights[2], qkv_biases[2], policy_indices, t);
+    auto q = optimized_linear(x, qkv_weights[0], qkv_biases[0], policy_indices, t);
+    auto k = optimized_linear(x, qkv_weights[1], qkv_biases[1], policy_indices, t);
+    auto v = optimized_linear(x, qkv_weights[2], qkv_biases[2], policy_indices, t);
 
     q = q.view({B, T, num_heads, head_dim}).transpose(1, 2);
     k = k.view({B, T, num_heads, head_dim}).transpose(1, 2);
@@ -774,10 +876,10 @@ transformer_layer_dense(
 
     auto attn_output = torch::scaled_dot_product_attention(q, k, v, torch::nullopt, 0.0, true);
     attn_output = attn_output.transpose(1, 2).contiguous().view({B, T, hidden_dim});
-    attn_output = lb::kernels::indexed_batched_linear(attn_output, out_proj_weight, out_proj_bias, policy_indices, t);
+    attn_output = optimized_linear(attn_output, out_proj_weight, out_proj_bias, policy_indices, t);
 
     auto residual1 = x + attn_output;
-    auto x_norm = lb::kernels::indexed_batched_layer_norm(residual1, norm1_weight, norm1_bias, policy_indices, 1e-5);
+    auto x_norm = optimized_layer_norm(residual1, norm1_weight, norm1_bias, policy_indices, 1e-5);
 
     auto t1 = Clock::now();
     t["layer_attention_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
@@ -796,7 +898,7 @@ transformer_layer_dense(
 
     // Residual + LayerNorm
     auto residual2 = x_norm + ffn_output;
-    auto x_next = lb::kernels::indexed_batched_layer_norm(residual2, norm2_weight, norm2_bias, policy_indices, 1e-5);
+    auto x_next = optimized_layer_norm(residual2, norm2_weight, norm2_bias, policy_indices, 1e-5);
 
     t1 = Clock::now();
     t["layer_ffn_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
@@ -822,22 +924,59 @@ compute_heads_dense(
     auto pol = policy_indices.to(transformer_output.device()).to(torch::kLong).contiguous();
     c10::Dict<std::string, torch::Tensor> result;
 
-    // Single heads (not per-expert)
-    auto action_logits = lb::kernels::indexed_batched_linear(transformer_output,
-        get_weight(batched_weights, "action_head.weight"),
-        get_weight(batched_weights, "action_head.bias"), pol, t);
+    // Helper to get optional weight
+    auto get_opt = [&](const std::string& key) -> torch::Tensor {
+        if (batched_weights.contains(key)) return get_weight(batched_weights, key);
+        return torch::Tensor();
+    };
 
-    auto opp_logits = lb::kernels::indexed_batched_linear(transformer_output,
-        get_weight(batched_weights, "opp_action_head.weight"),
-        get_weight(batched_weights, "opp_action_head.bias"), pol, t);
+    // Action Logits (Policy)
+    torch::Tensor action_logits;
+    if (batched_weights.contains("action_head.weight")) {
+        action_logits = optimized_linear(transformer_output,
+            get_weight(batched_weights, "action_head.weight"),
+            get_weight(batched_weights, "action_head.bias"), pol, t);
+    } else if (batched_weights.contains("output_head.weight")) {
+        // Fallback for Deep CFR model
+        action_logits = optimized_linear(transformer_output,
+            get_weight(batched_weights, "output_head.weight"),
+            get_weight(batched_weights, "output_head.bias"), pol, t);
+    } else {
+        throw std::runtime_error("Missing action_head or output_head weights");
+    }
 
-    auto state_values = lb::kernels::indexed_batched_linear(transformer_output,
-        get_weight(batched_weights, "reward_stream_head.weight"),
-        get_weight(batched_weights, "reward_stream_head.bias"), pol, t);
+    // Optional Heads (Opponent, Value, Win) - return zeros if missing
+    auto make_zeros = [&](int64_t dim) {
+        return torch::zeros({transformer_output.size(0), transformer_output.size(1), dim}, 
+                            transformer_output.options());
+    };
 
-    auto win_logits = lb::kernels::indexed_batched_linear(transformer_output,
-        get_weight(batched_weights, "win_prob_head.weight"),
-        get_weight(batched_weights, "win_prob_head.bias"), pol, t);
+    torch::Tensor opp_logits;
+    if (batched_weights.contains("opp_action_head.weight")) {
+        opp_logits = optimized_linear(transformer_output,
+            get_weight(batched_weights, "opp_action_head.weight"),
+            get_weight(batched_weights, "opp_action_head.bias"), pol, t);
+    } else {
+        opp_logits = make_zeros(7); // Assuming 7 actions
+    }
+
+    torch::Tensor state_values;
+    if (batched_weights.contains("reward_stream_head.weight")) {
+        state_values = optimized_linear(transformer_output,
+            get_weight(batched_weights, "reward_stream_head.weight"),
+            get_weight(batched_weights, "reward_stream_head.bias"), pol, t);
+    } else {
+        state_values = make_zeros(1);
+    }
+
+    torch::Tensor win_logits;
+    if (batched_weights.contains("win_prob_head.weight")) {
+        win_logits = optimized_linear(transformer_output,
+            get_weight(batched_weights, "win_prob_head.weight"),
+            get_weight(batched_weights, "win_prob_head.bias"), pol, t);
+    } else {
+        win_logits = make_zeros(1);
+    }
 
     result.insert("action_logits", action_logits);
     result.insert("opp_logits", opp_logits);
@@ -889,9 +1028,9 @@ lb::model::transformer_layer_dense_swiglu(
     auto qkv_weights = in_proj_weight.chunk(3, in_proj_weight.dim() == 3 ? 1 : 0);
     auto qkv_biases  = in_proj_bias.chunk(3, in_proj_bias.dim() == 2 ? 1 : 0);
 
-    auto q = lb::kernels::indexed_batched_linear(x, qkv_weights[0], qkv_biases[0], policy_indices, t);
-    auto k = lb::kernels::indexed_batched_linear(x, qkv_weights[1], qkv_biases[1], policy_indices, t);
-    auto v = lb::kernels::indexed_batched_linear(x, qkv_weights[2], qkv_biases[2], policy_indices, t);
+    auto q = optimized_linear(x, qkv_weights[0], qkv_biases[0], policy_indices, t);
+    auto k = optimized_linear(x, qkv_weights[1], qkv_biases[1], policy_indices, t);
+    auto v = optimized_linear(x, qkv_weights[2], qkv_biases[2], policy_indices, t);
 
     q = q.view({B, T, num_heads, head_dim}).transpose(1, 2);
     k = k.view({B, T, num_heads, head_dim}).transpose(1, 2);
@@ -907,24 +1046,24 @@ lb::model::transformer_layer_dense_swiglu(
 
     auto attn_output = torch::scaled_dot_product_attention(q, k, v, torch::nullopt, 0.0, true);
     attn_output = attn_output.transpose(1, 2).contiguous().view({B, T, hidden_dim});
-    attn_output = lb::kernels::indexed_batched_linear(attn_output, out_proj_weight, out_proj_bias, policy_indices, t);
+    attn_output = optimized_linear(attn_output, out_proj_weight, out_proj_bias, policy_indices, t);
 
     auto residual1 = x + attn_output;
-    auto x_norm = lb::kernels::indexed_batched_layer_norm(residual1, norm1_weight, norm1_bias, policy_indices, 1e-5);
+    auto x_norm = optimized_layer_norm(residual1, norm1_weight, norm1_bias, policy_indices, 1e-5);
 
     auto t1 = Clock::now();
     t["layer_attention_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
 
     // SwiGLU FFN block
     t0 = Clock::now();
-    auto gate = lb::kernels::indexed_batched_linear(x_norm, w_gate_weight, w_gate_bias, policy_indices, t);
+    auto gate = optimized_linear(x_norm, w_gate_weight, w_gate_bias, policy_indices, t);
     gate = torch::silu(gate);
-    auto up = lb::kernels::indexed_batched_linear(x_norm, w_up_weight, w_up_bias, policy_indices, t);
+    auto up = optimized_linear(x_norm, w_up_weight, w_up_bias, policy_indices, t);
     auto gated = gate * up;
-    auto ffn_output = lb::kernels::indexed_batched_linear(gated, w_down_weight, w_down_bias, policy_indices, t);
+    auto ffn_output = optimized_linear(gated, w_down_weight, w_down_bias, policy_indices, t);
 
     auto residual2 = x_norm + ffn_output;
-    auto x_next = lb::kernels::indexed_batched_layer_norm(residual2, norm2_weight, norm2_bias, policy_indices, 1e-5);
+    auto x_next = optimized_layer_norm(residual2, norm2_weight, norm2_bias, policy_indices, 1e-5);
 
     t1 = Clock::now();
     t["layer_ffn_us"] += std::chrono::duration_cast<Microseconds>(t1 - t0);
